@@ -4751,6 +4751,8 @@ pub struct Simulator {
     cg_type_options: HashMap<String, HashMap<String, Value>>,
     /// Per-call-site receiver expressions for `obj.coll.method()` dispatch.
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
+    /// See `lvalue_root_is_unpacked_struct_prop`.
+    unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// Interned scope hints and head identifiers for `method_receiver_cache` keys (see there).
     method_receiver_hint_ids: HashMap<String, u32>,
     /// `resolve_typeref_class_name` memo: name -> (scope, class ctx) -> (class-table size, answer).
@@ -5871,6 +5873,13 @@ fn sv_ato_value(text: &str, radix: u32) -> Value {
     }
     v.is_signed = true;
     v
+}
+
+/// The consequent of a class-constraint implication: a constraint item
+/// (`ConstraintItem::Implication`) or the right operand of a `->` expression.
+enum ImpCons<'a> {
+    Item(&'a ConstraintItem),
+    Expr(&'a Expression),
 }
 
 impl Simulator {
@@ -7076,6 +7085,14 @@ impl Simulator {
         for name in module.signals.keys() {
             names.push(name.clone());
         }
+        // Port directions for the VPI layer (`vpiPort` iteration and
+        // `vpiDirection`). Taken here because `module.signals` is freed once
+        // the indexed signal table exists, further down this constructor.
+        let vpi_port_directions: HashMap<String, PortDirection> = module
+            .signals
+            .iter()
+            .filter_map(|(name, signal)| signal.direction.map(|dir| (name.clone(), dir)))
+            .collect();
         for name in module.parameters.keys() {
             // Parameter and signal can share a name — dedup after sort.
             names.push(name.clone());
@@ -8102,11 +8119,6 @@ impl Simulator {
             }
             m
         };
-        let vpi_port_directions: HashMap<String, PortDirection> = module
-            .signals
-            .iter()
-            .filter_map(|(name, signal)| signal.direction.clone().map(|dir| (name.clone(), dir)))
-            .collect();
         let mut sim = Self {
             prev_val,
             prev_xz,
@@ -8463,6 +8475,7 @@ impl Simulator {
             ref_redirect_hot: false,
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
+            unpacked_struct_prop_names: std::cell::OnceCell::new(),
             method_receiver_hint_ids: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
@@ -60475,7 +60488,11 @@ impl Simulator {
                 // instance-scoped SIGNAL names (`<h>#arr[i].<m>`) that nothing
                 // reads back, which is what left every element 0.
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
-                    if let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) {
+                    if let Some((_, _, su)) = self
+                        .lvalue_root_is_unpacked_struct_prop(lvalue, true)
+                        .then(|| self.class_unpacked_array_prop_of(lvalue))
+                        .flatten()
+                    {
                         let probe0 = Self::index_expr(lvalue, 0);
                         if self.class_unpacked_elem_is_heap_owned(&probe0) {
                             let ord: Vec<Expression> =
@@ -60847,7 +60864,8 @@ impl Simulator {
                 // decompose into the same cells. A genuine queue/dynamic/assoc
                 // element is NOT claimed by it and keeps the signal-name copy
                 // below (UVM uvm_hdl_path_concat::add_slice).
-                if self.queue_pop_call(rvalue).is_none()
+                if self.lvalue_root_is_unpacked_struct_prop(lvalue, false)
+                    && self.queue_pop_call(rvalue).is_none()
                     && self.class_unpacked_elem_is_heap_owned(lvalue)
                 {
                     if let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) {
@@ -87489,6 +87507,61 @@ impl Simulator {
     /// select stripped — names a CLASS PROPERTY whose element type is an
     /// unpacked struct. Drives a member-wise decomposition of a whole-element
     /// write into the same cells `class_unpacked_leaf` reads back.
+    /// Cheap syntactic pre-check for the class unpacked-struct array
+    /// write paths: the lvalue's root identifier must name a class
+    /// property declared as an unpacked struct (of any class). Computed
+    /// once from `property_types`; a UVM run otherwise paid a receiver
+    /// resolution on every blocking assignment (+1.3% instructions on the
+    /// axi4 benchmark) for a write shape it never has.
+    fn lvalue_root_is_unpacked_struct_prop(&self, lvalue: &Expression, allow_bare: bool) -> bool {
+        if self.no_class_objects() {
+            return false;
+        }
+        // The common `x = ..` write: one bare identifier, no select. Only
+        // the whole-array pattern site (`A = '{..}`) may pass one through.
+        if !allow_bare {
+            if let ExprKind::Ident(h) = &lvalue.kind {
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    return false;
+                }
+            }
+        }
+        let set = self.unpacked_struct_prop_names.get_or_init(|| {
+            let mut set: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                for (name, dt) in &cd.property_types {
+                    let dt = Self::resolve_type_ref(dt, &self.module.typedef_types);
+                    if let DataType::Struct(su) = &dt {
+                        if Self::spreads_member_wise(su) {
+                            set.insert(name.clone());
+                        }
+                    }
+                }
+            }
+            set
+        });
+        if set.is_empty() {
+            return false;
+        }
+        let mut cur = lvalue;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, .. } => cur = expr.as_ref(),
+                ExprKind::Ident(h) => {
+                    return h.path.len() <= 2
+                        && h.path.iter().any(|seg| set.contains(&seg.name.name));
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    if set.contains(&member.name) {
+                        return true;
+                    }
+                    cur = expr.as_ref();
+                }
+                _ => return false,
+            }
+        }
+    }
+
     fn class_unpacked_array_prop_of(
         &mut self,
         lvalue: &Expression,
@@ -107712,6 +107785,439 @@ impl Simulator {
         r
     }
 
+
+    /// Every `cond -> consequent` item of the class constraints, with
+    /// `Block`/`Soft` nesting flattened (top level and inside blocks).
+    fn class_implications<'a>(constraints: &'a [ClassConstraint]) -> Vec<(&'a Expression, ImpCons<'a>)> {
+        fn walk<'a>(item: &'a ConstraintItem, out: &mut Vec<(&'a Expression, ImpCons<'a>)>) {
+            match item {
+                ConstraintItem::Implication { condition, constraint, .. } => {
+                    out.push((condition, ImpCons::Item(constraint.as_ref())));
+                }
+                // `a -> b` inside a constraint block parses as ONE expression
+                // (LogImplies), never as ConstraintItem::Implication.
+                ConstraintItem::Expr(e) => {
+                    if let ExprKind::Binary { op: BinaryOp::LogImplies, left, right } =
+                        &Simulator::unparen(e).kind
+                    {
+                        out.push((left.as_ref(), ImpCons::Expr(right.as_ref())));
+                    }
+                }
+                ConstraintItem::Block(items) => items.iter().for_each(|i| walk(i, out)),
+                ConstraintItem::Soft(inner) => walk(inner, out),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for con in constraints {
+            for it in &con.items {
+                walk(it, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Rand properties named by an implication's consequent, each with the
+    /// value ranges the consequent allows for it (`None` = no countable
+    /// restriction). Handles `p inside {..}`, `!(p inside {..})`, `p == c`,
+    /// `p != c` and the relational forms; anything else contributes no
+    /// restriction. Ranges are within the property's unsigned domain.
+    fn consequent_domains_of(
+        &mut self,
+        cons: &ImpCons<'_>,
+        rand_props: &[(String, u32)],
+        out: &mut Vec<(String, Option<Vec<(i128, i128)>>)>,
+    ) {
+        match cons {
+            ImpCons::Item(item) => self.consequent_domains(item, rand_props, out),
+            ImpCons::Expr(e) => self.consequent_domains_expr(e, rand_props, out),
+        }
+    }
+
+    fn unparen(e: &Expression) -> &Expression {
+        let mut cur = e;
+        while let ExprKind::Paren(inner) = &cur.kind {
+            cur = inner.as_ref();
+        }
+        cur
+    }
+
+    fn consequent_domains_expr(
+        &mut self,
+        e: &Expression,
+        rand_props: &[(String, u32)],
+        out: &mut Vec<(String, Option<Vec<(i128, i128)>>)>,
+    ) {
+        let prop_of = |e: &Expression| -> Option<(String, u32)> {
+            if let ExprKind::Ident(h) = &Self::unparen(e).kind {
+                let n = &h.path.last()?.name.name;
+                return rand_props.iter().find(|(p, _)| p == n).cloned();
+            }
+            None
+        };
+        let full = |w: u32| -> i128 { if w >= 127 { i128::MAX } else { (1i128 << w) - 1 } };
+        let inside_ranges = |me: &mut Self, ranges: &[Expression]| -> Vec<(i128, i128)> {
+            let cr: Vec<ConstraintRange> = ranges
+                .iter()
+                .map(|r| match &r.kind {
+                    ExprKind::Range(lo, hi) => ConstraintRange::Range { lo: (**lo).clone(), hi: (**hi).clone() },
+                    _ => ConstraintRange::Value(r.clone()),
+                })
+                .collect();
+            me.cons_ranges_i128(&cr)
+        };
+        let e = Self::unparen(e);
+        // a consequent that is itself a block of `a && b` restrictions
+        if let ExprKind::Binary { op: BinaryOp::LogAnd, left, right } = &e.kind {
+            self.consequent_domains_expr(left, rand_props, out);
+            self.consequent_domains_expr(right, rand_props, out);
+            return;
+        }
+        match &e.kind {
+                ExprKind::Inside { expr, ranges } => {
+                    if let Some((n, _)) = prop_of(expr) {
+                        let rs = inside_ranges(self, ranges);
+                        out.push((n, Some(rs)));
+                    }
+                }
+                ExprKind::Unary { op: UnaryOp::LogNot, operand } => {
+                    if let ExprKind::Inside { expr, ranges } = &Self::unparen(operand).kind {
+                        if let Some((n, w)) = prop_of(expr) {
+                            let mut rs = inside_ranges(self, ranges);
+                            rs.sort();
+                            // complement within [0, 2^w)
+                            let mut comp: Vec<(i128, i128)> = Vec::new();
+                            let mut cur: i128 = 0;
+                            let top = full(w);
+                            for (lo, hi) in rs {
+                                let lo = lo.max(0);
+                                if lo > cur {
+                                    comp.push((cur, lo - 1));
+                                }
+                                cur = cur.max(hi + 1);
+                            }
+                            if cur <= top {
+                                comp.push((cur, top));
+                            }
+                            out.push((n, Some(comp)));
+                        }
+                    }
+                }
+                ExprKind::Binary { op, left, right } => {
+                    let (prop, other, flipped) = match (prop_of(left), prop_of(right)) {
+                        (Some(p), None) => (p, right, false),
+                        (None, Some(p)) => (p, left, true),
+                        _ => return,
+                    };
+                    let mut ids = HashSet::default();
+                    self.collect_expr_idents(other, &mut ids);
+                    if rand_props.iter().any(|(n, _)| ids.contains(n)) {
+                        return;
+                    }
+                    let c = self.eval_expr(other).to_u128() as i128;
+                    let top = full(prop.1);
+                    let eff = if flipped {
+                        match op {
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::Leq => BinaryOp::Geq,
+                            BinaryOp::Geq => BinaryOp::Leq,
+                            o => *o,
+                        }
+                    } else {
+                        *op
+                    };
+                    let rs: Option<Vec<(i128, i128)>> = match eff {
+                        BinaryOp::Eq => Some(vec![(c, c)]),
+                        BinaryOp::Neq => Some(vec![(0, c - 1), (c + 1, top)]),
+                        BinaryOp::Lt => Some(vec![(0, c - 1)]),
+                        BinaryOp::Leq => Some(vec![(0, c)]),
+                        BinaryOp::Gt => Some(vec![(c + 1, top)]),
+                        BinaryOp::Geq => Some(vec![(c, top)]),
+                        _ => None,
+                    };
+                    out.push((prop.0, rs));
+                }
+                _ => {}
+            }
+    }
+
+    fn consequent_domains(
+        &mut self,
+        item: &ConstraintItem,
+        rand_props: &[(String, u32)],
+        out: &mut Vec<(String, Option<Vec<(i128, i128)>>)>,
+    ) {
+        if let ConstraintItem::Expr(e) = item {
+            return self.consequent_domains_expr(e, rand_props, out);
+        }
+        let prop_of = |e: &Expression| -> Option<(String, u32)> {
+            if let ExprKind::Ident(h) = &Self::unparen(e).kind {
+                let n = &h.path.last()?.name.name;
+                return rand_props.iter().find(|(p, _)| p == n).cloned();
+            }
+            None
+        };
+        let full = |w: u32| -> i128 { if w >= 127 { i128::MAX } else { (1i128 << w) - 1 } };
+        let inside_ranges = |me: &mut Self, ranges: &[Expression]| -> Vec<(i128, i128)> {
+            let cr: Vec<ConstraintRange> = ranges
+                .iter()
+                .map(|r| match &r.kind {
+                    ExprKind::Range(lo, hi) => ConstraintRange::Range { lo: (**lo).clone(), hi: (**hi).clone() },
+                    _ => ConstraintRange::Value(r.clone()),
+                })
+                .collect();
+            me.cons_ranges_i128(&cr)
+        };
+        match item {
+            ConstraintItem::Block(items) => {
+                for i in items {
+                    self.consequent_domains(i, rand_props, out);
+                }
+            }
+            ConstraintItem::Soft(inner) => self.consequent_domains(inner, rand_props, out),
+            ConstraintItem::Inside { expr, range, is_dist, .. } if !*is_dist => {
+                if let Some((n, _)) = prop_of(expr) {
+                    let rs = self.cons_ranges_i128(range);
+                    out.push((n, Some(rs)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// §18.5.10 without `solve … before`: every solution is equally likely,
+    /// so an antecedent whose value selects the size of the consequent
+    /// space must be drawn in proportion to that size. `sel inside {0,1,2}`
+    /// with `(sel==0) -> (addr inside {[512:1023]})`, `(sel==2) ->
+    /// !(addr inside {[512:1535]})` gives sel=2 almost always. Picking sel
+    /// uniformly and repairing addr afterwards gave one third each.
+    /// Returns None when the weights carry no information (uniform pick).
+    fn weighted_antecedent_pick(
+        &mut self,
+        handle: usize,
+        name: &str,
+        width: u32,
+        ranges: &[(i128, i128)],
+        constraints: &[ClassConstraint],
+        rand_props: &[(String, u32)],
+        solved: &HashMap<String, Value>,
+    ) -> Option<Value> {
+        let total: i128 = ranges.iter().map(|(lo, hi)| (hi - lo + 1).max(0)).sum();
+        if total <= 1 || total > 64 || width == 0 || width > 64 {
+            return None;
+        }
+        let imps = Self::class_implications(constraints);
+        if imps.is_empty() {
+            return None;
+        }
+        // Only implications whose condition reads this property and no
+        // other unsolved rand property.
+        let mine: Vec<(&Expression, ImpCons<'_>)> = imps
+            .into_iter()
+            .filter(|(cond, _)| {
+                let mut ids = HashSet::default();
+                self.collect_expr_idents(cond, &mut ids);
+                ids.contains(name)
+                    && !rand_props
+                        .iter()
+                        .any(|(n, _)| n != name && ids.contains(n) && !solved.contains_key(n))
+            })
+            .collect();
+        if mine.is_empty() {
+            return None;
+        }
+        let cands: Vec<i128> = ranges
+            .iter()
+            .flat_map(|(lo, hi)| (*lo..=*hi))
+            .filter(|c| *c >= 0)
+            .collect();
+        let saved = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|i| i.properties.get(name).cloned());
+        let full = |w: u32| -> f64 { 2f64.powi(w.min(127) as i32) };
+        let mut weights: Vec<f64> = Vec::with_capacity(cands.len());
+        self.this_stack.push(Some(handle));
+        for &c in &cands {
+            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                inst.properties.insert(name.to_string(), Value::from_u64(c as u64, width));
+            }
+            // per consequent property: the allowed count under the fired
+            // consequents, or the full domain when none fires for it
+            let mut per: HashMap<String, f64> = HashMap::default();
+            let mut feasible = true;
+            for (cond, cons) in &mine {
+                if !self.eval_expr(cond).is_true() {
+                    continue;
+                }
+                let mut doms = Vec::new();
+                self.consequent_domains_of(cons, rand_props, &mut doms);
+                for (pn, rs) in doms {
+                    if pn == name || solved.contains_key(&pn) {
+                        continue;
+                    }
+                    let Some(rs) = rs else { continue };
+                    let cnt: f64 = rs.iter().map(|(lo, hi)| ((hi - lo + 1).max(0)) as f64).sum();
+                    let e = per.entry(pn).or_insert(f64::INFINITY);
+                    *e = e.min(cnt);
+                    if cnt <= 0.0 {
+                        feasible = false;
+                    }
+                }
+            }
+            let _ = full;
+            weights.push(if feasible { per.values().product::<f64>().max(f64::MIN_POSITIVE) } else { 0.0 });
+        }
+        self.this_stack.pop();
+        // Properties restricted for SOME candidates but not others: the
+        // unrestricted candidates get the full domain for them.
+        let mut restricted: HashSet<String> = HashSet::default();
+        {
+            self.this_stack.push(Some(handle));
+            for &c in &cands {
+                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                    inst.properties.insert(name.to_string(), Value::from_u64(c as u64, width));
+                }
+                for (cond, cons) in &mine {
+                    if self.eval_expr(cond).is_true() {
+                        let mut doms = Vec::new();
+                        self.consequent_domains_of(cons, rand_props, &mut doms);
+                        for (pn, rs) in doms {
+                            if rs.is_some() && pn != name && !solved.contains_key(&pn) {
+                                restricted.insert(pn);
+                            }
+                        }
+                    }
+                }
+            }
+            self.this_stack.pop();
+        }
+        if !restricted.is_empty() {
+            // recompute with the full-domain default for unrestricted props
+            self.this_stack.push(Some(handle));
+            for (k, &c) in cands.iter().enumerate() {
+                if weights[k] == 0.0 {
+                    continue;
+                }
+                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                    inst.properties.insert(name.to_string(), Value::from_u64(c as u64, width));
+                }
+                let mut per: HashMap<String, f64> = restricted
+                    .iter()
+                    .map(|pn| {
+                        let w = rand_props.iter().find(|(n, _)| n == pn).map(|(_, w)| *w).unwrap_or(32);
+                        (pn.clone(), full(w))
+                    })
+                    .collect();
+                for (cond, cons) in &mine {
+                    if !self.eval_expr(cond).is_true() {
+                        continue;
+                    }
+                    let mut doms = Vec::new();
+                    self.consequent_domains_of(cons, rand_props, &mut doms);
+                    for (pn, rs) in doms {
+                        let Some(rs) = rs else { continue };
+                        if let Some(e) = per.get_mut(&pn) {
+                            let cnt: f64 = rs.iter().map(|(lo, hi)| ((hi - lo + 1).max(0)) as f64).sum();
+                            *e = e.min(cnt);
+                        }
+                    }
+                }
+                weights[k] = per.values().product::<f64>();
+            }
+            self.this_stack.pop();
+        }
+        // restore the property
+        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            match saved {
+                Some(v) => {
+                    inst.properties.insert(name.to_string(), v);
+                }
+                None => {
+                    inst.properties.remove(name);
+                }
+            }
+        }
+        let sum: f64 = weights.iter().sum();
+        if !(sum > 0.0) || weights.iter().all(|w| (*w - weights[0]).abs() <= f64::EPSILON * weights[0].abs()) {
+            return None;
+        }
+        use rand::Rng;
+        let mut r: f64 = self.cur_rng().gen_range(0.0..sum);
+        let mut chosen = cands[cands.len() - 1];
+        for (k, &c) in cands.iter().enumerate() {
+            if r < weights[k] {
+                chosen = c;
+                break;
+            }
+            r -= weights[k];
+        }
+        Some(Value::from_u64(chosen as u64, width))
+    }
+
+    /// After a property is solved, implications whose condition now holds
+    /// narrow the allowed ranges of the still-unsolved properties their
+    /// consequents name, so those are drawn inside the consequent instead
+    /// of being repaired by retries.
+    fn narrow_from_fired_implications(
+        &mut self,
+        handle: usize,
+        constraints: &[ClassConstraint],
+        rand_props: &[(String, u32)],
+        solved: &HashMap<String, Value>,
+        allowed: &mut HashMap<String, Vec<(i128, i128)>>,
+    ) {
+        let imps = Self::class_implications(constraints);
+        if imps.is_empty() {
+            return;
+        }
+        self.this_stack.push(Some(handle));
+        for (cond, cons) in imps {
+            let mut ids = HashSet::default();
+            self.collect_expr_idents(cond, &mut ids);
+            // every rand property the condition reads must be solved
+            if rand_props.iter().any(|(n, _)| ids.contains(n) && !solved.contains_key(n)) {
+                continue;
+            }
+            if !ids.iter().any(|i| rand_props.iter().any(|(n, _)| n == i)) {
+                continue;
+            }
+            if !self.eval_expr(cond).is_true() {
+                continue;
+            }
+            let mut doms = Vec::new();
+            self.consequent_domains_of(&cons, rand_props, &mut doms);
+            for (pn, rs) in doms {
+                let Some(rs) = rs else { continue };
+                if solved.contains_key(&pn) || rs.is_empty() {
+                    continue;
+                }
+                let entry = allowed.entry(pn).or_default();
+                if entry.is_empty() {
+                    *entry = rs;
+                } else {
+                    // intersect
+                    let mut inter = Vec::new();
+                    for (alo, ahi) in entry.iter() {
+                        for (blo, bhi) in &rs {
+                            let lo = (*alo).max(*blo);
+                            let hi = (*ahi).min(*bhi);
+                            if lo <= hi {
+                                inter.push((lo, hi));
+                            }
+                        }
+                    }
+                    if !inter.is_empty() {
+                        *entry = inter;
+                    }
+                }
+            }
+        }
+        self.this_stack.pop();
+    }
+
     fn exec_randomize_inner(&mut self, handle: usize, inline: &[ConstraintItem]) -> Value {
         // Reset the dist-pick-once tracker so each randomize call gets a
         // fresh weighted draw per `(handle, prop)`.
@@ -108578,7 +109084,23 @@ impl Simulator {
                     }
                 }
                 pids_to_solve = topo;
+            } else {
+                // Antecedents of implications first (see weighted_antecedent_pick).
+                let mut ante: HashSet<String> = HashSet::default();
+                for (cond, _) in Self::class_implications(&constraints) {
+                    let mut ids = HashSet::default();
+                    self.collect_expr_idents(cond, &mut ids);
+                    ante.extend(ids.into_iter().filter(|i| rand_props.iter().any(|(n, _)| n == i)));
+                }
+                if !ante.is_empty() {
+                    let (first, rest): (Vec<usize>, Vec<usize>) = pids_to_solve
+                        .iter()
+                        .copied()
+                        .partition(|&i| ante.contains(&rand_props[i].0));
+                    pids_to_solve = first.into_iter().chain(rest).collect();
+                }
             }
+            let has_solve_before = !solve_pairs.is_empty();
             let mut progress = true;
             while !pids_to_solve.is_empty() && progress {
                 progress = false;
@@ -108724,7 +109246,16 @@ impl Simulator {
                         // (signed) interval and keeps the property's signedness.
                         let sgn = signed_rand_props.contains(name);
                         if let Some(ranges) = prop_allowed_ranges.get(name).cloned() {
-                            if let Some(p) = self.pick_i128_range(&ranges, *width, sgn) {
+                            let weighted = if has_solve_before || sgn {
+                                None
+                            } else {
+                                self.weighted_antecedent_pick(
+                                    handle, name, *width, &ranges, &constraints, &rand_props, &solved_props,
+                                )
+                            };
+                            if let Some(p) = weighted {
+                                val = p;
+                            } else if let Some(p) = self.pick_i128_range(&ranges, *width, sgn) {
                                 val = p;
                             }
                         } else if let Some(et) = enum_prop_types.get(name) {
@@ -108743,6 +109274,9 @@ impl Simulator {
                         if let Some(Some(inst)) = self.heap.get_mut(handle) {
                             inst.properties.insert(name.clone(), val);
                         }
+                        self.narrow_from_fired_implications(
+                            handle, &constraints, &rand_props, &solved_props, &mut prop_allowed_ranges,
+                        );
                         pids_to_solve.remove(i);
                         progress = true;
                         continue;
@@ -115517,6 +116051,10 @@ static GLOBAL_ACTIVE_SIMULATOR: std::sync::atomic::AtomicPtr<Simulator> =
 /// fields that only some kinds populate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum VpiKind {
+    /// A module port (§37.16): its own object, with `vpiDirection`; the
+    /// connected signal keeps its `vpiNet`/`vpiReg` type. `signal_id` is the
+    /// port's signal so value reads work through the port handle.
+    Port,
     /// A whole signal in the flat signal table.
     Signal,
     /// A bit range of a signal — a packed-struct member or part-select.
@@ -115586,6 +116124,14 @@ impl VpiHandle {
             value: None,
             frame: 0,
         }
+    }
+
+    fn port(id: usize, name: &str, full: &str, direction: libc::c_int, width: u32) -> Self {
+        let mut h = VpiHandle::signal(id, vpi::PORT, name, full);
+        h.kind = VpiKind::Port;
+        h.direction = direction;
+        h.width = width;
+        h
     }
 
     fn into_raw(self) -> *mut libc::c_void {
@@ -115836,9 +116382,6 @@ where
 /// declaration we cannot see, which is the safe answer: a caller that
 /// believes a signal may hold X will read it with a 4-state format.
 fn vpi_type_of(sim: &Simulator, name: &str, id: usize) -> libc::c_int {
-    if sim.vpi_port_directions.contains_key(name) {
-        return vpi::PORT;
-    }
     use xezim_core::ast::types::{
         DataType, IntegerAtomType, IntegerVectorType, RealType, SimpleType, StructUnionKind,
     };
@@ -115892,13 +116435,23 @@ fn vpi_type_of(sim: &Simulator, name: &str, id: usize) -> libc::c_int {
     }
 }
 
-fn vpi_direction_of(sim: &Simulator, name: &str) -> libc::c_int {
-    match sim.vpi_port_directions.get(name) {
-        Some(PortDirection::Input) => vpi::INPUT,
-        Some(PortDirection::Output) => vpi::OUTPUT,
-        Some(PortDirection::Inout) => vpi::INOUT,
-        Some(PortDirection::Ref) | None => vpi::NO_DIRECTION,
+fn vpi_direction_code(dir: PortDirection) -> libc::c_int {
+    match dir {
+        PortDirection::Input => vpi::INPUT,
+        PortDirection::Output => vpi::OUTPUT,
+        PortDirection::Inout => vpi::INOUT,
+        PortDirection::Ref => vpi::NO_DIRECTION,
     }
+}
+
+/// Direction of the port a signal belongs to, `vpiNoDirection` for a plain
+/// signal. The standard defines `vpiDirection` on port objects; answering
+/// it on the port's signal too is a convenience that costs nothing.
+fn vpi_direction_of(sim: &Simulator, name: &str) -> libc::c_int {
+    sim.vpi_port_directions
+        .get(name)
+        .map(|d| vpi_direction_code(*d))
+        .unwrap_or(vpi::NO_DIRECTION)
 }
 
 fn new_vpi_handle(sim: &Simulator, name: &str, id: usize) -> *mut libc::c_void {
@@ -116329,10 +116882,31 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
         }
 
         // Declared objects, filtered by what the caller asked for.
+        if type_ == vpi::PORT {
+            // §37.16: ports are their own objects, one per direction-bearing
+            // member of the scope, in name order.
+            let items: Vec<VpiHandle> = vpi_scope_members(sim, &scope_path)
+                .into_iter()
+                .filter(|(_, id)| *id != usize::MAX)
+                .filter_map(|(name, id)| {
+                    let dir = sim.vpi_port_directions.get(&name)?;
+                    let leaf = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    let width = sim.signal_widths.get(id).copied().unwrap_or(1) as u32;
+                    Some(VpiHandle::port(
+                        id,
+                        &leaf,
+                        &vpi_full_name(sim, &name),
+                        vpi_direction_code(*dir),
+                        width,
+                    ))
+                })
+                .collect();
+            return vpi_make_iterator(items);
+        }
+
         let want = |ty: libc::c_int| -> bool {
             match type_ {
                 vpi::NET => ty == vpi::NET,
-                vpi::PORT => ty == vpi::PORT,
                 vpi::REG => ty == vpi::REG || ty == vpi::BIT_VAR,
                 vpi::PARAMETER => ty == vpi::PARAMETER,
                 vpi::MEMORY => ty == vpi::MEMORY,
@@ -116827,6 +117401,12 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
         };
     }
     // A module or an iterator has no width, sign or scalar-ness.
+    if property == vpi::DIRECTION {
+        return match h.kind {
+            VpiKind::Port | VpiKind::Signal => h.direction,
+            _ => vpi::UNDEFINED,
+        };
+    }
     match h.kind {
         VpiKind::Module | VpiKind::Iterator => return vpi::UNDEFINED,
         // vpiSize of a memory is its number of words; of a slice, its bits.

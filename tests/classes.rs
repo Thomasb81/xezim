@@ -274,3 +274,5 @@ mod class_method_sibling_instance_oomr;
 mod method_int_formal_zero_extends;
 #[path = "classes/handle_chain_read_in_instance_task.rs"]
 mod handle_chain_read_in_instance_task;
+#[path = "classes/implication_joint_distribution.rs"]
+mod implication_joint_distribution;

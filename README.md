@@ -128,6 +128,28 @@ and testbench flows. Portable code should not rely on them.
   runs with no scope hint, so the receiver cache above now keys on the
   instance-prefixed identifier too — `q.size()` inside a loop in ten
   sibling instances read the first sibling's queue.
+* **Constrained random: an implication's antecedent is drawn in
+  proportion to the solution space it selects**: without `solve … before`
+  every solution is equally likely (§18.5.10), so `sel inside {0,1,2}`
+  with two narrow address windows and one complement window must land on
+  the complement case almost always; it landed on each case a third of
+  the time because the antecedent was drawn uniformly and the address
+  repaired afterwards. Fired implications now also narrow the ranges of
+  the consequent's properties before they are drawn. An explicit
+  `solve … before` keeps the antecedent uniform.
+* **VPI ports**: `vpi_iterate(vpiPort, module)` yields port objects
+  (`vpiName`, `vpiFullName`, `vpiDirection`, `vpiSize`, value reads through
+  the connected signal) for the top module and for sub-instances; the
+  connected nets and variables keep their `vpiNet`/`vpiReg` types, and a
+  signal handle answers `vpiDirection` with its port's direction. The
+  `vpiPort`, `vpiPortBit`, `vpiDirection` and direction constants are in
+  `include/vpi_user.h`.
+* **Five write-path and scheduling fixes** (an x/z bit-select index writes
+  nothing; a constant continuous assign survives an early settle; NBA to a
+  packed-array element through a virtual interface keeps its width; nested
+  packed-struct member writes land; class unpacked-struct array elements
+  are written where their reads look) — the class array write path is
+  gated on the lvalue's root name so UVM runs pay nothing for it.
 * **Settle passes run in dependency order and clocked monitors stop
   re-cloning their bodies**: a combinational entry triggered mid-pass by a
   producer earlier in the same pass was appended to the end of the pass, so
