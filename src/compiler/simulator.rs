@@ -5564,6 +5564,10 @@ pub struct Simulator {
     forever_cont_cache: HashMap<(usize, usize, usize, usize, u8), Arc<[Statement]>>,
     /// Pending-injection bitset for `settle_combinatorial_inner` (kept to avoid reallocation).
     settle_inject_bits: Vec<u64>,
+    /// A `return <virtual interface>` left `__vif_return__` for the next assignment.
+    vif_return_pending: bool,
+    /// Static lvalue widths of bare-leaf identifiers, per identifier span (see infer_lhs_width).
+    lhs_leaf_width_cache: HashMap<(usize, usize), u32>,
     /// See `blocking_cont_frame`.
     blocking_cont_cache: HashMap<(usize, usize, usize, u8), Arc<[Statement]>>,
     /// §11.8.1: while narrowing relational constraint bounds for a target whose
@@ -8767,6 +8771,8 @@ impl Simulator {
             forever_depth: 0,
             forever_cont_cache: HashMap::default(),
             settle_inject_bits: Vec::new(),
+            vif_return_pending: false,
+            lhs_leaf_width_cache: HashMap::default(),
             blocking_cont_cache: HashMap::default(),
             forever_sens_cache: HashMap::default(),
             constraint_cmp_unsigned: false,
@@ -49409,12 +49415,16 @@ impl Simulator {
         // the FIRST assignment target after the call — `value = r.read(c)`
         // in uvm_config_db::get (issue #113). One-shot; also cleared at the
         // next function-call entry so it cannot leak further than that.
-        if let Some(nm) = self
-            .signals
-            .remove("__vif_return__")
-            .map(|x| x.to_sv_string())
-            .filter(|s| !s.is_empty())
+        // The marker is probed only when a `return <vif>` left one: the
+        // signal-map lookup was a string hash on EVERY assignment.
+        if self.vif_return_pending
+            && let Some(nm) = self
+                .signals
+                .remove("__vif_return__")
+                .map(|x| x.to_sv_string())
+                .filter(|s| !s.is_empty())
         {
+            self.vif_return_pending = false;
             let synth = Expression::new(
                 ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                     root: None,
@@ -65329,6 +65339,7 @@ impl Simulator {
                     if let Some(nm) = self.resolve_vif_rhs_name_strict(e) {
                         self.signals
                             .insert("__vif_return__".to_string(), Value::from_string(&nm));
+                        self.vif_return_pending = true;
                     }
                     // §13.4: `return <collection>` — record the collection's
                     // storage name so the caller's assign can copy elements
@@ -76165,9 +76176,26 @@ impl Simulator {
                         return self.signal_widths[id];
                     }
                 }
+                // A bare leaf may be a local or a signal, so the id cache above
+                // is skipped for it and the whole ladder below re-ran on every
+                // assignment. Its STATIC answers (a signal's declared width, a
+                // declared local/module width) are remembered per identifier
+                // span; the class-property and default answers are not.
+                let leaf_key = if is_ambiguous_leaf {
+                    let k = (h.span.start as usize, h.span.end as usize);
+                    if let Some(&w) = self.lhs_leaf_width_cache.get(&k) {
+                        return w;
+                    }
+                    Some(k)
+                } else {
+                    None
+                };
                 let name = self.resolve_hier_name(h);
                 if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     h.cached_signal_id.set(Some(id));
+                    if let Some(k) = leaf_key {
+                        self.lhs_leaf_width_cache.insert(k, self.signal_widths[id]);
+                    }
                     return self.signal_widths[id];
                 }
                 // A width of 0 is never valid for an lvalue — it usually
@@ -76175,6 +76203,9 @@ impl Simulator {
                 // class-handle elsewhere. Ignore it and fall through.
                 if let Some(w) = self.widths.get(&*name).copied() {
                     if w > 0 {
+                        if let Some(k) = leaf_key {
+                            self.lhs_leaf_width_cache.insert(k, w);
+                        }
                         return w;
                     }
                 }
@@ -101286,6 +101317,7 @@ impl Simulator {
 
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
         self.signals.remove("__vif_return__");
+        self.vif_return_pending = false;
         // §26.3: the package this body belongs to. Taken before anything else
         // runs, so a call appearing in an argument (evaluated below, in the
         // CALLER's scope) cannot pick it up. A scoped `pkg::f()` dispatch names
