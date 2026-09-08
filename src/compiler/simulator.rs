@@ -4768,6 +4768,10 @@ pub struct Simulator {
     cg_type_options: HashMap<String, HashMap<String, Value>>,
     /// Per-call-site receiver expressions for `obj.coll.method()` dispatch.
     method_receiver_cache: HashMap<(usize, usize, usize, u32, u32), std::rc::Rc<Expression>>,
+    /// Reused buffer for the `<hint>.<name>` probe in `get_signal_value_by_name` (a `&self` path).
+    hint_key_scratch: std::cell::RefCell<String>,
+    /// Reused buffer for the `__vif_local__` key probes (`&self` paths).
+    vif_key_scratch: std::cell::RefCell<String>,
     /// Reused buffer for `frame_leaf_key_of`'s marker probe.
     marker_key_scratch: String,
     /// See `lvalue_root_is_unpacked_struct_prop`.
@@ -8496,6 +8500,8 @@ impl Simulator {
             ref_redirect_hot: false,
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
+            hint_key_scratch: std::cell::RefCell::new(String::new()),
+            vif_key_scratch: std::cell::RefCell::new(String::new()),
             marker_key_scratch: String::new(),
             unpacked_struct_prop_names: std::cell::OnceCell::new(),
             method_receiver_hint_ids: HashMap::default(),
@@ -80725,23 +80731,41 @@ impl Simulator {
             // genuine composed name always wins). `tb.counter` read from a
             // class method silently returned x without this.
             if !self.signal_name_to_id.contains_key(name) && !self.signals.contains_key(name) {
-                if let Some(rest) = name.strip_prefix(&format!("{}.", self.module.name)) {
-                    if let Some(v) = self.get_signal_value_by_name(rest) {
+                // `<top>.` prefix test without building the prefix string.
+                let top = self.module.name.as_str();
+                if name.len() > top.len()
+                    && name.as_bytes()[top.len()] == b'.'
+                    && name.starts_with(top)
+                {
+                    if let Some(v) = self.get_signal_value_by_name(&name[top.len() + 1..]) {
                         return Some(v);
                     }
                 }
             }
         }
         if !name.contains('.') {
-            if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
-                let scoped = format!("{}.{}", hint, name);
-                if let Some(&id) = self.signal_name_to_id.get(scoped.as_str()) {
-                    let mut v = self.signal_table[id].clone();
-                    if self.signal_signed[id] {
-                        v.is_signed = true;
+            // Every undotted read under a scope hint probed `<hint>.<name>`
+            // through a fresh String; reuse one buffer instead.
+            let hinted: Option<usize> = {
+                let hint = self.name_resolve_hint.borrow();
+                match hint.as_deref() {
+                    Some(h) => {
+                        let mut k = self.hint_key_scratch.borrow_mut();
+                        k.clear();
+                        k.push_str(h);
+                        k.push('.');
+                        k.push_str(name);
+                        self.signal_name_to_id.get(k.as_str()).copied()
                     }
-                    return Some(v);
+                    None => None,
                 }
+            };
+            if let Some(id) = hinted {
+                let mut v = self.signal_table[id].clone();
+                if self.signal_signed[id] {
+                    v.is_signed = true;
+                }
+                return Some(v);
             }
         }
         if let Some(&id) = self.signal_name_to_id.get(name) {
@@ -93334,19 +93358,30 @@ impl Simulator {
                     {
                         return Some(Some(b.clone()));
                     }
-                    if self
-                        .signals
-                        .contains_key(&format!("__vif_local__{}#{}", th, raw))
-                    {
-                        return Some(
-                            self.signals
-                                .get(&format!("__vif_local__{}#{}", th, raw))
-                                .map(|v| v.to_sv_string()),
-                        );
+                    let hit = {
+                        let mut k = self.vif_key_scratch.borrow_mut();
+                        k.clear();
+                        {
+                            use std::fmt::Write as _;
+                            let _ = write!(k, "__vif_local__{}#{}", th, raw);
+                        }
+                        self.signals.get(k.as_str()).map(|v| v.to_sv_string())
+                    };
+                    if let Some(v) = hit {
+                        return Some(Some(v));
                     }
                 }
-                if let Some(v) = self.signals.get(&format!("__vif_local__{}", raw)) {
-                    return Some(Some(v.to_sv_string()));
+                let hit = {
+                    let mut k = self.vif_key_scratch.borrow_mut();
+                    k.clear();
+                    {
+                        use std::fmt::Write as _;
+                        let _ = write!(k, "__vif_local__{}", raw);
+                    }
+                    self.signals.get(k.as_str()).map(|v| v.to_sv_string())
+                };
+                if let Some(v) = hit {
+                    return Some(Some(v));
                 }
                 if let Some(b) = self.iface_alias_for(raw) {
                     return Some(Some(b));
@@ -93816,17 +93851,31 @@ impl Simulator {
                 // record the interface name in signals["__vif_local__<var>"] so a
                 // later `obj.vif_prop = local_var` can propagate the binding.
                 if let Some(th) = self.this_stack.last().copied().flatten() {
-                    let ikey = format!("__vif_local__{}#{}", th, raw);
-                    if let Some(iface_val) = self.signals.get(&ikey) {
-                        let s = iface_val.to_sv_string();
+                    let hit = {
+                        let mut k = self.vif_key_scratch.borrow_mut();
+                        k.clear();
+                        {
+                            use std::fmt::Write as _;
+                            let _ = write!(k, "__vif_local__{}#{}", th, raw);
+                        }
+                        self.signals.get(k.as_str()).map(|v| v.to_sv_string())
+                    };
+                    if let Some(s) = hit {
                         if !s.is_empty() {
                             return Some(s);
                         }
                     }
                 }
-                let local_key = format!("__vif_local__{}", raw);
-                if let Some(iface_val) = self.signals.get(&local_key) {
-                    let s = iface_val.to_sv_string();
+                let hit = {
+                    let mut k = self.vif_key_scratch.borrow_mut();
+                    k.clear();
+                    {
+                        use std::fmt::Write as _;
+                        let _ = write!(k, "__vif_local__{}", raw);
+                    }
+                    self.signals.get(k.as_str()).map(|v| v.to_sv_string())
+                };
+                if let Some(s) = hit {
                     if !s.is_empty() {
                         return Some(s);
                     }
