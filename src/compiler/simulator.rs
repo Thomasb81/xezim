@@ -3050,6 +3050,24 @@ fn bytecode_array_elem_width(
         .max(1)
 }
 
+/// §11.5.1: the effective index of a DYNAMIC bit-select. `None` when the index
+/// contains x or z, in which case a WRITE must be discarded ("no bits shall be
+/// modified") and a read yields x.
+///
+/// `Value::to_u64` masks x bits to ZERO and returns `Some(0)` rather than
+/// `None`, so it cannot answer this question. Every dynamic bit-store used
+/// `to_u64().unwrap_or(0)` and therefore wrote BIT 0 whenever the index was
+/// unknown. Out-of-range indices need no help here: `Value::set_bit` already
+/// drops them. Same defect, and same fix, as the `LoadArrayElem` x-index
+/// sentinel on the read side.
+#[inline]
+fn dyn_bit_index(v: &Value) -> Option<usize> {
+    if v.has_xz() {
+        return None;
+    }
+    Some(v.to_u64().unwrap_or(0) as usize)
+}
+
 fn resolve_bytecode_array_elem(
     array: &super::bytecode::ArrayOperand,
     idx: i64,
@@ -23162,23 +23180,25 @@ impl Simulator {
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = vm_regs[*val_reg as usize].get_bit(0);
-                    let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
-                    if let Some(i) = existing {
-                        let mut new_val = nba_out[i].value.clone();
-                        new_val.set_bit(idx, bit);
-                        nba_out[i].value = new_val;
-                    } else {
-                        let cur = &signal_table[*sig_id];
-                        if cur.get_bit(idx) != bit {
-                            let mut new_val = cur.clone();
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
+                        let bit = vm_regs[*val_reg as usize].get_bit(0);
+                        let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
+                        if let Some(i) = existing {
+                            let mut new_val = nba_out[i].value.clone();
                             new_val.set_bit(idx, bit);
-                            nba_out.push(NbaFast {
-                                signal_id: *sig_id,
-                                value: new_val,
-                                block_index,
-                            });
+                            nba_out[i].value = new_val;
+                        } else {
+                            let cur = &signal_table[*sig_id];
+                            if cur.get_bit(idx) != bit {
+                                let mut new_val = cur.clone();
+                                new_val.set_bit(idx, bit);
+                                nba_out.push(NbaFast {
+                                    signal_id: *sig_id,
+                                    value: new_val,
+                                    block_index,
+                                });
+                            }
                         }
                     }
                 }
@@ -23862,13 +23882,15 @@ impl Simulator {
                 }
                 Insn::BlockingAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = vm_regs[*val_reg as usize].get_bit(0);
-                    if view[*sig_id].get_bit(idx) != bit {
-                        let mut new_val = view[*sig_id].clone();
-                        new_val.set_bit(idx, bit);
-                        view[*sig_id] = new_val;
-                        dirtied.push(*sig_id as u32);
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
+                        let bit = vm_regs[*val_reg as usize].get_bit(0);
+                        if view[*sig_id].get_bit(idx) != bit {
+                            let mut new_val = view[*sig_id].clone();
+                            new_val.set_bit(idx, bit);
+                            view[*sig_id] = new_val;
+                            dirtied.push(*sig_id as u32);
+                        }
                     }
                 }
                 Insn::BlockingAssignRangeDyn(sig_id, hi_reg, lo_reg, val_reg) => {
@@ -24010,21 +24032,23 @@ impl Simulator {
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = vm_regs[*val_reg as usize].get_bit(0);
-                    let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
-                    if let Some(i) = existing {
-                        let mut new_val = nba_out[i].value.clone();
-                        new_val.set_bit(idx, bit);
-                        nba_out[i].value = new_val;
-                    } else if view[*sig_id].get_bit(idx) != bit {
-                        let mut new_val = view[*sig_id].clone();
-                        new_val.set_bit(idx, bit);
-                        nba_out.push(NbaFast {
-                            signal_id: *sig_id,
-                            value: new_val,
-                            block_index,
-                        });
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&vm_regs[*idx_reg as usize]) {
+                        let bit = vm_regs[*val_reg as usize].get_bit(0);
+                        let existing = nba_out.iter().rposition(|n| n.signal_id == *sig_id);
+                        if let Some(i) = existing {
+                            let mut new_val = nba_out[i].value.clone();
+                            new_val.set_bit(idx, bit);
+                            nba_out[i].value = new_val;
+                        } else if view[*sig_id].get_bit(idx) != bit {
+                            let mut new_val = view[*sig_id].clone();
+                            new_val.set_bit(idx, bit);
+                            nba_out.push(NbaFast {
+                                signal_id: *sig_id,
+                                value: new_val,
+                                block_index,
+                            });
+                        }
                     }
                 }
                 Insn::NbaAssignArray(array_name, idx_reg, val_reg, width) => {
@@ -25272,25 +25296,27 @@ impl Simulator {
                 }
                 Insn::NbaAssignBitDyn(sig_id, idx_reg, val_reg) => {
                     let sig_id = &(*sig_id as usize);
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = self.vm_regs[*val_reg as usize].get_bit(0);
-                    let id = *sig_id;
-                    if let Some(i) = self.nba_fast_index.get(id) {
-                        self.nba_fast[i].value.set_bit(idx, bit);
-                    } else {
-                        // Single-bit elision: if the bit is already what
-                        // we're about to write, skip the queue push.
-                        if self.signal_table[id].get_bit(idx) == bit {
-                            self.prof_nba_elided += 1;
+                    // §11.5.1: an x/z index modifies no bits.
+                    if let Some(idx) = dyn_bit_index(&self.vm_regs[*idx_reg as usize]) {
+                        let bit = self.vm_regs[*val_reg as usize].get_bit(0);
+                        let id = *sig_id;
+                        if let Some(i) = self.nba_fast_index.get(id) {
+                            self.nba_fast[i].value.set_bit(idx, bit);
                         } else {
-                            let mut new_val = self.signal_table[id].clone();
-                            new_val.set_bit(idx, bit);
-                            self.nba_fast_index.insert(id, self.nba_fast.len());
-                            self.nba_fast.push(NbaFast {
-                                block_index: 0,
-                                signal_id: id,
-                                value: new_val,
-                            });
+                            // Single-bit elision: if the bit is already what
+                            // we're about to write, skip the queue push.
+                            if self.signal_table[id].get_bit(idx) == bit {
+                                self.prof_nba_elided += 1;
+                            } else {
+                                let mut new_val = self.signal_table[id].clone();
+                                new_val.set_bit(idx, bit);
+                                self.nba_fast_index.insert(id, self.nba_fast.len());
+                                self.nba_fast.push(NbaFast {
+                                    block_index: 0,
+                                    signal_id: id,
+                                    value: new_val,
+                                });
+                            }
                         }
                     }
                 }
@@ -25416,22 +25442,26 @@ impl Simulator {
                     // this dominated allocator + memcpy time. Now: read
                     // current bit, skip the write if it matches; otherwise
                     // set in-place and mark dirty.
-                    let idx = self.vm_regs[*idx_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let bit = self.vm_regs[*val_reg as usize].get_bit(0);
-                    let id = *sig_id;
-                    if idx < self.signal_widths[id] as usize {
-                        let cur = self.signal_table[id].get_bit(idx);
-                        if cur != bit {
-                            self.signal_table[id].set_bit(idx, bit);
-                            self.sync_mirror(id);
-                            self.signal_table[id].is_signed = self.signal_signed[id];
-                            if !self.dirty_signals[id] {
-                                self.dirty_signals[id] = true;
-                                self.dirty_list.push(id);
+                    // §11.5.1: an x/z index modifies no bits. `to_u64` masks
+                    // x bits to zero, so this cannot be folded into the range
+                    // check below -- an unknown index looked like bit 0.
+                    if let Some(idx) = dyn_bit_index(&self.vm_regs[*idx_reg as usize]) {
+                        let bit = self.vm_regs[*val_reg as usize].get_bit(0);
+                        let id = *sig_id;
+                        if idx < self.signal_widths[id] as usize {
+                            let cur = self.signal_table[id].get_bit(idx);
+                            if cur != bit {
+                                self.signal_table[id].set_bit(idx, bit);
+                                self.sync_mirror(id);
+                                self.signal_table[id].is_signed = self.signal_signed[id];
+                                if !self.dirty_signals[id] {
+                                    self.dirty_signals[id] = true;
+                                    self.dirty_list.push(id);
+                                }
+                                self.dirty_any = true;
+                                self.table_modified = true;
+                                self.after_signal_write(id);
                             }
-                            self.dirty_any = true;
-                            self.table_modified = true;
-                            self.after_signal_write(id);
                         }
                     }
                 }
@@ -42133,6 +42163,56 @@ impl Simulator {
         false
     }
 
+    /// LRM §25.8 — resolve `vif.member` (or `this.vif.member`) to the FLAT
+    /// name of the bound interface signal, `"<iface_instance>.<member>"`.
+    ///
+    /// `resolve_nba_target` asks the same question but only ever returns a
+    /// registered signal id, which is no use to a caller that needs the NAME
+    /// — to look up the member's packed dimensions, say. The binding lives
+    /// either in `local_iface_aliases` (a vif passed as a task formal) or in
+    /// `virtual_iface_bindings` keyed by the current `this`; both lookups are
+    /// the ones that arm already does.
+    fn vif_member_flat_name(&self, expr: &Expression) -> Option<String> {
+        let ExprKind::MemberAccess { expr: base, member } = &expr.kind else {
+            return None;
+        };
+        let prop = match &base.kind {
+            ExprKind::Ident(hier) if hier.path.len() == 1 => {
+                hier.path[0].name.name.as_str()
+            }
+            ExprKind::MemberAccess {
+                expr: inner,
+                member: vprop,
+            } if matches!(&inner.kind, ExprKind::This) => vprop.name.as_str(),
+            _ => return None,
+        };
+        if let Some(bound) = self
+            .local_iface_aliases
+            .last()
+            .and_then(|frame| frame.get(prop))
+        {
+            return Some(format!("{}.{}", bound, member.name));
+        }
+        let this_h = self.this_stack.last().copied().flatten()?;
+        let cls_name = self
+            .heap
+            .get(this_h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.as_str())?;
+        if !self
+            .module
+            .classes
+            .get(cls_name)
+            .is_some_and(|cd| cd.virtual_iface_properties.contains_key(prop))
+        {
+            return None;
+        }
+        let (bound_name, _modport) = self
+            .virtual_iface_bindings
+            .get(&(this_h, prop.to_string()))?;
+        Some(format!("{}.{}", bound_name, member.name))
+    }
+
     fn resolve_nba_target(&mut self, lhs: &Expression) -> Option<usize> {
         match &lhs.kind {
             ExprKind::Ident(hier) => {
@@ -46380,7 +46460,9 @@ impl Simulator {
                 self.settle_triggered_list.push(eidx);
             }
         }
-        if self.time == 0 && !self.comb_time0_fired {
+        // See `settle_combinatorial_inner`: the one-shot must not retire on a
+        // static-init settle that runs before the comb graph is built.
+        if self.time == 0 && !self.comb_time0_fired && !self.comb_entries.is_empty() {
             for ti in 0..self.comb_time0_idx.len() {
                 let eidx = self.comb_time0_idx[ti];
                 if eidx < num_entries && !self.settle_triggered[eidx] {
@@ -47259,7 +47341,19 @@ impl Simulator {
         // at the same (or later) time rely on dirty propagation through the
         // worklist. The prior O(num_entries) scan per call was ~500μs on
         // c910 and dominated per-assign cost during memory-init loops.
-        if self.time == 0 && !self.comb_time0_fired {
+        //
+        // `num_entries > 0` keeps the one-shot from being CONSUMED before the
+        // comb graph exists. Class static initializers run during elaboration
+        // (the `registry spec static init` phase), long before
+        // `build combinational entries`; a blocking write in one of them
+        // reaches `settle_after_proc_write`, whose settle finds an empty
+        // entry list. Latching there seeded nothing yet retired the flag, so
+        // the real time-0 settle skipped `comb_time0_idx` entirely and every
+        // entry with an EMPTY READ SET — a constant-RHS continuous assign
+        // such as `assign a[i][v][j] = '0;` — never evaluated at all, leaving
+        // its net x for the whole run. UVM's parameterized-class registry
+        // makes that early static-init settle happen in any UVM testbench.
+        if self.time == 0 && !self.comb_time0_fired && num_entries > 0 {
             for &eidx in self.comb_time0_idx.iter() {
                 if eidx < num_entries && !triggered[eidx] {
                     triggered[eidx] = true;
@@ -48538,6 +48632,33 @@ impl Simulator {
                         }
                     }
                 }
+            }
+        }
+        None
+    }
+
+    /// The registered packed-struct base of a dotted member lvalue, as
+    /// `(base_name, bit_offset, width)` of the selected member within it.
+    ///
+    /// `packed_struct_fields[base]` is FLATTENED — a nested member is a key in
+    /// its own right (`"hdr.d.x"`), and no entry exists for an intermediate
+    /// member on its own (`packed_struct_fields["f.hdr"]` is None). So the
+    /// single split at the last dot only ever resolved a DEPTH-1 member, and
+    /// `f.hdr.d = v` inside a subroutine — where the lvalue parses as
+    /// MemberAccess rather than a dotted Ident — matched nothing and was
+    /// silently dropped. Walk the split points LONGEST BASE FIRST, exactly as
+    /// `resolve_packed_struct_target` does for assignment patterns (which is
+    /// why the same write with a `'{...}` RHS always worked): the base may
+    /// itself be instance-scoped (`u.r2`), so the first-dot split is wrong too.
+    fn packed_struct_member_slice(&mut self, lvalue: &Expression) -> Option<(String, u32, u32)> {
+        let flat = self.flat_member_name(lvalue)?;
+        for (i, _) in flat.match_indices('.').collect::<Vec<_>>().into_iter().rev() {
+            let (base, prefix) = (&flat[..i], &flat[i + 1..]);
+            let Some(layout) = self.module.packed_struct_fields.get(base) else {
+                continue;
+            };
+            if let Some((_, o, w)) = layout.iter().find(|(k, _, _)| k == prefix) {
+                return Some((base.to_string(), *o, *w));
             }
         }
         None
@@ -52379,27 +52500,21 @@ impl Simulator {
                 }
                 // A nested PACKED struct member inside an unpacked aggregate
                 // (`arr[i].tag.vlan`): slice the parent's own signal.
-                if let Some(pflat) = self.flat_member_name(expr) {
-                    if let Some(fields) = self.module.packed_struct_fields.get(&pflat).cloned() {
-                        if let Some((_, off, w)) =
-                            fields.iter().find(|(m, _, _)| *m == member.name).cloned()
-                        {
-                            // The container may be a procedural LOCAL: a packed
-                            // struct declared inside a task lives in the call
-                            // frame, not the signal table, so a member write
-                            // reached nothing and the struct read back as X.
-                            if let Some(cur_sig) = self.get_local_or_signal(&pflat) {
-                                let total_w = cur_sig.width;
-                                let mut cur = cur_sig.resize(total_w);
-                                let piece = val.resize(w);
-                                for i in 0..w {
-                                    cur.set_bit((off + i) as usize, piece.get_bit(i as usize));
-                                }
-                                let changed = cur != cur_sig;
-                                self.set_local_or_signal(&pflat, cur);
-                                return changed;
-                            }
+                if let Some((base, off, w)) = self.packed_struct_member_slice(lhs) {
+                    // The container may be a procedural LOCAL: a packed
+                    // struct declared inside a task lives in the call
+                    // frame, not the signal table, so a member write
+                    // reached nothing and the struct read back as X.
+                    if let Some(cur_sig) = self.get_local_or_signal(&base) {
+                        let total_w = cur_sig.width;
+                        let mut cur = cur_sig.resize(total_w);
+                        let piece = val.resize(w);
+                        for i in 0..w {
+                            cur.set_bit((off + i) as usize, piece.get_bit(i as usize));
                         }
+                        let changed = cur != cur_sig;
+                        self.set_local_or_signal(&base, cur);
+                        return changed;
                     }
                 }
                 // LRM §25.10 — `vif_arr[i].member = ...` (indexed
@@ -60345,6 +60460,30 @@ impl Simulator {
                 // spread, not collapsed into one packed value. This is also
                 // what makes a DECLARATION initializer work — elaboration
                 // lowers `T v[int] = '{...}` to `v = '{...}` in an initial block.
+                // §10.9.2: a whole-ARRAY pattern on a CLASS PROPERTY whose
+                // elements are unpacked structs — expand per element so each
+                // lands in the cells the READ path uses, by the same store rule
+                // as the whole-element write above. Must precede the spread
+                // below: `assign_class_fixed_array_pattern` writes the
+                // instance-scoped SIGNAL names (`<h>#arr[i].<m>`) that nothing
+                // reads back, which is what left every element 0.
+                if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
+                    if let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) {
+                        let probe0 = Self::index_expr(lvalue, 0);
+                        if self.class_unpacked_elem_is_heap_owned(&probe0) {
+                            let ord: Vec<Expression> =
+                                self.pattern_ordered(items).into_iter().cloned().collect();
+                            if !ord.is_empty() {
+                                for (i, item) in ord.iter().enumerate() {
+                                    let elem = Self::index_expr(lvalue, i as i64);
+                                    self.assign_class_unpacked_elem(&elem, item, &su);
+                                }
+                                self.settle_after_proc_write();
+                                return;
+                            }
+                        }
+                    }
+                }
                 if let ExprKind::AssignmentPattern(items) = &rvalue.kind {
                     let spread = self.assign_class_fixed_array_pattern(lvalue, items)
                         || self.assign_class_collection_pattern(lvalue, items)
@@ -60689,6 +60828,27 @@ impl Simulator {
                 // generic arm below can't resolve the container (`p_elem_type`
                 // only knows module-scope names), so the copy fell to a packed
                 // store and every member of the element stayed blank.
+                // §7.2/§18.4: ...unless the READ path owns this element's
+                // leaves. A CLASS PROPERTY that is a fixed array of unpacked
+                // structs is resolved on the read side by `class_unpacked_leaf`
+                // into the instance property map (`arr[i].<m>`) — which is also
+                // where a per-leaf write (`arr[i].m = v`) and a scalar-struct
+                // property write land. Only the whole-element path below routed
+                // to the instance-scoped SIGNAL name `<h>#arr[i].<m>`, so the
+                // value was written and then unreachable and every such element
+                // read back 0. Ask the read resolver where the leaves live and
+                // decompose into the same cells. A genuine queue/dynamic/assoc
+                // element is NOT claimed by it and keeps the signal-name copy
+                // below (UVM uvm_hdl_path_concat::add_slice).
+                if self.queue_pop_call(rvalue).is_none()
+                    && self.class_unpacked_elem_is_heap_owned(lvalue)
+                {
+                    if let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) {
+                        self.assign_class_unpacked_elem(lvalue, rvalue, &su);
+                        self.settle_after_proc_write();
+                        return;
+                    }
+                }
                 if self.queue_pop_call(rvalue).is_none() {
                     if let Some(dst) = self.flat_member_name(lvalue) {
                         // Only a BARE element lvalue (`slices[i] = ...`) — a
@@ -75965,8 +76125,20 @@ impl Simulator {
                     depth += 1;
                     cur = inner.as_ref();
                 }
-                if let ExprKind::Ident(h) = &cur.kind {
-                    let n = self.resolve_hier_name(h);
+                // §25.8: for `vif.member[i]` the root is a MemberAccess, not an
+                // Ident, so the whole block below was skipped and the lvalue
+                // fell through to width 1 — an NBA then resized its RHS to ONE
+                // BIT before queueing it, and `vif.data[p] <= flit` wrote the
+                // flit's LSB. Resolve the binding to the interface signal's
+                // flat name and ask the same width questions about it.
+                let root_name: Option<std::borrow::Cow<'_, str>> = match &cur.kind {
+                    ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
+                    ExprKind::MemberAccess { .. } => {
+                        self.vif_member_flat_name(cur).map(std::borrow::Cow::Owned)
+                    }
+                    _ => None,
+                };
+                if let Some(n) = root_name {
                     if depth == 1 {
                         if let Some((_, _, w)) = self.module.arrays.get(&*n) {
                             return *w;
@@ -87304,6 +87476,103 @@ impl Simulator {
             cur = cd.extends.clone();
         }
         params
+    }
+
+    /// `(handle, prop, elem_struct)` when `lvalue` — with any trailing element
+    /// select stripped — names a CLASS PROPERTY whose element type is an
+    /// unpacked struct. Drives a member-wise decomposition of a whole-element
+    /// write into the same cells `class_unpacked_leaf` reads back.
+    fn class_unpacked_array_prop_of(
+        &mut self,
+        lvalue: &Expression,
+    ) -> Option<(usize, String, crate::ast::types::StructUnionType)> {
+        if self.no_class_objects() {
+            return None;
+        }
+        let recv = match self.class_prop_receiver(lvalue) {
+            Some(r) => Some(r),
+            None => match &lvalue.kind {
+                ExprKind::Index { expr, .. } => self.class_prop_receiver(expr),
+                ExprKind::Ident(h) if h.path.len() == 1 && !h.path[0].selects.is_empty() => {
+                    let bare = crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![crate::ast::expr::HierPathSegment {
+                            name: h.path[0].name.clone(),
+                            selects: Vec::new(),
+                        }],
+                        span: h.span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    };
+                    let e = Expression::new(ExprKind::Ident(bare), lvalue.span);
+                    self.class_prop_receiver(&e)
+                }
+                _ => None,
+            },
+        };
+        let (handle, prop) = recv?;
+        let su = self.class_prop_struct(handle, &prop)?;
+        Self::spreads_member_wise(&su).then_some((handle, prop, su))
+    }
+
+    /// True when the READ path (`class_unpacked_leaf`) owns this element's
+    /// leaves — i.e. they live in the instance property map as
+    /// `<prop>[i].<member>`, not under an instance-scoped SIGNAL name. Used to
+    /// keep whole-element / whole-array writes in the same store the reads use.
+    fn class_unpacked_elem_is_heap_owned(&mut self, lvalue: &Expression) -> bool {
+        let Some((_, _, su)) = self.class_unpacked_array_prop_of(lvalue) else {
+            return false;
+        };
+        let Some(m0) = su
+            .members
+            .first()
+            .and_then(|m| m.declarators.first())
+            .map(|d| d.name.name.clone())
+        else {
+            return false;
+        };
+        let probe = Self::append_member_expr(lvalue, &m0);
+        self.class_unpacked_leaf(&probe).is_some()
+    }
+
+    /// Write one unpacked-struct value into a class-property element's leaf
+    /// cells, member by member, so each lands via the (working) per-leaf path.
+    fn assign_class_unpacked_elem(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+        su: &crate::ast::types::StructUnionType,
+    ) {
+        let items: Option<Vec<&Expression>> = match &rvalue.kind {
+            ExprKind::AssignmentPattern(its) => {
+                let ord = self.pattern_ordered(its);
+                (!ord.is_empty()).then_some(ord)
+            }
+            _ => None,
+        };
+        let mut k = 0usize;
+        for m in &su.members {
+            for md in &m.declarators {
+                let mn = md.name.name.as_str();
+                let lhs_f = Self::append_member_expr(lvalue, mn);
+                let v = match &items {
+                    // Ordered pattern: item k belongs to the k-th declared member.
+                    Some(its) => match its.get(k) {
+                        Some(e) => {
+                            let e = (*e).clone();
+                            self.eval_expr(&e)
+                        }
+                        None => continue,
+                    },
+                    None => {
+                        let rhs_f = Self::append_member_expr(rvalue, mn);
+                        self.eval_expr(&rhs_f)
+                    }
+                };
+                self.assign_value(&lhs_f, &v);
+                k += 1;
+            }
+        }
     }
 
     /// `class_agg_member` for an already-split `<base>.<field>`.
@@ -99980,6 +100249,26 @@ impl Simulator {
 
     /// Build a member-access lvalue for the write-back of a struct formal.
     /// See `bind_unpacked_struct_arg` for why the `Ident` form is preferred.
+    /// `<base>[i]` as an expression, for driving per-element decomposition.
+    fn index_expr(base: &Expression, i: i64) -> Expression {
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(base.clone()),
+                index: Box::new(Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: None,
+                        signed: true,
+                        base: NumberBase::Decimal,
+                        value: i.to_string(),
+                        cached_val: std::cell::Cell::new(None),
+                    }),
+                    base.span,
+                )),
+            },
+            base.span,
+        )
+    }
+
     fn struct_member_lvalue(base: &Expression, member: &str) -> Expression {
         if let ExprKind::Ident(hier) = &base.kind {
             let mut path = hier.path.clone();
@@ -104827,6 +105116,49 @@ impl Simulator {
                     let scoped = format!("{}#{}", handle, pname);
                     if let ExprKind::AssignmentPattern(items) = &init.kind {
                         let indices: Vec<i64> = (lo..=hi).collect();
+                        // §7.2/§18.4: an UNPACKED-STRUCT element has no single
+                        // cell — its members live as `<prop>[i].<m>` in the
+                        // instance property map, which is where the read path
+                        // (`class_unpacked_leaf`) looks. Storing the element as
+                        // one packed value under the signal name `<h>#<prop>[i]`
+                        // wrote something nothing reads, so every element of a
+                        // `localparam`/`const` array of unpacked structs came
+                        // back 0 — the shape a directed-stimulus table uses.
+                        // Decompose into the same cells the runtime element
+                        // write now uses.
+                        if let Some(su) = self.class_prop_struct(handle, &pname) {
+                            if Self::spreads_member_wise(&su) {
+                                let base = Expression::new(
+                                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![crate::ast::expr::HierPathSegment {
+                                            name: crate::ast::Identifier {
+                                                name: pname.clone(),
+                                                span: crate::ast::Span::dummy(),
+                                            },
+                                            selects: Vec::new(),
+                                        }],
+                                        span: crate::ast::Span::dummy(),
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    }),
+                                    crate::ast::Span::dummy(),
+                                );
+                                let elems = self.pattern_elems(items, &indices);
+                                let owned: Vec<(usize, Option<Expression>)> = elems
+                                    .into_iter()
+                                    .map(|e| e.cloned())
+                                    .enumerate()
+                                    .collect();
+                                for (k, e) in owned {
+                                    if let Some(e) = e {
+                                        let elem = Self::index_expr(&base, indices[k]);
+                                        self.assign_class_unpacked_elem(&elem, &e, &su);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                         let elems = self.pattern_elems(items, &indices);
                         for (k, e) in elems.into_iter().enumerate() {
                             if let Some(e) = e {

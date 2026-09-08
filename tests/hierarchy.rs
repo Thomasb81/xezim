@@ -163,3 +163,5 @@ mod ref_formal_same_name;
 mod instance_block_locals_shadow_module_names;
 #[path = "hierarchy/instance_collections_resolve_by_scope.rs"]
 mod instance_collections_resolve_by_scope;
+#[path = "hierarchy/vif_packed_array_elem_nba.rs"]
+mod vif_packed_array_elem_nba;
