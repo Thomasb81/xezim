@@ -169,7 +169,8 @@ and testbench flows. Portable code should not rely on them.
 * Process wake-ups are cheaper: the scheduler no longer hashes with
   SipHash, allocates an empty continuation, or clones the process scope
   string on every wake-up, and the timing wheel covers 4096 ticks before
-  spilling to the ordered overflow. A timed real-number model runs 16.7 %
+  spilling to the ordered overflow; the next event time is memoized and
+  an empty waiter list is skipped. A timed real-number model runs 26.9 %
   fewer instructions; the UVM and CPU benchmarks are unchanged.
 * A delay-driven `always` block with a compound body, the timed
   integration step of a real-number model, runs from compiled bytecode

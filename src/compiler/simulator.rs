@@ -2040,6 +2040,14 @@ struct TimingWheel {
     wheel: Vec<EventList>,              // circular array of WHEEL_SIZE slots
     bitmap: [u64; BITMAP_WORDS],        // occupancy bitmap: bit set = slot non-empty
     overflow: BTreeMap<u64, EventList>, // far-future events
+    /// Number of non-zero bitmap words, so `is_empty` is O(1) instead of a
+    /// 64-word compare per tick.
+    occupied_words: u32,
+    /// Memoized `next_time()`: `None` = unknown (recompute). Invalidated by
+    /// every mutator that can remove an event; `schedule` narrows it in
+    /// place. The scan it replaces walked up to every bitmap word on each
+    /// of the ~8 calls per tick.
+    next_cache: std::cell::Cell<Option<Option<u64>>>,
     current_time: u64,                  // last known simulation time
     /// Multiset of pids currently scheduled somewhere in the wheel or
     /// overflow. Lets `has_pid` return O(1) instead of scanning all 256
@@ -2067,6 +2075,8 @@ impl TimingWheel {
             wheel,
             bitmap: [0u64; BITMAP_WORDS],
             overflow: BTreeMap::new(),
+            occupied_words: 0,
+            next_cache: std::cell::Cell::new(None),
             current_time: 0,
             pid_counts: HashMap::default(),
         }
@@ -2080,19 +2090,31 @@ impl TimingWheel {
     /// Set bitmap bit for a slot.
     #[inline(always)]
     fn bitmap_set(&mut self, slot: usize) {
-        self.bitmap[slot >> 6] |= 1u64 << (slot & 63);
+        let w = &mut self.bitmap[slot >> 6];
+        if *w == 0 {
+            self.occupied_words += 1;
+        }
+        *w |= 1u64 << (slot & 63);
     }
 
     /// Clear bitmap bit for a slot.
     #[inline(always)]
     fn bitmap_clear(&mut self, slot: usize) {
-        self.bitmap[slot >> 6] &= !(1u64 << (slot & 63));
+        let w = &mut self.bitmap[slot >> 6];
+        if *w != 0 {
+            *w &= !(1u64 << (slot & 63));
+            if *w == 0 {
+                self.occupied_words -= 1;
+            }
+        }
+        self.next_cache.set(None);
     }
 
     /// Schedule an event at the given time.
     fn schedule(&mut self, time: u64, pid: usize, stmts: ProcCont) {
         sim_dbg_eprintln!("[DEBUG] scheduling process {} at time {}", pid, time);
         *self.pid_counts.entry(pid).or_insert(0) += 1;
+        self.narrow_next_cache(time);
         if time < self.current_time + WHEEL_SIZE as u64 {
             let s = Self::slot(time);
             self.wheel[s].push_back((pid, stmts));
@@ -2115,6 +2137,7 @@ impl TimingWheel {
     /// Children are inserted in reverse so the group keeps source order.
     fn schedule_front(&mut self, time: u64, pid: usize, stmts: ProcCont) {
         *self.pid_counts.entry(pid).or_insert(0) += 1;
+        self.narrow_next_cache(time);
         if time < self.current_time + WHEEL_SIZE as u64 {
             let s = Self::slot(time);
             self.wheel[s].push_front((pid, stmts));
@@ -2133,12 +2156,34 @@ impl TimingWheel {
     }
 
     fn is_empty(&self) -> bool {
-        self.bitmap == [0u64; BITMAP_WORDS] && self.overflow.is_empty()
+        self.occupied_words == 0 && self.overflow.is_empty()
+    }
+
+    /// A new event at `time` can only move the next time earlier.
+    #[inline(always)]
+    fn narrow_next_cache(&self, time: u64) {
+        if let Some(c) = self.next_cache.get() {
+            let nt = c.map_or(time, |t| t.min(time));
+            self.next_cache.set(Some(Some(nt)));
+        }
     }
 
     /// Get the next scheduled time (minimum) using bitmap scan.
     /// Uses trailing_zeros to find the next occupied slot in O(1) per word.
     fn next_time(&self) -> Option<u64> {
+        if let Some(c) = self.next_cache.get() {
+            // A cached time behind the wheel's clock means an event was left
+            // behind (deferred drain); fall through to the exact scan.
+            if c.map_or(true, |t| t >= self.current_time) {
+                return c;
+            }
+        }
+        let r = self.next_time_scan();
+        self.next_cache.set(Some(r));
+        r
+    }
+
+    fn next_time_scan(&self) -> Option<u64> {
         let start_slot = Self::slot(self.current_time);
         // Scan bitmap from current_time's slot position.
         // We need to handle wrap-around: scan from start_slot to 255, then 0 to start_slot-1.
@@ -2346,6 +2391,7 @@ impl TimingWheel {
         if !self.pid_counts.contains_key(&pid) {
             return None;
         }
+        self.next_cache.set(None);
         let mut found: Option<(u64, ProcCont)> = None;
         let cur_slot = Self::slot(self.current_time);
 
@@ -4656,7 +4702,7 @@ pub struct Simulator {
     /// Dynamic-delay simple assignments, keyed by their scheduled process id.
     fast_delay_always: HashMap<usize, FastDelayAlways>,
     /// Compiled process FSMs by pid (roadmap 11-12, opt-in XEZIM_PROC_FSM=1).
-    proc_fsm: HashMap<usize, ProcFsm>,
+    proc_fsm: HashMap<usize, Box<ProcFsm>>,
     /// Resume pc for the next `exec_insns` call (consumed at entry; 0 for
     /// ordinary block executions).
     fsm_start_pc: u32,
@@ -18368,7 +18414,7 @@ impl Simulator {
         self.process_origin.insert(pid, (stmt.span, origin));
         self.proc_fsm.insert(
             pid,
-            ProcFsm {
+            Box::new(ProcFsm {
                 compiled: cb,
                 waits,
                 pc: 0,
@@ -18380,7 +18426,7 @@ impl Simulator {
                 native: None,
                 #[cfg(feature = "jit")]
                 native_frame: Vec::new(),
-            },
+            }),
         );
         if dbg || sim_debug_enabled() {
             eprintln!(
@@ -35834,7 +35880,9 @@ impl Simulator {
         }
         while !self.finished && iters < max_iters {
             iters += 1;
-            if HANG_REPORT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+                && HANG_REPORT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
                 eprintln!("[xezim][hang-report] on-demand report (SIGUSR1) at sim time {}:", self.time);
                 self.report_parked_waiters(12);
             }
@@ -37533,6 +37581,31 @@ impl Simulator {
         }
     }
 
+    /// True when every field `take_process_context` would move out is
+    /// already empty/false — the state a top-level wake-up starts from.
+    #[inline]
+    fn process_context_is_default(&self) -> bool {
+        self.this_stack.is_empty()
+            && self.local_stack.is_empty()
+            && self.local_type_stack.is_empty()
+            && self.class_context_stack.is_empty()
+            && self.cg_this.is_none()
+            && self.return_value.is_none()
+            && !self.break_flag
+            && !self.continue_flag
+            && !self.return_flag
+            && self.local_iface_aliases.is_empty()
+            && self.ref_binding_stack.is_empty()
+            && self.ref_alias_stack.is_empty()
+            && self.ref_identity_stack.is_empty()
+            && self.queue_frame_saves.is_empty()
+            && self.task_cleanup.is_empty()
+            && self.local_dyn.is_empty()
+            && self.static_local_syncs.is_empty()
+            && self.method_local_base.is_empty()
+            && !self.ref_redirect_hot
+    }
+
     fn take_process_context(&mut self) -> ProcessContext {
         // The ref stacks leave with the context; nothing can redirect until
         // a context is restored or a new ref frame is pushed.
@@ -38057,9 +38130,19 @@ impl Simulator {
         // A compiled process FSM carries its whole state in its frame — the
         // AST-context save/restore dance is unnecessary, same as fast-delay.
         if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
-            let saved = self.take_process_context();
-            self.run_proc_fsm(pid);
-            self.restore_process_context(saved);
+            // A top-level FSM wake-up starts from an empty context; taking
+            // and restoring the 18 fields moved ~10% of this function's
+            // time for nothing. Reset only if the run left something behind.
+            if self.process_context_is_default() {
+                self.run_proc_fsm(pid);
+                if !self.process_context_is_default() {
+                    self.restore_process_context(ProcessContext::default());
+                }
+            } else {
+                let saved = self.take_process_context();
+                self.run_proc_fsm(pid);
+                self.restore_process_context(saved);
+            }
             self.auto_loop_vars.truncate(saved_auto_len);
             let mine = self.name_resolve_hint.replace(saved_hint);
             Self::recycle_string(&mut self.hint_string_pool, mine);
@@ -43848,6 +43931,9 @@ impl Simulator {
     /// drain and the commercial-order pre-edge-block drain (see
     /// XEZIM_WAITERS_FIRST in check_edges_inner).
     fn drain_triggered_event_waiters(&mut self) -> Vec<(usize, ProcCont)> {
+        if self.event_waiters.is_empty() {
+            return Vec::new();
+        }
         let waiters = std::mem::take(&mut self.event_waiters);
         self.prof_waiter_iters += waiters.len() as u64;
         self.event_waiters_swap.clear();
