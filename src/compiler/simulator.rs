@@ -114238,6 +114238,18 @@ impl Simulator {
                 // Member-wise struct `output`/`inout`/`ref` formals bypass the
                 // whole-value `output_bindings` path (see exec_function_call).
                 let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
+                // PORT TYPE-PARAMETER CLASS BINDINGS: a formal declared with a
+                // TYPE PARAMETER class type (`IMP imp`) resolves to a concrete
+                // class per-call (see the branch below). Record it NOW so that
+                // after the callee's frame is pushed (push_local_frame below)
+                // we can re-record into the CALLEE's frame slot — the body's
+                // `$cast`/`new` reads it via `local_class_type_of`, which
+                // scans only frames at/after the callee's method_local_base
+                // and would otherwise miss it (and fall back to a STALE,
+                // same-named global `var_class_types` entry from an unrelated
+                // scope such as uvm_config_db's `imp`, failing a valid TLM
+                // initiator socket $cast with UVM/TLM2/NOIMP).
+                let mut frame_class_ports: Vec<(String, String)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
                     if matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_)) {
                         self.register_formal_type_metadata(
@@ -114534,7 +114546,8 @@ impl Simulator {
                                             concrete.split('#').next().unwrap_or(&concrete),
                                         ));
                             if cn_is_class {
-                                self.record_local_class_type(&port.name.name, &concrete);
+                                frame_class_ports
+                                    .push((port.name.name.clone(), concrete.clone()));
                                 self.var_class_types.insert(port.name.name.clone(), concrete);
                             }
                         }
@@ -114857,6 +114870,18 @@ impl Simulator {
                     }
                 };
                 self.push_local_frame(locals);
+                // Re-apply the TYPE-PARAMETER class bindings now that the
+                // callee's own frame is on top of `local_type_stack`. During
+                // the port loop above, `local_type_stack.last_mut()` still
+                // pointed at the CALLER's frame, so recording there would be
+                // invisible to `local_class_type_of` (which scans only from
+                // this method's base downward via `method_local_base`).
+                // Recording here makes `$cast(imp, parent)` in a socket `new`
+                // body resolve `imp` to its concrete class (e.g. `producer`)
+                // instead of a stale same-named global entry.
+                for (pn, pconcrete) in frame_class_ports {
+                    self.record_local_class_type(&pn, &pconcrete);
+                }
                 // Record the `local_stack` depth BEFORE this method's own
                 // frame (i.e. the count of caller frames) so that
                 // `get_expr_type_name`'s `in_any_frame` check only considers
