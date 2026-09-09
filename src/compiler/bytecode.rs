@@ -2775,6 +2775,20 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// True when `rvalue` is one of the pre-parse intra-assignment timing
+    /// markers (see `crate::intra_delay`): the assignment carries a delay,
+    /// event, or cycle control that only the interpreter's assignment arms
+    /// honour.
+    fn is_intra_timing_marker(rvalue: &Expression) -> bool {
+        matches!(
+            &rvalue.kind,
+            ExprKind::SystemCall { name, .. }
+                if name == crate::intra_delay::INTRA_DELAY_MARKER
+                    || name == crate::intra_delay::INTRA_EVENT_MARKER
+                    || name == crate::intra_delay::INTRA_CYCLE_MARKER
+        )
+    }
+
     fn stmt_kind_label(stmt: &Statement) -> &'static str {
         match &stmt.kind {
             StatementKind::Null => "Stmt_Null",
@@ -5883,6 +5897,16 @@ impl<'a> BytecodeCompiler<'a> {
                 true
             }
             StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                // §9.4.5 / §14.16 intra-assignment timing markers
+                // (`lhs <= #d rhs`, `<= @(e) rhs`, `<= ##n rhs`) must reach
+                // the interpreter's NBA arm, which schedules the update d
+                // ticks out. Compiled as a plain expression the marker is an
+                // unknown system call that yields its RHS with the delay
+                // silently dropped (issue #160).
+                if Self::is_intra_timing_marker(rvalue) {
+                    self.bail("nba_intra_timing");
+                    return self.emit_fallback(stmt);
+                }
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
@@ -5906,6 +5930,13 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit_fallback(stmt)
             }
             StatementKind::BlockingAssign { lvalue, rvalue } => {
+                // Same intra-assignment timing markers on a blocking
+                // assignment (`lhs = #d rhs`): the interpreter arm blocks
+                // the process; a compiled expression drops the delay.
+                if Self::is_intra_timing_marker(rvalue) {
+                    self.bail("blocking_intra_timing");
+                    return self.emit_fallback(stmt);
+                }
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;

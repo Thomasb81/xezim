@@ -114,6 +114,20 @@ and testbench flows. Portable code should not rely on them.
 
 **Correctness**
 
+* An intra-assignment delay inside an edge-triggered `always` block is
+  honoured: `q <= #5 v;` schedules the update five time units out and
+  `q = #5 v;` suspends the block, as in an `initial` block. Both forms
+  previously assigned at once with no warning (#160).
+* An unpacked array parameter whose elements are assignment patterns
+  (`localparam cfg_t A [3] = '{'{4,2}, …}`) evaluates each element instead
+  of reading 0, for packed-struct, unpacked-struct and packed-vector
+  element types declared at compilation-unit scope. A constant function
+  containing `signed'(e)` or `unsigned'(e)` is now evaluated at
+  elaboration, so a `localparam` or typedef width derived from it in a
+  sub-instance is correct (it read 0, giving one-bit typedefs).
+* A continuous assignment accepts the rise/fall/turn-off delay form,
+  `assign #(rise, fall[, turnoff]) net = expr;`, and applies the delay by
+  transition as §10.3.3 specifies; a transition to x takes the smallest.
 * Collections declared in a module keep one copy per instance. Sibling
   instances of the same module no longer share a queue, dynamic array or
   associative array, and a packed-struct element of such a collection
@@ -159,13 +173,25 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* Process wake-ups are cheaper: the scheduler no longer hashes with
+  SipHash, allocates an empty continuation, or clones the process scope
+  string on every wake-up, and the timing wheel covers 4096 ticks before
+  spilling to the ordered overflow; the next event time is memoized and
+  an empty waiter list is skipped. A timed real-number model runs 26.9 %
+  fewer instructions; the UVM and CPU benchmarks are unchanged.
+* A delay-driven `always` block with a compound body, the timed
+  integration step of a real-number model, runs from compiled bytecode
+  instead of the AST interpreter: 3.8x faster per step on a fitted-lag
+  model (4.1 µs to 1.07 µs), results unchanged (#159).
 * Combinational settle passes track entries triggered mid-pass in a bitset
   instead of a heap, array element accesses in compiled blocks resolve
   inline, and an assignment whose value already has the target width copies
   it directly: 5.6 % fewer instructions on the C906 CoreMark run.
 * Reads and writes from class methods no longer build a scoped name string
   for every lookup, and virtual-interface bindings are probed without
-  allocating: 2.6 % fewer instructions on the axi4 AVIP.
+  allocating, an assignment no longer probes for a pending interface
+  return on every write, and the width of a plain variable target is
+  remembered per statement: 3.6 % fewer instructions on the axi4 AVIP.
 * Clocked monitor blocks that contain a rare `#delay` run compiled instead
   of interpreted, with the same process semantics: 0.3 % fewer instructions
   on C906 CoreMark.
