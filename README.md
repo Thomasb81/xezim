@@ -179,6 +179,10 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* The statement interpreter's three largest routines keep smaller stack
+  frames (the statement dispatcher went from 7.8 KB to 3.8 KB per nested
+  call), so a deeply nested testbench statement chain stays in cache: the
+  UVM benchmark runs about 1.7 % fewer cycles, output identical.
 * Process wake-ups are cheaper: the scheduler no longer hashes with
   SipHash, allocates an empty continuation, or clones the process scope
   string on every wake-up, and the timing wheel covers 4096 ticks before
