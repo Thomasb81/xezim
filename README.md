@@ -118,6 +118,13 @@ and testbench flows. Portable code should not rely on them.
   honoured: `q <= #5 v;` schedules the update five time units out and
   `q = #5 v;` suspends the block, as in an `initial` block. Both forms
   previously assigned at once with no warning (#160).
+* An unpacked array parameter whose elements are assignment patterns
+  (`localparam cfg_t A [3] = '{'{4,2}, …}`) evaluates each element instead
+  of reading 0, for packed-struct, unpacked-struct and packed-vector
+  element types declared at compilation-unit scope. A constant function
+  containing `signed'(e)` or `unsigned'(e)` is now evaluated at
+  elaboration, so a `localparam` or typedef width derived from it in a
+  sub-instance is correct (it read 0, giving one-bit typedefs).
 * A continuous assignment accepts the rise/fall/turn-off delay form,
   `assign #(rise, fall[, turnoff]) net = expr;`, and applies the delay by
   transition as §10.3.3 specifies; a transition to x takes the smallest.
