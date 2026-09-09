@@ -376,3 +376,5 @@ mod system_function_result_width;
 mod packed_member_select_name_collision;
 #[path = "types/bit_write_unknown_index_discarded.rs"]
 mod bit_write_unknown_index_discarded;
+#[path = "types/class_type_param_struct_prop.rs"]
+mod class_type_param_struct_prop;

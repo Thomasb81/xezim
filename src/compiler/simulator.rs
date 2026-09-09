@@ -70449,6 +70449,51 @@ impl Simulator {
                                         continue;
                                     }
                                 }
+                                // §21.2.1.7 / §7.2: a WHOLE unpacked-struct
+                                // CLASS property (`c.first` bound through a
+                                // class type parameter, UVM's
+                                // `uvm_built_in_pair #(s,s)` first/second).
+                                // Its leaves live in the instance PropMap, not
+                                // the flat signal namespace, so `render_p_var`
+                                // treats `first` as an untyped strip and
+                                // prints a raw packed value / x. Resolve the
+                                // receiver + property and render member-wise.
+                                if !self.no_class_objects()
+                                    && let Some(((handle, recv_prop), su)) =
+                                        self.class_prop_receiver(arg)
+                                            .zip(self.class_prop_struct_of(arg))
+                                {
+                                    let rendered =
+                                        self.render_p_class_prop_struct(handle, &recv_prop, &su);
+                                    result.push_str(&rendered);
+                                    continue;
+                                }
+                                // §6.16/§21.2.1.7: a STRING class property
+                                // (`c.s`, or a type PARAMETER bound to
+                                // `string` — UVM's `uvm_built_in_pair #(string,
+                                // string)` first/second). Its value lives in
+                                // the instance PropMap under the bare property
+                                // name, but `render_p_var` treats `s` as an
+                                // untyped strip and prints the first byte
+                                // (`121` for "y"). Render it as a quoted
+                                // string.
+                                if !self.no_class_objects()
+                                    && let Some((handle, prop)) =
+                                        self.class_prop_receiver(arg)
+                                    && self.class_prop_type_name(handle, &prop).as_deref()
+                                        == Some("string")
+                                {
+                                    if let Some(v) = self
+                                        .heap
+                                        .get(handle)
+                                        .and_then(|o| o.as_ref())
+                                        .and_then(|i| i.properties.get(&prop))
+                                        .cloned()
+                                    {
+                                        result.push_str(&Self::render_p_value(&v, true));
+                                        continue;
+                                    }
+                                }
                                 // §21.2.1.7: type-directed recursive render —
                                 // nested structs, unpacked arrays, enum labels,
                                 // strings and reals, in declaration order.
@@ -86930,7 +86975,45 @@ impl Simulator {
         // depends only on the class chain and the name, so it is cached
         // per class. The walk below used to clone the class name per level
         // and allocate a cycle-guard set on every property access.
-        if !class_name.is_empty()
+        //
+        // EXCEPTION: a property whose declared type is a class TYPE
+        // PARAMETER (`class pairi #(type T=int); T first;`) is NOT a
+        // class-chain-only answer — whether it is an unpacked struct depends
+        // on the CONCRETE type this instance bound to that parameter
+        // (§8.25). All specializations of one class share the same
+        // `class_name` (they differ only in `type_bindings`), so a negative
+        // cached for one binding (e.g. `T->int`) would poison the other
+        // (`T->struct s`), silently breaking the per-instance struct-leaf
+        // machinery: `pairi#(int).first=5` then made `pairi#(s).first` read x
+        // and an equality/`%p` fall apart. Skip the negative cache for such
+        // properties so the verdict below re-resolves the concrete binding
+        // on THIS instance.
+        let is_type_param_prop = if class_name.is_empty() {
+            false
+        } else {
+            let mut cur: Option<&str> = Some(class_name);
+            let mut tp = false;
+            let mut guard = 0;
+            while let Some(cn) = cur {
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+                let Some(cd) = self.module.classes.get(cn) else { break };
+                if cd.properties.contains_key(prop) {
+                    tp = cd
+                        .properties
+                        .get(prop)
+                        .and_then(|s| s.type_name.as_ref())
+                        .is_some_and(|tn| cd.type_param_names.contains(tn));
+                    break;
+                }
+                cur = cd.extends.as_deref();
+            }
+            tp
+        };
+        if !is_type_param_prop
+            && !class_name.is_empty()
             && self
                 .class_prop_struct_neg
                 .borrow()
@@ -86989,7 +87072,14 @@ impl Simulator {
                 _ => None,
             }
         })();
-        if verdict.is_none() && !class_name.is_empty() {
+        // Don't record a negative for a TYPE-PARAMETER property: the verdict
+        // depends on this instance's binding, and caching a `None` under the
+        // (shared) class_name would poison sibling specializations that bound
+        // the parameter to an actual struct.
+        if verdict.is_none()
+            && !class_name.is_empty()
+            && !is_type_param_prop
+        {
             self.class_prop_struct_neg
                 .borrow_mut()
                 .entry(class_name.to_string())
@@ -90299,6 +90389,47 @@ impl Simulator {
                 })
                 .unwrap_or_else(|| "x".into()),
         }
+    }
+
+    /// §21.2.1.7 / §7.2: render a WHOLE unpacked-struct CLASS property
+    /// (`c.first` where `first` is a `typedef struct` bound through a class
+    /// type parameter, e.g. `uvm_built_in_pair #(s,s)::first`) the way a
+    /// module-scope struct renders. The leaves of such a property live in the
+    /// instance `PropMap` keyed `<prop>.<member>` (and, for nested members,
+    /// `<prop>.<m1>.<m2>`), whereas the name-based `render_p_var` path
+    /// resolves `first` as an untyped strip and printed the raw packed value
+    /// (`pair : 18446743648507789112`) or `x` instead of `'{a:-100, b:-200}`.
+    /// `leaf` is the PropMap key prefix (initially the bare `prop`; recurses
+    /// into nested struct members).
+    fn render_p_class_prop_struct(
+        &mut self,
+        handle: usize,
+        leaf: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) -> String {
+        let mut parts = Vec::new();
+        for m in &su.members {
+            for md in &m.declarators {
+                let key = format!("{}.{}", leaf, md.name.name);
+                let v = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.properties.get(&key))
+                    .cloned();
+                let rendered = match self.resolve_dt(&m.data_type) {
+                    DataType::Struct(sub) if Self::spreads_member_wise(&sub) => {
+                        self.render_p_class_prop_struct(handle, &key, &sub)
+                    }
+                    _ => v
+                        .as_ref()
+                        .map(|vv| self.render_p_value_typed(vv, &m.data_type))
+                        .unwrap_or_else(|| "x".into()),
+                };
+                parts.push(format!("{}:{}", md.name.name, rendered));
+            }
+        }
+        format!("'{{{}}}", parts.join(", "))
     }
 
     /// Render one `%p` member value: strings as quoted text, reals as reals,
@@ -95744,6 +95875,7 @@ impl Simulator {
                     d,
                     crate::ast::types::UnpackedDimension::Unsized(_)
                         | crate::ast::types::UnpackedDimension::Queue { .. }
+                        | crate::ast::types::UnpackedDimension::Associative { .. }
                 )
             })
         };
