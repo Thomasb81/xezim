@@ -1640,7 +1640,7 @@ fn pad_string(s: &str, width: usize, zero_pad: bool) -> String {
 /// Timing wheel for O(1) near-future event scheduling.
 /// Events within WHEEL_SIZE ticks of current time use a circular array.
 /// Events further out fall back to a BTreeMap.
-const WHEEL_SIZE: usize = 256;
+const WHEEL_SIZE: usize = 4096;
 
 /// Prefix of the hidden per-clocking-input sample mirror signals (§14.13).
 /// Not expressible in SV source, so it can never collide with a user name.
@@ -1705,7 +1705,10 @@ impl ProcCont {
 
     /// Nothing to run.
     fn empty() -> Self {
-        ProcCont { stmts: Arc::from(Vec::new()), start: 0, next: None }
+        thread_local! {
+            static EMPTY: Arc<[Statement]> = Arc::from(Vec::new());
+        }
+        ProcCont { stmts: EMPTY.with(Arc::clone), start: 0, next: None }
     }
 
     /// Resume at `idx` of THIS frame, keeping the rest of the chain. This is the
@@ -1805,6 +1808,9 @@ impl ProcCont {
 
 impl From<Vec<Statement>> for ProcCont {
     fn from(v: Vec<Statement>) -> Self {
+        if v.is_empty() {
+            return ProcCont::empty();
+        }
         ProcCont::from_vec(v)
     }
 }
@@ -2048,7 +2054,7 @@ struct TimingWheel {
     /// load — and pids are never reused, so the dense form grows to the
     /// high-water pid and trades memory for nothing. Do not re-litigate without
     /// a benchmark that shows this map is hot.
-    pid_counts: std::collections::HashMap<usize, u32>,
+    pid_counts: HashMap<usize, u32>,
 }
 
 impl TimingWheel {
@@ -2062,7 +2068,7 @@ impl TimingWheel {
             bitmap: [0u64; BITMAP_WORDS],
             overflow: BTreeMap::new(),
             current_time: 0,
-            pid_counts: std::collections::HashMap::new(),
+            pid_counts: HashMap::default(),
         }
     }
 
@@ -4279,6 +4285,11 @@ pub struct Simulator {
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
+    /// Recycled scope-hint strings for the process wake-up path: every
+    /// wake-up installed a fresh clone of the process scope into
+    /// `name_resolve_hint` and `current_scope` (four allocations for a
+    /// compiled-FSM wake-up) and freed them on exit.
+    hint_string_pool: Vec<String>,
     /// Instance scope of the comb/edge BLOCK currently being evaluated, for
     /// `%m` only — deliberately separate from `current_scope`, which also
     /// steers name resolution (`resolve_hier_name`) and must not start
@@ -8320,6 +8331,7 @@ impl Simulator {
             spec_scope_stack: Vec::new(),
             gate_fall_delay_by_id: HashMap::default(),
             gate_off_delay_by_id: HashMap::default(),
+            hint_string_pool: Vec::new(),
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
@@ -37498,6 +37510,29 @@ impl Simulator {
     /// no process-local state of its own. A behavioral clock can fire while a
     /// task is inside `run_events_until`; moving the task context aside avoids
     /// cloning its local arrays on every clock edge.
+    /// A `String` holding `text`, reusing a pooled buffer when one exists.
+    #[inline]
+    fn pooled_string(pool: &mut Vec<String>, text: &str) -> String {
+        match pool.pop() {
+            Some(mut s) => {
+                s.clear();
+                s.push_str(text);
+                s
+            }
+            None => text.to_string(),
+        }
+    }
+
+    /// Return a hint string to the pool (bounded so a burst cannot pin memory).
+    #[inline]
+    fn recycle_string(pool: &mut Vec<String>, s: Option<String>) {
+        if let Some(s) = s {
+            if pool.len() < 64 {
+                pool.push(s);
+            }
+        }
+    }
+
     fn take_process_context(&mut self) -> ProcessContext {
         // The ref stacks leave with the context; nothing can redirect until
         // a context is restored or a new ref frame is pushed.
@@ -37985,9 +38020,10 @@ impl Simulator {
         // resolution hint so AST-evaluated bare names — e.g. a
         // `std::randomize(sig)` target — resolve to THIS instance's signals in
         // a multiply-instantiated module, not the first instance's.
-        if let Some(scope) = self.process_scope_hint.get(&pid).cloned() {
-            *self.name_resolve_hint.borrow_mut() = Some(scope.clone());
-            self.current_scope = scope;
+        if let Some(scope) = self.process_scope_hint.get(&pid) {
+            let hint = Self::pooled_string(&mut self.hint_string_pool, scope);
+            *self.name_resolve_hint.borrow_mut() = Some(hint);
+            self.current_scope.clone_from(scope);
         } else {
             self.current_scope.clear();
         }
@@ -38014,7 +38050,8 @@ impl Simulator {
             self.run_fast_delay_always(pid);
             self.restore_process_context(saved);
             self.auto_loop_vars.truncate(saved_auto_len);
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            let mine = self.name_resolve_hint.replace(saved_hint);
+            Self::recycle_string(&mut self.hint_string_pool, mine);
             return;
         }
         // A compiled process FSM carries its whole state in its frame — the
@@ -38024,7 +38061,8 @@ impl Simulator {
             self.run_proc_fsm(pid);
             self.restore_process_context(saved);
             self.auto_loop_vars.truncate(saved_auto_len);
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            let mine = self.name_resolve_hint.replace(saved_hint);
+            Self::recycle_string(&mut self.hint_string_pool, mine);
             return;
         }
         // Fast path: if we have no saved process context for this pid AND
@@ -38058,7 +38096,8 @@ impl Simulator {
             }
             self.method_local_base = saved_mlb;
             self.auto_loop_vars.truncate(saved_auto_len);
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            let mine = self.name_resolve_hint.replace(saved_hint);
+            Self::recycle_string(&mut self.hint_string_pool, mine);
             return;
         }
         // The caller's context is MOVED aside (the restore below overwrites
@@ -38346,9 +38385,12 @@ impl Simulator {
             f.regs.resize(f.compiled.num_regs as usize, Value::zero(1));
         }
         std::mem::swap(&mut self.vm_regs, &mut f.regs);
-        let saved_hint = self.name_resolve_hint.borrow().clone();
+        let saved_hint = self.name_resolve_hint.borrow_mut().take();
         if !f.scope.is_empty() {
-            *self.name_resolve_hint.borrow_mut() = Some(f.scope.clone());
+            let hint = Self::pooled_string(&mut self.hint_string_pool, &f.scope);
+            *self.name_resolve_hint.borrow_mut() = Some(hint);
+        } else {
+            *self.name_resolve_hint.borrow_mut() = saved_hint.clone();
         }
         let pd = *f.precision_diff.get_or_insert_with(|| {
             let (_, prec_exp) = {
@@ -38413,7 +38455,7 @@ impl Simulator {
                             break;
                         }
                         if !f.is_always {
-                            *self.name_resolve_hint.borrow_mut() = saved_hint;
+                            Self::recycle_string(&mut self.hint_string_pool, self.name_resolve_hint.replace(saved_hint.clone()));
                             self.settle_combinatorial();
                             return;
                         }
@@ -38429,7 +38471,7 @@ impl Simulator {
                     }
                 }
             }
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            Self::recycle_string(&mut self.hint_string_pool, self.name_resolve_hint.replace(saved_hint.clone()));
             self.proc_fsm.insert(pid, f);
             self.settle_combinatorial();
             return;
@@ -38481,7 +38523,7 @@ impl Simulator {
             if !f.is_always {
                 // An `initial` body ran to completion: done for good.
                 std::mem::swap(&mut self.vm_regs, &mut f.regs);
-                *self.name_resolve_hint.borrow_mut() = saved_hint;
+                Self::recycle_string(&mut self.hint_string_pool, self.name_resolve_hint.replace(saved_hint.clone()));
                 self.settle_combinatorial();
                 return;
             }
@@ -38496,7 +38538,7 @@ impl Simulator {
             }
         }
         std::mem::swap(&mut self.vm_regs, &mut f.regs);
-        *self.name_resolve_hint.borrow_mut() = saved_hint;
+        Self::recycle_string(&mut self.hint_string_pool, self.name_resolve_hint.replace(saved_hint));
         self.proc_fsm.insert(pid, f);
         self.settle_combinatorial();
     }
