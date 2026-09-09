@@ -4060,6 +4060,10 @@ pub struct Simulator {
     /// `ElaboratedModule::gate_fall_delays`. Empty unless some gate used the
     /// two-delay `#(rise, fall)` form with differing values.
     gate_fall_delay_by_id: HashMap<usize, u64>,
+    /// `assign #(rise, fall, turnoff)` (§10.3.3): per-net turn-off delay,
+    /// used for a transition to z. Empty unless some assign used the
+    /// three-delay form.
+    gate_off_delay_by_id: HashMap<usize, u64>,
     /// `(declaring_class, property)` → does this property's packed range
     /// depend on a parameter? `fit_class_prop` runs on every property store,
     /// so the common answer (`false`) is memoized to one hash lookup.
@@ -6724,6 +6728,8 @@ impl Simulator {
                         rhs,
                         delay: 0,
                         rhs_parent_scoped: false,
+                        delay_fall: None,
+                        delay_off: None,
                     });
                     alias
                 });
@@ -7032,6 +7038,8 @@ impl Simulator {
                         rhs,
                         delay: 0,
                         rhs_parent_scoped: false,
+                        delay_fall: None,
+                        delay_off: None,
                     });
             }
         }
@@ -8311,6 +8319,7 @@ impl Simulator {
             current_spec: None,
             spec_scope_stack: Vec::new(),
             gate_fall_delay_by_id: HashMap::default(),
+            gate_off_delay_by_id: HashMap::default(),
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
@@ -17474,6 +17483,13 @@ impl Simulator {
                 matches!(control, TimingControl::Delay(_))
                     || Self::stmt_contains_delay_control(inner)
             }
+            // §9.4.5 `lhs = #d rhs` suspends like a `#d` statement; the edge
+            // path's synchronous executor cannot, so it dropped the delay
+            // (issue #160). The nonblocking form schedules without
+            // suspending and stays on the edge path.
+            StatementKind::BlockingAssign { rvalue, .. } => {
+                Self::intra_delay_marker(rvalue).is_some()
+            }
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 stmts.iter().any(Self::stmt_contains_delay_control)
             }
@@ -17516,6 +17532,12 @@ impl Simulator {
                 matches!(control, TimingControl::Event(_))
                     || Self::stmt_contains_event_control(inner)
             }
+            // §9.4.5 `lhs = @(e) rhs` waits like an `@(e)` statement.
+            StatementKind::BlockingAssign { rvalue, .. } => matches!(
+                &rvalue.kind,
+                ExprKind::SystemCall { name, .. }
+                    if name == crate::intra_delay::INTRA_EVENT_MARKER
+            ),
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 stmts.iter().any(Self::stmt_contains_event_control)
             }
@@ -26573,6 +26595,23 @@ impl Simulator {
             } else {
                 None
             };
+            // `assign #(rise, fall[, turnoff]) net = …` (§10.3.3): the lowered
+            // item carries the rise delay; the fall / turn-off values go to
+            // the per-net maps consulted by `schedule_delayed_with_delay`,
+            // the one point where both the target and the new value are
+            // known. Whole-net targets only, like the gate form (§28.11).
+            if explicit_delay > 0 && wids.len() == 1 && lhs_is_bare_ident {
+                if let Some(f) = ca.delay_fall {
+                    if f != explicit_delay {
+                        self.gate_fall_delay_by_id.insert(wids[0], f);
+                    }
+                }
+                if let Some(t) = ca.delay_off {
+                    if t != explicit_delay {
+                        self.gate_off_delay_by_id.insert(wids[0], t);
+                    }
+                }
+            }
             let item = if explicit_delay > 0 {
                 CombItem::ContAssign {
                     lhs: Box::new(ca.lhs.clone()),
@@ -43031,9 +43070,24 @@ impl Simulator {
             let all_zero = |v: &Value| -> bool {
                 !v.has_xz() && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Zero)
             };
-            match self.gate_fall_delay_by_id.get(&id) {
-                Some(&fall) if all_zero(&val) && !all_zero(&self.signal_table[id]) => fall,
-                _ => delay,
+            let fall = self.gate_fall_delay_by_id.get(&id).copied();
+            let off = self.gate_off_delay_by_id.get(&id).copied();
+            let all_z = |v: &Value| -> bool {
+                v.width > 0 && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Z)
+            };
+            if fall.is_none() && off.is_none() {
+                delay
+            } else if all_zero(&val) && !all_zero(&self.signal_table[id]) {
+                fall.unwrap_or(delay)
+            } else if all_z(&val) {
+                // §10.3.3 / §28.11: to z uses the turn-off delay; with only
+                // two delays given, the smaller of rise and fall.
+                off.unwrap_or_else(|| fall.map_or(delay, |f| f.min(delay)))
+            } else if val.has_xz() {
+                // To x: the smallest of the delays given.
+                [Some(delay), fall, off].into_iter().flatten().min().unwrap_or(delay)
+            } else {
+                delay
             }
         };
         let target_time = self.time + delay;

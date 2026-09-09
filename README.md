@@ -114,6 +114,13 @@ and testbench flows. Portable code should not rely on them.
 
 **Correctness**
 
+* An intra-assignment delay inside an edge-triggered `always` block is
+  honoured: `q <= #5 v;` schedules the update five time units out and
+  `q = #5 v;` suspends the block, as in an `initial` block. Both forms
+  previously assigned at once with no warning (#160).
+* A continuous assignment accepts the rise/fall/turn-off delay form,
+  `assign #(rise, fall[, turnoff]) net = expr;`, and applies the delay by
+  transition as §10.3.3 specifies; a transition to x takes the smallest.
 * Collections declared in a module keep one copy per instance. Sibling
   instances of the same module no longer share a queue, dynamic array or
   associative array, and a packed-struct element of such a collection

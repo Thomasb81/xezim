@@ -217,3 +217,5 @@ mod always_value_change_after_edge_continuation;
 mod package_and_unit_delays_scale_by_timescale;
 #[path = "scheduling/clocking_cont_trigger_same_step.rs"]
 mod clocking_cont_trigger_same_step;
+#[path = "scheduling/intra_assignment_delay_in_always.rs"]
+mod intra_assignment_delay_in_always;
