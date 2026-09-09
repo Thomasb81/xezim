@@ -118,6 +118,12 @@ and testbench flows. Portable code should not rely on them.
   honoured: `q <= #5 v;` schedules the update five time units out and
   `q = #5 v;` suspends the block, as in an `initial` block. Both forms
   previously assigned at once with no warning (#160).
+* A class property that is a fixed array of collections (`int q[2][2][$]`,
+  `int d[3][]`, `int a[2][int]`) has storage for every element: `q[i][j]`
+  accepts `push_back`, `size`, `new[n]`, `exists` and element reads and
+  writes, from inside the class and through a handle. Previously each
+  element collection was silently empty while `$size(q)` and `foreach`
+  answered off the outer shape.
 * An unpacked array parameter whose elements are assignment patterns
   (`localparam cfg_t A [3] = '{'{4,2}, …}`) evaluates each element instead
   of reading 0, for packed-struct, unpacked-struct and packed-vector

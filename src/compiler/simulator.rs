@@ -50730,6 +50730,34 @@ impl Simulator {
                         return changed;
                     }
                 }
+                // Element write into an ARRAY-OF-COLLECTIONS class property
+                // (`expected[1][0][k] = v`, `dq[1][2] = v`, `aa[0][key] = v`):
+                // the base names one element collection (see
+                // `class_array_of_coll_key`); write its element.
+                if let Some(row) = self.class_array_of_coll_key(expr) {
+                    if self.module.dynamic_arrays.contains(&row) {
+                        self.dollar_bound.push(self.get_queue_size(&row) as i64 - 1);
+                        let k = self.eval_expr(index).to_i64().unwrap_or(0);
+                        self.dollar_bound.pop();
+                        if k >= 0 && k as u64 >= self.get_queue_size(&row) {
+                            self.set_queue_size(&row, k as u64 + 1);
+                        }
+                        let elem = format!("{}[{}]", row, k);
+                        let prev = self.get_signal_value_by_name(&elem);
+                        let changed = prev.as_ref() != Some(val);
+                        self.set_signal_value_by_name(&elem, val.clone());
+                        return changed;
+                    }
+                    if self.is_associative_array(&row) {
+                        let kv = self.eval_expr(index);
+                        let key = self.assoc_key_str(&row, &kv);
+                        let elem = format!("{}[{}]", row, key);
+                        let prev = self.get_signal_value_by_name(&elem);
+                        let changed = prev.as_ref() != Some(val);
+                        self.set_signal_value_by_name(&elem, val.clone());
+                        return changed;
+                    }
+                }
                 if let Some(qn) = self.indexed_queue_base(expr) {
                     // `$` is the last valid index of THIS queue.
                     self.dollar_bound.push(self.get_queue_size(&qn) as i64 - 1);
@@ -56032,6 +56060,15 @@ impl Simulator {
                             .get_signal_value_by_name(&format!("{}[{}]", row, j))
                             .unwrap_or_else(|| Value::zero(32));
                     }
+                    // Associative element of an array-of-collections class
+                    // property (`aa[0][key]`).
+                    if self.is_associative_array(&row) {
+                        let kv = self.eval_expr(index);
+                        let key = self.assoc_key_str(&row, &kv);
+                        return self
+                            .get_signal_value_by_name(&format!("{}[{}]", row, key))
+                            .unwrap_or_else(|| Value::new(ctx_width.max(1)));
+                    }
                 }
                 // Ascending packed vector bit-select (`logic [0:7] pa; pa[i]`):
                 // label i is the MSB end, so it reads internal bit (W-1)-i
@@ -60889,7 +60926,12 @@ impl Simulator {
                     if let Some((n_expr, src_expr)) = sized_new {
                         let target = match &lvalue.kind {
                             ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
-                            _ => self.flat_member_name(lvalue).map(std::borrow::Cow::Owned),
+                            // `dq[1] = new[n]` on an array-of-dynamic-arrays
+                            // class property: the element collection's key.
+                            _ => self
+                                .class_array_of_coll_key(lvalue)
+                                .or_else(|| self.flat_member_name(lvalue))
+                                .map(std::borrow::Cow::Owned),
                         };
                         // A class-property dynamic array (`c.p = new[n]`)
                         // lives under the instance-scoped `<handle>#p`, which
@@ -97551,7 +97593,11 @@ impl Simulator {
                 // `m[i]` / `obj.m[i]`, which is not the storage name — resolve
                 // the instance-scoped row (`<h>#m[i]`) instead.
                 if let Some(row) = self.coll_elem_expr_key(expr) {
-                    if self.module.dynamic_arrays.contains(&row) {
+                    // A queue/dyn row, or an associative element of an
+                    // array-of-collections class property (`aa[0].exists(k)`).
+                    if self.module.dynamic_arrays.contains(&row)
+                        || self.module.associative_arrays.contains_key(&row)
+                    {
                         if let Some(res) = self.eval_builtin_method(&row, mname, args) {
                             return res;
                         }
@@ -106541,7 +106587,81 @@ impl Simulator {
     /// `m[i][j]`, `obj.m[k]`) to its scoped storage key. Loop variables must
     /// already be bound on `local_stack`. Returns None when the base is not a
     /// collection.
+    /// §7.4.5 class property that is an ARRAY OF COLLECTIONS
+    /// (`int q[2][2][$]`, `int d[3][]`, `int a[2][int]`): `q[i][j]` names
+    /// one element collection, stored under the object-scoped flat key
+    /// `h#q[i][j]` (core registers a queue/assoc property per element).
+    /// Returns that key when `e` supplies exactly the outer indices; with
+    /// fewer or more indices the caller's element paths apply.
+    fn class_array_of_coll_key(&mut self, e: &Expression) -> Option<String> {
+        let mut idxs: Vec<&Expression> = Vec::new();
+        let mut cur = e;
+        while let ExprKind::Index { expr: b, index } = &cur.kind {
+            idxs.push(index);
+            cur = b;
+        }
+        if idxs.is_empty() || self.no_class_objects() {
+            return None;
+        }
+        idxs.reverse();
+        let (handle, member): (usize, String) = match &cur.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let nm = &h.path[0].name.name;
+                if self.local_stack.last().is_some_and(|l| l.contains_key(nm)) {
+                    return None;
+                }
+                (self.this_stack.last().copied().flatten()?, nm.clone())
+            }
+            ExprKind::MemberAccess { expr: obj, member } => {
+                let h = self.eval_expr(obj).to_u64()? as usize;
+                (h, member.name.clone())
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 && h.path[0].selects.is_empty() => {
+                let obj = &h.path[0].name.name;
+                let hd = if obj == "this" || obj == "super" {
+                    self.this_stack.last().copied().flatten().unwrap_or(0)
+                } else {
+                    self.eval_ident_handle(obj).unwrap_or(0)
+                };
+                (hd, h.path[1].name.name.clone())
+            }
+            _ => return None,
+        };
+        if handle == 0 {
+            return None;
+        }
+        let cn = self
+            .heap
+            .get(handle)
+            .and_then(|x| x.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let mut cur_cls: Option<String> = Some(cn);
+        let mut outer_len: Option<usize> = None;
+        while let Some(c) = cur_cls {
+            let Some(cd) = self.module.classes.get(&c) else { break };
+            if let Some((shape, _, _)) = cd.array_of_coll_properties.get(&member) {
+                outer_len = Some(shape.len());
+                break;
+            }
+            cur_cls = cd.extends.clone();
+        }
+        if outer_len? != idxs.len() {
+            return None;
+        }
+        let mut key = format!("{}#{}", handle, member);
+        for ix in idxs {
+            let i = self.eval_expr(ix).to_i64().unwrap_or(0);
+            key.push('[');
+            key.push_str(&i.to_string());
+            key.push(']');
+        }
+        Some(key)
+    }
+
     fn coll_elem_expr_key(&mut self, e: &Expression) -> Option<String> {
+        if let Some(k) = self.class_array_of_coll_key(e) {
+            return Some(k);
+        }
         let ExprKind::Index { expr: base, index } = &e.kind else {
             return None;
         };

@@ -276,3 +276,5 @@ mod method_int_formal_zero_extends;
 mod handle_chain_read_in_instance_task;
 #[path = "classes/implication_joint_distribution.rs"]
 mod implication_joint_distribution;
+#[path = "classes/array_of_collections_property.rs"]
+mod array_of_collections_property;
