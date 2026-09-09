@@ -18121,6 +18121,15 @@ impl Simulator {
                     self.event_queue.schedule(0, pid, Vec::new().into());
                     return None;
                 }
+                // A delay-headed `always` with a compound body (the timed
+                // integration step of a real-number model, `always #(TSTEP)
+                // begin state = …; end`) ran as an AST `forever` process and
+                // paid the identifier-resolution ladder on every step (#159).
+                // The process FSM implements the same wait/run cycle from
+                // bytecode; use it whenever the body compiles fallback-free.
+                if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
+                    return None;
+                }
                 let forever_stmt = Statement::new(
                     StatementKind::Forever {
                         body: Box::new(ab.stmt.clone()),
@@ -18320,6 +18329,15 @@ impl Simulator {
                     .iter()
                     .map(super::bytecode::insn_opcode_name)
                     .collect();
+                let reasons: Vec<&str> = cb
+                    .instructions
+                    .iter()
+                    .filter_map(|i| match i {
+                        Insn::StmtFallback(b) => Some(&*b.1),
+                        _ => None,
+                    })
+                    .collect();
+                eprintln!("[PROC-FSM] scope '{}': fallback reasons {:?}", scope, reasons);
                 eprintln!(
                     "[PROC-FSM] scope '{}': gated out (fallback={} insns={} ops={:?})",
                     scope,

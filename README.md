@@ -166,6 +166,10 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* A delay-driven `always` block with a compound body, the timed
+  integration step of a real-number model, runs from compiled bytecode
+  instead of the AST interpreter: 3.8x faster per step on a fitted-lag
+  model (4.1 µs to 1.07 µs), results unchanged (#159).
 * Combinational settle passes track entries triggered mid-pass in a bitset
   instead of a heap, array element accesses in compiled blocks resolve
   inline, and an assignment whose value already has the target width copies
