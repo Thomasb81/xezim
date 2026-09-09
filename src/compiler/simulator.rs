@@ -1640,7 +1640,7 @@ fn pad_string(s: &str, width: usize, zero_pad: bool) -> String {
 /// Timing wheel for O(1) near-future event scheduling.
 /// Events within WHEEL_SIZE ticks of current time use a circular array.
 /// Events further out fall back to a BTreeMap.
-const WHEEL_SIZE: usize = 256;
+const WHEEL_SIZE: usize = 4096;
 
 /// Prefix of the hidden per-clocking-input sample mirror signals (§14.13).
 /// Not expressible in SV source, so it can never collide with a user name.
@@ -1705,7 +1705,10 @@ impl ProcCont {
 
     /// Nothing to run.
     fn empty() -> Self {
-        ProcCont { stmts: Arc::from(Vec::new()), start: 0, next: None }
+        thread_local! {
+            static EMPTY: Arc<[Statement]> = Arc::from(Vec::new());
+        }
+        ProcCont { stmts: EMPTY.with(Arc::clone), start: 0, next: None }
     }
 
     /// Resume at `idx` of THIS frame, keeping the rest of the chain. This is the
@@ -1805,6 +1808,9 @@ impl ProcCont {
 
 impl From<Vec<Statement>> for ProcCont {
     fn from(v: Vec<Statement>) -> Self {
+        if v.is_empty() {
+            return ProcCont::empty();
+        }
         ProcCont::from_vec(v)
     }
 }
@@ -2034,6 +2040,14 @@ struct TimingWheel {
     wheel: Vec<EventList>,              // circular array of WHEEL_SIZE slots
     bitmap: [u64; BITMAP_WORDS],        // occupancy bitmap: bit set = slot non-empty
     overflow: BTreeMap<u64, EventList>, // far-future events
+    /// Number of non-zero bitmap words, so `is_empty` is O(1) instead of a
+    /// 64-word compare per tick.
+    occupied_words: u32,
+    /// Memoized `next_time()`: `None` = unknown (recompute). Invalidated by
+    /// every mutator that can remove an event; `schedule` narrows it in
+    /// place. The scan it replaces walked up to every bitmap word on each
+    /// of the ~8 calls per tick.
+    next_cache: std::cell::Cell<Option<Option<u64>>>,
     current_time: u64,                  // last known simulation time
     /// Multiset of pids currently scheduled somewhere in the wheel or
     /// overflow. Lets `has_pid` return O(1) instead of scanning all 256
@@ -2048,7 +2062,7 @@ struct TimingWheel {
     /// load — and pids are never reused, so the dense form grows to the
     /// high-water pid and trades memory for nothing. Do not re-litigate without
     /// a benchmark that shows this map is hot.
-    pid_counts: std::collections::HashMap<usize, u32>,
+    pid_counts: HashMap<usize, u32>,
 }
 
 impl TimingWheel {
@@ -2061,8 +2075,10 @@ impl TimingWheel {
             wheel,
             bitmap: [0u64; BITMAP_WORDS],
             overflow: BTreeMap::new(),
+            occupied_words: 0,
+            next_cache: std::cell::Cell::new(None),
             current_time: 0,
-            pid_counts: std::collections::HashMap::new(),
+            pid_counts: HashMap::default(),
         }
     }
 
@@ -2074,19 +2090,31 @@ impl TimingWheel {
     /// Set bitmap bit for a slot.
     #[inline(always)]
     fn bitmap_set(&mut self, slot: usize) {
-        self.bitmap[slot >> 6] |= 1u64 << (slot & 63);
+        let w = &mut self.bitmap[slot >> 6];
+        if *w == 0 {
+            self.occupied_words += 1;
+        }
+        *w |= 1u64 << (slot & 63);
     }
 
     /// Clear bitmap bit for a slot.
     #[inline(always)]
     fn bitmap_clear(&mut self, slot: usize) {
-        self.bitmap[slot >> 6] &= !(1u64 << (slot & 63));
+        let w = &mut self.bitmap[slot >> 6];
+        if *w != 0 {
+            *w &= !(1u64 << (slot & 63));
+            if *w == 0 {
+                self.occupied_words -= 1;
+            }
+        }
+        self.next_cache.set(None);
     }
 
     /// Schedule an event at the given time.
     fn schedule(&mut self, time: u64, pid: usize, stmts: ProcCont) {
         sim_dbg_eprintln!("[DEBUG] scheduling process {} at time {}", pid, time);
         *self.pid_counts.entry(pid).or_insert(0) += 1;
+        self.narrow_next_cache(time);
         if time < self.current_time + WHEEL_SIZE as u64 {
             let s = Self::slot(time);
             self.wheel[s].push_back((pid, stmts));
@@ -2109,6 +2137,7 @@ impl TimingWheel {
     /// Children are inserted in reverse so the group keeps source order.
     fn schedule_front(&mut self, time: u64, pid: usize, stmts: ProcCont) {
         *self.pid_counts.entry(pid).or_insert(0) += 1;
+        self.narrow_next_cache(time);
         if time < self.current_time + WHEEL_SIZE as u64 {
             let s = Self::slot(time);
             self.wheel[s].push_front((pid, stmts));
@@ -2127,12 +2156,34 @@ impl TimingWheel {
     }
 
     fn is_empty(&self) -> bool {
-        self.bitmap == [0u64; BITMAP_WORDS] && self.overflow.is_empty()
+        self.occupied_words == 0 && self.overflow.is_empty()
+    }
+
+    /// A new event at `time` can only move the next time earlier.
+    #[inline(always)]
+    fn narrow_next_cache(&self, time: u64) {
+        if let Some(c) = self.next_cache.get() {
+            let nt = c.map_or(time, |t| t.min(time));
+            self.next_cache.set(Some(Some(nt)));
+        }
     }
 
     /// Get the next scheduled time (minimum) using bitmap scan.
     /// Uses trailing_zeros to find the next occupied slot in O(1) per word.
     fn next_time(&self) -> Option<u64> {
+        if let Some(c) = self.next_cache.get() {
+            // A cached time behind the wheel's clock means an event was left
+            // behind (deferred drain); fall through to the exact scan.
+            if c.map_or(true, |t| t >= self.current_time) {
+                return c;
+            }
+        }
+        let r = self.next_time_scan();
+        self.next_cache.set(Some(r));
+        r
+    }
+
+    fn next_time_scan(&self) -> Option<u64> {
         let start_slot = Self::slot(self.current_time);
         // Scan bitmap from current_time's slot position.
         // We need to handle wrap-around: scan from start_slot to 255, then 0 to start_slot-1.
@@ -2340,6 +2391,7 @@ impl TimingWheel {
         if !self.pid_counts.contains_key(&pid) {
             return None;
         }
+        self.next_cache.set(None);
         let mut found: Option<(u64, ProcCont)> = None;
         let cur_slot = Self::slot(self.current_time);
 
@@ -2656,12 +2708,6 @@ struct ClockingTick {
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
-    /// Parallel to `local_stack`: the frame generation each slot was pushed
-    /// with. Two different method activations never share a generation even
-    /// when they occupy the same slot index, so a fork child can tell whether
-    /// a parent slot still holds the activation it forked from (see
-    /// `merge_fork_writes`).
-    local_gen_stack: Vec<u64>,
     local_type_stack: Vec<(HashMap<String, String>, HashMap<String, String>)>,
     class_context_stack: Vec<Option<String>>,
     cg_this: Option<usize>,
@@ -2692,13 +2738,15 @@ struct ProcessContext {
     // `push_queue_frame`/`pop_and_restore_queue_frame`.
     local_dyn: Vec<Vec<(String, String)>>,
     static_local_syncs: Vec<(String, Vec<(String, String)>)>,
-    // Base index into `local_stack`/`local_type_stack` of THIS method's own
-    // locals frame, so that after a process parks inside an inlined blocking
-    // method and its `local_stack` is swapped into its `ProcessContext`, the
-    // bounds for `local_class_type_of`/`local_typedef_type_of`/`in_any_frame`
-    // follow the frame rather than leaking a foreign index from whichever
-    // process runs next. Kept in `ProcessContext` (like `local_stack` itself)
-    // precisely because the base is only meaningful against that stack.
+    /// See `Simulator::method_local_base`. This is per-PROCESS state: the
+    /// base indexes into `local_stack`, which is swapped out with the rest
+    /// of the context when a process parks. A process suspended inside an
+    /// inlined BLOCKING class method used to leave its base behind, so
+    /// another process's frame-local lookups (`local_class_type_of`,
+    /// `local_typedef_type_of`, `get_expr_type_name`'s `in_any_frame`) were
+    /// bounded by an index into a `local_stack` that was no longer there —
+    /// a method-local shadowing a module-scope net then resolved to the net
+    /// and `local = new()` constructed the wrong class.
     method_local_base: Vec<usize>,
 }
 
@@ -4064,6 +4112,10 @@ pub struct Simulator {
     /// `ElaboratedModule::gate_fall_delays`. Empty unless some gate used the
     /// two-delay `#(rise, fall)` form with differing values.
     gate_fall_delay_by_id: HashMap<usize, u64>,
+    /// `assign #(rise, fall, turnoff)` (§10.3.3): per-net turn-off delay,
+    /// used for a transition to z. Empty unless some assign used the
+    /// three-delay form.
+    gate_off_delay_by_id: HashMap<usize, u64>,
     /// `(declaring_class, property)` → does this property's packed range
     /// depend on a parameter? `fit_class_prop` runs on every property store,
     /// so the common answer (`false`) is memoized to one hash lookup.
@@ -4201,11 +4253,6 @@ pub struct Simulator {
     /// Call stack for tracking 'this' and local variables.
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
-    /// Parallel to `local_stack`: the frame generation each slot was pushed
-    /// with (see `ProcessContext::local_gen_stack`). Kept on the active
-    /// `Simulator` exactly like `local_stack`, and moved into/out of a
-    /// `ProcessContext` by snapshot/take/restore.
-    local_gen_stack: Vec<u64>,
     /// Context for 'super' resolution: stack of (current_class_name).
     class_context_stack: Vec<Option<String>>,
     /// For each class-method call entered via `exec_method_in_class_hierarchy`,
@@ -4284,6 +4331,11 @@ pub struct Simulator {
     /// Stable instance scope of the process currently running (for `%m`).
     /// Unlike `name_resolve_hint`, this is not mutated by name resolution.
     current_scope: String,
+    /// Recycled scope-hint strings for the process wake-up path: every
+    /// wake-up installed a fresh clone of the process scope into
+    /// `name_resolve_hint` and `current_scope` (four allocations for a
+    /// compiled-FSM wake-up) and freed them on exit.
+    hint_string_pool: Vec<String>,
     /// Instance scope of the comb/edge BLOCK currently being evaluated, for
     /// `%m` only — deliberately separate from `current_scope`, which also
     /// steers name resolution (`resolve_hier_name`) and must not start
@@ -4650,7 +4702,7 @@ pub struct Simulator {
     /// Dynamic-delay simple assignments, keyed by their scheduled process id.
     fast_delay_always: HashMap<usize, FastDelayAlways>,
     /// Compiled process FSMs by pid (roadmap 11-12, opt-in XEZIM_PROC_FSM=1).
-    proc_fsm: HashMap<usize, ProcFsm>,
+    proc_fsm: HashMap<usize, Box<ProcFsm>>,
     /// Resume pc for the next `exec_insns` call (consumed at entry; 0 for
     /// ordinary block executions).
     fsm_start_pc: u32,
@@ -4663,13 +4715,6 @@ pub struct Simulator {
     event_queue: TimingWheel,
     next_pid: usize,
     current_pid: usize,
-    /// Monotonic counter assigning each pushed local call-frame a unique
-    /// generation (see `local_gen_stack`). Used to tell apart two different
-    /// method activations that reuse the same `local_stack` slot index — e.g.
-    /// a fork child spawned under method-<i>A</i> that keeps running after
-    /// <i>A</i> returns must not merge its (stale) locals into the frame slot
-    /// that method-<i>B</i> now owns (regression 3627).
-    frame_gen: u64,
     /// Value that `$` resolves to in the current evaluation scope
     /// (e.g. queue upper bound during `q[a:$]`). Stack of overrides.
     dollar_bound: Vec<i64>,
@@ -5580,6 +5625,10 @@ pub struct Simulator {
     forever_cont_cache: HashMap<(usize, usize, usize, usize, u8), Arc<[Statement]>>,
     /// Pending-injection bitset for `settle_combinatorial_inner` (kept to avoid reallocation).
     settle_inject_bits: Vec<u64>,
+    /// A `return <virtual interface>` left `__vif_return__` for the next assignment.
+    vif_return_pending: bool,
+    /// Static lvalue widths of bare-leaf identifiers, per identifier span (see infer_lhs_width).
+    lhs_leaf_width_cache: HashMap<(usize, usize), u32>,
     /// See `blocking_cont_frame`.
     blocking_cont_cache: HashMap<(usize, usize, usize, u8), Arc<[Statement]>>,
     /// §11.8.1: while narrowing relational constraint bounds for a target whose
@@ -6736,6 +6785,8 @@ impl Simulator {
                         rhs,
                         delay: 0,
                         rhs_parent_scoped: false,
+                        delay_fall: None,
+                        delay_off: None,
                     });
                     alias
                 });
@@ -7044,6 +7095,8 @@ impl Simulator {
                         rhs,
                         delay: 0,
                         rhs_parent_scoped: false,
+                        delay_fall: None,
+                        delay_off: None,
                     });
             }
         }
@@ -8320,11 +8373,11 @@ impl Simulator {
             rand_ranges: HashMap::default(),
             class_statics: HashMap::default(),
             local_type_stack: Vec::new(),
-            local_gen_stack: Vec::new(),
-            frame_gen: 0,
             current_spec: None,
             spec_scope_stack: Vec::new(),
             gate_fall_delay_by_id: HashMap::default(),
+            gate_off_delay_by_id: HashMap::default(),
+            hint_string_pool: Vec::new(),
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
@@ -8785,6 +8838,8 @@ impl Simulator {
             forever_depth: 0,
             forever_cont_cache: HashMap::default(),
             settle_inject_bits: Vec::new(),
+            vif_return_pending: false,
+            lhs_leaf_width_cache: HashMap::default(),
             blocking_cont_cache: HashMap::default(),
             forever_sens_cache: HashMap::default(),
             constraint_cmp_unsigned: false,
@@ -12887,25 +12942,20 @@ impl Simulator {
             .collect();
         // A static-collection bare name declared by TWO SIBLING classes must
         // be stored per DECLARING class (§8.9) — compute that set up front.
-        // A static-collection name needs per-DECLARING-class storage whenever
-        // two or more classes declare it (§8.9 each gets its own cell). This
-        // covers sibling collisions (the four `uvm_cmdline_*` classes each
-        // declaring `static … settings[$]`) AND a derived class that
-        // REDECLARES a base's static collection (`d` extends `b`, both declare
-        // `static m_q[$]` → `d::m_q` and `b::m_q` are separate). Inherited-ONLY
-        // access (a single declarer further up the chain) is not a collision
-        // and keeps the bare, shared store the runtime relies on.
-        // `module.classes` is fully populated here.
+        // A name is colliding iff two classes declaring it are NOT in an
+        // ancestor/descendant relationship (a base+subclass pair like
+        // `uvm_sequence_library` / `simple_seq_lib` shares one cell and is not
+        // a collision). `module.classes` is fully populated here.
         let mut colliding_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        let name_counts: std::collections::HashMap<String, Vec<String>> =
+        let name_counts: std::collections::HashMap<&str, Vec<&str>> =
             self.module.classes.values().fold(
                 std::collections::HashMap::new(),
                 |mut acc, cd| {
                     let mut seen: Vec<&str> = Vec::new();
                     for (nm, _, _) in &cd.static_collections {
                         if !seen.contains(&nm.as_str()) {
-                            acc.entry(nm.clone()).or_default().push(cd.name.clone());
+                            acc.entry(nm.as_str()).or_default().push(&cd.name);
                             seen.push(nm.as_str());
                         }
                     }
@@ -12913,15 +12963,15 @@ impl Simulator {
                 },
             );
         for (nm, classes) in &name_counts {
-            // A single class may be materialised under several keys in
-            // `module.classes` (parameterized specializations that collapse
-            // to the same name); count DISTINCT class names so we detect true
-            // cross-class collisions / redeclarations, not the same class
-            // twice. The only names left are genuinely declared by 2+ classes.
-            let mut uniq: Vec<&String> = classes.iter().collect();
-            uniq.sort();
-            uniq.dedup();
-            if uniq.len() >= 2 {
+            let mut collides = false;
+            for (i, a) in classes.iter().enumerate() {
+                for b in &classes[i + 1..] {
+                    if !self.class_is_a(a, b) && !self.class_is_a(b, a) {
+                        collides = true;
+                    }
+                }
+            }
+            if collides {
                 colliding_names.insert(nm.to_string());
             }
         }
@@ -17491,6 +17541,13 @@ impl Simulator {
                 matches!(control, TimingControl::Delay(_))
                     || Self::stmt_contains_delay_control(inner)
             }
+            // §9.4.5 `lhs = #d rhs` suspends like a `#d` statement; the edge
+            // path's synchronous executor cannot, so it dropped the delay
+            // (issue #160). The nonblocking form schedules without
+            // suspending and stays on the edge path.
+            StatementKind::BlockingAssign { rvalue, .. } => {
+                Self::intra_delay_marker(rvalue).is_some()
+            }
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 stmts.iter().any(Self::stmt_contains_delay_control)
             }
@@ -17533,6 +17590,12 @@ impl Simulator {
                 matches!(control, TimingControl::Event(_))
                     || Self::stmt_contains_event_control(inner)
             }
+            // §9.4.5 `lhs = @(e) rhs` waits like an `@(e)` statement.
+            StatementKind::BlockingAssign { rvalue, .. } => matches!(
+                &rvalue.kind,
+                ExprKind::SystemCall { name, .. }
+                    if name == crate::intra_delay::INTRA_EVENT_MARKER
+            ),
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
                 stmts.iter().any(Self::stmt_contains_event_control)
             }
@@ -18116,6 +18179,15 @@ impl Simulator {
                     self.event_queue.schedule(0, pid, Vec::new().into());
                     return None;
                 }
+                // A delay-headed `always` with a compound body (the timed
+                // integration step of a real-number model, `always #(TSTEP)
+                // begin state = …; end`) ran as an AST `forever` process and
+                // paid the identifier-resolution ladder on every step (#159).
+                // The process FSM implements the same wait/run cycle from
+                // bytecode; use it whenever the body compiles fallback-free.
+                if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
+                    return None;
+                }
                 let forever_stmt = Statement::new(
                     StatementKind::Forever {
                         body: Box::new(ab.stmt.clone()),
@@ -18315,6 +18387,15 @@ impl Simulator {
                     .iter()
                     .map(super::bytecode::insn_opcode_name)
                     .collect();
+                let reasons: Vec<&str> = cb
+                    .instructions
+                    .iter()
+                    .filter_map(|i| match i {
+                        Insn::StmtFallback(b) => Some(&*b.1),
+                        _ => None,
+                    })
+                    .collect();
+                eprintln!("[PROC-FSM] scope '{}': fallback reasons {:?}", scope, reasons);
                 eprintln!(
                     "[PROC-FSM] scope '{}': gated out (fallback={} insns={} ops={:?})",
                     scope,
@@ -18333,7 +18414,7 @@ impl Simulator {
         self.process_origin.insert(pid, (stmt.span, origin));
         self.proc_fsm.insert(
             pid,
-            ProcFsm {
+            Box::new(ProcFsm {
                 compiled: cb,
                 waits,
                 pc: 0,
@@ -18345,7 +18426,7 @@ impl Simulator {
                 native: None,
                 #[cfg(feature = "jit")]
                 native_frame: Vec::new(),
-            },
+            }),
         );
         if dbg || sim_debug_enabled() {
             eprintln!(
@@ -26590,6 +26671,23 @@ impl Simulator {
             } else {
                 None
             };
+            // `assign #(rise, fall[, turnoff]) net = …` (§10.3.3): the lowered
+            // item carries the rise delay; the fall / turn-off values go to
+            // the per-net maps consulted by `schedule_delayed_with_delay`,
+            // the one point where both the target and the new value are
+            // known. Whole-net targets only, like the gate form (§28.11).
+            if explicit_delay > 0 && wids.len() == 1 && lhs_is_bare_ident {
+                if let Some(f) = ca.delay_fall {
+                    if f != explicit_delay {
+                        self.gate_fall_delay_by_id.insert(wids[0], f);
+                    }
+                }
+                if let Some(t) = ca.delay_off {
+                    if t != explicit_delay {
+                        self.gate_off_delay_by_id.insert(wids[0], t);
+                    }
+                }
+            }
             let item = if explicit_delay > 0 {
                 CombItem::ContAssign {
                     lhs: Box::new(ca.lhs.clone()),
@@ -35782,7 +35880,9 @@ impl Simulator {
         }
         while !self.finished && iters < max_iters {
             iters += 1;
-            if HANG_REPORT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+                && HANG_REPORT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
                 eprintln!("[xezim][hang-report] on-demand report (SIGUSR1) at sim time {}:", self.time);
                 self.report_parked_waiters(12);
             }
@@ -36122,7 +36222,6 @@ impl Simulator {
                 eprintln!("[INLINE_BITS] final invariant clean ({} iters)", iters);
             }
         }
-        self.flush_stdout();
         // PerTickAccum → local vars for the existing PROF print code.
         let t_settle = accum.t_settle;
         let t_edges = accum.t_edges;
@@ -37435,7 +37534,6 @@ impl Simulator {
         ProcessContext {
             this_stack: self.this_stack.clone(),
             local_stack: self.local_stack.clone(),
-            local_gen_stack: self.local_gen_stack.clone(),
             local_type_stack: self.local_type_stack.clone(),
             class_context_stack: self.class_context_stack.clone(),
             cg_this: self.cg_this,
@@ -37460,6 +37558,54 @@ impl Simulator {
     /// no process-local state of its own. A behavioral clock can fire while a
     /// task is inside `run_events_until`; moving the task context aside avoids
     /// cloning its local arrays on every clock edge.
+    /// A `String` holding `text`, reusing a pooled buffer when one exists.
+    #[inline]
+    fn pooled_string(pool: &mut Vec<String>, text: &str) -> String {
+        match pool.pop() {
+            Some(mut s) => {
+                s.clear();
+                s.push_str(text);
+                s
+            }
+            None => text.to_string(),
+        }
+    }
+
+    /// Return a hint string to the pool (bounded so a burst cannot pin memory).
+    #[inline]
+    fn recycle_string(pool: &mut Vec<String>, s: Option<String>) {
+        if let Some(s) = s {
+            if pool.len() < 64 {
+                pool.push(s);
+            }
+        }
+    }
+
+    /// True when every field `take_process_context` would move out is
+    /// already empty/false — the state a top-level wake-up starts from.
+    #[inline]
+    fn process_context_is_default(&self) -> bool {
+        self.this_stack.is_empty()
+            && self.local_stack.is_empty()
+            && self.local_type_stack.is_empty()
+            && self.class_context_stack.is_empty()
+            && self.cg_this.is_none()
+            && self.return_value.is_none()
+            && !self.break_flag
+            && !self.continue_flag
+            && !self.return_flag
+            && self.local_iface_aliases.is_empty()
+            && self.ref_binding_stack.is_empty()
+            && self.ref_alias_stack.is_empty()
+            && self.ref_identity_stack.is_empty()
+            && self.queue_frame_saves.is_empty()
+            && self.task_cleanup.is_empty()
+            && self.local_dyn.is_empty()
+            && self.static_local_syncs.is_empty()
+            && self.method_local_base.is_empty()
+            && !self.ref_redirect_hot
+    }
+
     fn take_process_context(&mut self) -> ProcessContext {
         // The ref stacks leave with the context; nothing can redirect until
         // a context is restored or a new ref frame is pushed.
@@ -37467,7 +37613,6 @@ impl Simulator {
         ProcessContext {
             this_stack: std::mem::take(&mut self.this_stack),
             local_stack: std::mem::take(&mut self.local_stack),
-            local_gen_stack: std::mem::take(&mut self.local_gen_stack),
             local_type_stack: std::mem::take(&mut self.local_type_stack),
             class_context_stack: std::mem::take(&mut self.class_context_stack),
             cg_this: self.cg_this.take(),
@@ -37490,7 +37635,6 @@ impl Simulator {
     fn restore_process_context(&mut self, ctx: ProcessContext) {
         self.this_stack = ctx.this_stack;
         self.local_stack = ctx.local_stack;
-        self.local_gen_stack = ctx.local_gen_stack;
         self.local_type_stack = ctx.local_type_stack;
         self.class_context_stack = ctx.class_context_stack;
         self.cg_this = ctx.cg_this;
@@ -37564,7 +37708,6 @@ impl Simulator {
                     }
                 } else {
                     ctx.local_stack.push(caps);
-                    ctx.local_gen_stack.push(self.next_frame_gen());
                 }
             }
         }
@@ -37950,9 +38093,10 @@ impl Simulator {
         // resolution hint so AST-evaluated bare names — e.g. a
         // `std::randomize(sig)` target — resolve to THIS instance's signals in
         // a multiply-instantiated module, not the first instance's.
-        if let Some(scope) = self.process_scope_hint.get(&pid).cloned() {
-            *self.name_resolve_hint.borrow_mut() = Some(scope.clone());
-            self.current_scope = scope;
+        if let Some(scope) = self.process_scope_hint.get(&pid) {
+            let hint = Self::pooled_string(&mut self.hint_string_pool, scope);
+            *self.name_resolve_hint.borrow_mut() = Some(hint);
+            self.current_scope.clone_from(scope);
         } else {
             self.current_scope.clear();
         }
@@ -37979,17 +38123,29 @@ impl Simulator {
             self.run_fast_delay_always(pid);
             self.restore_process_context(saved);
             self.auto_loop_vars.truncate(saved_auto_len);
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            let mine = self.name_resolve_hint.replace(saved_hint);
+            Self::recycle_string(&mut self.hint_string_pool, mine);
             return;
         }
         // A compiled process FSM carries its whole state in its frame — the
         // AST-context save/restore dance is unnecessary, same as fast-delay.
         if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
-            let saved = self.take_process_context();
-            self.run_proc_fsm(pid);
-            self.restore_process_context(saved);
+            // A top-level FSM wake-up starts from an empty context; taking
+            // and restoring the 18 fields moved ~10% of this function's
+            // time for nothing. Reset only if the run left something behind.
+            if self.process_context_is_default() {
+                self.run_proc_fsm(pid);
+                if !self.process_context_is_default() {
+                    self.restore_process_context(ProcessContext::default());
+                }
+            } else {
+                let saved = self.take_process_context();
+                self.run_proc_fsm(pid);
+                self.restore_process_context(saved);
+            }
             self.auto_loop_vars.truncate(saved_auto_len);
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            let mine = self.name_resolve_hint.replace(saved_hint);
+            Self::recycle_string(&mut self.hint_string_pool, mine);
             return;
         }
         // Fast path: if we have no saved process context for this pid AND
@@ -38023,7 +38179,8 @@ impl Simulator {
             }
             self.method_local_base = saved_mlb;
             self.auto_loop_vars.truncate(saved_auto_len);
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            let mine = self.name_resolve_hint.replace(saved_hint);
+            Self::recycle_string(&mut self.hint_string_pool, mine);
             return;
         }
         // The caller's context is MOVED aside (the restore below overwrites
@@ -38060,23 +38217,16 @@ impl Simulator {
             if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
                 // (a) subroutine-frame merge
                 if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
-                    // `parent_ctx` mutably borrows `self`, so snapshot the
-                    // child's generations first to avoid a self-borrow clash.
-                    let child_gen = self.local_gen_stack.clone();
                     Self::merge_fork_writes(
                         &mut parent_ctx.local_stack,
-                        &parent_ctx.local_gen_stack,
-                        &child_frames,
-                        &child_gen,
+                        child_frames,
                         baseline,
                     );
                 } else {
                     // Parent is the active process — its context is `saved`.
                     Self::merge_fork_writes(
                         &mut saved.local_stack,
-                        &saved.local_gen_stack,
-                        &child_frames,
-                        &self.local_gen_stack,
+                        child_frames,
                         baseline,
                     );
                 }
@@ -38318,9 +38468,12 @@ impl Simulator {
             f.regs.resize(f.compiled.num_regs as usize, Value::zero(1));
         }
         std::mem::swap(&mut self.vm_regs, &mut f.regs);
-        let saved_hint = self.name_resolve_hint.borrow().clone();
+        let saved_hint = self.name_resolve_hint.borrow_mut().take();
         if !f.scope.is_empty() {
-            *self.name_resolve_hint.borrow_mut() = Some(f.scope.clone());
+            let hint = Self::pooled_string(&mut self.hint_string_pool, &f.scope);
+            *self.name_resolve_hint.borrow_mut() = Some(hint);
+        } else {
+            *self.name_resolve_hint.borrow_mut() = saved_hint.clone();
         }
         let pd = *f.precision_diff.get_or_insert_with(|| {
             let (_, prec_exp) = {
@@ -38385,7 +38538,7 @@ impl Simulator {
                             break;
                         }
                         if !f.is_always {
-                            *self.name_resolve_hint.borrow_mut() = saved_hint;
+                            Self::recycle_string(&mut self.hint_string_pool, self.name_resolve_hint.replace(saved_hint.clone()));
                             self.settle_combinatorial();
                             return;
                         }
@@ -38401,7 +38554,7 @@ impl Simulator {
                     }
                 }
             }
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
+            Self::recycle_string(&mut self.hint_string_pool, self.name_resolve_hint.replace(saved_hint.clone()));
             self.proc_fsm.insert(pid, f);
             self.settle_combinatorial();
             return;
@@ -38453,7 +38606,7 @@ impl Simulator {
             if !f.is_always {
                 // An `initial` body ran to completion: done for good.
                 std::mem::swap(&mut self.vm_regs, &mut f.regs);
-                *self.name_resolve_hint.borrow_mut() = saved_hint;
+                Self::recycle_string(&mut self.hint_string_pool, self.name_resolve_hint.replace(saved_hint.clone()));
                 self.settle_combinatorial();
                 return;
             }
@@ -38468,7 +38621,7 @@ impl Simulator {
             }
         }
         std::mem::swap(&mut self.vm_regs, &mut f.regs);
-        *self.name_resolve_hint.borrow_mut() = saved_hint;
+        Self::recycle_string(&mut self.hint_string_pool, self.name_resolve_hint.replace(saved_hint));
         self.proc_fsm.insert(pid, f);
         self.settle_combinatorial();
     }
@@ -38566,31 +38719,13 @@ impl Simulator {
     /// whole-frame merge so the §9.3.2 write-visibility guarantee still
     /// holds. Only keys that exist in the parent's frame are propagated (a
     /// key the child declared itself, like a loop-local, is child-private).
-    /// Write a fork child's changed locals back into the parent's frames.
-    /// `parent_gens` / `child_gens` are the `local_gen_stack`s of the parent
-    /// (the frame set it owns *right now*) and the child (the frame set it
-    /// inherited at fork time). For slot index `i` we only propagate when the
-    /// two generations agree: slot `i` in the parent must still be the very
-    /// activation the child forked from. A fork child that outlives its
-    /// creating method and keeps writing its *stale* automatic locals must not
-    /// clobber the unrelated activation that now occupies the same slot
-    /// (regression 3627: an alpha reader orphaned by `join_any` kept overwriting
-    /// beta's `count` with its own stale value).
     fn merge_fork_writes(
         parent_frames: &mut [HashMap<String, Value>],
-        parent_gens: &[u64],
         child_frames: &[HashMap<String, Value>],
-        child_gens: &[u64],
         baseline: Option<&Vec<HashMap<String, Value>>>,
     ) {
         let n = parent_frames.len().min(child_frames.len());
         for i in 0..n {
-            let same_activation = parent_gens.get(i).copied() == child_gens.get(i).copied();
-            if !same_activation {
-                // The parent slot `i` no longer belongs to the activation this
-                // child forked from — keep this child's locals out of it.
-                continue;
-            }
             for (k, v) in &child_frames[i] {
                 if !parent_frames[i].contains_key(k) {
                     continue;
@@ -38603,62 +38738,6 @@ impl Simulator {
                     continue;
                 }
                 parent_frames[i].insert(k.clone(), v.clone());
-            }
-        }
-    }
-
-    /// IEEE 1800-2023 §6.21/§9.3.2 live-share: a fork child's write to an
-    /// automatic local it INHERITED from a (suspended) parent must be visible
-    /// to the parent immediately, not merely merged when the child later
-    /// finishes (see `propagate_fork_locals_to_parent`). This matters for the
-    /// UVM sequencer watchdog (`m_safe_select_item`): a `fork … join_none`
-    /// child writes `select_process = process::self()` and then blocks forever
-    /// on `await()`, while the parent blocks on `wait(select_process != null)`
-    /// — a cross-process handshake that only works if the write is shared
-    /// live. Mirror this one key into the parent's same-generation frame slot
-    /// so a parked `wait(cond)` waiter (which `assign_value` re-evaluates via
-    /// `check_condition_waiters_for_write` immediately after) observes the
-    /// fresh value. Gated on: the writer is a fork child with a recorded
-    /// baseline, the key was inherited (present in that slot's baseline) and
-    /// changed, the parent is suspended with a context, and the frame
-    /// generations still match (the slot still holds the activation this child
-    /// forked from).
-    fn live_mirror_fork_child_write(&mut self, key: &str, val: &Value, frame_idx: usize) {
-        let pid = self.current_pid;
-        // Cheap reject: only fork children with a recorded fork-time baseline
-        // need live-sharing (they hold a COPY of the parent's locals).
-        if self.fork_baselines.is_empty() || !self.fork_baselines.contains_key(&pid) {
-            return;
-        }
-
-        let Some(&parent_pid) = self.process_parents.get(&pid) else {
-            return;
-        };
-        if parent_pid == pid {
-            return;
-        }
-        let Some(baseline) = self.fork_baselines.get(&pid) else {
-            return;
-        };
-        // Only an INHERITED local that the child actually changed is shared
-        // live; a merely-inherited-unchanged value must not clobber a parent
-        // write (same gate `merge_fork_writes` uses for the completion merge).
-        if !baseline
-            .get(frame_idx)
-            .is_some_and(|f| f.get(key).is_some_and(|old| old != val))
-        {
-            return;
-        }
-        let child_gen = self.local_gen_stack.get(frame_idx).copied();
-        let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) else {
-            return;
-        };
-        if parent_ctx.local_gen_stack.get(frame_idx).copied() != child_gen {
-            return;
-        }
-        if let Some(frame) = parent_ctx.local_stack.get_mut(frame_idx) {
-            if frame.contains_key(key) {
-                frame.insert(key.to_string(), val.clone());
             }
         }
     }
@@ -39673,89 +39752,50 @@ impl Simulator {
                     // (the `::` static form). Stage 1b already tried — and
                     // failed — to resolve the receiver as a handle, so a
                     // bare class name reaching here is a static call.
-                    let scoped: Option<(String, String, Option<(String, String)>)> =
-                        match &func.kind {
+                    let scoped: Option<(String, String)> = match &func.kind {
+                        ExprKind::Ident(h)
+                            if h.path.len() == 2
+                                && self.module.classes.contains_key(&h.path[0].name.name) =>
+                        {
+                            Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
+                        }
+                        ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
+                            // `C#(T)::method(...)` — the receiver is a
+                            // parameterized static class. Stage 1b's receiver
+                            // is a HANDLE; a `Specialization` receiver is a
+                            // TYPE, so it reaches here (static form). Build
+                            // the concrete specialized class name and classify
+                            // its blocking method like the plain static form.
+                            ExprKind::Specialization { base, type_args_text } => {
+                                let bn = Self::leaf_ident_name(base).unwrap_or_default();
+                                if bn.is_empty() {
+                                    None
+                                } else {
+                                    let spec = format!(
+                                        "{}#({})",
+                                        bn,
+                                        Self::normalize_spec_ws(type_args_text)
+                                    );
+                                    let mut cand = vec![spec.clone(), bn];
+                                    cand.retain(|c| self.module.classes.contains_key(c));
+                                    cand.first()
+                                        .map(|c| (c.clone(), member.name.clone()))
+                                }
+                            }
                             ExprKind::Ident(h)
-                                if h.path.len() == 2
-                                    && self.module.classes.contains_key(&h.path[0].name.name) =>
+                                if h.path.len() == 1
+                                    && self
+                                        .module
+                                        .classes
+                                        .contains_key(&h.path[0].name.name) =>
                             {
-                                Some((h.path[0].name.name.clone(), h.path[1].name.name.clone(), None))
+                                Some((h.path[0].name.name.clone(), member.name.clone()))
                             }
-                            ExprKind::Ident(h) if h.path.len() == 2 => {
-                                // A module-scoped TYPEDEF receiver (`T::method`
-                                // where `T` aliases a class or a specialization,
-                                // e.g. `typedef uvm_config_db#(uvm_bitstream_t)
-                                // uvm_config_int;`). The typedef alias is not
-                                // itself a class, so follow it to the real class
-                                // (and its specialization) so a blocking static
-                                // task call is recognized and inlined like the
-                                // `Class::` / `Class#(params)::` spellings.
-                                let tname = &h.path[0].name.name;
-                                let spec = self.resolve_typedef_spec(tname);
-                                spec.clone()
-                                    .map(|(b, _s)| (b, h.path[1].name.name.clone(), spec))
-                                    .or_else(|| {
-                                        self.resolve_simple_typedef_class(tname)
-                                            .map(|c| (c, h.path[1].name.name.clone(), None))
-                                    })
-                            }
-                            ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
-                                // `C#(T)::method(...)` — the receiver is a
-                                // parameterized static class. Stage 1b's receiver
-                                // is a HANDLE; a `Specialization` receiver is a
-                                // TYPE, so it reaches here (static form). Build
-                                // the concrete specialized class name and classify
-                                // its blocking method like the plain static form.
-                                ExprKind::Specialization { base, type_args_text } => {
-                                    let bn = Self::leaf_ident_name(base).unwrap_or_default();
-                                    if bn.is_empty() {
-                                        None
-                                    } else {
-                                        let spec = format!(
-                                            "{}#({})",
-                                            bn,
-                                            Self::normalize_spec_ws(type_args_text)
-                                        );
-                                        let mut cand = vec![spec.clone(), bn];
-                                        cand.retain(|c| self.module.classes.contains_key(c));
-                                        cand.first()
-                                            .map(|c| (c.clone(), member.name.clone(), None))
-                                    }
-                                }
-                                ExprKind::Ident(h) if h.path.len() == 1 => {
-                                    let bn = &h.path[0].name.name;
-                                    if self.module.classes.contains_key(bn) {
-                                        Some((bn.clone(), member.name.clone(), None))
-                                    } else {
-                                        // A module/package TYPEDEF receiver
-                                        // (`uvm_config_int::wait_modified` where
-                                        // `typedef uvm_config_db#(uvm_bitstream_t)
-                                        // uvm_config_int;`): the typedef alias is
-                                        // not itself a class, so the static-call
-                                        // dispatcher must follow it to the real
-                                        // class (and its specialization, so the
-                                        // static-collection store keys match the
-                                        // `Class#(params)::` spelling) before
-                                        // inlining a blocking task. Otherwise the
-                                        // call is treated as synchronous and its
-                                        // event wait spins forever.
-                                        let spec = self.resolve_typedef_spec(bn);
-                                        let simple = if spec.is_none() {
-                                            self.resolve_simple_typedef_class(bn)
-                                                .map(|c| (c.clone(), member.name.clone(), None))
-                                        } else {
-                                            None
-                                        };
-                                        spec.clone()
-                                            .map(|(b, _s)| (b, member.name.clone(), spec))
-                                            .or(simple)
-                                    }
-                                }
-                                _ => None,
-                            },
                             _ => None,
-                        };
-                    if let Some((cls, mn, tf_spec)) = scoped {
+                        },
+                        _ => None,
+                    };
+                    if let Some((cls, mn)) = scoped {
                         // A `C#(params)::task` receiver dispatches on the
                         // bare class but must ALSO establish the receiver
                         // specialization as `current_spec`, or a bare type
@@ -39769,22 +39809,15 @@ impl Simulator {
                         // locals with `type_bindings={T:"T"}`, casting to
                         // `uvm_callback` failed, and every `$cast` inside the
                         // callback `get_all` saw a plain `uvm_callback` with
-                        // no callbacks. A TYPEDEF receiver (`T::task`, T a
-                        // typedef alias of a parameterized class) has no
-                        // `Specialization` receiver to seed `current_spec`
-                        // from, so `tf_spec` (resolved when the typedef was
-                        // followed to its class above) carries the same
-                        // specialization here.
-                        let mut recv_spec: Option<(String, String)> = tf_spec;
-                        if recv_spec.is_none() {
-                            if let ExprKind::MemberAccess { expr: mrecv, .. } = &func.kind {
-                                if let ExprKind::Specialization { .. } = &mrecv.kind {
-                                    recv_spec = self
-                                        .resolve_call_spec_params(
-                                            Self::extract_call_spec(&func.clone()),
-                                            &self.current_spec.clone(),
-                                        );
-                                }
+                        // no callbacks.
+                        let mut recv_spec: Option<(String, String)> = None;
+                        if let ExprKind::MemberAccess { expr: mrecv, .. } = &func.kind {
+                            if let ExprKind::Specialization { .. } = &mrecv.kind {
+                                recv_spec = self
+                                    .resolve_call_spec_params(
+                                        Self::extract_call_spec(&func.clone()),
+                                        &self.current_spec.clone(),
+                                    );
                             }
                         }
                         if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
@@ -43180,9 +43213,24 @@ impl Simulator {
             let all_zero = |v: &Value| -> bool {
                 !v.has_xz() && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Zero)
             };
-            match self.gate_fall_delay_by_id.get(&id) {
-                Some(&fall) if all_zero(&val) && !all_zero(&self.signal_table[id]) => fall,
-                _ => delay,
+            let fall = self.gate_fall_delay_by_id.get(&id).copied();
+            let off = self.gate_off_delay_by_id.get(&id).copied();
+            let all_z = |v: &Value| -> bool {
+                v.width > 0 && (0..v.width as usize).all(|i| v.get_bit(i) == LogicBit::Z)
+            };
+            if fall.is_none() && off.is_none() {
+                delay
+            } else if all_zero(&val) && !all_zero(&self.signal_table[id]) {
+                fall.unwrap_or(delay)
+            } else if all_z(&val) {
+                // §10.3.3 / §28.11: to z uses the turn-off delay; with only
+                // two delays given, the smaller of rise and fall.
+                off.unwrap_or_else(|| fall.map_or(delay, |f| f.min(delay)))
+            } else if val.has_xz() {
+                // To x: the smallest of the delays given.
+                [Some(delay), fall, off].into_iter().flatten().min().unwrap_or(delay)
+            } else {
+                delay
             }
         };
         let target_time = self.time + delay;
@@ -43883,6 +43931,9 @@ impl Simulator {
     /// drain and the commercial-order pre-edge-block drain (see
     /// XEZIM_WAITERS_FIRST in check_edges_inner).
     fn drain_triggered_event_waiters(&mut self) -> Vec<(usize, ProcCont)> {
+        if self.event_waiters.is_empty() {
+            return Vec::new();
+        }
         let waiters = std::mem::take(&mut self.event_waiters);
         self.prof_waiter_iters += waiters.len() as u64;
         self.event_waiters_swap.clear();
@@ -49564,12 +49615,16 @@ impl Simulator {
         // the FIRST assignment target after the call — `value = r.read(c)`
         // in uvm_config_db::get (issue #113). One-shot; also cleared at the
         // next function-call entry so it cannot leak further than that.
-        if let Some(nm) = self
-            .signals
-            .remove("__vif_return__")
-            .map(|x| x.to_sv_string())
-            .filter(|s| !s.is_empty())
+        // The marker is probed only when a `return <vif>` left one: the
+        // signal-map lookup was a string hash on EVERY assignment.
+        if self.vif_return_pending
+            && let Some(nm) = self
+                .signals
+                .remove("__vif_return__")
+                .map(|x| x.to_sv_string())
+                .filter(|s| !s.is_empty())
         {
+            self.vif_return_pending = false;
             let synth = Expression::new(
                 ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
                     root: None,
@@ -50061,19 +50116,6 @@ impl Simulator {
                                 val.clone()
                             };
                             self.local_stack[last_idx].insert(name.clone(), fitted.clone());
-
-                            // §6.21 two-way: a fork CHILD's write to an
-                            // automatic local it inherited from a suspended
-                            // parent must be visible to the parent NOW, not
-                            // only when the child finishes. Live-mirror it so
-                            // a parked `wait(cond)` observes it immediately.
-                            if !self.in_const_param_eval {
-                                self.live_mirror_fork_child_write(
-                                    name.as_str(),
-                                    &fitted,
-                                    last_idx,
-                                );
-                            }
                             // §6.21: write a `static` subroutine local through
                             // to its live shared cell so other simultaneous
                             // activations (recursive phase re-entry / method)
@@ -56137,24 +56179,8 @@ impl Simulator {
                     // `dynamic_arrays`/`arrays`/`associative_arrays` here and
                     // falls through to a scalar bit-select — reading null.
                     if let Some((cls, coll)) = name.split_once('.') {
-                        // §8.25: the leading segment may be a class-LOCAL
-                        // TYPEDEF alias of a parameterized class (`this_type`
-                        // -> `seqlib#(REQ,RSP)`), which the parser folds into
-                        // a dotted member access `this_type.member`. Resolve it
-                        // to the concrete per-spec class, so a STATIC-collection
-                        // ELEMENT read `this_type::m[i]` keys under the per-spec
-                        // cell (`seqlib#item,item::m`) that the ::-form size()
-                        // and bare static writes share — NOT the literal
-                        // `this_type.m` (which reads empty).
-                        let real_cls = if self.module.classes.contains_key(cls) {
-                            Some(cls.to_string())
-                        } else {
-                            self.resolve_typedef_spec(cls)
-                                .map(|(b, _)| b)
-                                .filter(|b| self.module.classes.contains_key(b))
-                        };
-                        if let Some(real_cls) = real_cls
-                            && self.member_is_static_coll(&real_cls, coll)
+                        if self.module.classes.contains_key(cls)
+                            && self.member_is_static_coll(cls, coll)
                         {
                             // Sibling-collision storage is per-DECLARING class
                             // (`ClassName::coll` — e.g. the four
@@ -56163,29 +56189,13 @@ impl Simulator {
                             // collection keeps the BARE name its accessors and
                             // store use. Match `spec_static_coll_key`.
                             name = if self.static_coll_name_collides(coll) {
-                                std::borrow::Cow::Owned(
-                                    self.static_prop_key(&real_cls, coll)
-                                        .unwrap_or_else(|| coll.to_string()),
-                                )
-                            } else if self.class_is_parameterized(&real_cls) {
+                                std::borrow::Cow::Owned(self.static_prop_key(cls, coll).unwrap_or_else(|| coll.to_string()))
+                            } else if self.class_is_parameterized(cls) {
                                 // PARAMETERIZED class: elements live
                                 // per-specialization via the qualified form
                                 // (§8.25) — see the matching receiver rewrite
-                                // in the MemberAccess handler. For a TYPEDEF
-                                // alias of a parameterized class (`this_type`)
-                                // resolve its specialization explicitly, since
-                                // the MemberAccess pre-rewrite only fires for a
-                                // plain class receiver.
-                                if let Some((b, sig)) = self.resolve_typedef_spec(cls) {
-                                    std::borrow::Cow::Owned(format!(
-                                        "{}#{}::{}",
-                                        b,
-                                        self.canonicalize_spec_sig(&b, &sig),
-                                        coll
-                                    ))
-                                } else {
-                                    name
-                                }
+                                // in the MemberAccess handler.
+                                name
                             } else {
                                 std::borrow::Cow::Owned(coll.to_string())
                             };
@@ -56209,11 +56219,7 @@ impl Simulator {
                             }
                         }
                     }
-                    if self.module.arrays.contains_key(&*name)
-                        || self.module.dynamic_arrays.contains(&*name)
-                        || self.is_associative_array(&name)
-                        || self.is_per_spec_dynamic_static(&name)
-                    {
+                    if self.module.arrays.contains_key(&*name) || self.module.dynamic_arrays.contains(&*name) || self.is_associative_array(&name) {
                         // Check if `name` is a queue/dynamic array. This
                         // handles struct-field sub-paths (`info.addr`) and
                         // class-property paths (`c.addr`) that aren't in
@@ -64558,9 +64564,6 @@ impl Simulator {
                         name = std::borrow::Cow::Owned(rn.to_string());
                     } else {
                         let spec_key = self.spec_static_coll_key(&name);
-                        // §8.25: adopt the per-spec key when `spec_static_coll_key`
-                        // specialized this collection (`Class#spec::member`); a
-                        // bare (unparameterized) collection keeps its name.
                         if let std::borrow::Cow::Owned(k) = spec_key {
                             name = std::borrow::Cow::Owned(k);
                         } else if let Some(scoped) = self.instance_assoc_member(&name) {
@@ -65014,9 +65017,7 @@ impl Simulator {
                                 }
                                 self.continue_flag = false;
                             }
-                        } else if self.module.dynamic_arrays.contains(&*name)
-                            || self.is_per_spec_dynamic_static(&name)
-                        {
+                        } else if self.module.dynamic_arrays.contains(&*name) {
                             // Queue / dynamic array: iterate 0..current size.
                             let size = self.get_queue_size(&name);
                             for i in 0..size {
@@ -65538,6 +65539,7 @@ impl Simulator {
                     if let Some(nm) = self.resolve_vif_rhs_name_strict(e) {
                         self.signals
                             .insert("__vif_return__".to_string(), Value::from_string(&nm));
+                        self.vif_return_pending = true;
                     }
                     // §13.4: `return <collection>` — record the collection's
                     // storage name so the caller's assign can copy elements
@@ -72929,13 +72931,12 @@ impl Simulator {
             if let Some((base, sig)) = self.resolve_typedef_spec(&hier.path[0].name.name) {
                 let member = &hier.path[1].name.name;
                 if self.member_is_static_coll(&base, member) {
-                    let r = format!(
+                    return format!(
                         "{}#{}::{}",
                         base,
                         self.canonicalize_spec_sig(&base, &sig),
                         member
                     );
-                    return r;
                 }
             }
             // §8.9: a 2-segment path `[Class, member]` where the leading
@@ -72946,44 +72947,26 @@ impl Simulator {
             // `A.settings.size()` / `A.settings[k]` must resolve to that
             // per-class key, not collapse to the bare `settings` (which would
             // hit whichever sibling stored under the bare name).
-            if hier.path[0].selects.is_empty() {
-                let lead = hier.path[0].name.name.clone();
-                // The leading segment may be a class-LOCAL through a typedef
-                // alias (`this_type` inside a base method — each class
-                // declares `typedef base this_type`), so resolve it to the
-                // concrete class first; a real class name resolves to itself.
-                let cls = self
-                    .resolve_typeref_class_name_str(&lead)
-                    .filter(|c| self.module.classes.contains_key(c))
-                    .unwrap_or(lead.clone());
-                if self.module.classes.contains_key(&cls) {
-                    let member = &hier.path[1].name.name;
-                    if self.member_is_static_coll(&cls, member) {
-                        if let Some(key) = self.static_prop_key(&cls, member) {
-                        // Per-declaring-class storage (§8.9). A static
-                        // collection COLLIDES when two classes declare it;
-                        // and a derived class that REDECLARES a static
-                        // collection (rather than merely inheriting it) also
-                        // gets its OWN cell keyed by the declaring class —
-                        // `d::m_q` must not share `b::m_q` when `d` declares
-                        // its own `static m_q`. Inherited-only access (the
-                        // sole declarer is an ancestor) keeps the bare name,
-                        // sharing the ancestor's single cell. NOT the
-                        // `#spec` case here — that is
+            if hier.path[0].selects.is_empty()
+                && self.module.classes.contains_key(&hier.path[0].name.name)
+            {
+                let cls = hier.path[0].name.name.clone();
+                let member = &hier.path[1].name.name;
+                if self.member_is_static_coll(&cls, member) {
+                    if let Some(key) = self.static_prop_key(&cls, member) {
+                        // Sibling-class collision: the bare name is stored per
+                        // DECLARING class. NOT the `#spec` case here — that is
                         // handled by the typedef-alias block above and by
                         // `spec_static_coll_key`, and intercepting it would
                         // split storage for a parameterized subclass
                         // (`simple_seq_lib::typewide` reading a per-spec key
                         // that registration writes under the bare name).
-                        if self.static_coll_name_collides(member)
-                            || self.class_declares_coll(&cls, member)
-                        {
+                        if self.static_coll_name_collides(member) {
                             return key;
                         }
                     }
                 }
             }
-        }
         }
 
         // Multi-segment suffix fallback: for paths like "uut.picorv32_core.cpu_state",
@@ -76438,9 +76421,29 @@ impl Simulator {
                         return self.signal_widths[id];
                     }
                 }
+                // A bare leaf may be a local or a signal, so the id cache above
+                // is skipped for it and the whole ladder below re-ran on every
+                // assignment. Its STATIC answers (a signal's declared width, a
+                // declared local/module width) are remembered per identifier
+                // span; the class-property and default answers are not.
+                // Synthetic identifiers all carry the dummy (0, 0) span and
+                // must not share a cache slot: a never-driven trireg's implicit
+                // self-driver read a 1-bit width from another synthetic name.
+                let leaf_key = if is_ambiguous_leaf && !(h.span.start == 0 && h.span.end == 0) {
+                    let k = (h.span.start as usize, h.span.end as usize);
+                    if let Some(&w) = self.lhs_leaf_width_cache.get(&k) {
+                        return w;
+                    }
+                    Some(k)
+                } else {
+                    None
+                };
                 let name = self.resolve_hier_name(h);
                 if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     h.cached_signal_id.set(Some(id));
+                    if let Some(k) = leaf_key {
+                        self.lhs_leaf_width_cache.insert(k, self.signal_widths[id]);
+                    }
                     return self.signal_widths[id];
                 }
                 // A width of 0 is never valid for an lvalue — it usually
@@ -76448,6 +76451,9 @@ impl Simulator {
                 // class-handle elsewhere. Ignore it and fall through.
                 if let Some(w) = self.widths.get(&*name).copied() {
                     if w > 0 {
+                        if let Some(k) = leaf_key {
+                            self.lhs_leaf_width_cache.insert(k, w);
+                        }
                         return w;
                     }
                 }
@@ -79434,28 +79440,6 @@ impl Simulator {
         }
         let leaf = name.rsplit('.').next().unwrap_or(name);
         self.module.assoc_elem_widths.get(leaf).copied()
-    }
-
-    /// §8.25: a per-specialization static collection key
-    /// (`Class#spec::member`, e.g. `seqlib#int::m_typewide_sequences`)
-    /// produced by `spec_static_coll_key` / the typed-qualifier rewrite. The
-    /// BARE `member` may be registered in `module.dynamic_arrays`, but the
-    /// per-spec key itself is not — and when a DERIVED class re-declares the
-    /// same static (`seqlib_RST extends seqlib#(int); static … m_…;`), even the
-    /// bare member may not sit in `module.dynamic_arrays`. Element reads
-    /// (`Class#spec::m[i]`) and `foreach` must still treat the key as a
-    /// queue/dynamic collection (the mirror of `is_associative_array`'s
-    /// `#…::` branch). ASSOC collections are handled separately by
-    /// `is_associative_array`, so this need only confirm the member is a
-    /// static collection reached through a per-spec key.
-    fn is_per_spec_dynamic_static(&self, name: &str) -> bool {
-        if let Some((head, sig_member)) = name.split_once('#')
-            && let Some((_, member)) = sig_member.rsplit_once("::")
-            && self.member_is_static_coll(head, member)
-        {
-            return true;
-        }
-        false
     }
 
     /// Does `name` resolve to a signal under the active process scope
@@ -86482,21 +86466,11 @@ impl Simulator {
     }
 
     /// Push a local frame, keeping the type overlay in lockstep.
-    /// Monotonic frame-generation source for `local_gen_stack`. Each pushed
-    /// frame slot gets a distinct generation so separate activations that
-    /// reuse a slot index remain distinguishable (regression 3627).
-    fn next_frame_gen(&mut self) -> u64 {
-        self.frame_gen += 1;
-        self.frame_gen
-    }
-
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {
         if self.name_stats_on {
             self.name_stats[2].set(self.name_stats[2].get() + 1);
         }
         self.local_stack.push(f);
-        let fgen = self.next_frame_gen();
-        self.local_gen_stack.push(fgen);
         self.local_type_stack
             .push((HashMap::default(), HashMap::default()));
     }
@@ -86506,7 +86480,6 @@ impl Simulator {
     /// use `pop_local_frame_take` when the caller needs the contents.
     fn pop_local_frame(&mut self) {
         self.local_type_stack.pop();
-        self.local_gen_stack.pop();
         if let Some(mut f) = self.local_stack.pop() {
             if self.frame_pool.len() < 64 {
                 f.clear();
@@ -86518,7 +86491,6 @@ impl Simulator {
     /// Pop a local frame and hand the map to the caller (writeback reads).
     fn pop_local_frame_take(&mut self) -> Option<HashMap<String, Value>> {
         self.local_type_stack.pop();
-        self.local_gen_stack.pop();
         self.local_stack.pop()
     }
 
@@ -86983,11 +86955,9 @@ impl Simulator {
         // (§8.25). All specializations of one class share the same
         // `class_name` (they differ only in `type_bindings`), so a negative
         // cached for one binding (e.g. `T->int`) would poison the other
-        // (`T->struct s`), silently breaking the per-instance struct-leaf
-        // machinery: `pairi#(int).first=5` then made `pairi#(s).first` read x
-        // and an equality/`%p` fall apart. Skip the negative cache for such
-        // properties so the verdict below re-resolves the concrete binding
-        // on THIS instance.
+        // (`T->struct s`) — `pairi#(int).first=5` then made `pairi#(s).first`
+        // read x and an equality/`%p` fall apart. Such properties skip the
+        // negative cache and re-resolve the concrete binding per instance.
         let is_type_param_prop = if class_name.is_empty() {
             false
         } else {
@@ -87076,10 +87046,7 @@ impl Simulator {
         // depends on this instance's binding, and caching a `None` under the
         // (shared) class_name would poison sibling specializations that bound
         // the parameter to an actual struct.
-        if verdict.is_none()
-            && !class_name.is_empty()
-            && !is_type_param_prop
-        {
+        if verdict.is_none() && !class_name.is_empty() && !is_type_param_prop {
             self.class_prop_struct_neg
                 .borrow_mut()
                 .entry(class_name.to_string())
@@ -90391,47 +90358,6 @@ impl Simulator {
         }
     }
 
-    /// §21.2.1.7 / §7.2: render a WHOLE unpacked-struct CLASS property
-    /// (`c.first` where `first` is a `typedef struct` bound through a class
-    /// type parameter, e.g. `uvm_built_in_pair #(s,s)::first`) the way a
-    /// module-scope struct renders. The leaves of such a property live in the
-    /// instance `PropMap` keyed `<prop>.<member>` (and, for nested members,
-    /// `<prop>.<m1>.<m2>`), whereas the name-based `render_p_var` path
-    /// resolves `first` as an untyped strip and printed the raw packed value
-    /// (`pair : 18446743648507789112`) or `x` instead of `'{a:-100, b:-200}`.
-    /// `leaf` is the PropMap key prefix (initially the bare `prop`; recurses
-    /// into nested struct members).
-    fn render_p_class_prop_struct(
-        &mut self,
-        handle: usize,
-        leaf: &str,
-        su: &crate::ast::types::StructUnionType,
-    ) -> String {
-        let mut parts = Vec::new();
-        for m in &su.members {
-            for md in &m.declarators {
-                let key = format!("{}.{}", leaf, md.name.name);
-                let v = self
-                    .heap
-                    .get(handle)
-                    .and_then(|o| o.as_ref())
-                    .and_then(|i| i.properties.get(&key))
-                    .cloned();
-                let rendered = match self.resolve_dt(&m.data_type) {
-                    DataType::Struct(sub) if Self::spreads_member_wise(&sub) => {
-                        self.render_p_class_prop_struct(handle, &key, &sub)
-                    }
-                    _ => v
-                        .as_ref()
-                        .map(|vv| self.render_p_value_typed(vv, &m.data_type))
-                        .unwrap_or_else(|| "x".into()),
-                };
-                parts.push(format!("{}:{}", md.name.name, rendered));
-            }
-        }
-        format!("'{{{}}}", parts.join(", "))
-    }
-
     /// Render one `%p` member value: strings as quoted text, reals as reals,
     /// everything else in decimal (LRM §21.2.1.7 assignment-pattern form).
     /// §21.2.1.7 `%0p`: rewrite a `%p` assignment-pattern rendering into the
@@ -90496,6 +90422,47 @@ impl Simulator {
             }
         }
         out
+    }
+
+    /// §21.2.1.7 / §7.2: render a WHOLE unpacked-struct CLASS property
+    /// (`c.first` where `first` is a `typedef struct` bound through a class
+    /// type parameter, e.g. `uvm_built_in_pair #(s,s)::first`) the way a
+    /// module-scope struct renders. The leaves of such a property live in the
+    /// instance `PropMap` keyed `<prop>.<member>` (and, for nested members,
+    /// `<prop>.<m1>.<m2>`), whereas the name-based `render_p_var` path
+    /// resolves `first` as an untyped strip and printed the raw packed value
+    /// (`pair : 18446743648507789112`) or `x` instead of `'{a:-100, b:-200}`.
+    /// `leaf` is the PropMap key prefix (initially the bare `prop`; recurses
+    /// into nested struct members).
+    fn render_p_class_prop_struct(
+        &mut self,
+        handle: usize,
+        leaf: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) -> String {
+        let mut parts = Vec::new();
+        for m in &su.members {
+            for md in &m.declarators {
+                let key = format!("{}.{}", leaf, md.name.name);
+                let v = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.properties.get(&key))
+                    .cloned();
+                let rendered = match self.resolve_dt(&m.data_type) {
+                    DataType::Struct(sub) if Self::spreads_member_wise(&sub) => {
+                        self.render_p_class_prop_struct(handle, &key, &sub)
+                    }
+                    _ => v
+                        .as_ref()
+                        .map(|vv| self.render_p_value_typed(vv, &m.data_type))
+                        .unwrap_or_else(|| "x".into()),
+                };
+                parts.push(format!("{}:{}", md.name.name, rendered));
+            }
+        }
+        format!("'{{{}}}", parts.join(", "))
     }
 
     fn render_p_value(v: &Value, is_string: bool) -> String {
@@ -91358,30 +91325,7 @@ impl Simulator {
         let saved_iter = self.locator_iter.clone();
         self.locator_iter = iter.unwrap_or("item").to_string();
 
-        // §7.12.2: `q.sort/.rsort with (item.expr)` sorts by the value of the
-        // filter expression. When that expression is STRING-valued (e.g.
-        // `succ_q.sort with (item.get_full_name())` in the UVM phase hopper),
-        // the key's correct ordering is the CHARACTER-LEXICOGRAPHIC order
-        // (SV `<` on strings §11.4.8), NOT the little-endian byte-packed i64
-        // that `to_i64` would yield — the numeric encoding of "uvm" sorts
-        // before "common.run" even though the string compares after. Detect
-        // a string-typed filter and sort on the rendered text.
-        //
-        // A bare `item`, or the declared iterator, has the SAME type as the
-        // collection element, so sorting a string collection with `(item)`
-        // is also lexicographic even though `expr_is_string_valued` can't
-        // resolve the loop-local's declared type.
-        let bare_elem = match &filter.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 => {
-                let nm = &h.path[0].name.name;
-                nm == "item" || iter.is_some_and(|it| nm == it)
-            }
-            _ => false,
-        };
-        let str_keys = self.expr_is_string_valued(filter)
-            || (bare_elem && self.is_string_collection(arr));
         let mut keys: Vec<i64> = Vec::with_capacity(size);
-        let mut skeys: Vec<String> = Vec::with_capacity(size);
         for i in 0..size {
             let elem = format!("{}[{}]", arr, i);
             if elem_su.is_some() {
@@ -91396,12 +91340,7 @@ impl Simulator {
                 }
                 f.insert("item".to_string(), v);
             }
-            let kv = self.eval_expr(filter);
-            if str_keys {
-                skeys.push(kv.to_sv_string());
-            } else {
-                keys.push(kv.to_i64().unwrap_or(0));
-            }
+            keys.push(self.eval_expr(filter).to_i64().unwrap_or(0));
         }
 
         self.item_alias = saved_alias;
@@ -91426,20 +91365,8 @@ impl Simulator {
         let mut order: Vec<usize> = (0..size).collect();
         match method {
             // `sort_by_key` is stable, so equal keys keep their order.
-            "sort" => {
-                if str_keys {
-                    order.sort_by_key(|&i| skeys[i].clone());
-                } else {
-                    order.sort_by_key(|&i| keys[i]);
-                }
-            }
-            "rsort" => {
-                if str_keys {
-                    order.sort_by_key(|&i| std::cmp::Reverse(skeys[i].clone()));
-                } else {
-                    order.sort_by_key(|&i| std::cmp::Reverse(keys[i]));
-                }
-            }
+            "sort" => order.sort_by_key(|&i| keys[i]),
+            "rsort" => order.sort_by_key(|&i| std::cmp::Reverse(keys[i])),
             // `unique` is a LOCATOR (§7.12.1): it returns a queue and must not
             // reorder or shrink the source. Handled by the locator path.
             _ => return,
@@ -92375,10 +92302,6 @@ impl Simulator {
         if bm == BuiltinM::Sort {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
-                // §7.12.2 + §11.4.8: a STRING element collection sorts
-                // lexicographically, not by its little-endian packed-byte
-                // integer ("uvm" would sort before "common.run").
-                let is_str = self.is_string_collection(obj_name);
                 let mut elements = Vec::new();
                 for i in 0..cur_size {
                     if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
@@ -92386,11 +92309,7 @@ impl Simulator {
                         elements.push(v);
                     }
                 }
-                if is_str {
-                    elements.sort_by(|a, b| a.to_sv_string().cmp(&b.to_sv_string()));
-                } else {
-                    elements.sort_by_key(|a| a.to_u64().unwrap_or(0));
-                }
+                elements.sort_by_key(|a| a.to_u64().unwrap_or(0));
                 for (i, v) in elements.into_iter().enumerate() {
                     self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
                 }
@@ -92400,7 +92319,6 @@ impl Simulator {
         if bm == BuiltinM::Rsort {
             let cur_size = self.get_queue_size(obj_name) as usize;
             if cur_size > 0 {
-                let is_str = self.is_string_collection(obj_name);
                 let mut elements = Vec::new();
                 for i in 0..cur_size {
                     if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i))
@@ -92408,11 +92326,7 @@ impl Simulator {
                         elements.push(v);
                     }
                 }
-                if is_str {
-                    elements.sort_by(|a, b| b.to_sv_string().cmp(&a.to_sv_string()));
-                } else {
-                    elements.sort_by(|a, b| b.to_u64().unwrap_or(0).cmp(&a.to_u64().unwrap_or(0)));
-                }
+                elements.sort_by(|a, b| b.to_u64().unwrap_or(0).cmp(&a.to_u64().unwrap_or(0)));
                 for (i, v) in elements.into_iter().enumerate() {
                     self.set_signal_value_by_name(&format!("{}[{}]", obj_name, i), v);
                 }
@@ -92769,70 +92683,6 @@ impl Simulator {
     /// that revisits an already-seen class is cleared to `None`.
     fn sanitize_class_hierarchy(&mut self) {
         let names: Vec<String> = self.module.classes.keys().cloned().collect();
-        // Resolve each `extends` base that is a typedef ALIAS to its concrete
-        // class key. `class d extends simple_lib` where `simple_lib` is
-        // `typedef base#(bit) simple_lib` stores `extends = "simple_lib"`, which
-        // is NOT a `module.classes` key — every hierarchy walk (method lookup,
-        // inherited-field registration, property resolution) then stops one
-        // hop early and loses the base's members/methods. Rewrite it to the
-        // concrete key (`"base"`) so the walks see the real ancestor.
-        for cname in &names {
-            let mut resolved_extends = None;
-            let mut resolved_args: Vec<String> = Vec::new();
-            {
-                let cd = self.module.classes.get(cname);
-                resolved_extends = cd.and_then(|cd| cd.extends.clone()).and_then(|e| {
-                    if self.module.classes.contains_key(&e) {
-                        Some(e)
-                    } else {
-                        self.resolve_typeref_class_name_str(&e)
-                            .filter(|r| self.module.classes.contains_key(r))
-                    }
-                });
-                // When the `extends` alias is a TYPEDEF of a PARAMETERIZED
-                // class (`class D extends simple_lib` where
-                // `typedef uvm_sequence_library#(sequence_item) simple_lib;`),
-                // `extends_type_args` was recorded as EMPTY (a bare alias name).
-                // Every ancestor walk that rebinds the base's type params
-                // (`static_receiver_spec`, `static_prop_key`) then cites only
-                // the base class with its UNBOUND declared params, so a derived
-                // instance's base method resolves `this_type` to the DEFAULT
-                // specialization instead of the concrete one. Carry the alias's
-                // specialization args here (positional, per the base's
-                // param_order) so those walks rebind REQ/RSP to `simple_item`.
-                if let Some(real) = &resolved_extends {
-                    if let Some(cd) = self.module.classes.get(cname) {
-                        let already = cd
-                            .extends_type_args
-                            .iter()
-                            .any(|a| a != "<unknown>");
-                        if !already
-                            && self.module.classes.get(real).is_some_and(|p| {
-                                !p.type_param_names.is_empty() || !p.param_order.is_empty()
-                            })
-                            && let Some((rb, rsig)) =
-                                self.resolve_typedef_spec(cd.extends.as_deref().unwrap_or(""))
-                            && rb == *real
-                        {
-                            resolved_args = Self::split_spec_args(&rsig);
-                        }
-                    }
-                }
-            }
-            if let Some(real) = resolved_extends {
-                if let Some(cd) = self
-                    .module
-                    .classes
-                    .get_mut(cname)
-                    .map(std::sync::Arc::make_mut)
-                {
-                    cd.extends = Some(real);
-                    if cd.extends_type_args.is_empty() && !resolved_args.is_empty() {
-                        cd.extends_type_args = resolved_args;
-                    }
-                }
-            }
-        }
         for start in names {
             let mut seen: HashSet<String> = HashSet::default();
             let mut cur = Some(start.clone());
@@ -93324,31 +93174,6 @@ impl Simulator {
             }
             break; // no default for this position — stop (leave partial)
         }
-        // §8.25: transitively resolve a type-param default that names ANOTHER
-        // type param of the same class (`RSP=REQ`, where `REQ` is bound to a
-        // concrete type). After the per-position substitution above, `REQ` is
-        // concrete at its own index; a later position whose default is `REQ`
-        // must follow it (`#(item, REQ)` -> `#(item, item)`), not leak the raw
-        // param name into the sig. Otherwise a static write that binds `REQ`
-        // and an instance-method read through `this_type` (which re-expands
-        // `REQ,RSP`) would key DIFFERENT cells -> systemverilog static
-        // collections (e.g. UVM's `m_typewide_sequences`) come up empty.
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for i in 0..frags.len() {
-                let f = frags[i].trim().to_string();
-                if let Some(j) = order.iter().position(|p| *p == f) {
-                    if let Some(bind) = frags.get(j) {
-                        let bind = bind.trim().to_string();
-                        if !bind.is_empty() && bind != f {
-                            frags[i] = bind.clone();
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
         let canon_frags: Vec<String> = frags.iter().map(|f| self.canonicalize_spec_frag(f)).collect();
         canon_frags.join(",")
     }
@@ -93406,42 +93231,6 @@ impl Simulator {
             }
         }
         std::borrow::Cow::Borrowed(name)
-    }
-
-    /// Resolve a bare static-collection member `name` to its storage key,
-    /// walking the class hierarchy of the given concrete class `ctx`.
-    /// Shared by the static-method path (ctx from `class_context_stack`) and
-    /// the instance-method path (ctx from the runtime class of `this`), so
-    /// a static COLLECTION (registered in `static_collections`, not in
-    /// `assoc_properties`/`queue_properties`) read/written BARE from an
-    /// instance method lands in the SAME shared store the static-method path
-    /// (and any `ClassName::m[...]` spelling) uses.
-    fn spec_static_coll_key_in_class(&self, name: &str, ctx: &str) -> String {
-        let mut cur = Some(ctx.to_string());
-        while let Some(cn) = cur {
-            if let Some(cd) = self.module.classes.get(&cn) {
-                if cd.static_properties.contains(name)
-                    && cd.static_collections.iter().any(|(n, _, _)| n == name)
-                {
-                    if let Some(key) = self.static_prop_key(&cn, name) {
-                        // Rewrite storage to the per-DECLARING-class key ONLY
-                        // when the bare name collides across classes (§8.9) or
-                        // the class is parameterized (`#spec`). A statically
-                        // unique collection name keeps the bare store the rest
-                        // of the runtime uses; rewriting it would split
-                        // storage and break the many bare-name accessors
-                        // (including the UVM phase machinery).
-                        if key.contains('#') || self.static_coll_name_collides(name) {
-                            return key;
-                        }
-                    }
-                }
-                cur = cd.extends.clone();
-            } else {
-                break;
-            }
-        }
-        name.to_string()
     }
 
     /// Walk the class hierarchy from `start_class` and return the
@@ -95102,17 +94891,6 @@ impl Simulator {
             DataType::TypeReference { name, .. } => {
                 let n = &name.name.name;
                 if self.module.interfaces.contains(n) {
-                    // Name collision resolution (§3.12): a plain (non-`virtual`)
-                    // `TypeReference` whose NAME is BOTH an interface and a
-                    // class (e.g. `interface shared;` + `class shared;`) is an
-                    // ambiguous probe. SV resolves the procedural block-local
-                    // declaration `shared h;` to the CLASS handle, NOT a
-                    // virtual interface, so prefer the class when one exists.
-                    // Only an explicit `virtual <iface>` (`DataType::Interface`
-                    // above) unambiguously denotes a virtual interface.
-                    if self.module.classes.contains_key(n) || self.module.covergroups.contains_key(n) {
-                        return false;
-                    }
                     return true;
                 }
                 // A TYPE-PARAM formal (`function void set(T value)` inside
@@ -95332,19 +95110,8 @@ impl Simulator {
 
     /// Is `member` a STATIC queue/assoc/dynamic-array collection property of
     /// `start_class` or an ancestor (i.e. it is in `static_collections`)?
-    /// Does `cls` itself (not an ancestor) declare `member` as a STATIC
-    /// collection in its own body? Used to distinguish a derived class that
-    /// REDECLARES a static collection (gets its own §8.9 cell) from one that
-    /// merely INHERITS it (shares the ancestor's cell).
-    fn class_declares_coll(&self, cls: &str, member: &str) -> bool {
-        self.module
-            .classes
-            .get(cls)
-            .map(|cd| cd.static_collections.iter().any(|(n, _, _)| n == member))
-            .unwrap_or(false)
-    }
-
-    fn member_is_static_coll(&self, start_class: &str, member: &str) -> bool {        let mut cur: Option<&str> = Some(start_class);
+    fn member_is_static_coll(&self, start_class: &str, member: &str) -> bool {
+        let mut cur: Option<&str> = Some(start_class);
         while let Some(cn) = cur {
             if let Some(cd) = self.module.classes.get(cn) {
                 if cd.static_collections.iter().any(|(n, _, _)| n == member) {
@@ -95705,18 +95472,6 @@ impl Simulator {
                 Some(owner) => format!("{}::{}", owner, name),
             });
         }
-        // §8.25: a STATIC collection member (registered in `static_collections`, so
-        // absent from `assoc_properties`/`queue_properties`/`class_coll_index`)
-        // accessed BARE from an INSTANCE method must still resolve to the class's
-        // shared static store — the same cell a static method (`spec_static_coll_key`)
-        // and a `ClassName::m[...]` spelling use. Without this the element write
-        // `m[k]=v` and later `m[k]`/`m.exists(k)` resolve to DIFFERENT stores
-        // (the write auto-created a fresh empty cell), so values read back `x`/0
-        // and `exists` is false — uvm_config_db's `m_waiters` waiter map broke
-        // exactly this way. Uses the runtime class of `this` as the concrete ctx.
-        if self.collection_is_static_in(ctx, name) {
-            return Some(self.spec_static_coll_key_in_class(name, ctx));
-        }
         // Miss: only the per-instance type-binding case can still match.
         if self
             .class_non_member_cache
@@ -96035,26 +95790,6 @@ impl Simulator {
                         {
                             return Some(k);
                         }
-                    } else if let Some((tb, ts)) =
-                        self.resolve_typedef_spec(&bh.path[0].name.name)
-                    {
-                        // §8.25: a class-LOCAL TYPEDEF alias (e.g. `this_type`
-                        // -> `seqlib#(REQ)`) of a parameterized class with a
-                        // STATIC-collection member, reached as
-                        // `this_type::m.size()` from a DERIVED class that
-                        // re-declares the same static (`seqlib_RST`). Resolve it
-                        // to the per-spec cell (`seqlib#int::m`) — the same cell
-                        // the bare static write and the element read use — not
-                        // the bare class name (`seqlib::m`), which would miss the
-                        // written elements and report size/`exists` empty.
-                        if self.member_is_static_coll(&tb, &member.name) {
-                            return Some(format!(
-                                "{}#{}::{}",
-                                tb,
-                                self.canonicalize_spec_sig(&tb, &ts),
-                                member.name
-                            ));
-                        }
                     }
                     obj_member(self, &bh.path[0].name.name, &member.name)
                 }
@@ -96170,54 +95905,6 @@ impl Simulator {
                     }
                     let hd = self.eval_expr(&base_expr).to_u64().unwrap_or(0) as usize;
                     return self.handle_collection_name(hd, &h.path[1].name.name);
-                }
-                // `ClassName::coll` — first segment is a CLASS name, not an
-                // object variable. A STATIC collection member (`static T m[..]`)
-                // is stored globally under its bare class-qualified key; route it
-                // there (mirroring the MemberAccess arm above) so
-                // `ClassName::m[key] = v` / reads hit the shared store instead of
-                // `obj_member`, which treats the class name as an object handle
-                // (0 -> None) and silently drops the element.
-                if !h.path[0].selects.is_empty() {
-                    // done below via selects arm — already handled above
-                } else if self.module.classes.contains_key(&h.path[0].name.name) {
-                    let cname = &h.path[0].name.name;
-                    let member = &h.path[1].name.name;
-                    if self.member_is_static_coll(cname, member) {
-                        // §8.25: an EXPLICITLY parameterized access
-                        // (`config_db#(int)::m`) arrives as a bare Ident receiver
-                        // with an active `current_spec`; resolve the per-spec key.
-                        if let Some((cb, cs)) = &self.current_spec {
-                            if cb == cname && self.member_is_static_coll(cb, member) {
-                                let sb = cb.clone();
-                                let ss = cs.clone();
-                                let saved = self.current_spec.take();
-                                self.current_spec = Some((sb.clone(), ss));
-                                let key = self.static_prop_key(&sb, member);
-                                self.current_spec = saved;
-                                return key;
-                            }
-                        }
-                        if self.is_associative_array(member) {
-                            return Some(member.clone());
-                        }
-                        // Fixed-size static array (`ClassName::S[i]`).
-                        if let Some(k) = self.static_fixed_key_in(cname, member) {
-                            return Some(k);
-                        }
-                    }
-                    // A class-LOCAL TYPEDEF alias of a parameterized class
-                    // (member is the alias name, not a real class).
-                    if let Some((tb, ts)) = self.resolve_typedef_spec(cname) {
-                        if self.member_is_static_coll(&tb, member) {
-                            return Some(format!(
-                                "{}#{}::{}",
-                                tb,
-                                self.canonicalize_spec_sig(&tb, &ts),
-                                member
-                            ));
-                        }
-                    }
                 }
                 obj_member(
                     self,
@@ -101960,6 +101647,7 @@ impl Simulator {
 
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
         self.signals.remove("__vif_return__");
+        self.vif_return_pending = false;
         // §26.3: the package this body belongs to. Taken before anything else
         // runs, so a call appearing in an argument (evaluated below, in the
         // CALLER's scope) cannot pick it up. A scoped `pkg::f()` dispatch names
@@ -102076,13 +101764,6 @@ impl Simulator {
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut assoc_params: Vec<(String, String, bool, Option<bool>)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
-        // Class-typed / class-TYPE-PARAMETER formals, gathered while binding so
-        // they can be recorded into THIS function's freshly-pushed frame overlay
-        // (right after `push_local_frame`) rather than the CALLER's top overlay
-        // (which `local_class_type_of`/`method_local_base` cannot see from here).
-        // Recording them inline into `var_class_types` only leaves a bare-name
-        // entry that unrelated scopes clobber. Mirrors the method path.
-        let mut frame_class_formals: Vec<(String, String)> = Vec::new();
         // `output`/`inout`/`ref` STRUCT formals are bound member-wise (locals
         // `o.a`, `o.b`), so they bypass the whole-value `output_bindings`
         // path — collect their `(local_key, caller_lvalue)` pairs to copy
@@ -102245,7 +101926,7 @@ impl Simulator {
                     self.record_local_typedef_type(&port.name.name, &type_name);
                     self.var_typedef_types.insert(port.name.name.clone(), type_name);
                 } else if self.module.classes.contains_key(&type_name) {
-                    frame_class_formals.push((port.name.name.clone(), type_name.clone()));
+                    self.record_local_class_type(&port.name.name, &type_name);
                     self.var_class_types.insert(port.name.name.clone(), type_name);
                 } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
                     // The formal is typed with a class TYPE PARAMETER
@@ -102269,7 +101950,7 @@ impl Simulator {
                                 .classes
                                 .contains_key(concrete.split('#').next().unwrap_or(&concrete)));
                     if cn_is_class {
-                        frame_class_formals.push((port.name.name.clone(), concrete.clone()));
+                        self.record_local_class_type(&port.name.name, &concrete);
                         self.var_class_types.insert(port.name.name.clone(), concrete);
                     }
                 }
@@ -102420,11 +102101,6 @@ impl Simulator {
         }
         self.local_iface_aliases.push(iface_alias_frame);
         self.push_local_frame(locals);
-        // Record this function's class-typed / class-type-param formals into
-        // this function's freshly-pushed frame overlay (see collector decl above).
-        for (fname, fcls) in &frame_class_formals {
-            self.record_local_class_type(fname, fcls);
-        }
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
@@ -106462,7 +106138,6 @@ impl Simulator {
                         }
                         let pid = self.next_pid;
                         self.next_pid += 1;
-                        let fgen = self.next_frame_gen();
                         if let Some(first) = t.items.first() {
                             self.process_origin.insert(pid, (first.span, "class task"));
                         }
@@ -106471,7 +106146,6 @@ impl Simulator {
                             ProcessContext {
                                 this_stack: vec![Some(handle)],
                                 local_stack: vec![locals],
-                                local_gen_stack: vec![fgen],
                                 local_type_stack: vec![(
                                     HashMap::default(),
                                     HashMap::default(),
@@ -114065,16 +113739,6 @@ impl Simulator {
                 // Member-wise struct `output`/`inout`/`ref` formals bypass the
                 // whole-value `output_bindings` path (see exec_function_call).
                 let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
-                // Class-typed and class-TYPE-PARAMETER formals, collected while
-                // binding so they can be recorded into the CALLEE's fresh frame
-                // overlay AFTER `push_local_frame` (the overlay is only pushed
-                // once the value frame is). Recording them during the binding
-                // loop would land them on the CALLER's top frame, where the
-                // callee's `local_class_type_of` cannot see them (it starts at
-                // `method_local_base`) — leaving `class_of_var` to fall through
-                // to the FLAT `var_class_types` map, whose bare-name key is
-                // clobbered by unrelated scopes (UVM config_db's `imp`).
-                let mut frame_class_formals: Vec<(String, String)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
                     if matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_)) {
                         self.register_formal_type_metadata(
@@ -114348,7 +114012,7 @@ impl Simulator {
                             self.record_local_typedef_type(&port.name.name, &type_name);
                             self.var_typedef_types.insert(port.name.name.clone(), type_name);
                         } else if self.module.classes.contains_key(&type_name) {
-                            frame_class_formals.push((port.name.name.clone(), type_name.clone()));
+                            self.record_local_class_type(&port.name.name, &type_name);
                             self.var_class_types.insert(port.name.name.clone(), type_name.clone());
                         } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
                             // See the identical branch in exec_function_call's
@@ -114371,7 +114035,7 @@ impl Simulator {
                                             concrete.split('#').next().unwrap_or(&concrete),
                                         ));
                             if cn_is_class {
-                                frame_class_formals.push((port.name.name.clone(), concrete.clone()));
+                                self.record_local_class_type(&port.name.name, &concrete);
                                 self.var_class_types.insert(port.name.name.clone(), concrete);
                             }
                         }
@@ -114694,16 +114358,6 @@ impl Simulator {
                     }
                 };
                 self.push_local_frame(locals);
-                // Record this method's class-typed / class-type-param formals
-                // into the CALLEE's freshly-pushed frame overlay, so the body's
-                // `class_of_var`/`local_class_type_of` resolve them from THIS
-                // activation instead of the flat bare-name `var_class_types` map
-                // (whose `imp`-style keys unrelated scopes clobber). They were
-                // collected during the formals loops above because recording
-                // there targeted the CALLER's already-top overlay.
-                for (fname, fcls) in &frame_class_formals {
-                    self.record_local_class_type(fname, fcls);
-                }
                 // Record the `local_stack` depth BEFORE this method's own
                 // frame (i.e. the count of caller frames) so that
                 // `get_expr_type_name`'s `in_any_frame` check only considers
