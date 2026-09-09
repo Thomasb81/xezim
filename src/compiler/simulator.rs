@@ -38607,6 +38607,62 @@ impl Simulator {
         }
     }
 
+    /// IEEE 1800-2023 §6.21/§9.3.2 live-share: a fork child's write to an
+    /// automatic local it INHERITED from a (suspended) parent must be visible
+    /// to the parent immediately, not merely merged when the child later
+    /// finishes (see `propagate_fork_locals_to_parent`). This matters for the
+    /// UVM sequencer watchdog (`m_safe_select_item`): a `fork … join_none`
+    /// child writes `select_process = process::self()` and then blocks forever
+    /// on `await()`, while the parent blocks on `wait(select_process != null)`
+    /// — a cross-process handshake that only works if the write is shared
+    /// live. Mirror this one key into the parent's same-generation frame slot
+    /// so a parked `wait(cond)` waiter (which `assign_value` re-evaluates via
+    /// `check_condition_waiters_for_write` immediately after) observes the
+    /// fresh value. Gated on: the writer is a fork child with a recorded
+    /// baseline, the key was inherited (present in that slot's baseline) and
+    /// changed, the parent is suspended with a context, and the frame
+    /// generations still match (the slot still holds the activation this child
+    /// forked from).
+    fn live_mirror_fork_child_write(&mut self, key: &str, val: &Value, frame_idx: usize) {
+        let pid = self.current_pid;
+        // Cheap reject: only fork children with a recorded fork-time baseline
+        // need live-sharing (they hold a COPY of the parent's locals).
+        if self.fork_baselines.is_empty() || !self.fork_baselines.contains_key(&pid) {
+            return;
+        }
+
+        let Some(&parent_pid) = self.process_parents.get(&pid) else {
+            return;
+        };
+        if parent_pid == pid {
+            return;
+        }
+        let Some(baseline) = self.fork_baselines.get(&pid) else {
+            return;
+        };
+        // Only an INHERITED local that the child actually changed is shared
+        // live; a merely-inherited-unchanged value must not clobber a parent
+        // write (same gate `merge_fork_writes` uses for the completion merge).
+        if !baseline
+            .get(frame_idx)
+            .is_some_and(|f| f.get(key).is_some_and(|old| old != val))
+        {
+            return;
+        }
+        let child_gen = self.local_gen_stack.get(frame_idx).copied();
+        let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) else {
+            return;
+        };
+        if parent_ctx.local_gen_stack.get(frame_idx).copied() != child_gen {
+            return;
+        }
+        if let Some(frame) = parent_ctx.local_stack.get_mut(frame_idx) {
+            if frame.contains_key(key) {
+                frame.insert(key.to_string(), val.clone());
+            }
+        }
+    }
+
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.
     /// A real-valued delay (e.g. `#1.5`, or `#0.5` under a finer `\`timescale`)
     /// is rounded to the nearest tick — LRM §3.14.3 rounds delays to the time
@@ -50005,6 +50061,19 @@ impl Simulator {
                                 val.clone()
                             };
                             self.local_stack[last_idx].insert(name.clone(), fitted.clone());
+
+                            // §6.21 two-way: a fork CHILD's write to an
+                            // automatic local it inherited from a suspended
+                            // parent must be visible to the parent NOW, not
+                            // only when the child finishes. Live-mirror it so
+                            // a parked `wait(cond)` observes it immediately.
+                            if !self.in_const_param_eval {
+                                self.live_mirror_fork_child_write(
+                                    name.as_str(),
+                                    &fitted,
+                                    last_idx,
+                                );
+                            }
                             // §6.21: write a `static` subroutine local through
                             // to its live shared cell so other simultaneous
                             // activations (recursive phase re-entry / method)
