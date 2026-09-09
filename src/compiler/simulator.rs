@@ -93600,13 +93600,34 @@ impl Simulator {
                 }
             }
         }
-        // Pad missing trailing positions with their defaults.
+        // Pad missing trailing positions with their defaults. A default that
+        // is the bare name of an EARLIER parameter (`#(type REQ=uvm_sequence_item,
+        // type RSP=REQ)` specialized as `Class#(simple_item)`) must resolve that
+        // name to the already-bound leaf (`simple_item`), not the literal
+        // parameter name `REQ` — else the write `simple_item,REQ` keys a
+        // different per-spec static cell than the reads, which rebind the
+        // whole chain (`simple_item,simple_item`). QV: this is how UVM's
+        // `uvm_sequence_library#(REQ,RSP=REQ)` keeps its static
+        // `m_typewide_sequences` shared whether reached via `Lib::add_...`
+        // (partial `#(simple_item)`) or via a derived subclass of the full
+        // specialization.
         while frags.len() < order.len() {
             let i = frags.len();
             if let Some(pname) = order.get(i) {
+                let mut filled = false;
                 if let Some((_, d)) = tp_defaults.iter().find(|(n, _)| n == pname) {
-                    frags.push(d.clone());
-                    continue;
+                    // If the default references an earlier bound param, use
+                    // that param's already-resolved leaf value.
+                    if let Some(j) = order.iter().position(|p| p == d) {
+                        if let Some(v) = frags.get(j).cloned() {
+                            frags.push(v);
+                            filled = true;
+                        }
+                    }
+                    if !filled {
+                        frags.push(d.clone());
+                        continue;
+                    }
                 }
                 if let Some((_, Some(init))) = v_defaults.iter().find(|(n, _)| n == pname) {
                     if let Some(d) = self.expr_to_spec_fragment(init) {
