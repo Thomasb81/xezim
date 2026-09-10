@@ -118,6 +118,12 @@ and testbench flows. Portable code should not rely on them.
   honoured: `q <= #5 v;` schedules the update five time units out and
   `q = #5 v;` suspends the block, as in an `initial` block. Both forms
   previously assigned at once with no warning (#160).
+* A class property that is a fixed array of collections (`int q[2][2][$]`,
+  `int d[3][]`, `int a[2][int]`) has storage for every element: `q[i][j]`
+  accepts `push_back`, `size`, `new[n]`, `exists` and element reads and
+  writes, from inside the class and through a handle. Previously each
+  element collection was silently empty while `$size(q)` and `foreach`
+  answered off the outer shape.
 * An unpacked array parameter whose elements are assignment patterns
   (`localparam cfg_t A [3] = '{'{4,2}, …}`) evaluates each element instead
   of reading 0, for packed-struct, unpacked-struct and packed-vector
@@ -173,6 +179,10 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* The statement interpreter's three largest routines keep smaller stack
+  frames (the statement dispatcher went from 7.8 KB to 3.8 KB per nested
+  call), so a deeply nested testbench statement chain stays in cache: the
+  UVM benchmark runs about 1.7 % fewer cycles, output identical.
 * Process wake-ups are cheaper: the scheduler no longer hashes with
   SipHash, allocates an empty continuation, or clones the process scope
   string on every wake-up, and the timing wheel covers 4096 ticks before

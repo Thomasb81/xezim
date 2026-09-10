@@ -4730,6 +4730,37 @@ impl<'a> BytecodeCompiler<'a> {
         self.signal_name_to_id.get(name).copied()
     }
 
+    /// The parameter value behind a signal-table TWIN: the elaborator gives
+    /// an instance parameter a placeholder signal so it is readable
+    /// hierarchically, and the identifier path resolved `hier` to that
+    /// signal `id`. Returns the parameter's value only when one of the
+    /// exact keys (raw name, scope-qualified, bare single segment) names
+    /// that very signal — never the leaf-suffix index, which can match a
+    /// same-named parameter of another scope.
+    fn param_twin_value(&self, hier: &HierarchicalIdentifier, id: usize) -> Option<Value> {
+        let params = self.params?;
+        let raw = Self::hier_raw_name(hier);
+        let mut keys: Vec<String> = Vec::with_capacity(3);
+        if let Some(scope) = &self.scope_hint {
+            keys.push(format!("{}.{}", scope, raw));
+        }
+        keys.push(raw.clone());
+        if hier.path.len() == 1 {
+            keys.push(hier.path[0].name.name.clone());
+        }
+        for k in keys {
+            if self.signal_name_to_id.get(k.as_str()).copied() == Some(id) {
+                if let Some(v) = params.get(k.as_str()) {
+                    if !v.is_real {
+                        return Some(v.clone());
+                    }
+                }
+                return None;
+            }
+        }
+        None
+    }
+
     fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
         let params = self.params?;
         let raw = Self::hier_raw_name(hier);
@@ -6970,6 +7001,18 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 if let Some(id) = self.lookup_signal_id(hier) {
+                    // An integral parameter's signal-table twin: fold to the
+                    // parameter's constant instead of a runtime load. On
+                    // c906 `tmp_out[n*DATA +: DATA]` read DATA as a signal,
+                    // so its bounds were register-computed, the entry's
+                    // dependency on `tmp_out` was whole-signal, and one bit
+                    // change re-triggered all 64 chain entries (the loop
+                    // census saw a 64-entry cycle in a plain chain).
+                    if let Some(v) = self.param_twin_value(hier, id) {
+                        let r = self.alloc_reg();
+                        self.emit(Insn::LoadConst(r, Box::new(v)));
+                        return Some(r);
+                    }
                     let r = self.alloc_reg();
                     if self.signal_signed[id] {
                         self.emit(Insn::LoadSignalSigned(r, as_sig_id(id)));
@@ -7775,6 +7818,35 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     };
                     let base = self.compile_expr(expr, 0)?;
+                    // A constant base index (genvar-unrolled `x[n*W +: W]`)
+                    // gives static bounds: select the range directly instead
+                    // of computing `idx*W + W-1` in registers on every eval.
+                    if let Some(c) = self.fold_const(left).and_then(|v| v.to_i64()) {
+                        let (l, r) = if *kind == RangeKind::IndexedUp {
+                            (c + width as i64 - 1, c)
+                        } else {
+                            (c, c - width as i64 + 1)
+                        };
+                        let plain = matches!(&expr.kind, ExprKind::Ident(h)
+                            if self.packed_elem_width_of(h).filter(|&w| w > 1).is_none());
+                        if plain && r >= 0 {
+                            let (mut phys_l, mut phys_r) = (l, r);
+                            if let ExprKind::Ident(h) = &expr.kind {
+                                if let Some((dl, dr)) = self.packed_outer_dim(h) {
+                                    let lo_b = dl.min(dr);
+                                    if lo_b != 0 {
+                                        phys_l -= lo_b;
+                                        phys_r -= lo_b;
+                                    }
+                                }
+                            }
+                            if phys_r >= 0 {
+                                let dest = self.alloc_reg();
+                                self.emit(Insn::RangeSelectConst(dest, base, phys_l as u32, phys_r as u32));
+                                return Some(dest);
+                            }
+                        }
+                    }
                     let idx = self.compile_expr(left, 0)?;
                     // §7.4.6/§11.5.1: the base index is a DECLARED index, but
                     // `RangeSelect` takes physical bit offsets — rebase it for a
@@ -9269,6 +9341,31 @@ impl<'a> BytecodeCompiler<'a> {
                                 let resized = self.alloc_reg();
                                 self.emit(Insn::Move(resized, val_reg));
                                 self.emit(Insn::Resize(resized, width));
+                                // Static bounds for a constant base index (see
+                                // the read arm): a ranged store instead of a
+                                // register-computed one.
+                                if self.packed_elem_width_of(hier).filter(|&w| w > 1).is_none() {
+                                    if let Some(c) = self.fold_const(left).and_then(|v| v.to_i64()) {
+                                        let (mut l, mut r) = if *kind == RangeKind::IndexedUp {
+                                            (c + width as i64 - 1, c)
+                                        } else {
+                                            (c, c - width as i64 + 1)
+                                        };
+                                        if let Some((dl, dr)) = self.packed_outer_dim(hier) {
+                                            let lo_b = dl.min(dr);
+                                            if lo_b != 0 {
+                                                l -= lo_b;
+                                                r -= lo_b;
+                                            }
+                                        }
+                                        if r >= 0 {
+                                            self.emit(Insn::BlockingAssignRange(
+                                                as_sig_id(id), l as u32, r as u32, resized,
+                                            ));
+                                            return true;
+                                        }
+                                    }
+                                }
                                 let Some(idx) = self.compile_expr(left, 0) else {
                                     self.bail("blocking_range_base");
                                     return false;

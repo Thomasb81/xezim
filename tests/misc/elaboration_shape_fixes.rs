@@ -3,8 +3,7 @@
 //! `unsigned'(e)` in a constant function made the whole function
 //! unevaluable, so a child-scope `localparam` from it read 0 and a typedef
 //! sized by it collapsed to one bit. Expected values from the reference
-//! simulator. Known residual: the typedef must be at `$unit` scope for (1);
-//! a module-scope typedef still yields 0 for array elements.
+//! simulator. Both `$unit`-scope and module-scope typedefs are covered.
 use xezim::simulate;
 
 fn messages(src: &str) -> Vec<String> {
@@ -33,6 +32,24 @@ endmodule",
         msgs.iter().any(|m| m == "LP=4 5 6 x=2 1 3 PP=7 8 LU=9 10 BV=101 011"),
         "{msgs:?}"
     );
+}
+
+#[test]
+fn struct_pattern_elements_with_module_scope_typedef() {
+    let msgs = messages(
+        "module tb;
+  typedef struct packed { bit [31:0] s; bit [1:0] x; } p_t;
+  typedef struct { int s; bit [1:0] x; } u_t;
+  localparam p_t LP [3] = '{ '{4,2'd2}, '{5,2'd1}, '{6,2'd3} };
+  localparam p_t LL [2] = '{ 34'h13, 34'h15 };
+  localparam u_t LU [2] = '{ '{9,2'd1}, '{10,2'd2} };
+  initial begin
+    $display("LP=%0d %0d %0d LL=%0d %0d LU=%0d %0d", LP[0].s, LP[1].s, LP[2].s, LL[0].s, LL[1].s, LU[0].s, LU[1].s);
+    $finish;
+  end
+endmodule",
+    );
+    assert!(msgs.iter().any(|m| m == "LP=4 5 6 LL=4 5 LU=9 10"), "{msgs:?}");
 }
 
 #[test]
