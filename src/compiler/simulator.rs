@@ -64657,7 +64657,9 @@ impl Simulator {
                         }
                         self.continue_flag = false;
                     }
-                } else if self.module.dynamic_arrays.contains(&*name) {
+                } else if self.module.dynamic_arrays.contains(&*name)
+                    || self.is_per_spec_dynamic_static(&name)
+                {
                     // Queue / dynamic array: iterate 0..current size.
                     let size = self.get_queue_size(&name);
                     for i in 0..size {
