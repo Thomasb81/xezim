@@ -370,3 +370,7 @@ mod system_function_result_width;
 mod packed_member_select_name_collision;
 #[path = "types/bit_write_unknown_index_discarded.rs"]
 mod bit_write_unknown_index_discarded;
+#[path = "types/nettype_struct_variable_driver.rs"]
+mod nettype_struct_variable_driver;
+#[path = "types/struct_named_pattern_continuous_assign.rs"]
+mod struct_named_pattern_continuous_assign;
