@@ -5462,6 +5462,11 @@ pub struct Simulator {
     event_after: u64,
     edge_block_data_reads: Vec<Vec<u32>>,
     edge_block_gateable: Vec<bool>,
+    /// Gateable only through write-arming: the block reads/writes a dense
+    /// unpacked array with a dynamic index, and every element of that array
+    /// is registered as an arm-only input (no value snapshot). Once armed it
+    /// always executes; the snapshot compare cannot see element changes.
+    edge_block_arm_only: Vec<bool>,
     // Timestamp-based change tracking (gating-agnostic): per-signal iteration
     // at which it last changed, and per-edge-block iteration at which it last
     // fired. A flop is skippable iff none of its data inputs changed since the
@@ -8808,6 +8813,7 @@ impl Simulator {
             event_after: 0,
             edge_block_data_reads: Vec::new(),
             edge_block_gateable: Vec::new(),
+            edge_block_arm_only: Vec::new(),
             sig_last_change: Vec::new(),
             flop_last_fire: Vec::new(),
             edge_block_reads_flat: Vec::new(),
@@ -45769,7 +45775,7 @@ impl Simulator {
                             fast_skip_delta += 1;
                             false
                         }
-                    } else if !self.edge_block_snap_valid[bi] {
+                    } else if self.edge_block_arm_only[bi] || !self.edge_block_snap_valid[bi] {
                         true
                     } else {
                         let start = self.edge_block_off[bi] as usize;
@@ -75331,6 +75337,12 @@ impl Simulator {
         let mut data_reads: Vec<Vec<u32>> = vec![Vec::new(); nb];
         let mut data_metas: Vec<Vec<(u16, u16)>> = vec![Vec::new(); nb];
         let mut gateable: Vec<bool> = vec![false; nb];
+        // Census of non-gateable reasons (XEZIM_EVENT_EDGE_CENSUS=1):
+        // 0 uncompiled, 1 range-oob, 2 LoadArrayElem, 3 NbaAssignArrayRead,
+        // 4 array write, 5 opaque (StmtFallback), 6 wide-without-armed.
+        let mut gate_census = [0usize; 7];
+        let mut arm_extra: Vec<Vec<u32>> = vec![Vec::new(); nb];
+        let mut arm_only: Vec<bool> = vec![false; nb];
         // Subtract ONLY true clock-generator signals (they toggle every cycle,
         // so they'd never let a flop skip). Keep reset/enable/gated-clock
         // reads in the change-check: a reset or enable CHANGE must ungate the
@@ -75343,12 +75355,18 @@ impl Simulator {
             .collect();
         for bi in 0..nb {
             let Some(cb) = self.compiled_edge_blocks[bi].as_ref() else {
+                gate_census[0] += 1;
                 continue;
             };
             let mut reads: Vec<u32> = Vec::new();
             let mut metas: Vec<(u16, u16)> = Vec::new();
             let mut seen: HashSet<(u32, u16, u16)> = HashSet::default();
             let mut dynamic = false;
+            let mut dyn_kind = 0usize;
+            let mut arm_extra_b: Vec<u32> = Vec::new();
+            let mut arm_only_b = false;
+            let mut arm_seen: HashSet<usize> = HashSet::default();
+            let armed = self.armed_edge;
             // A block that escapes to the AST interpreter (`StmtFallback`, e.g.
             // its only effect is `$display`/`$monitor`) has side effects and
             // reads the bytecode can't see. Gating it on "no tracked data-input
@@ -75377,6 +75395,7 @@ impl Simulator {
                             }
                         } else {
                             dynamic = true;
+                            dyn_kind = 1;
                         }
                     }
                     Insn::LoadSignal(_, s)
@@ -75406,7 +75425,14 @@ impl Simulator {
                             metas.push((0, w));
                         }
                     }
-                    Insn::LoadArrayElem(..) => dynamic = true,
+                    Insn::LoadArrayElem(_, arr, _) => {
+                        if Self::arm_array_elems(arr, armed, &mut arm_extra_b, &mut arm_seen) {
+                            arm_only_b = true;
+                        } else {
+                            dynamic = true;
+                            dyn_kind = 2;
+                        }
+                    }
                     // Fused `LoadSignal ; LoadArrayElem ; NbaAssign`. It READS
                     // the index signal (register it exactly as the LoadSignal
                     // it replaced would have) and WRITES the destination
@@ -75414,22 +75440,42 @@ impl Simulator {
                     // destination is NOT an implicit read). The element read is
                     // dynamically addressed, so — as for the `LoadArrayElem` it
                     // replaced — the block must stay non-gateable.
-                    Insn::NbaAssignArrayRead(_, _, s, _) => {
+                    Insn::NbaAssignArrayRead(_, arr, s, _) => {
                         let w = self.signal_widths[*s as usize].min(u16::MAX as u32) as u16;
                         if seen.insert((*s as u32, 0, w)) {
                             reads.push(*s as u32);
                             metas.push((0, w));
                         }
-                        dynamic = true;
+                        if Self::arm_array_elems(arr, armed, &mut arm_extra_b, &mut arm_seen) {
+                            arm_only_b = true;
+                        } else {
+                            dynamic = true;
+                            dyn_kind = 3;
+                        }
                     }
                     // Array-element NBA/blocking writes (memory) use a dynamic
                     // index; conservatively make such blocks non-gateable.
-                    Insn::NbaAssignArray(..)
-                    | Insn::NbaAssignArrayRange(..)
-                    | Insn::BlockingAssignArray(..)
-                    | Insn::BlockingAssignArrayRange(..) => dynamic = true,
+                    Insn::NbaAssignArray(arr, ..)
+                    | Insn::NbaAssignArrayRange(arr, ..)
+                    | Insn::BlockingAssignArray(arr, ..)
+                    | Insn::BlockingAssignArrayRange(arr, ..) => {
+                        if Self::arm_array_elems(arr, armed, &mut arm_extra_b, &mut arm_seen) {
+                            arm_only_b = true;
+                        } else {
+                            dynamic = true;
+                            dyn_kind = 4;
+                        }
+                    }
                     _ => {}
                 }
+            }
+            if dynamic {
+                gate_census[dyn_kind] += 1;
+            }
+            arm_extra[bi] = arm_extra_b;
+            arm_only[bi] = arm_only_b;
+            if opaque {
+                gate_census[5] += 1;
             }
             // Drop only true clock signals; keep reset/enable/data.
             {
@@ -75447,11 +75493,30 @@ impl Simulator {
             // can still gate them safely: no input write permits a skip, and
             // any input write forces execution without a value comparison.
             let has_wide = metas.iter().any(|&(_, w)| w > 64);
+            if has_wide && !self.armed_edge {
+                gate_census[6] += 1;
+            }
             gateable[bi] = !dynamic && !opaque && (!has_wide || self.armed_edge);
             data_reads[bi] = reads;
             data_metas[bi] = metas;
         }
+        for bi in 0..nb {
+            if !gateable[bi] {
+                arm_only[bi] = false;
+                arm_extra[bi].clear();
+            }
+        }
         self.edge_block_gateable = gateable;
+        self.edge_block_arm_only = arm_only;
+        if std::env::var_os("XEZIM_EVENT_EDGE_CENSUS").is_some() {
+            let arm_only_n = self.edge_block_arm_only.iter().filter(|&&a| a).count();
+            let arm_elems: usize = arm_extra.iter().map(|v| v.len()).sum();
+            eprintln!(
+                "[EVENT-EDGE-CENSUS] non-gateable: uncompiled={} range_oob={} load_array_elem={} nba_array_read={} array_write={} opaque={} wide_unarmed={}; arm-only blocks={} (element inputs={})",
+                gate_census[0], gate_census[1], gate_census[2], gate_census[3],
+                gate_census[4], gate_census[5], gate_census[6], arm_only_n, arm_elems
+            );
+        }
         let tracked_signal_len = if self.armed_edge {
             0
         } else {
@@ -75516,7 +75581,7 @@ impl Simulator {
             self.edge_block_epoch_probe_left = Vec::new();
             self.edge_block_skip_streak = Vec::new();
         }
-        self.build_armed_edge_state();
+        self.build_armed_edge_state(&arm_extra);
         self.rebuild_signal_commit_plans();
         eprintln!(
             "[EVENT-EDGE] measure (timestamp): {} edge blocks, {} gateable, {} gateable-with-EMPTY-data-reads, avg data-reads/gateable={:.2}",
@@ -75525,7 +75590,37 @@ impl Simulator {
         );
     }
 
-    fn build_armed_edge_state(&mut self) {
+    /// Register every element of a dense unpacked array as an arm-only input
+    /// of the block (see `edge_block_arm_only`). Returns false when the block
+    /// must stay non-gateable: write-arming off, a name-resolved (non-dense)
+    /// array, a packed-arena array (its element writes bypass `write_sig!`),
+    /// or an array too large to fan out per element.
+    fn arm_array_elems(
+        arr: &super::bytecode::ArrayOperand,
+        armed: bool,
+        out: &mut Vec<u32>,
+        seen: &mut HashSet<usize>,
+    ) -> bool {
+        const MAX_ARM_ELEMS: i64 = 1 << 16;
+        if !armed {
+            return false;
+        }
+        match arr {
+            super::bytecode::ArrayOperand::Dense { first_id, lo, hi, .. } => {
+                let count = *hi - *lo + 1;
+                if is_packed_id(*first_id) || count <= 0 || count > MAX_ARM_ELEMS {
+                    return false;
+                }
+                if seen.insert(*first_id) {
+                    out.extend((*first_id..*first_id + count as usize).map(|i| i as u32));
+                }
+                true
+            }
+            super::bytecode::ArrayOperand::Named(_) => false,
+        }
+    }
+
+    fn build_armed_edge_state(&mut self, arm_extra: &[Vec<u32>]) {
         self.armed_input_bitmap.clear();
         self.armed_input_ranges.clear();
         self.armed_input_blocks.clear();
@@ -75544,6 +75639,11 @@ impl Simulator {
             let hi = self.edge_block_off[bi + 1] as usize;
             for &sid in &self.edge_block_reads_flat[lo..hi] {
                 pairs.push((sid, bi as u32));
+            }
+            if let Some(extra) = arm_extra.get(bi) {
+                for &eid in extra {
+                    pairs.push((eid, bi as u32));
+                }
             }
         }
         pairs.sort_unstable();

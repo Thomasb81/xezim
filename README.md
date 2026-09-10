@@ -179,6 +179,13 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* Edge-triggered blocks that read or write an unpacked array through a
+  dynamic index (register files, memories: `q <= mem[raddr]`,
+  `mem[waddr] <= d`) now take part in the idle-edge skip. Every element of
+  the array arms the block on write, so an edge with no input change is
+  skipped instead of re-executed. On the C906 CoreMark run 858 of 906
+  previously always-executed flop blocks now skip: 8.1 % fewer
+  instructions, 11 % fewer cycles. UVM benchmarks unchanged.
 * `XEZIM_CYCLE_MODE=cycle` selects the cycle-based engine (default
   `event` is the engine as before). Its first stage evaluates the clock
   tree eagerly at each clock-generator edge instead of through the
