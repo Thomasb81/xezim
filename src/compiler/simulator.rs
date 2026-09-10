@@ -19150,16 +19150,21 @@ impl Simulator {
                 is_gen[cg.signal_id] = true;
             }
         }
-        // single comb writer per signal
+        // single comb writer per signal; multi-writer nets (a clock BUS written
+        // per bit by a generate loop) are resolved by bit range below
         let mut writer: HashMap<usize, usize> = HashMap::default();
         let mut multi: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut writers_all: HashMap<usize, Vec<usize>> = HashMap::default();
         for (e, ent) in self.comb_entries.iter().enumerate() {
             for &w in &ent.cold.write_signal_ids {
                 if writer.insert(w, e).is_some() {
                     multi.insert(w);
                 }
+                writers_all.entry(w).or_default().push(e);
             }
         }
+        let ranges: Vec<(HashMap<usize, (u32, u32)>, Vec<(usize, u32, u32)>)> =
+            self.comb_entries.iter().map(Self::comb_entry_bit_ranges).collect();
         // A tree net is a generator, or a single-writer net whose writer is a
         // fused gate / direct copy with EXACTLY ONE tree-net input (the rest
         // are enables). Memoized: Some(root) / None (not a tree net).
@@ -19168,9 +19173,13 @@ impl Simulator {
         let mut clock_input_of: HashMap<usize, usize> = HashMap::default(); // net -> its tree-net input
         fn walk(
             sig: usize,
+            hull: (u32, u32),
             n_sig: usize,
             is_gen: &[bool],
+            is_edge_sig: &[bool],
             writer: &HashMap<usize, usize>,
+            writers_all: &HashMap<usize, Vec<usize>>,
+            ranges: &[(HashMap<usize, (u32, u32)>, Vec<(usize, u32, u32)>)],
             multi: &std::collections::HashSet<usize>,
             entries: &[CombEntry],
             memo: &mut HashMap<usize, Option<usize>>,
@@ -19187,11 +19196,32 @@ impl Simulator {
             if let Some(&m) = memo.get(&sig) {
                 return m;
             }
-            memo.insert(sig, None); // cycle guard
-            let Some(&e) = writer.get(&sig) else { return None };
-            if multi.contains(&sig) {
-                return None;
+            let memoize = !multi.contains(&sig);
+            if memoize {
+                memo.insert(sig, None); // cycle guard
             }
+            // the writer: unique, or for a multi-writer bus the one whose static
+            // write range covers the reader's hull (a clock bus written per bit)
+            let e: usize = if multi.contains(&sig) {
+                if hull.0 == 0 && hull.1 == u32::MAX {
+                    return None;
+                }
+                let mut hit: Option<usize> = None;
+                for &w in writers_all.get(&sig).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    let covers = ranges[w].1.iter().any(|&(ws, wlo, whi)| ws == sig && wlo <= hull.0 && hull.1 <= whi);
+                    if covers {
+                        if hit.is_some() {
+                            return None;
+                        }
+                        hit = Some(w);
+                    }
+                }
+                let Some(w) = hit else { return None };
+                w
+            } else {
+                let Some(&e) = writer.get(&sig) else { return None };
+                e
+            };
             let ent = &entries[e];
             // Any comb entry kind can sit in a clock tree (buffers, ICG cells,
             // fanout buffers, gate regions, compiled cell bodies); stateful
@@ -19200,9 +19230,16 @@ impl Simulator {
                 CombItem::Udp { .. } | CombItem::UdpBatch { .. } | CombItem::Noop => return None,
                 _ => ent.cold.read_signal_ids.clone(),
             };
+            // A non-clock output (an ICG enable latch reads the clock too)
+            // must not become a tree net: only an edge signal, or a
+            // single-input buffer/copy of a tree net, qualifies.
+            if !is_edge_sig[sig] && inputs.len() != 1 {
+                return None;
+            }
             let mut found: Option<(usize, usize)> = None; // (input net, root)
             for &r in &inputs {
-                if let Some(root) = walk(r, n_sig, is_gen, writer, multi, entries, memo, tree_entry_of, clock_input_of, depth + 1) {
+                let rh = ranges[e].0.get(&r).copied().unwrap_or((0, u32::MAX));
+                if let Some(root) = walk(r, rh, n_sig, is_gen, is_edge_sig, writer, writers_all, ranges, multi, entries, memo, tree_entry_of, clock_input_of, depth + 1) {
                     if found.is_some() {
                         return None; // two clock inputs (a clock mux)
                     }
@@ -19210,7 +19247,9 @@ impl Simulator {
                 }
             }
             let Some((inp, root)) = found else { return None };
-            memo.insert(sig, Some(root));
+            if memoize {
+                memo.insert(sig, Some(root));
+            }
             tree_entry_of.insert(sig, e);
             clock_input_of.insert(sig, inp);
             Some(root)
@@ -19218,7 +19257,7 @@ impl Simulator {
         // seed from every edge signal (derived clocks) — intermediates are discovered on the way
         for sid in 0..n_sig {
             if is_edge_sig[sid] && !is_gen[sid] {
-                let _ = walk(sid, n_sig, &is_gen, &writer, &multi, &self.comb_entries, &mut memo, &mut tree_entry_of, &mut clock_input_of, 0);
+                let _ = walk(sid, (0, u32::MAX), n_sig, &is_gen, &is_edge_sig, &writer, &writers_all, &ranges, &multi, &self.comb_entries, &mut memo, &mut tree_entry_of, &mut clock_input_of, 0);
             }
         }
         // depth (distance from root) per tree net, for evaluation order
@@ -19256,12 +19295,18 @@ impl Simulator {
         if std::env::var_os("XEZIM_CLOCK_TREE_STATS").is_some() || sim_debug_enabled() {
             let total: usize = tree.values().map(|v| v.len()).sum();
             let unconv = (0..n_sig).filter(|&sid| is_edge_sig[sid] && !is_gen[sid] && !tree_entry_of.contains_key(&sid)).count();
-            // hop-by-hop trace of the first three unconverted clocks that have a comb writer
+            // hop-by-hop trace of named nets (XEZIM_CLOCK_TREE_TRACE=leaf1,leaf2,…) or of the first three unconverted clocks
+            let wanted: Vec<String> = std::env::var("XEZIM_CLOCK_TREE_TRACE").ok().map(|v| v.split(',').map(|x| x.to_string()).collect()).unwrap_or_default();
             let mut shown = 0;
             for sid in 0..n_sig {
-                if shown >= 3 { break; }
-                if !is_edge_sig[sid] || is_gen[sid] || tree_entry_of.contains_key(&sid) || !writer.contains_key(&sid) { continue; }
-                if self.name_for_id(sid).contains("__xz_") { continue; }
+                if shown >= 3 + wanted.len() { break; }
+                if !wanted.is_empty() {
+                    let leaf = self.name_for_id(sid).rsplit('.').next().unwrap_or("").to_string();
+                    if !wanted.iter().any(|w| *w == leaf) { continue; }
+                } else {
+                    if !is_edge_sig[sid] || is_gen[sid] || tree_entry_of.contains_key(&sid) || !writer.contains_key(&sid) { continue; }
+                    if self.name_for_id(sid).contains("__xz_") { continue; }
+                }
                 shown += 1;
                 let mut cur = sid;
                 let mut trace: Vec<String> = Vec::new();
@@ -19280,7 +19325,8 @@ impl Simulator {
                         let t = if r < n_sig && is_gen[r] { "GEN" } else if memo.get(&r).copied().flatten().is_some() { "tree" } else if r < n_sig && is_edge_sig[r] { "edge" } else { "data" };
                         format!("{}:{}", self.name_for_id(r).rsplit('.').next().unwrap_or(""), t)
                     }).collect();
-                    trace.push(format!("{leaf} <- {kind}[w={}] {:?}", ent.cold.write_signal_ids.len(), ins));
+                    let tn = match memo.get(&cur) { Some(Some(_)) => "TREE", Some(None) => "not-tree", None => "unvisited" };
+                    trace.push(format!("{leaf}({tn}{}{}) <- {kind}[w={}] {:?}", if is_edge_sig[cur] { ",edge" } else { "" }, if multi.contains(&cur) { ",MULTI" } else { "" }, ent.cold.write_signal_ids.len(), ins));
                     let next = ent.cold.read_signal_ids.iter().copied().find(|&r| r < n_sig && (is_gen[r] || is_edge_sig[r] || memo.get(&r).copied().flatten().is_some()))
                         .or_else(|| if ent.cold.read_signal_ids.len() == 1 { Some(ent.cold.read_signal_ids[0]) } else { None });
                     match next { Some(n) if n != cur => cur = n, _ => break }
@@ -19340,7 +19386,17 @@ impl Simulator {
                 let entries = std::mem::take(&mut self.comb_entries);
                 let dsts: Vec<usize> = entries[e].cold.write_signal_ids.clone();
                 let before: Vec<(u64, u64)> = dsts.iter().map(|&d| self.signal_table[d].raw_bits()).collect();
-                self.eval_comb_entry_full(&entries[e]);
+                // the settle's fast dispatcher (two-state plan) first; the
+                // four-state full evaluator only when it declines
+                let handled = match &entries[e].item {
+                    CombItem::CompiledContAssign { compiled, .. } | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                        self.dispatch_comb_plan(e, compiled)
+                    }
+                    _ => false,
+                };
+                if !handled {
+                    self.eval_comb_entry_full(&entries[e]);
+                }
                 self.comb_entries = entries;
                 for (i, &dst) in dsts.iter().enumerate() {
                     if self.signal_table[dst].raw_bits() != before[i] {
@@ -19395,6 +19451,95 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    /// Bit-range view of one comb entry: per read signal the hull `[lo, hi]`
+    /// of what it reads (`(0, u32::MAX)` = whole), and its write ranges.
+    /// Exact for fused gates and for compiled bodies (the sixteen `SigId`
+    /// instruction forms); everything else is whole-signal.
+    fn comb_entry_bit_ranges(
+        entry: &CombEntry,
+    ) -> (HashMap<usize, (u32, u32)>, Vec<(usize, u32, u32)>) {
+        use super::bytecode::Insn;
+        let whole = (0u32, u32::MAX);
+        let mut r: HashMap<usize, (u32, u32)> = HashMap::default();
+        let mut w: Vec<(usize, u32, u32)> = Vec::new();
+        let add = |m: &mut HashMap<usize, (u32, u32)>, sig: usize, lo: u32, hi: u32| {
+            let e = m.entry(sig).or_insert((lo, hi));
+            if e.0 == 0 && e.1 == u32::MAX {
+                return;
+            }
+            if lo == 0 && hi == u32::MAX {
+                *e = whole;
+                return;
+            }
+            e.0 = e.0.min(lo);
+            e.1 = e.1.max(hi);
+        };
+        let mut ranged = true;
+        match &entry.item {
+            CombItem::FusedGate { op } => match op {
+                FusedGate::Buf1 { dst, src, .. } => {
+                    add(&mut r, src.sig_id as usize, src.bit, src.bit);
+                    w.push((dst.sig_id as usize, dst.bit, dst.bit));
+                }
+                FusedGate::Bin2 { dst, a, b, .. } => {
+                    add(&mut r, a.sig_id as usize, a.bit, a.bit);
+                    add(&mut r, b.sig_id as usize, b.bit, b.bit);
+                    w.push((dst.sig_id as usize, dst.bit, dst.bit));
+                }
+                FusedGate::Mux2 { dst, s, t, e, .. } => {
+                    add(&mut r, s.sig_id as usize, s.bit, s.bit);
+                    add(&mut r, t.sig_id as usize, t.bit, t.bit);
+                    add(&mut r, e.sig_id as usize, e.bit, e.bit);
+                    w.push((dst.sig_id as usize, dst.bit, dst.bit));
+                }
+                FusedGate::UdpLut3 { dst, inputs, input_count, .. } => {
+                    for i in 0..(*input_count as usize).min(3) {
+                        add(&mut r, inputs[i].sig_id as usize, inputs[i].bit, inputs[i].bit);
+                    }
+                    w.push((dst.sig_id as usize, dst.bit, dst.bit));
+                }
+                #[allow(unreachable_patterns)]
+                _ => ranged = false,
+            },
+            CombItem::CompiledContAssign { compiled } | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                for insn in &compiled.instructions {
+                    match insn {
+                        Insn::LoadSignal(_, sg) | Insn::LoadSignalSigned(_, sg) | Insn::BranchIfSignalFalse(sg, _, _) => add(&mut r, *sg as usize, 0, u32::MAX),
+                        Insn::LoadSignalRange(_, sg, l, rr) => add(&mut r, *sg as usize, (*l).min(*rr), (*l).max(*rr)),
+                        Insn::LoadSignalBit(_, sg, bit) => add(&mut r, *sg as usize, *bit, *bit),
+                        Insn::NbaAssignArrayRead(dst, _, src, _) => { add(&mut r, *src as usize, 0, u32::MAX); w.push((*dst as usize, 0, u32::MAX)); }
+                        Insn::BlockingAssignRange(sg, hi, lo, _) | Insn::NbaAssignRange(sg, hi, lo, _) => w.push((*sg as usize, (*lo).min(*hi), (*lo).max(*hi))),
+                        Insn::BlockingAssign(sg, _, _) | Insn::NbaAssign(sg, _, _) | Insn::NbaAssignConst(sg, _, _) | Insn::BlockingAssignString(sg, _)
+                        | Insn::NbaAssignRangeDyn(sg, _, _, _) | Insn::NbaAssignBitDyn(sg, _, _) | Insn::BlockingAssignRangeDyn(sg, _, _, _) | Insn::BlockingAssignBitDyn(sg, _, _) => w.push((*sg as usize, 0, u32::MAX)),
+                        Insn::StmtFallback(..) | Insn::EvalExprFallback(..) => ranged = false,
+                        _ => {}
+                    }
+                }
+                // signals the scan did not see stay whole
+                for &sid in &entry.cold.read_signal_ids {
+                    r.entry(sid).or_insert(whole);
+                }
+                for &sid in &entry.cold.write_signal_ids {
+                    if !w.iter().any(|x| x.0 == sid) {
+                        w.push((sid, 0, u32::MAX));
+                    }
+                }
+            }
+            _ => ranged = false,
+        }
+        if !ranged {
+            r.clear();
+            w.clear();
+            for &sid in &entry.cold.read_signal_ids {
+                r.insert(sid, whole);
+            }
+            for &sid in &entry.cold.write_signal_ids {
+                w.push((sid, 0, u32::MAX));
+            }
+        }
+        (r, w)
     }
 
     fn dump_cycle_census(&self) {
@@ -37783,6 +37928,33 @@ impl Simulator {
 
         // Aggregate comb entry triggers by block
         if !self.activity_counts.is_empty() {
+            // Always-active entries (>= 0.99 evaluations per clock cycle): what are they?
+            {
+                let cycles = (self.loop_iters.max(2) / 2) as f64;
+                let mut kinds: HashMap<&'static str, (usize, u64)> = HashMap::default();
+                let mut names: Vec<(u64, String)> = Vec::new();
+                let mut tree_hits = 0usize;
+                for (eidx, &c) in self.activity_counts.iter().enumerate() {
+                    if (c as f64) / cycles < 0.99 { continue; }
+                    let ent = &self.comb_entries[eidx];
+                    let k = match &ent.item {
+                        CombItem::FusedGate { .. } => "FusedGate", CombItem::CompiledContAssign { .. } => "CompiledContAssign",
+                        CombItem::CompiledAlwaysBlock { .. } => "CompiledAlwaysBlock", CombItem::ContAssign { .. } => "ContAssign",
+                        CombItem::AlwaysBlock { .. } => "AlwaysBlock", CombItem::DirectCopy { .. } | CombItem::FastDirectCopy { .. } => "DirectCopy",
+                        CombItem::FastDirectFanout { .. } | CombItem::FusedBufFanout { .. } | CombItem::FusedAndFanout { .. } => "Fanout",
+                        CombItem::VectorGate { .. } => "VectorGate", CombItem::ScatterGate { .. } => "ScatterGate",
+                        CombItem::GateRegion { .. } => "GateRegion", CombItem::Udp { .. } | CombItem::UdpBatch { .. } => "Udp", _ => "other" };
+                    let e = kinds.entry(k).or_insert((0, 0)); e.0 += 1; e.1 += c;
+                    if self.is_clock_tree_entry.get(eidx).copied().unwrap_or(false) { tree_hits += 1; }
+                    if let Some(&w) = ent.cold.write_signal_ids.first() {
+                        let reads: Vec<String> = ent.cold.read_signal_ids.iter().take(3).map(|&r| self.name_for_id(r).rsplit('.').next().unwrap_or("").to_string()).collect();
+                        names.push((c, format!("{} <- {:?}", self.name_for_id(w), reads)));
+                    }
+                }
+                names.sort_by(|a, b| b.0.cmp(&a.0));
+                eprintln!("[ACTIVE] entries with activity >= 0.99: kinds {:?}; in clock tree: {}", kinds, tree_hits);
+                for (c, n) in names.iter().take(12) { eprintln!("[ACTIVE]   {:>10} {}", c, &n[..n.len().min(160)]); }
+            }
             let mut block_triggers: HashMap<String, u64> = HashMap::default();
             let mut block_entry_count: HashMap<String, usize> = HashMap::default();
             for (eidx, &count) in self.activity_counts.iter().enumerate() {
@@ -48157,9 +48329,14 @@ impl Simulator {
                 if id + 1 < dep_offsets.len() {
                     let lo = dep_offsets[id] as usize;
                     let hi = dep_offsets[id + 1] as usize;
+                    let tree_clk = tree_sig.get(id).copied().unwrap_or(false);
                     for &eidx_u32 in &dep_entries[lo..hi] {
                         let eidx = eidx_u32 as usize;
                         if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
+                            continue;
+                        }
+                        // the eager clock-tree pass already evaluated these
+                        if tree_clk && tree_entry.get(eidx).copied().unwrap_or(false) {
                             continue;
                         }
                         if !triggered[eidx] {
