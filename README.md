@@ -179,6 +179,9 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* The idle-edge prefilter that decides whether a clocked block runs at a
+  clock edge now reads one packed state byte per block instead of four
+  flag arrays. C906 CoreMark: 1.3 % fewer instructions, output identical.
 * Combinational blocks that write one bit or a constant-bound slice into a
   bus wider than 64 bits (`bus[k] = v;`, `dst[63:0] = src[127:64];`, the
   C906 decode-bus shapes) now run on the two-state fast path instead of the

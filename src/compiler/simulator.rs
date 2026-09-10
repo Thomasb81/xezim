@@ -615,7 +615,7 @@ macro_rules! write_sig {
                 let (lo, hi) = $self.armed_input_ranges[__wsig_id];
                 for __k in lo as usize..hi as usize {
                     let __bi = $self.armed_input_blocks[__k] as usize;
-                    $self.edge_block_armed[__bi] = 1;
+                    $self.edge_block_armed[__bi] |= EDGE_ARMED;
                 }
             }
             // Dirty-driven edge detect: record edge-sensitive writes (no-op unless
@@ -1137,6 +1137,15 @@ struct AwaitWaiter {
     waiter_pid: usize,
     continuation: ProcCont,
 }
+
+/// `edge_block_armed` state bits. A gateable block skips its clock edge in
+/// the scan prefilter iff its byte is ZERO: no input written since its last
+/// execution (`EDGE_ARMED` clear) and nothing forcing a visit (`EDGE_HOLD`
+/// clear — set while the block is not gateable, or has no valid value
+/// snapshot and no wide read that lets it gate on arming alone). One byte
+/// load per block visit instead of four flag arrays.
+const EDGE_ARMED: u8 = 1;
+const EDGE_HOLD: u8 = 2;
 
 struct NbaFast {
     signal_id: usize,
@@ -45467,9 +45476,6 @@ impl Simulator {
         // Same treatment for the tables the DISPATCH half reads — the armed
         // prefilter alone consults three of them on every one of ~189 M
         // fanout events.
-        let blk_gateable: &[bool] = &self.edge_block_gateable;
-        let blk_snap_valid: &[bool] = &self.edge_block_snap_valid;
-        let blk_wide: &[bool] = &self.edge_block_wide_read;
         let blk_armed: &[u8] = &self.edge_block_armed;
         let bitsel_sid_bits: &[u64] = &self.bitsel_sid_bits;
         let bitsel_edge_sens: &HashMap<(usize, usize), u32> = &self.bitsel_edge_sens;
@@ -45698,10 +45704,7 @@ impl Simulator {
                         && block_idx < triggered_bitmap.len()
                         && !(iff_active && iff_denied[block_idx])
                     {
-                        let skip_early = armed_prefilter
-                            && blk_gateable[block_idx]
-                            && blk_armed[block_idx] == 0
-                            && (blk_snap_valid[block_idx] || blk_wide[block_idx]);
+                        let skip_early = armed_prefilter && blk_armed[block_idx] == 0;
                         if skip_early {
                             if prefilter_seen[block_idx] != prefilter_generation {
                                 prefilter_seen[block_idx] = prefilter_generation;
@@ -45800,11 +45803,11 @@ impl Simulator {
                 let mut snapshot_result = None;
                 let mut epoch_fast = false;
                 let keep = if gate && self.armed_edge {
-                    let was_armed = self.edge_block_armed[bi] != 0;
+                    let was_armed = self.edge_block_armed[bi] & EDGE_ARMED != 0;
                     // Clear before execution. Any write performed by this or
                     // another block later in the delta cycle re-arms through
                     // the canonical write hooks.
-                    self.edge_block_armed[bi] = 0;
+                    self.edge_block_armed[bi] &= !EDGE_ARMED;
                     if !was_armed {
                         if self.armed_edge_shadow {
                             // `start`/`end` are read HERE rather than above:
@@ -45941,6 +45944,11 @@ impl Simulator {
                         // rebuilds it from current values after this forced
                         // execution.
                         self.edge_block_snap_valid[bi] = false;
+                        if bi < self.edge_block_armed.len()
+                            && !self.edge_block_wide_read.get(bi).copied().unwrap_or(false)
+                        {
+                            self.edge_block_armed[bi] |= EDGE_HOLD;
+                        }
                         true
                     } else {
                         self.edge_block_skip_streak[bi] = streak;
@@ -45956,6 +45964,11 @@ impl Simulator {
                     if gate {
                         if epoch_fast {
                             self.edge_block_snap_valid[bi] = false;
+                        if bi < self.edge_block_armed.len()
+                            && !self.edge_block_wide_read.get(bi).copied().unwrap_or(false)
+                        {
+                            self.edge_block_armed[bi] |= EDGE_HOLD;
+                        }
                         } else {
                             let start = self.edge_block_off[bi] as usize;
                             let end = self.edge_block_off[bi + 1] as usize;
@@ -45964,6 +45977,11 @@ impl Simulator {
                                 .any(|&(_, width)| width > 64);
                             if has_wide {
                                 self.edge_block_snap_valid[bi] = false;
+                        if bi < self.edge_block_armed.len()
+                            && !self.edge_block_wide_read.get(bi).copied().unwrap_or(false)
+                        {
+                            self.edge_block_armed[bi] |= EDGE_HOLD;
+                        }
                             } else {
                                 // Keep compact snapshots for narrow reads.
                                 let st: &[Value] = &self.signal_table;
@@ -45976,6 +45994,9 @@ impl Simulator {
                                     snaps[k] = Self::raw_bits_slice(&st[s], lo, w);
                                 }
                                 self.edge_block_snap_valid[bi] = true;
+                                if bi < self.edge_block_armed.len() {
+                                    self.edge_block_armed[bi] &= !EDGE_HOLD;
+                                }
                             }
                         }
                     }
@@ -68385,7 +68406,7 @@ impl Simulator {
                     self.edge_block_snap_valid
                         .iter_mut()
                         .for_each(|v| *v = false);
-                    self.edge_block_armed.iter_mut().for_each(|v| *v = 1);
+                    self.edge_block_armed.iter_mut().for_each(|v| *v |= EDGE_ARMED);
                     self.dirty_any = true;
                 }
             },
@@ -74791,7 +74812,7 @@ impl Simulator {
         let (lo, hi) = self.armed_input_ranges[id];
         for k in lo as usize..hi as usize {
             let bi = self.armed_input_blocks[k] as usize;
-            self.edge_block_armed[bi] = 1;
+            self.edge_block_armed[bi] |= EDGE_ARMED;
         }
     }
 
@@ -75743,7 +75764,16 @@ impl Simulator {
         self.edge_block_armed = self
             .edge_block_gateable
             .iter()
-            .map(|&gateable| u8::from(gateable))
+            .enumerate()
+            .map(|(bi, &gateable)| {
+                if !gateable {
+                    EDGE_HOLD
+                } else if self.edge_block_wide_read.get(bi).copied().unwrap_or(false) {
+                    EDGE_ARMED
+                } else {
+                    EDGE_ARMED | EDGE_HOLD
+                }
+            })
             .collect();
         eprintln!(
             "[EVENT-EDGE] ARMED mode ON: {} input signals, {} fanout edges{}",
@@ -119839,7 +119869,7 @@ pub extern "C" fn vpi_put_value(
             sim.edge_block_snap_valid
                 .iter_mut()
                 .for_each(|v| *v = false);
-            sim.edge_block_armed.iter_mut().for_each(|v| *v = 1);
+            sim.edge_block_armed.iter_mut().for_each(|v| *v |= EDGE_ARMED);
             sim.dirty_any = true;
             return std::ptr::null_mut();
         }
