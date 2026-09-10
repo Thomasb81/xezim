@@ -47430,6 +47430,22 @@ impl Simulator {
     /// `eval_ast_comb_entry` (restores the table around the call). Per-write
     /// bookkeeping mirrors `write_sig!`. Falls back to canonical settle if
     /// levels are missing.
+    /// Per-write bookkeeping the level-BSP drain must mirror from `write_sig!`
+    /// beyond the has_xz / inline-bit mirrors it already keeps: the dirty-edge
+    /// position (without it a comb-driven clock never fires its edge blocks
+    /// under the dirty-edge scan), the VCD dirty mark and the force epochs.
+    /// Value-trace and DPI value-change callbacks are not replayed here.
+    #[inline(always)]
+    fn bsp_after_write(&mut self, id: usize) {
+        self.note_edge_write(id);
+        vcd_mark!(self, id);
+        if !self.active_force_exprs.is_empty() && id < self.active_force_signal_epochs.len() {
+            self.active_force_signal_epochs[id] =
+                self.active_force_signal_epochs[id].wrapping_add(1);
+            self.force_epoch_gen = self.force_epoch_gen.wrapping_add(1);
+        }
+    }
+
     fn settle_combinatorial_bsp(&mut self) {
         if self.settling || !self.dirty_any {
             return;
@@ -47664,6 +47680,7 @@ impl Simulator {
                                 self.sig_last_change[id] = self.event_phase;
                             }
                             self.note_armed_write(id);
+                            self.bsp_after_write(id);
                         }
                         self.table_modified = true;
                         // Propagate to dependents (serial, after the barrier).
@@ -47740,6 +47757,7 @@ impl Simulator {
                                     self.sig_last_change[id] = self.event_phase;
                                 }
                                 self.note_armed_write(id);
+                                self.bsp_after_write(id);
                             }
                             self.table_modified = true;
                         } else {
