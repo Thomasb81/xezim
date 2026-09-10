@@ -19058,6 +19058,158 @@ impl Simulator {
     /// the native emitter could compile today (width gate). Pure analysis;
     /// the go/no-go for the island wrapper, exactly as the template census
     /// gated dedup.
+    /// Cycle-mode phase-1 census (`XEZIM_CYCLE_CENSUS=1`): the comb entries
+    /// that can NEVER be evaluated in a single levelized pass — members of a
+    /// non-trivial strongly connected component of the entry graph (entry
+    /// A writes a signal entry B reads, and B reaches A), and self-looping
+    /// level-sensitive blocks (latches: a block that reads what it writes).
+    /// Everything else is a DAG and evaluates once per edge in topo order.
+    fn dump_cycle_census(&self) {
+        let mode = match std::env::var("XEZIM_CYCLE_CENSUS") { Ok(v) => v, Err(_) => return };
+        use super::bytecode::Insn;
+        let n = self.comb_entries.len();
+        type Rng = (usize, u32, u32); // (signal, lo, hi) inclusive; whole = (0, u32::MAX)
+        let whole = |sig: usize| -> Rng { (sig, 0, u32::MAX) };
+        let bref = |r: &BitRef| -> Rng { (r.sig_id as usize, r.bit, r.bit) };
+        // per entry: (reads, writes) with bit ranges where the item knows them
+        let mut reads: Vec<Vec<Rng>> = Vec::with_capacity(n);
+        let mut writes: Vec<Vec<Rng>> = Vec::with_capacity(n);
+        let mut ranged_entries = 0usize;
+        for ent in &self.comb_entries {
+            let mut r: Vec<Rng> = Vec::new();
+            let mut w: Vec<Rng> = Vec::new();
+            let mut ranged = false;
+            match &ent.item {
+                CombItem::FusedGate { op } => {
+                    ranged = true;
+                    match op {
+                        FusedGate::Buf1 { dst, src, .. } => { w.push(bref(dst)); r.push(bref(src)); }
+                        FusedGate::Bin2 { dst, a, b, .. } => { w.push(bref(dst)); r.push(bref(a)); r.push(bref(b)); }
+                        FusedGate::Mux2 { dst, s, t, e, .. } => { w.push(bref(dst)); r.push(bref(s)); r.push(bref(t)); r.push(bref(e)); }
+                        FusedGate::UdpLut3 { dst, inputs, input_count, .. } => { w.push(bref(dst)); for i in 0..(*input_count as usize).min(3) { r.push(bref(&inputs[i])); } }
+                        #[allow(unreachable_patterns)]
+                        _ => { ranged = false; }
+                    }
+                }
+                CombItem::Udp { idx } => {
+                    ranged = true;
+                    let u = &self.udp_runtime[*idx];
+                    w.push(bref(&u.out_ref));
+                    for i in &u.in_refs { r.push(bref(i)); }
+                }
+                CombItem::CompiledContAssign { compiled } | CombItem::CompiledAlwaysBlock { compiled, .. } => {
+                    ranged = true;
+                    // whole-signal loads/stores of a signal override its ranged forms
+                    for insn in &compiled.instructions {
+                        match insn {
+                            Insn::LoadSignal(_, s) | Insn::LoadSignalSigned(_, s) | Insn::BranchIfSignalFalse(s, _, _) => r.push(whole(*s as usize)),
+                            Insn::LoadSignalRange(_, s, l, rr) => r.push((*s as usize, (*l).min(*rr), (*l).max(*rr))),
+                            Insn::LoadSignalBit(_, s, bit) => r.push((*s as usize, *bit, *bit)),
+                            Insn::NbaAssignArrayRead(dst, _, src, _) => { w.push(whole(*dst as usize)); r.push(whole(*src as usize)); }
+                            Insn::BlockingAssign(s, _, _) | Insn::NbaAssign(s, _, _) | Insn::NbaAssignConst(s, _, _) | Insn::BlockingAssignString(s, _)
+                            | Insn::NbaAssignRangeDyn(s, _, _, _) | Insn::NbaAssignBitDyn(s, _, _) | Insn::BlockingAssignRangeDyn(s, _, _, _) | Insn::BlockingAssignBitDyn(s, _, _) => w.push(whole(*s as usize)),
+                            Insn::BlockingAssignRange(s, hi, lo, _) | Insn::NbaAssignRange(s, hi, lo, _) => w.push((*s as usize, (*lo).min(*hi), (*lo).max(*hi))),
+                            _ => {}
+                        }
+                    }
+                    // any signal in the cold sets that the scan did not see at all: keep whole
+                    for &sid in &ent.cold.read_signal_ids { if !r.iter().any(|x| x.0 == sid) { r.push(whole(sid)); } }
+                    for &sid in &ent.cold.write_signal_ids { if !w.iter().any(|x| x.0 == sid) { w.push(whole(sid)); } }
+                }
+                _ => {}
+            }
+            if !ranged {
+                r = ent.cold.read_signal_ids.iter().map(|&s| whole(s)).collect();
+                w = ent.cold.write_signal_ids.iter().map(|&s| whole(s)).collect();
+            } else {
+                ranged_entries += 1;
+            }
+            reads.push(r);
+            writes.push(w);
+        }
+        // readers index: signal -> entries reading it (from the settle CSR)
+        let dependents = |sig: usize| -> &[u32] {
+            if sig + 1 < self.comb_dep_offsets.len() {
+                &self.comb_dep_entries[self.comb_dep_offsets[sig] as usize..self.comb_dep_offsets[sig + 1] as usize]
+            } else { &[] }
+        };
+        let overlaps = |a: &Rng, b: &Rng| -> bool { a.0 == b.0 && a.1 <= b.2 && b.1 <= a.2 };
+        let succ = |e: usize| -> Vec<usize> {
+            let mut out: Vec<usize> = Vec::new();
+            for wr in &writes[e] {
+                for &d in dependents(wr.0) {
+                    let d = d as usize;
+                    if reads[d].iter().any(|rd| overlaps(wr, rd)) { out.push(d); }
+                }
+            }
+            out.sort_unstable(); out.dedup(); out
+        };
+        // iterative Tarjan
+        let mut index = vec![u32::MAX; n]; let mut low = vec![0u32; n]; let mut on_stack = vec![false; n];
+        let mut stack: Vec<usize> = Vec::new(); let mut next_index = 0u32;
+        let mut scc_sizes: Vec<usize> = Vec::new(); let mut in_scc = vec![false; n]; let mut self_loop = vec![false; n];
+        for root in 0..n {
+            if index[root] != u32::MAX { continue; }
+            let mut work: Vec<(usize, Vec<usize>, usize)> = vec![(root, succ(root), 0)];
+            index[root] = next_index; low[root] = next_index; next_index += 1; stack.push(root); on_stack[root] = true;
+            while let Some((v, succs, pos)) = work.last_mut() {
+                let v = *v;
+                if *pos < succs.len() {
+                    let w = succs[*pos]; *pos += 1;
+                    if w == v { self_loop[v] = true; continue; }
+                    if index[w] == u32::MAX {
+                        index[w] = next_index; low[w] = next_index; next_index += 1; stack.push(w); on_stack[w] = true;
+                        let sw = succ(w); work.push((w, sw, 0));
+                    } else if on_stack[w] { low[v] = low[v].min(index[w]); }
+                } else {
+                    work.pop();
+                    if let Some(&(u, _, _)) = work.last() { low[u] = low[u].min(low[v]); }
+                    if low[v] == index[v] {
+                        let mut members: Vec<usize> = Vec::new();
+                        loop { let w = stack.pop().unwrap(); on_stack[w] = false; members.push(w); if w == v { break; } }
+                        if members.len() > 1 {
+                            scc_sizes.push(members.len());
+                            if members.len() >= 32 && mode == "2" {
+                                let mut wsigs: HashMap<usize, usize> = HashMap::default();
+                                for &m in &members { for wr in &writes[m] { *wsigs.entry(wr.0).or_insert(0) += 1; } }
+                                let mut ws: Vec<(usize, usize)> = wsigs.into_iter().collect(); ws.sort_by(|a, b| b.1.cmp(&a.1));
+                                let names: Vec<String> = ws.iter().take(3).map(|(id, c)| format!("{}x{}", c, self.name_for_id(*id))).collect();
+                                eprintln!("[CYCLE]   SCC size {}: distinct written signals {}; top {:?}", members.len(), ws.len(), names);
+                                if members.len() == 64 {
+                                    let m = members[0];
+                                    let kind = match &self.comb_entries[m].item {
+                                        CombItem::ContAssign { .. } => "ContAssign", CombItem::CompiledContAssign { .. } => "CompiledContAssign",
+                                        CombItem::AlwaysBlock { .. } => "AlwaysBlock", CombItem::CompiledAlwaysBlock { .. } => "CompiledAlwaysBlock",
+                                        CombItem::FusedGate { .. } => "FusedGate", CombItem::VectorGate { .. } => "VectorGate", CombItem::ScatterGate { .. } => "ScatterGate",
+                                        CombItem::Udp { .. } => "Udp", _ => "other" };
+                                    let insns: Vec<String> = match &self.comb_entries[m].item {
+                                        CombItem::CompiledContAssign { compiled } | CombItem::CompiledAlwaysBlock { compiled, .. } => compiled.instructions.iter().take(40).map(|i| format!("{:?}", i)).collect(),
+                                        _ => Vec::new() };
+                                    let rn: Vec<String> = reads[m].iter().map(|r| format!("{}[{}:{}]", self.name_for_id(r.0), r.2, r.1)).collect();
+                                    let wn: Vec<String> = writes[m].iter().map(|r| format!("{}[{}:{}]", self.name_for_id(r.0), r.2, r.1)).collect();
+                                    eprintln!("[CYCLE]     member kind={} reads={:?} writes={:?}", kind, rn, wn);
+                                    for i in insns { eprintln!("[CYCLE]       {}", &i[..i.len().min(110)]); }
+                                }
+                            }
+                            for m in members { in_scc[m] = true; }
+                        }
+                    }
+                }
+            }
+        }
+        let latches = self_loop.iter().filter(|&&b| b).count();
+        let in_scc_n = in_scc.iter().filter(|&&b| b).count();
+        let excl = (0..n).filter(|&e| self_loop[e] || in_scc[e]).count();
+        scc_sizes.sort_unstable_by(|a, b| b.cmp(a));
+        eprintln!("[CYCLE] comb entries={} ranged-tracked={} ({:.1}%) non-trivial SCCs={} entries-in-SCC={} ({:.2}%) largest={:?}",
+            n, ranged_entries, 100.0 * ranged_entries as f64 / n.max(1) as f64, scc_sizes.len(), in_scc_n, 100.0 * in_scc_n as f64 / n.max(1) as f64, &scc_sizes[..scc_sizes.len().min(8)]);
+        eprintln!("[CYCLE] self-looping entries={} ; single-pass exclusion set (SCC ∪ self-loop) = {} entries ({:.2}%)", latches, excl, 100.0 * excl as f64 / n.max(1) as f64);
+        let mut written = vec![false; self.signal_table.len()];
+        for ent in &self.comb_entries { for &w in &ent.cold.write_signal_ids { if w < written.len() { written[w] = true; } } }
+        let derived = self.edge_blocks.iter().filter(|eb| eb.resolved_sensitivities.first().is_some_and(|s| written.get(s.signal_id).copied().unwrap_or(false))).count();
+        eprintln!("[CYCLE] edge blocks={} clocked by a comb-written (derived/gated) signal={} ({:.1}%)", self.edge_blocks.len(), derived, 100.0 * derived as f64 / self.edge_blocks.len().max(1) as f64);
+    }
+
     fn dump_island_census(&self) {
         if std::env::var("XEZIM_ISLAND_CENSUS").is_err() {
             return;
@@ -36353,6 +36505,7 @@ impl Simulator {
         self.dump_comb_paths();
         self.dump_template_census();
         self.dump_island_census();
+        self.dump_cycle_census();
         self.dump_chain_census();
         self.dump_coact_census();
         eprintln!("[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
