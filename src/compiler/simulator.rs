@@ -107148,8 +107148,8 @@ impl Simulator {
                     let owner = self.heap.get(handle).and_then(|o| o.as_ref());
                     let resolved = owner
                         .and_then(|i| i.type_bindings.get(raw).cloned())
-                        .or_else(|| self.resolve_type_param_binding(raw))
-                        .or_else(|| self.ancestor_type_param_binding(handle, &cn, raw));
+                        .or_else(|| self.ancestor_type_param_binding(handle, &cn, raw))
+                        .or_else(|| self.resolve_type_param_binding(raw));
                     if let Some(r) = resolved {
                         tn = Some(r);
                     }

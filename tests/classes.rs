@@ -39,6 +39,8 @@ mod param_type_binding_resolves_enclosing_value_param;
 mod virtual_method_in_binary_is_evaluated_once;
 #[path = "classes/typename_type_param_resolves_concrete.rs"]
 mod typename_type_param_resolves_concrete;
+#[path = "classes/param_instance_field_uses_owner_binding.rs"]
+mod param_instance_field_uses_owner_binding;
 #[path = "classes/static_param_class_collection_reuse.rs"]
 mod static_param_class_collection_reuse;
 #[path = "classes/explicit_param_static_coll_read.rs"]
