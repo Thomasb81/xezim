@@ -12581,7 +12581,8 @@ pub enum TsInsn {
     /// `sig[regs[i]] = regs[s] & 1` (§11.5.1 dynamic bit-select target).
     /// Out-of-range indices are dropped, matching `Value::set_bit`. Splices
     /// through the same plane-level merge as `RangeStore`, so X elsewhere in
-    /// the destination survives.
+    /// the destination survives. `w > 64` (wide destination) sets the bit in
+    /// the wide planes directly.
     BitStoreDyn { sig: u32, i: u16, s: u16, w: u32 },
     /// Blocking store of a folded 4-state constant (`y = 'x;`). `v`/`x` are
     /// the raw value/xz planes, already masked to the assigned width.
@@ -12610,6 +12611,13 @@ pub enum TsInsn {
     /// 133.2M interpreter evaluations on the C906 SoC — 42.9% of them, the
     /// single largest reason two-state lowering gave up.
     RangeStore { sig: u32, hi: u32, lo: u32, s: u16, mask: u64 },
+    /// `RangeStore` into a >64-bit destination: the ≤64-bit slice regs[s]
+    /// replaces bits [hi:lo] of the wide planes; everything else (X
+    /// included) is preserved. Routed through the same splice the JIT bridge
+    /// uses for wide destinations.
+    RangeStoreW { sig: u32, hi: u32, lo: u32, s: u16, mask: u64 },
+    /// `RangeStoreX` into a >64-bit destination (folded 4-state constant).
+    RangeStoreXW { sig: u32, hi: u32, lo: u32, v: u64, x: u64 },
     /// Dynamic array-element read: eid = first + (regs[idx] - lo). ABORTS
     /// the two-state run (caller re-runs 4-state) when the index is out of
     /// range or the element holds X — both produce X in 4-state. Lowering
@@ -13566,9 +13574,9 @@ pub fn lower_two_state(
                 if sig >= signal_widths.len() || signal_real[sig] {
                     gate!("dest oob/real");
                 }
-                if signal_widths[sig] > 64 {
-                    gate!("dest >64b");
-                }
+                // A >64-bit destination is fine: the executor sets one bit in
+                // the wide planes (`ts_wide_bit_store`) instead of splicing
+                // the inline word.
                 narrow_reg!(rw, *idx, "wide bit index");
                 narrow_reg!(rw, *r, "wide store source");
                 side_effects = true;
@@ -13641,48 +13649,72 @@ pub fn lower_two_state(
                 if sig >= signal_widths.len() || signal_real[sig] {
                     gate!("dest oob/real");
                 }
+                let wide_dest = signal_widths[sig] > 64;
                 if let Some((v, x)) = xc[*r as usize] {
-                    if signal_widths[sig] > 64 {
-                        gate!("dest >64b");
-                    }
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
-                    if high >= 64 {
+                    if high - low + 1 > 64 {
+                        gate!("range span >64");
+                    }
+                    if !wide_dest && high >= 64 {
                         gate!("range top >=64");
+                    }
+                    if high >= signal_widths[sig] {
+                        gate!("range top past dest");
                     }
                     let m = ts_mask(high - low + 1);
                     side_effects = true;
                     stored.push(sig as u32);
-                    out.push(TsInsn::RangeStoreX {
-                        sig: sig as u32,
-                        hi: high,
-                        lo: low,
-                        v: v & m,
-                        x: x & m,
+                    out.push(if wide_dest {
+                        TsInsn::RangeStoreXW {
+                            sig: sig as u32,
+                            hi: high,
+                            lo: low,
+                            v: v & m,
+                            x: x & m,
+                        }
+                    } else {
+                        TsInsn::RangeStoreX {
+                            sig: sig as u32,
+                            hi: high,
+                            lo: low,
+                            v: v & m,
+                            x: x & m,
+                        }
                     });
                     continue;
-                }
-                if signal_widths[sig] > 64 {
-                    gate!("dest >64b");
                 }
                 let Some(cw) = rw[*r as usize] else {
                     gate!("src reg width unknown");
                 };
                 let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                 let w = high - low + 1;
-                if cw > 64 {
+                if cw > 64 || w > 64 {
                     gate!("src reg >64b");
                 }
-                if high >= 64 {
+                if !wide_dest && high >= 64 {
                     gate!("range top >=64");
+                }
+                if high >= signal_widths[sig] {
+                    gate!("range top past dest");
                 }
                 side_effects = true;
                 stored.push(sig as u32);
-                out.push(TsInsn::RangeStore {
-                    sig: sig as u32,
-                    hi: high,
-                    lo: low,
-                    s: *r as u16,
-                    mask: ts_mask(w),
+                out.push(if wide_dest {
+                    TsInsn::RangeStoreW {
+                        sig: sig as u32,
+                        hi: high,
+                        lo: low,
+                        s: *r as u16,
+                        mask: ts_mask(w),
+                    }
+                } else {
+                    TsInsn::RangeStore {
+                        sig: sig as u32,
+                        hi: high,
+                        lo: low,
+                        s: *r as u16,
+                        mask: ts_mask(w),
+                    }
                 });
             }
             Insn::NbaAssignRange(sig, hi, lo, r) => {
@@ -13988,6 +14020,8 @@ pub fn lower_two_state(
                     | TsInsn::BitStoreDyn { .. }
                     | TsInsn::ConstStoreX { .. }
                     | TsInsn::RangeStoreX { .. }
+                    | TsInsn::RangeStoreW { .. }
+                    | TsInsn::RangeStoreXW { .. }
                     | TsInsn::ElemStore { .. }
                     | TsInsn::ElemStoreNba { .. }
                     | TsInsn::NbaFromElem { .. }

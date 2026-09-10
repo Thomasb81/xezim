@@ -179,6 +179,12 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* Combinational blocks that write one bit or a constant-bound slice into a
+  bus wider than 64 bits (`bus[k] = v;`, `dst[63:0] = src[127:64];`, the
+  C906 decode-bus shapes) now run on the two-state fast path instead of the
+  4-state interpreter, and clocked blocks that read wide buses skip idle
+  edges in the prefilter. C906 CoreMark: 2.6 % fewer instructions on top of
+  the array-arming change, output identical; UVM benchmarks unchanged.
 * Edge-triggered blocks that read or write an unpacked array through a
   dynamic index (register files, memories: `q <= mem[raddr]`,
   `mem[waddr] <= d`) now take part in the idle-edge skip. Every element of

@@ -188,3 +188,112 @@ endmodule
     assert!(out.contains(&"D_ffff".to_string()), "{out:?}");
     assert!(out.contains(&"E_0000".to_string()), "{out:?}");
 }
+
+/// A dynamic bit-select write into a >64-bit destination lowers now
+/// (`BitStoreDyn` with a wide `w`): the one bit is set in the wide planes and
+/// every other bit — X included — survives. Values are checked through the
+/// display so the result is the same whichever path evaluates the block.
+#[test]
+fn dynamic_bit_write_into_wide_destination() {
+    let out = msgs(
+        r#"
+module tb;
+  logic [199:0] bus;
+  logic [7:0] idx;
+  logic v;
+  always @* begin
+    bus = {200{1'bx}};
+    bus[7:0] = 8'h5a;
+    bus[idx] = v;
+  end
+  initial begin
+    idx = 8'd3; v = 1'b1; #1;
+    $display("A=%b %h", bus[199:196], bus[7:0]);
+    idx = 8'd130; v = 1'b1; #1;
+    $display("B=%b %h %b", bus[131:129], bus[7:0], bus[199]);
+    idx = 8'd130; v = 1'b0; #1;
+    $display("C=%b", bus[131:129]);
+    idx = 8'd250; v = 1'b1; #1;
+    $display("D=%h %b", bus[7:0], bus[131:129]);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(out.iter().any(|m| m == "A=xxxx 5a"), "{out:?}");
+    assert!(out.iter().any(|m| m == "B=x1x 5a x"), "{out:?}");
+    assert!(out.iter().any(|m| m == "C=x0x"), "{out:?}");
+    assert!(out.iter().any(|m| m == "D=5a xxx"), "{out:?}");
+}
+
+/// The lowering-shaped variant: the block does nothing but the dynamic bit
+/// write into a 200-bit bus (the C906 decode-bus shape), so it runs on the
+/// two-state path when the operands are clean. The rest of the bus is set
+/// by another process and must be preserved bit for bit.
+#[test]
+fn dynamic_bit_write_only_block_on_wide_bus() {
+    let out = msgs(
+        r#"
+module tb;
+  logic [199:0] bus2;
+  logic [7:0] idx;
+  logic v;
+  always @* bus2[idx] = v;
+  initial begin
+    bus2 = {25{8'ha5}};
+    idx = 8'd0; v = 1'b0; #1;
+    $display("E=%h", bus2[7:0]);
+    idx = 8'd199; v = 1'b0; #1;
+    $display("F=%h %h", bus2[199:192], bus2[7:0]);
+    idx = 8'd64; v = 1'b0; #1;
+    $display("G=%h", bus2[71:64]);
+    idx = 8'd64; v = 1'b1; #1;
+    $display("H=%h %h", bus2[71:64], bus2[199:192]);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(out.iter().any(|m| m == "E=a4"), "{out:?}");
+    assert!(out.iter().any(|m| m == "F=25 a4"), "{out:?}");
+    assert!(out.iter().any(|m| m == "G=a4"), "{out:?}");
+    assert!(out.iter().any(|m| m == "H=a5 25"), "{out:?}");
+}
+
+/// Constant-bound part-select writes into a >64-bit destination lower now
+/// (`RangeStoreW` / `RangeStoreXW`): a 64-bit slice copy between two wide
+/// buses (the C906 decode-bus shape), a slice above bit 64, and a folded
+/// x constant into a wide bus. Untouched bits keep their value and X.
+#[test]
+fn range_writes_into_wide_destination() {
+    let out = msgs(
+        r#"
+module tb;
+  logic [310:0] src;
+  logic [179:0] dst;
+  logic [199:0] xb;
+  always @* dst[63:0] = src[127:64];
+  always @* dst[131:100] = src[31:0];
+  always @* begin
+    xb[7:0] = src[7:0];
+    xb[71:64] = 8'bxx01_10xx;
+  end
+  initial begin
+    dst = {180{1'b1}};
+    xb = '0;
+    src = {311{1'b0}};
+    src[127:64] = 64'h0123_4567_89ab_cdef;
+    src[31:0] = 32'hfeed_beef;
+    #1 $display("A=%h %h %h", dst[63:0], dst[131:100], dst[179:132]);
+    $display("B=%b %h", xb[71:64], xb[7:0]);
+    src[127:64] = 64'hffff_0000_ffff_0000;
+    #1 $display("C=%h %h", dst[63:0], dst[99:64]);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(out.iter().any(|m| m == "A=0123456789abcdef feedbeef ffffffffffff"), "{out:?}");
+    assert!(out.iter().any(|m| m == "B=xx0110xx ef"), "{out:?}");
+    assert!(out.iter().any(|m| m == "C=ffff0000ffff0000 fffffffff"), "{out:?}");
+}

@@ -5467,6 +5467,10 @@ pub struct Simulator {
     /// is registered as an arm-only input (no value snapshot). Once armed it
     /// always executes; the snapshot compare cannot see element changes.
     edge_block_arm_only: Vec<bool>,
+    /// Gateable block with a >64-bit data read: no compact value snapshot
+    /// exists, so under write-arming an UNARMED block skips on arming alone
+    /// (no input write since its last execution ⇒ no change).
+    edge_block_wide_read: Vec<bool>,
     // Timestamp-based change tracking (gating-agnostic): per-signal iteration
     // at which it last changed, and per-edge-block iteration at which it last
     // fired. A flop is skippable iff none of its data inputs changed since the
@@ -8814,6 +8818,7 @@ impl Simulator {
             edge_block_data_reads: Vec::new(),
             edge_block_gateable: Vec::new(),
             edge_block_arm_only: Vec::new(),
+            edge_block_wide_read: Vec::new(),
             sig_last_change: Vec::new(),
             flop_last_fire: Vec::new(),
             edge_block_reads_flat: Vec::new(),
@@ -20914,11 +20919,22 @@ impl Simulator {
                     let idx = regs[*i as usize];
                     if idx < *w as u64 {
                         let b = regs[*s as usize] & 1;
-                        self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
+                        if *w > 64 {
+                            self.ts_wide_bit_store(*sig as usize, idx as usize, b);
+                        } else {
+                            self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
+                        }
                     }
                 }
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
+                }
+                TsInsn::RangeStoreW { sig, hi, lo, s, mask } => {
+                    let v = regs[*s as usize] & mask;
+                    self.ts_wide_range_store(*sig as usize, *lo, *hi, v, 0);
+                }
+                TsInsn::RangeStoreXW { sig, hi, lo, v, x } => {
+                    self.ts_wide_range_store(*sig as usize, *lo, *hi, *v, *x);
                 }
                 TsInsn::RangeStoreX { sig, hi, lo, v, x } => {
                     self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
@@ -21420,11 +21436,22 @@ impl Simulator {
                     let idx = r!(*i);
                     if idx < *w as u64 {
                         let b = r!(*s) & 1;
-                        self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
+                        if *w > 64 {
+                            self.ts_wide_bit_store(*sig as usize, idx as usize, b);
+                        } else {
+                            self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
+                        }
                     }
                 }
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
+                }
+                TsInsn::RangeStoreW { sig, hi, lo, s, mask } => {
+                    let v = r!(*s) & mask;
+                    self.ts_wide_range_store(*sig as usize, *lo, *hi, v, 0);
+                }
+                TsInsn::RangeStoreXW { sig, hi, lo, v, x } => {
+                    self.ts_wide_range_store(*sig as usize, *lo, *hi, *v, *x);
                 }
                 TsInsn::RangeStoreX { sig, hi, lo, v, x } => {
                     self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
@@ -21610,6 +21637,33 @@ impl Simulator {
     /// untouched, then run the ordinary change/dirty/post-write bookkeeping.
     fn ts_range_store(&mut self, id: usize, v: u64, lo: u32, hi: u32) {
         self.ts_range_store_xz(id, v, 0, lo, hi)
+    }
+
+    /// Two-state dynamic bit store into a >64-bit signal: set the one bit in
+    /// the wide planes (value known, x cleared) and run the same write
+    /// bookkeeping as the inline stores. Everything else in the destination,
+    /// X included, is untouched.
+    fn ts_wide_bit_store(&mut self, id: usize, idx: usize, bit: u64) {
+        self.ts_wide_range_store(id, idx as u32, idx as u32, bit & 1, 0);
+    }
+
+    /// Two-state range store into a >64-bit signal: word-level splice of the
+    /// ≤64-bit planes `(v, x)` over bits [hi:lo], then the same write
+    /// bookkeeping as the inline stores. Untouched bits keep their value
+    /// and X.
+    fn ts_wide_range_store(&mut self, id: usize, lo: u32, hi: u32, v: u64, x: u64) {
+        let n = (hi - lo + 1) as usize;
+        if !self.signal_table[id].splice_bits64(lo as usize, v, x, n) {
+            return;
+        }
+        self.sync_mirror(id);
+        if !self.dirty_signals[id] {
+            self.dirty_signals[id] = true;
+            self.dirty_list.push(id);
+        }
+        self.dirty_any = true;
+        self.table_modified = true;
+        self.after_signal_write(id);
     }
 
     /// `ts_range_store` with an explicit x/z plane, for a folded 4-state
@@ -21885,11 +21939,22 @@ impl Simulator {
                     let idx = regs[*i as usize];
                     if idx < *w as u64 {
                         let b = regs[*s as usize] & 1;
-                        self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
+                        if *w > 64 {
+                            self.ts_wide_bit_store(*sig as usize, idx as usize, b);
+                        } else {
+                            self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
+                        }
                     }
                 }
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
+                }
+                TsInsn::RangeStoreW { sig, hi, lo, s, mask } => {
+                    let v = regs[*s as usize] & mask;
+                    self.ts_wide_range_store(*sig as usize, *lo, *hi, v, 0);
+                }
+                TsInsn::RangeStoreXW { sig, hi, lo, v, x } => {
+                    self.ts_wide_range_store(*sig as usize, *lo, *hi, *v, *x);
                 }
                 TsInsn::RangeStoreX { sig, hi, lo, v, x } => {
                     self.ts_range_store_xz(*sig as usize, *v, *x, *lo, *hi);
@@ -45404,6 +45469,7 @@ impl Simulator {
         // fanout events.
         let blk_gateable: &[bool] = &self.edge_block_gateable;
         let blk_snap_valid: &[bool] = &self.edge_block_snap_valid;
+        let blk_wide: &[bool] = &self.edge_block_wide_read;
         let blk_armed: &[u8] = &self.edge_block_armed;
         let bitsel_sid_bits: &[u64] = &self.bitsel_sid_bits;
         let bitsel_edge_sens: &HashMap<(usize, usize), u32> = &self.bitsel_edge_sens;
@@ -45634,8 +45700,8 @@ impl Simulator {
                     {
                         let skip_early = armed_prefilter
                             && blk_gateable[block_idx]
-                            && blk_snap_valid[block_idx]
-                            && blk_armed[block_idx] == 0;
+                            && blk_armed[block_idx] == 0
+                            && (blk_snap_valid[block_idx] || blk_wide[block_idx]);
                         if skip_early {
                             if prefilter_seen[block_idx] != prefilter_generation {
                                 prefilter_seen[block_idx] = prefilter_generation;
@@ -75343,6 +75409,7 @@ impl Simulator {
         let mut gate_census = [0usize; 7];
         let mut arm_extra: Vec<Vec<u32>> = vec![Vec::new(); nb];
         let mut arm_only: Vec<bool> = vec![false; nb];
+        let mut wide_read: Vec<bool> = vec![false; nb];
         // Subtract ONLY true clock-generator signals (they toggle every cycle,
         // so they'd never let a flop skip). Keep reset/enable/gated-clock
         // reads in the change-check: a reset or enable CHANGE must ungate the
@@ -75497,6 +75564,7 @@ impl Simulator {
                 gate_census[6] += 1;
             }
             gateable[bi] = !dynamic && !opaque && (!has_wide || self.armed_edge);
+            wide_read[bi] = has_wide;
             data_reads[bi] = reads;
             data_metas[bi] = metas;
         }
@@ -75504,17 +75572,20 @@ impl Simulator {
             if !gateable[bi] {
                 arm_only[bi] = false;
                 arm_extra[bi].clear();
+                wide_read[bi] = false;
             }
         }
         self.edge_block_gateable = gateable;
         self.edge_block_arm_only = arm_only;
+        self.edge_block_wide_read = wide_read;
         if std::env::var_os("XEZIM_EVENT_EDGE_CENSUS").is_some() {
             let arm_only_n = self.edge_block_arm_only.iter().filter(|&&a| a).count();
             let arm_elems: usize = arm_extra.iter().map(|v| v.len()).sum();
+            let wide_n = self.edge_block_wide_read.iter().filter(|&&a| a).count();
             eprintln!(
-                "[EVENT-EDGE-CENSUS] non-gateable: uncompiled={} range_oob={} load_array_elem={} nba_array_read={} array_write={} opaque={} wide_unarmed={}; arm-only blocks={} (element inputs={})",
+                "[EVENT-EDGE-CENSUS] non-gateable: uncompiled={} range_oob={} load_array_elem={} nba_array_read={} array_write={} opaque={} wide_unarmed={}; arm-only blocks={} (element inputs={}); gateable wide-read blocks={}",
                 gate_census[0], gate_census[1], gate_census[2], gate_census[3],
-                gate_census[4], gate_census[5], gate_census[6], arm_only_n, arm_elems
+                gate_census[4], gate_census[5], gate_census[6], arm_only_n, arm_elems, wide_n
             );
         }
         let tracked_signal_len = if self.armed_edge {
@@ -76570,16 +76641,21 @@ impl Simulator {
             self.after_signal_write_premirrored(id);
             return;
         }
-        let val = Value::from_inline(val_bits, xz_bits, w);
-        let high_eff = high.min(sig_w.saturating_sub(1));
-        let mut changed = false;
-        for bit_pos in low..=high_eff {
-            let src_bit = val.get_bit((bit_pos - low) as usize);
-            if self.signal_table[id].get_bit(bit_pos as usize) != src_bit {
-                self.signal_table[id].set_bit(bit_pos as usize, src_bit);
-                changed = true;
+        let changed = if w <= 64 {
+            self.signal_table[id].splice_bits64(low as usize, val_bits, xz_bits, w as usize)
+        } else {
+            let val = Value::from_inline(val_bits, xz_bits, w);
+            let high_eff = high.min(sig_w.saturating_sub(1));
+            let mut changed = false;
+            for bit_pos in low..=high_eff {
+                let src_bit = val.get_bit((bit_pos - low) as usize);
+                if self.signal_table[id].get_bit(bit_pos as usize) != src_bit {
+                    self.signal_table[id].set_bit(bit_pos as usize, src_bit);
+                    changed = true;
+                }
             }
-        }
+            changed
+        };
         if changed {
             // ONE mirror sync for the whole span (raw_bits walks 64
             // LogicBits and has_xz the full value — never per changed bit),
