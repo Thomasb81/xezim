@@ -91277,7 +91277,18 @@ impl Simulator {
                 // both print 0 there; returning x instead rendered `%b` as x).
                 return Some(Value::from_u64(0, 1));
             }
-            if lv != rv {
+            // §11.4.5 / §7.12: dynamic-array / queue element `==` compares the
+            // element VALUES, widened to a common width (§6.24.3/§11.6.1:
+            // zero-extend the narrower operand when unsigned). Comparing the
+            // Value STRUCTS (`lv != rv`) made two equal-valued elements with
+            // different storage widths compare unequal — e.g. an in-place
+            // `q[i] = v` overwrite stores an 8-bit element while an
+            // initializer/whole-copy rounds up to 32-bit. Use `is_equal`,
+            // which zero-extends the narrower operand before comparing.
+            // `is_equal` returns a 1-bit Value (possibly X), but the elements
+            // are fully known here (all X/Z was rejected above), so bit 0 is
+            // a definitive 0/1.
+            if lv.is_equal(&rv).get_bit(0) != LogicBit::One {
                 equal = false;
             }
         }
