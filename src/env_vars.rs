@@ -58,6 +58,8 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_CYCLE_CENSUS", "Census: comb entries in combinational loops (SCCs) / self-loops and edge blocks on derived clocks — the exclusion set for single-pass cycle evaluation (=2 samples the largest SCCs)"),
     ("XEZIM_DBG_ARR", "Elab debug: trace array dimension/type resolution"),
     ("XEZIM_DBG_PARAM", "Elab debug: trace parameter overrides and resolution"),
+    ("XEZIM_CYCLE_CENSUS", "Census: comb entries in combinational loops (SCCs) / self-loops and edge blocks on derived clocks — the exclusion set for single-pass cycle evaluation (=2 samples the largest SCCs)"),
+    ("XEZIM_CYCLE_MODE", "Engine: `event` (default, the event-driven engine) or `cycle` (cycle-based stepping after reset with event-driven fallback for ticks that need delta cycles; phase 0 = eager clock-tree pass)"),
     ("XEZIM_DEAD_CENSUS", "Census: upper bound on comb entries whose outputs nothing observable reads (hanging logic)"),
     ("XEZIM_DEBUG", "General verbose debug output"),
     ("XEZIM_DEBUG_NAMED_ARRAYS", "Debug: trace named-array signal-table binding"),

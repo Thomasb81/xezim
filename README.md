@@ -179,6 +179,13 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* `XEZIM_CYCLE_MODE=cycle` selects the cycle-based engine (default
+  `event` is the engine as before). Its first stage evaluates the clock
+  tree eagerly at each clock-generator edge instead of through the
+  combinational worklist; on the C906 CoreMark run it converts the clocks
+  of 64 % of the edge blocks, cuts settle passes by 12 %, and produces
+  identical output for 0.4 % fewer instructions. Later stages will add
+  cycle stepping after reset with event-driven fallback.
 * The statement interpreter's three largest routines keep smaller stack
   frames (the statement dispatcher went from 7.8 KB to 3.8 KB per nested
   call), so a deeply nested testbench statement chain stays in cache: the

@@ -4347,6 +4347,25 @@ pub struct Simulator {
     /// `name_resolve_hint` and `current_scope` (four allocations for a
     /// compiled-FSM wake-up) and freed them on exit.
     hint_string_pool: Vec<String>,
+    /// Gated-clock conversion (cycle design phase 0). A derived clock is a
+    /// fused-gate output (ICG `clk & en`, buffer, inverter) whose input
+    /// clock chains back to a clock GENERATOR. Those gate entries form the
+    /// clock tree: at a generator toggle they are evaluated EAGERLY in
+    /// topological order and any derived clock that toggled joins the same
+    /// edge pass, so the tree never goes through the settle worklist
+    /// (c906: 666 always-active entries, 38% of all comb evaluations, were
+    /// the clock tree). `trigger_deps` skips a tree entry when the written
+    /// signal is a tree clock; an ENABLE change still reaches it through
+    /// the enable's own dependents.
+    /// `XEZIM_CYCLE_MODE`: `event` (the event-driven engine, default) or
+    /// `cycle`. Everything under the cycle design (the eager clock tree,
+    /// later the cycle scheduler and its delta-cycle fallback) is gated on
+    /// this so `event` is exactly the engine as it was.
+    cycle_mode: bool,
+    clock_tree_by_root: HashMap<usize, Vec<usize>>,
+    is_clock_tree_entry: Vec<bool>,
+    is_clock_tree_signal: Vec<bool>,
+    prof_clock_tree_evals: u64,
     /// Instance scope of the comb/edge BLOCK currently being evaluated, for
     /// `%m` only — deliberately separate from `current_scope`, which also
     /// steers name resolution (`resolve_hier_name`) and must not start
@@ -8396,6 +8415,18 @@ impl Simulator {
             gate_fall_delay_by_id: HashMap::default(),
             gate_off_delay_by_id: HashMap::default(),
             hint_string_pool: Vec::new(),
+            cycle_mode: match std::env::var("XEZIM_CYCLE_MODE").as_deref() {
+                Ok("cycle") => true,
+                Ok("event") | Err(_) => false,
+                Ok(other) => {
+                    eprintln!("[xezim][warning] XEZIM_CYCLE_MODE={other:?} is not `event` or `cycle`; using `event`");
+                    false
+                }
+            },
+            clock_tree_by_root: HashMap::default(),
+            is_clock_tree_entry: Vec::new(),
+            is_clock_tree_signal: Vec::new(),
+            prof_clock_tree_evals: 0,
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
@@ -13657,6 +13688,7 @@ impl Simulator {
                 .binary_search(&cg.signal_id)
                 .unwrap_or(usize::MAX);
         }
+        self.build_clock_tree();
         // Build the non-clock-edge-signal lookup table.  Dense Vec<bool>
         // indexed by signal_id and bounded by the highest edge signal so the
         // hot per-write check stays a single bounds-check + load. Tags
@@ -17304,6 +17336,7 @@ impl Simulator {
         // Collected inside the &mut borrow of `clock_generators`, printed
         // after it ends (the names live in `id_to_name`).
         let mut fired: Vec<(usize, u64)> = Vec::new();
+        let mut tree_roots: Vec<usize> = Vec::new();
         for cg in &mut self.clock_generators {
             if cg.next_toggle_time == self.time {
                 let w = self.signal_widths[cg.signal_id];
@@ -17356,6 +17389,12 @@ impl Simulator {
                 if cg.edge_signal_position != usize::MAX {
                     self.toggled_clock_positions.push(cg.edge_signal_position);
                 }
+                tree_roots.push(cg.signal_id);
+            }
+        }
+        for root in tree_roots {
+            if self.is_clock_tree_signal.get(root).copied().unwrap_or(false) {
+                self.eval_clock_tree(root);
             }
         }
         for (sig, v) in fired {
@@ -19089,6 +19128,275 @@ impl Simulator {
     /// A writes a signal entry B reads, and B reaches A), and self-looping
     /// level-sensitive blocks (latches: a block that reads what it writes).
     /// Everything else is a DAG and evaluates once per edge in topo order.
+    /// See the `clock_tree_by_root` field. Only fused-gate entries qualify
+    /// (Buf1 / Bin2 / Mux2 / UdpLut3 with a clock input); the walk from a
+    /// derived clock follows the entry's clock-typed input until it reaches
+    /// a clock generator, and the per-root list is in evaluation order
+    /// (parents before children). Disabled with `XEZIM_CLOCK_TREE=0`.
+    fn build_clock_tree(&mut self) {
+        if !self.cycle_mode || std::env::var("XEZIM_CLOCK_TREE").as_deref() == Ok("0") {
+            return;
+        }
+        let n_sig = self.signal_table.len();
+        let mut is_edge_sig = vec![false; n_sig];
+        for &sid in &self.edge_signal_ids {
+            if sid < n_sig {
+                is_edge_sig[sid] = true;
+            }
+        }
+        let mut is_gen = vec![false; n_sig];
+        for cg in &self.clock_generators {
+            if cg.signal_id < n_sig {
+                is_gen[cg.signal_id] = true;
+            }
+        }
+        // single comb writer per signal
+        let mut writer: HashMap<usize, usize> = HashMap::default();
+        let mut multi: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (e, ent) in self.comb_entries.iter().enumerate() {
+            for &w in &ent.cold.write_signal_ids {
+                if writer.insert(w, e).is_some() {
+                    multi.insert(w);
+                }
+            }
+        }
+        // A tree net is a generator, or a single-writer net whose writer is a
+        // fused gate / direct copy with EXACTLY ONE tree-net input (the rest
+        // are enables). Memoized: Some(root) / None (not a tree net).
+        let mut memo: HashMap<usize, Option<usize>> = HashMap::default();
+        let mut tree_entry_of: HashMap<usize, usize> = HashMap::default(); // net -> writer entry
+        let mut clock_input_of: HashMap<usize, usize> = HashMap::default(); // net -> its tree-net input
+        fn walk(
+            sig: usize,
+            n_sig: usize,
+            is_gen: &[bool],
+            writer: &HashMap<usize, usize>,
+            multi: &std::collections::HashSet<usize>,
+            entries: &[CombEntry],
+            memo: &mut HashMap<usize, Option<usize>>,
+            tree_entry_of: &mut HashMap<usize, usize>,
+            clock_input_of: &mut HashMap<usize, usize>,
+            depth: u32,
+        ) -> Option<usize> {
+            if sig >= n_sig || depth > 64 {
+                return None;
+            }
+            if is_gen[sig] {
+                return Some(sig);
+            }
+            if let Some(&m) = memo.get(&sig) {
+                return m;
+            }
+            memo.insert(sig, None); // cycle guard
+            let Some(&e) = writer.get(&sig) else { return None };
+            if multi.contains(&sig) {
+                return None;
+            }
+            let ent = &entries[e];
+            // Any comb entry kind can sit in a clock tree (buffers, ICG cells,
+            // fanout buffers, gate regions, compiled cell bodies); stateful
+            // UDPs and no-ops cannot.
+            let inputs: Vec<usize> = match &ent.item {
+                CombItem::Udp { .. } | CombItem::UdpBatch { .. } | CombItem::Noop => return None,
+                _ => ent.cold.read_signal_ids.clone(),
+            };
+            let mut found: Option<(usize, usize)> = None; // (input net, root)
+            for &r in &inputs {
+                if let Some(root) = walk(r, n_sig, is_gen, writer, multi, entries, memo, tree_entry_of, clock_input_of, depth + 1) {
+                    if found.is_some() {
+                        return None; // two clock inputs (a clock mux)
+                    }
+                    found = Some((r, root));
+                }
+            }
+            let Some((inp, root)) = found else { return None };
+            memo.insert(sig, Some(root));
+            tree_entry_of.insert(sig, e);
+            clock_input_of.insert(sig, inp);
+            Some(root)
+        }
+        // seed from every edge signal (derived clocks) — intermediates are discovered on the way
+        for sid in 0..n_sig {
+            if is_edge_sig[sid] && !is_gen[sid] {
+                let _ = walk(sid, n_sig, &is_gen, &writer, &multi, &self.comb_entries, &mut memo, &mut tree_entry_of, &mut clock_input_of, 0);
+            }
+        }
+        // depth (distance from root) per tree net, for evaluation order
+        let mut depth_of: HashMap<usize, usize> = HashMap::default();
+        let mut by_root: HashMap<usize, Vec<(usize, usize)>> = HashMap::default();
+        for (&net, &e) in &tree_entry_of {
+            let Some(Some(root)) = memo.get(&net).copied() else { continue };
+            let mut d = 0usize;
+            let mut cur = net;
+            while let Some(&up) = clock_input_of.get(&cur) {
+                d += 1;
+                cur = up;
+                if d > 64 { break; }
+            }
+            depth_of.insert(net, d);
+            by_root.entry(root).or_default().push((d, e));
+        }
+        let n_ent = self.comb_entries.len();
+        let mut is_entry = vec![false; n_ent];
+        let mut is_sig = vec![false; n_sig];
+        let mut tree: HashMap<usize, Vec<usize>> = HashMap::default();
+        for (r, mut v) in by_root {
+            v.sort_by_key(|&(d, e)| (d, e));
+            v.dedup_by_key(|x| x.1);
+            for &(_, e) in &v {
+                is_entry[e] = true;
+            }
+            tree.insert(r, v.into_iter().map(|(_, e)| e).collect());
+            is_sig[r] = true;
+        }
+        for (&net, _) in &tree_entry_of {
+            is_sig[net] = true;
+        }
+        let derived_clocks = (0..n_sig).filter(|&sid| is_edge_sig[sid] && tree_entry_of.contains_key(&sid)).count();
+        if std::env::var_os("XEZIM_CLOCK_TREE_STATS").is_some() || sim_debug_enabled() {
+            let total: usize = tree.values().map(|v| v.len()).sum();
+            let unconv = (0..n_sig).filter(|&sid| is_edge_sig[sid] && !is_gen[sid] && !tree_entry_of.contains_key(&sid)).count();
+            // hop-by-hop trace of the first three unconverted clocks that have a comb writer
+            let mut shown = 0;
+            for sid in 0..n_sig {
+                if shown >= 3 { break; }
+                if !is_edge_sig[sid] || is_gen[sid] || tree_entry_of.contains_key(&sid) || !writer.contains_key(&sid) { continue; }
+                if self.name_for_id(sid).contains("__xz_") { continue; }
+                shown += 1;
+                let mut cur = sid;
+                let mut trace: Vec<String> = Vec::new();
+                for _ in 0..7 {
+                    let leaf = self.name_for_id(cur).rsplit('.').next().unwrap_or("").to_string();
+                    let Some(&e) = writer.get(&cur) else { trace.push(format!("{leaf}: NO WRITER")); break };
+                    if multi.contains(&cur) { trace.push(format!("{leaf}: MULTI-WRITER")); break; }
+                    let ent = &self.comb_entries[e];
+                    let kind = match &ent.item {
+                        CombItem::FusedGate { .. } => "FusedGate", CombItem::CompiledContAssign { .. } => "CompiledCA",
+                        CombItem::CompiledAlwaysBlock { .. } => "CompiledAB", CombItem::DirectCopy { .. } | CombItem::FastDirectCopy { .. } => "DirectCopy",
+                        CombItem::FastDirectFanout { .. } | CombItem::FusedBufFanout { .. } | CombItem::FusedAndFanout { .. } => "Fanout",
+                        CombItem::VectorGate { .. } => "VectorGate", CombItem::GateRegion { .. } => "GateRegion", CombItem::Udp { .. } | CombItem::UdpBatch { .. } => "Udp",
+                        CombItem::ContAssign { .. } => "ContAssign", CombItem::AlwaysBlock { .. } => "AlwaysBlock", _ => "other" };
+                    let ins: Vec<String> = ent.cold.read_signal_ids.iter().map(|&r| {
+                        let t = if r < n_sig && is_gen[r] { "GEN" } else if memo.get(&r).copied().flatten().is_some() { "tree" } else if r < n_sig && is_edge_sig[r] { "edge" } else { "data" };
+                        format!("{}:{}", self.name_for_id(r).rsplit('.').next().unwrap_or(""), t)
+                    }).collect();
+                    trace.push(format!("{leaf} <- {kind}[w={}] {:?}", ent.cold.write_signal_ids.len(), ins));
+                    let next = ent.cold.read_signal_ids.iter().copied().find(|&r| r < n_sig && (is_gen[r] || is_edge_sig[r] || memo.get(&r).copied().flatten().is_some()))
+                        .or_else(|| if ent.cold.read_signal_ids.len() == 1 { Some(ent.cold.read_signal_ids[0]) } else { None });
+                    match next { Some(n) if n != cur => cur = n, _ => break }
+                    if cur < n_sig && is_gen[cur] { trace.push("GEN".to_string()); break; }
+                }
+                eprintln!("[CLOCK-TREE]   trace {}: {}", shown, trace.join("  ->  "));
+            }
+            eprintln!(
+                "[CLOCK-TREE] roots={} tree entries={} derived clocks converted={} unconverted={} (edge signals {})",
+                tree.len(), total, derived_clocks, unconv, self.edge_signal_ids.len()
+            );
+            // coverage by CLOCK ROLE: the first sensitivity of an edge block, weighted by blocks
+            let mut blocks_by_clock: HashMap<usize, usize> = HashMap::default();
+            for eb in self.edge_blocks.iter() {
+                if let Some(s0) = eb.resolved_sensitivities.first() {
+                    *blocks_by_clock.entry(s0.signal_id).or_insert(0) += 1;
+                }
+            }
+            let (mut conv_blocks, mut gen_blocks, mut unconv_blocks) = (0usize, 0usize, 0usize);
+            let mut unconv_list: Vec<(usize, usize)> = Vec::new();
+            let mut conv_list: Vec<(usize, usize)> = Vec::new();
+            for (&clk, &nb) in &blocks_by_clock {
+                if clk < n_sig && is_gen[clk] { gen_blocks += nb; }
+                else if tree_entry_of.contains_key(&clk) { conv_blocks += nb; conv_list.push((nb, clk)); }
+                else { unconv_blocks += nb; unconv_list.push((nb, clk)); }
+            }
+            unconv_list.sort_by(|a, b| b.0.cmp(&a.0));
+            conv_list.sort_by(|a, b| b.0.cmp(&a.0));
+            let nm = |sid: usize| self.name_for_id(sid).rsplit('.').next().unwrap_or("").to_string();
+            eprintln!("[CLOCK-TREE] edge blocks by clock role: on generators {} | on converted derived clocks {} | on unconverted {} (of {})",
+                gen_blocks, conv_blocks, unconv_blocks, self.edge_blocks.len());
+            eprintln!("[CLOCK-TREE]   converted top: {:?}", conv_list.iter().take(5).map(|&(n, c)| format!("{}x{}", n, nm(c))).collect::<Vec<_>>());
+            eprintln!("[CLOCK-TREE]   unconverted top: {:?}", unconv_list.iter().take(8).map(|&(n, c)| {
+                let w = match writer.get(&c) { None => "no-writer".to_string(), Some(&e) => match &self.comb_entries[e].item {
+                    CombItem::FusedGate { .. } => "gate".into(), CombItem::CompiledContAssign { .. } => "compiled".into(), CombItem::CompiledAlwaysBlock { .. } => "compiledAB".into(),
+                    CombItem::DirectCopy { .. } | CombItem::FastDirectCopy { .. } => "copy".into(), CombItem::Udp { .. } | CombItem::UdpBatch { .. } => "udp".into(), _ => "other".into() } };
+                format!("{}x{}[{}{}]", n, nm(c), w, if multi.contains(&c) { ",multi" } else { "" })
+            }).collect::<Vec<_>>());
+        }
+        self.clock_tree_by_root = tree;
+        self.is_clock_tree_entry = is_entry;
+        self.is_clock_tree_signal = is_sig;
+    }
+
+    /// Eager clock-tree pass for a root that just toggled (see the field
+    /// docs). Evaluates the tree's gate entries in order; a derived clock
+    /// that changed is queued for the clocks-only edge pass and marked
+    /// dirty for its data readers (the settle skips its tree children).
+    fn eval_clock_tree(&mut self, root: usize) {
+        let Some(list) = self.clock_tree_by_root.get(&root) else { return };
+        let list: Vec<usize> = list.clone();
+        let sdf_any = !self.sdf_delays.is_empty();
+        for e in list {
+            self.prof_clock_tree_evals += 1;
+            if !matches!(self.comb_entries[e].item, CombItem::FusedGate { .. } | CombItem::DirectCopy { .. } | CombItem::FastDirectCopy { .. }) {
+                // generic path: the full single-entry evaluator on a taken entry vector
+                let entries = std::mem::take(&mut self.comb_entries);
+                let dsts: Vec<usize> = entries[e].cold.write_signal_ids.clone();
+                let before: Vec<(u64, u64)> = dsts.iter().map(|&d| self.signal_table[d].raw_bits()).collect();
+                self.eval_comb_entry_full(&entries[e]);
+                self.comb_entries = entries;
+                for (i, &dst) in dsts.iter().enumerate() {
+                    if self.signal_table[dst].raw_bits() != before[i] {
+                        if let Some(&pos) = self.sig_to_edge_pos.get(dst) {
+                            if pos >= 0 {
+                                self.toggled_clock_positions.push(pos as usize);
+                            }
+                        }
+                        if !self.dirty_signals[dst] {
+                            self.dirty_signals[dst] = true;
+                            self.dirty_list.push(dst);
+                        }
+                        self.dirty_any = true;
+                    }
+                }
+                continue;
+            }
+            let changed_id: Option<usize> = match &self.comb_entries[e].item {
+                CombItem::FusedGate { op } => {
+                    let op = *op;
+                    let (dst, new_bit) = self.fused_gate_eval(&op);
+                    if self.fused_bit_commit(dst, new_bit, sdf_any) { Some(dst.sig_id as usize) } else { None }
+                }
+                CombItem::DirectCopy { dst_id, .. } | CombItem::FastDirectCopy { dst_id, .. } => {
+                    let dst = *dst_id;
+                    let Some(&src) = self.comb_entries[e].cold.read_signal_ids.first() else { continue };
+                    let (sv, sx) = self.signal_table[src].raw_bits();
+                    let (dv, dx) = self.signal_table[dst].raw_bits();
+                    if self.signal_widths[dst] <= 64 && self.signal_widths[src] == self.signal_widths[dst] && !(sv == dv && sx == dx)
+                        && self.signal_table[dst].set_inline_bits(sv, sx)
+                    {
+                        self.sync_mirror(dst);
+                        self.table_modified = true;
+                        self.after_signal_write_premirrored(dst);
+                        Some(dst)
+                    } else {
+                        None
+                    }
+                }
+                _ => continue,
+            };
+            if let Some(id) = changed_id {
+                if !self.dirty_signals[id] {
+                    self.dirty_signals[id] = true;
+                    self.dirty_list.push(id);
+                }
+                self.dirty_any = true;
+                if let Some(&pos) = self.sig_to_edge_pos.get(id) {
+                    if pos >= 0 {
+                        self.toggled_clock_positions.push(pos as usize);
+                    }
+                }
+            }
+        }
+    }
+
     fn dump_cycle_census(&self) {
         let mode = match std::env::var("XEZIM_CYCLE_CENSUS") { Ok(v) => v, Err(_) => return };
         use super::bytecode::Insn;
@@ -36707,6 +37015,8 @@ impl Simulator {
             self.prof_settle_ab_ns as f64 / 1e6,
             self.prof_settle_ab_count
         );
+        eprintln!("[PROF] engine={}", if self.cycle_mode { "cycle" } else { "event" });
+        eprintln!("[PROF] clock_tree: roots={} entries={} eager_evals={}", self.clock_tree_by_root.len(), self.is_clock_tree_entry.iter().filter(|&&b| b).count(), self.prof_clock_tree_evals);
         eprintln!("[PROF] settle_calls={} settle_iters={} max_iters={} entry_evals={} unresolved_entries={}/{}",
             self.settle_calls, self.settle_iters, self.max_settle_iters, self.entry_evals,
             unresolved, self.comb_entries.len());
@@ -47793,6 +48103,8 @@ impl Simulator {
         let entries = std::mem::take(&mut self.comb_entries);
         let dep_offsets = std::mem::take(&mut self.comb_dep_offsets);
         let dep_entries = std::mem::take(&mut self.comb_dep_entries);
+        let tree_sig = std::mem::take(&mut self.is_clock_tree_signal);
+        let tree_entry = std::mem::take(&mut self.is_clock_tree_entry);
         let num_entries = entries.len();
 
         // Resize persistent buffers if needed (only happens once)
@@ -47907,6 +48219,8 @@ impl Simulator {
             self.comb_entries = entries;
             self.comb_dep_offsets = dep_offsets;
             self.comb_dep_entries = dep_entries;
+            self.is_clock_tree_signal = tree_sig;
+            self.is_clock_tree_entry = tree_entry;
             self.settle_triggered = triggered;
             self.settle_triggered_list = next_list;
             self.settling = false;
@@ -48003,8 +48317,12 @@ impl Simulator {
                     let __lo = dep_offsets[__tid] as usize;
                     let __hi = dep_offsets[__tid + 1] as usize;
                     n_dep_edges += (__hi - __lo) as u64;
+                    let __tree_clk = tree_sig.get(__tid).copied().unwrap_or(false);
                     for &__dep_u32 in &dep_entries[__lo..__hi] {
                         let __dep = __dep_u32 as usize;
+                        if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
+                            continue;
+                        }
                         if !triggered[__dep] {
                             triggered[__dep] = true;
                             if __dep > $eidx {
@@ -48698,6 +49016,8 @@ impl Simulator {
         self.comb_entries = entries;
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;
+        self.is_clock_tree_signal = tree_sig;
+        self.is_clock_tree_entry = tree_entry;
         self.settle_inject_bits = inject_bits;
         self.settle_triggered = triggered;
         self.settle_triggered_list = next_list;
