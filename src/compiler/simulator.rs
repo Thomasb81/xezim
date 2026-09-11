@@ -1004,7 +1004,7 @@ struct CombEntryCold {
     span: crate::ast::Span,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB008";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB009";
 
 #[derive(serde::Serialize)]
 struct PreparedCombCacheRef<'a> {
@@ -20856,6 +20856,9 @@ impl Simulator {
                 TsInsn::XorC { d, s, k } => {
                     regs[*d as usize] = regs[*s as usize] ^ k;
                 }
+                TsInsn::MaskEq { d, s, mask, v } => {
+                    regs[*d as usize] = ((regs[*s as usize] & mask) == *v) as u64;
+                }
                 TsInsn::EqC { d, s, k } => {
                     regs[*d as usize] = (regs[*s as usize] == *k) as u64;
                 }
@@ -21379,6 +21382,9 @@ impl Simulator {
                 TsInsn::XorC { d, s, k } => {
                     r!(*d) = r!(*s) ^ k;
                 }
+                TsInsn::MaskEq { d, s, mask, v } => {
+                    r!(*d) = ((r!(*s) & mask) == *v) as u64;
+                }
                 TsInsn::EqC { d, s, k } => {
                     r!(*d) = (r!(*s) == *k) as u64;
                 }
@@ -21881,6 +21887,9 @@ impl Simulator {
                 }
                 TsInsn::XorC { d, s, k } => {
                     regs[*d as usize] = regs[*s as usize] ^ k;
+                }
+                TsInsn::MaskEq { d, s, mask, v } => {
+                    regs[*d as usize] = ((regs[*s as usize] & mask) == *v) as u64;
                 }
                 TsInsn::EqC { d, s, k } => {
                     regs[*d as usize] = (regs[*s as usize] == *k) as u64;

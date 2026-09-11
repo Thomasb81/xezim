@@ -179,6 +179,11 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* `casez`/`casex` decoders compiled to a jump table now lay their wildcard
+  chains out with forward jumps only, and a `casez`/`casex` compare against
+  a constant pattern runs on the two-state fast path. The C906 instruction
+  decoders (up to 7,500 instructions each) leave the 4-state interpreter;
+  CoreMark 0.3 % fewer instructions, output identical.
 * The bytecode compiler folds constant register chains: an unrolled
   `i = 0; bus[i] = v; i = i + 1; …` sequence (the C906 decode blocks carried
   230 chained constant adds each) becomes static bit writes, and constants

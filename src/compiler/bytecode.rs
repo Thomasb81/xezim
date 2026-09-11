@@ -4507,21 +4507,15 @@ impl<'a> BytecodeCompiler<'a> {
         let arm_reg_start = self.next_reg;
         let mut peak_reg = arm_reg_start;
         let mut ok = true;
-        for (ii, it) in items.iter().enumerate() {
-            let entry = self.insns.len() as u32;
-            body_entry[ii] = entry;
-            if it.is_default {
-                default_entry = Some(entry);
-            }
-            if !self.compile_stmt(&it.stmt) {
-                ok = false;
-                break;
-            }
-            end_jumps.push(self.insns.len());
-            self.emit(Insn::Jump(0));
-            peak_reg = peak_reg.max(self.next_reg);
-            self.next_reg = arm_reg_start;
-        }
+        // Layout: the per-bucket wildcard chains and the x/z chain come FIRST
+        // and the arm bodies AFTER them, so every chain -> arm jump is
+        // forward. Arms first (chains at the end jumping back into them)
+        // gave every casez decoder a backward branch, and the two-state
+        // lowering refuses a block with a backward branch as soon as any
+        // register is reused at a different width — which the arm temporaries
+        // always are. `arm_fixups` patches the chain jumps once the arm
+        // entries are known.
+        let mut arm_fixups: Vec<(usize, usize)> = Vec::new();
         let mut bucket_entries: Vec<u32> = Vec::new();
         let mut xz_entry: u32 = 0;
         if ok {
@@ -4555,7 +4549,8 @@ impl<'a> BytecodeCompiler<'a> {
                     });
                     let bidx = self.insns.len();
                     self.emit(Insn::BranchIfFalse(cmp, 0));
-                    self.emit(Insn::Jump(body_entry[ii]));
+                    arm_fixups.push((self.insns.len(), ii));
+                    self.emit(Insn::Jump(0));
                     let next = self.insns.len() as u32;
                     self.insns[bidx] = Insn::BranchIfFalse(cmp, next);
                     peak_reg = peak_reg.max(self.next_reg);
@@ -4584,7 +4579,8 @@ impl<'a> BytecodeCompiler<'a> {
                 });
                 let bidx = self.insns.len();
                 self.emit(Insn::BranchIfFalse(cmp, 0));
-                self.emit(Insn::Jump(body_entry[ii]));
+                arm_fixups.push((self.insns.len(), ii));
+                self.emit(Insn::Jump(0));
                 let next = self.insns.len() as u32;
                 self.insns[bidx] = Insn::BranchIfFalse(cmp, next);
                 peak_reg = peak_reg.max(self.next_reg);
@@ -4594,10 +4590,30 @@ impl<'a> BytecodeCompiler<'a> {
             self.emit(Insn::Jump(0));
             end_jumps.push(usize::MAX - dj);
         }
+        if ok {
+            for (ii, it) in items.iter().enumerate() {
+                let entry = self.insns.len() as u32;
+                body_entry[ii] = entry;
+                if it.is_default {
+                    default_entry = Some(entry);
+                }
+                if !self.compile_stmt(&it.stmt) {
+                    ok = false;
+                    break;
+                }
+                end_jumps.push(self.insns.len());
+                self.emit(Insn::Jump(0));
+                peak_reg = peak_reg.max(self.next_reg);
+                self.next_reg = arm_reg_start;
+            }
+        }
         if !ok {
             self.insns.truncate(start);
             self.next_reg = start_reg;
             return false;
+        }
+        for (idx, ii) in arm_fixups {
+            self.insns[idx] = Insn::Jump(body_entry[ii]);
         }
         self.next_reg = peak_reg;
         let end = self.insns.len() as u32;
@@ -12775,6 +12791,11 @@ pub enum TsInsn {
     /// 1-bit comparison results; unsigned compare per §5.5.1 (either operand
     /// unsigned ⇒ unsigned, and every lowered register is unsigned).
     Eq { d: u16, a: u16, b: u16 },
+    /// regs[d] = ((regs[s] & mask) == v) — a `casez`/`casex` compare against
+    /// a constant pattern: `mask` clears the pattern's wildcard bits (z, or
+    /// x too for casex) and the bits above the compare width; `v` is the
+    /// pattern value under that mask. The selector is X-free on this path.
+    MaskEq { d: u16, s: u16, mask: u64, v: u64 },
     Neq { d: u16, a: u16, b: u16 },
     Lt { d: u16, a: u16, b: u16 },
     Leq { d: u16, a: u16, b: u16 },
@@ -13242,6 +13263,8 @@ pub fn lower_two_state(
                     | Insn::Move(..)
                     | Insn::BlockingAssign(..)
                     | Insn::BlockingAssignRange(..)
+                    | Insn::CasezEq(..)
+                    | Insn::CasexEq(..)
             )
             && xc_live
                 .iter()
@@ -13538,6 +13561,37 @@ pub fn lower_two_state(
             Insn::StrOp(..) => return None,
             Insn::BlockingAssignString(..) => return None,
             // 1-bit results. CaseEq/CaseNeq equal Eq/Neq on X-free values.
+            Insn::CasezEq(d, a, b) | Insn::CasexEq(d, a, b) => {
+                let sw = narrow_reg!(rw, *a, "wide operand (casez)");
+                let Some(pw) = rw[*b as usize] else {
+                    gate!("casez pattern width unknown");
+                };
+                if pw > 64 {
+                    gate!("wide operand (casez)");
+                }
+                let casex = matches!(insn, Insn::CasexEq(..));
+                let (pv, px) = if let Some((v, x)) = xc[*b as usize] {
+                    (v, x)
+                } else if let Some(v) = rc[*b as usize] {
+                    (v, 0u64)
+                } else {
+                    gate!("casez pattern not const");
+                };
+                let m = ts_mask(sw.max(pw));
+                // Z (val=1,xz=1) is the wildcard for casez; casex also
+                // treats X (val=0,xz=1) as one. A literal X in a casez
+                // pattern never equals a clean selector bit.
+                let wild = if casex { px } else { px & pv };
+                let (d, a) = (*d as u16, *a as u16);
+                def!(rw, d, 1);
+                if !casex && (px & !pv) != 0 {
+                    rc[d as usize] = Some(0);
+                    out.push(TsInsn::Const { d, v: 0 });
+                } else {
+                    let mask = m & !wild;
+                    out.push(TsInsn::MaskEq { d, s: a, mask, v: pv & mask });
+                }
+            }
             Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {
                 narrow_reg!(rw, *a, "wide operand (eq)");
                 narrow_reg!(rw, *b, "wide operand (eq)");
