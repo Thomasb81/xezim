@@ -56,18 +56,27 @@ endmodule
 "#;
 
 fn run() -> String {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("class_type_param_struct_prop");
-    std::fs::create_dir_all(&dir).unwrap();
-    let sv = dir.join("t.sv");
-    std::fs::write(&sv, DESIGN).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "top", "--no-cache", sv.to_str().unwrap()])
-        .output()
-        .unwrap();
-    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    assert!(output.status.success(), "run failed:\n{text}");
-    text
+    // The three tests below share one design; run it ONCE and hand every
+    // test the same text. Writing one shared `t.sv` from each test and
+    // spawning xezim on it raced under the parallel harness (a test
+    // rewrote the file while another's xezim was reading it) and failed
+    // about one run in three.
+    static OUT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OUT.get_or_init(|| {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("class_type_param_struct_prop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sv = dir.join("t.sv");
+        std::fs::write(&sv, DESIGN).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
+            .args(["--simulate", "-s", "top", "--no-cache", sv.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success(), "run failed:\n{text}");
+        text
+    })
+    .clone()
 }
 
 #[test]

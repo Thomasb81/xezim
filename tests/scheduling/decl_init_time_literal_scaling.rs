@@ -173,3 +173,29 @@ endmodule
 "#;
     assert_eq!(notes(src), vec!["NOTE: 10 10"]);
 }
+
+/// A parameter OVERRIDE at the instantiation (`m #(.P(50ns))`) and a
+/// `defparam` are written in the instantiating module's unit and scale like
+/// the declaration default. The reference simulator prints 50000 / 25000 /
+/// 100000 here under `1ps/1ps`; before this was covered, the default scaled
+/// and the override did not (50), so one design mixed the two.
+#[test]
+fn instantiation_overrides_and_defparam_scale_like_the_default() {
+    let out = notes(
+        r#"
+`timescale 1ps/1ps
+module m #(parameter realtime P = 100ns) ();
+  initial $display("NOTE: %m %0.0f", P);
+endmodule
+module tb;
+  m u();
+  m #(.P(50ns)) w();
+  m d();
+  defparam d.P = 25ns;
+endmodule
+"#,
+    );
+    assert!(out.iter().any(|m| m == "NOTE: tb.u 100000"), "{out:?}");
+    assert!(out.iter().any(|m| m == "NOTE: tb.w 50000"), "{out:?}");
+    assert!(out.iter().any(|m| m == "NOTE: tb.d 25000"), "{out:?}");
+}
