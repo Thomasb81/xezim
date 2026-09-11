@@ -1004,7 +1004,7 @@ struct CombEntryCold {
     span: crate::ast::Span,
 }
 
-const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB007";
+const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB008";
 
 #[derive(serde::Serialize)]
 struct PreparedCombCacheRef<'a> {

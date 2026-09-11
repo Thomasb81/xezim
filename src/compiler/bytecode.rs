@@ -10444,6 +10444,7 @@ impl<'a> BytecodeCompiler<'a> {
         // pattern is disjoint from `fuse_array_read_nba`'s, so the order
         // between the two does not matter.
         Self::fuse_binop_const(&mut self.insns);
+        Self::fold_const_regs(&mut self.insns, signal_widths);
         // After fuse_binop_const, before fuse_cmp_branch_move_resize: its
         // Move;Resize pattern is disjoint from the Move;Assign one here.
         Self::forward_move_into_assign(&mut self.insns);
@@ -11358,6 +11359,244 @@ impl<'a> BytecodeCompiler<'a> {
     /// would then need resizing before use. Before `compact_nops`, which
     /// removes the `Nop`s left behind. `XEZIM_FUSE_CONST=0` disables the pass
     /// (A/B escape hatch).
+    /// Register constant propagation. A `BinOpConst` whose source register
+    /// holds a compile-time constant (a `LoadConst`, or an earlier fold)
+    /// becomes a `LoadConst` of the result, computed with the SAME `Value`
+    /// operators the interpreter applies, so nothing observable changes. A
+    /// dynamic bit select or bit store whose index register is then constant
+    /// takes its static form, and constant registers nothing reads afterwards
+    /// are dropped. Knowledge is reset at every control-flow boundary.
+    ///
+    /// Why: an unrolled `i = 0; …; bus[i] = v; i = i + 1; …` decode block on
+    /// the C906 compiled to 230 chained `+1`/`+5`/`+64` constant adds feeding
+    /// 20 dynamic bit writes — 250 M interpreter instructions per CoreMark
+    /// run doing arithmetic on numbers known at compile time.
+    fn fold_const_regs(insns: &mut Vec<Insn>, signal_widths: &[u32]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FOLD_CONST_REGS").as_deref(), Ok("0"))
+        }) || insns.is_empty()
+        {
+            return;
+        }
+        let n = insns.len();
+        let mut is_target = vec![false; n + 1];
+        for insn in insns.iter() {
+            match insn {
+                Insn::CaseJump(_, cj) => {
+                    for &t in cj.table.iter().chain(std::iter::once(&cj.default)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::CaseMaskJump(_, mj) => {
+                    for &t in mj.table.iter().chain(std::iter::once(&mj.xz_path)) {
+                        if (t as usize) < is_target.len() {
+                            is_target[t as usize] = true;
+                        }
+                    }
+                }
+                Insn::BranchIfFalse(_, t)
+                | Insn::BranchUnlessZero(_, t)
+                | Insn::BranchIfSignalFalse(_, t, _)
+                | Insn::CmpBranch(_, _, _, _, t)
+                | Insn::Jump(t)
+                    if (*t as usize) < is_target.len() =>
+                {
+                    is_target[*t as usize] = true;
+                }
+                _ => {}
+            }
+        }
+        // Static index from a constant register, mirroring `dyn_bit_index`:
+        // an X/Z index drops the write at run time, so it stays dynamic.
+        let const_index = |v: &Value| -> Option<u32> {
+            if v.has_xz() {
+                return None;
+            }
+            let u = v.to_u64()?;
+            if u > u32::MAX as u64 {
+                return None;
+            }
+            Some(u as u32)
+        };
+        let mut known: HashMap<RegId, Value> = HashMap::default();
+        let mut folded = 0usize;
+        for i in 0..n {
+            if is_target[i] {
+                known.clear();
+            }
+            // Register the instruction defines (None: defines no register).
+            // Anything not listed clears all knowledge.
+            let dest: Option<Option<RegId>> = match &insns[i] {
+                Insn::LoadConst(d, _)
+                | Insn::LoadSignal(d, _)
+                | Insn::LoadSignalSigned(d, _)
+                | Insn::LoadProcessLocal(d, _)
+                | Insn::Resize(d, _)
+                | Insn::Add(d, _, _)
+                | Insn::Sub(d, _, _)
+                | Insn::Mul(d, _, _)
+                | Insn::Div(d, _, _)
+                | Insn::Mod(d, _, _)
+                | Insn::Pow(d, _, _)
+                | Insn::BitAnd(d, _, _)
+                | Insn::BitOr(d, _, _)
+                | Insn::BitXor(d, _, _)
+                | Insn::BitXnor(d, _, _)
+                | Insn::LogAnd(d, _, _)
+                | Insn::LogOr(d, _, _)
+                | Insn::Eq(d, _, _)
+                | Insn::Neq(d, _, _)
+                | Insn::CaseEq(d, _, _)
+                | Insn::CasezEq(d, _, _)
+                | Insn::CasexEq(d, _, _)
+                | Insn::Lt(d, _, _)
+                | Insn::Leq(d, _, _)
+                | Insn::Gt(d, _, _)
+                | Insn::Geq(d, _, _)
+                | Insn::Shl(d, _, _)
+                | Insn::Shr(d, _, _)
+                | Insn::AShr(d, _, _)
+                | Insn::CaseLut(d, _, _)
+                | Insn::MoveResize(d, _, _)
+                | Insn::Format(d, _)
+                | Insn::StrOp(d, _, _)
+                | Insn::BitNot(d, _)
+                | Insn::LogNot(d, _)
+                | Insn::Negate(d, _)
+                | Insn::ReduceAnd(d, _)
+                | Insn::ReduceOr(d, _)
+                | Insn::ReduceXor(d, _)
+                | Insn::BitSelect(d, _, _)
+                | Insn::BitSelectConst(d, _, _)
+                | Insn::RangeSelect(d, _, _, _)
+                | Insn::RangeSelectConst(d, _, _, _)
+                | Insn::Concat(d, _)
+                | Insn::Replicate(d, _, _)
+                | Insn::Select(d, _, _, _)
+                | Insn::LoadArrayElem(d, _, _)
+                | Insn::Move(d, _)
+                | Insn::EvalExprFallback(_, d, _)
+                | Insn::SetSigned(d)
+                | Insn::ClearSigned(d)
+                | Insn::LoadSignalRange(d, _, _, _)
+                | Insn::LoadSignalBit(d, _, _)
+                | Insn::BinOpConst(d, _, _, _) => Some(Some(*d)),
+                Insn::NbaAssign(..)
+                | Insn::NbaAssignRange(..)
+                | Insn::NbaAssignRangeDyn(..)
+                | Insn::NbaAssignBitDyn(..)
+                | Insn::NbaAssignConst(..)
+                | Insn::NbaAssignArray(..)
+                | Insn::NbaAssignArrayRange(..)
+                | Insn::NbaAssignArrayRead(..)
+                | Insn::BlockingAssign(..)
+                | Insn::BlockingAssignRange(..)
+                | Insn::BlockingAssignRangeDyn(..)
+                | Insn::BlockingAssignBitDyn(..)
+                | Insn::BlockingAssignArray(..)
+                | Insn::BlockingAssignArrayRange(..)
+                | Insn::BlockingAssignString(..)
+                | Insn::StmtFallback(..)
+                | Insn::WaitDelayReg(..)
+                | Insn::WaitEdge(..)
+                | Insn::Nop => Some(None),
+                _ => None,
+            };
+            // Fold / rewrite before the definition is applied.
+            match &insns[i] {
+                Insn::BinOpConst(d, src, k, kind) => {
+                    if let Some(v) = known.get(src) {
+                        let r = match kind {
+                            BinOpConstKind::Add => v.add(k),
+                            BinOpConstKind::Eq => v.is_equal(k),
+                            BinOpConstKind::CaseEq => v.case_eq(k),
+                            BinOpConstKind::Xor => v.bitwise_xor(k),
+                        };
+                        let d = *d;
+                        insns[i] = Insn::LoadConst(d, Box::new(r.clone()));
+                        known.insert(d, r);
+                        folded += 1;
+                        continue;
+                    }
+                }
+                Insn::BlockingAssignBitDyn(sig, idx, val) => {
+                    if let Some(u) = known.get(idx).and_then(|v| const_index(v)) {
+                        let w = signal_widths.get(*sig as usize).copied().unwrap_or(0);
+                        if u < w {
+                            insns[i] = Insn::BlockingAssignRange(*sig, u, u, *val);
+                            folded += 1;
+                        }
+                    }
+                }
+                Insn::NbaAssignBitDyn(sig, idx, val) => {
+                    if let Some(u) = known.get(idx).and_then(|v| const_index(v)) {
+                        let w = signal_widths.get(*sig as usize).copied().unwrap_or(0);
+                        if u < w {
+                            insns[i] = Insn::NbaAssignRange(*sig, u, u, *val);
+                            folded += 1;
+                        }
+                    }
+                }
+                Insn::BitSelect(d, base, idx) => {
+                    if let Some(u) = known.get(idx).and_then(|v| const_index(v)) {
+                        insns[i] = Insn::BitSelectConst(*d, *base, u);
+                        folded += 1;
+                    }
+                }
+                _ => {}
+            }
+            match dest {
+                Some(Some(d)) => {
+                    if let Insn::LoadConst(_, k) = &insns[i] {
+                        known.insert(d, (**k).clone());
+                    } else {
+                        known.remove(&d);
+                    }
+                }
+                Some(None) => {}
+                None => known.clear(),
+            }
+            if matches!(
+                insns[i],
+                Insn::Jump(..)
+                    | Insn::BranchIfFalse(..)
+                    | Insn::BranchUnlessZero(..)
+                    | Insn::BranchIfSignalFalse(..)
+                    | Insn::CmpBranch(..)
+                    | Insn::CaseJump(..)
+                    | Insn::CaseMaskJump(..)
+            ) {
+                known.clear();
+            }
+        }
+        if folded == 0 {
+            return;
+        }
+        // Drop constant loads nothing reads (the folded chain's temporaries).
+        let mut dead = 0usize;
+        for i in 0..n {
+            let Insn::LoadConst(d, _) = &insns[i] else {
+                continue;
+            };
+            let d = *d;
+            let read = insns
+                .iter()
+                .enumerate()
+                .any(|(j, other)| j != i && Self::insn_reads_reg(other, d));
+            if !read {
+                insns[i] = Insn::Nop;
+                dead += 1;
+            }
+        }
+        if std::env::var_os("XEZIM_FOLD_CONST_STATS").is_some() {
+            eprintln!("[FOLD-CONST] folded={folded} dead_consts={dead} insns={n}");
+        }
+    }
+
     fn fuse_binop_const(insns: &mut [Insn]) {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();

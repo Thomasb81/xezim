@@ -179,6 +179,12 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* The bytecode compiler folds constant register chains: an unrolled
+  `i = 0; bus[i] = v; i = i + 1; …` sequence (the C906 decode blocks carried
+  230 chained constant adds each) becomes static bit writes, and constants
+  nothing reads are dropped. C906 CoreMark: 5.2 % fewer instructions,
+  output identical; UVM benchmarks unchanged. `XEZIM_FOLD_CONST_REGS=0`
+  disables it.
 * The idle-edge prefilter that decides whether a clocked block runs at a
   clock edge now reads one packed state byte per block instead of four
   flag arrays. C906 CoreMark: 1.3 % fewer instructions, output identical.
