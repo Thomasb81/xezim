@@ -8182,6 +8182,13 @@ pub struct Simulator {
     vcd_limit_hit: bool,
     /// XEZIM_BSP_SHADOW=1: number of time>0 settles compared so far.
     bsp_shadow_checks: u64,
+    /// SystemC co-simulation bridge (`--sc-source`/`--sc-lib`/`--sc-top sc`).
+    /// `None` (the default) leaves every SystemC code path dormant — nothing
+    /// here depends on SystemC being installed, and the UVM regressions never
+    /// touch it.
+    pub sc_bridge: Option<crate::sc_bridge::ScBridge>,
+    /// SC-top link to the SystemC host thread (set only with `--sc-top sc`).
+    pub sc_link: Option<std::sync::Arc<crate::sc_bridge::ScLink>>,
     /// Buffered stdout sink for $display/$write. Lazily initialized on first
     /// write; runs its own background writer unless XEZIM_DUMP_INLINE=1.
     stdout_sink: Option<super::stdout_sink::StdoutSink>,
@@ -13608,6 +13615,8 @@ impl Simulator {
             vcd_limit_hit: false,
             bsp_shadow_checks: 0,
             stdout_sink: None,
+            sc_bridge: None,
+            sc_link: None,
             xtrace_file: None,
             xtrace_scopes: Vec::new(),
             xtrace_writer: None,
@@ -19915,15 +19924,9 @@ impl Simulator {
             self.event_queue
                 .schedule(0, pid, Vec::<Statement>::new().into());
         }
-        // Open the XTrace dump (if requested) AFTER initial-block scheduling
-        // and time-0 settle so the dictionary captures all elaborated signals
-        // and the snapshot reflects post-settle initial values.
-        if self.xtrace_file.is_some() {
-            self.xtrace_start_dump();
-        }
-        if self.fst_file.is_some() {
-            self.fst_start_dump();
-        }
+        // (XTrace/FST dumps open in `simulate()` — after SystemC co-sim setup —
+        // so the bridge's registry rows make it into the dictionary. They used
+        // to open here, but compile() cannot see the co-sim model yet.)
         self.auto_partition_by_clock();
         self.auto_partition_by_scope();
         mark_compile_phase("schedule initial blocks", &mut compile_phase_start);
@@ -20937,6 +20940,89 @@ impl Simulator {
         if !self.compile_errors.is_empty() {
             return;
         }
+        // ── SystemC co-simulation setup ─────────────────────────────────
+        // SC top: take the link to the SystemC host thread and publish the
+        // tick length it maps time against. The model .so is compiled and
+        // loaded over there; we only get its function table.
+        self.sc_link = crate::sc_bridge::take_pending_link();
+        if let Some(link) = self.sc_link.as_ref() {
+            link.set_tick_s(self.module.tick_s);
+            match link.take_shim() {
+                Some(shim) => match crate::sc_bridge::ScBridge::init_sc_top(shim) {
+                    Ok(mut b) => {
+                        // Attach the CLI maps: SV names resolve now (the
+                        // table is complete); SC registry indices resolve
+                        // lazily on the first rendezvous.
+                        self.sync_table_to_hashmap();
+                        let maps = crate::sc_bridge::sc_options()
+                            .map(|o| o.maps)
+                            .unwrap_or_default();
+                        for (sv_name, sc_name, dir) in &maps {
+                            let Some(&id) = self.signal_name_to_id.get(sv_name.as_str())
+                            else {
+                                eprintln!(
+                                    "Error: --sc-map '{}': no such SystemVerilog signal",
+                                    sv_name
+                                );
+                                self.finished = true;
+                                return;
+                            };
+                            let w = self.signal_table[id].width;
+                            if w > 64 {
+                                eprintln!(
+                                    "Error: --sc-map '{}': signals wider than 64 bits are not supported",
+                                    sv_name
+                                );
+                                self.finished = true;
+                                return;
+                            }
+                            b.add_map(id, w, sc_name.clone(), *dir);
+                        }
+                        self.sc_bridge = Some(b);
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        self.finished = true;
+                        return;
+                    }
+                },
+                None => {
+                    // The SystemC host thread never produced a model (its
+                    // compile/load error was already reported). Run the SV
+                    // side standalone rather than hang.
+                    eprintln!(
+                        "[xezim-sc] SystemC model unavailable; continuing without co-simulation"
+                    );
+                }
+            }
+        } else if let Some(opts) = crate::sc_bridge::sc_options() {
+            if opts.top == Some(crate::sc_bridge::ScTop::Sc) {
+                eprintln!(
+                    "Error: --sc-top sc requires the source path (xezim passes sources \n  directly; a precompiled bytecode model cannot host the SystemC master link)"
+                );
+                self.finished = true;
+                return;
+            }
+            // SV top: compile + load the model .so and run the user's build
+            // function now, so a build error aborts before any SV output.
+            match crate::sc_bridge::ScBridge::init_sv_top(&opts, self.module.tick_s) {
+                Ok(b) => self.sc_bridge = Some(b),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    self.finished = true;
+                    return;
+                }
+            }
+        }
+        // Open the XTrace/FST dumps (if requested) after SystemC co-sim setup
+        // so the bridge's registry rows make it into the dictionary, and after
+        // elaboration + time-0 settle so the snapshot reflects initial values.
+        if self.xtrace_file.is_some() {
+            self.xtrace_start_dump();
+        }
+        if self.fst_file.is_some() {
+            self.fst_start_dump();
+        }
         // Back the big, stable, randomly-accessed arrays with 2 MiB transparent
         // huge pages. On c910 the per-signal arrays span ~1.3 GiB / ~340k 4 KiB
         // pages accessed with no spatial locality, so page-table walks burned
@@ -20987,6 +21073,31 @@ impl Simulator {
         {
             self.time = self.max_time;
         }
+        // ── SystemC co-simulation teardown ──────────────────────────────
+        // Tell the SystemC master the SV kernel is done (SC top), and end
+        // the model kernel if the SV run reached $finish first (SV top).
+        // Both are idempotent no-ops without a bridge.
+        if let Some(b) = self.sc_bridge.as_ref() {
+            if b.sv_top {
+                unsafe { (b.shim.model_finish)() };
+            } else if let Some(link) = self.sc_link.as_ref() {
+                if !link.sc_done() {
+                    unsafe { (b.shim.sv_set_finished)() };
+                    link.set_sv_finished();
+                }
+            }
+        }
+        // Fire cbEndOfSimulation callbacks exactly once after the event loop
+        // terminates, before `final` blocks execute.
+        if !self.dpi_end_sim_cbs.is_empty() && !self.dpi_pending_end_sim_fired {
+            let self_ptr = self as *mut Simulator;
+            let now = self.time;
+            for cb in &self.dpi_end_sim_cbs.clone() {
+                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_END_OF_SIMULATION);
+            }
+            self.dpi_pending_end_sim_fired = true;
+        }
+
         // LRM §9.2.3 — `final` procedures run after the event loop terminates
         // but BEFORE any trace flush. May not contain time-consuming
         // statements (no `#`, `@`, `wait`). We honor that by running each
@@ -48302,6 +48413,26 @@ impl Simulator {
         }
         while !self.finished && iters < max_iters {
             iters += 1;
+            // ── SystemC co-sim rendezvous (SC top) ──────────────────────────
+            // The SystemC kernel is the time master: never advance past its
+            // current cap, and when this kernel reaches the cap, exchange.
+            // The rendezvous blocks until the SystemC slice completes, so a
+            // quiescent SV side simply parks here instead of spinning.
+            if self.sc_link.is_some()
+                && self.time >= self.sc_link.as_ref().unwrap().current_cap()
+                // Let the t=0 initial-block slot run before the first
+                // exchange: an import delivered while the design is still
+                // executing its initials would arm every @/always block at
+                // the delivered value and be silently swallowed (the LRM's
+                // value-change semantics). After t=0 has drained, a change
+                // is a change.
+                && !(self.time == 0 && self.event_queue.next_time() == Some(0))
+            {
+                if !self.sc_rendezvous() {
+                    self.finished = true;
+                    break;
+                }
+            }
             if HANG_REPORT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
                 && HANG_REPORT_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
             {
@@ -48534,8 +48665,18 @@ impl Simulator {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
                     continue;
                 }
-                break;
+                // SC top: SV is quiescent but the SystemC master may still
+                // have slices to run (or imports to deliver) — exchange
+                // instead of ending the run. Once the SystemC kernel is
+                // quiescent too, nothing can ever resume this kernel: end.
+                if self.sc_link.is_some() && self.sc_side_alive() {
+                    if self.sc_rendezvous() {
+                        continue;
+                    }
+                    self.finished = true;
+                }
             }
+            break;
             // Deadlock: only waiters remain but nothing can ever wake them.
             // A pending phase/drain timer still needs the loop to advance to its
             // deadline, so don't treat that as a deadlock.
@@ -48550,12 +48691,22 @@ impl Simulator {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
                     continue;
                 }
-                break;
+                // SC top: what looks like a deadlock locally is often just
+                // this kernel waiting for the SystemC master to drive it.
+                // Keep exchanging only while the SystemC side can still
+                // produce activity; once it is quiescent, those waiters can
+                // never fire and the run is genuinely over.
+                if self.sc_link.is_some() && self.sc_side_alive() {
+                    if self.sc_rendezvous() {
+                        continue;
+                    }
+                    self.finished = true;
+                }
             }
+            break;
 
             // Determine next time: minimum of event queue, clock generators, and delayed updates
-            let next_eq_time = self.event_queue.next_time();
-            let next_clk_time = if has_clocks {
+            let next_eq_time = self.event_queue.next_time();            let next_clk_time = if has_clocks {
                 self.clock_generators
                     .iter()
                     .map(|c| c.next_toggle_time)
@@ -48590,6 +48741,15 @@ impl Simulator {
                     u64::MAX
                 }
             });
+            // SystemC master cap (SC top): the SV kernel may never run past
+            // the time the SystemC side has rendezvoused to.
+            let mut next_time = next_time;
+            if let Some(link) = self.sc_link.as_ref() {
+                let cap = link.current_cap();
+                if cap < next_time {
+                    next_time = cap;
+                }
+            }
 
             if next_time > self.max_time {
                 if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
@@ -94175,6 +94335,23 @@ impl Simulator {
                     },
                 }
             }
+            "$sc_export_sig" | "$sc_import_sig" => {
+                self.exec_sc_map_task(name, args);
+            }
+            "$sc_step" => {
+                let ticks = if args.is_empty() {
+                    1
+                } else {
+                    self.eval_expr(&args[0]).to_u64().unwrap_or(1)
+                };
+                self.sc_step_sv_top(ticks);
+            }
+            "$sc_finish" => {
+                if let Some(b) = self.sc_bridge.as_ref() {
+                    unsafe { (b.shim.model_finish)() };
+                }
+                self.finished = true;
+            }
             "$dumpfile" => {
                 if let Some(arg) = args.first() {
                     // §21.7.2.1: the file name is any string-valued expression
@@ -106346,6 +106523,36 @@ impl Simulator {
             }
             let _ = writeln!(hdr, "$upscope $end");
         }
+        for (child_name, child_node) in &root.children {
+            emit_scope(&mut hdr, child_name, child_node);
+        }
+        let _ = writeln!(hdr, "$upscope $end");
+        // ── SystemC co-sim scope ──
+        // The bridge's registry signals appear as their own scope, sibling of
+        // the SV top, with id codes continuing after the SystemVerilog ones.
+        // Values update at each exchange (not on SV writes), so the per-change
+        // path below compares against each writer's own mirror.
+        let sc_codes: Vec<Arc<str>> = match self.sc_bridge.as_ref() {
+            Some(b) if !b.trace.is_empty() => {
+                let _ = writeln!(hdr, "$scope module systemc_bridge $end");
+                let mut codes = Vec::with_capacity(b.trace.len());
+                for (i, row) in b.trace.iter().enumerate() {
+                    let code: Arc<str> =
+                        Arc::from(Self::vcd_id_code(code_of_backing.len() + i));
+                    let _ = writeln!(
+                        hdr,
+                        "$var wire {} {} {} $end",
+                        row.width.max(1),
+                        code,
+                        Self::sc_trace_leaf(&row.name)
+                    );
+                    codes.push(code);
+                }
+                let _ = writeln!(hdr, "$upscope $end");
+                codes
+            }
+            _ => Vec::new(),
+        };
         let _ = writeln!(hdr, "$enddefinitions $end");
 
         // Build the compact per-cycle trace table: (signal_table index, code).
@@ -106383,6 +106590,16 @@ impl Simulator {
             prev.push(self.signal_table[sid].clone());
             kinds.push(kind);
             trace.push((sid, code));
+        }
+        // SystemC rows: initial mirror value in the checkpoint + seed the
+        // per-writer prev so only genuine changes emit.
+        if !sc_codes.is_empty() {
+            let b = self.sc_bridge.as_mut().unwrap();
+            for (i, row) in b.trace.iter_mut().enumerate() {
+                row.vcd_code = Some(sc_codes[i].clone());
+                row.vcd_prev = Some(row.mirror.clone());
+                super::vcd_sink::write_vcd_value(&mut hdr, &row.mirror, &sc_codes[i]);
+            }
         }
         let _ = writeln!(hdr, "$end");
 
@@ -106502,6 +106719,216 @@ impl Simulator {
             self.dump_dirty_epoch = self.dump_dirty_epoch.wrapping_add(1);
         }
     }
+
+    // ═════════════════════════════════════════════════════════
+    // SystemC co-simulation (runtime-optional; see docs/systemc-cosim.md)
+    // ═════════════════════════════════════════════════════════
+
+    /// Sanitize a SystemC registry name into a waveform leaf name: the last
+    /// path component, with characters outside `[A-Za-z0-9_$]` replaced.
+    fn sc_trace_leaf(name: &str) -> String {
+        let leaf = name.rsplit(['/', '.']).next().unwrap_or(name);
+        leaf.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '$') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+
+    /// `$sc_export_sig(sv_signal, "sc_name")` /
+    /// `$sc_import_sig(sv_signal, "sc_name")`: attach a SystemVerilog signal
+    /// to a SystemC registry signal (SV top). Export = SV drives SC.
+    fn exec_sc_map_task(&mut self, name: &str, args: &[Expression]) {
+        // Call convention: ("registry_name", signal) — the string first,
+        // matching $dumpfile-style system tasks.
+        if args.len() != 2 {
+            eprintln!("Warning: {} expects (\"registry_name\", signal)", name);
+            return;
+        }
+        let sc_name = self.system_string_arg(&args[0]);
+        let hier = match &args[1].kind {
+            ExprKind::Ident(h) => h.clone(),
+            _ => {
+                eprintln!("Warning: {} second argument must be a signal identifier", name);
+                return;
+            }
+        };
+        let full = self.resolve_hier_name(&hier).into_owned();
+        self.sync_table_to_hashmap();
+        let Some(&sv_id) = self.signal_name_to_id.get(full.as_str()) else {
+            eprintln!("Warning: {}: '{}' does not name a signal", name, full);
+            return;
+        };
+        let width = self.signal_table[sv_id].width;
+        if width > 64 {
+            eprintln!(
+                "Error: {}: signals wider than 64 bits are not supported",
+                name
+            );
+            self.finished = true;
+            return;
+        }
+        let dir = if name == "$sc_export_sig" {
+            crate::sc_bridge::ScDir::Export
+        } else {
+            crate::sc_bridge::ScDir::Import
+        };
+        let Some(b) = self.sc_bridge.as_mut() else {
+            eprintln!(
+                "Error: {} used without a SystemC model — pass --sc-source or --sc-lib",
+                name
+            );
+            self.finished = true;
+            return;
+        };
+        if b.rows
+            .iter()
+            .any(|r| r.sv_id == sv_id && r.dir == dir && r.sc_name == sc_name)
+        {
+            return;
+        }
+        b.add_map(sv_id, width, sc_name, dir);
+    }
+
+    /// Stage export-mapped SV signals into the shim, returning the pairs.
+    fn sc_stage_exports(&mut self) -> Vec<(i32, u64)> {
+        let Some(b) = self.sc_bridge.as_mut() else {
+            return Vec::new();
+        };
+        // $sc_export_sig mappings created via exec_sc_map_task carry a lazy
+        // sc_idx; resolve any that are still pending before the first exchange.
+        b.ensure_ready();
+        let mut out = Vec::new();
+        for row in &b.rows {
+            if row.dir != crate::sc_bridge::ScDir::Export {
+                continue;
+            }
+            if let Some(idx) = row.sc_idx {
+                let (v, _x) = self.signal_table[row.sv_id].raw_bits();
+                out.push((idx, v));
+            }
+        }
+        out
+    }
+
+    /// Apply pulled import values into the signal table with full write
+    /// bookkeeping (settle marks, dirty tracking, edge detection).
+    fn sc_apply_imports(&mut self, imports: Vec<(usize, u64)>) {
+        for (sv_id, w) in imports {
+            let w_bits = self.signal_table[sv_id].width;
+            let mask = if w_bits >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << w_bits) - 1
+            };
+            // Two-state v1: the C++ readers already map sc_lv X/Z to 0.
+            self.ts_store(sv_id, w & mask, mask);
+        }
+    }
+
+    /// `$sc_step(n)` (SV top): push exports, advance the SystemC kernel
+    /// exactly n ticks, pull imports back. SystemC time after the call is
+    /// exactly n*step earlier than after $sc_step(n-1) — exact accounting.
+    fn sc_step_sv_top(&mut self, ticks: u64) {
+        if self.sc_bridge.is_none() {
+            eprintln!(
+                "Error: $sc_step used without a SystemC model — pass --sc-source or --sc-lib"
+            );
+            self.finished = true;
+            return;
+        }
+        let exports = self.sc_stage_exports();
+        {
+            let b = self.sc_bridge.as_ref().unwrap();
+            for (idx, w) in &exports {
+                unsafe { (b.shim.write_export)(*idx, w, 1) };
+            }
+            unsafe { (b.shim.step)(ticks) };
+        }
+        let mut imports = Vec::new();
+        self.sc_bridge
+            .as_ref()
+            .unwrap()
+            .collect_imports(&mut imports);
+        if let Some(b) = self.sc_bridge.as_mut() {
+            b.update_mirrors();
+        }
+        self.sc_apply_imports(imports);
+    }
+
+    /// One SC-top exchange: stage exports, block until the SystemC slice
+    /// completes, apply its imports, refresh the trace mirrors. Returns
+    /// false when the SystemC side is done (sc_main returned / failed).
+    /// True when the SystemC kernel can still produce future activity (or
+    /// has not started yet). Both-kernels-quiescent means the co-simulation
+    /// is over: parked SV waiters can never be resumed.
+    fn sc_side_alive(&self) -> bool {
+        match self.sc_bridge.as_ref() {
+            Some(b) => unsafe { (b.shim.has_pending)() != 0 },
+            None => false,
+        }
+    }
+
+    fn sc_rendezvous(&mut self) -> bool {
+        let Some(link) = self.sc_link.clone() else {
+            return true;
+        };
+        if link.sc_done() {
+            return false;
+        }
+        if self.sc_bridge.is_none() {
+            // No model was ever loaded (its failure was reported at startup);
+            // park until the host thread flags completion.
+            while !link.sc_done() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            return false;
+        }
+        let exports = self.sc_stage_exports();
+        // 1. Publish this kernel's exports for the slice.
+        {
+            let b = self.sc_bridge.as_ref().unwrap();
+            for (idx, w) in &exports {
+                unsafe { (b.shim.write_export)(*idx, w, 1) };
+            }
+            // 2. Block until the SystemC slice ran to its next activity.
+            let rc = unsafe { (b.shim.sv_wait_slice)() };
+            if rc != 0 {
+                link.mark_sc_done();
+                return false;
+            }
+            // 3. Adopt the slice's time as the new cap.
+            let cap = unsafe { (b.shim.sv_cap)() };
+            link.set_cap(cap);
+        }
+        // 4. Pull the SystemC outputs into this kernel.
+        let mut imports = Vec::new();
+        self.sc_bridge
+            .as_ref()
+            .unwrap()
+            .collect_imports(&mut imports);
+        if let Some(b) = self.sc_bridge.as_mut() {
+            b.update_mirrors();
+        }
+        let had_imports = !imports.is_empty();
+        self.sc_apply_imports(imports);
+        if had_imports {
+            // The import writes bypass the delta machinery (this runs at the
+            // event-loop top, outside any time slot): propagate combinational
+            // fanout and re-check parked @/always-edge waiters against the
+            // new values, mirroring what a $deposit inside a time slot does.
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            self.check_edges();
+        }
+        true
+    }
+
 
     // NOTE: `Simulator::vcd_write_value` is GONE. It was a second, divergent
     // copy of `vcd_sink::write_vcd_value` (the two disagreed about `real` and
@@ -106624,6 +107051,20 @@ impl Simulator {
             // Full scan: walk every dumped trace slot.
             for idx in 0..self.vcd_trace.len() {
                 check_slot!(idx);
+            }
+        }
+
+        // SystemC bridge rows: the mirror updates at each exchange, not on SV
+        // writes, so these slots never appear in the dirty set.
+        if let Some(b) = self.sc_bridge.as_mut() {
+            for row in b.trace.iter_mut() {
+                let Some(code) = row.vcd_code.clone() else {
+                    continue;
+                };
+                if row.vcd_prev.as_ref() != Some(&row.mirror) {
+                    row.vcd_prev = Some(row.mirror.clone());
+                    changes.push((code, row.mirror.clone()));
+                }
             }
         }
 
@@ -107900,6 +108341,31 @@ impl Simulator {
             ));
         }
 
+        // ── SystemC co-sim rows (bridge registry mirror) ──
+        // Own module scope `/systemc_bridge` and its own id range, appended
+        // after the SystemVerilog dictionary.
+        let sc_xt: Vec<(Arc<str>, u32)> = match self.sc_bridge.as_ref() {
+            Some(b) if !b.trace.is_empty() => {
+                modules.push(("mSC".to_string(), "/systemc_bridge".to_string()));
+                let mut out = Vec::with_capacity(b.trace.len());
+                for (i, row) in b.trace.iter().enumerate() {
+                    let sid = Self::xtrace_id_code(entries.len() + i);
+                    let w = row.width.max(1);
+                    let type_str = if w == 1 { "bit".to_string() } else { format!("u{}", w) };
+                    signal_records.push(format!(
+                        "S,{},mSC,{},{},enc=delta,width={}",
+                        sid,
+                        Self::sc_trace_leaf(&row.name),
+                        type_str,
+                        w
+                    ));
+                    out.push((Arc::from(sid.as_str()), w));
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+
         // Header per §6. The §18 BNF orders `@producer` after `@profile`, but
         // the spec's own Appendix-A example (and every xezim-produced trace in
         // the wild, including the 0.1.2 reference dumps) puts it third; the
@@ -107982,6 +108448,14 @@ impl Simulator {
         self.xtrace_id_to_trace = self.build_dump_id_to_trace(&trace);
         self.enable_dump_dirty_tracking();
         self.xtrace_trace = trace;
+        // SystemC rows: bind dictionary ids and seed the per-writer prev.
+        if !sc_xt.is_empty() {
+            let b = self.sc_bridge.as_mut().unwrap();
+            for (i, row) in b.trace.iter_mut().enumerate() {
+                row.xt_sid = Some(sc_xt[i].0.clone());
+                row.xt_prev = Some(row.mirror.clone());
+            }
+        }
         self.xtrace_writer = Some(w);
         self.xtrace_last_time = self.time;
         self.xtrace_snapshot_pending = true;
@@ -108108,6 +108582,20 @@ impl Simulator {
             None => {
                 for idx in 0..self.xtrace_trace.len() {
                     check_xt_slot!(idx);
+                }
+            }
+        }
+
+        // SystemC bridge rows: mirror updates at each exchange, never on SV
+        // writes, so they bypass the dirty set.
+        if let Some(b) = self.sc_bridge.as_mut() {
+            for row in b.trace.iter_mut() {
+                let Some(sid) = row.xt_sid.clone() else {
+                    continue;
+                };
+                if row.xt_prev.as_ref() != Some(&row.mirror) {
+                    row.xt_prev = Some(row.mirror.clone());
+                    changes.push((sid, row.mirror.clone(), false, false));
                 }
             }
         }
@@ -108396,7 +108884,11 @@ impl Simulator {
         // An FST with no variables is not a valid file — GTKWave and `fst2vcd`
         // both refuse to open it — so writing one leaves the user a broken
         // artifact instead of a diagnostic. Skip the file entirely.
-        if sig_names.is_empty() {
+        let has_sc_rows = self
+            .sc_bridge
+            .as_ref()
+            .is_some_and(|b| !b.trace.is_empty());
+        if sig_names.is_empty() && !has_sc_rows {
             eprintln!(
                 "Warning: no signals selected for the FST dump; '{}' not written",
                 filename
@@ -108581,6 +109073,24 @@ impl Simulator {
             );
         }
 
+        // ── SystemC co-sim scope (bridge registry mirror) ──
+        let _ = header.scope("systemc_bridge", "", FstScopeType::Module);
+        let mut sc_fst: Vec<(usize, FstSignalId)> = Vec::new();
+        if let Some(b) = self.sc_bridge.as_ref() {
+            for (i, row) in b.trace.iter().enumerate() {
+                if let Ok(fid) = header.var(
+                    &Self::sc_trace_leaf(&row.name),
+                    fst_writer::FstSignalType::bit_vec(row.width.max(1)),
+                    fst_writer::FstVarType::Wire,
+                    fst_writer::FstVarDirection::Implicit,
+                    None,
+                ) {
+                    sc_fst.push((i, fid));
+                }
+            }
+        }
+        let _ = header.up_scope();
+
         let mut body = match header.finish() {
             Ok(b) => b,
             Err(e) => {
@@ -108602,6 +109112,14 @@ impl Simulator {
         }
         for (_, fid) in &events {
             let _ = body.signal_change(*fid, b"0");
+        }
+        // SystemC rows: initial mirror values + bind ids.
+        for (i, fid) in &sc_fst {
+            let b = self.sc_bridge.as_mut().unwrap();
+            let row = &mut b.trace[*i];
+            row.fst_id = Some(*fid);
+            row.fst_prev = Some(row.mirror.clone());
+            let _ = body.signal_change(*fid, &Self::fst_format_value(&row.mirror));
         }
 
         // Incremental change detection, shared with the VCD and XTrace writers
@@ -108670,6 +109188,19 @@ impl Simulator {
                 let fid = self.fst_events[idx].1;
                 changes.push((fid, Value::ones(1), 1));
                 changes.push((fid, Value::zero(1), 1));
+            }
+        }
+        // SystemC bridge rows: mirror updates at each exchange, never on SV
+        // writes, so they bypass the dirty set.
+        if let Some(b) = self.sc_bridge.as_mut() {
+            for row in b.trace.iter_mut() {
+                let Some(fid) = row.fst_id else {
+                    continue;
+                };
+                if row.fst_prev.as_ref() != Some(&row.mirror) {
+                    row.fst_prev = Some(row.mirror.clone());
+                    changes.push((fid, row.mirror.clone()));
+                }
             }
         }
         if changes.is_empty() {

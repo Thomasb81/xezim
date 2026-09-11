@@ -360,6 +360,22 @@ fn print_usage() {
     eprintln!("  -xezim_env <file>  (--xezim-env) Set XEZIM_* variables from a file before");
     eprintln!("                   anything reads them: NAME=value, export NAME=value,");
     eprintln!("                   setenv NAME value, unsetenv NAME. Overrides the shell.");
+    eprintln!("SystemC co-simulation (needs SYSTEMC_HOME pointing at a SystemC 2.3+/3.x install):");
+    eprintln!("  --sc-top <sv|sc> Co-simulation master: 'sv' (default) = xezim testbench drives");
+    eprintln!("                   $sc_step/$sc_export_sig/$sc_import_sig; 'sc' = SystemC's");
+    eprintln!("                   sc_main owns the run and xezim simulates the DUT on demand.");
+    eprintln!("  --sc-source <file>  User C++ source (model for --sc-top sv, sc_main TU for");
+    eprintln!("                   --sc-top sc). Compiled with src/sc_shim/sc_shim.cc into a");
+    eprintln!("                   shared object at startup. Repeatable.");
+    eprintln!("  --sc-include <dir>  Extra -I directory for the SystemC model. Repeatable.");
+    eprintln!("  --sc-cxxflag <flag> Extra compiler flag for the SystemC model. Repeatable.");
+    eprintln!("  --sc-lib <so>    Use a prebuilt model shared object (built from the user TU");
+    eprintln!("                   + xezim's sc_shim.cc) instead of compiling --sc-source.");
+    eprintln!("  --sc-map <sv=sc:dir>  Attach signals (--sc-top sc). sv is the SystemVerilog");
+    eprintln!("                   hierarchical name, sc the xsc_bind() registry name, dir is");
+    eprintln!("                   'out' (SV drives SC) or 'in' (SC drives SV). Repeatable.");
+    eprintln!("  --sc-quantum <ticks>  Max ticks SystemC runs ahead per exchange (--sc-top sc,");
+    eprintln!("                   default 1000).");
     eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
     eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
     eprintln!("  --no-strict      Disable strict negative-test diagnostics (accept LRM-illegal");
@@ -460,6 +476,26 @@ fn parse_time_literal(s: &str) -> Result<i32, String> {
         other => return Err(format!("invalid time unit '{}'", other)),
     };
     Ok(mantissa_exp + unit_exp)
+}
+
+/// Parse a `--sc-map` spec `<sv_name>=<sc_name>:<dir>` where dir is `out`
+/// (SystemVerilog drives SystemC) or `in` (SystemC drives SystemVerilog).
+fn parse_sc_map(
+    s: &str,
+) -> Result<(String, String, xezim::sc_bridge::ScDir), String> {
+    let (sv, rest) = s.split_once('=').ok_or("expected <sv_name>=<sc_name>:<dir>")?;
+    let (sc, dir) = rest
+        .rsplit_once(':')
+        .ok_or("expected <sc_name>:<dir> with dir 'out' or 'in'")?;
+    let dir = match dir {
+        "out" => xezim::sc_bridge::ScDir::Export,
+        "in" => xezim::sc_bridge::ScDir::Import,
+        other => return Err(format!("dir must be 'out' or 'in', got '{}'", other)),
+    };
+    if sv.is_empty() || sc.is_empty() {
+        return Err("names must be non-empty".to_string());
+    }
+    Ok((sv.to_string(), sc.to_string(), dir))
 }
 
 /// Parse a `<unit>/<precision>` timescale value, checking precision <= unit.
@@ -2047,6 +2083,14 @@ fn run_main() -> i32 {
     let mut xtrace_level: u8 = 0;
     let mut xtrace_format = "text".to_string();
     let mut xtrace_profile: Option<String> = None;
+    // SystemC co-simulation (runtime-optional; needs SYSTEMC_HOME at run time).
+    let mut sc_top: Option<xezim::sc_bridge::ScTop> = None;
+    let mut sc_sources: Vec<String> = Vec::new();
+    let mut sc_includes: Vec<String> = Vec::new();
+    let mut sc_cxxflags: Vec<String> = Vec::new();
+    let mut sc_libs: Vec<String> = Vec::new();
+    let mut sc_maps: Vec<(String, String, xezim::sc_bridge::ScDir)> = Vec::new();
+    let mut sc_quantum: u64 = 1000;
     let mut xtrace_compress: Option<String> = None;
     let mut wave = false;
     // `--code-coverage[=<kinds>]` / `--code-coverage-scope`.
@@ -2699,6 +2743,96 @@ fn run_main() -> i32 {
             _ if arg.starts_with("--fst-scope=") => {
                 fst_scopes.push(arg["--fst-scope=".len()..].to_string());
             }
+            // ── SystemC co-simulation (runtime-optional; needs SYSTEMC_HOME) ──
+            "--sc-top" => {
+                i += 1;
+                if i < args.len() {
+                    sc_top = Some(match args[i].as_str() {
+                        "sv" => xezim::sc_bridge::ScTop::Sv,
+                        "sc" => xezim::sc_bridge::ScTop::Sc,
+                        other => {
+                            eprintln!("Error: --sc-top must be 'sv' or 'sc', got '{}'", other);
+                            return 2;
+                        }
+                    });
+                }
+            }
+            _ if arg.starts_with("--sc-top=") => {
+                sc_top = Some(match &arg["--sc-top=".len()..] {
+                    "sv" => xezim::sc_bridge::ScTop::Sv,
+                    "sc" => xezim::sc_bridge::ScTop::Sc,
+                    other => {
+                        eprintln!("Error: --sc-top must be 'sv' or 'sc', got '{}'", other);
+                        return 2;
+                    }
+                });
+            }
+            "--sc-source" => {
+                i += 1;
+                if i < args.len() {
+                    sc_sources.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--sc-source=") => {
+                sc_sources.push(arg["--sc-source=".len()..].to_string());
+            }
+            "--sc-include" => {
+                i += 1;
+                if i < args.len() {
+                    sc_includes.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--sc-include=") => {
+                sc_includes.push(arg["--sc-include=".len()..].to_string());
+            }
+            "--sc-cxxflag" => {
+                i += 1;
+                if i < args.len() {
+                    sc_cxxflags.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--sc-cxxflag=") => {
+                sc_cxxflags.push(arg["--sc-cxxflag=".len()..].to_string());
+            }
+            "--sc-lib" => {
+                i += 1;
+                if i < args.len() {
+                    sc_libs.push(args[i].clone());
+                }
+            }
+            _ if arg.starts_with("--sc-lib=") => {
+                sc_libs.push(arg["--sc-lib=".len()..].to_string());
+            }
+            "--sc-map" => {
+                i += 1;
+                if i < args.len() {
+                    match parse_sc_map(&args[i]) {
+                        Ok(m) => sc_maps.push(m),
+                        Err(e) => {
+                            eprintln!("Error: --sc-map {}: {}", args[i], e);
+                            return 2;
+                        }
+                    }
+                }
+            }
+            _ if arg.starts_with("--sc-map=") => {
+                match parse_sc_map(&arg["--sc-map=".len()..]) {
+                    Ok(m) => sc_maps.push(m),
+                    Err(e) => {
+                        eprintln!("Error: --sc-map {}: {}", arg, e);
+                        return 2;
+                    }
+                }
+            }
+            "--sc-quantum" => {
+                i += 1;
+                if i < args.len() {
+                    sc_quantum = args[i].parse().unwrap_or(1000);
+                }
+            }
+            _ if arg.starts_with("--sc-quantum=") => {
+                sc_quantum = arg["--sc-quantum=".len()..].parse().unwrap_or(1000);
+            }
             // `--sim_debug` kept as a compatibility alias for existing scripts.
             "--sim-debug" | "--sim_debug" => {
                 sim_debug = true;
@@ -3214,6 +3348,22 @@ fn run_main() -> i32 {
     // Library search config (`-v` files, `+libext+` extensions) — consumed by
     // the core resolver that satisfies unresolved instantiations from `-y`
     // directories and `-v` files.
+    // ── SystemC co-simulation configuration (set once, before any compile) ──
+    if sc_top.is_some()
+        || !sc_sources.is_empty()
+        || !sc_libs.is_empty()
+        || !sc_maps.is_empty()
+    {
+        xezim::sc_bridge::set_sc_options(xezim::sc_bridge::ScOptions {
+            top: sc_top,
+            sources: sc_sources.clone(),
+            include_dirs: sc_includes.clone(),
+            cxxflags: sc_cxxflags.clone(),
+            libs: sc_libs.clone(),
+            maps: sc_maps.clone(),
+            quantum: sc_quantum,
+        });
+    }
     if nospecify {
         xezim::compiler::simulator::set_nospecify(true);
         if sdf_file.is_some() {

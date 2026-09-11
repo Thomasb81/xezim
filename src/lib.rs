@@ -62,6 +62,8 @@ pub mod benchw;
 pub mod compiler;
 pub mod env_vars;
 pub mod intra_delay;
+pub mod multikernel;
+pub mod sc_bridge;
 pub mod should_fail_lint;
 pub mod type_lint;
 
@@ -1004,7 +1006,24 @@ pub fn simulate_multi(
     // SAFETY: see above — transfer-once of a self-contained value.
     unsafe impl Send for SendResult {}
     std::thread::scope(|scope| {
-        std::thread::Builder::new()
+        // SystemC co-simulation, SC top: the SystemC kernel (sc_main + our
+        // shim) runs on its own thread and rendezvouses with the simulation
+        // worker through the link below. The link must be installed BEFORE
+        // the worker starts, since the worker's Simulator picks it up at
+        // simulate() entry.
+        let sc_join = if sc_bridge::sc_top() == sc_bridge::ScTop::Sc
+            && sc_bridge::sc_options().is_some()
+        {
+            let link = std::sync::Arc::new(sc_bridge::ScLink::new());
+            // SC top owns time: the SV kernel must rendezvous before its
+            // first time step (cap 0), not free-run.
+            link.set_cap(0);
+            sc_bridge::store_pending_link(link.clone());
+            Some(scope.spawn(move || sc_bridge::run_sc_top_thread(link)))
+        } else {
+            None
+        };
+        let result = std::thread::Builder::new()
             .name("xezim-sim".to_string())
             .stack_size(stack_mb * 1024 * 1024)
             .spawn_scoped(scope, || {
@@ -1036,7 +1055,15 @@ pub fn simulate_multi(
             .expect("spawn simulation worker")
             .join()
             .map(|r| r.0)
-            .unwrap_or_else(|_| Err("simulation worker panicked".to_string()))
+            .unwrap_or_else(|_| Err("simulation worker panicked".to_string()));
+        // The SystemC host thread exits when the SV side signals $finish (or
+        // sc_main returns); joining it here keeps the scoped lifetime honest
+        // and guarantees the co-sim teardown completes before the caller
+        // prints its summary.
+        if let Some(h) = sc_join {
+            let _ = h.join();
+        }
+        result
     })
 }
 

@@ -169,4 +169,18 @@ fn main() {
     // `+whole-archive` so vpi_printf is kept even though no Rust code
     // references it — a dlopen'd VPI module resolves it at load time.
     println!("cargo:rustc-link-lib=static:+whole-archive=vpishim");
+
+    // ── SystemC co-simulation ────────────────────────────────────────────
+    // The shim C++ sources are compiled at RUN time together with the user's
+    // SystemC model (see `sc_bridge::build_and_load`), so nothing here needs
+    // SYSTEMC_HOME or a C++ compiler at Rust build time. Bake the shim source
+    // paths (absolute, from this crate's manifest dir) so the installed
+    // binary finds them from any working directory.
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let shim_src = manifest.join("src/sc_shim/sc_shim.cc");
+    let shim_inc = manifest.join("src/sc_shim");
+    println!("cargo:rustc-env=XEZIM_SC_SHIM_SRC={}", shim_src.display());
+    println!("cargo:rustc-env=XEZIM_SC_SHIM_INC={}", shim_inc.display());
+    println!("cargo:rerun-if-changed={}", shim_src.display());
+    println!("cargo:rerun-if-changed={}", shim_inc.display());
 }

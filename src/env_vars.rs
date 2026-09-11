@@ -789,6 +789,8 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "XEZIM_SPLIT_CENSUS",
         "Census: size the block-splitting opportunity (multi-statement comb blocks with disjoint statement read sets)",
     ),
+    ("XEZIM_SC_SHIM_INC", "Build-time override for the include directory of the bundled SystemC shim sources"),
+    ("XEZIM_SC_SHIM_SRC", "Build-time override for the bundled SystemC shim source path (sc_shim.cc)"),
     ("XEZIM_STACK_MB", "Main simulation thread stack size in MB"),
     (
         "XEZIM_STALL_LIMIT",
