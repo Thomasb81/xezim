@@ -14,6 +14,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_AOT", "AOT: compile eligible blocks to native code via generated Rust + rustc (needs --features jit build)"),
     ("XEZIM_AOT_OPT", "AOT: rustc opt-level for the generated crate (0-3, default 2)"),
     ("XEZIM_AOT_TEMPLATE", "AOT: dedup structurally identical blocks into shared template bodies (1 enables)"),
+    ("XEZIM_ARM_CENSUS", "Event-edge engine: report which signals arm the most edge blocks on write"),
     ("XEZIM_ARMED_EDGE", "Edge engine: force ARMED edge-detection mode on/off (0/1)"),
     ("XEZIM_ARMED_EDGE_SHADOW", "Edge engine: run ARMED mode in shadow-compare mode against the scan path"),
     ("XEZIM_ARRAY_SOA_SHADOW", "Arrays: shadow-verify structure-of-arrays storage against per-element Values"),

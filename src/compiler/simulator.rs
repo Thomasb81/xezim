@@ -5480,6 +5480,8 @@ pub struct Simulator {
     /// exists, so under write-arming an UNARMED block skips on arming alone
     /// (no input write since its last execution ⇒ no change).
     edge_block_wide_read: Vec<bool>,
+    /// XEZIM_ARM_CENSUS=1: per-signal (writes, block-arms) through note_armed_write.
+    arm_census: Option<Vec<(u64, u64)>>,
     // Timestamp-based change tracking (gating-agnostic): per-signal iteration
     // at which it last changed, and per-edge-block iteration at which it last
     // fired. A flop is skippable iff none of its data inputs changed since the
@@ -8828,6 +8830,7 @@ impl Simulator {
             edge_block_gateable: Vec::new(),
             edge_block_arm_only: Vec::new(),
             edge_block_wide_read: Vec::new(),
+            arm_census: if std::env::var_os("XEZIM_ARM_CENSUS").is_some() { Some(Vec::new()) } else { None },
             sig_last_change: Vec::new(),
             flop_last_fire: Vec::new(),
             edge_block_reads_flat: Vec::new(),
@@ -37169,6 +37172,20 @@ impl Simulator {
                     "[EVENT-EDGE] adaptive epoch-fast-exec={} snapshot-checks={} healed={}",
                     self.event_epoch_fast_exec, self.event_snapshot_checks, self.event_healed
                 );
+                if let Some(c) = &self.arm_census {
+                    let mut rows: Vec<(usize, u64, u64)> =
+                        c.iter().enumerate().filter(|(_, v)| v.1 > 0).map(|(i, v)| (i, v.0, v.1)).collect();
+                    rows.sort_by(|a, b| b.2.cmp(&a.2));
+                    let total: u64 = rows.iter().map(|r| r.2).sum();
+                    let writes: u64 = rows.iter().map(|r| r.1).sum();
+                    eprintln!("[ARM-CENSUS] signals={} writes={} block_arms={}", rows.len(), writes, total);
+                    for (i, w, a) in rows.iter().take(25) {
+                        eprintln!(
+                            "[ARM-CENSUS]   arms={} writes={} fanout={} {}",
+                            a, w, a / w.max(&1), self.id_to_name.get(*i).map(|s| s.as_ref()).unwrap_or("?")
+                        );
+                    }
+                }
                 if self.armed_edge {
                     eprintln!(
                         "[EVENT-EDGE] armed-fast-skips={} shadow-checks={}",
@@ -74819,6 +74836,13 @@ impl Simulator {
             return;
         }
         let (lo, hi) = self.armed_input_ranges[id];
+        if let Some(c) = self.arm_census.as_mut() {
+            if c.len() <= id {
+                c.resize(id + 1, (0, 0));
+            }
+            c[id].0 += 1;
+            c[id].1 += (hi - lo) as u64;
+        }
         for k in lo as usize..hi as usize {
             let bi = self.armed_input_blocks[k] as usize;
             self.edge_block_armed[bi] |= EDGE_ARMED;
