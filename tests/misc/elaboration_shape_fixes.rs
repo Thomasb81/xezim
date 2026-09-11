@@ -37,7 +37,9 @@ endmodule",
 #[test]
 fn struct_pattern_elements_with_module_scope_typedef() {
     let msgs = messages(
-        "module tb;
+        // Raw string: this case is the one in the file whose SV contains a
+        // `$display("...")`, and a plain literal ends at that inner quote.
+        r#"module tb;
   typedef struct packed { bit [31:0] s; bit [1:0] x; } p_t;
   typedef struct { int s; bit [1:0] x; } u_t;
   localparam p_t LP [3] = '{ '{4,2'd2}, '{5,2'd1}, '{6,2'd3} };
@@ -47,7 +49,7 @@ fn struct_pattern_elements_with_module_scope_typedef() {
     $display("LP=%0d %0d %0d LL=%0d %0d LU=%0d %0d", LP[0].s, LP[1].s, LP[2].s, LL[0].s, LL[1].s, LU[0].s, LU[1].s);
     $finish;
   end
-endmodule",
+endmodule"#,
     );
     assert!(msgs.iter().any(|m| m == "LP=4 5 6 LL=4 5 LU=9 10"), "{msgs:?}");
 }
