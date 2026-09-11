@@ -378,3 +378,7 @@ mod packed_member_select_name_collision;
 mod bit_write_unknown_index_discarded;
 #[path = "types/class_type_param_struct_prop.rs"]
 mod class_type_param_struct_prop;
+#[path = "types/nettype_struct_variable_driver.rs"]
+mod nettype_struct_variable_driver;
+#[path = "types/struct_named_pattern_continuous_assign.rs"]
+mod struct_named_pattern_continuous_assign;
