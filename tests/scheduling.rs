@@ -19,6 +19,8 @@ mod static_local_nba_per_instance;
 mod block_local_decl_ast_fallback;
 #[path = "scheduling/class_method_delay_timeunit.rs"]
 mod class_method_delay_timeunit;
+#[path = "scheduling/decl_init_time_literal_scaling.rs"]
+mod decl_init_time_literal_scaling;
 #[path = "scheduling/fork_children_start_in_spawn_slot.rs"]
 mod fork_children_start_in_spawn_slot;
 #[path = "scheduling/wait_fork_immediate_children.rs"]
