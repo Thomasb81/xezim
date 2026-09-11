@@ -3782,6 +3782,10 @@ pub struct Simulator {
     edge_signal_names: HashSet<String>,
     /// Edge sensitivity resolved to signal IDs.
     edge_signal_ids: Vec<usize>,
+    /// Signals registered by sampled-value watches at run time (`$rose`,
+    /// `$past`, …): their preponed value lives in `prev_*` and is read by
+    /// `preponed_value_of`, so the incremental snapshot always walks them.
+    preponed_ids: Vec<usize>,
     /// Reverse index signal_id → edge_block_idx lists by edge kind, built once after
     /// edge_blocks are classified. Lets `check_edges` iterate edge-sensitive
     /// signals (typically ~100s on c910: clk, rst_b, a few enables) instead
@@ -8277,6 +8281,7 @@ impl Simulator {
             snap_gen: 0,
             edge_signal_names: HashSet::default(),
             edge_signal_ids: Vec::new(),
+            preponed_ids: Vec::new(),
             edge_blocks_by_sig: Vec::new(),
             edge_blocks_with_iff: Vec::new(),
             edge_iff_denied: Vec::new(),
@@ -13870,7 +13875,7 @@ impl Simulator {
         // IDU's `always @(dep_bit)` decode blocks are clocked by exactly such
         // constant nets, and the reference fires them once at t0. Snapshotting
         // AFTER the settle erased that change and the blocks never ran.
-        self.snapshot_edge_signals();
+        self.snapshot_edge_signals_full();
         self.in_pre_process_settle = true;
         self.settle_combinatorial();
         self.in_pre_process_settle = false;
@@ -44194,10 +44199,25 @@ impl Simulator {
     /// Snapshot only edge-sensitive signals + event_waiter signals into
     /// the prev_val/prev_xz parallel arrays (A3 from the compression
     /// analysis). Wide signals (> 64 bits) also update `prev_wide`.
+    /// Under the dirty-edge scan the edge-signal walk below is redundant:
+    /// every scanned signal that changed was re-baselined by
+    /// `check_edges_inner` (`fired_snap`), and a signal no write hook touched
+    /// already equals its baseline — so only the initial baseline, the shadow
+    /// mode and dirty-edge-off take the full walk. The event-waiter
+    /// sensitivities are always refreshed.
     fn snapshot_edge_signals(&mut self) {
+        self.snapshot_edge_signals_inner(false);
+    }
+
+    fn snapshot_edge_signals_full(&mut self) {
+        self.snapshot_edge_signals_inner(true);
+    }
+
+    fn snapshot_edge_signals_inner(&mut self, full: bool) {
         // New snapshot generation: waiters registered before this point
         // become eligible for edges detected against it (see EventWaiter).
         self.snap_gen = self.snap_gen.wrapping_add(1);
+        let walk_edges = full || !self.dirty_edge || self.dirty_edge_shadow;
         #[inline]
         fn snap_one(
             id: usize,
@@ -44234,7 +44254,7 @@ impl Simulator {
         // appends to it at run time — so `lim` is compared per id rather than
         // once against the last element. Any id at or past `lim` falls back to
         // the checked path, preserving the original panic-on-out-of-range.
-        {
+        if walk_edges {
             let st: &[Value] = &self.signal_table;
             let widths: &[u32] = &self.signal_widths;
             let pv: &mut [u64] = &mut self.prev_val;
@@ -44267,6 +44287,19 @@ impl Simulator {
                         p.copy_from(sv);
                     }
                 }
+            }
+        }
+        if !walk_edges {
+            for k in 0..self.preponed_ids.len() {
+                let sid = self.preponed_ids[k];
+                snap_one(
+                    sid,
+                    &self.signal_table,
+                    &self.signal_widths,
+                    &mut self.prev_val,
+                    &mut self.prev_xz,
+                    &mut self.prev_wide,
+                );
             }
         }
         for i in 0..self.event_waiters.len() {
@@ -45225,7 +45258,13 @@ impl Simulator {
             self.edge_signal_ids.push(clk_id);
             self.seed_prev_from_current(clk_id);
         }
+        if !self.preponed_ids.contains(&clk_id) {
+            self.preponed_ids.push(clk_id);
+        }
         if let Some(sid) = sig_id {
+            if !self.preponed_ids.contains(&sid) {
+                self.preponed_ids.push(sid);
+            }
             if !self.edge_signal_ids.contains(&sid) {
                 self.edge_signal_ids.push(sid);
                 self.seed_prev_from_current(sid);

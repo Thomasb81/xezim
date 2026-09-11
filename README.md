@@ -179,6 +179,11 @@ and testbench flows. Portable code should not rely on them.
 
 **Performance** (instruction counts, output identical)
 
+* The edge detector no longer re-baselines every edge signal after each
+  pass: under the dirty-edge scan only the signals that changed are
+  re-baselined (plus the operands of sampled-value functions), which is
+  what the scan already did for them. C906 CoreMark: 4.0 % fewer
+  instructions, output identical; UVM benchmarks unchanged.
 * `casez`/`casex` decoders compiled to a jump table now lay their wildcard
   chains out with forward jumps only, and a `casez`/`casex` compare against
   a constant pattern runs on the two-state fast path. The C906 instruction
