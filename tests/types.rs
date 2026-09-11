@@ -51,6 +51,12 @@ mod cast_valparam_typeparam_static;
 mod cast_value_param_specs;
 #[path = "types/circular_typedef_diagnostics.rs"]
 mod circular_typedef_diagnostics;
+#[path = "types/class_module_same_name.rs"]
+mod class_module_same_name;
+#[path = "types/typedef_same_named_hierarchy.rs"]
+mod typedef_same_named_hierarchy;
+#[path = "types/class_interface_same_name.rs"]
+mod class_interface_same_name;
 #[path = "types/conditional_real_x_select.rs"]
 mod conditional_real_x_select;
 #[path = "types/const_function_params.rs"]
@@ -370,3 +376,5 @@ mod system_function_result_width;
 mod packed_member_select_name_collision;
 #[path = "types/bit_write_unknown_index_discarded.rs"]
 mod bit_write_unknown_index_discarded;
+#[path = "types/class_type_param_struct_prop.rs"]
+mod class_type_param_struct_prop;

@@ -139,3 +139,132 @@ endmodule
     // the empty collection, so `count` must stay 0.
     assert_eq!(u(&sim, "count"), 0);
 }
+/// §8.9 — a static collection REDECLARED in a derived class (not merely
+/// inherited) must get its OWN cell, separate from the base's. This is the
+/// `uvm_sequence_library_utils` pattern: `simple_seq_lib_RST` redeclares
+/// `static m_typewide_sequences[$]` and `simple_seq_lib` (a subclass) inherits
+/// the base's — a `d::q` push must never bleed into `b::q` and vice-versa.
+/// Questa keeps `b::q` = [1,2] and `d::q` = [3].
+#[test]
+fn derived_redeclared_static_queue_is_separate_from_base() {
+    let src = r#"
+module top;
+  class b;
+    static int m_q[$];
+  endclass
+  class d extends b;
+    static int m_q[$];
+  endclass
+  int rb, rd, b0, d0;
+  initial begin
+    b::m_q.push_back(1);
+    b::m_q.push_back(2);
+    d::m_q.push_back(3);
+    rb = b::m_q.size();
+    rd = d::m_q.size();
+    b0 = b::m_q[0];
+    d0 = d::m_q[0];
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "rb"), 2, "base keeps only its own two writes");
+    assert_eq!(u(&sim, "rd"), 1, "derived holds only its own one write");
+    assert_eq!(u(&sim, "b0"), 1, "base[0] is the base's first write");
+    assert_eq!(u(&sim, "d0"), 3, "derived[0] is the derived's write");
+}
+
+/// Same as above but with the base accessed through an intermediate subclass
+/// that does NOT redeclare (inherited-only): the single base cell is shared,
+/// so `a::q` reads still see the base's writes, while a redeclaring `d` stays
+/// separate.
+#[test]
+fn inherited_versus_redeclared_static_queue() {
+    let src = r#"
+module top;
+  class base;
+    static int q[$];
+  endclass
+  class a extends base; endclass      // inherits base::q
+  class d extends a;
+    static int q[$];                  // redeclares — own cell
+  endclass
+  int nar, nrd, ar;
+  initial begin
+    a::q.push_back(1);                // goes to base::q (inherited)
+    d::q.push_back(2);                // goes to d::q (own)
+    nar = a::q.size();                // 1 (base cell)
+    nrd = d::q.size();                // 1 (own cell)
+    ar = a::q[0];                     // 1
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(u(&sim, "nar"), 1, "inherited a::q sees only the base write");
+    assert_eq!(u(&sim, "nrd"), 1, "redeclared d::q holds its own write");
+    assert_eq!(u(&sim, "ar"), 1, "a::q[0] is the base's write");
+}
+
+/// §8.x — a base-class method reading a qualified `this_type::static` must
+/// resolve `this_type` to the DEFINING class (the base), not the receiver's
+/// dynamic (derived) type, so a static-collection member declared in the base
+/// and re-declared in a derived class stays separate per-class. This is the
+/// `uvm_sequence_library` `init_sequence_library()` pattern: the base `new`
+/// runs the base method reading `this_type::typewide` (the base cell), while
+/// the derived `new` runs the derived method reading `Derived::typewide` (its
+/// own cell). Questa's derived instance ends up holding BOTH the base's
+/// [1,2] and its own [3] = 3 elements.
+#[test]
+fn base_method_this_type_static_resolves_to_defining_class() {
+    let src = r#"
+module top;
+  class item; int v; endclass
+  class base;
+    item sequences[$];
+    static item typewide[$];
+    typedef base this_type;
+    function new();
+      init_sequence_library();
+    endfunction
+    function void init_sequence_library();
+      foreach (this_type::typewide[i])
+        sequences.push_back(this_type::typewide[i]);
+    endfunction
+    function int n();
+      return sequences.size();
+    endfunction
+  endclass
+  class derived extends base;
+    static item typewide[$];
+    typedef derived this_type;
+    function new();
+      super.new();
+      init_sequence_library();
+    endfunction
+    function void init_sequence_library();
+      foreach (derived::typewide[i])
+        sequences.push_back(derived::typewide[i]);
+    endfunction
+  endclass
+  item b1, b2, r3;
+  derived d;
+  int n;
+  initial begin
+    b1 = new(); b1.v = 1;
+    b2 = new(); b2.v = 2;
+    r3 = new(); r3.v = 3;
+    base::typewide.push_back(b1);
+    base::typewide.push_back(b2);
+    derived::typewide.push_back(r3);
+    d = new();
+    n = d.n();
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    assert_eq!(
+        u(&sim, "n"),
+        3,
+        "base init (this_type -> base [1,2]) + derived init (-> [3]) = 3"
+    );
+}

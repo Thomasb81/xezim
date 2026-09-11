@@ -70,6 +70,27 @@ fn orphan_fork_wait_deadlock() {
 }
 
 #[test]
+fn fork_child_blocking_live_share() {
+    // The UVM sequencer watchdog (`m_safe_select_item`) writes a task-local
+    // automatic from a `fork … join_none` child that then blocks forever on
+    // `await()`, while the parent parks on `wait(select_process != null)`. A
+    // merge-on-child-completion model can never deliver the value (the child
+    // never completes) — the write must be LIVE-shared with the suspended
+    // parent. This regression compiles that exact child-blocks-forever idiom.
+    let msgs = outputs(include_str!("../fork_child_blocking_share.sv"), 100_000);
+    assert!(
+        msgs.iter().any(|m| m.contains("PASS: fork-child live-shared write wakes a parked wait")),
+        "{:?}",
+        msgs
+    );
+    assert!(
+        !msgs.iter().any(|m| m.starts_with("FAIL")),
+        "{:?}",
+        msgs
+    );
+}
+
+#[test]
 fn orphan_force_release_compliance_ratchet() {
     let msgs = outputs(include_str!("../dpi/force_release_compliance.sv"), 100_000);
     let fails = msgs.iter().filter(|m| m.starts_with("FAIL")).count();

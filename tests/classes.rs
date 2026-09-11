@@ -47,6 +47,9 @@ mod explicit_param_static_coll_read;
 mod typename_p_subroutine_locals;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
+
+#[path = "classes/blocking_method_keyed_method_local_base.rs"]
+mod blocking_method_keyed_method_local_base;
 #[path = "classes/class_field_named_event.rs"]
 mod class_field_named_event;
 #[path = "classes/this_chain_edge_sensitivity.rs"]
@@ -57,6 +60,8 @@ mod class_handle_return_preservation;
 mod class_output_handle_copyback;
 #[path = "classes/typedef_extends_cast.rs"]
 mod typedef_extends_cast;
+#[path = "classes/typedef_param_base_inherits_spec_arg.rs"]
+mod typedef_param_base_inherits_spec_arg;
 #[path = "classes/class_local_typedef_aa.rs"]
 mod class_local_typedef_aa;
 #[path = "classes/class_local_typedef_resolution.rs"]
@@ -232,6 +237,10 @@ mod struct_prop_whole_copy;
 mod randomize_obj_array_property;
 #[path = "classes/static_assoc_struct_pool.rs"]
 mod static_assoc_struct_pool;
+#[path = "classes/static_instance_assoc_object.rs"]
+mod static_instance_assoc_object;
+#[path = "classes/typedef_receiver_static_task.rs"]
+mod typedef_receiver_static_task;
 #[path = "classes/static_collection_qualified_access.rs"]
 mod static_collection_qualified_access;
 #[path = "classes/vif_static_roundtrip.rs"]
@@ -258,6 +267,8 @@ mod condition_waiter_yields_to_inactive;
 mod package_class_nested_class;
 #[path = "classes/sqr_zero_time_loop.rs"]
 mod sqr_zero_time_loop;
+#[path = "classes/member_visibility_local_protected.rs"]
+mod member_visibility_local_protected;
 #[path = "classes/method_local_base_per_process.rs"]
 mod method_local_base_per_process;
 #[path = "classes/class_covergroups.rs"]

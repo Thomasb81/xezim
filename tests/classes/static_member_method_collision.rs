@@ -72,7 +72,7 @@ module top;
   endclass
 
   class catcher;
-    local static msg holder;
+    static msg holder;
     function int read();
       return holder.get_sev();
     endfunction
