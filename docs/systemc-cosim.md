@@ -1,16 +1,22 @@
 # SystemC co-simulation
 
 xezim can simulate a SystemVerilog design and a SystemC model **in one
-process**, with either side as the simulation top:
+process**, with either side as the simulation top. The co-simulation master
+is **inferred from the C++ source** — a TU defining `xsc_model_build` is a
+passive model (SystemVerilog top), a TU defining `sc_main` owns the run
+(SystemC top) — the same spirit as auto-elaborating an uninstantiated root
+module. Signals whose registry name matches an SV signal name are attached
+automatically, so the common cases need **no `--sc-*` flags beyond the
+source itself**:
 
-| Mode          | Top                    | Time master | Typical use                          |
-|---------------|------------------------|-------------|--------------------------------------|
-| `--sc-top sv` | SystemVerilog testbench / DUT | SystemVerilog kernel, SystemC driven by `$sc_step` / exchanges | SystemC IP (TLM, crypto, DSP) inside an SV environment |
-| `--sc-top sc` | `sc_main` model        | SystemC kernel; the SV kernel is driven per slice | Reuse an existing `sc_main` executive; SV acts as the DUT |
+| Mode        | Top                    | Time master | Typical use                          |
+|-------------|------------------------|-------------|--------------------------------------|
+| SV top      | SystemVerilog testbench / DUT | SystemVerilog kernel, SystemC driven by `$sc_step` / exchanges | SystemC IP (TLM, crypto, DSP) inside an SV environment |
+| SC top      | `sc_main` model        | SystemC kernel; the SV kernel is driven per slice | Reuse an existing `sc_main` executive; SV acts as the DUT |
 
 SystemC support is **runtime-gated**: it is always compiled in but only
-activates when `--sc-*` flags are passed. Runs without those flags are
-byte-for-byte identical to plain xezim.
+activates when `--sc-source` / `--sc-lib` is passed. Runs without those
+flags are byte-for-byte identical to plain xezim.
 
 ## Requirements
 
@@ -62,11 +68,15 @@ extern "C" void xsc_model_build() {
 ```
 
 ```console
-$ xezim --simulate -s tb --sc-top sv --sc-source model.cc tb.sv
+$ xezim --simulate -s tb --sc-source model.cc tb.sv
 ```
 
-The SystemVerilog side drives and observes the registry by name from
-procedural code (module-scope occurrences of these tasks are ignored):
+The master is inferred as **sv** because the TU defines `xsc_model_build`.
+
+If a registry name matches an SV signal name exactly (e.g. registry `en` and
+SV signal `en`), the pair is attached **automatically** and synced both ways
+at every exchange — no `$sc_*` call needed. The `$sc_*` tasks below remain
+for renamed signals and for code that wants explicit direction:
 
 ```systemverilog
 $sc_export_sig("en",  en);    // SV -> SystemC (stage a value)
@@ -99,13 +109,29 @@ int sc_main(int, char**) {
 ```
 
 ```console
-$ xezim --simulate -s dut --sc-top sc --sc-source sc_master.cc \
+$ xezim --simulate -s dut --sc-source sc_master.cc dut.sv
+```
+
+The master is inferred as **sc** because the TU defines `sc_main`. The
+registry signals `cmd`/`resp` match the DUT's port names `cmd`/`resp`
+exactly, so they are auto-attached — bidirectionally: xezim stages the SV
+value into SystemC before each slice and applies the SystemC value back
+after it. A signal driven from only one side behaves exactly like a
+directed mapping (writing the current value is a no-op); if both sides
+drive, the SystemC value from the just-completed slice wins.
+
+To attach a signal whose names differ on the two sides (here `cmd_in` →
+registry `cmd`), map it explicitly:
+
+```console
+$ xezim --simulate -s dut --sc-source sc_master.cc \
     --sc-map 'cmd_in=cmd:in' --sc-map 'resp_o=resp:out' dut.sv
 ```
 
 `--sc-map '<sv_name>=<sc_name>:<dir>'` maps a top-level SV signal to a
 registry signal; `dir` is `in` (SystemC drives the SV signal) or `out` (the
-SV signal drives SystemC). Repeat the flag per signal.
+SV signal drives SystemC). Repeat the flag per signal. Explicit rows take
+precedence over name-matched rows for the same registry name.
 
 A prebuilt model can be passed instead of sources with
 `--sc-lib <path>.so` (built from the user TU together with
@@ -117,9 +143,9 @@ A prebuilt model can be passed instead of sources with
   initialization; one `sc_time` value unit equals one xezim tick.
 - **SV top**: SystemC time advances only inside `$sc_step(n)`.
 - **SC top** (one-slice lookahead): xezim stages its export values, the
-  SystemC side applies them and runs to its next pending activity (bounded by
-  `--sc-quantum`, default 1000 ticks), then xezim adopts the SystemC time as
-  an upper bound (`cap`) and applies the imported values. Consequences:
+  SystemC side applies them and runs to its next pending activity (bounded
+  by `XEZIM_SC_QUANTUM`, default 1000 ticks), then xezim adopts the SystemC
+  time as an upper bound (`cap`) and applies the imported values. Consequences:
   - An SV signal driven by SystemC changes at xezim's current time when the
     slice closes, never later than the SystemC time that produced it.
   - A value SystemC reads mid-slice reflects the SV state as of the *start*
@@ -145,14 +171,14 @@ every slice), so a trace shows both kernels on one timeline.
 
 ## Flag reference
 
-| Flag | Meaning |
+| Flag / variable | Meaning |
 |---|---|
-| `--sc-top <sv\|sc>` | Which kernel is the top (default `sv`). |
-| `--sc-source <file.cc>` | C++ source compiled with the shim into the model `.so` (repeatable). |
+| `--sc-source <file.cc>` | C++ source compiled with the shim into the model `.so` (repeatable). Its entry point (`xsc_model_build` vs `sc_main`) infers the master. |
+| `--sc-top <sv\|sc>` | Override the inferred master (rarely needed). |
 | `--sc-include <dir>` | Extra `-I` path (repeatable). |
 | `--sc-cxxflag <flag>` | Extra compiler flag (repeatable). |
 | `--sc-lib <path>` | With `--sc-source`: an extra link library (`-lfoo` / `-lfoo.so` / a directory → `-L`). Without sources: a prebuilt model `.so` to load directly (repeatable). |
-| `--sc-map '<sv>=<sc>:<in\|out>'` | SC-top signal mapping (repeatable). |
-| `--sc-quantum <ticks>` | SC-top slice bound (default 1000). |
+| `--sc-map '<sv>=<sc>:<in\|out>'` | Explicit signal mapping for renamed signals (repeatable); everything else name-matches automatically. |
+| `XEZIM_SC_QUANTUM` | SC-master slice bound in ticks (default 1000). |
 
 `SYSTEMC_HOME` must be exported for any `--sc-*` run.

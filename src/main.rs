@@ -361,21 +361,25 @@ fn print_usage() {
     eprintln!("                   anything reads them: NAME=value, export NAME=value,");
     eprintln!("                   setenv NAME value, unsetenv NAME. Overrides the shell.");
     eprintln!("SystemC co-simulation (needs SYSTEMC_HOME pointing at a SystemC 2.3+/3.x install):");
-    eprintln!("  --sc-top <sv|sc> Co-simulation master: 'sv' (default) = xezim testbench drives");
-    eprintln!("                   $sc_step/$sc_export_sig/$sc_import_sig; 'sc' = SystemC's");
-    eprintln!("                   sc_main owns the run and xezim simulates the DUT on demand.");
-    eprintln!("  --sc-source <file>  User C++ source (model for --sc-top sv, sc_main TU for");
-    eprintln!("                   --sc-top sc). Compiled with src/sc_shim/sc_shim.cc into a");
-    eprintln!("                   shared object at startup. Repeatable.");
+    eprintln!("  --sc-source <file>  User C++ source. Compiled with xezim's sc_shim.cc into a");
+    eprintln!("                   shared object at startup. Repeatable. The co-simulation");
+    eprintln!("                   master is inferred from the source: a TU defining");
+    eprintln!("                   xsc_model_build is a passive model (xezim testbench drives");
+    eprintln!("                   time via $sc_step); a TU defining sc_main owns the run and");
+    eprintln!("                   xezim simulates the DUT on demand (--sc-top overrides).");
     eprintln!("  --sc-include <dir>  Extra -I directory for the SystemC model. Repeatable.");
     eprintln!("  --sc-cxxflag <flag> Extra compiler flag for the SystemC model. Repeatable.");
     eprintln!("  --sc-lib <so>    Use a prebuilt model shared object (built from the user TU");
     eprintln!("                   + xezim's sc_shim.cc) instead of compiling --sc-source.");
-    eprintln!("  --sc-map <sv=sc:dir>  Attach signals (--sc-top sc). sv is the SystemVerilog");
-    eprintln!("                   hierarchical name, sc the xsc_bind() registry name, dir is");
-    eprintln!("                   'out' (SV drives SC) or 'in' (SC drives SV). Repeatable.");
-    eprintln!("  --sc-quantum <ticks>  Max ticks SystemC runs ahead per exchange (--sc-top sc,");
-    eprintln!("                   default 1000).");
+    eprintln!("  --sc-map <sv=sc:dir>  Attach signals explicitly (optional: registry names");
+    eprintln!("                   matching an SV signal name are attached automatically,");
+    eprintln!("                   synced both ways). sv is the SystemVerilog hierarchical");
+    eprintln!("                   name, sc the xsc_bind() registry name, dir is 'out' (SV");
+    eprintln!("                   drives SC) or 'in' (SC drives SV). Repeatable. Use it to");
+    eprintln!("                   attach a signal whose names differ on the two sides.");
+    eprintln!("  --sc-top <sv|sc> Override the inferred co-simulation master (rarely");
+    eprintln!("                   needed). XEZIM_SC_QUANTUM caps the ticks SystemC runs");
+    eprintln!("                   ahead per exchange (default 1000, sc master only).");
     eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
     eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
     eprintln!("  --no-strict      Disable strict negative-test diagnostics (accept LRM-illegal");
@@ -2090,7 +2094,6 @@ fn run_main() -> i32 {
     let mut sc_cxxflags: Vec<String> = Vec::new();
     let mut sc_libs: Vec<String> = Vec::new();
     let mut sc_maps: Vec<(String, String, xezim::sc_bridge::ScDir)> = Vec::new();
-    let mut sc_quantum: u64 = 1000;
     let mut xtrace_compress: Option<String> = None;
     let mut wave = false;
     // `--code-coverage[=<kinds>]` / `--code-coverage-scope`.
@@ -2824,15 +2827,6 @@ fn run_main() -> i32 {
                     }
                 }
             }
-            "--sc-quantum" => {
-                i += 1;
-                if i < args.len() {
-                    sc_quantum = args[i].parse().unwrap_or(1000);
-                }
-            }
-            _ if arg.starts_with("--sc-quantum=") => {
-                sc_quantum = arg["--sc-quantum=".len()..].parse().unwrap_or(1000);
-            }
             // `--sim_debug` kept as a compatibility alias for existing scripts.
             "--sim-debug" | "--sim_debug" => {
                 sim_debug = true;
@@ -3349,6 +3343,17 @@ fn run_main() -> i32 {
     // the core resolver that satisfies unresolved instantiations from `-y`
     // directories and `-v` files.
     // ── SystemC co-simulation configuration (set once, before any compile) ──
+    // Infer the master from the source entry points unless --sc-top said it
+    // explicitly (same spirit as auto-elaborating uninstantiated roots).
+    if sc_top.is_none() && !sc_sources.is_empty() {
+        let (inferred, why) = xezim::sc_bridge::infer_sc_top(&sc_sources);
+        sc_top = inferred;
+        eprintln!("[xezim-sc] master inferred: {} ({})", 
+            match inferred {
+                Some(xezim::sc_bridge::ScTop::Sc) => "sc",
+                _ => "sv",
+            }, why);
+    }
     if sc_top.is_some()
         || !sc_sources.is_empty()
         || !sc_libs.is_empty()
@@ -3361,7 +3366,7 @@ fn run_main() -> i32 {
             cxxflags: sc_cxxflags.clone(),
             libs: sc_libs.clone(),
             maps: sc_maps.clone(),
-            quantum: sc_quantum,
+            quantum: xezim::sc_bridge::quantum_from_env(),
         });
     }
     if nospecify {

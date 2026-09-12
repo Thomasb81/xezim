@@ -43,6 +43,70 @@ pub enum ScDir {
     Export,
     /// SystemC drives the SystemVerilog signal ($sc_import_sig / `:in`).
     Import,
+    /// Name-matched automatically; synced both ways each exchange. A
+    /// signal driven from only one side behaves exactly like the directed
+    /// mapping (staging/applying a value that matches the current value is
+    /// a no-op); if both sides drive, the SystemC value from the just-
+    /// completed slice wins.
+    Auto,
+}
+
+/// Infer which kernel owns the run from the user C++ sources — the same
+/// spirit as auto-elaborating uninstantiated root modules. A TU defining
+/// `xsc_model_build` is a passive model (SV top); otherwise a TU defining
+/// `sc_main` owns the run (SC top).
+pub fn infer_sc_top(sources: &[String]) -> (Option<ScTop>, String) {
+    let mut sc_main_file: Option<String> = None;
+    for path in sources {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        match infer_sc_top_from_text(&text) {
+            Some(ScTop::Sv) => {
+                return (
+                    Some(ScTop::Sv),
+                    format!("{} defines xsc_model_build (passive model)", path),
+                );
+            }
+            Some(ScTop::Sc) => {
+                if sc_main_file.is_none() {
+                    sc_main_file = Some(path.clone());
+                }
+            }
+            None => {}
+        }
+    }
+    match sc_main_file {
+        Some(p) => (
+            Some(ScTop::Sc),
+            format!("{} defines sc_main (kernel master)", p),
+        ),
+        None => (
+            Some(ScTop::Sv),
+            "no xsc_model_build or sc_main found; defaulting to sv".to_string(),
+        ),
+    }
+}
+
+/// Entry-point marker in one source text: `Some(Sv)` for `xsc_model_build`,
+/// `Some(Sc)` for `sc_main`, `None` for neither.
+fn infer_sc_top_from_text(text: &str) -> Option<ScTop> {
+    if text.contains("xsc_model_build") {
+        Some(ScTop::Sv)
+    } else if text.contains("sc_main") {
+        Some(ScTop::Sc)
+    } else {
+        None
+    }
+}
+
+/// Slice bound (ticks SystemC may run ahead per exchange, SC top). A
+/// tuning knob, so it lives in the environment rather than the CLI.
+pub fn quantum_from_env() -> u64 {
+    std::env::var("XEZIM_SC_QUANTUM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000)
 }
 
 /// Everything the CLI collects; consumed once at simulation start.
@@ -518,7 +582,8 @@ impl ScBridge {
     /// (sv_id, word) pairs. The caller applies them to the signal table.
     pub fn collect_imports(&self, out: &mut Vec<(usize, u64)>) {
         for row in &self.rows {
-            if row.dir != ScDir::Import {
+            // Import and Auto rows both pull the SystemC value back.
+            if row.dir == ScDir::Export {
                 continue;
             }
             let Some(idx) = row.sc_idx else { continue };
@@ -579,4 +644,33 @@ pub fn run_sc_top_thread(link: Arc<ScLink>) {
         }
     }
     link.sc_done.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sc_top_inference_prefers_model_build() {
+        // xsc_model_build wins even when both entry points are mentioned.
+        assert_eq!(
+            infer_sc_top_from_text(
+                "int sc_main(int, char**) { return 0; }\nvoid* xsc_model_build() { return nullptr; }\n",
+            ),
+            Some(ScTop::Sv)
+        );
+    }
+
+    #[test]
+    fn sc_top_inference_finds_sc_main() {
+        assert_eq!(
+            infer_sc_top_from_text("int sc_main(int argc, char* argv[]) {}"),
+            Some(ScTop::Sc)
+        );
+    }
+
+    #[test]
+    fn sc_top_inference_defaults_to_sv() {
+        assert_eq!(infer_sc_top_from_text("// just a comment\n"), None);
+    }
 }

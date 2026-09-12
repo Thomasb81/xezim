@@ -20978,6 +20978,9 @@ impl Simulator {
                             }
                             b.add_map(id, w, sc_name.clone(), *dir);
                         }
+                        // Then the name-matched auto rows (registry name ==
+                        // SV signal name), bidirectional.
+                        self.sc_auto_attach(&mut b);
                         self.sc_bridge = Some(b);
                     }
                     Err(e) => {
@@ -21006,7 +21009,10 @@ impl Simulator {
             // SV top: compile + load the model .so and run the user's build
             // function now, so a build error aborts before any SV output.
             match crate::sc_bridge::ScBridge::init_sv_top(&opts, self.module.tick_s) {
-                Ok(b) => self.sc_bridge = Some(b),
+                Ok(mut b) => {
+                    self.sc_auto_attach(&mut b);
+                    self.sc_bridge = Some(b);
+                }
                 Err(e) => {
                     eprintln!("Error: {}", e);
                     self.finished = true;
@@ -106785,13 +106791,51 @@ impl Simulator {
             self.finished = true;
             return;
         };
-        if b.rows
-            .iter()
-            .any(|r| r.sv_id == sv_id && r.dir == dir && r.sc_name == sc_name)
-        {
+        // An Auto (name-matched) row already covers any direction; also
+        // dedup an exact repeat so double tasks are harmless.
+        if b.rows.iter().any(|r| {
+            r.sv_id == sv_id
+                && r.sc_name == sc_name
+                && (r.dir == dir || r.dir == crate::sc_bridge::ScDir::Auto)
+        }) {
             return;
         }
         b.add_map(sv_id, width, sc_name, dir);
+    }
+
+    /// Name-based auto-attachment — the SystemC analogue of simulating an
+    /// uninstantiated root module: every registry signal whose name matches
+    /// an SV signal name is attached automatically, synced both ways each
+    /// exchange (ScDir::Auto). Explicit rows (--sc-map / $sc_*_sig) keep
+    /// precedence; a wider-than-64-bit match is skipped with a warning
+    /// rather than aborting the run.
+    fn sc_auto_attach(&mut self, b: &mut crate::sc_bridge::ScBridge) {
+        self.sync_table_to_hashmap();
+        b.ensure_ready();
+        let names: Vec<(String, u32)> = b
+            .trace
+            .iter()
+            .map(|r| (r.name.clone(), r.width))
+            .collect();
+        let mapped: std::collections::HashSet<String> =
+            b.rows.iter().map(|r| r.sc_name.clone()).collect();
+        for (name, w) in names {
+            if mapped.contains(name.as_str()) {
+                continue;
+            }
+            let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+                continue;
+            };
+            if w > 64 {
+                eprintln!(
+                    "Warning: SystemC registry signal '{}' ({} bits) exceeds the \
+                     64-bit crossing limit; not auto-attached",
+                    name, w
+                );
+                continue;
+            }
+            b.add_map(id, w, name, crate::sc_bridge::ScDir::Auto);
+        }
     }
 
     /// Stage export-mapped SV signals into the shim, returning the pairs.
@@ -106804,7 +106848,8 @@ impl Simulator {
         b.ensure_ready();
         let mut out = Vec::new();
         for row in &b.rows {
-            if row.dir != crate::sc_bridge::ScDir::Export {
+            // Export and Auto rows both push the SV value into SystemC.
+            if row.dir == crate::sc_bridge::ScDir::Import {
                 continue;
             }
             if let Some(idx) = row.sc_idx {
