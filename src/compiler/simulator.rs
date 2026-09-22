@@ -36309,11 +36309,23 @@ impl Simulator {
                 match &base.kind {
                     ExprKind::Ident(hier) => {
                         let name = Self::resolve_hier_name_static(hier, module);
-                        if let Some((lo, hi, _)) = module.arrays.get(&name) {
-                            if let Some(a) = arrays.as_deref_mut() {
+                        if let Some(&(lo, hi, _)) = module.arrays.get(&name) {
+                            // A CONSTANT index — a literal, or what a genvar
+                            // unrolls to — names ONE element. Claiming the
+                            // whole array regardless made two generate arms
+                            // writing `mem[0]` and `mem[1]` two drivers of
+                            // every element, so neither could skip an idle
+                            // edge. An index computed at run time still
+                            // claims the array, and so does one out of range,
+                            // where the fold is the only thing saying so.
+                            let single = Self::constant_array_index(index, module)
+                                .filter(|i| (lo.min(hi)..=lo.max(hi)).contains(i));
+                            if let Some(i) = single {
+                                writes.insert(format!("{}[{}]", name, i));
+                            } else if let Some(a) = arrays.as_deref_mut() {
                                 a.insert(name);
                             } else {
-                                for i in *lo..=*hi {
+                                for i in lo..=hi {
                                     writes.insert(format!("{}[{}]", name, i));
                                 }
                             }
@@ -80486,13 +80498,29 @@ if self.profile_report {
                 }
             }
         }
+        // A whole-array claim covers every element id in its range; it is
+        // kept as the range rather than expanded (see `block_arrays`), so the
+        // span test below scans these for an element another block writes
+        // by constant index. A `mem[0] <= x` beside a `mem[p] <= y` must not
+        // skip: once p reaches 0, its element depends on which block ran
+        // last.
+        let array_claims: Vec<(usize, usize, usize)> = block_arrays
+            .iter()
+            .enumerate()
+            .flat_map(|(bj, v)| {
+                v.iter()
+                    .map(move |&(first, len)| (bj, first, first.saturating_add(len)))
+            })
+            .collect();
         let mut data_reads: Vec<Vec<u32>> = vec![Vec::new(); nb];
         let mut data_metas: Vec<Vec<(u16, u16)>> = vec![Vec::new(); nb];
         let mut gateable: Vec<bool> = vec![false; nb];
         // Census of non-gateable reasons (XEZIM_EVENT_EDGE_CENSUS=1):
         // 0 uncompiled, 1 range-oob, 2 LoadArrayElem, 3 NbaAssignArrayRead,
-        // 4 array write, 5 opaque (StmtFallback), 6 wide-without-armed.
-        let mut gate_census = [0usize; 7];
+        // 4 array write, 5 opaque (StmtFallback), 6 wide-without-armed,
+        // 7 another block claims the same bits, 8 another block claims the
+        // same array.
+        let mut gate_census = [0usize; 9];
         let mut arm_extra: Vec<Vec<u32>> = vec![Vec::new(); nb];
         let mut arm_only: Vec<bool> = vec![false; nb];
         let mut wide_read: Vec<bool> = vec![false; nb];
@@ -80655,16 +80683,26 @@ if self.profile_report {
             // Another driver of the same BITS, rather than merely of the same
             // signal. An overlap makes this block's output depend on when the
             // other one last ran, so it must fire on every edge.
-            let shared_output = block_spans[bi].iter().any(|&(id, lo, hi)| {
+            let span_shared = block_spans[bi].iter().any(|&(id, lo, hi)| {
                 spans_by_sig.get(&id).is_some_and(|others| {
                     others
                         .iter()
                         .any(|&(bj, olo, ohi)| bj != bi && lo <= ohi && olo <= hi)
-                })
-            }) || block_arrays[bi].iter().any(|&(first, len)| {
+                }) || (writer_counts.get(id).is_some_and(|&c| c > 1)
+                    && array_claims
+                        .iter()
+                        .any(|&(bj, first, end)| bj != bi && first <= id && id < end))
+            });
+            let array_shared = block_arrays[bi].iter().any(|&(first, len)| {
                 let end = first.saturating_add(len).min(writer_counts.len());
                 writer_counts[first.min(end)..end].iter().any(|&c| c > 1)
             });
+            if span_shared {
+                gate_census[7] += 1;
+            } else if array_shared {
+                gate_census[8] += 1;
+            }
+            let shared_output = span_shared || array_shared;
             gateable[bi] = !dynamic && !opaque && !shared_output && (!has_wide || self.armed_edge);
             wide_read[bi] = has_wide;
             data_reads[bi] = reads;
@@ -80685,9 +80723,10 @@ if self.profile_report {
             let arm_elems: usize = arm_extra.iter().map(|v| v.len()).sum();
             let wide_n = self.edge_block_wide_read.iter().filter(|&&a| a).count();
             eprintln!(
-                "[EVENT-EDGE-CENSUS] non-gateable: uncompiled={} range_oob={} load_array_elem={} nba_array_read={} array_write={} opaque={} wide_unarmed={}; arm-only blocks={} (element inputs={}); gateable wide-read blocks={}",
+                "[EVENT-EDGE-CENSUS] non-gateable: uncompiled={} range_oob={} load_array_elem={} nba_array_read={} array_write={} opaque={} wide_unarmed={} shared_bits={} shared_array={}; arm-only blocks={} (element inputs={}); gateable wide-read blocks={}",
                 gate_census[0], gate_census[1], gate_census[2], gate_census[3],
-                gate_census[4], gate_census[5], gate_census[6], arm_only_n, arm_elems, wide_n
+                gate_census[4], gate_census[5], gate_census[6], gate_census[7],
+                gate_census[8], arm_only_n, arm_elems, wide_n
             );
         }
         let tracked_signal_len = if self.armed_edge {
