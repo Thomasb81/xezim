@@ -5000,6 +5000,14 @@ pub struct Simulator {
     /// same instance. String keys are never cached (HashMaps intern to u32).
     compiled_class_method_ids: HashMap<String, u32>,
     compiled_method_block_cache: HashMap<(u32, u32, Vec<u32>, u32), super::bytecode::CompiledMethodOutcome>,
+    /// class-perf decision cache: interned (class, method) id pairs whose
+    /// method can NEVER run as bytecode (task-form, string return, void, a
+    /// ref/output formal, or a non-scalar return). These decisions are
+    /// deterministic per method and instance-independent (`scalar_formal_integral`
+    /// resolves widths from module scope), so once decided they never flip;
+    /// memoizing them skips the gate + type-resolution re-validation on every
+    /// one of the (mostly negative-cached) UVM calls.
+    compiled_method_skip: HashSet<(u32, u32)>,
     /// `resolve_typeref_class_name` memo: name -> (scope, class ctx) -> (class-table size, answer).
     typeref_class_memo: std::cell::RefCell<HashMap<String, HashMap<(String, String), (usize, Option<String>)>>>, 
     /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
@@ -8765,6 +8773,7 @@ impl Simulator {
             method_receiver_hint_ids: HashMap::default(),
             compiled_class_method_ids: HashMap::default(),
             compiled_method_block_cache: HashMap::default(),
+            compiled_method_skip: HashSet::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
@@ -116597,17 +116606,46 @@ impl Simulator {
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::PortDirection;
         use super::bytecode::BytecodeCompiler;
+        // Intern the (class, method) identity ONCE; it keys both the fast
+        // decision cache (this method) and the compiled-block cache (below).
+        // Cheap-u32-ids, NOT String keys (the #2 lesson).
+        let ids = &mut self.compiled_class_method_ids;
+        let cid = {
+            let next = ids.len() as u32;
+            *ids.entry(cname.to_string()).or_insert(next)
+        };
+        let mid = {
+            let next = ids.len() as u32;
+            *ids.entry(method_name.to_string()).or_insert(next)
+        };
+        // Fast decision cache: a (class, method) already decided it can never
+        // run as bytecode is looked up BEFORE re-running the whole gate +
+        // type-resolution. Every decision memoized here is instance-
+        // independent (scalar_formal_integral reads module scope), so a skip
+        // can never flip with the instance. Without this, the THOUSANDS of
+        // negative-cached UVM calls re-paid the full re-validation per call
+        // (the dominant cost on the hier-gen perf workload even though the block cache hits).
+        if self.compiled_method_skip.contains(&(cid, mid)) {
+            return None;
+        }
         let ClassMethodKind::Function(_f) = kind else {
+            self.compiled_method_skip.insert((cid, mid));
             return None; // Tasks keep waits/scheduling on the AST interpreter.
         };
         if ret_is_string {
+            self.compiled_method_skip.insert((cid, mid));
             return None; // String returns go through the signal-store path.
         }
-        let rname = fn_ret_name.as_ref()?; // void functions: keep AST (pilot).
-        // Reject ref/output/inout formals (write-back semantics the compiled
+        let Some(rname) = fn_ret_name.as_ref() else {
+            // No implicit return-variable name: the method is a plain
+            // `function void ...` body with no result cell. Keep AST.
+            self.compiled_method_skip.insert((cid, mid));
+            return None;
+        }; // Reject ref/output/inout formals (write-back semantics the compiled
         // path does not implement yet).
         for port in ports {
             if port.direction != PortDirection::Input {
+                self.compiled_method_skip.insert((cid, mid));
                 return None;
             }
         }
@@ -116616,7 +116654,12 @@ impl Simulator {
         let result_width = self.scalar_formal_integral(&self.resolve_dt_ref(&_f.return_type));
         let (result_width, result_signed) = match result_width {
             Some((w, s)) => (w, s),
-            None => return None,
+            None => {
+                // `scalar_formal_integral` resolves widths from MODULE scope,
+                // so a None here is instance-independent — memoize the skip.
+                self.compiled_method_skip.insert((cid, mid));
+                return None;
+            }
         };
         // Build the formal list: (name, width) plus a class-handle set. A
         // class-typed formal must be positively identified as a class before
@@ -116695,18 +116738,9 @@ impl Simulator {
         // method lower its body ONCE and reuse the block. The interner borrow
         // is dropped before the cache probe so the probe can reach other
         // `self` fields.
-        let key = {
-            let ids = &mut self.compiled_class_method_ids;
-            let cid = {
-                let next = ids.len() as u32;
-                *ids.entry(cname.to_string()).or_insert(next)
-            };
-            let mid = {
-                let next = ids.len() as u32;
-                *ids.entry(method_name.to_string()).or_insert(next)
-            };
-            (cid, mid, formals.iter().map(|f| f.1).collect::<Vec<u32>>(), result_width)
-        };
+        // (cid, mid) were interned once at the top of this function (they also
+        // key the fast decision cache above); reused here for the block cache.
+        let key = (cid, mid, formals.iter().map(|f| f.1).collect::<Vec<u32>>(), result_width);
         let entry = match self.compiled_method_block_cache.get(&key) {
             Some(super::bytecode::CompiledMethodOutcome::Block(e)) => e.clone(),
             // Negative-cached as non-compilable: skip straight to AST.
