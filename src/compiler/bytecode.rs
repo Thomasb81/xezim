@@ -10702,21 +10702,25 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
 
-        // Function result cell: the implicit name resolves to its register so
-        // `f = e` writes it; explicit `return e` uses the separate return reg.
+        // Function result CELL: the implicit name and an explicit `return e`
+        // share ONE register, so the LAST write wins — exactly the
+        // interpreter's `ret = return_value.take().or(implicit)` (an explicit
+        // return overrides a prior `f = ...`, and falling off the end keeps
+        // the last `f =`). `method_return_val_reg` aliases `method_result_reg`
+        // so the Return handler and the function-name binding land on the
+        // same cell.
         let (result_reg, return_val_reg): (Option<RegId>, Option<RegId>) = match result {
             Some((rname, rw, is_class)) => {
                 let r = self.alloc_reg();
+                // Return-handler writes also resize to the shared cell width.
                 self.local_var_regs.insert(rname.to_string(), (r, rw));
                 if is_class {
                     self.method_handle_names.insert(rname.to_string());
                 }
                 self.method_result_reg = Some(r);
                 self.method_result_width = if rw > 0 { Some(rw) } else { None };
-                // Explicit-return reg, sized to the declared result width.
-                let rv = self.alloc_reg();
-                self.method_return_val_reg = Some(rv);
-                (Some(r), Some(rv))
+                self.method_return_val_reg = Some(r);
+                (Some(r), Some(r))
             }
             None => (None, None),
         };

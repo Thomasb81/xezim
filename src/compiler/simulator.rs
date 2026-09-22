@@ -189,6 +189,19 @@ fn fnv_name(s: &str) -> u64 {
     h
 }
 
+/// class-perf pilot gate: `XEZIM_COMPILE_METHODS=1` enables class-function
+/// body bytecode compilation+execution. Default off, so every run keeps the
+/// proven AST interpreter (byte-identical); this is a correctness pilot for
+/// the member-addressed method VM, not yet a performance path.
+fn compiled_methods_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XEZIM_COMPILE_METHODS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Sampler thread: read the hot thread's current hash and bump.
 pub fn sampler_sample() {
     let h = CUR_METHOD_HASH.load(Ordering::Relaxed);
@@ -25531,7 +25544,8 @@ impl Simulator {
                 // body prologue seeds. Missing object / missing member yield
                 // a zero value and a no-op drop write respectively.
                 Insn::LoadClassMember(dest, handle, field) => {
-                    let h = *handle as usize;
+                    let hreg = *handle as usize;
+                    let h = self.vm_regs[hreg].to_u64().unwrap_or(0) as usize;
                     let value = self
                         .heap
                         .get(h)
@@ -25542,12 +25556,19 @@ impl Simulator {
                     self.vm_regs[*dest as usize] = value;
                 }
                 Insn::StoreClassMember(handle, value, field) => {
-                    let h = *handle as usize;
+                    let hreg = *handle as usize;
+                    let h = self.vm_regs[hreg].to_u64().unwrap_or(0) as usize;
+                    // Fit the value to the member's DECLARED width and
+                    // signedness exactly as the interpreter's `obj.member = e`
+                    // write does (`fit_class_prop`) — otherwise a compiled
+                    // store could leave a differently-sized value in the heap
+                    // than the AST path, diverging on the next read.
+                    let fitted = {
+                        let v = &self.vm_regs[*value as usize];
+                        self.fit_class_prop(h, field, v)
+                    };
                     if let Some(o) = self.heap.get_mut(h).and_then(|o| o.as_mut()) {
-                        o.properties.insert(
-                            field.to_string(),
-                            self.vm_regs[*value as usize].clone(),
-                        );
+                        o.properties.insert(field.to_string(), fitted);
                     }
                 }
                 // 10.8% of all executed bytecode — the second most frequent
@@ -116203,12 +116224,35 @@ impl Simulator {
                 } else {
                     None
                 };
+                // class-perf pilot: a fully-lowered Function body may run as
+                // bytecode instead of the AST interpreter. ALL-OR-NOTHING:
+                // `try_run_compiled_method` returns None unless every
+                // statement lowered without a fallback, in which case the
+                // value is byte-identical to the interpreter by construction
+                // (the compiled block reads `this` members and locals from
+                // the same heap / register file the AST path uses). Gated off
+                // by default.
+                if let Some(cval) = compiled_methods_enabled().then(|| {
+                    self.try_run_compiled_method(
+                        handle,
+                        &cname,
+                        method_name,
+                        ports,
+                        body,
+                        &fn_ret_name,
+                        ret_is_string,
+                        &method.kind,
+                    )
+                }).flatten() {
+                    self.return_value = Some(cval);
+                } else {
                 for stmt in body {
                     self.exec_statement(stmt);
                     if self.break_flag || self.return_flag {
                         break;
                     }
                 }
+                } // end else: AST interpreter path
                 if let Some(prev) = _prev_meth {
                     CUR_METHOD_HASH.store(prev, Ordering::Relaxed);
                 }
@@ -116436,6 +116480,150 @@ impl Simulator {
             self.factory_reg_in_progress.remove(&h);
         }
         Value::zero(32)
+    }
+
+    /// class-perf pilot: compile and run a class-FUNCTION method body as
+    /// bytecode, all-or-nothing. Returns `None` (fall back to the AST
+    /// interpreter) unless EVERYTHING lowerable: the method is a scalar-
+    /// integral-returning Function with no ref/output/inout formals, no
+    /// string/collection result, and a body `compile_class_method` fully
+    /// lowers. The block only reads `this` members (heap) plus seeded formal/
+    /// this registers — byte-identical to the AST path by construction.
+    fn try_run_compiled_method(
+        &mut self,
+        handle: usize,
+        _cname: &str,
+        _method_name: &str,
+        ports: &[crate::ast::decl::FunctionPort],
+        body: &[crate::ast::stmt::Statement],
+        fn_ret_name: &Option<String>,
+        ret_is_string: bool,
+        kind: &crate::ast::decl::ClassMethodKind,
+    ) -> Option<Value> {
+        use crate::ast::decl::ClassMethodKind;
+        use crate::ast::types::PortDirection;
+        use super::bytecode::BytecodeCompiler;
+        let ClassMethodKind::Function(_f) = kind else {
+            return None; // Tasks keep waits/scheduling on the AST interpreter.
+        };
+        if ret_is_string {
+            return None; // String returns go through the signal-store path.
+        }
+        let rname = fn_ret_name.as_ref()?; // void functions: keep AST (pilot).
+        // Reject ref/output/inout formals (write-back semantics the compiled
+        // path does not implement yet).
+        for port in ports {
+            if port.direction != PortDirection::Input {
+                return None;
+            }
+        }
+        // Result must be a scalar integral (NOT a class handle, string,
+        // real, or unpacked collection) — those aren't simple registers yet.
+        let result_width = self.scalar_formal_integral(&self.resolve_dt_ref(&_f.return_type));
+        let (result_width, result_signed) = match result_width {
+            Some((w, s)) => (w, s),
+            None => return None,
+        };
+        // Build the formal list: (name, width) plus a class-handle set. A
+        // class-typed formal must be positively identified as a class before
+        // we treat `.member` on it as heap access; any doubt keeps the whole
+        // method on the AST path (safe).
+        let mut formals: Vec<(String, u32)> = Vec::with_capacity(ports.len());
+        let mut class_formals: HashSet<String> = Default::default();
+        for port in ports {
+            let resolved = self.resolve_dt_ref(&port.data_type);
+            let is_class = if let crate::ast::types::DataType::TypeReference { name: tn, .. } =
+                resolved
+            {
+                self.module.classes.contains_key(&tn.name.name)
+            } else {
+                false
+            };
+            let w = if is_class {
+                0 // class handle formal; width irrelevant (heap member access)
+            } else {
+                match self.scalar_formal_integral(resolved) {
+                    Some((w, _)) => w,
+                    None => return None, // real/enum/collection formal: AST.
+                }
+            };
+            if is_class {
+                class_formals.insert(port.name.name.clone());
+            }
+            formals.push((port.name.name.clone(), w));
+        }
+        // Parametrized result width must resolve to the actual instance; use
+        // the same instance-parameter scope the interpreter applies to `ret`.
+        let dyn_ret = if let crate::ast::types::DataType::TypeReference { .. } = &_f.return_type {
+            let scope = self.instance_param_scope(handle);
+            resolve_type_width(&_f.return_type, Some(&scope), Some(&self.module.typedefs))
+        } else {
+            0
+        };
+        let result_width = if dyn_ret > 0 { dyn_ret } else { result_width };
+
+        // Compile all-or-nothing. On any lowering failure, None => AST.
+        let mut compiler = BytecodeCompiler::new(
+            &self.signal_name_to_id,
+            &self.signal_signed,
+            &self.signal_widths,
+            &self.module.arrays,
+            &self.widths,
+        );
+        let body_refs: Vec<&crate::ast::stmt::Statement> = body.iter().collect();
+        let compiled = compiler.compile_class_method(
+            &formals,
+            &class_formals,
+            Some((rname, result_width, false)),
+            &body_refs,
+        )?;
+        let (block, this_reg, result_reg, _rv_reg) = compiled;
+        let result_reg = result_reg?;
+        // Ensure the shared VM register file is large enough for this block.
+        let saved_vm_len = self.vm_regs.len();
+        if (block.num_regs as usize) > saved_vm_len {
+            self.vm_regs.resize(block.num_regs as usize, Value::zero(1));
+        }
+        // Seed `this` + formal registers from the bound locals frame (the
+        // formals were already bound into the current frame above).
+        let frame = self.local_stack.last();
+        self.vm_regs[this_reg as usize] = Value::from_u64(handle as u64, 32);
+        for (i, port) in ports.iter().enumerate() {
+            let val = frame
+                .and_then(|fr| fr.get(&port.name.name).cloned())
+                .unwrap_or_else(|| Value::zero(32));
+            let w = formals[i].1;
+            // `this` is reg `this_reg`; formals are the following registers.
+            let reg = this_reg as usize + 1usize + i;
+            if reg < block.num_regs as usize {
+                let mut v = val;
+                if w > 0 && v.width != w {
+                    v = v.resize_for_assign(w);
+                }
+                self.vm_regs[reg] = v;
+            }
+        }
+        // Run the block.
+        self.exec_insns(&block.instructions);
+        let result = self
+            .vm_regs
+            .get(result_reg as usize)
+            .cloned()
+            .unwrap_or_else(|| Value::zero(32));
+        // Restore the register-file length.
+        self.vm_regs.truncate(saved_vm_len);
+        // Clamp width (mirrors the interpreter's dyn_ret clamp) and stamp the
+        // declared signedness for plainly-integral returns (mirrors its
+        // §13.4.1 signedness stamp). The pilot only handles scalar-integral
+        // returns, so this never touches a class-handle/string result.
+        let mut result = result;
+        if result_width > 0 && result.width != result_width {
+            result = result.resize_for_assign(result_width);
+        }
+        if !result.is_real {
+            result.is_signed = result_signed;
+        }
+        Some(result)
     }
 
     fn resolve_expr_name(&self, expr: &Expression) -> String {

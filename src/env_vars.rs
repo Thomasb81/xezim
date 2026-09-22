@@ -54,6 +54,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_COMB_PATHS_TOP", "Profiling: how many ranked interp-bound entries the COMB_PATHS histograms cover (0 = all, default 40)"),
     ("XEZIM_COMMIT_PLAN", "Signal commits: enable experimental per-destination sidecar specialization (1 enables)"),
     ("XEZIM_COMPILE_FAIL_STATS", "Bytecode: print why statements failed to compile (bail census)"),
+    ("XEZIM_COMPILE_METHODS", "class-perf: compile class-function method bodies to bytecode and execute them (0/1, default off; performance pilot)"),
     ("XEZIM_COMPILE_PHASES", "Print per-phase compilation timing breakdown"),
     ("XEZIM_CONE", "Debug: dump the fan-in cone of a named signal"),
     ("XEZIM_CONST_CENSUS", "Census: size the constant-driven net population and the reader load sites it would fold"),
