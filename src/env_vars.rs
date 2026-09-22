@@ -136,6 +136,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_MAX_INST_DEPTH", "Elab: max instance recursion depth"),
     ("XEZIM_MBX_DBG", "Debug: trace mailbox get/put/peek operations"),
     ("XEZIM_MEM_CENSUS", "Memory: per-array cell census sizing the packed word-storage opportunity"),
+    ("XEZIM_METHOD_PROFILE", "Profiling: enable the in-process per-method wall-time sampler (prints a histogram at end of run)"),
     ("XEZIM_NAME_STATS", "Count string-keyed name lookups per site (UVM runtime-ID investigation)"),
     ("XEZIM_NBA_DENSE", "NBA queue: use dense per-signal slots instead of hash map (0/1)"),
     ("XEZIM_NO_CACHE", "Elab cache: disable reading/writing the design cache"),
