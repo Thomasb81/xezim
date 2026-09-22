@@ -4992,8 +4992,16 @@ pub struct Simulator {
     unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// Interned scope hints and head identifiers for `method_receiver_cache` keys (see there).
     method_receiver_hint_ids: HashMap<String, u32>,
+    /// class-perf Step 4b: cache of fully-lowered class-FUNCTION `CompiledBlock`s,
+    /// keyed by an INTERNED (class, method) id pair PLUS the resolved width
+    /// signature (formal widths + result width). The width signature captures
+    /// all instance-dependent compile inputs (parameterized formals / return),
+    /// so a cached block is always byte-identical to a fresh compile of the
+    /// same instance. String keys are never cached (HashMaps intern to u32).
+    compiled_class_method_ids: HashMap<String, u32>,
+    compiled_method_block_cache: HashMap<(u32, u32, Vec<u32>, u32), super::bytecode::CompiledMethodOutcome>,
     /// `resolve_typeref_class_name` memo: name -> (scope, class ctx) -> (class-table size, answer).
-    typeref_class_memo: std::cell::RefCell<HashMap<String, HashMap<(String, String), (usize, Option<String>)>>>,
+    typeref_class_memo: std::cell::RefCell<HashMap<String, HashMap<(String, String), (usize, Option<String>)>>>, 
     /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
@@ -8755,6 +8763,8 @@ impl Simulator {
             marker_key_scratch: String::new(),
             unpacked_struct_prop_names: std::cell::OnceCell::new(),
             method_receiver_hint_ids: HashMap::default(),
+            compiled_class_method_ids: HashMap::default(),
+            compiled_method_block_cache: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
@@ -116515,7 +116525,58 @@ impl Simulator {
         Value::zero(32)
     }
 
-    /// class-perf pilot: compile and run a class-FUNCTION method body as
+    /// class-perf Step 4b: the set of member/static names visible in class
+    /// scope for a method of class `cname` — the method class's own
+    /// properties plus every ENCLOSING class's properties (a nested method
+    /// lexically reaches an outer class's statics). A bare Ident in the
+    /// body matching one of these must resolve to CLASS scope, never to a
+    /// same-named module-level signal; the compiled method cannot model
+    /// class-static storage, so it bails to AST instead of reading the wrong
+    /// thing. Instance-independent (depends only on the class name) so it is
+    /// safe to reuse across instances of the same class.
+    fn class_scoping_shadow_names(&self, cname: &str) -> HashSet<String> {
+        let mut names = HashSet::default();
+        let mut seen = HashSet::default();
+        // Walk the method-class + enclosing chain, then their extends chains.
+        let mut chain: Vec<String> = Vec::new();
+        let mut cur = cname.to_string();
+        loop {
+            let Some(cd) = self.module.classes.get(&cur) else {
+                break;
+            };
+            chain.push(cur.clone());
+            match &cd.enclosing {
+                Some(e) => cur = e.clone(),
+                None => break,
+            }
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+        }
+        // Also fold in each class's `extends` base chain (base members are
+        // visible and could shadow a module name too).
+        let mut all = chain.clone();
+        let mut i = 0;
+        while i < all.len() {
+            let cn = all[i].clone();
+            if let Some(cd) = self.module.classes.get(&cn) {
+                if let Some(b) = &cd.extends {
+                    if !seen.contains(b) && !all.contains(b) {
+                        all.push(b.clone());
+                    }
+                }
+            }
+            i += 1;
+        }
+        for cn in &all {
+            if let Some(cd) = self.module.classes.get(cn) {
+                names.extend(cd.properties.keys().cloned());
+            }
+        }
+        names
+    }
+
+    /// class-perf Step 4b: compile and run a class-FUNCTION method body as
     /// bytecode, all-or-nothing. Returns `None` (fall back to the AST
     /// interpreter) unless EVERYTHING lowerable: the method is a scalar-
     /// integral-returning Function with no ref/output/inout formals, no
@@ -116525,8 +116586,8 @@ impl Simulator {
     fn try_run_compiled_method(
         &mut self,
         handle: usize,
-        _cname: &str,
-        _method_name: &str,
+        cname: &str,
+        method_name: &str,
         ports: &[crate::ast::decl::FunctionPort],
         body: &[crate::ast::stmt::Statement],
         fn_ret_name: &Option<String>,
@@ -116575,9 +116636,28 @@ impl Simulator {
             let w = if is_class {
                 0 // class handle formal; width irrelevant (heap member access)
             } else {
-                match self.scalar_formal_integral(resolved) {
-                    Some((w, _)) => w,
-                    None => return None, // real/enum/collection formal: AST.
+                // Scalar-integral GATE (bail to AST if not): the type must be
+                // a compile-able integer vector/atom.
+                let Some(pw) = self.scalar_formal_integral(resolved).map(|(w, _)| w) else {
+                    return None; // real/enum/collection formal: AST.
+                };
+                // Seed width MIRRORS the interpreter's formal-binding branch
+                // (exec_method_in_class_hierarchy): a TypeReference / IntegerAtom
+                // / literal-packed formal resizes the actual to its declared
+                // width; a PARAMETERIZED-packed formal (`logic [W-1:0]` with a
+                // class type-param bound, non-literal) keeps the CALLER's
+                // width — `scalar_formal_integral` would wrongly read the param
+                // from module scope and truncate the seed. Width 0 = keep the
+                // source width, exactly like the AST path (which only stamps
+                // signedness there).
+                use crate::ast::types::DataType as DT;
+                let keep_source = !matches!(port.data_type, DT::TypeReference { .. })
+                    && !matches!(port.data_type, DT::IntegerAtom { .. })
+                    && !Self::packed_dims_are_literal(&port.data_type);
+                if keep_source {
+                    0
+                } else {
+                    pw
                 }
             };
             if is_class {
@@ -116585,33 +116665,93 @@ impl Simulator {
             }
             formals.push((port.name.name.clone(), w));
         }
-        // Parametrized result width must resolve to the actual instance; use
-        // the same instance-parameter scope the interpreter applies to `ret`.
-        let dyn_ret = if let crate::ast::types::DataType::TypeReference { .. } = &_f.return_type {
-            let scope = self.instance_param_scope(handle);
-            resolve_type_width(&_f.return_type, Some(&scope), Some(&self.module.typedefs))
-        } else {
-            0
+        // Parameterized result width must resolve to the actual instance. The
+        // return may be a class type-param reference (TypeReference) OR a
+        // param-bounded packed vector (`logic [W-1:0]`); both resolve through
+        // the instance's param scope. Integer atoms (`int`, `bit`) and
+        // literal-bounded packed ([15:0]) returns are fixed — no instance
+        // resolution needed.
+        let instance_result_width = {
+            use crate::ast::types::DataType as DT;
+            let param_able = !matches!(&_f.return_type, DT::IntegerAtom { .. })
+                && !Self::packed_dims_are_literal(&_f.return_type);
+            if param_able {
+                let scope = self.instance_param_scope(handle);
+                resolve_type_width(&_f.return_type, Some(&scope), Some(&self.module.typedefs))
+            } else {
+                0
+            }
         };
-        let result_width = if dyn_ret > 0 { dyn_ret } else { result_width };
+        let result_width = if instance_result_width > 0 {
+            instance_result_width
+        } else {
+            result_width
+        };
 
-        // Compile all-or-nothing. On any lowering failure, None => AST.
-        let compiler = BytecodeCompiler::new(
-            &self.signal_name_to_id,
-            &self.signal_signed,
-            &self.signal_widths,
-            &self.module.arrays,
-            &self.widths,
-        );
-        let body_refs: Vec<&crate::ast::stmt::Statement> = body.iter().collect();
-        let compiled = compiler.compile_class_method(
-            &formals,
-            &class_formals,
-            Some((rname, result_width, false)),
-            &body_refs,
-        )?;
-        let (block, this_reg, result_reg, _rv_reg) = compiled;
-        let result_reg = result_reg?;
+        // Intern the (class, method) identity and build the width signature —
+        // the cache key. All compile inputs for a method are (class id, method
+        // id, formal widths, result width); interned u32 ids + a Vec<u32> of
+        // the resolved widths (NOT String keys) so repeated calls to a hot
+        // method lower its body ONCE and reuse the block. The interner borrow
+        // is dropped before the cache probe so the probe can reach other
+        // `self` fields.
+        let key = {
+            let ids = &mut self.compiled_class_method_ids;
+            let cid = {
+                let next = ids.len() as u32;
+                *ids.entry(cname.to_string()).or_insert(next)
+            };
+            let mid = {
+                let next = ids.len() as u32;
+                *ids.entry(method_name.to_string()).or_insert(next)
+            };
+            (cid, mid, formals.iter().map(|f| f.1).collect::<Vec<u32>>(), result_width)
+        };
+        let entry = match self.compiled_method_block_cache.get(&key) {
+            Some(super::bytecode::CompiledMethodOutcome::Block(e)) => e.clone(),
+            // Negative-cached as non-compilable: skip straight to AST.
+            Some(super::bytecode::CompiledMethodOutcome::Nil) => return None,
+            None => {
+                // Compile all-or-nothing. On any lowering failure, none the
+                // key (so it is not retried per call) and fall to AST.
+                let shadow_names = self.class_scoping_shadow_names(cname);
+                let compiled = {
+                    let compiler = BytecodeCompiler::new(
+                        &self.signal_name_to_id,
+                        &self.signal_signed,
+                        &self.signal_widths,
+                        &self.module.arrays,
+                        &self.widths,
+                    );
+                    let body_refs: Vec<&crate::ast::stmt::Statement> = body.iter().collect();
+                    compiler.compile_class_method(
+                        &formals,
+                        &class_formals,
+                        &shadow_names,
+                        Some((rname, result_width, false)),
+                        &body_refs,
+                    )
+                };
+                let Some((block, this_reg, result_reg, _rv_reg)) = compiled else {
+                    self.compiled_method_block_cache.insert(
+                        key,
+                        super::bytecode::CompiledMethodOutcome::Nil,
+                    );
+                    return None;
+                };
+                let entry = super::bytecode::CompiledMethodEntry {
+                    block: std::rc::Rc::new(block),
+                    this_reg,
+                    result_reg: result_reg?,
+                };
+                let rc = std::rc::Rc::new(entry);
+                self.compiled_method_block_cache.insert(key, super::bytecode::CompiledMethodOutcome::Block(rc.clone()));
+                rc
+            }
+        };
+        let block = &entry.block;
+        let this_reg = entry.this_reg;
+        let result_reg = entry.result_reg;
         // Swap OUT whatever registers the CALLER's VM is using so this
         // method's execution gets a fresh file and a nested compiled method
         // (a `CallMethod` re-entering exec_method_call above) can never

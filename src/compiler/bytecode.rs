@@ -576,6 +576,27 @@ pub struct CompiledBlock {
     pub nba_dup_targets: bool,
 }
 
+/// class-perf Step 4b: a cached, fully-lowered class-FUNCTION body plus the
+/// register ids of its seeded `this` / result cells. One entry per compiled
+/// (class, method, width-signature); shared across all calls to that method
+/// so the body is lowered ONCE instead of re-compiled per call.
+#[derive(Clone)]
+pub struct CompiledMethodEntry {
+    pub block: std::rc::Rc<CompiledBlock>,
+    pub this_reg: crate::compiler::bytecode::RegId,
+    pub result_reg: crate::compiler::bytecode::RegId,
+}
+
+/// Result of probing / populating the compiled-class-method cache for a
+/// (class, method, width-signature) key. `Block` holds the lowered body;
+/// `Nil` marks a method that FAILED to lower (negative cache) so it is not
+/// re-compiled on every call — it stays on the AST interpreter forever.
+#[derive(Clone)]
+pub enum CompiledMethodOutcome {
+    Block(std::rc::Rc<CompiledMethodEntry>),
+    Nil,
+}
+
 impl Insn {
     /// Region fusion (`build_comb_entries`): shift every register operand by
     /// `rb` and every branch target by `ib` so one member block can be
@@ -868,6 +889,13 @@ pub struct BytecodeCompiler<'a> {
     /// `.member` on them lowers to a heap access. Scalar formals/locals are
     /// already in `local_var_regs`; only class-typed ones need this set.
     method_handle_names: std::collections::HashSet<String>,
+    /// Names declared as members/statics by the method's class OR any
+    /// ENCLOSING class (so a nested method can lexically reach an outer
+    /// static). In method mode a BARE Ident matching one of these names must
+    /// resolve to class scope, NOT to a module-level signal of the same name;
+    /// the compiled path does not model class-static storage, so it bails
+    /// (falls to the AST interpreter) rather than read the wrong thing.
+    class_shadow_names: HashSet<String>,
     /// Register holding the (implicit) function result cell, so `return` and
     /// `f = ...` writes land where the method-mode prologue reads the result.
     method_result_reg: Option<RegId>,
@@ -1099,6 +1127,7 @@ impl<'a> BytecodeCompiler<'a> {
             method_mode: false,
             method_this_reg: None,
             method_handle_names: std::collections::HashSet::default(),
+            class_shadow_names: HashSet::default(),
             method_result_reg: None,
             method_return_val_reg: None,
             method_result_width: None,
@@ -7131,6 +7160,25 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(r);
                     }
                 }
+                // In method mode, a BARE Ident that names a member/static of
+                // the method's class or an enclosing class must resolve to
+                // class scope, NOT to a same-named module-level signal. The
+                // compiled path only models `this` heap members + formals/
+                // locals/params, so it cannot know the class-static value —
+                // bail (AST) rather than read the wrong (module) storage.
+                if self.method_mode
+                    && hier.root.is_none()
+                    && hier.path.len() == 1
+                    && hier.path[0].selects.is_empty()
+                {
+                    let bare = hier.path[0].name.name.as_str();
+                    if self.class_shadow_names.contains(bare)
+                        && !self.local_var_regs.contains_key(bare)
+                    {
+                        self.bail("method_class_shadow");
+                        return None;
+                    }
+                }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     // An integral parameter's signal-table twin: fold to the
                     // parameter's constant instead of a runtime load. On
@@ -10730,6 +10778,7 @@ impl<'a> BytecodeCompiler<'a> {
         mut self,
         formals: &[(String, u32)],
         class_formals: &HashSet<String>,
+        class_shadow_names: &HashSet<String>,
         result: Option<(&str, u32, bool)>,
         body: &[&crate::ast::stmt::Statement],
     ) -> Option<(CompiledBlock, RegId, Option<RegId>, Option<RegId>)> {
@@ -10741,6 +10790,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_ast_fallback = false;
         self.allow_expr_fallback = false;
         self.allow_waits = false;
+        self.class_shadow_names = class_shadow_names.clone();
 
         // `this` handle lives in a dedicated register.
         let this_reg = self.alloc_reg();
@@ -13087,7 +13137,7 @@ mod tests {
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, Some(("f", 32, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), Some(("f", 32, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -13151,7 +13201,7 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), Some(("f", 32, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -13161,6 +13211,39 @@ mod tests {
             .count();
         assert_eq!(cm, 1, "expected one CallMethod, got {cm}");
         assert!(!compiled.0.has_fallback, "method body must have no AST fallback");
+    }
+
+    // class-perf Step 4b: a bare Ident that names a member/static of the
+    // method's class or an ENCLOSING class must NOT read a same-named module
+    // signal. The compiled path does not model class-static storage, so the
+    // method must BAIL (return None => AST interpreter) rather than silently
+    // read the wrong (module) cell. `class_shadow_names` feeds this check.
+    #[test]
+    fn method_body_with_enclosing_class_shadow_bails() {
+        // return os;   (os is an enclosing-class static that shadows a module var)
+        let stmt_ret = Statement::new(
+            StatementKind::Return(Some(ident_expr("os"))),
+            crate::ast::Span::dummy(),
+        );
+        let body: Vec<&Statement> = vec![&stmt_ret];
+
+        let sigmap: HashMap<Arc<str>, usize> = Default::default();
+        let sig_signed: Vec<bool> = Vec::new();
+        let sig_w: Vec<u32> = Vec::new();
+        let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
+        let widths: HashMap<String, u32> = Default::default();
+
+        // Without the shadow set the bare `os` lowers as a module signal; with
+        // `os` listed as a class-scope name it must bail all-or-nothing.
+        let shadow: HashSet<String> = ["os".to_string()].into_iter().collect();
+        let compiler =
+            BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
+        assert!(
+            compiler
+                .compile_class_method(&[], &HashSet::default(), &shadow, Some(("f", 32, false)), &body)
+                .is_none(),
+            "bare Ident in the class-shadow set must bail, not read a module signal"
+        );
     }
 }
 
