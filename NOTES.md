@@ -135,6 +135,20 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* Loop-heavy clocked blocks with `int` counters — memory models that walk
+  lanes, byte-lane writes into a packed memory, per-lane write pointers —
+  now run on the two-state executor instead of the four-state VM. The
+  counter's signed tag, its increment, a slice read at a run-time offset and
+  range stores at a run-time offset (blocking and non-blocking, into
+  vectors wider than 64 bits) all lower now. A DRAM-model reproducer runs
+  in a third of the instructions.
+* The bytecode such blocks compile to is leaner first: a loop variable's
+  reads are forwarded into their consumers instead of being copied into a
+  temporary each time, `& K`, `* K`, `- K` and `| K` fold their constant
+  operand like `+ K` already did, a constant that only becomes one after
+  folding is fused too, and `i = i + 1` is two instructions rather than
+  five. The same reproducer executes 34% fewer VM instructions before the
+  two-state gain above.
 * A clocked block whose inputs did not change may now skip an idle edge even
   when another block writes a different part of the same register or a
   different element of the same array. Generated logic that gives

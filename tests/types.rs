@@ -392,3 +392,5 @@ mod packed_path_dynamic_stores;
 mod select_label_mapping;
 #[path = "types/packed_memory_read.rs"]
 mod packed_memory_read;
+#[path = "types/two_state_loop_blocks.rs"]
+mod two_state_loop_blocks;

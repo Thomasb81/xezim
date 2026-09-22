@@ -683,6 +683,24 @@ fn emit_insn_rust(
             use super::bytecode::BinOpConstKind as K;
             let (kv, kx) = k.raw_bits();
             match kind {
+                K::And => {
+                    let _ = writeln!(w, "let t = and4(r{sr}v, r{sr}x, {kv:#x}, {kx:#x}); r{d}v = t.0; r{d}x = t.1;");
+                }
+                K::Or => {
+                    let _ = writeln!(w, "let t = or4(r{sr}v, r{sr}x, {kv:#x}, {kx:#x}); r{d}v = t.0; r{d}x = t.1;");
+                }
+                K::Mul => {
+                    let _ = writeln!(
+                        w,
+                        "let t = arith4(r{sr}v.wrapping_mul({kv:#x}), r{sr}x, {kx:#x}); r{d}v = t.0; r{d}x = t.1;"
+                    );
+                }
+                K::Sub => {
+                    let _ = writeln!(
+                        w,
+                        "let t = arith4(r{sr}v.wrapping_sub({kv:#x}), r{sr}x, {kx:#x}); r{d}v = t.0; r{d}x = t.1;"
+                    );
+                }
                 K::Add => {
                     if kx != 0 {
                         let _ = writeln!(w, "r{d}v = 0; r{d}x = !0u64;");

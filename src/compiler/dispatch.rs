@@ -82,6 +82,10 @@ pub enum Opcode {
     BinOpConstEq,
     BinOpConstCaseEq,
     BinOpConstXor,
+    BinOpConstAnd,
+    BinOpConstOr,
+    BinOpConstMul,
+    BinOpConstSub,
     CmpBranch,
     MoveResize,
     WaitDelayReg,
@@ -179,6 +183,10 @@ impl Opcode {
                 BinOpConstKind::Eq => Self::BinOpConstEq,
                 BinOpConstKind::CaseEq => Self::BinOpConstCaseEq,
                 BinOpConstKind::Xor => Self::BinOpConstXor,
+                BinOpConstKind::And => Self::BinOpConstAnd,
+                BinOpConstKind::Or => Self::BinOpConstOr,
+                BinOpConstKind::Mul => Self::BinOpConstMul,
+                BinOpConstKind::Sub => Self::BinOpConstSub,
             },
             Insn::CmpBranch(..) => Self::CmpBranch,
             Insn::MoveResize(..) => Self::MoveResize,
@@ -194,7 +202,7 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 78;
+pub const NUM_OPCODES: usize = 82;
 
 /// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
 /// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to

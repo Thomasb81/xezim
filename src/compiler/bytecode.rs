@@ -71,15 +71,13 @@ pub fn packed_loop_nba_copies() -> u64 {
 /// `Insn::BinOpConst`, indexed by `BinOpConstKind as usize`. See
 /// [`BytecodeCompiler::fuse_binop_const`].
 static FUSED_BINOP_CONST: [std::sync::atomic::AtomicU64; BinOpConstKind::COUNT] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
+    const { std::sync::atomic::AtomicU64::new(0) }; BinOpConstKind::COUNT
 ];
 
 /// Static count of `Move ; <assign>` pairs where the Move was forwarded into
 /// the assign's value operand (see `forward_move_into_assign`).
 static FUSED_MOVE_FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FUSED_COPY_FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Static count of `ClearSigned` insns deleted because the register provably
 /// held an unsigned value already (see `elide_provably_unsigned_scrubs`).
@@ -99,6 +97,11 @@ pub fn elided_scrub_count() -> u64 {
 
 pub fn census_pair_fusions() -> u64 {
     FUSED_MOVE_FWD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Copies forwarded into their readers by `forward_copies` (static sites).
+pub fn copy_forward_count() -> u64 {
+    FUSED_COPY_FWD.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Static count of constant-operand ALU fusions performed, per
@@ -146,11 +149,19 @@ pub enum BinOpConstKind {
     CaseEq = 2,
     /// `dst = src ^ K` — same `Value` semantics as [`Insn::BitXor`].
     Xor = 3,
+    /// `dst = src & K` — same `Value` semantics as [`Insn::BitAnd`].
+    And = 4,
+    /// `dst = src | K` — same `Value` semantics as [`Insn::BitOr`].
+    Or = 5,
+    /// `dst = src * K` — same `Value` semantics as [`Insn::Mul`].
+    Mul = 6,
+    /// `dst = src - K` — same `Value` semantics as [`Insn::Sub`].
+    Sub = 7,
 }
 
 impl BinOpConstKind {
     /// Number of kinds; sizes the static fusion-count array.
-    pub const COUNT: usize = 4;
+    pub const COUNT: usize = 8;
 }
 
 /// Bytecode instruction set. Stack-free, register-based design.
@@ -796,6 +807,10 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::BinOpConst(_, _, _, BinOpConstKind::Eq) => "EqC",
         Insn::BinOpConst(_, _, _, BinOpConstKind::CaseEq) => "CaseEqC",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Xor) => "XorC",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::And) => "AndC",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::Or) => "OrC",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::Mul) => "MulC",
+        Insn::BinOpConst(_, _, _, BinOpConstKind::Sub) => "SubC",
         Insn::StmtFallback(..) => "Fallback",
         Insn::EvalExprFallback(..) => "EvalExpr",
     }
@@ -5118,7 +5133,7 @@ impl<'a> BytecodeCompiler<'a> {
         for e in &idx_exprs {
             idx_regs.push(self.compile_expr(e, 0)?);
         }
-        let root = self.compile_expr_root_of(base)?;
+        let root_sig = self.lookup_signal_id(hier);
         let mut off_reg: Option<RegId> = None;
         for (k, idx_reg) in idx_regs.into_iter().enumerate() {
             let (l, r) = dims[k];
@@ -5162,6 +5177,16 @@ impl<'a> BytecodeCompiler<'a> {
             });
         }
         let lo_reg = off_reg?;
+        // A signal root is sliced IN PLACE. `compile_expr_root_of` copied
+        // the whole vector into a register first, so a loop reading one
+        // byte of a 512-bit table cloned all 512 bits on every iteration —
+        // the copy, not the select, was the cost.
+        if let Some(sig) = root_sig {
+            let dest = self.alloc_reg();
+            self.emit(Insn::LoadSignalRangeDyn(dest, as_sig_id(sig), lo_reg, width as u32));
+            return Some(dest);
+        }
+        let root = self.compile_expr_root_of(base)?;
         let hi_reg = if width == 1 {
             lo_reg
         } else {
@@ -11078,6 +11103,7 @@ impl<'a> BytecodeCompiler<'a> {
         let num_regs = (self.next_reg as usize).min(u16::MAX as usize + 1);
         Self::elide_redundant_resizes(&mut self.insns, signal_widths, self.signal_real, num_regs);
         Self::fold_fill_const_resize(&mut self.insns);
+        Self::forward_copies(&mut self.insns);
         Self::propagate_copies(&mut self.insns);
         // AFTER resize elision: an about-to-be-deleted `Resize` sitting between
         // the array read and the NBA would otherwise hide the triple. Still
@@ -11089,6 +11115,9 @@ impl<'a> BytecodeCompiler<'a> {
         // between the two does not matter.
         Self::fuse_binop_const(&mut self.insns);
         Self::fold_const_regs(&mut self.insns, signal_widths);
+        // Folding turns `Mul(t, K0, K8)` into a constant the pass above had
+        // already walked past; a second pass fuses those too.
+        Self::fuse_binop_const(&mut self.insns);
         // After fuse_binop_const, before fuse_cmp_branch_move_resize: its
         // Move;Resize pattern is disjoint from the Move;Assign one here.
         Self::forward_move_into_assign(&mut self.insns);
@@ -11550,6 +11579,280 @@ impl<'a> BytecodeCompiler<'a> {
     /// `a` is never read again, retarget the producer to write `d` directly
     /// and drop the Move. `LoadConst -> Move` alone was 4.9% of all executed
     /// insns on the ibex CoreMark census.
+    /// The register an instruction DEFINES outright (its old contents are
+    /// irrelevant afterwards). None for stores, branches and waits, which
+    /// define nothing, and for the in-place and opaque shapes, which
+    /// `in_place_reg` / `is_opaque_insn` classify instead.
+    fn dest_reg(insn: &Insn) -> Option<RegId> {
+        match insn {
+            Insn::LoadConst(d, _)
+            | Insn::LoadSignal(d, _)
+            | Insn::LoadSignalSigned(d, _)
+            | Insn::LoadProcessLocal(d, _)
+            | Insn::LoadSignalRange(d, _, _, _)
+            | Insn::LoadSignalBit(d, _, _)
+            | Insn::LoadSignalRangeDyn(d, _, _, _)
+            | Insn::LoadArrayElem(d, _, _)
+            | Insn::Pow(d, _, _)
+            | Insn::Add(d, _, _)
+            | Insn::Sub(d, _, _)
+            | Insn::Mul(d, _, _)
+            | Insn::Div(d, _, _)
+            | Insn::Mod(d, _, _)
+            | Insn::BitAnd(d, _, _)
+            | Insn::BitOr(d, _, _)
+            | Insn::BitXor(d, _, _)
+            | Insn::BitXnor(d, _, _)
+            | Insn::LogAnd(d, _, _)
+            | Insn::LogOr(d, _, _)
+            | Insn::Eq(d, _, _)
+            | Insn::Neq(d, _, _)
+            | Insn::CaseEq(d, _, _)
+            | Insn::CasezEq(d, _, _)
+            | Insn::CasexEq(d, _, _)
+            | Insn::Lt(d, _, _)
+            | Insn::Leq(d, _, _)
+            | Insn::Gt(d, _, _)
+            | Insn::Geq(d, _, _)
+            | Insn::Shl(d, _, _)
+            | Insn::Shr(d, _, _)
+            | Insn::AShr(d, _, _)
+            | Insn::BitNot(d, _)
+            | Insn::LogNot(d, _)
+            | Insn::Negate(d, _)
+            | Insn::ReduceAnd(d, _)
+            | Insn::ReduceOr(d, _)
+            | Insn::ReduceXor(d, _)
+            | Insn::Move(d, _)
+            | Insn::MoveResize(d, _, _)
+            | Insn::Replicate(d, _, _)
+            | Insn::BinOpConst(d, _, _, _)
+            | Insn::BitSelect(d, _, _)
+            | Insn::BitSelectConst(d, _, _)
+            | Insn::RangeSelect(d, _, _, _)
+            | Insn::RangeSelectW(d, _, _, _, _)
+            | Insn::RangeSelectConst(d, _, _, _)
+            | Insn::Concat(d, _)
+            | Insn::Select(d, _, _, _)
+            | Insn::CaseLut(d, _, _)
+            | Insn::CmpBranch(_, _, _, d, _) => Some(*d),
+            _ => None,
+        }
+    }
+
+    /// The register an instruction modifies IN PLACE (read and written).
+    fn in_place_reg(insn: &Insn) -> Option<RegId> {
+        match insn {
+            Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) => Some(*a),
+            _ => None,
+        }
+    }
+
+    /// Instructions whose register traffic this file's rewrites do not
+    /// model: interpreter escapes, formatting, string ops, and the fused
+    /// pair form that only exists after every rewrite has run.
+    fn is_opaque_insn(insn: &Insn) -> bool {
+        matches!(
+            insn,
+            Insn::StmtFallback(..)
+                | Insn::EvalExprFallback(..)
+                | Insn::Format(..)
+                | Insn::StrOp(..)
+                | Insn::BinOpConstAdd2(..)
+        )
+    }
+
+    /// Rewrite every SOURCE operand `from` of `insn` to `to`. False when the
+    /// instruction has a source this function does not know how to rewrite,
+    /// in which case nothing was changed.
+    fn replace_read_reg(insn: &mut Insn, from: RegId, to: RegId) -> bool {
+        let sub = |r: &mut RegId| {
+            if *r == from {
+                *r = to;
+            }
+        };
+        match insn {
+            Insn::Pow(_, l, r)
+            | Insn::Add(_, l, r)
+            | Insn::Sub(_, l, r)
+            | Insn::Mul(_, l, r)
+            | Insn::Div(_, l, r)
+            | Insn::Mod(_, l, r)
+            | Insn::BitAnd(_, l, r)
+            | Insn::BitOr(_, l, r)
+            | Insn::BitXor(_, l, r)
+            | Insn::BitXnor(_, l, r)
+            | Insn::LogAnd(_, l, r)
+            | Insn::LogOr(_, l, r)
+            | Insn::Eq(_, l, r)
+            | Insn::Neq(_, l, r)
+            | Insn::CaseEq(_, l, r)
+            | Insn::CasezEq(_, l, r)
+            | Insn::CasexEq(_, l, r)
+            | Insn::Lt(_, l, r)
+            | Insn::Leq(_, l, r)
+            | Insn::Gt(_, l, r)
+            | Insn::Geq(_, l, r)
+            | Insn::Shl(_, l, r)
+            | Insn::Shr(_, l, r)
+            | Insn::AShr(_, l, r)
+            | Insn::CmpBranch(_, l, r, _, _)
+            | Insn::BitSelect(_, l, r) => {
+                sub(l);
+                sub(r);
+            }
+            Insn::BitNot(_, a)
+            | Insn::LogNot(_, a)
+            | Insn::Negate(_, a)
+            | Insn::ReduceAnd(_, a)
+            | Insn::ReduceOr(_, a)
+            | Insn::ReduceXor(_, a)
+            | Insn::Move(_, a)
+            | Insn::MoveResize(_, a, _)
+            | Insn::Replicate(_, a, _)
+            | Insn::BinOpConst(_, a, _, _)
+            | Insn::BitSelectConst(_, a, _)
+            | Insn::RangeSelectConst(_, a, _, _)
+            | Insn::CaseLut(_, a, _)
+            | Insn::CaseJump(a, _)
+            | Insn::CaseMaskJump(a, _)
+            | Insn::BranchIfFalse(a, _)
+            | Insn::BranchUnlessZero(a, _)
+            | Insn::LoadSignalRangeDyn(_, _, a, _)
+            | Insn::LoadArrayElem(_, _, a)
+            | Insn::NbaAssign(_, a, _)
+            | Insn::BlockingAssign(_, a, _)
+            | Insn::NbaAssignRange(_, _, _, a)
+            | Insn::BlockingAssignRange(_, _, _, a)
+            | Insn::BlockingAssignString(_, a)
+            | Insn::WaitDelayReg(a) => sub(a),
+            Insn::RangeSelect(_, b, l, r) => {
+                sub(b);
+                sub(l);
+                sub(r);
+            }
+            Insn::RangeSelectW(_, b, i, _, _) => {
+                sub(b);
+                sub(i);
+            }
+            Insn::Select(_, c, t, e) => {
+                sub(c);
+                sub(t);
+                sub(e);
+            }
+            Insn::Concat(_, parts) => parts.iter_mut().for_each(sub),
+            Insn::NbaAssignRangeDyn(_, h, l, v) | Insn::BlockingAssignRangeDyn(_, h, l, v) => {
+                sub(h);
+                sub(l);
+                sub(v);
+            }
+            Insn::NbaAssignBitDyn(_, i, v)
+            | Insn::BlockingAssignBitDyn(_, i, v)
+            | Insn::NbaAssignArray(_, i, v, _)
+            | Insn::BlockingAssignArray(_, i, v, _) => {
+                sub(i);
+                sub(v);
+            }
+            Insn::NbaAssignArrayRange(_, i, h, l, v)
+            | Insn::BlockingAssignArrayRange(_, i, h, l, v) => {
+                sub(i);
+                sub(h);
+                sub(l);
+                sub(v);
+            }
+            _ => return !Self::insn_reads_reg(insn, from),
+        }
+        true
+    }
+
+    /// The consumer side of a register copy: after `Move(t, v)`, reads of
+    /// `t` become reads of `v`, and the Move goes once nothing reads `t`.
+    ///
+    /// `propagate_copies` folds `producer ; Move` by retargeting the
+    /// producer and `forward_move_into_assign` folds `Move ; store`; a loop
+    /// variable is neither. Every read of a `for (int b ...)` counter
+    /// compiles to a Move of its register into a fresh temporary, so
+    /// `sbox_i[(b+m)&63][m]` spent 28% of a DRAM model's executed bytecode
+    /// on `Move`. Forwarding covers the straight-line run after the Move:
+    /// a read of `t` there, before `t` or `v` is written again, observes
+    /// the Move's value whatever the block's branches do elsewhere. A
+    /// branch TARGET ends the run, since control arriving there may carry
+    /// a different `t`; a branch AWAY does not, its fall-through is still
+    /// the same run. The Move itself is deleted only when no read of `t`
+    /// survives anywhere in the block — with a backward branch, a read
+    /// placed before the Move can still see it.
+    fn forward_copies(insns: &mut [Insn]) {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| {
+            !matches!(std::env::var("XEZIM_FUSE").as_deref(), Ok("0"))
+                && !matches!(std::env::var("XEZIM_FUSE_COPYFWD").as_deref(), Ok("0"))
+        }) || insns.len() < 2
+        {
+            return;
+        }
+        let is_target = Self::branch_target_map(insns);
+        for i in 0..insns.len() - 1 {
+            let Insn::Move(md, ms) = insns[i] else {
+                continue;
+            };
+            if md == ms {
+                continue;
+            }
+            let mut j = i + 1;
+            // Set when the run redefined `t` outright before any branch
+            // could leave it: every path from the Move then reaches that
+            // redefinition first, so the Move's value is unobservable and
+            // reads of `t` elsewhere in the block do not keep it alive.
+            let mut buried = false;
+            let mut escaped = false;
+            while j < insns.len() && !is_target[j] {
+                let ins = &insns[j];
+                if Self::is_opaque_insn(ins) {
+                    break;
+                }
+                let ip = Self::in_place_reg(ins);
+                if ip == Some(md) || ip == Some(ms) {
+                    break;
+                }
+                if Self::insn_reads_reg(ins, md) && !Self::replace_read_reg(&mut insns[j], md, ms)
+                {
+                    break;
+                }
+                let ins = &insns[j];
+                let dest = Self::dest_reg(ins);
+                if dest == Some(md) {
+                    buried = !escaped;
+                    break;
+                }
+                if dest == Some(ms) || matches!(ins, Insn::Jump(_)) {
+                    break;
+                }
+                if matches!(
+                    ins,
+                    Insn::CmpBranch(..)
+                        | Insn::BranchIfFalse(..)
+                        | Insn::BranchUnlessZero(..)
+                        | Insn::BranchIfSignalFalse(..)
+                        | Insn::CaseJump(..)
+                        | Insn::CaseMaskJump(..)
+                ) {
+                    escaped = true;
+                }
+                j += 1;
+            }
+            let live = !buried
+                && insns
+                    .iter()
+                    .enumerate()
+                    .any(|(k, x)| k != i && Self::insn_reads_reg(x, md));
+            if !live {
+                insns[i] = Insn::Nop;
+                FUSED_COPY_FWD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
     fn propagate_copies(insns: &mut [Insn]) {
         if insns.len() < 2 {
             return;
@@ -11855,13 +12158,17 @@ impl<'a> BytecodeCompiler<'a> {
             // the Move's dest — identical result, and `a` stays stale-but-dead.
             if let (&Insn::Resize(a, w), &Insn::Move(d, ms)) = (&insns[i], &insns[i + 1]) {
                 if ms == a && d != a {
+                    // The Resize itself reads `a` in place (the pre-resize
+                    // value the fused form also reads), so it is excluded
+                    // like the Move; counting it kept every loop body's
+                    // `i = i + 1` on three instructions.
                     let only_reader = if fwd_only {
                         insns[i + 2..].iter().all(|x| !Self::insn_reads_reg(x, a))
                     } else {
                         insns
                             .iter()
                             .enumerate()
-                            .all(|(j, x)| j == i + 1 || !Self::insn_reads_reg(x, a))
+                            .all(|(j, x)| j == i || j == i + 1 || !Self::insn_reads_reg(x, a))
                     };
                     if only_reader {
                         insns[i] = Insn::MoveResize(d, a, w);
@@ -12163,6 +12470,10 @@ impl<'a> BytecodeCompiler<'a> {
                             BinOpConstKind::Eq => v.is_equal(k),
                             BinOpConstKind::CaseEq => v.case_eq(k),
                             BinOpConstKind::Xor => v.bitwise_xor(k),
+                            BinOpConstKind::And => v.bitwise_and(k),
+                            BinOpConstKind::Or => v.bitwise_or(k),
+                            BinOpConstKind::Mul => v.mul(k),
+                            BinOpConstKind::Sub => v.sub(k),
                         };
                         let d = *d;
                         insns[i] = Insn::LoadConst(d, Box::new(r.clone()));
@@ -12340,6 +12651,11 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::Eq(d, l, r) if r == c => (d, l, BinOpConstKind::Eq),
                 Insn::CaseEq(d, l, r) if r == c => (d, l, BinOpConstKind::CaseEq),
                 Insn::BitXor(d, l, r) if r == c => (d, l, BinOpConstKind::Xor),
+                // Loop address arithmetic: `(b+m) & 63`, `i * 8`, `n - 1`.
+                Insn::BitAnd(d, l, r) if r == c => (d, l, BinOpConstKind::And),
+                Insn::BitOr(d, l, r) if r == c => (d, l, BinOpConstKind::Or),
+                Insn::Mul(d, l, r) if r == c => (d, l, BinOpConstKind::Mul),
+                Insn::Sub(d, l, r) if r == c => (d, l, BinOpConstKind::Sub),
                 _ => continue,
             };
             // `op(d, c, c)`: the left operand is the constant register too,
@@ -12660,7 +12976,11 @@ impl<'a> BytecodeCompiler<'a> {
                         BinOpConstKind::Eq | BinOpConstKind::CaseEq => Some((1, true)),
                         // `bitwise_xor` has no single-width guarantee worth
                         // proving here — leave the register width unknown.
-                        BinOpConstKind::Xor => None,
+                        BinOpConstKind::Xor
+                        | BinOpConstKind::And
+                        | BinOpConstKind::Or
+                        | BinOpConstKind::Mul
+                        | BinOpConstKind::Sub => None,
                         BinOpConstKind::Add => {
                             // Identical to the `Insn::LoadConst` arm's fact.
                             let kf = ok(k.width).map(|w| (w, !k.is_real && !k.is_fill));
@@ -12987,8 +13307,17 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::LoadSignalSigned(d, _) => set_to = Some((*d, false)),
                 Insn::BinOpConst(d, sr, k, kind) => {
                     let c = match kind {
-                        BinOpConstKind::Eq | BinOpConstKind::CaseEq | BinOpConstKind::Xor => true,
-                        BinOpConstKind::Add => clean.contains(sr) || !k.is_signed,
+                        // `bitwise_and/or/xor` clear the flag unconditionally
+                        // (the register-form rule above); losing that for
+                        // the fused forms kept 14k scrubs on a C910 SoC.
+                        BinOpConstKind::Eq
+                        | BinOpConstKind::CaseEq
+                        | BinOpConstKind::Xor
+                        | BinOpConstKind::And
+                        | BinOpConstKind::Or => true,
+                        BinOpConstKind::Add | BinOpConstKind::Mul | BinOpConstKind::Sub => {
+                            clean.contains(sr) || !k.is_signed
+                        }
                     };
                     set_to = Some((*d, c));
                 }
@@ -13592,6 +13921,15 @@ pub enum TsInsn {
     /// the destination survives. `w > 64` (wide destination) sets the bit in
     /// the wide planes directly.
     BitStoreDyn { sig: u32, i: u16, s: u16, w: u32 },
+    /// `d = sig[i +: w]` at a run-time offset, on a narrow or a wide
+    /// signal; a slice running past the signal aborts (the four-state read
+    /// yields x there), an x inside it bails like any signal read.
+    SigRangeDyn { d: u16, sig: u32, i: u16, w: u16, sw: u32, mask: u64 },
+    /// `sig[i +: w] = s` at a run-time offset; a slice past the signal
+    /// aborts to the four-state re-run.
+    RangeStoreDyn { sig: u32, i: u16, s: u16, w: u16, sw: u32, mask: u64 },
+    /// `sig[i +: w] <= s` at a run-time offset.
+    RangeStoreNbaDyn { sig: u32, i: u16, s: u16, w: u16, sw: u32, mask: u64 },
     /// Blocking store of a folded 4-state constant (`y = 'x;`). `v`/`x` are
     /// the raw value/xz planes, already masked to the assigned width.
     ConstStoreX { sig: u32, v: u64, x: u64 },
@@ -14502,6 +14840,32 @@ pub fn lower_two_state(
             return None;
         }};
     }
+    let bt_map = BytecodeCompiler::branch_target_map(&cb.instructions);
+    // Index of each register's LAST definition (dest or in-place), for the
+    // back-edge reset below; `usize::MAX` marks the fused pair form, which
+    // the lowering handles but this table does not model.
+    let mut last_def: Vec<usize> = vec![0; cb.num_regs as usize];
+    for (j, ins) in cb.instructions.iter().enumerate() {
+        let mut note = |r: RegId| {
+            if let Some(slot) = last_def.get_mut(r as usize) {
+                *slot = j;
+            }
+        };
+        if let Some(d) = BytecodeCompiler::dest_reg(ins) {
+            note(d);
+        }
+        if let Some(a) = BytecodeCompiler::in_place_reg(ins) {
+            note(a);
+        }
+        match ins {
+            Insn::BinOpConstAdd2(a) => {
+                note(a.d1);
+                note(a.d2);
+            }
+            Insn::EvalExprFallback(_, d, _) | Insn::Format(d, _) | Insn::StrOp(d, _, _) => note(*d),
+            _ => {}
+        }
+    }
     for (ins_i, insn) in cb.instructions.iter().enumerate() {
         if track {
             TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));
@@ -14511,6 +14875,23 @@ pub fn lower_two_state(
             return None;
         }
         cur_i = ins_i;
+        // A back edge re-enters a branch target from a LATER definition, so
+        // nothing known about a register's VALUE survives the merge: a loop
+        // counter seeded by `LoadConst(i, 0)` is not 0 on the second trip,
+        // and an element read indexed by it must not become a constant
+        // element read. Widths are guarded by the phi rule below.
+        // Only a register DEFINED at or after the target can arrive here
+        // with a value the forward walk did not see; a constant set before
+        // the loop and never touched inside it stays known (clearing every
+        // register cost a c906 SoC 0.8% in lost constant-index folds).
+        if back_branch && is_tgt[ins_i] {
+            for r in 0..rc.len() {
+                if last_def[r] >= ins_i {
+                    rc[r] = None;
+                    wfill[r] = None;
+                }
+            }
+        }
         if !wconf_list.is_empty() {
             if back_branch {
                 gate!("reg width phi (back edge)");
@@ -15067,6 +15448,33 @@ pub fn lower_two_state(
                             mask: ts_mask(wr),
                         });
                     }
+                    // No constant-operand two-state form for these. The
+                    // constant is materialised in the DESTINATION register,
+                    // which this instruction defines anyway, and the
+                    // register form follows; `d == s` would clobber the
+                    // source first.
+                    BinOpConstKind::And
+                    | BinOpConstKind::Or
+                    | BinOpConstKind::Mul
+                    | BinOpConstKind::Sub => {
+                        if d == s {
+                            gate!("in-place binop-const");
+                        }
+                        if k.width > 64 {
+                            return None;
+                        }
+                        let wr = w.max(k.width);
+                        def!(rw, *d, wr);
+                        sg[*d as usize] = both_sg;
+                        let (d, s) = (*d as u16, *s as u16);
+                        out.push(TsInsn::Const { d, v });
+                        out.push(match kind {
+                            BinOpConstKind::And => TsInsn::And { d, a: s, b: d },
+                            BinOpConstKind::Or => TsInsn::Or { d, a: s, b: d },
+                            BinOpConstKind::Sub => TsInsn::Sub { d, a: s, b: d, mask: ts_mask(wr) },
+                            _ => TsInsn::Mul { d, a: s, b: d, mask: ts_mask(wr) },
+                        });
+                    }
                 }
             }
             Insn::Concat(d, parts) => {
@@ -15291,6 +15699,140 @@ pub fn lower_two_state(
                         s: *src as u16,
                         mask: ts_mask(sw),
                     }
+                });
+            }
+            // A signed tag on a narrow register: the LoadSignalSigned
+            // treatment — an unsigned bit pattern marked in `sg`, which the
+            // consumers that care (`mn!`) test. `int` loop counters produce
+            // this on every iteration.
+            Insn::SetSigned(r) => {
+                let w = rw[*r as usize]?;
+                if w > 64 {
+                    gate!("wide signed");
+                }
+                sg[*r as usize] = true;
+            }
+            // A copy with the Resize arm's narrow rules folded in.
+            Insn::MoveResize(d, s, w) => {
+                let cur = rw[*s as usize]?;
+                if *w == 0 || *w > 64 || cur > 64 {
+                    gate!("wide move-resize");
+                }
+                if xc[*s as usize].is_some() || wfill[*s as usize].is_some() {
+                    gate!("x-const move-resize");
+                }
+                if *w > cur && mn!(*s) {
+                    gate!("signed widening (move-resize)");
+                }
+                let src_sg = sg[*s as usize];
+                let src_rc = rc[*s as usize];
+                def!(rw, *d, *w);
+                sg[*d as usize] = src_sg;
+                rc[*d as usize] = src_rc.map(|k| k & ts_mask(*w));
+                out.push(TsInsn::Range {
+                    d: *d as u16,
+                    s: *s as u16,
+                    lo: 0,
+                    mask: ts_mask(*w),
+                });
+            }
+            // `sig[lo +: W]` with a run-time `lo`: the whole signal counts
+            // as read, since the slice can land anywhere in it.
+            Insn::LoadSignalRangeDyn(d, sig, lo, w) => {
+                let sig = *sig as usize;
+                let Some(&sw) = signal_widths.get(sig) else {
+                    gate!("dyn slice source oob");
+                };
+                if signal_real[sig] || *w == 0 || *w > 64 || sw > u16::MAX as u32 {
+                    gate!("dyn slice source shape");
+                }
+                narrow_reg!(rw, *lo, "wide slice offset");
+                let s32 = sig as u32;
+                if sw > 64 {
+                    if !sig_ok_wide(sig) {
+                        gate!("dyn slice wide source");
+                    }
+                    let skip = !side_effects || stored.contains(&s32);
+                    if let Some(e) = reads_wide.iter_mut().find(|(x, _)| *x == s32) {
+                        e.1 &= skip;
+                    } else {
+                        reads_wide.push((s32, skip));
+                    }
+                } else {
+                    if !sig_ok(sig) {
+                        gate!("dyn slice source");
+                    }
+                    note_read(sig, 0, sw, true, stored.contains(&s32), &mut reads_whole, &mut reads_slice);
+                }
+                def!(rw, *d, *w);
+                out.push(TsInsn::SigRangeDyn {
+                    d: *d as u16,
+                    sig: s32,
+                    i: *lo as u16,
+                    w: *w as u16,
+                    sw,
+                    mask: ts_mask(*w),
+                });
+            }
+            // `sig[lo +: W] = v` / `<= v` with a run-time `lo`. The width is
+            // static only in the compiler's own shapes: `hi == lo` (one
+            // bit) or `hi` defined as `lo + K` immediately upstream.
+            Insn::BlockingAssignRangeDyn(sig, hi, lo, r) | Insn::NbaAssignRangeDyn(sig, hi, lo, r) => {
+                let sig = *sig as usize;
+                let Some(&sw) = signal_widths.get(sig) else {
+                    gate!("dyn range dest oob");
+                };
+                if signal_real[sig] || sw > u16::MAX as u32 {
+                    gate!("dyn range dest shape");
+                }
+                let w = if hi == lo {
+                    1
+                } else {
+                    let mut k = None;
+                    for j in (0..ins_i).rev() {
+                        if bt_map[j + 1] {
+                            break;
+                        }
+                        let ins = &cb.instructions[j];
+                        if BytecodeCompiler::dest_reg(ins) == Some(*lo)
+                            || BytecodeCompiler::in_place_reg(ins) == Some(*lo)
+                        {
+                            break;
+                        }
+                        if BytecodeCompiler::dest_reg(ins) == Some(*hi)
+                            || BytecodeCompiler::in_place_reg(ins) == Some(*hi)
+                        {
+                            if let Insn::BinOpConst(_, s, kk, BinOpConstKind::Add) = ins {
+                                if *s == *lo && !kk.is_signed && !kk.has_xz() {
+                                    k = kk.to_u64();
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    match k {
+                        Some(k) if k < 64 => k as u32 + 1,
+                        _ => gate!("dyn range width"),
+                    }
+                };
+                if xc[*r as usize].is_some() || wfill[*r as usize].is_some() {
+                    gate!("x-const dyn range store");
+                }
+                narrow_reg!(rw, *lo, "wide range offset");
+                let cw = narrow_reg!(rw, *r, "wide store source");
+                if cw < w && mn!(*r) {
+                    gate!("signed widening (dyn range store)");
+                }
+                side_effects = true;
+                let nba = matches!(insn, Insn::NbaAssignRangeDyn(..));
+                if !nba {
+                    stored.push(sig as u32);
+                }
+                let (sig, i, s, w16, mask) = (sig as u32, *lo as u16, *r as u16, w as u16, ts_mask(w));
+                out.push(if nba {
+                    TsInsn::RangeStoreNbaDyn { sig, i, s, w: w16, sw, mask }
+                } else {
+                    TsInsn::RangeStoreDyn { sig, i, s, w: w16, sw, mask }
                 });
             }
             Insn::NbaAssignBitDyn(sig, idx, r) => {
@@ -15871,6 +16413,8 @@ pub fn lower_two_state(
                     | TsInsn::RangeStoreNba { .. }
                     | TsInsn::BitStoreDyn { .. }
                     | TsInsn::BitStoreNbaDyn { .. }
+                    | TsInsn::RangeStoreDyn { .. }
+                    | TsInsn::RangeStoreNbaDyn { .. }
                     | TsInsn::ConstStoreX { .. }
                     | TsInsn::RangeStoreX(..)
                     | TsInsn::RangeStoreW { .. }
@@ -15963,6 +16507,8 @@ pub fn lower_two_state(
             TsInsn::Store { sig, .. }
             | TsInsn::StoreNba { sig, .. }
             | TsInsn::BitStoreNbaDyn { sig, .. }
+            | TsInsn::RangeStoreDyn { sig, .. }
+            | TsInsn::RangeStoreNbaDyn { sig, .. }
             | TsInsn::RangeStoreNbaW { sig, .. }
             | TsInsn::RangeFillW { sig, .. }
             | TsInsn::RangeFillNbaW { sig, .. }
@@ -15991,6 +16537,12 @@ pub fn lower_two_state(
         // Fusion re-indexes the stream; a wait-bearing stream keeps its
         // four-state index map exact instead.
         fuse_ts_pairs(&mut out);
+    }
+    if track && std::env::var_os("XEZIM_TS_DUMP").is_some() {
+        eprintln!("[TS-DUMP] {} insns:", out.len());
+        for (i, ti) in out.iter().enumerate() {
+            eprintln!("[TS-DUMP]   {i:>3} {ti:?}");
+        }
     }
     Some(TwoStateBlock {
         insns: out,

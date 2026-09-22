@@ -1478,6 +1478,58 @@ mod enabled {
                 let (kv0, kx0) = k.raw_bits();
                 let (sv, sx) = ld2(builder, pointer_type, regs, xz, *sr);
                 match kind {
+                    // Any x operand makes the whole result x, as `Value::mul`
+                    // / `Value::sub` do (the Add arm's rule).
+                    K::Mul | K::Sub => {
+                        if kx0 != 0 {
+                            let zero = builder.ins().iconst(types::I64, 0);
+                            let ones = builder.ins().iconst(types::I64, -1);
+                            st2(builder, pointer_type, regs, xz, *d, zero, ones);
+                        } else {
+                            let kc = builder.ins().iconst(types::I64, kv0 as i64);
+                            let res = if matches!(kind, K::Mul) {
+                                builder.ins().imul(sv, kc)
+                            } else {
+                                builder.ins().isub(sv, kc)
+                            };
+                            let zero = builder.ins().iconst(types::I64, 0);
+                            let ones = builder.ins().iconst(types::I64, -1);
+                            let unk = builder.ins().icmp(IntCC::NotEqual, sx, zero);
+                            let out_v = builder.ins().select(unk, zero, res);
+                            let out_x = builder.ins().select(unk, ones, zero);
+                            st2(builder, pointer_type, regs, xz, *d, out_v, out_x);
+                        }
+                    }
+                    // Bitwise: a known 0 (And) / known 1 (Or) decides the bit
+                    // whatever the other operand is; otherwise any x is x.
+                    K::And | K::Or => {
+                        let kvc = builder.ins().iconst(types::I64, kv0 as i64);
+                        let kxc = builder.ins().iconst(types::I64, kx0 as i64);
+                        let nsv = builder.ins().bnot(sv);
+                        let nsx = builder.ins().bnot(sx);
+                        let nkv = builder.ins().bnot(kvc);
+                        let nkx = builder.ins().bnot(kxc);
+                        let decided = if matches!(kind, K::And) {
+                            let a0 = builder.ins().band(nsv, nsx);
+                            let k0 = builder.ins().band(nkv, nkx);
+                            builder.ins().bor(a0, k0)
+                        } else {
+                            let a1 = builder.ins().band(sv, nsx);
+                            let k1 = builder.ins().band(kvc, nkx);
+                            builder.ins().bor(a1, k1)
+                        };
+                        let anyx = builder.ins().bor(sx, kxc);
+                        let ndecided = builder.ins().bnot(decided);
+                        let unk = builder.ins().band(anyx, ndecided);
+                        let raw = if matches!(kind, K::And) {
+                            builder.ins().band(sv, kvc)
+                        } else {
+                            builder.ins().bor(sv, kvc)
+                        };
+                        let nunk = builder.ins().bnot(unk);
+                        let rv = builder.ins().band(raw, nunk);
+                        st2(builder, pointer_type, regs, xz, *d, rv, unk);
+                    }
                     K::Add => {
                         if kx0 != 0 {
                             let zero = builder.ins().iconst(types::I64, 0);
@@ -2682,7 +2734,7 @@ mod enabled {
             BinOpConst(d, sr, k, kind) => {
                 use crate::compiler::bytecode::BinOpConstKind as K;
                 match kind {
-                    K::Add => {
+                    K::Add | K::Mul | K::Sub => {
                         let sw = rw(sr);
                         if sw == 0 || k.width == 0 {
                             None
@@ -2726,7 +2778,9 @@ mod enabled {
             BinOpConst(d, sr, k, kind) => {
                 use crate::compiler::bytecode::BinOpConstKind as K;
                 reg_s[*d as usize] = match kind {
-                    K::Add | K::Xor => reg_s[*sr as usize] && k.is_signed,
+                    K::Add | K::Xor | K::And | K::Or | K::Mul | K::Sub => {
+                        reg_s[*sr as usize] && k.is_signed
+                    }
                     K::Eq | K::CaseEq => false,
                 }
             }
@@ -2831,7 +2885,7 @@ mod enabled {
                 use crate::compiler::bytecode::BinOpConstKind as K;
                 match kind {
                     K::Eq | K::CaseEq => set(reg_w, d, 1),
-                    K::Add | K::Xor => {
+                    K::Add | K::Xor | K::And | K::Or | K::Mul | K::Sub => {
                         let sw = get(reg_w, sr);
                         set(reg_w, d, if sw == 0 || k.width == 0 { 0 } else { sw.max(k.width) })
                     }

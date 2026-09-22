@@ -3728,6 +3728,13 @@ pub(crate) fn oob_write_discard(hi: i64, lo: i64, w: u32) -> bool {
     oob_select_whole() && (lo < 0 || hi >= w as i64)
 }
 
+/// Outcome of a two-state dynamic-offset slice read.
+enum TsDyn {
+    Ok(u64),
+    Oob,
+    X,
+}
+
 #[inline]
 pub(crate) fn oob_range_select(base: &Value, hi: i64, lo: i64) -> Value {
     let per_bit = !oob_select_whole();
@@ -22516,6 +22523,17 @@ impl Simulator {
                         }
                     }
                 }
+                // Dynamic-offset slice and range stores: one arm, one call,
+                // so the executor loop's register allocation stays as it was
+                // (three inline arms cost a c906 SoC 0.8%, outlined bodies
+                // still 0.5%).
+                insn @ (TsInsn::SigRangeDyn { .. } | TsInsn::RangeStoreDyn { .. } | TsInsn::RangeStoreNbaDyn { .. }) => {
+                    match unsafe { self.ts_exec_dyn(insn, regs.as_mut_ptr()) } {
+                        0 => {}
+                        1 => return false,
+                        _ => xbail!(),
+                    }
+                }
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
                 }
@@ -23348,6 +23366,17 @@ impl Simulator {
                         }
                     }
                 }
+                // Dynamic-offset slice and range stores: one arm, one call,
+                // so the executor loop's register allocation stays as it was
+                // (three inline arms cost a c906 SoC 0.8%, outlined bodies
+                // still 0.5%).
+                TsInsn::SigRangeDyn { .. } | TsInsn::RangeStoreDyn { .. } | TsInsn::RangeStoreNbaDyn { .. } => {
+                    match unsafe { self.ts_exec_dyn(insn, rp) } {
+                        0 => {}
+                        1 => return false,
+                        _ => xbail!(),
+                    }
+                }
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
                 }
@@ -23881,6 +23910,69 @@ impl Simulator {
     /// `sig[hi:lo] <= v` (narrow destination): merge into the pending NBA
     /// entry when one exists, else seed from the signal with elision — the
     /// `RangeStoreNba` executor arm as a callable.
+    /// The dynamic-offset two-state instructions, executed out of line on
+    /// a raw view of the register file: 0 = done, 1 = abort (slice past
+    /// the signal), 2 = x read. See the executors' arm comment.
+    ///
+    /// SAFETY: `regs` is the executor's register file, sized for every
+    /// register index the lowered stream names.
+    #[inline(never)]
+    unsafe fn ts_exec_dyn(&mut self, insn: &super::bytecode::TsInsn, regs: *mut u64) -> u8 {
+        use super::bytecode::TsInsn;
+        match insn {
+            TsInsn::SigRangeDyn { d, sig, i, w, sw, mask } => {
+                match self.ts_sig_range_dyn(*sig, *regs.add(*i as usize), *w, *sw) {
+                    TsDyn::Ok(v) => {
+                        *regs.add(*d as usize) = v & mask;
+                        0
+                    }
+                    TsDyn::Oob => 1,
+                    TsDyn::X => 2,
+                }
+            }
+            TsInsn::RangeStoreDyn { sig, i, s, w, sw, mask } => {
+                let (lo, v) = (*regs.add(*i as usize), *regs.add(*s as usize) & mask);
+                (!self.ts_range_store_dyn(*sig, lo, v, *w, *sw, false)) as u8
+            }
+            TsInsn::RangeStoreNbaDyn { sig, i, s, w, sw, mask } => {
+                let (lo, v) = (*regs.add(*i as usize), *regs.add(*s as usize) & mask);
+                (!self.ts_range_store_dyn(*sig, lo, v, *w, *sw, true)) as u8
+            }
+            _ => 0,
+        }
+    }
+
+    /// `sig[lo +: w]` at a run-time offset, for the two-state executors.
+    #[inline(never)]
+    fn ts_sig_range_dyn(&self, sig: u32, lo: u64, w: u16, sw: u32) -> TsDyn {
+        if lo + w as u64 > sw as u64 {
+            return TsDyn::Oob;
+        }
+        let (v, x) = Self::raw_bits_slice(&self.signal_table[sig as usize], lo as u16, w);
+        if x != 0 {
+            return TsDyn::X;
+        }
+        TsDyn::Ok(v)
+    }
+
+    /// `sig[lo +: w] = v` (or `<=` with `nba`) at a run-time offset; false
+    /// when the slice runs past the signal, which the four-state re-run
+    /// handles.
+    #[inline(never)]
+    fn ts_range_store_dyn(&mut self, sig: u32, lo: u64, v: u64, w: u16, sw: u32, nba: bool) -> bool {
+        if lo + w as u64 > sw as u64 {
+            return false;
+        }
+        let (id, lo, hi) = (sig as usize, lo as u32, lo as u32 + w as u32 - 1);
+        match (nba, sw > 64) {
+            (false, true) => self.ts_wide_range_store(id, lo, hi, v, 0),
+            (false, false) => self.ts_range_store(id, v, lo, hi),
+            (true, true) => self.ts_wide_range_store_nba(id, lo, hi, v),
+            (true, false) => self.ts_range_store_nba(id, lo, hi, v),
+        }
+        true
+    }
+
     pub(crate) fn ts_range_store_nba(&mut self, id: usize, lo: u32, hi: u32, v: u64) {
         if let Some(i) = self.nba_fast_index.get(id) {
             let target = &mut self.nba_fast[i].value;
@@ -24403,6 +24495,17 @@ impl Simulator {
                         } else {
                             self.ts_range_store(*sig as usize, b, idx as u32, idx as u32);
                         }
+                    }
+                }
+                // Dynamic-offset slice and range stores: one arm, one call,
+                // so the executor loop's register allocation stays as it was
+                // (three inline arms cost a c906 SoC 0.8%, outlined bodies
+                // still 0.5%).
+                insn @ (TsInsn::SigRangeDyn { .. } | TsInsn::RangeStoreDyn { .. } | TsInsn::RangeStoreNbaDyn { .. }) => {
+                    match unsafe { self.ts_exec_dyn(insn, rp) } {
+                        0 => {}
+                        1 => return false,
+                        _ => xbail!(),
                     }
                 }
                 TsInsn::ConstStoreX { sig, v, x } => {
@@ -26221,6 +26324,10 @@ impl Simulator {
                         K::Eq => vm_regs[d] = vm_regs[s].is_equal(&**k),
                         K::CaseEq => vm_regs[d] = vm_regs[s].case_eq(&**k),
                         K::Xor => vm_regs[d] = vm_regs[s].bitwise_xor(&**k),
+                        K::And => vm_regs[d] = vm_regs[s].bitwise_and(&**k),
+                        K::Or => vm_regs[d] = vm_regs[s].bitwise_or(&**k),
+                        K::Mul => vm_regs[d] = vm_regs[s].mul(&**k),
+                        K::Sub => vm_regs[d] = vm_regs[s].sub(&**k),
                     }
                 }
                 Insn::CasezEq(d, l, r) => {
@@ -26940,6 +27047,10 @@ impl Simulator {
                         K::Eq => vm_regs[d] = vm_regs[s].is_equal(&**k),
                         K::CaseEq => vm_regs[d] = vm_regs[s].case_eq(&**k),
                         K::Xor => vm_regs[d] = vm_regs[s].bitwise_xor(&**k),
+                        K::And => vm_regs[d] = vm_regs[s].bitwise_and(&**k),
+                        K::Or => vm_regs[d] = vm_regs[s].bitwise_or(&**k),
+                        K::Mul => vm_regs[d] = vm_regs[s].mul(&**k),
+                        K::Sub => vm_regs[d] = vm_regs[s].sub(&**k),
                     }
                 }
                 Insn::CasezEq(d, l, r) => {
@@ -28408,6 +28519,10 @@ impl Simulator {
                             None => self.vm_regs[d] = self.vm_regs[s].case_eq(&**k),
                         },
                         K::Xor => self.vm_regs[d] = self.vm_regs[s].bitwise_xor(&**k),
+                        K::And => self.vm_regs[d] = self.vm_regs[s].bitwise_and(&**k),
+                        K::Or => self.vm_regs[d] = self.vm_regs[s].bitwise_or(&**k),
+                        K::Mul => self.vm_regs[d] = self.vm_regs[s].mul(&**k),
+                        K::Sub => self.vm_regs[d] = self.vm_regs[s].sub(&**k),
                     }
                 }
                 Insn::CasezEq(d, l, r) => {
@@ -40164,16 +40279,24 @@ impl Simulator {
         {
             let f = super::bytecode::binop_const_fusions();
             eprintln!(
-                "[FUSE] const-operand ALU fusions (static sites): Add={} Eq={} CaseEq={} Xor={} total={}",
+                "[FUSE] const-operand ALU fusions (static sites): Add={} Eq={} CaseEq={} Xor={} And={} Or={} Mul={} Sub={} total={}",
                 f[0],
                 f[1],
                 f[2],
                 f[3],
+                f[4],
+                f[5],
+                f[6],
+                f[7],
                 f.iter().sum::<u64>()
             );
             eprintln!(
                 "[FUSE] Move-into-assign forwards (static sites): {}",
                 super::bytecode::census_pair_fusions()
+            );
+            eprintln!(
+                "[FUSE] copies forwarded into readers (static sites): {}",
+                super::bytecode::copy_forward_count()
             );
             eprintln!(
                 "[FUSE] provably-unsigned scrubs elided (static sites): {}",
@@ -41067,6 +41190,10 @@ impl Simulator {
                 super::bytecode::BinOpConstKind::Eq => "BinOpConstEq",
                 super::bytecode::BinOpConstKind::CaseEq => "BinOpConstCaseEq",
                 super::bytecode::BinOpConstKind::Xor => "BinOpConstXor",
+                super::bytecode::BinOpConstKind::And => "BinOpConstAnd",
+                super::bytecode::BinOpConstKind::Or => "BinOpConstOr",
+                super::bytecode::BinOpConstKind::Mul => "BinOpConstMul",
+                super::bytecode::BinOpConstKind::Sub => "BinOpConstSub",
             },
         }
     }
