@@ -23742,6 +23742,10 @@ impl Simulator {
                     debug_assert!(false, "wait insn in isolated comb exec");
                     break;
                 }
+                Insn::LoadClassMember(..) | Insn::StoreClassMember(..) => {
+                    debug_assert!(false, "class-member insn in isolated comb exec");
+                    break;
+                }
                 Insn::LoadConst(dest, val) => {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
@@ -24400,6 +24404,10 @@ impl Simulator {
                 // an isolated evaluator cannot suspend — stop the block.
                 Insn::WaitDelayReg(..) | Insn::WaitEdge(..) => {
                     debug_assert!(false, "wait insn in isolated comb exec");
+                    break;
+                }
+                Insn::LoadClassMember(..) | Insn::StoreClassMember(..) => {
+                    debug_assert!(false, "class-member insn in isolated comb exec");
                     break;
                 }
                 Insn::LoadConst(dest, val) => {
@@ -25516,6 +25524,31 @@ impl Simulator {
                         .cloned()
                         .unwrap_or_else(|| Value::new(1));
                     self.vm_regs[*dest as usize] = value;
+                }
+                // class-perf tier-1 opcodes: read/write an object member off
+                // the heap, addressed by a register-held handle. `this` is
+                // held in the `this_handle` VM register slot that the method-
+                // body prologue seeds. Missing object / missing member yield
+                // a zero value and a no-op drop write respectively.
+                Insn::LoadClassMember(dest, handle, field) => {
+                    let h = *handle as usize;
+                    let value = self
+                        .heap
+                        .get(h)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|inst| inst.properties.get(field.as_ref()))
+                        .cloned()
+                        .unwrap_or_else(|| Value::zero(1));
+                    self.vm_regs[*dest as usize] = value;
+                }
+                Insn::StoreClassMember(handle, value, field) => {
+                    let h = *handle as usize;
+                    if let Some(o) = self.heap.get_mut(h).and_then(|o| o.as_mut()) {
+                        o.properties.insert(
+                            field.to_string(),
+                            self.vm_regs[*value as usize].clone(),
+                        );
+                    }
                 }
                 // 10.8% of all executed bytecode — the second most frequent
                 // opcode. Rewriting the register's two words and its width in
@@ -37979,6 +38012,8 @@ impl Simulator {
             Insn::Format(..) => "Format",
             Insn::StrOp(..) => "StrOp",
             Insn::BlockingAssignString(..) => "BlockingAssignString",
+            Insn::LoadClassMember(..) => "LoadClassMember",
+            Insn::StoreClassMember(..) => "StoreClassMember",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",

@@ -412,6 +412,14 @@ pub enum Insn {
     /// §11.4.3 `**` with a non-constant base: left operand pre-resized to the
     /// operation width by the compiler; result width = left's width.
     Pow(RegId, RegId, RegId),
+    /// Read a field of the object whose handle is in a register off the object
+    /// heap: `dest = heap[handle].properties[field]`. Class methods (not the
+    /// signal namespace) resolve `this.<field>` to this. `class-perf` tier-1
+    /// opcode; always rendered as a bytecode op but only reachable from the
+    /// (gated) method-body compile path.
+    LoadClassMember(RegId, RegId, Box<str>), // (dest, this_handle_reg, field)
+    /// Write a field of the object whose handle is in a register: `heap[handle].properties[field] = value`.
+    StoreClassMember(RegId, RegId, Box<str>), // (this_handle_reg, value_reg, field)
     Nop,
 
     /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
@@ -616,7 +624,9 @@ impl Insn {
             | BinOpConst(a, b, _, _)
             | BlockingAssignBitDyn(_, a, b)
             | LoadArrayElem(a, _, b)
-            | BlockingAssignArray(_, a, b, _) => {
+            | BlockingAssignArray(_, a, b, _)
+            | LoadClassMember(a, b, _)
+            | StoreClassMember(a, b, _) => {
                 *a += rb;
                 *b += rb;
             }
@@ -743,6 +753,8 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::SetSigned(..) => "SetSigned",
         Insn::ClearSigned(..) => "ClearSigned",
         Insn::Pow(..) => "Pow",
+        Insn::LoadClassMember(..) => "LoadCls",
+        Insn::StoreClassMember(..) => "StoreCls",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
@@ -10556,6 +10568,10 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::BranchUnlessZero(c, _) => *c == r,
             // In-place mutators read their register.
             Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) => *a == r,
+            // Class-member access: Load reads the handle; Store reads the
+            // handle AND the stored value register.
+            Insn::LoadClassMember(_, h, _) => *h == r,
+            Insn::StoreClassMember(h, v, _) => *h == r || *v == r,
             Insn::Pow(_, l, rr)
             | Insn::Add(_, l, rr)
             | Insn::Sub(_, l, rr)
@@ -11855,6 +11871,12 @@ impl<'a> BytecodeCompiler<'a> {
 
                 // Result width varies per entry; drop tracking for the dest.
                 Insn::CaseLut(d, ..) => store(&mut rw, *d, None),
+                // Class-member load: the width isn't statically known (the
+                // member's Value width follows its runtime type) — bare
+                // dest store, no width/plain bogus elision.
+                Insn::LoadClassMember(d, ..) => store(&mut rw, *d, None),
+                // Class-member store defines nothing (only the heap object).
+                Insn::StoreClassMember(..) => {}
                 // Two dests; widths follow operand widths — drop tracking.
                 Insn::BinOpConstAdd2(a) => {
                     store(&mut rw, a.d1, None);

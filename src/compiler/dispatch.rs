@@ -86,6 +86,8 @@ pub enum Opcode {
     WaitDelayReg,
     BinOpConstAdd2,
     WaitEdge,
+    LoadClassMember,
+    StoreClassMember,
 }
 
 impl Opcode {
@@ -182,6 +184,8 @@ impl Opcode {
             Insn::WaitDelayReg(..) => Self::WaitDelayReg,
             Insn::BinOpConstAdd2(..) => Self::BinOpConstAdd2,
             Insn::WaitEdge(..) => Self::WaitEdge,
+            Insn::LoadClassMember(..) => Self::LoadClassMember,
+            Insn::StoreClassMember(..) => Self::StoreClassMember,
         }
     }
 
@@ -191,12 +195,12 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 77;
+pub const NUM_OPCODES: usize = 79;
 
 /// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
 /// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to
 /// the last discriminant at compile time instead.
-const _: () = assert!(NUM_OPCODES == Opcode::WaitEdge as usize + 1);
+const _: () = assert!(NUM_OPCODES == Opcode::StoreClassMember as usize + 1);
 
 /// Dispatch table - proof of concept.
 #[derive(Debug, Clone)]
