@@ -201,7 +201,6 @@ fn compiled_methods_enabled() -> bool {
             .unwrap_or(false)
     })
 }
-
 /// Sampler thread: read the hot thread's current hash and bump.
 pub fn sampler_sample() {
     let h = CUR_METHOD_HASH.load(Ordering::Relaxed);
@@ -23759,6 +23758,10 @@ impl Simulator {
                     debug_assert!(false, "class-member insn in isolated comb exec");
                     break;
                 }
+                Insn::CallMethod(..) => {
+                    debug_assert!(false, "class-member insn in isolated comb exec");
+                    break;
+                }
                 Insn::LoadConst(dest, val) => {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
@@ -24421,6 +24424,10 @@ impl Simulator {
                 }
                 Insn::LoadClassMember(..) | Insn::StoreClassMember(..) => {
                     debug_assert!(false, "class-member insn in isolated comb exec");
+                    break;
+                }
+                Insn::CallMethod(..) => {
+                    debug_assert!(false, "CallMethod insn in isolated comb exec");
                     break;
                 }
                 Insn::LoadConst(dest, val) => {
@@ -25570,6 +25577,31 @@ impl Simulator {
                     if let Some(o) = self.heap.get_mut(h).and_then(|o| o.as_mut()) {
                         o.properties.insert(field.to_string(), fitted);
                     }
+                }
+                Insn::CallMethod(dest, handle_reg, method, arg_start, n_args) => {
+                    let handle = self.vm_regs[*handle_reg as usize]
+                        .to_u64()
+                        .unwrap_or(0) as usize;
+                    let base = *arg_start as usize;
+                    let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
+                    for i in 0..*n_args as usize {
+                        argvals.push(self.vm_regs.get(base + i).cloned().unwrap_or(Value::zero(32)));
+                    }
+                    // Hand the runtime arg VALUES to the interpreter's method
+                    // dispatcher as constant-expressions (an integer/real literal
+                    // whose cached bits round-trip exactly), so every callee-
+                    // binding feature (normalize_call_args, defaults, ref /
+                    // output write-backs, __vif_local__) runs untouched. A
+                    // compiled callee re-enters try_run_compiled_method, which
+                    // swaps `self.vm_regs` out and back, so our caller regs
+                    // below survive the nested VM.
+                    let args: Vec<Expression> = argvals
+                        .iter()
+                        .map(|v| self.value_method_arg_expr(v))
+                        .collect();
+                    let result = self.exec_method_call(handle, method, &args);
+                    self.vm_regs[*dest as usize] = result;
+                    local_count += 1;
                 }
                 // 10.8% of all executed bytecode — the second most frequent
                 // opcode. Rewriting the register's two words and its width in
@@ -38035,6 +38067,7 @@ impl Simulator {
             Insn::BlockingAssignString(..) => "BlockingAssignString",
             Insn::LoadClassMember(..) => "LoadClassMember",
             Insn::StoreClassMember(..) => "StoreClassMember",
+            Insn::CallMethod(..) => "CallMethod",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
@@ -116563,7 +116596,7 @@ impl Simulator {
         let result_width = if dyn_ret > 0 { dyn_ret } else { result_width };
 
         // Compile all-or-nothing. On any lowering failure, None => AST.
-        let mut compiler = BytecodeCompiler::new(
+        let compiler = BytecodeCompiler::new(
             &self.signal_name_to_id,
             &self.signal_signed,
             &self.signal_widths,
@@ -116579,9 +116612,13 @@ impl Simulator {
         )?;
         let (block, this_reg, result_reg, _rv_reg) = compiled;
         let result_reg = result_reg?;
-        // Ensure the shared VM register file is large enough for this block.
-        let saved_vm_len = self.vm_regs.len();
-        if (block.num_regs as usize) > saved_vm_len {
+        // Swap OUT whatever registers the CALLER's VM is using so this
+        // method's execution gets a fresh file and a nested compiled method
+        // (a `CallMethod` re-entering exec_method_call above) can never
+        // clobber the caller's live registers mid-`exec_insns`. Restored
+        // below even if the block defects.
+        let saved_vm_regs = std::mem::take(&mut self.vm_regs);
+        if (block.num_regs as usize) > self.vm_regs.len() {
             self.vm_regs.resize(block.num_regs as usize, Value::zero(1));
         }
         // Seed `this` + formal registers from the bound locals frame (the
@@ -116610,8 +116647,8 @@ impl Simulator {
             .get(result_reg as usize)
             .cloned()
             .unwrap_or_else(|| Value::zero(32));
-        // Restore the register-file length.
-        self.vm_regs.truncate(saved_vm_len);
+        // Restore the CALLER's register file now that we're done with ours.
+        self.vm_regs = saved_vm_regs;
         // Clamp width (mirrors the interpreter's dyn_ret clamp) and stamp the
         // declared signedness for plainly-integral returns (mirrors its
         // §13.4.1 signedness stamp). The pilot only handles scalar-integral
@@ -116624,6 +116661,40 @@ impl Simulator {
             result.is_signed = result_signed;
         }
         Some(result)
+    }
+
+    /// class-perf: wrap a runtime `Value` as a constant `Expression` for the
+    /// interpreter's method dispatcher to bind as an actual. A non-real value
+    /// becomes a sized hex integer whose cached bits round-trip exactly (the
+    /// inline fast path reproduces `val`/`xz`/`width`; the text fallback keeps
+    /// X/Z and width identical for >64-bit values). A real becomes a `Real`
+    /// literal. This is only called from `CallMethod`'s handler, so the
+    /// arg VALUES are already computed — the wrapper just lets the existing
+    /// callee-binding code (defaults, ref/output write-backs, vif handling)
+    /// run unchanged.
+    fn value_method_arg_expr(&self, v: &Value) -> Expression {
+        use crate::ast::expr::NumberLiteral;
+        use crate::ast::expr::NumberBase;
+        if v.is_real {
+            return Expression::new(
+                ExprKind::Number(NumberLiteral::Real(v.to_f64())),
+                crate::ast::Span::dummy(),
+            );
+        }
+        let inline = v
+            .inline_bits()
+            .filter(|_| v.width <= 64)
+            .map(|(vb, xz)| (vb, xz, v.width));
+        Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: Some(v.width.max(1)),
+                signed: v.is_signed,
+                base: NumberBase::Hex,
+                value: v.to_hex(),
+                cached_val: std::cell::Cell::new(inline),
+            }),
+            crate::ast::Span::dummy(),
+        )
     }
 
     fn resolve_expr_name(&self, expr: &Expression) -> String {

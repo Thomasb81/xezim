@@ -420,6 +420,15 @@ pub enum Insn {
     LoadClassMember(RegId, RegId, Box<str>), // (dest, this_handle_reg, field)
     /// Write a field of the object whose handle is in a register: `heap[handle].properties[field] = value`.
     StoreClassMember(RegId, RegId, Box<str>), // (this_handle_reg, value_reg, field)
+    /// class-perf tier-2: call a method on the object whose handle is in
+    /// `handle_reg`, passing the `n_args` actuals already computed into the
+    /// contiguous registers `arg_start..arg_start+n_args`. Writes the scalar
+    /// return into `dest`. At runtime the receiver + args are re-entered into
+    /// the interpreter's `exec_method_call` dispatcher, so the callee keeps
+    /// full AST semantics (virtual dispatch, defaults, output/ref/string);
+    /// `class-perf` bridges a compiled caller's method call back to the
+    /// battle-tested interpreter — correctness pilot, not the end-state.
+    CallMethod(RegId, RegId, Box<str>, RegId, u32), // (dest, handle_reg, method, arg_start, n_args)
     Nop,
 
     /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
@@ -691,7 +700,8 @@ impl Insn {
             NbaAssignArrayRead(..) => {}
             LoadProcessLocal(..) | Format(..) | CaseJump(..) | CaseMaskJump(..)
             | StmtFallback(..) | EvalExprFallback(..)
-            | WaitDelayReg(..) | WaitEdge(..) => return false,
+            | WaitDelayReg(..) | WaitEdge(..)
+            | CallMethod(..) => return false,
         }
         true
     }
@@ -755,6 +765,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::Pow(..) => "Pow",
         Insn::LoadClassMember(..) => "LoadCls",
         Insn::StoreClassMember(..) => "StoreCls",
+        Insn::CallMethod(..) => "CallM,",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
@@ -8616,6 +8627,55 @@ impl<'a> BytecodeCompiler<'a> {
                 acc
             }
             ExprKind::Call { func, args } => {
+                // class-perf method-mode: `this.m(a,..)` / `<classhandle>.m(a,..)`
+                // where the receiver is a class handle lowers to a CallMethod
+                // instruction. Runtime re-enters the interpreter's method
+                // dispatcher (full virtual dispatch / defaults / refs / strings
+                // in the callee), so the callee keeps all AST semantics. The
+                // ALL-OR-NOTHING contract holds on the ARGS: any actual that
+                // cannot become a register keeps the whole body on the AST
+                // interpreter (rollback below).
+                if self.method_mode
+                    && let ExprKind::MemberAccess { expr: base, member } = &func.kind
+                    && let Some(handle_reg) = self.method_member_base_reg(base)
+                {
+                    let call_start = self.insns.len();
+                    let call_next = self.next_reg;
+                    let mut ok = true;
+                    let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.compile_expr(a, 0) {
+                            Some(r) => arg_values.push(r),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        let dest = self.alloc_reg();
+                        let n = arg_values.len() as u32;
+                        let arg_start = self.alloc_reg();
+                        for (i, &v) in arg_values.iter().enumerate() {
+                            let slot = (arg_start as usize + i) as RegId;
+                            if slot != v {
+                                self.emit(Insn::Move(slot, v));
+                            }
+                        }
+                        self.emit(Insn::CallMethod(
+                            dest,
+                            handle_reg,
+                            member.name.clone().into_boxed_str(),
+                            arg_start,
+                            n,
+                        ));
+                        return Some(dest);
+                    }
+                    self.insns.truncate(call_start);
+                    self.next_reg = call_next;
+                    self.bail("Expr_Call_class_method");
+                    return None;
+                }
                 if let Some(r) = self.compile_string_method(func, args, expr.span) {
                     return Some(r);
                 }
@@ -10816,6 +10876,9 @@ impl<'a> BytecodeCompiler<'a> {
             // handle AND the stored value register.
             Insn::LoadClassMember(_, h, _) => *h == r,
             Insn::StoreClassMember(h, v, _) => *h == r || *v == r,
+            Insn::CallMethod(_, h, _, a, n) => {
+                *h == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+            }
             Insn::Pow(_, l, rr)
             | Insn::Add(_, l, rr)
             | Insn::Sub(_, l, rr)
@@ -12121,6 +12184,9 @@ impl<'a> BytecodeCompiler<'a> {
                 Insn::LoadClassMember(d, ..) => store(&mut rw, *d, None),
                 // Class-member store defines nothing (only the heap object).
                 Insn::StoreClassMember(..) => {}
+                // Method call: dest width isn't statically known (callee
+                // return width follows its runtime type) — bare dest store.
+                Insn::CallMethod(d, ..) => store(&mut rw, *d, None),
                 // Two dests; widths follow operand widths — drop tracking.
                 Insn::BinOpConstAdd2(a) => {
                     store(&mut rw, a.d1, None);
@@ -13042,12 +13108,13 @@ mod tests {
         assert!(!block.has_fallback, "method body must have no AST fallback");
     }
 
-    // class-perf: a body that CALLS a method (`this.compute(1)`) must NOT be
-    // compiled (no method-call instruction yet) — the whole method bails to
-    // the AST interpreter, byte-identical by construction. This is the core
-    // all-or-nothing correctness guarantee.
+    // class-perf: a body that CALLS a method (`this.compute(1)`) in an
+    // EXPRESSION position on `this` now LOWERS to a CallMethod instruction
+    // (Step 4): the compiled body re-enters the interpreter's method
+    // dispatcher for the callee, so the caller stays 100% VM. Still
+    // byte-identical by construction (the callee keeps full AST semantics).
     #[test]
-    fn method_body_with_call_bails_all_or_nothing() {
+    fn method_body_with_call_lowers_to_callmethod() {
         fn span() -> crate::ast::Span {
             crate::ast::Span::dummy()
         }
@@ -13085,7 +13152,15 @@ mod tests {
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out = compiler.compile_class_method(&[], &HashSet::default(), Some(("f", 32, false)), &body);
-        assert!(out.is_none(), "a method body with a call must bail (all-or-nothing)");
+        let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
+        let cm = compiled
+            .0
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Insn::CallMethod(..)))
+            .count();
+        assert_eq!(cm, 1, "expected one CallMethod, got {cm}");
+        assert!(!compiled.0.has_fallback, "method body must have no AST fallback");
     }
 }
 
