@@ -841,6 +841,35 @@ pub struct BytecodeCompiler<'a> {
     /// all (§12.7.1 makes it automatic and local to the loop). Without this the
     /// whole loop fell back to the AST interpreter.
     pub local_var_regs: std::collections::HashMap<String, (RegId, u32)>,
+    /// class-perf method-body mode (§X): when true, the compiler is
+    /// lowering the BODY of a class method rather than an always block. In
+    /// this mode `this.<member>` and `<class-formal/local>.<member>` lower
+    /// to LoadClassMember/StoreClassMember instead of hierarchical-signal
+    /// reads, and formals/locals live in VM registers. Any statement that
+    /// cannot lower this way fails the WHOLE method (all-or-nothing) so the
+    /// runtime falls back to the proven AST interpreter — byte-identical by
+    /// construction.
+    method_mode: bool,
+    /// VM register holding the receiving object's heap handle (`this`).
+    /// Seeded by the method-mode prologue before the body runs.
+    method_this_reg: Option<RegId>,
+    /// Method-local/formal names that hold CLASS HANDLES (not scalars), so a
+    /// `.member` on them lowers to a heap access. Scalar formals/locals are
+    /// already in `local_var_regs`; only class-typed ones need this set.
+    method_handle_names: std::collections::HashSet<String>,
+    /// Register holding the (implicit) function result cell, so `return` and
+    /// `f = ...` writes land where the method-mode prologue reads the result.
+    method_result_reg: Option<RegId>,
+    /// Register holding a `return <expr>` VALUE on its way to the caller.
+    /// Distinct from the function's implicit result cell only for explicit
+    /// `return e`; the prologue returns this register's value.
+    method_return_val_reg: Option<RegId>,
+    /// Declared width of the method's (implicit) result, for re-sizing an
+    /// explicit `return e`. Zero-width / void returns leave this unset.
+    method_result_width: Option<u32>,
+    /// Indices of the placeholder `Jump(0)` emitted by method-mode `return`;
+    /// back-patched to the method's common exit at the end of the body.
+    method_ret_jumps: Vec<usize>,
     /// Names introduced by a `VarDecl` INSIDE the compiled block that live only
     /// in a VM register — the interpreter never ran the declaration, so it has
     /// no storage for them at all.
@@ -1056,6 +1085,13 @@ impl<'a> BytecodeCompiler<'a> {
             wait_specs: Vec::new(),
             for_loop_var_ids: std::collections::HashMap::default(),
             local_var_regs: std::collections::HashMap::default(),
+            method_mode: false,
+            method_this_reg: None,
+            method_handle_names: std::collections::HashSet::default(),
+            method_result_reg: None,
+            method_return_val_reg: None,
+            method_result_width: None,
+            method_ret_jumps: Vec::new(),
             decl_local_regs: std::collections::HashSet::default(),
             process_local_names: HashSet::default(),
             reg_var_loop_depth: 0,
@@ -2841,6 +2877,33 @@ impl<'a> BytecodeCompiler<'a> {
         // names this compiler bound, so a hit here is by construction one of
         // those, not a design signal that happens to be dotted.
         self.local_var_regs.get(&seg.name.name).copied()
+    }
+
+    /// class-perf method-mode: when `base` denotes the receiving object
+    /// (`this`) or a method-local CLASS HANDLE, return the VM register whose
+    /// value is that object's heap handle — the base register for
+    /// LoadClassMember/StoreClassMember. `None` means `base` is not a
+    /// method-mode handle (a signal, scalar local, struct — keep the
+    /// pre-existing compile paths).
+    fn method_member_base_reg(&self, base: &crate::ast::expr::Expression) -> Option<RegId> {
+        if !self.method_mode {
+            return None;
+        }
+        match &base.kind {
+            crate::ast::expr::ExprKind::This => self.method_this_reg,
+            crate::ast::expr::ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty() =>
+            {
+                let name = h.path[0].name.name.as_str();
+                if !self.method_handle_names.contains(name) {
+                    return None;
+                }
+                self.local_var_regs.get(name).map(|(r, _)| *r)
+            }
+            _ => None,
+        }
     }
 
     /// Bind a small fixed-shape local array to per-element registers. One
@@ -5835,6 +5898,35 @@ impl<'a> BytecodeCompiler<'a> {
             // §13.4.1 early return inside an INLINED body: move the value
             // into the result register and jump to the body end (patched by
             // the inliner). Outside an inline there is nothing to return to.
+            // class-perf method-mode: an explicit `return e;` in a compiled
+            // class method writes e into the designated return register and
+            // jumps to the method's common exit (the prologue reads that
+            // register's value and returns it to the caller). Trailing/jump
+            // targets are back-patched like `inline_ret_jumps` below.
+            StatementKind::Return(e) if self.method_mode => {
+                if let Some(e) = e {
+                    let Some(rv) = self.method_return_val_reg else {
+                        self.bail("Return_value_in_void");
+                        return false;
+                    };
+                    let Some(w) = self.method_result_reg.and_then(|_| self.method_result_width)
+                    else {
+                        self.bail("Return_unknown_width");
+                        return false;
+                    };
+                    let Some(v) = self.compile_expr(e, w) else {
+                        return false;
+                    };
+                    self.emit(Insn::Move(rv, v));
+                    if w > 0 {
+                        self.emit(Insn::Resize(rv, w));
+                    }
+                }
+                let j = self.insns.len();
+                self.emit(Insn::Jump(0));
+                self.method_ret_jumps.push(j);
+                true
+            }
             StatementKind::Return(e) => {
                 let Some((slot, w)) = self.inline_ret else {
                     self.bail("Return_outside_inline");
@@ -8381,6 +8473,18 @@ impl<'a> BytecodeCompiler<'a> {
                     }
             },
             ExprKind::MemberAccess { expr: base, member } => {
+                // class-perf method-mode: `this.<member>`/`<classlocal>.<member>`
+                // is an OBJECT-field read off the heap, not a hierarchical
+                // signal. Only the literal `this` keyword or a method-local
+                // bound as a CLASS HANDLE qualifies; anything else keeps the
+                // pre-existing (signal/struct) paths below.
+                if self.method_mode {
+                    if let Some(handle_reg) = self.method_member_base_reg(base) {
+                        let dest = self.alloc_reg();
+                        self.emit(Insn::LoadClassMember(dest, handle_reg, member.name.clone().into_boxed_str()));
+                        return Some(dest);
+                    }
+                }
                 let member_start = self.insns.len();
                 let member_reg = self.next_reg;
                 if let Some(dest) = self.compile_indexed_packed_member(base, &member.name) {
@@ -8980,6 +9084,15 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
+        // class-perf method-mode: `this.<member> = e` / `<classlocal>.<member> = e`
+        // is an OBJECT-field store off the heap.
+        if self.method_mode
+            && let ExprKind::MemberAccess { expr: base, member } = &lhs.kind
+            && let Some(handle_reg) = self.method_member_base_reg(base)
+        {
+            self.emit(Insn::StoreClassMember(handle_reg, val_reg, member.name.clone().into_boxed_str()));
+            return true;
+        }
         // Packed element WRITE on a register-backed local (`y[i] = v` on a
         // `u8_vec16_t y` inside an inlined function): mask-splice with plain
         // ALU insns — y = (y & ~(elem_mask << i*ew)) | ((v & elem_mask) << i*ew).
@@ -10533,6 +10646,133 @@ impl<'a> BytecodeCompiler<'a> {
             has_fallback,
             nba_dup_targets,
         }
+    }
+
+    /// class-perf method-body mode: compile a whole class-method BODY to a
+    /// standalone `CompiledBlock`. All-or-nothing — if every statement lowers
+    /// to VM bytecode (member access via `this`/class-handle formals, method-
+    /// local registers, arithmetic/control flow, `return`), the caller may
+    /// run the block instead of the AST interpreter; otherwise `None` keeps
+    /// the proven AST path, byte-identical by construction.
+    ///
+    /// `formals`: (name, declared width) for each port — class-typed ones
+    /// are additionally marked in `class_formals` so `.member` on them lowers
+    /// to a heap access. `result`: (name, width, is_class) for the implicit
+    /// function result (functions only; `None` for tasks). `body` is the
+    /// method's statement list. `this` is always available as the receiving
+    /// object handle.
+    ///
+    /// On success the returned block references, in order, the registers:
+    /// `result`: (this_reg, result_reg, return_val_reg) where `return_val_reg`
+    /// is `Some` only for functions that can `return e`. The caller seeds
+    /// `this`/formal registers before executing and reads the result after.
+    pub fn compile_class_method(
+        mut self,
+        formals: &[(String, u32)],
+        class_formals: &HashSet<String>,
+        result: Option<(&str, u32, bool)>,
+        body: &[&crate::ast::stmt::Statement],
+    ) -> Option<(CompiledBlock, RegId, Option<RegId>, Option<RegId>)> {
+        use crate::ast::stmt::StatementKind;
+        let start_len = self.insns.len();
+        let start_reg = self.next_reg;
+        // Enter method mode; any failure below restores the saved state.
+        self.method_mode = true;
+        self.allow_ast_fallback = false;
+        self.allow_expr_fallback = false;
+        self.allow_waits = false;
+
+        // `this` handle lives in a dedicated register.
+        let this_reg = self.alloc_reg();
+        self.method_this_reg = Some(this_reg);
+
+        // Bind formals into registers. Scalar/vector ones become ordinary
+        // locals; class-typed ones ALSO join `method_handle_names` so a
+        // `.member` on them is a heap access. (Zero-width => width from a
+        // later Resize/source; formals default to the caller's resolved
+        // width when known.)
+        for (name, w) in formals {
+            let r = self.alloc_reg();
+            if self.local_var_regs.insert(name.clone(), (r, *w)).is_some() {
+                // A duplicated formal name (defensive) bails.
+                self.bail("method_dup_formal");
+            }
+            if class_formals.contains(name) {
+                self.method_handle_names.insert(name.clone());
+            }
+        }
+
+        // Function result cell: the implicit name resolves to its register so
+        // `f = e` writes it; explicit `return e` uses the separate return reg.
+        let (result_reg, return_val_reg): (Option<RegId>, Option<RegId>) = match result {
+            Some((rname, rw, is_class)) => {
+                let r = self.alloc_reg();
+                self.local_var_regs.insert(rname.to_string(), (r, rw));
+                if is_class {
+                    self.method_handle_names.insert(rname.to_string());
+                }
+                self.method_result_reg = Some(r);
+                self.method_result_width = if rw > 0 { Some(rw) } else { None };
+                // Explicit-return reg, sized to the declared result width.
+                let rv = self.alloc_reg();
+                self.method_return_val_reg = Some(rv);
+                (Some(r), Some(rv))
+            }
+            None => (None, None),
+        };
+
+        // Compile every body statement, all-or-nothing.
+        let mut ok = true;
+        for stmt in body {
+            if matches!(stmt.kind, StatementKind::VarDecl { .. }) {
+                // Body locals bind themselves into `local_var_regs` via the
+                // existing VarDecl arm; only a shadowing/signal collision
+                // fails it.
+            }
+            if !self.compile_stmt(stmt) {
+                ok = false;
+                break;
+            }
+        }
+
+        if !ok {
+            // Roll back everything; leave the compiler in non-method mode.
+            self.insns.truncate(start_len);
+            self.next_reg = start_reg;
+            self.method_mode = false;
+            self.method_this_reg = None;
+            self.method_handle_names.clear();
+            self.method_result_reg = None;
+            self.method_return_val_reg = None;
+            self.method_result_width = None;
+            self.method_ret_jumps.clear();
+            self.bail_reset();
+            return None;
+        }
+
+        // Patch `return` jumps to the method's common exit (current end of
+        // the insn stream).
+        let end = self.insns.len() as u32;
+        for j in std::mem::take(&mut self.method_ret_jumps) {
+            match &mut self.insns[j] {
+                Insn::Jump(t) => *t = end,
+                _ => unreachable!("method ret jump placeholder"),
+            }
+        }
+
+        let block = self.finish();
+        // Restore the caller's compiler state (finish consumes self-relevant
+        // bookkeeping, so do this AFTER finish via re-entering method mode is
+        // NOT done here; the caller owns a fresh compiler per method). The
+        // returned block is the only artifact.
+        let result_reg = result_reg?;
+        Some((block, this_reg, Some(result_reg), return_val_reg))
+    }
+
+    /// Fallback bail reset for the all-or-nothing method compile path.
+    fn bail_reset(&mut self) {
+        self.bail_reason = None;
+        self.register_overflow = false;
     }
 
     /// Does `insn` read register `r`? Conservative: unknown/AST-fallback
@@ -12726,6 +12966,123 @@ mod tests {
         assert!(matches!(insns[3], Insn::Resize(2, 8)));
         assert!(matches!(insns[5], Insn::Nop));
     }
+
+    // class-perf: an all-or-nothing method-body compile lowers `this.<member>`
+    // reads and writes to LoadClassMember/StoreClassMember, never an AST
+    // fallback, for a body the compiler fully understands.
+    #[test]
+    fn method_body_this_member_lowers() {
+        fn span() -> crate::ast::Span {
+            crate::ast::Span::dummy()
+        }
+        fn this_member(member: &str) -> Expression {
+            Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(Expression::new(ExprKind::This, span())),
+                    member: crate::ast::Identifier {
+                        name: member.to_string(),
+                        span: span(),
+                    },
+                },
+                span(),
+            )
+        }
+        fn num(n: u64) -> Expression {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: n.to_string(),
+                    cached_val: Default::default(),
+                }),
+                span(),
+            )
+        }
+        // function int f(int delta); this.acc = 5; return this.acc; endfunction
+        let formals = vec![("delta".to_string(), 32u32)];
+        let class_formals: HashSet<String> = Default::default();
+        let stmt_store = Statement::new(
+            StatementKind::BlockingAssign { lvalue: this_member("acc"), rvalue: num(5) },
+            span(),
+        );
+        let stmt_ret = Statement::new(StatementKind::Return(Some(this_member("acc"))), span());
+        let body: Vec<&Statement> = vec![&stmt_store, &stmt_ret];
+
+        let sigmap: HashMap<Arc<str>, usize> = Default::default();
+        let sig_signed: Vec<bool> = Vec::new();
+        let sig_w: Vec<u32> = Vec::new();
+        let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
+        let widths: HashMap<String, u32> = Default::default();
+        let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
+
+        let out =
+            compiler.compile_class_method(&formals, &class_formals, Some(("f", 32, false)), &body);
+        let (block, this_reg, _result_reg, _ret_reg) =
+            out.expect("simple this.member body should compile all-or-nothing");
+        // `this` occupies the method's first allocated register (slot 0).
+        assert_eq!(this_reg, 0);
+        // Exactly one store and one load of the `acc` member.
+        let stores = block
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Insn::StoreClassMember(..)))
+            .count();
+        let loads = block
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Insn::LoadClassMember(..)))
+            .count();
+        assert_eq!(stores, 1, "expected one StoreClassMember, got {stores}");
+        assert_eq!(loads, 1, "expected one LoadClassMember, got {loads}");
+        assert!(!block.has_fallback, "method body must have no AST fallback");
+    }
+
+    // class-perf: a body that CALLS a method (`this.compute(1)`) must NOT be
+    // compiled (no method-call instruction yet) — the whole method bails to
+    // the AST interpreter, byte-identical by construction. This is the core
+    // all-or-nothing correctness guarantee.
+    #[test]
+    fn method_body_with_call_bails_all_or_nothing() {
+        fn span() -> crate::ast::Span {
+            crate::ast::Span::dummy()
+        }
+        fn this_member(member: &str) -> Expression {
+            Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(Expression::new(ExprKind::This, span())),
+                    member: crate::ast::Identifier {
+                        name: member.to_string(),
+                        span: span(),
+                    },
+                },
+                span(),
+            )
+        }
+        // return this.compute(1);   (a virtual method call)
+        let call = Expression::new(
+            ExprKind::Call {
+                func: Box::new(this_member("compute")),
+                args: vec![Expression::new(
+                    ExprKind::Number(NumberLiteral::UnbasedUnsized('1')),
+                    span(),
+                )],
+            },
+            span(),
+        );
+        let stmt_ret = Statement::new(StatementKind::Return(Some(call)), span());
+        let body: Vec<&Statement> = vec![&stmt_ret];
+
+        let sigmap: HashMap<Arc<str>, usize> = Default::default();
+        let sig_signed: Vec<bool> = Vec::new();
+        let sig_w: Vec<u32> = Vec::new();
+        let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
+        let widths: HashMap<String, u32> = Default::default();
+        let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
+
+        let out = compiler.compile_class_method(&[], &HashSet::default(), Some(("f", 32, false)), &body);
+        assert!(out.is_none(), "a method body with a call must bail (all-or-nothing)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -14460,3 +14817,4 @@ pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
 pub(crate) fn system_function_carries_arg(name: &str) -> bool {
     matches!(name, "$signed" | "$unsigned" | "$past" | "$sampled")
 }
+
