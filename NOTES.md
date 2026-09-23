@@ -9,6 +9,16 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* Covergroup coverage numbers match the LRM: `ignore_bins` and
+  `illegal_bins` values are excluded from array and automatic bins; an
+  automatic cross has the product of its coverpoints' bins (not of their
+  value ranges); a crossed variable without a coverpoint is an implicit
+  coverpoint that is sampled and counts in the group; `cg.cp.get_coverage()`
+  and `cg.cp.get_inst_coverage()` report that coverpoint or cross (they
+  returned the group's number); type coverage averages the instances unless
+  `type_option.merge_instances` is set; `$get_coverage` weights each type by
+  its `type_option.weight`; a `ref` constructor formal reads its actual at
+  every sample; bin bounds may be expressions of constructor formals.
 * A concurrent assertion clocked by an event without an edge (`@(clk)`, or
   `@clk` on a checker's event formal) samples on every change of the clock,
   as §9.4.2 defines; it used to sample on the rising edge only.
