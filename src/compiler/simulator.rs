@@ -5022,7 +5022,16 @@ pub struct Simulator {
     /// so a cached block is always byte-identical to a fresh compile of the
     /// same instance. String keys are never cached (HashMaps intern to u32).
     compiled_class_method_ids: HashMap<String, u32>,
-    compiled_method_block_cache: HashMap<(u32, u32, Vec<u32>, u32), super::bytecode::CompiledMethodOutcome>,
+    compiled_method_block_cache: HashMap<
+        (u32, u32, std::rc::Rc<Vec<u32>>, u32),
+        super::bytecode::CompiledMethodOutcome,
+    >,
+    /// class-perf Step 7b: prebound compiled-method gates, keyed (cid, mid).
+    /// Present only for methods that PASSED the compile gate; the per-call
+    /// type-resolution work (return kind, formal seed widths) runs once at
+    /// plan creation instead of per call.
+    compiled_method_plans:
+        HashMap<(u32, u32), std::rc::Rc<super::bytecode::PreboundCompiledMethod>>,
     /// class-perf decision cache: interned (class, method) id pairs whose
     /// method can NEVER run as bytecode (task-form, string return, void, a
     /// ref/output formal, or a non-scalar return). These decisions are
@@ -8799,6 +8808,7 @@ impl Simulator {
             method_receiver_hint_ids: HashMap::default(),
             compiled_class_method_ids: HashMap::default(),
             compiled_method_block_cache: HashMap::default(),
+            compiled_method_plans: HashMap::default(),
             compiled_method_skip: HashSet::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
@@ -116997,14 +117007,25 @@ impl Simulator {
         // Intern the (class, method) identity ONCE; it keys both the fast
         // decision cache (this method) and the compiled-block cache (below).
         // Cheap-u32-ids, NOT String keys (the #2 lesson).
+        // Intern the (class, method) identity ONCE; it keys both the fast
+        // decision cache (this method) and the compiled-block cache (below).
+        // Cheap-u32-ids, NOT String keys (the #2 lesson). Step 7b: probe
+        // first — HashMap::entry needs an owned key, so the old form
+        // allocated two Strings per CALL even on interner hits.
         let ids = &mut self.compiled_class_method_ids;
-        let cid = {
-            let next = ids.len() as u32;
-            *ids.entry(cname.to_string()).or_insert(next)
+        let cid = match ids.get(cname) {
+            Some(&id) => id,
+            None => {
+                let next = ids.len() as u32;
+                *ids.entry(cname.to_string()).or_insert(next)
+            }
         };
-        let mid = {
-            let next = ids.len() as u32;
-            *ids.entry(method_name.to_string()).or_insert(next)
+        let mid = match ids.get(method_name) {
+            Some(&id) => id,
+            None => {
+                let next = ids.len() as u32;
+                *ids.entry(method_name.to_string()).or_insert(next)
+            }
         };
         // Fast decision cache: a (class, method) already decided it can never
         // run as bytecode is looked up BEFORE re-running the whole gate +
@@ -117016,135 +117037,149 @@ impl Simulator {
         if self.compiled_method_skip.contains(&(cid, mid)) {
             return None;
         }
-        let ClassMethodKind::Function(_f) = kind else {
-            self.compiled_method_skip.insert((cid, mid));
-            return None; // Tasks keep waits/scheduling on the AST interpreter.
-        };
-        if ret_is_string {
-            self.compiled_method_skip.insert((cid, mid));
-            return None; // String returns go through the signal-store path.
-        }
-        let Some(rname) = fn_ret_name.as_ref() else {
-            // No implicit return-variable name: the method is a plain
-            // `function void ...` body with no result cell. Keep AST.
-            self.compiled_method_skip.insert((cid, mid));
-            return None;
-        }; // Reject ref/output/inout formals (write-back semantics the compiled
-        // path does not implement yet).
-        for port in ports {
-            if port.direction != PortDirection::Input {
+        // Step 7b: PREBOUND gate. Everything between the skip cache and the
+        // block cache is a pure function of the class declaration + module
+        // scope, so it runs once per (cid, mid) at plan creation. The only
+        // per-instance input — the result width of a param-bounded packed
+        // return — is flagged in the plan and re-resolved below.
+        let pre = if let Some(p) = self.compiled_method_plans.get(&(cid, mid)) {
+            p.clone()
+        } else {
+            let ClassMethodKind::Function(_f) = kind else {
+                self.compiled_method_skip.insert((cid, mid));
+                return None; // Tasks keep waits/scheduling on the AST interpreter.
+            };
+            if ret_is_string {
+                self.compiled_method_skip.insert((cid, mid));
+                return None; // String returns go through the signal-store path.
+            }
+            let Some(rname) = fn_ret_name.as_ref() else {
+                // No implicit return-variable name: the method is a plain
+                // `function void ...` body with no result cell. Keep AST.
                 self.compiled_method_skip.insert((cid, mid));
                 return None;
-            }
-        }
-        // Determine the return "kind". Either a SCALAR-INTEGRAL result (the
-        // original pilot surface), a CLASS-HANDLE result (a TypeReference
-        // naming a class: the value is a heap index passed through untouched),
-        // or a bail. A class-handle return must NOT be resized or signedness-
-        // stamped — the interpreter never touches a non-`plainly_integral`
-        // (Typeref) return, so a handle must round-trip unchanged.
-        let is_class_result = self.typeref_names_class(&_f.return_type);
-        let (result_width, result_signed) = if is_class_result {
-            // class handle: width meaningless; pass through untouched.
-            (0u32, false)
-        } else if let Some(pair) = self.scalar_formal_integral(&_f.return_type) {
-            pair
-        } else if let Some(pair) = self.enum_type_info(&_f.return_type) {
-            // Step 6: an enum RETURN is integral — width of the enum's base
-            // type. The Return handler resizes to it like any scalar.
-            pair
-        } else {
-            self.compiled_method_skip.insert((cid, mid));
-            return None;
-        };
-        // Build the formal list: (name, width) plus a class-handle set. A
-        // class-typed formal must be positively identified as a class before
-        // we treat `.member` on it as heap access; any doubt keeps the whole
-        // method on the AST path (safe).
-        let mut formals: Vec<(String, u32)> = Vec::with_capacity(ports.len());
-        let mut class_formals: HashSet<String> = Default::default();
-        for port in ports {
-            // Forward typedefs (`typedef class uvm_component;`) make
-            // resolve_dt_ref erase the class identity, so the OLD check saw
-            // every UVM class formal as non-class and skip-cached the method
-            // as non-scalar. The walk checks the class table first.
-            let is_class = self.typeref_names_class(&port.data_type);
-            let w = if is_class {
-                0 // class handle formal; width irrelevant (heap member access)
-            } else {
-                // Scalar-integral GATE (bail to AST if not): the type must be
-                // a compile-able integer vector/atom.
-                let Some(pw) = self.scalar_formal_integral(&port.data_type).map(|(w, _)| w) else {
-                    // real/enum/collection formal: AST. String formals land
-                    // here too (uvm_pool::exists(KEY key) with KEY=string,
-                    // m_find_successor_by_name(string name), ...) and these
-                    // are HOT — memoize the skip so the per-call gate cost
-                    // is paid once (decision is instance-independent: the
-                    // declared formal type cannot change per instance).
+            }; // Reject ref/output/inout formals (write-back semantics the compiled
+            // path does not implement yet).
+            for port in ports {
+                if port.direction != PortDirection::Input {
                     self.compiled_method_skip.insert((cid, mid));
                     return None;
-                };
-                // Seed width MIRRORS the interpreter's formal-binding branch
-                // (exec_method_in_class_hierarchy): a TypeReference / IntegerAtom
-                // / literal-packed formal resizes the actual to its declared
-                // width; a PARAMETERIZED-packed formal (`logic [W-1:0]` with a
-                // class type-param bound, non-literal) keeps the CALLER's
-                // width — `scalar_formal_integral` would wrongly read the param
-                // from module scope and truncate the seed. Width 0 = keep the
-                // source width, exactly like the AST path (which only stamps
-                // signedness there).
-                use crate::ast::types::DataType as DT;
-                let keep_source = !matches!(port.data_type, DT::TypeReference { .. })
-                    && !matches!(port.data_type, DT::IntegerAtom { .. })
-                    && !Self::packed_dims_are_literal(&port.data_type);
-                if keep_source {
-                    0
-                } else {
-                    pw
                 }
-            };
-            if is_class {
-                class_formals.insert(port.name.name.clone());
             }
-            formals.push((port.name.name.clone(), w));
-        }
-        // Parameterized result width must resolve to the actual instance. The
-        // return may be a class type-param reference (TypeReference) OR a
-        // param-bounded packed vector (`logic [W-1:0]`); both resolve through
-        // the instance's param scope. Integer atoms (`int`, `bit`) and
-        // literal-bounded packed ([15:0]) returns are fixed — no instance
-        // resolution needed.
-        let instance_result_width = if is_class_result {
-            // A class TypeReference has no packed width; resolve_type_width on
-            // it is meaningless. Pass through untouched.
-            0
-        } else {
-            use crate::ast::types::DataType as DT;
-            let param_able = !matches!(&_f.return_type, DT::IntegerAtom { .. })
-                && !Self::packed_dims_are_literal(&_f.return_type);
-            if param_able {
-                let scope = self.instance_param_scope(handle);
-                resolve_type_width(&_f.return_type, Some(&scope), Some(&self.module.typedefs))
+            // Determine the return "kind". Either a SCALAR-INTEGRAL result (the
+            // original pilot surface), a CLASS-HANDLE result (a TypeReference
+            // naming a class: the value is a heap index passed through untouched),
+            // or a bail. A class-handle return must NOT be resized or signedness-
+            // stamped — the interpreter never touches a non-`plainly_integral`
+            // (Typeref) return, so a handle must round-trip unchanged.
+            let is_class_result = self.typeref_names_class(&_f.return_type);
+            let (static_result_width, result_signed) = if is_class_result {
+                // class handle: width meaningless; pass through untouched.
+                (0u32, false)
+            } else if let Some(pair) = self.scalar_formal_integral(&_f.return_type) {
+                pair
+            } else if let Some(pair) = self.enum_type_info(&_f.return_type) {
+                // Step 6: an enum RETURN is integral — width of the enum's base
+                // type. The Return handler resizes to it like any scalar.
+                pair
             } else {
-                0
+                self.compiled_method_skip.insert((cid, mid));
+                return None;
+            };
+            // Build the formal list: (name, width) plus a class-handle set. A
+            // class-typed formal must be positively identified as a class before
+            // we treat `.member` on it as heap access; any doubt keeps the whole
+            // method on the AST path (safe).
+            let mut formals: Vec<(String, u32)> = Vec::with_capacity(ports.len());
+            let mut class_formals: HashSet<String> = Default::default();
+            for port in ports {
+                // Forward typedefs (`typedef class uvm_component;`) make
+                // resolve_dt_ref erase the class identity, so the OLD check saw
+                // every UVM class formal as non-class and skip-cached the method
+                // as non-scalar. The walk checks the class table first.
+                let is_class = self.typeref_names_class(&port.data_type);
+                let w = if is_class {
+                    0 // class handle formal; width irrelevant (heap member access)
+                } else {
+                    // Scalar-integral GATE (bail to AST if not): the type must be
+                    // a compile-able integer vector/atom.
+                    let Some(pw) = self.scalar_formal_integral(&port.data_type).map(|(w, _)| w)
+                    else {
+                        // real/enum/collection formal: AST. String formals land
+                        // here too (uvm_pool::exists(KEY key) with KEY=string,
+                        // m_find_successor_by_name(string name), ...) and these
+                        // are HOT — memoize the skip so the per-call gate cost
+                        // is paid once (decision is instance-independent: the
+                        // declared formal type cannot change per instance).
+                        self.compiled_method_skip.insert((cid, mid));
+                        return None;
+                    };
+                    // Seed width MIRRORS the interpreter's formal-binding branch
+                    // (exec_method_in_class_hierarchy): a TypeReference / IntegerAtom
+                    // / literal-packed formal resizes the actual to its declared
+                    // width; a PARAMETERIZED-packed formal (`logic [W-1:0]` with a
+                    // class type-param bound, non-literal) keeps the CALLER's
+                    // width — `scalar_formal_integral` would wrongly read the param
+                    // from module scope and truncate the seed. Width 0 = keep the
+                    // source width, exactly like the AST path (which only stamps
+                    // signedness there).
+                    use crate::ast::types::DataType as DT;
+                    let keep_source = !matches!(port.data_type, DT::TypeReference { .. })
+                        && !matches!(port.data_type, DT::IntegerAtom { .. })
+                        && !Self::packed_dims_are_literal(&port.data_type);
+                    if keep_source {
+                        0
+                    } else {
+                        pw
+                    }
+                };
+                if is_class {
+                    class_formals.insert(port.name.name.clone());
+                }
+                formals.push((port.name.name.clone(), w));
             }
+            // Parameterized result width must resolve to the actual instance.
+            // Only a param-bounded packed return (`logic [W-1:0]` with param W,
+            // non-literal bounds) needs the INSTANCE's param scope — flagged so
+            // the per-call resolution below runs just for those. Integer atoms,
+            // literal-bounded packed vectors and class TypeReferences are fixed.
+            let param_able_result = !is_class_result
+                && !matches!(&_f.return_type, crate::ast::types::DataType::IntegerAtom { .. })
+                && !Self::packed_dims_are_literal(&_f.return_type);
+            let pre = std::rc::Rc::new(super::bytecode::PreboundCompiledMethod {
+                formal_widths: std::rc::Rc::new(formals.iter().map(|f| f.1).collect()),
+                class_formals: std::rc::Rc::new(class_formals),
+                return_type: std::rc::Rc::new(_f.return_type.clone()),
+                fn_ret_name: rname.clone(),
+                is_class_result,
+                static_result_width,
+                result_signed,
+                param_able_result,
+                formals,
+            });
+            self.compiled_method_plans.insert((cid, mid), pre.clone());
+            pre
         };
-        let result_width = if instance_result_width > 0 {
-            instance_result_width
+        // Effective result width: instance-resolved for param-bounded packed
+        // returns, else the static width from the plan.
+        let result_width = if pre.param_able_result {
+            let scope = self.instance_param_scope(handle);
+            let w = resolve_type_width(
+                &pre.return_type,
+                Some(&scope),
+                Some(&self.module.typedefs),
+            );
+            if w > 0 { w } else { pre.static_result_width }
         } else {
-            result_width
+            pre.static_result_width
         };
 
         // Intern the (class, method) identity and build the width signature —
         // the cache key. All compile inputs for a method are (class id, method
-        // id, formal widths, result width); interned u32 ids + a Vec<u32> of
-        // the resolved widths (NOT String keys) so repeated calls to a hot
-        // method lower its body ONCE and reuse the block. The interner borrow
-        // is dropped before the cache probe so the probe can reach other
-        // `self` fields.
-        // (cid, mid) were interned once at the top of this function (they also
-        // key the fast decision cache above); reused here for the block cache.
-        let key = (cid, mid, formals.iter().map(|f| f.1).collect::<Vec<u32>>(), result_width);
+        // id, formal widths, result width); interned u32 ids + the plan's Rc'd
+        // width Vec (an Rc clone per call, no allocation) so repeated calls to
+        // a hot method lower its body ONCE and reuse the block.
+        let key = (cid, mid, pre.formal_widths.clone(), result_width);
         let entry = match self.compiled_method_block_cache.get(&key) {
             Some(super::bytecode::CompiledMethodOutcome::Block(e)) => e.clone(),
             // Negative-cached as non-compilable: skip straight to AST.
@@ -117177,13 +117212,13 @@ impl Simulator {
                     );
                     let body_refs: Vec<&crate::ast::stmt::Statement> = body.iter().collect();
                     compiler.compile_class_method(
-                        &formals,
-                        &class_formals,
+                        &pre.formals,
+                        &pre.class_formals,
                         &class_locals,
                         &shadow_names,
                         &member_safe,
                         &bare_members,
-                        Some((rname, result_width, is_class_result)),
+                        Some((&pre.fn_ret_name, result_width, pre.is_class_result)),
                         &body_refs,
                     )
                 };
@@ -117224,7 +117259,7 @@ impl Simulator {
             let val = frame
                 .and_then(|fr| fr.get(&port.name.name).cloned())
                 .unwrap_or_else(|| Value::zero(32));
-            let w = formals[i].1;
+            let w = pre.formals[i].1;
             // `this` is reg `this_reg`; formals are the following registers.
             let reg = this_reg as usize + 1usize + i;
             if reg < block.num_regs as usize {
@@ -117253,8 +117288,8 @@ impl Simulator {
         if result_width > 0 && result.width != result_width {
             result = result.resize_for_assign(result_width);
         }
-        if !is_class_result && !result.is_real {
-            result.is_signed = result_signed;
+        if !pre.is_class_result && !result.is_real {
+            result.is_signed = pre.result_signed;
         }
         Some(result)
     }

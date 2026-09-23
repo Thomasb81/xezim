@@ -585,6 +585,39 @@ pub(super) struct ResolvedMethodDispatch {
     pub method: Arc<crate::ast::decl::ClassMethod>,
 }
 
+/// class-perf Step 7b: a PREBOUND compiled-method gate. Everything between
+/// the skip cache and the block cache in `try_run_compiled_method` — return-
+/// kind resolution, per-formal type walks, seed widths — is a pure function
+/// of the class declaration plus module scope (instance-independent by the
+/// decision-cache rule), so it is computed ONCE per (class, method) and
+/// reused on every call. The one genuinely per-instance input, the result
+/// width of a param-bounded packed return, is flagged (`param_able_result`)
+/// and re-resolved against the instance's param scope per call; formals'
+/// seed widths are static (module-scope resolution) so the compiled block
+/// for a width signature is shared across instances.
+pub(super) struct PreboundCompiledMethod {
+    /// (formal name, seed width); width 0 = keep the caller's width.
+    pub formals: Vec<(String, u32)>,
+    /// Seed widths only — the block-cache key component; `Rc` so a call
+    /// clones a refcount instead of rebuilding the `Vec`.
+    pub formal_widths: std::rc::Rc<Vec<u32>>,
+    /// Class-typed formal names (heap-member access inside the body).
+    pub class_formals: std::rc::Rc<HashSet<String>>,
+    /// Declared return type (only read when `param_able_result`).
+    pub return_type: std::rc::Rc<crate::ast::types::DataType>,
+    /// Implicit result-variable name — a compile-time input only (the block
+    /// bakes it in); never touched on plan hits.
+    pub fn_ret_name: String,
+    /// Return is a class TypeReference: pass handles through untouched.
+    pub is_class_result: bool,
+    /// Module-scope result width (0 = pass-through / keep source).
+    pub static_result_width: u32,
+    pub result_signed: bool,
+    /// Return is a param-bounded packed vector: resolve the effective width
+    /// against the instance's param scope on every call.
+    pub param_able_result: bool,
+}
+
 /// class-perf Step 4b: a cached, fully-lowered class-FUNCTION body plus the
 /// register ids of its seeded `this` / result cells. One entry per compiled
 /// (class, method, width-signature); shared across all calls to that method
