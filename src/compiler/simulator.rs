@@ -4396,6 +4396,29 @@ pub struct Simulator {
     /// parsed body avoids rebuilding a deep AST on every call.
     class_method_cache: std::cell::RefCell<
         HashMap<String, HashMap<String, Option<Arc<crate::ast::decl::ClassMethod>>>>>,
+    /// class-perf Step 7: RESOLVED method dispatch, memoized per (start
+    /// class, method name). Class declarations are frozen after the one-time
+    /// `compile()` (sanitize_class_hierarchy runs there; `classes.insert`
+    /// never happens post-elaboration), so the extends-chain walk answering
+    /// "which ancestor DEFINES this method" is instance-independent and can
+    /// be paid ONCE per pair instead of on every call. The hot funnel
+    /// (`exec_method_call` → `exec_method_in_class_hierarchy`) previously
+    /// re-probed `cached_class_method` at every ancestor level per call and
+    /// then re-fetched the defining entry a second time. `None` is the
+    /// negative cache: no Function/Task with that name anywhere in the
+    /// chain (the built-in interception checks miss constantly).
+    class_method_dispatch: std::cell::RefCell<
+        HashMap<String, HashMap<String, Option<std::rc::Rc<super::bytecode::ResolvedMethodDispatch>>>>,
+    >,
+    /// class-perf Step 7: memoized `class_has_method` (whole-chain,
+    /// declaration-presence only — includes PureVirtual/Extern prototypes,
+    /// unlike `cached_class_method`). Same freeze argument as
+    /// `class_method_dispatch`.
+    class_has_method_memo: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
+    /// class-perf Step 7: memoized `is_static_method` (whole-chain — an
+    /// ancestor's static declaration wins, exactly like the walk it
+    /// replaces).
+    is_static_method_memo: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
     /// Current covergroup instance if in sampling context.
     cg_this: Option<usize>,
     /// Processes waiting for join
@@ -8608,6 +8631,9 @@ impl Simulator {
             class_context_stack: vec![],
             method_local_base: vec![],
             class_method_cache: std::cell::RefCell::new(HashMap::default()),
+            class_method_dispatch: std::cell::RefCell::new(HashMap::default()),
+            class_has_method_memo: std::cell::RefCell::new(HashMap::default()),
+            is_static_method_memo: std::cell::RefCell::new(HashMap::default()),
             cg_this: None,
             join_waiters: Vec::new(),
             process_parents: HashMap::default(),
@@ -98018,18 +98044,33 @@ impl Simulator {
     }
 
     fn class_has_method(&self, class_name: &str, name: &str) -> bool {
+        if let Some(cached) = self
+            .class_has_method_memo
+            .borrow()
+            .get(class_name)
+            .and_then(|methods| methods.get(name))
+        {
+            return *cached;
+        }
         let mut cur = Some(class_name.to_string());
+        let mut found = false;
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(&cname) {
                 if cd.methods.contains_key(name) {
-                    return true;
+                    found = true;
+                    break;
                 }
                 cur = cd.extends.clone();
             } else {
                 break;
             }
         }
-        false
+        self.class_has_method_memo
+            .borrow_mut()
+            .entry(class_name.to_string())
+            .or_default()
+            .insert(name.to_string(), found);
+        found
     }
 
     /// Does receiver expression `recv` denote a class handle whose type — or
@@ -98530,18 +98571,33 @@ impl Simulator {
 
     /// Is `name` a static method of `class_name` or any ancestor?
     fn is_static_method(&self, class_name: &str, name: &str) -> bool {
+        if let Some(cached) = self
+            .is_static_method_memo
+            .borrow()
+            .get(class_name)
+            .and_then(|methods| methods.get(name))
+        {
+            return *cached;
+        }
         let mut cur = Some(class_name.to_string());
+        let mut found = false;
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(&cname) {
                 if cd.static_methods.contains(name) {
-                    return true;
+                    found = true;
+                    break;
                 }
                 cur = cd.extends.clone();
             } else {
                 break;
             }
         }
-        false
+        self.is_static_method_memo
+            .borrow_mut()
+            .entry(class_name.to_string())
+            .or_default()
+            .insert(name.to_string(), found);
+        found
     }
 
     /// Resolve the DECLARED (static) class of a receiver expression used for
@@ -115445,6 +115501,50 @@ impl Simulator {
         method
     }
 
+    /// class-perf Step 7: memoized extends-chain resolution for the method
+    /// funnel. Returns the most-derived ancestor of `start_class` declaring
+    /// `method_name` as a Function/Task — the same filter
+    /// `cached_class_method` applies, so PureVirtual/Extern prototypes keep
+    /// deferring to an ancestor's body — or `None` (negative-cached) when no
+    /// ancestor does. Semantically identical to the per-call probe walk it
+    /// replaces; the walk just runs once per (class, method) pair.
+    fn method_dispatch(
+        &self,
+        start_class: &str,
+        method_name: &str,
+    ) -> Option<std::rc::Rc<super::bytecode::ResolvedMethodDispatch>> {
+        if let Some(hit) = self
+            .class_method_dispatch
+            .borrow()
+            .get(start_class)
+            .and_then(|methods| methods.get(method_name))
+        {
+            return hit.clone();
+        }
+        let mut found: Option<std::rc::Rc<super::bytecode::ResolvedMethodDispatch>> = None;
+        let mut probe: Option<String> = Some(start_class.to_string());
+        while let Some(cn) = probe {
+            if let Some(method) = self.cached_class_method(&cn, method_name) {
+                found = Some(std::rc::Rc::new(super::bytecode::ResolvedMethodDispatch {
+                    defining_class: cn,
+                    method,
+                }));
+                break;
+            }
+            probe = self
+                .module
+                .classes
+                .get(&cn)
+                .and_then(|class_def| class_def.extends.clone());
+        }
+        self.class_method_dispatch
+            .borrow_mut()
+            .entry(start_class.to_string())
+            .or_default()
+            .insert(method_name.to_string(), found.clone());
+        found
+    }
+
     fn exec_method_in_class_hierarchy(
         &mut self,
         handle: usize,
@@ -115474,32 +115574,18 @@ impl Simulator {
                 return Value::zero(32);
             }
         }
-        // Find the DEFINING class by borrow before doing any work: the old
-        // form allocated `start_class.to_string()` plus one `extends.clone()`
-        // per ancestor level on every method call, and UVM dispatch is the
-        // hottest path in a testbench run (4.5% of the run's memcmp sat under
-        // this function). The search is pure lookup, so it can hold a borrow;
-        // only the class that actually defines the method is materialized.
-        let mut cur_class: Option<String> = {
-            let mut found: Option<String> = None;
-            let mut probe: Option<&str> = Some(start_class);
-            while let Some(cn) = probe {
-                if self.cached_class_method(cn, method_name).is_some() {
-                    found = Some(cn.to_string());
-                    break;
-                }
-                probe = self
-                    .module
-                    .classes
-                    .get(cn)
-                    .and_then(|class_def| class_def.extends.as_deref());
+        // Find the DEFINING class via the memoized dispatch table (Step 7):
+        // the per-call extends-chain walk is gone; the resolution ran once
+        // for this (class, method) pair. Borrow held: pure lookup.
+        let Some(dispatch) = self.method_dispatch(start_class, method_name) else {
+            if let Some(h) = reg_guard_obj {
+                self.factory_reg_in_progress.remove(&h);
             }
-            found
+            return Value::zero(32);
         };
-        while let Some(cname) = cur_class {
-            let method_opt = self.cached_class_method(&cname, method_name);
-            cur_class = None;
-            if let Some(method) = method_opt {
+        {
+            let cname = dispatch.defining_class.clone();
+            let method = dispatch.method.clone();
                 let (ports, body) = match &method.kind {
                     ClassMethodKind::Function(f) => (&f.ports, &f.items),
                     ClassMethodKind::Task(t) => (&t.ports, &t.items),
@@ -116526,7 +116612,6 @@ impl Simulator {
                     self.factory_reg_in_progress.remove(&h);
                 }
                 return ret;
-            }
         }
         if let Some(h) = reg_guard_obj {
             self.factory_reg_in_progress.remove(&h);

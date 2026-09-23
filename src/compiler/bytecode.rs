@@ -576,6 +576,15 @@ pub struct CompiledBlock {
     pub nba_dup_targets: bool,
 }
 
+/// class-perf Step 7: one resolved method-dispatch target, shared by `Rc`
+/// across all calls reaching it. Produced by `Interpreter::method_dispatch`
+/// (memoized in `class_method_dispatch`); class declarations are frozen
+/// after `compile()`, so the pair is immutable for the whole run.
+pub(super) struct ResolvedMethodDispatch {
+    pub defining_class: String,
+    pub method: Arc<crate::ast::decl::ClassMethod>,
+}
+
 /// class-perf Step 4b: a cached, fully-lowered class-FUNCTION body plus the
 /// register ids of its seeded `this` / result cells. One entry per compiled
 /// (class, method, width-signature); shared across all calls to that method
