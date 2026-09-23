@@ -6,13 +6,12 @@
 //!
 //! This is the shape behind UVM's `uvm_info` inside a BFM task called from a
 //! driver proxy: the macro's unqualified report calls must reach the global
-//! reporter. xezim resolves them dynamically today (`WHO=class`), so such
-//! messages are attributed to the calling component.
+//! reporter. xezim used to resolve them dynamically (`WHO=class`), so such
+//! messages were attributed to the calling component.
 
 use xezim::simulate;
 
 #[test]
-#[ignore = "names in an interface task called through a virtual interface resolve in the caller's scope (fix pending)"]
 fn interface_task_calls_resolve_lexically() {
     let sim = simulate(
         r#"

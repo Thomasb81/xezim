@@ -9,6 +9,12 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* A module or interface task reached through a virtual interface or a
+  hierarchical path resolves names in its own scope. Called from a class
+  method, an unqualified call in its body used to bind to the calling
+  class's method of the same name — which is how `uvm_info` inside a BFM
+  task was attributed to the calling component instead of the global
+  reporter.
 * Covergroup coverage numbers match the LRM: `ignore_bins` and
   `illegal_bins` values are excluded from array and automatic bins; an
   automatic cross has the product of its coverpoints' bins (not of their

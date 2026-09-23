@@ -4922,6 +4922,12 @@ pub struct Simulator {
     assertion_stats: HashMap<usize, AssertionStat>,
     /// Call stack for tracking 'this' and local variables.
     this_stack: Vec<Option<usize>>,
+    /// One-shot: the next `exec_task_call` runs an INSTANCE (module or
+    /// interface) task — reached through a hierarchical path or a virtual
+    /// interface — so its body resolves names lexically, without the
+    /// calling class method's `this` (§23.8). Consumed after the arguments
+    /// are bound in the caller's context.
+    task_clears_this: bool,
     local_stack: Vec<HashMap<String, Value>>,
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with (see `ProcessContext::local_gen_stack`). Kept on the active
@@ -9320,6 +9326,7 @@ impl Simulator {
             cg_heap: vec![None],
             assertion_stats: HashMap::default(),
             this_stack: vec![],
+            task_clears_this: false,
             local_stack: vec![],
             local_gen_stack: Vec::new(),
             class_context_stack: vec![],
@@ -44414,6 +44421,7 @@ impl Simulator {
                                         .map(|(sc, _)| sc.to_string())
                                         .unwrap_or_default();
                                     let mut cleanup = self.bind_task_frame(&td, args);
+                                    self.push_instance_task_context(&mut cleanup);
                                     cleanup.prev_hint =
                                         self.name_resolve_hint.borrow().clone();
                                     cleanup.frame_scope_hint = Some(scope.clone());
@@ -104423,6 +104431,7 @@ if self.profile_report {
                     return self.exec_function_call(&fd, args);
                 }
                 if let Some(td) = self.module.tasks.get(&joined).cloned() {
+                    self.task_clears_this = true;
                     self.exec_task_call(&td, args);
                     return Value::zero(32);
                 }
@@ -107198,6 +107207,7 @@ if self.profile_report {
                     *self.name_resolve_hint.borrow_mut() = scope.clone();
                     let saved_ts = self.timescale_scope_override.take();
                     self.timescale_scope_override = scope.clone();
+                    self.task_clears_this = true;
                     self.exec_task_call(&td, args);
                     self.timescale_scope_override = saved_ts;
                     *self.name_resolve_hint.borrow_mut() = saved;
@@ -109607,7 +109617,10 @@ if self.profile_report {
                 .get(&td.name.name.name)
                 .cloned()
         });
-        let cleanup = self.bind_task_frame(td, args);
+        let mut cleanup = self.bind_task_frame(td, args);
+        if std::mem::take(&mut self.task_clears_this) {
+            self.push_instance_task_context(&mut cleanup);
+        }
         self.pkg_scope_stack.push(pkg_scope);
         // Execute task body
         for stmt in &td.items {
@@ -110339,6 +110352,23 @@ if self.profile_report {
             saved_spec: None,
             formal_metadata,
         }
+    }
+
+    /// §23.8: an instance (module / interface) task body resolves names in
+    /// its own scope — a calling class method's `this` must not be visible,
+    /// or an unqualified call binds to the caller's method instead of the
+    /// interface's or its imported package's subroutine. Unwound with the
+    /// method frame (`pushed_method_this`).
+    fn push_instance_task_context(&mut self, cleanup: &mut TaskCleanup) {
+        if cleanup.pushed_method_this || self.this_stack.last().copied().flatten().is_none() {
+            return;
+        }
+        cleanup.saved_spec = self.current_spec.clone();
+        cleanup.pushed_method_this = true;
+        self.this_stack.push(None);
+        self.class_context_stack.push(None);
+        self.method_local_base.push(self.local_stack.len().saturating_sub(1));
+        self.current_spec = None;
     }
 
     fn push_task_method_this(&mut self, handle_opt: Option<usize>, mclass: String, cleanup: &mut TaskCleanup) {
