@@ -23817,6 +23817,10 @@ impl Simulator {
                     debug_assert!(false, "class-member insn in isolated comb exec");
                     break;
                 }
+                Insn::CallCollMethod(..) => {
+                    debug_assert!(false, "class-member insn in isolated comb exec");
+                    break;
+                }
                 Insn::LoadConst(dest, val) => {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
@@ -24483,6 +24487,10 @@ impl Simulator {
                 }
                 Insn::CallMethod(..) => {
                     debug_assert!(false, "CallMethod insn in isolated comb exec");
+                    break;
+                }
+                Insn::CallCollMethod(..) => {
+                    debug_assert!(false, "CallCollMethod insn in isolated comb exec");
                     break;
                 }
                 Insn::LoadConst(dest, val) => {
@@ -25655,6 +25663,67 @@ impl Simulator {
                         .map(|v| self.value_method_arg_expr(v))
                         .collect();
                     let result = self.exec_method_call(handle, method, &args);
+                    self.vm_regs[*dest as usize] = result;
+                    local_count += 1;
+                }
+                Insn::CallCollMethod(dest, handle_reg, member, method, arg_start, n_args, bare) => {
+                    let handle = self.vm_regs[*handle_reg as usize]
+                        .to_u64()
+                        .unwrap_or(0) as usize;
+                    let base = *arg_start as usize;
+                    let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
+                    for i in 0..*n_args as usize {
+                        argvals.push(self.vm_regs.get(base + i).cloned().unwrap_or(Value::zero(32)));
+                    }
+                    // Value-const actuals, exactly like CallMethod: the
+                    // builtin arms read/eval them through the ordinary
+                    // expression paths (§7.10.2.3 queue append, §15.5.5 event
+                    // keys, string keys — all carried).
+                    let args: Vec<Expression> = argvals
+                        .iter()
+                        .map(|v| self.value_method_arg_expr(v))
+                        .collect();
+                    let result = if handle == 0 {
+                        // Null receiver: the AST funnel falls through to
+                        // `Value::zero(32)` (no storage, no fault).
+                        Value::zero(32)
+                    } else if *bare != 0 {
+                        // Bare receiver (`q.size()`): the receiver IS
+                        // `this`. Pass the bare collection NAME to the
+                        // builtin dispatcher — its §8.10 rewrite
+                        // (`instance_assoc_member`) re-runs with the live
+                        // `this_stack` and resolves the same store the AST
+                        // funnel uses, including param-bound collections and
+                        // per-spec static keys. The admitted methods all
+                        // return Some for a resolved collection name (the
+                        // delegate must be the exec_method_call for the
+                        // impossible user-method race).
+                        let m: &str = &method;
+                        match self.eval_builtin_method(member, m, &args) {
+                            Some(v) => v,
+                            None => self.exec_method_call(handle, m, &args),
+                        }
+                    } else {
+                        // Dotted receiver (`obj.coll.meth()`): resolve the
+                        // instance-scoped store `<handle>#coll` exactly like
+                        // the funnel's `expr_assoc_name` receiver arm, then
+                        // dispatch the builtin on it. Scoped names contain
+                        // `#`, so the builtin's bare-name rewrites never
+                        // fire — pure storage ops.
+                        let m: &str = &method;
+                        match self.handle_collection_name(handle, member) {
+                            Some(scoped) => {
+                                match self.eval_builtin_method(&scoped, m, &args) {
+                                    Some(v) => v,
+                                    None => self.exec_method_call(handle, m, &args),
+                                }
+                            }
+                            // Undotted-scoped member (param-bound collection
+                            // the plan set excluded): interpret the call as
+                            // the ordinary funnel would.
+                            None => self.exec_method_call(handle, m, &args),
+                        }
+                    };
                     self.vm_regs[*dest as usize] = result;
                     local_count += 1;
                 }
@@ -38123,6 +38192,7 @@ impl Simulator {
             Insn::LoadClassMember(..) => "LoadClassMember",
             Insn::StoreClassMember(..) => "StoreClassMember",
             Insn::CallMethod(..) => "CallMethod",
+            Insn::CallCollMethod(..) => "CallCollMethod",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
@@ -117031,6 +117101,57 @@ impl Simulator {
         out
     }
 
+    /// class-perf Step 9b: member-collection names callable with a value-
+    /// arg builtin in a method body of `cname`. The UNION of
+    /// `assoc_properties`/`queue_properties` keys over the extends chain —
+    /// instance stores (`<h>#member`), always runtime-resolvable. Statics
+    /// (`static_collections`) are deliberately EXCLUDED here: a bare
+    /// receiver resolves them through the interpreter's §8.10 rewrite (see
+    /// the compiler field doc), and a dotted receiver must stay AST (it
+    /// otherwise reaches `exec_method_call`'s broken zero path) — so a
+    /// static name may only join the set at the CALL SITE, and only for a
+    /// bare receiver. Fixed arrays (`array_properties`) have no legal
+    /// builtin methods; type-param-bound collections (`prop_bound_collection`)
+    /// are instance-dependent and cannot join a plan set — the runtime bare
+    /// path still resolves them through `instance_assoc_member`.
+    fn class_coll_member_names(&self, cname: &str) -> HashSet<String> {
+        let mut out = HashSet::default();
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            out.extend(cd.assoc_properties.keys().cloned());
+            out.extend(cd.queue_properties.keys().cloned());
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// class-perf Step 9b: the `static_collections` names of `cname`'s
+    /// chain — bare-receiver admission only (see
+    /// `PreboundCompiledMethod::static_coll_members`).
+    fn class_static_coll_member_names(&self, cname: &str) -> HashSet<String> {
+        let mut out = HashSet::default();
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            out.extend(cd.static_collections.iter().map(|(n, _, _)| n.clone()));
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out
+    }
+
     /// class-perf Step 4b: compile and run a class-FUNCTION method body as
     /// bytecode, all-or-nothing. Returns `None` (fall back to the AST
     /// interpreter) unless EVERYTHING lowerable: the method is a scalar-
@@ -117220,6 +117341,9 @@ impl Simulator {
                 is_class_result,
                 is_string_result,
                 string_formals: std::rc::Rc::new(string_formals),
+                coll_members: std::rc::Rc::new(self.class_coll_member_names(cname)),
+                static_coll_members: std::rc::Rc::new(self
+                    .class_static_coll_member_names(cname)),
                 static_result_width,
                 result_signed,
                 param_able_result,
@@ -117296,6 +117420,8 @@ impl Simulator {
                         &bare_members,
                         &member_classes,
                         &string_members,
+                        &pre.coll_members,
+                        &pre.static_coll_members,
                         &pre.string_formals,
                         Some((
                             &pre.fn_ret_name,

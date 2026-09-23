@@ -429,6 +429,29 @@ pub enum Insn {
     /// `class-perf` bridges a compiled caller's method call back to the
     /// battle-tested interpreter — correctness pilot, not the end-state.
     CallMethod(RegId, RegId, Box<str>, RegId, u32), // (dest, handle_reg, method, arg_start, n_args)
+
+    /// Compiled class-method builtin-collection call. The receiver is a
+    /// class handle in `handle_reg`; `member` names a member collection
+    /// (associative array or queue) declared in the receiver's class;
+    /// `method` is a builtin with value-only args (`size`/`num`,
+    /// `exists`, `delete`, `push_back`/`push_front`, `pop_front`/`pop_back`,
+    /// `insert`). Args are pre-evaluated values in contiguous registers
+    /// `arg_start..arg_start+n_args`; the scalar result (0/1 for `exists`,
+    /// count for `size`/`num`, popped element for pops) lands in `dest`.
+    /// Runtime resolution goes through `handle_collection_name` (or the
+    /// static-collection fallback) and then re-enters the interpreter's own
+    /// `eval_builtin_method`, so storage semantics are byte-for-byte those
+    /// of the AST path. Null receiver => `dest = zero(32)` (LRM no-op).
+    /// `bare != 0` marks a bare-receiver call (`q.size()` inside a method —
+    /// the runtime receiver is `this`): resolution passes the bare member
+    /// name to `eval_builtin_method`, which re-runs the interpreter's own
+    /// §8.10 member rewrite (`instance_assoc_member`, covering member
+    /// collections, type-param-bound collections and static-collection
+    /// stores) and answers identically to the AST funnel. `bare == 0`
+    /// marks a dotted receiver (`obj.member.exists(k)`): resolution goes
+    /// through `handle_collection_name(handle, member)` and re-enters
+    /// `eval_builtin_method` on the scoped `<handle>#member` store.
+    CallCollMethod(RegId, RegId, Box<str>, Box<str>, RegId, u32, u8), // (dest, handle_reg, member, method, arg_start, n_args, bare)
     Nop,
 
     /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
@@ -624,6 +647,17 @@ pub(super) struct PreboundCompiledMethod {
     /// relational/arith operands): the interpreter routes those through the
     /// `string_signals` registry, which the compiled block cannot see.
     pub string_formals: std::rc::Rc<HashSet<String>>,
+    /// class-perf Step 9b: member-collection names callable with a value-
+    /// arg builtin (`size`/`num`, `exists`, `delete`, `push_back`/
+    /// `push_front`, `pop_front`/`pop_back`, `insert`) — see the simulator's
+    /// `class_coll_member_names`. Feeds the compiler's CallCollMethod
+    /// receiver admission (instance collections).
+    pub coll_members: std::rc::Rc<HashSet<String>>,
+    /// The `static_collections` names of the class chain. BARE receivers
+    /// only: their stores resolve through the interpreter's §8.10 rewrite
+    /// (per-spec key, collision-aware); a dotted static receiver must stay
+    /// AST (it reaches `exec_method_call`'s broken zero path).
+    pub static_coll_members: std::rc::Rc<HashSet<String>>,
 }
 
 /// class-perf Step 4b: a cached, fully-lowered class-FUNCTION body plus the
@@ -772,7 +806,7 @@ impl Insn {
             LoadProcessLocal(..) | Format(..) | CaseJump(..) | CaseMaskJump(..)
             | StmtFallback(..) | EvalExprFallback(..)
             | WaitDelayReg(..) | WaitEdge(..)
-            | CallMethod(..) => return false,
+            | CallMethod(..) | CallCollMethod(..) => return false,
         }
         true
     }
@@ -837,6 +871,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::LoadClassMember(..) => "LoadCls",
         Insn::StoreClassMember(..) => "StoreCls",
         Insn::CallMethod(..) => "CallM,",
+        Insn::CallCollMethod(..) => "CallColl,",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
@@ -1004,6 +1039,27 @@ pub struct BytecodeCompiler<'a> {
     /// string local is a no-op; a store without one risks a width-mutated
     /// value landing in the heap slot).
     string_member_names: HashSet<String>,
+    /// class-perf Step 9b: member-collection names the runtime may resolve
+    /// for the method's class chain. The BARE-receiver set is the union of
+    /// `assoc_properties`/`queue_properties` keys over the extends chain
+    /// (instance stores; statics are deliberately absent) — a bare
+    /// `q.size()`/`m.exists(k)` inside a method body lowers to a
+    /// CallCollMethod whose runtime resolution re-runs the interpreter's own
+    /// §8.10 rewrite (`instance_assoc_member`) on the live `this`, so the
+    /// store answer is byte-identical even for param-bound collections the
+    /// plan set cannot see. The DOTTED-receiver set is the same union PLUS
+    /// `static_collections` — dotted statics (`Cls::m`-flattened forms
+    /// aside) are excluded at the call site instead, where only a bare
+    /// receiver is admitted for a static name (a dotted static otherwise
+    /// reaches `exec_method_call`'s broken zero path).
+    coll_member_names: HashSet<String>,
+    /// class-perf Step 9b: `static_collections` names of the class chain.
+    /// Bare-receiver admission only (see `PreboundCompiledMethod::
+    /// static_coll_members`): their stores resolve through the interpreter's
+    /// §8.10 rewrite (per-spec key, collision-aware); a dotted static
+    /// receiver must stay AST (it reaches `exec_method_call`'s broken zero
+    /// path).
+    static_coll_member_names: HashSet<String>,
     /// Indices of the placeholder `Jump(0)` emitted by method-mode `return`;
     /// back-patched to the method's common exit at the end of the body.
     method_ret_jumps: Vec<usize>,
@@ -1237,6 +1293,8 @@ impl<'a> BytecodeCompiler<'a> {
             method_result_is_string: false,
             string_formal_names: HashSet::default(),
             string_member_names: HashSet::default(),
+            coll_member_names: HashSet::default(),
+            static_coll_member_names: HashSet::default(),
             method_ret_jumps: Vec::new(),
             decl_local_regs: std::collections::HashSet::default(),
             process_local_names: HashSet::default(),
@@ -3141,6 +3199,148 @@ impl<'a> BytecodeCompiler<'a> {
             }
             _ => false,
         }
+    }
+
+    /// class-perf Step 9b: lower a builtin-collection call on a class
+    /// member collection to a `CallCollMethod`. `recv` is the receiver
+    /// expression (a bare member Ident `q`, `this.q`, or a dotted chain
+    /// `obj.coll`); `meth` is the builtin name; `args` the call's actuals.
+    /// Returns `Some(dest_reg)` when admitted, `None` to keep the
+    /// pre-existing paths (the caller falls through unchanged).
+    ///
+    /// Admission = arity gate + receiver gate. The METHOD list is exactly
+    /// the builtins whose args are values (no ref-key write-backs, no with-
+    /// clause iterators): `size`/`num`/`pop_front`/`pop_back` (0 args),
+    /// `exists`/`delete`/`push_back`/`push_front` (1), `insert` (2).
+    ///
+    /// Receiver gate, two shapes:
+    ///
+    /// * BARE (`q.size()` — parse: MemberAccess{Ident(q), size}): the
+    ///   runtime receiver IS `this`. The collection name must be an
+    ///   instance collection (assoc/queue keys of the extends chain —
+    ///   statics excluded here: dotted statics take a broken interpreter
+    ///   path, so they stay AST in BOTH shapes) and must not be a block
+    ///   local or signal (a local shadows the member; the compiled block
+    ///   cannot see the local's storage). Runtime: `eval_builtin_method`
+    ///   on the bare name re-runs the interpreter's own §8.10 rewrite
+    ///   (`instance_assoc_member`), which also resolves param-bound
+    ///   collections and per-spec static stores — parity by delegation.
+    ///   The bare insn still carries the collection NAME (the builtin
+    ///   dispatcher keys its store resolution on it); `bare == 1` tells
+    ///   the exec arm to pass it straight through instead of resolving a
+    ///   dotted receiver first.
+    /// * DOTTED (`obj.coll.meth()` / `this.coll.meth()` — parse:
+    ///   MemberAccess{MemberAccess{..}, meth}): `coll` must be an instance
+    ///   collection name of the class chain AND the base must be a provably
+    ///   class-typed chain (the rvalue-arm shadow/safe test — a non-class
+    ///   base would change the funnel's meaning). Runtime:
+    ///   `handle_collection_name(handle, coll)` mirrors the funnel's
+    ///   `expr_assoc_name` receiver arm, then `eval_builtin_method` on the
+    ///   scoped store. `this.q` / handle locals / members / chains are all
+    ///   admitted — including the formerly BAILED `this.q.size()`.
+    ///
+    /// Note the AST builtin-name-collision paths that run BEFORE the
+    /// member-collection dispatch are all class-name- or super-receiver-
+    /// keyed (config_db statics, static methods, super calls, rand_mode,
+    /// enum receivers) — none of them fires for a class member collection
+    /// name, and the funnel's `expr_assoc_name`-gated member dispatch
+    /// (`eval_call_inner`) routes the admitted shapes here byte-for-byte.
+    fn compile_coll_method_call(
+        &mut self,
+        recv: &crate::ast::expr::Expression,
+        meth: &str,
+        args: &[crate::ast::expr::Expression],
+    ) -> Option<RegId> {
+        if !matches!(
+            meth,
+            "size" | "num" | "pop_front" | "pop_back" | "exists" | "delete" | "push_back"
+                | "push_front" | "insert"
+        ) {
+            return None;
+        }
+        let arity_ok = match meth {
+            "size" | "num" | "pop_front" | "pop_back" => args.is_empty(),
+            "exists" | "delete" | "push_back" | "push_front" => args.len() == 1,
+            _ => args.len() == 2, // insert
+        };
+        if !arity_ok {
+            return None;
+        }
+        // Resolve the receiver shape FIRST (pure, no emission), so a
+        // rejection leaves the insn stream untouched.
+        let (coll, bare): (&str, bool) = match &recv.kind {
+            // `q.meth()` — the receiver IS `this.q`.
+            crate::ast::expr::ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let name = h.path[0].name.name.as_str();
+                // A block local or formal shadows the member collection.
+                // (`local_var_regs` also carries the result/handle formals,
+                // which are never collection names — the second test is the
+                // load-bearing one for shadowing.)
+                if self.local_var_regs.contains_key(name) {
+                    return None;
+                }
+                (name, true)
+            }
+            // `obj.coll.meth()` / `this.coll.meth()` — the receiver is the
+            // collection `coll` on the object the base evaluates to.
+            crate::ast::expr::ExprKind::MemberAccess { expr: inner, member } => {
+                // `this.coll` / provably class-typed chain only.
+                if !self.method_handle_chain_ok(inner) {
+                    return None;
+                }
+                (member.name.as_str(), false)
+            }
+            _ => return None,
+        };
+        // Instance collection (assoc/queue keys, statics excluded) — bare
+        // receivers may additionally be a STATIC collection of the chain.
+        let admitted = self.coll_member_names.contains(coll)
+            || (bare && self.static_coll_member_names.contains(coll));
+        if !admitted {
+            return None;
+        }
+        // Receiver handle register: bare => `this`; dotted => the base's
+        // handle (a bare member base emits its LoadClassMember here).
+        let handle_reg = if bare {
+            self.method_this_reg?
+        } else {
+            match self.method_member_handle_reg(recv) {
+                Some(r) => r,
+                // `recv` is a MemberAccess chain passing chain_ok — lower it
+                // through the ordinary rvalue path (loads class members).
+                None => self.compile_expr(recv, 0)?,
+            }
+        };
+        // Args as pre-evaluated values in contiguous slots (same protocol
+        // as CallMethod).
+        let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+        for a in args {
+            arg_values.push(self.compile_expr(a, 0)?);
+        }
+        let dest = self.alloc_reg();
+        let n = arg_values.len() as u32;
+        let arg_start = self.alloc_reg();
+        for _ in 1..arg_values.len() {
+            self.alloc_reg();
+        }
+        for (i, &v) in arg_values.iter().enumerate() {
+            let slot = (arg_start as usize + i) as RegId;
+            if slot != v {
+                self.emit(Insn::Move(slot, v));
+            }
+        }
+        self.emit(Insn::CallCollMethod(
+            dest,
+            handle_reg,
+            coll.into(),
+            meth.into(),
+            arg_start,
+            n,
+            bare as u8,
+        ));
+        Some(dest)
     }
 
     /// Bind a small fixed-shape local array to per-element registers. One
@@ -9156,6 +9356,21 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("string_formal_as_callee");
                     return None;
                 }
+                // class-perf Step 9b: a builtin-collection call on a member
+                // collection — `m_children.exists(n)`, `q.size()`,
+                // `m_total_count[obj] += count`'s read — lowers to a
+                // CallCollMethod (see compile_coll_method_call). Sits BEFORE
+                // the CallMethod branch: collection members are nonloadable,
+                // so `method_handle_chain_ok(base)` is false for them and
+                // that branch would bail. Not admitted (method/arity/receiver
+                // gate) => falls through to the pre-existing paths unchanged.
+                if self.method_mode
+                    && let ExprKind::MemberAccess { expr: base, member } = &func.kind
+                    && let Some(r) =
+                        self.compile_coll_method_call(base, member.name.as_str(), args)
+                {
+                    return Some(r);
+                }
                 if self.method_mode
                     && let ExprKind::MemberAccess { expr: base, member } = &func.kind
                     && self.method_handle_chain_ok(base)
@@ -11296,6 +11511,8 @@ impl<'a> BytecodeCompiler<'a> {
         bare_member_names: &HashSet<String>,
         member_class_names: &HashSet<String>,
         string_member_names: &HashSet<String>,
+        coll_member_names: &HashSet<String>,
+        static_coll_member_names: &HashSet<String>,
         string_formals: &HashSet<String>,
         result: Option<(&str, u32, bool, bool)>,
         body: &[&crate::ast::stmt::Statement],
@@ -11314,6 +11531,8 @@ impl<'a> BytecodeCompiler<'a> {
         self.member_class_names = member_class_names.clone();
         self.string_formal_names = string_formals.clone();
         self.string_member_names = string_member_names.clone();
+        self.coll_member_names = coll_member_names.clone();
+        self.static_coll_member_names = static_coll_member_names.clone();
 
         // `this` handle lives in a dedicated register.
         let this_reg = self.alloc_reg();
@@ -11460,6 +11679,9 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::LoadClassMember(_, h, _) => *h == r,
             Insn::StoreClassMember(h, v, _) => *h == r || *v == r,
             Insn::CallMethod(_, h, _, a, n) => {
+                *h == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+            }
+            Insn::CallCollMethod(_, h, _, _, a, n, _) => {
                 *h == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
             }
             Insn::Pow(_, l, rr)
@@ -12770,6 +12992,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // Method call: dest width isn't statically known (callee
                 // return width follows its runtime type) — bare dest store.
                 Insn::CallMethod(d, ..) => store(&mut rw, *d, None),
+                // Collection builtin: dest width follows the runtime member
+                // (count / exists flag / popped element) — bare dest store.
+                Insn::CallCollMethod(d, ..) => store(&mut rw, *d, None),
                 // Two dests; widths follow operand widths — drop tracking.
                 Insn::BinOpConstAdd2(a) => {
                     store(&mut rw, a.d1, None);
@@ -13670,7 +13895,7 @@ mod tests {
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -13734,13 +13959,13 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
             .instructions
             .iter()
-            .filter(|i| matches!(i, Insn::CallMethod(..)))
+            .filter(|i| matches!(i, Insn::CallMethod(..) | Insn::CallCollMethod(..)))
             .count();
         assert_eq!(cm, 1, "expected one CallMethod, got {cm}");
         assert!(!compiled.0.has_fallback, "method body must have no AST fallback");
@@ -13773,7 +13998,7 @@ mod tests {
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &shadow, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &shadow, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );
