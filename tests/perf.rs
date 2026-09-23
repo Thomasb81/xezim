@@ -21,3 +21,5 @@ mod packed_record_edge_loop;
 mod design_shape_regression;
 #[path = "perf/loop_block_counters.rs"]
 mod loop_block_counters;
+#[path = "perf/wide_block_counters.rs"]
+mod wide_block_counters;
