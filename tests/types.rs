@@ -394,3 +394,5 @@ mod select_label_mapping;
 mod packed_memory_read;
 #[path = "types/two_state_loop_blocks.rs"]
 mod two_state_loop_blocks;
+#[path = "types/array_elem_out_of_range.rs"]
+mod array_elem_out_of_range;

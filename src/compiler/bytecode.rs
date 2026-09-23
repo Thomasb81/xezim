@@ -14090,6 +14090,11 @@ pub enum TsInsn {
     /// range or the element holds X — both produce X in 4-state. Lowering
     /// only admits this before any side-effecting op, so an abort is clean.
     ElemLoad(Box<TsElemOp>),
+    /// `ElemLoad` into the wide bank: elements wider than 64 bits (a
+    /// vector unit's register file, a cache line array). Out-of-range
+    /// aborts like `ElemLoad`; an element holding X is an x-read bail, so a
+    /// persistently undefined memory sleeps like any other x source.
+    WElemLoad(Box<TsElemOp>),
     /// Dynamic array-element NBA (`mem[waddr] <= v`): out-of-range DROPS
     /// silently (4-state behavior); otherwise mirrors the NbaAssignArray
     /// arm (elide-if-equal, then index+push).
@@ -14107,6 +14112,10 @@ pub enum TsInsn {
     /// index comes from a SIGNAL; aborts on out-of-range or X element
     /// (4-state queues an X value there).
     NbaFromElem(Box<TsNbaFromElem>),
+    /// `NbaFromElem` for elements wider than 64 bits: the element Value is
+    /// queued whole (the NBA queue holds Values), so it needs no wide
+    /// register and runs in every executor through the out-of-line arm.
+    WNbaFromElem(Box<TsNbaFromElem>),
     // ---- WIDE (65..=512-bit) bank: little-endian [u64; N] registers, N
     // = 2 or 8 words per block (`TwoStateBlock::wide_words`); widths give
     // the executor the top word and its mask. ----
@@ -16293,9 +16302,27 @@ pub fn lower_two_state(
                 }
             }
             Insn::LoadArrayElem(d, array, idx_reg) => {
-                let Some((first, lo, hi)) = array_span(array) else {
-                    gate!("array elements wide/signed/real");
+                // Every element shares the first one's shape. Wide elements
+                // (65..=512 bits) load into the wide bank; signed and real
+                // elements stay on the four-state VM.
+                let (first, lo, hi) = match &**array {
+                    ArrayOperand::Dense { first_id, lo, hi, .. } => (*first_id, *lo, *hi),
+                    ArrayOperand::Named(name) => match array_first_id.get(name.as_str()) {
+                        Some(&t) => t,
+                        None => gate!("array unknown"),
+                    },
                 };
+                if hi < lo || first >= signal_widths.len() || signal_real[first] {
+                    gate!("array elements real/empty");
+                }
+                if signal_signed[first] {
+                    gate!("array elements signed");
+                }
+                let ew = signal_widths[first];
+                if ew > 512 {
+                    gate!("array elements >512b");
+                }
+                let wide = ew > 64;
                 let _ = side_effects;
                 // A constant, in-range index names one element: that is a
                 // plain signal load with the ordinary x-read contract, not an
@@ -16308,21 +16335,35 @@ pub fn lower_two_state(
                         gate!("const element out of range");
                     }
                     let eid = first + (ki - lo) as usize;
-                    if signal_signed.get(eid).copied().unwrap_or(true) || !sig_ok(eid) {
-                        gate!("const element signed/wide");
+                    if eid >= signal_widths.len()
+                        || signal_widths[eid] != ew
+                        || signal_signed[eid]
+                        || signal_real[eid]
+                    {
+                        gate!("const element shape");
                     }
-                    note_read(eid, 0, signal_widths[eid], true, stored.contains(&(eid as u32)), &mut reads_whole, &mut reads_slice);
-                    def!(rw, *d, signal_widths[eid]);
-                    out.push(TsInsn::LoadSig { d: *d as u16, sig: eid as u32 });
+                    def!(rw, *d, ew);
+                    if wide {
+                        let skip = !side_effects || stored.contains(&(eid as u32));
+                        let s32 = eid as u32;
+                        if let Some(e) = reads_wide.iter_mut().find(|(x, _)| *x == s32) {
+                            e.1 &= skip;
+                        } else {
+                            reads_wide.push((s32, skip));
+                        }
+                        out.push(TsInsn::WLoadSig { d: *d as u16, sig: s32 });
+                    } else {
+                        note_read(eid, 0, ew, true, stored.contains(&(eid as u32)), &mut reads_whole, &mut reads_slice);
+                        out.push(TsInsn::LoadSig { d: *d as u16, sig: eid as u32 });
+                    }
                     continue;
                 }
                 // Abortable (X/out-of-range element read). Admissible after
                 // side effects too: `ts_raw_hazard` proved the four-state
                 // re-run reproduces every store made before the abort.
                 narrow_reg!(rw, *idx_reg, "wide array index");
-                let w = signal_widths[first];
-                def!(rw, *d, w);
-                out.push(TsInsn::ElemLoad(Box::new(TsElemOp {
+                def!(rw, *d, ew);
+                let op = Box::new(TsElemOp {
                     first: first as u32,
                     lo,
                     hi,
@@ -16330,7 +16371,8 @@ pub fn lower_two_state(
                     s: *d as u16,
                     w: 0,
                     mask: 0,
-                })));
+                });
+                out.push(if wide { TsInsn::WElemLoad(op) } else { TsInsn::ElemLoad(op) });
             }
             Insn::NbaAssignArray(array, idx_reg, val_reg, w) => {
                 let (first, lo, hi) = array_span(array)?;
@@ -16403,15 +16445,41 @@ pub fn lower_two_state(
                 }
             }
             Insn::NbaAssignArrayRead(dst, array, idx_sig, w) => {
-                let (first, lo, hi) = array_span(array)?;
                 let isig = *idx_sig as usize;
                 let d = *dst as usize;
-                if !sig_ok(isig)
-                    || *w > 64
-                    || d >= signal_widths.len()
-                    || signal_real[d]
-                {
-                    gate!("bare bail at bytecode.rs:16414");
+                if !sig_ok(isig) || d >= signal_widths.len() || signal_real[d] {
+                    gate!("nba array read shape");
+                }
+                let (first, lo, hi) = match &**array {
+                    ArrayOperand::Dense { first_id, lo, hi, .. } => (*first_id, *lo, *hi),
+                    ArrayOperand::Named(name) => match array_first_id.get(name.as_str()) {
+                        Some(&t) => t,
+                        None => gate!("array unknown"),
+                    },
+                };
+                if hi < lo || first >= signal_widths.len() || signal_real[first] || signal_signed[first] {
+                    gate!("array elements signed/real");
+                }
+                let ew = signal_widths[first];
+                if ew > 64 {
+                    // Wide element: queue the element Value itself.
+                    if *w != ew || signal_widths[d] != ew {
+                        gate!("wide nba array read shape");
+                    }
+                    note_read(isig, 0, signal_widths[isig], true, stored.contains(&(isig as u32)), &mut reads_whole, &mut reads_slice);
+                    side_effects = true;
+                    out.push(TsInsn::WNbaFromElem(Box::new(TsNbaFromElem {
+                        dst: *dst,
+                        first: first as u32,
+                        lo,
+                        hi,
+                        idx_sig: isig as u32,
+                        w: *w,
+                    })));
+                    continue;
+                }
+                if *w > 64 {
+                    gate!("nba array read width");
                 }
                 // Historically the read was ABORTABLE (X index, X data,
                 // out-of-range), so it had to precede every side effect: a
@@ -16625,6 +16693,7 @@ pub fn lower_two_state(
                     | TsInsn::ElemStoreNba { .. }
                     | TsInsn::ElemStoreNbaFromSig { .. }
                     | TsInsn::NbaFromElem { .. }
+                    | TsInsn::WNbaFromElem { .. }
                     | TsInsn::WStore { .. }
                     | TsInsn::WStoreNba { .. }
             )
@@ -16656,6 +16725,7 @@ pub fn lower_two_state(
                 | TsInsn::WAnd { .. }
                 | TsInsn::WOr { .. }
                 | TsInsn::WSel { .. }
+                | TsInsn::WElemLoad(..)
                 | TsInsn::WNot { .. }
                 | TsInsn::WRange { .. }
                 | TsInsn::RangeFromW { .. }
@@ -16714,7 +16784,7 @@ pub fn lower_two_state(
             | TsInsn::WRangeStoreNba { sig, .. }
             | TsInsn::WStore { sig, .. }
             | TsInsn::WStoreNba { sig, .. } => writes.push(*sig),
-            TsInsn::NbaFromElem(op) => writes.push(op.dst),
+            TsInsn::NbaFromElem(op) | TsInsn::WNbaFromElem(op) => writes.push(op.dst),
             TsInsn::ElemStoreNbaFromSig(f) => {
                 let op = &f.op;
                 writes_span.push((op.first, (op.hi - op.lo + 1).max(0) as u32));

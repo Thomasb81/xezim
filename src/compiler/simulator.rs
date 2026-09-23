@@ -22744,6 +22744,7 @@ impl Simulator {
                 | TsInsn::RangeStoreDyn { .. }
                 | TsInsn::RangeStoreNbaDyn { .. }
                 | TsInsn::SaveSigW { .. }
+                | TsInsn::WNbaFromElem(..)
                 | TsInsn::RangeFillXW { .. }) => {
                     match unsafe { self.ts_exec_dyn(insn, regs.as_mut_ptr()) } {
                         0 => {}
@@ -22905,6 +22906,18 @@ impl Simulator {
                         bail!();
                     }
                     regs[op.s as usize] = v;
+                }
+                TsInsn::WElemLoad(op) => {
+                    let i = regs[op.idx as usize] as i64;
+                    if i < op.lo || i > op.hi {
+                        bail!();
+                    }
+                    let eid = op.first as usize + (i - op.lo) as usize;
+                    let mut wv = [0u64; N];
+                    if !self.signal_table[eid].words_if_clean(&mut wv) {
+                        xbail!();
+                    }
+                    wregs[op.s as usize] = wv;
                 }
                 TsInsn::ElemStoreNbaFromSig(f) => {
                     // Data straight from the source signal's planes; x/z bits
@@ -23602,6 +23615,7 @@ impl Simulator {
                 | TsInsn::RangeStoreDyn { .. }
                 | TsInsn::RangeStoreNbaDyn { .. }
                 | TsInsn::SaveSigW { .. }
+                | TsInsn::WNbaFromElem(..)
                 | TsInsn::RangeFillXW { .. } => {
                     match unsafe { self.ts_exec_dyn(insn, rp) } {
                         0 => {}
@@ -23810,6 +23824,7 @@ impl Simulator {
                 | TsInsn::WAnd { .. }
                 | TsInsn::WOr { .. }
                 | TsInsn::WSel { .. }
+                | TsInsn::WElemLoad(..)
                 | TsInsn::WNot { .. }
                 | TsInsn::WRange { .. }
                 | TsInsn::RangeFromW { .. }
@@ -24231,6 +24246,25 @@ impl Simulator {
             TsInsn::RangeStoreNbaDyn { sig, i, s, w, sw, mask } => {
                 let (lo, v) = (*regs.add(*i as usize), *regs.add(*s as usize) & mask);
                 (!self.ts_range_store_dyn(*sig, lo, v, *w, *sw, true)) as u8
+            }
+            TsInsn::WNbaFromElem(op) => {
+                let (iv, ix) = self.signal_table[op.idx_sig as usize].raw_bits();
+                if ix != 0 {
+                    // §11.5.1: an x/z index reads an all-x element.
+                    let mut v = Value::new(op.w.max(1));
+                    v.is_signed = false;
+                    self.ts_store_nba_val(op.dst as usize, v);
+                    return 0;
+                }
+                let i = iv as i64;
+                if i < op.lo || i > op.hi {
+                    return 1;
+                }
+                let eid = op.first as usize + (i - op.lo) as usize;
+                let mut v = self.signal_table[eid].clone();
+                v.is_signed = false;
+                self.ts_store_nba_val(op.dst as usize, v);
+                0
             }
             TsInsn::SaveSigW { sig } => {
                 // One entry per 64-bit word, then a marker (`TS_SAVE_WIDE`
@@ -24821,6 +24855,7 @@ impl Simulator {
                 | TsInsn::RangeStoreDyn { .. }
                 | TsInsn::RangeStoreNbaDyn { .. }
                 | TsInsn::SaveSigW { .. }
+                | TsInsn::WNbaFromElem(..)
                 | TsInsn::RangeFillXW { .. }) => {
                     match unsafe { self.ts_exec_dyn(insn, rp) } {
                         0 => {}
@@ -25090,6 +25125,7 @@ impl Simulator {
                 | TsInsn::WAnd { .. }
                 | TsInsn::WOr { .. }
                 | TsInsn::WSel { .. }
+                | TsInsn::WElemLoad(..)
                 | TsInsn::WNot { .. }
                 | TsInsn::WRange { .. }
                 | TsInsn::RangeFromW { .. }
@@ -27140,7 +27176,7 @@ impl Simulator {
                             signal_name_to_id,
                         ) {
                             Some(eid) => signal_table[eid].resize_for_assign(*width),
-                            None => Value::new(1).resize_for_assign(*width),
+                            None => Value::new((*width).max(1)),
                         },
                     };
                     let sig_id = &(*sig_id as usize);
@@ -27899,7 +27935,7 @@ impl Simulator {
                             signal_name_to_id,
                         ) {
                             Some(eid) => view[eid].resize_for_assign(*width),
-                            None => Value::new(1).resize_for_assign(*width),
+                            None => Value::new((*width).max(1)),
                         },
                     };
                     let sig_id = &(*sig_id as usize);
@@ -29356,7 +29392,7 @@ impl Simulator {
                             Value::from_inline(v, x, *width)
                         }
                         Some(eid) => self.signal_table[eid].resize_for_assign(*width),
-                        None => Value::new(1).resize_for_assign(*width),
+                        None => Value::new((*width).max(1)),
                     };
                     let sig_id = *sig_id as usize;
                     if let Some(i) = self.nba_fast_index.get(sig_id) {
@@ -65222,6 +65258,15 @@ if self.profile_report {
                                     }
                                     return v;
                                 }
+                                // §7.4.6: out of range on a FIXED array reads
+                                // x at the element width. Falling through
+                                // reached the bit-select fallback, a 1-bit x
+                                // that the store then zero-extended.
+                                if !self.module.dynamic_arrays.contains(&*name) {
+                                    if let Some(ew) = self.module.arrays.get(&*name).map(|a| a.2) {
+                                        return Value::new(ew.max(1));
+                                    }
+                                }
                             }
                         }
                         // §7.8.2: reading with an x/z index yields the element
@@ -65533,6 +65578,13 @@ if self.profile_report {
                             let elem = format!("{}[{}]", base, i);
                             if let Some(v) = self.get_signal_value_by_name(&elem) {
                                 return v;
+                            }
+                            // §7.4.6: a declared array with no such element
+                            // is an out-of-range read: x at the element
+                            // width (the bit-select fallback below made it
+                            // a 1-bit x that a store zero-extended).
+                            if let Some(ew) = self.module.arrays.get(base.as_ref()).map(|a| a.2) {
+                                return Value::new(ew.max(1));
                             }
                         }
                     }
@@ -79466,11 +79518,17 @@ if self.profile_report {
             return v;
         }
         // Fallback
-        let mut v = self
-            .signals
-            .get(&*name)
-            .cloned()
-            .unwrap_or_else(|| Value::new(1));
+        let mut v = self.signals.get(&*name).cloned().unwrap_or_else(|| {
+            // §7.4.6: an out-of-range element read (`mem[9]` of `mem[0:3]`
+            // names no signal) yields x at the ELEMENT width, not a 1-bit
+            // x that a store then zero-extends.
+            let w = name
+                .rfind('[')
+                .and_then(|p| self.array_first_id.get(&name[..p]))
+                .and_then(|&(first, _, _)| self.signal_widths.get(first).copied())
+                .unwrap_or(1);
+            Value::new(w.max(1))
+        });
         if self.signed_signals.contains(&*name) {
             v.is_signed = true;
         }

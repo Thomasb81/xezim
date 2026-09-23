@@ -145,3 +145,67 @@ endmodule
     assert!(text.contains("WC 2dd591369b37acca 0000003c3c03fc3f 40"), "answer:\n{text}");
     assert!(stat(&text, "two_state_evals=") >= 40, "the wide entry left two-state:\n{text}");
 }
+
+/// A dynamically indexed read of a 256-bit memory element (`vrf[rs]`, a
+/// vector register file) feeding wide logic in a clocked block. The element
+/// loads into the wide register bank (`WElemLoad`); it used to bail the
+/// block with "array elements wide" — 21% of a C910 SoC's interpreted
+/// combinational evaluations and 31% of a C906's.
+#[test]
+fn wide_element_read_block_is_two_state() {
+    let text = run(
+        "wide_elem",
+        r#"
+module tb;
+  logic clk = 0; always #5 clk = ~clk;
+  logic [255:0] vrf [0:15];
+  logic [255:0] acc; logic [3:0] rs; logic [7:0] tag; int cyc = 0;
+  always @(posedge clk) begin
+    acc <= acc ^ {vrf[rs][127:0], vrf[rs][255:128]} ^ {32{tag}};
+    rs <= rs + 4'd3; tag <= tag + 8'd1;
+    cyc <= cyc + 1;
+  end
+  initial begin
+    for (int k = 0; k < 16; k++) vrf[k] = {8{32'h0101_0000 * k + 32'h1234}} ^ (256'h1 << (k * 13));
+    acc = 0; rs = 0; tag = 0;
+    repeat (40) @(posedge clk);
+    #1 $display("VRF %h %h %0d", acc[63:0], acc[255:192], cyc);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(text.contains("VRF 0808000018080000 0828000008084002 40"), "answer:\n{text}");
+    assert!(stat(&text, "two_state_evals=") >= 40, "the wide element-read block left two-state:\n{text}");
+}
+
+/// The fused memory-read flop `rdata <= line[raddr]` with 256-bit elements
+/// (`WNbaFromElem`): the element Value is queued whole, so the block needs
+/// no wide register at all.
+#[test]
+fn wide_memory_read_flop_is_two_state() {
+    let text = run(
+        "wide_mem_flop",
+        r#"
+module tb;
+  logic clk = 0; always #5 clk = ~clk;
+  logic [255:0] line [0:7];
+  logic [255:0] rdata; logic [2:0] raddr; int cyc = 0;
+  always @(posedge clk) begin
+    rdata <= line[raddr];
+    raddr <= raddr + 3'd1;
+    cyc <= cyc + 1;
+  end
+  initial begin
+    for (int k = 0; k < 8; k++) line[k] = {4{64'hdead_beef_0000_0000 + 64'(k) * 64'h1_0001}};
+    raddr = 0; rdata = 0;
+    repeat (40) @(posedge clk);
+    #1 $display("LINE %h %h %0d", rdata[63:0], rdata[255:192], cyc);
+    $finish;
+  end
+endmodule
+"#,
+    );
+    assert!(text.contains("LINE deadbeef00070007 deadbeef00070007 40"), "answer:\n{text}");
+    assert!(stat(&text, "two_state_evals=") >= 40, "the wide memory-read flop left two-state:\n{text}");
+}

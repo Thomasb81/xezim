@@ -9,6 +9,11 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* Reading an unpacked-array element with an out-of-range index yields x at
+  the element's width (§7.4.6). Three paths produced a 1-bit x that the
+  store then zero-extended to `0000000X`: the fused memory-read flop
+  (`q <= mem[i]`), a blocking read in a process (`a = mem[i]`) and the same
+  read through a task output. Combinational reads were already right.
 * Selecting from a class property inside an `always` block or an `assign`
   reads the property instead of zero. `bk.arr[i]`, `bk.arr[3][0]` and
   `bk.arr[i][3:0]` asked the interpreter for `bk.arr` alone, which is an
@@ -135,6 +140,13 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* Dynamically indexed reads of memory elements wider than 64 bits — a
+  vector register file, a cache-line array — now run on the two-state
+  executor, both as operands (`vrf[rs]` in wide logic) and as the fused
+  memory-read flop (`rdata <= line[raddr]`). They were the largest labelled
+  reason for a clocked or combinational block to stay on the four-state VM
+  on both SoC benchmarks (21% of a C910 SoC's interpreted combinational
+  evaluations, 31% of a C906's).
 * `scripts/build-pgo.sh` run without a training command builds a
   profile-guided binary from a bundled trainer (the `tests/perf` shapes,
   `scripts/pgo-train`, `xezim-bench`): about −0.5% host instructions on the
