@@ -995,6 +995,15 @@ pub struct BytecodeCompiler<'a> {
     /// pass-through surface (read, compare, assign, concat, call arg, return)
     /// bails: indexing/string-methods/arith take interpreter-only paths.
     string_formal_names: HashSet<String>,
+    /// class-perf Step 9a: string-typed INSTANCE members of the method's
+    /// class chain (plan-provided). A bare/dotted read of one lowers to a
+    /// LoadClassMember — the heap stores the string as a plain byte-vector
+    /// Value and the interpreter's dotted read passes it through verbatim
+    /// (fit_class_prop no-ops on `class_prop_width_impl == None`, which
+    /// strings return). Stores stay AST for now (width-0 `Resize` to a
+    /// string local is a no-op; a store without one risks a width-mutated
+    /// value landing in the heap slot).
+    string_member_names: HashSet<String>,
     /// Indices of the placeholder `Jump(0)` emitted by method-mode `return`;
     /// back-patched to the method's common exit at the end of the body.
     method_ret_jumps: Vec<usize>,
@@ -1227,6 +1236,7 @@ impl<'a> BytecodeCompiler<'a> {
             method_result_is_class: false,
             method_result_is_string: false,
             string_formal_names: HashSet::default(),
+            string_member_names: HashSet::default(),
             method_ret_jumps: Vec::new(),
             decl_local_regs: std::collections::HashSet::default(),
             process_local_names: HashSet::default(),
@@ -7513,7 +7523,16 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     let bare = hier.path[0].name.name.as_str();
                     if !self.local_var_regs.contains_key(bare) {
-                        if hier.path[0].selects.is_empty() && self.bare_member_names.contains(bare)
+                        if hier.path[0].selects.is_empty()
+                            && (self.bare_member_names.contains(bare)
+                                // Step 9a: a bare STRING member reads from the
+                                // heap slot verbatim, exactly like an integral
+                                // one — `fit_class_prop` never resizes a string
+                                // member (`class_prop_width_impl` returns None),
+                                // so the loaded Value round-trips. The member is
+                                // NOT in `bare_member_names` (nonloadable), so
+                                // test the string set separately.
+                                || self.string_member_names.contains(bare))
                         {
                             // Resolve `return parent;` to `this.parent`.
                             let dest = self.alloc_reg();
@@ -8960,6 +8979,14 @@ impl<'a> BytecodeCompiler<'a> {
                         // non-loadable types) keep the AST path.
                         if self.class_shadow_names.contains(member.name.as_str())
                             && !self.member_safe_names.contains(member.name.as_str())
+                            // Step 9a: a string member's heap slot holds the
+                            // byte-vector Value verbatim (no width-fitting),
+                            // so a dotted read is as faithful as an integral
+                            // one. It is in neither `member_safe_names` nor
+                            // `bare_member_names` (nonloadable), so admit it
+                            // explicitly.
+                            && !(self.string_member_names.contains(member.name.as_str())
+                                && !self.member_safe_names.contains(member.name.as_str()))
                         {
                             self.bail("method_member_noload");
                             return None;
@@ -11268,6 +11295,7 @@ impl<'a> BytecodeCompiler<'a> {
         member_safe_names: &HashSet<String>,
         bare_member_names: &HashSet<String>,
         member_class_names: &HashSet<String>,
+        string_member_names: &HashSet<String>,
         string_formals: &HashSet<String>,
         result: Option<(&str, u32, bool, bool)>,
         body: &[&crate::ast::stmt::Statement],
@@ -11285,6 +11313,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.bare_member_names = bare_member_names.clone();
         self.member_class_names = member_class_names.clone();
         self.string_formal_names = string_formals.clone();
+        self.string_member_names = string_member_names.clone();
 
         // `this` handle lives in a dedicated register.
         let this_reg = self.alloc_reg();
@@ -11362,6 +11391,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_result_is_class = false;
             self.method_result_is_string = false;
             self.string_formal_names.clear();
+            self.string_member_names.clear();
             self.method_ret_jumps.clear();
             self.bail_reset();
             return None;
@@ -13640,7 +13670,7 @@ mod tests {
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -13704,7 +13734,7 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -13743,7 +13773,7 @@ mod tests {
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &shadow, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &shadow, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );

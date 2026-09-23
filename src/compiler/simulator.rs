@@ -117004,6 +117004,33 @@ impl Simulator {
         safe
     }
 
+    /// class-perf Step 9a: string-typed instance members of `cname`'s chain.
+    /// The heap stores a string property as a plain byte-vector Value and the
+    /// interpreter's dotted read passes it through verbatim (`fit_class_prop`
+    /// never resizes — `class_prop_width_impl` returns None for strings), so
+    /// a bare/dotted READ lowers to LoadClassMember like an integral member.
+    /// Statics are excluded (per-class cells).
+    fn class_string_member_names(&self, cname: &str) -> HashSet<String> {
+        let mut out = HashSet::default();
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            for p in cd.string_properties.iter() {
+                if !cd.static_properties.contains(p) {
+                    out.insert(p.clone());
+                }
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out
+    }
+
     /// class-perf Step 4b: compile and run a class-FUNCTION method body as
     /// bytecode, all-or-nothing. Returns `None` (fall back to the AST
     /// interpreter) unless EVERYTHING lowerable: the method is a scalar-
@@ -117244,6 +117271,9 @@ impl Simulator {
                 // Dotted member accesses faithful by runtime bare key (see
                 // the fn doc): statics/nonloadable/enclosing excluded.
                 let member_safe = self.class_member_access_safe_names(cname);
+                // Step 9a: string members — bare/dotted reads lower to
+                // LoadClassMember (byte-vector Value round-trips verbatim).
+                let string_members = self.class_string_member_names(cname);
                 // Step 6: body VarDecls of CLASS type hold heap handles in
                 // registers; the compiler needs their names (it cannot see
                 // the class table).
@@ -117265,6 +117295,7 @@ impl Simulator {
                         &member_safe,
                         &bare_members,
                         &member_classes,
+                        &string_members,
                         &pre.string_formals,
                         Some((
                             &pre.fn_ret_name,
