@@ -116691,6 +116691,15 @@ impl Simulator {
                 }
             }
         }
+        // Unpacked arrays/queues/assoc members (and any other non-loadable
+        // type) must NEVER be bare-resolved: the heap slot does not hold
+        // their storage, and a member-access base like `queue.size()` would
+        // silently become `this.size()` (infinite dispatch recursion —
+        // uvm_queue::size regressed exactly this way). The nonloadable set
+        // covers the whole extends chain, same as the walk above.
+        for bad in self.class_nonloadable_member_names(cname) {
+            names.remove(&bad);
+        }
         names
     }
 
@@ -116724,7 +116733,11 @@ impl Simulator {
                     .property_types
                     .get(p)
                     .map(|dt| {
-                        self.scalar_formal_integral(dt).is_some() || self.typeref_names_class(dt)
+                        // Step 6: enum-typed properties are integral heap
+                        // Values (width of the enum's base) — loadable.
+                        self.scalar_formal_integral(dt).is_some()
+                            || self.typeref_names_class(dt)
+                            || self.typeref_names_enum(dt)
                     })
                     // Unknown type (missing property_types entry): assume the
                     // safe side and refuse to lower.
@@ -116765,6 +116778,114 @@ impl Simulator {
             }
         }
         false
+    }
+
+    /// class-perf Step 6: does `dt` (possibly through a typedef chain)
+    /// resolve to an ENUM type? Enum properties are integral heap Values
+    /// (the interpreter stores them width-of-base), so they load/store like
+    /// scalars; enum-RETURNING getters (uvm_phase::get_phase_type) were
+    /// skip-cached non_scalar_ret because scalar_formal_integral excludes
+    /// enums (its formals were never width-adapted — a RETURN has no such
+    /// history).
+    fn typeref_names_enum(&self, dt: &DataType) -> bool {
+        use crate::ast::types::DataType as DT;
+        let mut cur = dt;
+        for _ in 0..16 {
+            match cur {
+                DT::Enum(_) => return true,
+                DT::TypeReference { name: tn, .. } => {
+                    match self.module.typedef_types.get(&tn.name.name) {
+                        Some(next) => cur = next,
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// (width, signed) of an enum type reached through typedefs; None when
+    /// `dt` is not an enum. Width is the enum's BASE width (§6.19).
+    fn enum_type_info(&self, dt: &DataType) -> Option<(u32, bool)> {
+        if !self.typeref_names_enum(dt) {
+            return None;
+        }
+        let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        let crate::ast::types::DataType::Enum(_) = &resolved else {
+            return None;
+        };
+        let w = super::elaborate::resolve_type_width(
+            &resolved,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        if w == 0 {
+            return None;
+        }
+        let signed = super::elaborate::is_type_signed_resolved(&resolved, &self.module.typedef_types);
+        Some((w, signed))
+    }
+
+    /// class-perf Step 6: names of body VarDecls whose type is a CLASS
+    /// (through typedefs), found recursively through nested statements.
+    /// A class-typed local holds a heap HANDLE in a VM register — like a
+    /// class formal — so `.member` on it lowers to a heap access.
+    fn class_typed_local_names(&self, body: &[Statement]) -> HashSet<String> {
+        fn walk(stmts: &[Statement], sim: &Simulator, out: &mut HashSet<String>) {
+            for st in stmts {
+                match &st.kind {
+                    crate::ast::stmt::StatementKind::VarDecl { data_type, declarators, .. } => {
+                        if sim.typeref_names_class(data_type) {
+                            for d in declarators {
+                                out.insert(d.name.name.clone());
+                            }
+                        }
+                    }
+                    crate::ast::stmt::StatementKind::SeqBlock { stmts, .. } => {
+                        walk(stmts, sim, out)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = HashSet::default();
+        walk(body, self, &mut out);
+        out
+    }
+
+    /// class-perf Step 6: members that a DOTTED member access (`base.m`)
+    /// may lower to a bare-key heap access. The interpreter's dotted read
+    /// AND write use the instance's runtime key (`properties["m"]`) — the
+    /// same key LoadClassMember/StoreClassMember use — so ANY instance
+    /// property of the method-class's extends chain is faithful, even a
+    /// shadowed one (the leaf-most declarer owns the bare key both ways).
+    /// NOT safe: statics/localparams (per-class cells), non-loadable types
+    /// (arrays/queues/assoc/structs/strings/reals), and enclosing-class
+    /// members (not instantiated on a nested-class instance).
+    fn class_member_access_safe_names(&self, cname: &str) -> HashSet<String> {
+        let nonloadable = self.class_nonloadable_member_names(cname);
+        let mut safe = HashSet::default();
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        loop {
+            let Some(cd) = self.module.classes.get(&cur) else {
+                break;
+            };
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            for p in cd.properties.keys() {
+                if !nonloadable.contains(p) {
+                    safe.insert(p.clone());
+                }
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        safe
     }
 
     /// class-perf Step 4b: compile and run a class-FUNCTION method body as
@@ -116841,17 +116962,15 @@ impl Simulator {
         let (result_width, result_signed) = if is_class_result {
             // class handle: width meaningless; pass through untouched.
             (0u32, false)
+        } else if let Some(pair) = self.scalar_formal_integral(&_f.return_type) {
+            pair
+        } else if let Some(pair) = self.enum_type_info(&_f.return_type) {
+            // Step 6: an enum RETURN is integral — width of the enum's base
+            // type. The Return handler resizes to it like any scalar.
+            pair
         } else {
-            // Scalar-integral gate, or bail to AST. `scalar_formal_integral`
-            // resolves widths from MODULE scope, so a None is
-            // instance-independent — memoize the skip.
-            match self.scalar_formal_integral(&_f.return_type) {
-                Some(pair) => pair,
-                None => {
-                    self.compiled_method_skip.insert((cid, mid));
-                    return None;
-                }
-            }
+            self.compiled_method_skip.insert((cid, mid));
+            return None;
         };
         // Build the formal list: (name, width) plus a class-handle set. A
         // class-typed formal must be positively identified as a class before
@@ -116871,7 +116990,14 @@ impl Simulator {
                 // Scalar-integral GATE (bail to AST if not): the type must be
                 // a compile-able integer vector/atom.
                 let Some(pw) = self.scalar_formal_integral(&port.data_type).map(|(w, _)| w) else {
-                    return None; // real/enum/collection formal: AST.
+                    // real/enum/collection formal: AST. String formals land
+                    // here too (uvm_pool::exists(KEY key) with KEY=string,
+                    // m_find_successor_by_name(string name), ...) and these
+                    // are HOT — memoize the skip so the per-call gate cost
+                    // is paid once (decision is instance-independent: the
+                    // declared formal type cannot change per instance).
+                    self.compiled_method_skip.insert((cid, mid));
+                    return None;
                 };
                 // Seed width MIRRORS the interpreter's formal-binding branch
                 // (exec_method_in_class_hierarchy): a TypeReference / IntegerAtom
@@ -116937,7 +117063,9 @@ impl Simulator {
         let entry = match self.compiled_method_block_cache.get(&key) {
             Some(super::bytecode::CompiledMethodOutcome::Block(e)) => e.clone(),
             // Negative-cached as non-compilable: skip straight to AST.
-            Some(super::bytecode::CompiledMethodOutcome::Nil) => return None,
+            Some(super::bytecode::CompiledMethodOutcome::Nil) => {
+                return None;
+            }
             None => {
                 // Compile all-or-nothing. On any lowering failure, none the
                 // key (so it is not retried per call) and fall to AST.
@@ -116947,6 +117075,13 @@ impl Simulator {
                 // set: any reference bails to AST instead of reading garbage.
                 shadow_names.extend(self.class_nonloadable_member_names(cname));
                 let bare_members = self.bare_class_member_names(cname);
+                // Dotted member accesses faithful by runtime bare key (see
+                // the fn doc): statics/nonloadable/enclosing excluded.
+                let member_safe = self.class_member_access_safe_names(cname);
+                // Step 6: body VarDecls of CLASS type hold heap handles in
+                // registers; the compiler needs their names (it cannot see
+                // the class table).
+                let class_locals = self.class_typed_local_names(body);
                 let compiled = {
                     let compiler = BytecodeCompiler::new(
                         &self.signal_name_to_id,
@@ -116959,7 +117094,9 @@ impl Simulator {
                     compiler.compile_class_method(
                         &formals,
                         &class_formals,
+                        &class_locals,
                         &shadow_names,
+                        &member_safe,
                         &bare_members,
                         Some((rname, result_width, is_class_result)),
                         &body_refs,

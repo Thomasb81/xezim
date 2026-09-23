@@ -902,6 +902,16 @@ pub struct BytecodeCompiler<'a> {
     /// the chain. A bare name here compiles to LoadClassMember(this_reg,
     /// name) instead of bailing.
     bare_member_names: HashSet<String>,
+    /// Step 6: instance properties of the extends chain whose DOTTED access
+    /// (`base.m`) is faithful by runtime bare key — see the simulator-side
+    /// doc. A member in `class_shadow_names` but ALSO here lowers to a
+    /// Load/StoreClassMember; in shadow but NOT here it bails.
+    member_safe_names: HashSet<String>,
+    /// Step 6: body VarDecl names the simulator identified as CLASS-typed
+    /// (through typedefs). A declaration of one of these holds a heap HANDLE
+    /// (32-bit register, default null), and the name joins
+    /// `method_handle_names` so `.member` on it is a heap access.
+    class_local_names: HashSet<String>,
     /// Register holding the (implicit) function result cell, so `return` and
     /// `f = ...` writes land where the method-mode prologue reads the result.
     method_result_reg: Option<RegId>,
@@ -1140,6 +1150,8 @@ impl<'a> BytecodeCompiler<'a> {
             method_handle_names: std::collections::HashSet::default(),
             class_shadow_names: HashSet::default(),
             bare_member_names: HashSet::default(),
+            member_safe_names: HashSet::default(),
+            class_local_names: HashSet::default(),
             method_result_reg: None,
             method_return_val_reg: None,
             method_result_width: None,
@@ -2246,6 +2258,29 @@ impl<'a> BytecodeCompiler<'a> {
                     for d in declarators {
                         let is_real =
                             crate::compiler::elaborate::is_type_real(data_type);
+                        // Step 6: a CLASS-typed local holds a heap HANDLE in a
+                        // register — default null (0), no resize (handles
+                        // round-trip untouched), and the name joins
+                        // `method_handle_names` so `.member` is a heap access.
+                        if self.class_local_names.contains(&d.name.name)
+                            && d.dimensions.is_empty()
+                        {
+                            let slot = self.alloc_reg();
+                            match &d.init {
+                                Some(e) => {
+                                    let Some(v) = self.compile_expr(e, 0) else {
+                                        return false;
+                                    };
+                                    self.emit(Insn::Move(slot, v));
+                                }
+                                None => {
+                                    self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
+                                }
+                            }
+                            self.local_var_regs.insert(d.name.name.clone(), (slot, 0));
+                            self.method_handle_names.insert(d.name.name.clone());
+                            continue;
+                        }
                         if !d.dimensions.is_empty() {
                             // A SMALL fixed-shape local array (`real row
                             // [0:3]`) — the working-buffer shape every
@@ -2938,24 +2973,80 @@ impl<'a> BytecodeCompiler<'a> {
     /// LoadClassMember/StoreClassMember. `None` means `base` is not a
     /// method-mode handle (a signal, scalar local, struct — keep the
     /// pre-existing compile paths).
-    fn method_member_base_reg(&self, base: &crate::ast::expr::Expression) -> Option<RegId> {
+    /// The receiver-handle register for a member-access BASE in method mode,
+    /// EMITTING the load when the base is a bare member:
+    ///
+    /// * `this` → the method's `this` register;
+    /// * a handle local/arg → its register;
+    /// * a BARE class member Ident → allocate a register and load
+    ///   `this.<name>` into it — `m.f()` must dispatch on `this.m`, NOT on
+    ///   `this` (a regression here silently dispatched the outer method on
+    ///   the receiver itself and lost virtual overrides).
+    ///
+    /// `bare_member_names` is pre-filtered to loadable instance members
+    /// (never statics/arrays/strings). Returns None for anything else; the
+    /// caller falls back to `compile_expr(base, 0)` for chains (after the
+    /// pure `method_handle_chain_ok` gate).
+    fn method_member_handle_reg(
+        &mut self,
+        base: &crate::ast::expr::Expression,
+    ) -> Option<RegId> {
         if !self.method_mode {
             return None;
         }
         match &base.kind {
             crate::ast::expr::ExprKind::This => self.method_this_reg,
             crate::ast::expr::ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let name = h.path[0].name.name.as_str();
+                if self.method_handle_names.contains(name) {
+                    return self.local_var_regs.get(name).map(|(r, _)| *r);
+                }
+                if self.bare_member_names.contains(name) {
+                    let this = self.method_this_reg?;
+                    let r = self.alloc_reg();
+                    self.emit(Insn::LoadClassMember(
+                        r,
+                        this,
+                        name.to_string().into_boxed_str(),
+                    ));
+                    return Some(r);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Step 6: is `expr` a chain of class-handle reads rooted at `this` / a
+    /// handle local / a bare member — i.e. can `compile_expr` lower it to a
+    /// plain LoadClassMember sequence yielding a handle register? A chain
+    /// element's member must pass the same shadow/safe test the rvalue arm
+    /// applies (statics, enclosing-class members and non-loadable types
+    /// refuse). This mirrors `method_member_handle_reg` but is PURE (no insn
+    /// emission), so callers can test before committing to lowering.
+    fn method_handle_chain_ok(&self, expr: &crate::ast::expr::Expression) -> bool {
+        if !self.method_mode {
+            return false;
+        }
+        match &expr.kind {
+            crate::ast::expr::ExprKind::This => true,
+            crate::ast::expr::ExprKind::Ident(h)
                 if h.root.is_none()
                     && h.path.len() == 1
                     && h.path[0].selects.is_empty() =>
             {
                 let name = h.path[0].name.name.as_str();
-                if !self.method_handle_names.contains(name) {
-                    return None;
-                }
-                self.local_var_regs.get(name).map(|(r, _)| *r)
+                self.method_handle_names.contains(name) || self.bare_member_names.contains(name)
             }
-            _ => None,
+            crate::ast::expr::ExprKind::MemberAccess { expr: inner, member } => {
+                let m = member.name.as_str();
+                let loadable =
+                    !(self.class_shadow_names.contains(m) && !self.member_safe_names.contains(m));
+                loadable && self.method_handle_chain_ok(inner)
+            }
+            _ => false,
         }
     }
 
@@ -4963,7 +5054,24 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn expr_to_signal_id(&self, expr: &Expression) -> Option<usize> {
         match &expr.kind {
-            ExprKind::Ident(hier) => self.lookup_signal_id(hier),
+            ExprKind::Ident(hier) => {
+                // class-perf method mode, §8.10 scope order: a bare Ident in
+                // a method body resolves in the CLASS scope first — it must
+                // never name a module signal behind the method's back (a
+                // `c++` on a class member once silently incremented a
+                // same-named module variable instead). Class-scope names
+                // take their own Load/StoreClassMember paths; shadow names
+                // without a loadable path keep the all-or-nothing bail.
+                if self.method_mode
+                    && hier.root.is_none()
+                    && hier.path.len() == 1
+                    && hier.path[0].selects.is_empty()
+                    && self.class_shadow_names.contains(hier.path[0].name.name.as_str())
+                {
+                    return None;
+                }
+                self.lookup_signal_id(hier)
+            }
             ExprKind::Paren(inner) => self.expr_to_signal_id(inner),
             _ => None,
         }
@@ -6084,6 +6192,29 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     );
                     let width = if is_string { 0 } else { self.decl_width(data_type) };
+                    // Step 6: a CLASS-typed local holds a heap HANDLE in a
+                    // register — default null (0), no resize (handles
+                    // round-trip untouched), and the name joins
+                    // `method_handle_names` so `.member` is a heap access.
+                    if self.method_mode && self.class_local_names.contains(&decl.name.name) {
+                        let slot = self.alloc_reg();
+                        match &decl.init {
+                            Some(expr) => {
+                                let Some(value) = self.compile_expr(expr, 0) else {
+                                    self.bail("VarDecl_init");
+                                    return false;
+                                };
+                                self.emit(Insn::Move(slot, value));
+                            }
+                            None => {
+                                self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
+                            }
+                        }
+                        self.local_var_regs.insert(decl.name.name.clone(), (slot, 0));
+                        self.method_handle_names.insert(decl.name.name.clone());
+                        self.decl_local_regs.insert(decl.name.name.clone());
+                        continue;
+                    }
                     let slot = self.alloc_reg();
                     match &decl.init {
                         Some(expr) => {
@@ -7137,6 +7268,27 @@ impl<'a> BytecodeCompiler<'a> {
                 let val = self.eval_number_static(num)?;
                 let r = self.alloc_reg();
                 self.emit(Insn::LoadConst(r, Box::new(val)));
+                Some(r)
+            }
+            ExprKind::Null => {
+                // §6.15: null is the default (invalid) handle — the
+                // interpreter evaluates it as a 32-bit zero.
+                let r = self.alloc_reg();
+                self.emit(Insn::LoadConst(r, Box::new(Value::zero(32))));
+                Some(r)
+            }
+            ExprKind::This => {
+                // Step 6 (method mode): `this` evaluates to the receiving
+                // object's heap handle — a register Move from the method's
+                // this-register. Covers `sched = this`, `return this`, and
+                // method calls on `this`.
+                if !self.method_mode {
+                    self.bail("Expr_This");
+                    return None;
+                }
+                let this_reg = self.method_this_reg?;
+                let r = self.alloc_reg();
+                self.emit(Insn::Move(r, this_reg));
                 Some(r)
             }
             ExprKind::Ident(hier) => {
@@ -8607,13 +8759,30 @@ impl<'a> BytecodeCompiler<'a> {
                 // bound as a CLASS HANDLE qualifies; anything else keeps the
                 // pre-existing (signal/struct) paths below.
                 if self.method_mode {
-                    if let Some(handle_reg) = self.method_member_base_reg(base) {
-                        // Shadowed or non-loadable members (arrays, structs,
-                        // strings, reals) must not lower to a bare-key heap
-                        // access — the storage key differs (shadowed) or the
-                        // heap value is not faithful (non-integral). Bail to
-                        // the AST path instead.
-                        if self.class_shadow_names.contains(member.name.as_str()) {
+                    // Step 6: the base may be a whole chain (`a.b`,
+                    // `this.m_parent`, a bare member) — lower it to its
+                    // handle register first, then read `member` off that
+                    // handle. `method_member_handle_reg` EMITS the base load
+                    // for a bare member (`m.f` reads this.m first).
+                    let base_reg = if self.method_handle_chain_ok(base) {
+                        match self.method_member_handle_reg(base) {
+                            Some(r) => Some(r),
+                            None => self.compile_expr(base, 0),
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(handle_reg) = base_reg {
+                        // The interpreter's dotted read uses the instance's
+                        // runtime key (`properties["m"]`) — the same key
+                        // LoadClassMember reads — so an extends-chain INSTANCE
+                        // property is faithful even when shadowed (Step 6,
+                        // `member_safe_names`). Shadowed names NOT in that set
+                        // (statics/localparams, enclosing-class members,
+                        // non-loadable types) keep the AST path.
+                        if self.class_shadow_names.contains(member.name.as_str())
+                            && !self.member_safe_names.contains(member.name.as_str())
+                        {
                             self.bail("method_member_noload");
                             return None;
                         }
@@ -8763,8 +8932,16 @@ impl<'a> BytecodeCompiler<'a> {
                 // interpreter (rollback below).
                 if self.method_mode
                     && let ExprKind::MemberAccess { expr: base, member } = &func.kind
-                    && let Some(handle_reg) = self.method_member_base_reg(base)
+                    && self.method_handle_chain_ok(base)
                 {
+                    // Step 6: the receiver may be a chain (`sched.m_parent.get_
+                    // phase_type()`) or a bare member (`m.f()` dispatches on
+                    // `this.m`, loaded here) — lower the base to its handle
+                    // register.
+                    let handle_reg = match self.method_member_handle_reg(base) {
+                        Some(r) => r,
+                        None => self.compile_expr(base, 0)?,
+                    };
                     let call_start = self.insns.len();
                     let call_next = self.next_reg;
                     let mut ok = true;
@@ -9274,11 +9451,25 @@ impl<'a> BytecodeCompiler<'a> {
         // is an OBJECT-field store off the heap.
         if self.method_mode
             && let ExprKind::MemberAccess { expr: base, member } = &lhs.kind
-            && let Some(handle_reg) = self.method_member_base_reg(base)
+            && self.method_handle_chain_ok(base)
         {
-            // Same guard as the rvalue path: shadowed keys and non-integral
-            // members must keep the AST store semantics.
-            if self.class_shadow_names.contains(member.name.as_str()) {
+            // Step 6: the base may be a chain (`a.b.c = v`) or a bare member
+            // (`m.f = v` stores through this.m, loaded here) — lower it to
+            // its handle register first.
+            let handle_reg = match self.method_member_handle_reg(base) {
+                Some(r) => r,
+                None => match self.compile_expr(base, 0) {
+                    Some(r) => r,
+                    None => return false,
+                },
+            };
+            // Same guard as the rvalue path: the dotted STORE also uses the
+            // runtime bare key, so extends-chain instance properties are
+            // faithful (`member_safe_names`); statics, enclosing-class
+            // members, and non-integral types keep the AST store semantics.
+            if self.class_shadow_names.contains(member.name.as_str())
+                && !self.member_safe_names.contains(member.name.as_str())
+            {
                 self.bail("method_member_noload");
                 return false;
             }
@@ -10862,7 +11053,9 @@ impl<'a> BytecodeCompiler<'a> {
         mut self,
         formals: &[(String, u32)],
         class_formals: &HashSet<String>,
+        class_locals: &HashSet<String>,
         class_shadow_names: &HashSet<String>,
+        member_safe_names: &HashSet<String>,
         bare_member_names: &HashSet<String>,
         result: Option<(&str, u32, bool)>,
         body: &[&crate::ast::stmt::Statement],
@@ -10876,6 +11069,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_expr_fallback = false;
         self.allow_waits = false;
         self.class_shadow_names = class_shadow_names.clone();
+        self.member_safe_names = member_safe_names.clone();
         self.bare_member_names = bare_member_names.clone();
 
         // `this` handle lives in a dedicated register.
@@ -10897,6 +11091,10 @@ impl<'a> BytecodeCompiler<'a> {
                 self.method_handle_names.insert(name.clone());
             }
         }
+        // Step 6: class-typed LOCAL declarations the simulator pre-identified
+        // (the compiler cannot see the class table). Stash the names so the
+        // VarDecl arm treats them as handle locals.
+        self.class_local_names = class_locals.clone();
 
         // Function result CELL: the implicit name and an explicit `return e`
         // share ONE register, so the LAST write wins — exactly the
@@ -13225,7 +13423,7 @@ mod tests {
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -13289,7 +13487,7 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -13328,7 +13526,7 @@ mod tests {
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &shadow, &HashSet::default(), Some(("f", 32, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &shadow, &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );
@@ -13614,6 +13812,7 @@ thread_local! {
 pub fn ts_last_bail() -> (usize, &'static str) {
     TS_BAIL_AT.with(|c| c.get())
 }
+
 
 thread_local! {
     /// Fine-grained reason for the last bail, for arms that carry several

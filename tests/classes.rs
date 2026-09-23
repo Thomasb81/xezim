@@ -58,6 +58,8 @@ mod this_chain_edge_sensitivity;
 mod class_handle_return_preservation;
 #[path = "classes/compiled_method_class_return.rs"]
 mod compiled_method_class_return;
+#[path = "classes/compiled_method_step6_surface.rs"]
+mod compiled_method_step6_surface;
 #[path = "classes/class_output_handle_copyback.rs"]
 mod class_output_handle_copyback;
 #[path = "classes/typedef_extends_cast.rs"]
