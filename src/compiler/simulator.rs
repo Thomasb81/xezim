@@ -116585,13 +116585,195 @@ impl Simulator {
         names
     }
 
+    /// class-perf: the set of BARE idents (single segment, no selects) that
+    /// resolve to `this.<member>` in a method body — a directly-declared or
+    /// extends-inherited INSTANCE property of the method's class that is
+    /// bare-key STABLE for every possible instance. A bare ident naming one
+    /// of these compiles to `LoadClassMember(this_reg, name)` (matching the
+    /// interpreter's method-member resolution). Everything else in
+    /// `class_shadow_names` (shadowed members, enclosing-class members,
+    /// statics) still BAILS: the compiled path cannot model shadowed storage
+    /// keys nor class-static cells, so those must fall to the AST
+    /// interpreter.
+    fn bare_class_member_names(&self, cname: &str) -> HashSet<String> {
+        use std::collections::HashMap as StdMap;
+        // Collect the method-class + its full extends chain (the classes whose
+        // instance properties are visible on `this`). Enclosing-class members
+        // are deliberately EXCLUDED: a bare name in a nested class does NOT
+        // resolve to an enclosing class's member without `Outer::x`.
+        let mut chain: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            chain.push(cur.clone());
+            seen.insert(cur.clone());
+            if let Some(b) = &cd.extends {
+                if seen.contains(b) {
+                    break;
+                }
+                cur = b.clone();
+            } else {
+                break;
+            }
+        }
+        // Storage keys are laid out per instance: the LEAF-MOST declarer of a
+        // name on the instance's chain keeps the bare key; every other
+        // declarer stores under "<Class>::<name>". A bare-key read is
+        // therefore only correct for ALL instances if NO class that can be
+        // the leaf — i.e. cname itself or any TRANSITIVE DESCENDANT — other
+        // than the chain declarer redeclares the name. Declarations on
+        // UNRELATED chains are irrelevant (an instance is on one chain only):
+        // UVM declares `m_parent` in uvm_component, uvm_phase, uvm_reg, ...
+        // but that never collides, so a module-wide count is far too
+        // conservative (it made every such getter bail).
+        let mut descendant_decls: StdMap<&str, usize> = StdMap::new();
+        for (dn, _) in self.module.classes.iter() {
+            if seen.contains(dn) {
+                continue; // chain classes were counted below
+            }
+            // Is `cname` on dn's ancestor chain?
+            let mut a = dn.clone();
+            let mut seen_a: HashSet<String> = HashSet::default();
+            let mut is_desc = false;
+            while let Some(ad) = self.module.classes.get(&a) {
+                if !seen_a.insert(a.clone()) {
+                    break;
+                }
+                if a == cname {
+                    is_desc = true;
+                    break;
+                }
+                match &ad.extends {
+                    Some(b) => a = b.clone(),
+                    None => break,
+                }
+            }
+            if !is_desc {
+                continue;
+            }
+            if let Some(dd) = self.module.classes.get(dn) {
+                for p in dd.properties.keys() {
+                    *descendant_decls.entry(p.as_str()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut names = HashSet::default();
+        for cn in &chain {
+            if let Some(cd) = self.module.classes.get(cn) {
+                for p in cd.properties.keys() {
+                    // STATIC members (and class-body localparams, which the
+                    // elaborator also registers in `static_properties`) are
+                    // NOT instance storage: their cell is per-class (and per
+                    // SPECIALIZATION for parameterized classes), so a heap
+                    // read is wrong (0 / generic value). They must stay on
+                    // the interpreter path.
+                    if cd.static_properties.contains(p) {
+                        continue;
+                    }
+                    // The name must be declared EXACTLY ONCE on the instance
+                    // chain rooted at this class — chain redeclarations below
+                    // cname are descendant_decls, chain redeclarations above
+                    // are impossible (chain classes each contribute their own
+                    // names; a name appearing twice on the chain means two
+                    // entries in `p`'s counting below — approximate that by
+                    // tracking chain counts too).
+                    let mut chain_count = 0usize;
+                    for c2 in &chain {
+                        if let Some(cd2) = self.module.classes.get(c2) {
+                            if cd2.properties.contains_key(p.as_str()) {
+                                chain_count += 1;
+                            }
+                        }
+                    }
+                    if chain_count == 1 && descendant_decls.get(p.as_str()).copied().unwrap_or(0) == 0 {
+                        names.insert(p.clone());
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// class-perf: chain property names the compiled path must NOT lower to
+    /// LoadClassMember/StoreClassMember. The heap only faithfully holds plain
+    /// integral scalars and class handles; array/queue/assoc properties are
+    /// keyed in their own tables, and unpacked-struct/string/real members
+    /// need element-wise or text semantics the bytecode lacks. Loading such
+    /// a member compiled to a bare-key heap read returned garbage (regression:
+    /// array_equality_class — every `sa == rhs.sa` compared two zeros "equal").
+    /// The caller merges these into the shadow-bail set so any reference bails
+    /// to the AST path.
+    fn class_nonloadable_member_names(&self, cname: &str) -> HashSet<String> {
+        let mut bad: HashSet<String> = HashSet::default();
+        let mut seen: HashSet<String> = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            for p in cd.properties.keys().chain(cd.static_properties.iter()) {
+                // Statics/localparams: per-class (or per-specialization)
+                // cells the compiled path cannot address — always bail.
+                // Arrays/queues/assoc: keyed in their own tables, not the
+                // heap slot a bare-key LoadClassMember would read.
+                let unpacked = cd.static_properties.contains(p)
+                    || cd.array_properties.contains_key(p)
+                    || cd.queue_properties.contains_key(p)
+                    || cd.assoc_properties.contains_key(p);
+                let integral_or_handle = cd
+                    .property_types
+                    .get(p)
+                    .map(|dt| {
+                        self.scalar_formal_integral(dt).is_some() || self.typeref_names_class(dt)
+                    })
+                    // Unknown type (missing property_types entry): assume the
+                    // safe side and refuse to lower.
+                    .unwrap_or(false);
+                if unpacked || !integral_or_handle {
+                    bad.insert(p.clone());
+                }
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        bad
+    }
+
+    /// class-perf: does `dt` (a TypeReference, possibly through a typedef
+    /// chain) name a CLASS in `module.classes`? Unlike `resolve_dt_ref` + a
+    /// TypeReference test, this survives FORWARD typedefs (`typedef class
+    /// uvm_component;` — UVM's forward declarations), which put a non-class
+    /// placeholder in `typedef_types` and made `resolve_dt_ref` erase the
+    /// class identity: every uvm_component/uvm_phase-returning getter then
+    /// looked non-class and was skip-cached as non_scalar_ret. Each step of
+    /// the walk checks the class table FIRST, so a class name short-circuits
+    /// before its (placeholder) typedef entry can hide it.
+    fn typeref_names_class(&self, dt: &DataType) -> bool {
+        let mut cur = dt;
+        for _ in 0..16 {
+            let crate::ast::types::DataType::TypeReference { name: tn, .. } = cur else {
+                return false;
+            };
+            if self.module.classes.contains_key(&tn.name.name) {
+                return true;
+            }
+            match self.module.typedef_types.get(&tn.name.name) {
+                Some(next) => cur = next,
+                None => return false,
+            }
+        }
+        false
+    }
+
     /// class-perf Step 4b: compile and run a class-FUNCTION method body as
     /// bytecode, all-or-nothing. Returns `None` (fall back to the AST
     /// interpreter) unless EVERYTHING lowerable: the method is a scalar-
-    /// integral-returning Function with no ref/output/inout formals, no
-    /// string/collection result, and a body `compile_class_method` fully
-    /// lowers. The block only reads `this` members (heap) plus seeded formal/
-    /// this registers — byte-identical to the AST path by construction.
+    /// integral- OR class-handle-returning Function with no ref/output/inout
+    /// formals, no string/collection result, and a body `compile_class_method`
+    /// fully lowers. The block only reads `this` members (heap) plus seeded
+    /// formal/this registers — byte-identical to the AST path by construction.
     fn try_run_compiled_method(
         &mut self,
         handle: usize,
@@ -116649,16 +116831,26 @@ impl Simulator {
                 return None;
             }
         }
-        // Result must be a scalar integral (NOT a class handle, string,
-        // real, or unpacked collection) — those aren't simple registers yet.
-        let result_width = self.scalar_formal_integral(&self.resolve_dt_ref(&_f.return_type));
-        let (result_width, result_signed) = match result_width {
-            Some((w, s)) => (w, s),
-            None => {
-                // `scalar_formal_integral` resolves widths from MODULE scope,
-                // so a None here is instance-independent — memoize the skip.
-                self.compiled_method_skip.insert((cid, mid));
-                return None;
+        // Determine the return "kind". Either a SCALAR-INTEGRAL result (the
+        // original pilot surface), a CLASS-HANDLE result (a TypeReference
+        // naming a class: the value is a heap index passed through untouched),
+        // or a bail. A class-handle return must NOT be resized or signedness-
+        // stamped — the interpreter never touches a non-`plainly_integral`
+        // (Typeref) return, so a handle must round-trip unchanged.
+        let is_class_result = self.typeref_names_class(&_f.return_type);
+        let (result_width, result_signed) = if is_class_result {
+            // class handle: width meaningless; pass through untouched.
+            (0u32, false)
+        } else {
+            // Scalar-integral gate, or bail to AST. `scalar_formal_integral`
+            // resolves widths from MODULE scope, so a None is
+            // instance-independent — memoize the skip.
+            match self.scalar_formal_integral(&_f.return_type) {
+                Some(pair) => pair,
+                None => {
+                    self.compiled_method_skip.insert((cid, mid));
+                    return None;
+                }
             }
         };
         // Build the formal list: (name, width) plus a class-handle set. A
@@ -116668,20 +116860,17 @@ impl Simulator {
         let mut formals: Vec<(String, u32)> = Vec::with_capacity(ports.len());
         let mut class_formals: HashSet<String> = Default::default();
         for port in ports {
-            let resolved = self.resolve_dt_ref(&port.data_type);
-            let is_class = if let crate::ast::types::DataType::TypeReference { name: tn, .. } =
-                resolved
-            {
-                self.module.classes.contains_key(&tn.name.name)
-            } else {
-                false
-            };
+            // Forward typedefs (`typedef class uvm_component;`) make
+            // resolve_dt_ref erase the class identity, so the OLD check saw
+            // every UVM class formal as non-class and skip-cached the method
+            // as non-scalar. The walk checks the class table first.
+            let is_class = self.typeref_names_class(&port.data_type);
             let w = if is_class {
                 0 // class handle formal; width irrelevant (heap member access)
             } else {
                 // Scalar-integral GATE (bail to AST if not): the type must be
                 // a compile-able integer vector/atom.
-                let Some(pw) = self.scalar_formal_integral(resolved).map(|(w, _)| w) else {
+                let Some(pw) = self.scalar_formal_integral(&port.data_type).map(|(w, _)| w) else {
                     return None; // real/enum/collection formal: AST.
                 };
                 // Seed width MIRRORS the interpreter's formal-binding branch
@@ -116714,7 +116903,11 @@ impl Simulator {
         // the instance's param scope. Integer atoms (`int`, `bit`) and
         // literal-bounded packed ([15:0]) returns are fixed — no instance
         // resolution needed.
-        let instance_result_width = {
+        let instance_result_width = if is_class_result {
+            // A class TypeReference has no packed width; resolve_type_width on
+            // it is meaningless. Pass through untouched.
+            0
+        } else {
             use crate::ast::types::DataType as DT;
             let param_able = !matches!(&_f.return_type, DT::IntegerAtom { .. })
                 && !Self::packed_dims_are_literal(&_f.return_type);
@@ -116748,7 +116941,12 @@ impl Simulator {
             None => {
                 // Compile all-or-nothing. On any lowering failure, none the
                 // key (so it is not retried per call) and fall to AST.
-                let shadow_names = self.class_scoping_shadow_names(cname);
+                let mut shadow_names = self.class_scoping_shadow_names(cname);
+                // Members the heap cannot faithfully round-trip (arrays,
+                // queues, assoc, structs, strings, reals) join the shadow-bail
+                // set: any reference bails to AST instead of reading garbage.
+                shadow_names.extend(self.class_nonloadable_member_names(cname));
+                let bare_members = self.bare_class_member_names(cname);
                 let compiled = {
                     let compiler = BytecodeCompiler::new(
                         &self.signal_name_to_id,
@@ -116762,7 +116960,8 @@ impl Simulator {
                         &formals,
                         &class_formals,
                         &shadow_names,
-                        Some((rname, result_width, false)),
+                        &bare_members,
+                        Some((rname, result_width, is_class_result)),
                         &body_refs,
                     )
                 };
@@ -116825,13 +117024,14 @@ impl Simulator {
         self.vm_regs = saved_vm_regs;
         // Clamp width (mirrors the interpreter's dyn_ret clamp) and stamp the
         // declared signedness for plainly-integral returns (mirrors its
-        // §13.4.1 signedness stamp). The pilot only handles scalar-integral
-        // returns, so this never touches a class-handle/string result.
+        // §13.4.1 signedness stamp). A CLASS-HANDLE return is passed through
+        // UNTOUCHED (no resize, no stamp) exactly like the interpreter, which
+        // never resizes/stamps a non-`plainly_integral` (Typeref) return.
         let mut result = result;
         if result_width > 0 && result.width != result_width {
             result = result.resize_for_assign(result_width);
         }
-        if !result.is_real {
+        if !is_class_result && !result.is_real {
             result.is_signed = result_signed;
         }
         Some(result)

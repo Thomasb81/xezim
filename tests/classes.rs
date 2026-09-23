@@ -56,6 +56,8 @@ mod class_field_named_event;
 mod this_chain_edge_sensitivity;
 #[path = "classes/class_handle_return_preservation.rs"]
 mod class_handle_return_preservation;
+#[path = "classes/compiled_method_class_return.rs"]
+mod compiled_method_class_return;
 #[path = "classes/class_output_handle_copyback.rs"]
 mod class_output_handle_copyback;
 #[path = "classes/typedef_extends_cast.rs"]

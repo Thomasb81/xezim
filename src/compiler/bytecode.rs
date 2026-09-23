@@ -896,6 +896,12 @@ pub struct BytecodeCompiler<'a> {
     /// the compiled path does not model class-static storage, so it bails
     /// (falls to the AST interpreter) rather than read the wrong thing.
     class_shadow_names: HashSet<String>,
+    /// BARE idents (single segment, no selects) that resolve to
+    /// `this.<member>` in method mode: directly-declared or extends-inherited
+    /// INSTANCE properties of the method's class that are NOT shadowed along
+    /// the chain. A bare name here compiles to LoadClassMember(this_reg,
+    /// name) instead of bailing.
+    bare_member_names: HashSet<String>,
     /// Register holding the (implicit) function result cell, so `return` and
     /// `f = ...` writes land where the method-mode prologue reads the result.
     method_result_reg: Option<RegId>,
@@ -906,6 +912,11 @@ pub struct BytecodeCompiler<'a> {
     /// Declared width of the method's (implicit) result, for re-sizing an
     /// explicit `return e`. Zero-width / void returns leave this unset.
     method_result_width: Option<u32>,
+    /// True when the method returns a CLASS HANDLE: the result `Value` is a
+    /// heap index passed through UNTOUCHED (no resize/stamp), exactly like the
+    /// interpreter, which never resizes or stamps a non-`plainly_integral`
+    /// return. Lets the Return handler tolerate an absent result width.
+    method_result_is_class: bool,
     /// Indices of the placeholder `Jump(0)` emitted by method-mode `return`;
     /// back-patched to the method's common exit at the end of the body.
     method_ret_jumps: Vec<usize>,
@@ -1128,9 +1139,11 @@ impl<'a> BytecodeCompiler<'a> {
             method_this_reg: None,
             method_handle_names: std::collections::HashSet::default(),
             class_shadow_names: HashSet::default(),
+            bare_member_names: HashSet::default(),
             method_result_reg: None,
             method_return_val_reg: None,
             method_result_width: None,
+            method_result_is_class: false,
             method_ret_jumps: Vec::new(),
             decl_local_regs: std::collections::HashSet::default(),
             process_local_names: HashSet::default(),
@@ -5949,8 +5962,18 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("Return_value_in_void");
                         return false;
                     };
-                    let Some(w) = self.method_result_reg.and_then(|_| self.method_result_width)
-                    else {
+                    // Class-handle returns pass the slot value through UNTOUCHED
+                    // (no Resize), mirroring the interpreter, which never
+                    // resizes/stamps a non-integral (handle) return. The result
+                    // width is therefore allowed to be absent when
+                    // `method_result_is_class` is set.
+                    let w = if let Some(w) =
+                        self.method_result_reg.and_then(|_| self.method_result_width)
+                    {
+                        w
+                    } else if self.method_result_is_class {
+                        0
+                    } else {
                         self.bail("Return_unknown_width");
                         return false;
                     };
@@ -7079,6 +7102,26 @@ impl<'a> BytecodeCompiler<'a> {
 
     /// Compile an expression, returning the register holding the result.
     /// Returns None if the expression can't be compiled to bytecode.
+    /// class-perf method-mode: does `expr` (single-segment, rootless Ident)
+    /// name a CLASS-SCOPE entity the compiled path cannot model (shadowed
+    /// member, static, localparam, array/struct member)? Locals and loadable
+    /// bare members never match.
+    fn method_bares_to_shadowed(&self, expr: &Expression) -> bool {
+        if !self.method_mode {
+            return false;
+        }
+        let ExprKind::Ident(h) = &expr.kind else {
+            return false;
+        };
+        if h.root.is_some() || h.path.len() != 1 {
+            return false;
+        }
+        let bare = h.path[0].name.name.as_str();
+        !self.local_var_regs.contains_key(bare)
+            && !self.local_array_regs.contains_key(bare)
+            && self.class_shadow_names.contains(bare)
+    }
+
     fn compile_expr(&mut self, expr: &Expression, ctx_width: u32) -> Option<RegId> {
         if let Some(id) = self.const_multi_dim_array_elem_signal_id(expr) {
             let dest = self.alloc_reg();
@@ -7162,21 +7205,38 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 // In method mode, a BARE Ident that names a member/static of
                 // the method's class or an enclosing class must resolve to
-                // class scope, NOT to a same-named module-level signal. The
-                // compiled path only models `this` heap members + formals/
-                // locals/params, so it cannot know the class-static value —
-                // bail (AST) rather than read the wrong (module) storage.
+                // class scope, NOT to a same-named module-level signal. A
+                // NON-shadowed instance member of `this` resolves to
+                // `this.<member>` (a heap access); everything else (shadowed
+                // members, class statics, enclosing-class members) the
+                // compiled path cannot model, so it bails (AST) rather than
+                // read the wrong (module) storage.
                 if self.method_mode
                     && hier.root.is_none()
                     && hier.path.len() == 1
-                    && hier.path[0].selects.is_empty()
                 {
                     let bare = hier.path[0].name.name.as_str();
-                    if self.class_shadow_names.contains(bare)
-                        && !self.local_var_regs.contains_key(bare)
-                    {
-                        self.bail("method_class_shadow");
-                        return None;
+                    if !self.local_var_regs.contains_key(bare) {
+                        if hier.path[0].selects.is_empty() && self.bare_member_names.contains(bare)
+                        {
+                            // Resolve `return parent;` to `this.parent`.
+                            let dest = self.alloc_reg();
+                            self.emit(Insn::LoadClassMember(
+                                dest,
+                                self.method_this_reg.expect("this in method_mode"),
+                                bare.to_string().into_boxed_str(),
+                            ));
+                            return Some(dest);
+                        }
+                        if self.class_shadow_names.contains(bare) {
+                            // A class-scope name the compiled path cannot
+                            // model: shadowed members, statics/localparams,
+                            // arrays (also as `g[i][j]` element selects —
+                            // those reach HERE, selects non-empty, and used
+                            // to fall through to a bogus module-signal read).
+                            self.bail("method_class_shadow");
+                            return None;
+                        }
                     }
                 }
                 if let Some(id) = self.lookup_signal_id(hier) {
@@ -7631,6 +7691,15 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
             ExprKind::Index { expr, index } => {
+                // class-perf method-mode: element selects on a CLASS-SCOPE
+                // name (e.g. `g[i][j]` on an array member) must bail — arrays
+                // live in their own storage, and falling through used to read
+                // a bogus module-signal element (regression:
+                // chained_handle_multidim). Locals are unaffected.
+                if self.method_bares_to_shadowed(expr) {
+                    self.bail("method_class_shadow");
+                    return None;
+                }
                 // Register-bank local array with a CONSTANT (possibly folded
                 // through an unrolled loop var) index: a plain register move.
                 if let ExprKind::Ident(h) = &expr.kind {
@@ -8539,6 +8608,15 @@ impl<'a> BytecodeCompiler<'a> {
                 // pre-existing (signal/struct) paths below.
                 if self.method_mode {
                     if let Some(handle_reg) = self.method_member_base_reg(base) {
+                        // Shadowed or non-loadable members (arrays, structs,
+                        // strings, reals) must not lower to a bare-key heap
+                        // access — the storage key differs (shadowed) or the
+                        // heap value is not faithful (non-integral). Bail to
+                        // the AST path instead.
+                        if self.class_shadow_names.contains(member.name.as_str()) {
+                            self.bail("method_member_noload");
+                            return None;
+                        }
                         let dest = self.alloc_reg();
                         self.emit(Insn::LoadClassMember(dest, handle_reg, member.name.clone().into_boxed_str()));
                         return Some(dest);
@@ -9198,6 +9276,12 @@ impl<'a> BytecodeCompiler<'a> {
             && let ExprKind::MemberAccess { expr: base, member } = &lhs.kind
             && let Some(handle_reg) = self.method_member_base_reg(base)
         {
+            // Same guard as the rvalue path: shadowed keys and non-integral
+            // members must keep the AST store semantics.
+            if self.class_shadow_names.contains(member.name.as_str()) {
+                self.bail("method_member_noload");
+                return false;
+            }
             self.emit(Insn::StoreClassMember(handle_reg, val_reg, member.name.clone().into_boxed_str()));
             return true;
         }
@@ -10779,6 +10863,7 @@ impl<'a> BytecodeCompiler<'a> {
         formals: &[(String, u32)],
         class_formals: &HashSet<String>,
         class_shadow_names: &HashSet<String>,
+        bare_member_names: &HashSet<String>,
         result: Option<(&str, u32, bool)>,
         body: &[&crate::ast::stmt::Statement],
     ) -> Option<(CompiledBlock, RegId, Option<RegId>, Option<RegId>)> {
@@ -10791,6 +10876,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_expr_fallback = false;
         self.allow_waits = false;
         self.class_shadow_names = class_shadow_names.clone();
+        self.bare_member_names = bare_member_names.clone();
 
         // `this` handle lives in a dedicated register.
         let this_reg = self.alloc_reg();
@@ -10829,6 +10915,7 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 self.method_result_reg = Some(r);
                 self.method_result_width = if rw > 0 { Some(rw) } else { None };
+                self.method_result_is_class = is_class;
                 self.method_return_val_reg = Some(r);
                 (Some(r), Some(r))
             }
@@ -10859,6 +10946,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_result_reg = None;
             self.method_return_val_reg = None;
             self.method_result_width = None;
+            self.method_result_is_class = false;
             self.method_ret_jumps.clear();
             self.bail_reset();
             return None;
@@ -13137,7 +13225,7 @@ mod tests {
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), Some(("f", 32, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -13201,7 +13289,7 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -13240,7 +13328,7 @@ mod tests {
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &shadow, Some(("f", 32, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &shadow, &HashSet::default(), Some(("f", 32, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );
