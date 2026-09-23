@@ -60,6 +60,8 @@ mod class_handle_return_preservation;
 mod compiled_method_class_return;
 #[path = "classes/compiled_method_step6_surface.rs"]
 mod compiled_method_step6_surface;
+#[path = "classes/compiled_method_string_forms.rs"]
+mod compiled_method_string_forms;
 #[path = "classes/class_output_handle_copyback.rs"]
 mod class_output_handle_copyback;
 #[path = "classes/typedef_extends_cast.rs"]

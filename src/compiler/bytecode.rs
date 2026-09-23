@@ -616,6 +616,14 @@ pub(super) struct PreboundCompiledMethod {
     /// Return is a param-bounded packed vector: resolve the effective width
     /// against the instance's param scope on every call.
     pub param_able_result: bool,
+    /// Return is a `string` (§6.16): the result Value is a byte-vector
+    /// passed through untouched, like a class handle.
+    pub is_string_result: bool,
+    /// String-typed formal names (§6.16). The compiler bails when one is
+    /// used in any non-pass-through context (indexing, string methods,
+    /// relational/arith operands): the interpreter routes those through the
+    /// `string_signals` registry, which the compiled block cannot see.
+    pub string_formals: std::rc::Rc<HashSet<String>>,
 }
 
 /// class-perf Step 4b: a cached, fully-lowered class-FUNCTION body plus the
@@ -944,6 +952,16 @@ pub struct BytecodeCompiler<'a> {
     /// the chain. A bare name here compiles to LoadClassMember(this_reg,
     /// name) instead of bailing.
     bare_member_names: HashSet<String>,
+    /// Instance properties of the extends chain whose declared type IS a
+    /// class (through typedefs/forward typedefs). Only these may be
+    /// method-DISPATCH bases in method mode: `value.rand_mode()` on an
+    /// integral member (`rand bit [63:0] value`) is a BUILTIN variable
+    /// method, not a class-method dispatch — lowering it to CallMethod over
+    /// the raw member bits silently returned 0 (uvm_reg_field::get_rand_mode
+    /// regressed exactly this way). Integral members stay in
+    /// `bare_member_names` (plain loads are fine); this set is the
+    /// intersection the dispatch gate requires.
+    member_class_names: HashSet<String>,
     /// Step 6: instance properties of the extends chain whose DOTTED access
     /// (`base.m`) is faithful by runtime bare key — see the simulator-side
     /// doc. A member in `class_shadow_names` but ALSO here lowers to a
@@ -969,6 +987,14 @@ pub struct BytecodeCompiler<'a> {
     /// interpreter, which never resizes or stamps a non-`plainly_integral`
     /// return. Lets the Return handler tolerate an absent result width.
     method_result_is_class: bool,
+    /// True when the method returns a `string`: like the class-handle case,
+    /// the result Value (a byte vector) passes through untouched — the Return
+    /// handler tolerates an absent width and skips the Resize.
+    method_result_is_string: bool,
+    /// String-typed formal names (plan-provided). Any use of one outside the
+    /// pass-through surface (read, compare, assign, concat, call arg, return)
+    /// bails: indexing/string-methods/arith take interpreter-only paths.
+    string_formal_names: HashSet<String>,
     /// Indices of the placeholder `Jump(0)` emitted by method-mode `return`;
     /// back-patched to the method's common exit at the end of the body.
     method_ret_jumps: Vec<usize>,
@@ -1192,12 +1218,15 @@ impl<'a> BytecodeCompiler<'a> {
             method_handle_names: std::collections::HashSet::default(),
             class_shadow_names: HashSet::default(),
             bare_member_names: HashSet::default(),
+            member_class_names: HashSet::default(),
             member_safe_names: HashSet::default(),
             class_local_names: HashSet::default(),
             method_result_reg: None,
             method_return_val_reg: None,
             method_result_width: None,
             method_result_is_class: false,
+            method_result_is_string: false,
+            string_formal_names: HashSet::default(),
             method_ret_jumps: Vec::new(),
             decl_local_regs: std::collections::HashSet::default(),
             process_local_names: HashSet::default(),
@@ -3045,7 +3074,12 @@ impl<'a> BytecodeCompiler<'a> {
                 if self.method_handle_names.contains(name) {
                     return self.local_var_regs.get(name).map(|(r, _)| *r);
                 }
-                if self.bare_member_names.contains(name) {
+                // The member must ALSO be class-typed: a bare integral
+                // member is loadable as a VALUE but is not a dispatch
+                // handle (see `member_class_names`).
+                if self.bare_member_names.contains(name)
+                    && self.member_class_names.contains(name)
+                {
                     let this = self.method_this_reg?;
                     let r = self.alloc_reg();
                     self.emit(Insn::LoadClassMember(
@@ -3080,7 +3114,10 @@ impl<'a> BytecodeCompiler<'a> {
                     && h.path[0].selects.is_empty() =>
             {
                 let name = h.path[0].name.name.as_str();
-                self.method_handle_names.contains(name) || self.bare_member_names.contains(name)
+                // Dispatch-handle members must be class-typed (see
+                // `member_class_names`) as well as bare-key loadable.
+                self.bare_member_names.contains(name)
+                    && self.member_class_names.contains(name)
             }
             crate::ast::expr::ExprKind::MemberAccess { expr: inner, member } => {
                 let m = member.name.as_str();
@@ -3989,6 +4026,67 @@ impl<'a> BytecodeCompiler<'a> {
     fn bail(&mut self, reason: &'static str) {
         if self.bail_reason.is_none() {
             self.bail_reason = Some(reason);
+        }
+    }
+
+    /// Step 8 (string formals): true if the expression mentions a
+    /// STRING-typed formal anywhere. Conservative by design — any Ident
+    /// node whose name matches bails the enclosing lowering, so a field
+    /// access whose member name collides with a string formal just keeps
+    /// the method on the AST interpreter (all-or-nothing, safe).
+    fn touches_string_formal(&self, e: &Expression) -> bool {
+        if self.string_formal_names.is_empty() {
+            return false;
+        }
+        use crate::ast::expr::ExprKind;
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && self.string_formal_names.contains(h.path[0].name.name.as_str())
+            }
+            ExprKind::Paren(inner)
+            | ExprKind::Unary { operand: inner, .. }
+            | ExprKind::MemberAccess { expr: inner, .. }
+            | ExprKind::Index { expr: inner, .. }
+            | ExprKind::RangeSelect { expr: inner, .. } => self.touches_string_formal(inner),
+            ExprKind::Binary { left, right, .. } => {
+                self.touches_string_formal(left) || self.touches_string_formal(right)
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                self.touches_string_formal(condition)
+                    || self.touches_string_formal(then_expr)
+                    || self.touches_string_formal(else_expr)
+            }
+            ExprKind::Concatenation(parts) => parts.iter().any(|p| self.touches_string_formal(p)),
+            ExprKind::AssignmentPattern(items) => items
+                .iter()
+                .any(|p| match p {
+                    crate::ast::expr::AssignmentPatternItem::Ordered(v) => {
+                        self.touches_string_formal(v)
+                    }
+                    crate::ast::expr::AssignmentPatternItem::Named(_, v) => {
+                        self.touches_string_formal(v)
+                    }
+                    crate::ast::expr::AssignmentPatternItem::Typed(_, v) => {
+                        self.touches_string_formal(v)
+                    }
+                    crate::ast::expr::AssignmentPatternItem::Default(v) => {
+                        self.touches_string_formal(v)
+                    }
+                    crate::ast::expr::AssignmentPatternItem::Keyed(k, v) => {
+                        self.touches_string_formal(k) || self.touches_string_formal(v)
+                    }
+                }),
+            ExprKind::Replication { count, exprs } => {
+                self.touches_string_formal(count)
+                    || exprs.iter().any(|p| self.touches_string_formal(p))
+            }
+            ExprKind::Call { func, args } => {
+                self.touches_string_formal(func) || args.iter().any(|a| self.touches_string_formal(a))
+            }
+            _ => false,
         }
     }
 
@@ -6121,7 +6219,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.method_result_reg.and_then(|_| self.method_result_width)
                     {
                         w
-                    } else if self.method_result_is_class {
+                    } else if self.method_result_is_class || self.method_result_is_string {
                         0
                     } else {
                         self.bail("Return_unknown_width");
@@ -7489,6 +7587,13 @@ impl<'a> BytecodeCompiler<'a> {
                 // resize the operand and corrupt the reduction
                 // (e.g. zero-extending a 32-bit value to 64 makes &a = 0
                 // even when the 32-bit value was all 1s).
+                // Step 8 (string formals): `!s`/`~s` on a string value would
+                // bit-bang bytes the interpreter string-paths never form —
+                // bail.
+                if self.touches_string_formal(operand) {
+                    self.bail("string_formal_unary");
+                    return None;
+                }
                 let operand_ctx = if matches!(
                     op,
                     UnaryOp::BitAnd
@@ -7550,6 +7655,24 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dest)
             }
             ExprKind::Binary { op, left, right } => {
+                // Step 8 (string formals): only equality/case-equality is
+                // byte-for-byte safe on string values — for pure-byte
+                // operands (no X/Z, byte-multiple widths, which is all a
+                // string formal/literal/call-return can hold) the packed
+                // compare's zero-extension of the shorter side matches the
+                // interpreter's string path (leading-NUL trim, §4.2 of
+                // value.rs). Relational and arithmetic string ops route
+                // through the interpreter's string_paths / would zero-extend
+                // wrongly — bail them.
+                if !matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                ) && (self.touches_string_formal(left)
+                    || self.touches_string_formal(right))
+                {
+                    self.bail("string_formal_non_eq_binary");
+                    return None;
+                }
                 // Verilog operand-width rules: comparison and logical ops
                 // (==, !=, <, <=, >, >=, &&, ||, ===, !==, case-eq) are
                 // self-determined — their operands' widths are max(L,R) of
@@ -7885,6 +8008,15 @@ impl<'a> BytecodeCompiler<'a> {
             }
             ExprKind::Paren(inner) => self.compile_expr(inner, ctx_width),
             ExprKind::Index { expr, index } => {
+                // Step 8 (string formals): a select on a string formal takes
+                // the interpreter's char-select path (`string_signals`
+                // registry, out-of-range → NUL byte, not X) — bail. An index
+                // EXPRESSION mentioning a string formal is equally unsafe
+                // (non-integral index coercion differs).
+                if self.touches_string_formal(expr) || self.touches_string_formal(index) {
+                    self.bail("string_formal_index");
+                    return None;
+                }
                 // class-perf method-mode: element selects on a CLASS-SCOPE
                 // name (e.g. `g[i][j]` on an array member) must bail — arrays
                 // live in their own storage, and falling through used to read
@@ -8914,6 +9046,13 @@ impl<'a> BytecodeCompiler<'a> {
             // still propagates exactly per LRM: Eq yields x, and x|1 = 1,
             // x|0 = x. Ranges and wildcard members keep the interpreter.
             ExprKind::Inside { expr: e, ranges } => {
+                // Step 8 (string formals): `inside` on a string formal takes
+                // the packed wildcard match; interpreter string semantics
+                // (leading-NUL trim) differ — bail.
+                if self.touches_string_formal(e) {
+                    self.bail("string_formal_inside");
+                    return None;
+                }
                 let mut members: Vec<Value> = Vec::with_capacity(ranges.len());
                 let mut ok = true;
                 for m in ranges {
@@ -8972,6 +9111,20 @@ impl<'a> BytecodeCompiler<'a> {
                 // ALL-OR-NOTHING contract holds on the ARGS: any actual that
                 // cannot become a register keeps the whole body on the AST
                 // interpreter (rollback below).
+                // Step 8 (string formals): `s.f()` on a string formal (len,
+                // putc, itoa...) dispatches through the string_signals
+                // registry at runtime — unlowerable here. Bail on a receiver
+                // that mentions a string formal. (ARGS are pass-through and
+                // stay allowed — `m.exists(key)` is the whole point.)
+                if let ExprKind::MemberAccess { expr: base, .. } = &func.kind {
+                    if self.touches_string_formal(base) {
+                        self.bail("string_formal_method_receiver");
+                        return None;
+                    }
+                } else if self.touches_string_formal(func) {
+                    self.bail("string_formal_as_callee");
+                    return None;
+                }
                 if self.method_mode
                     && let ExprKind::MemberAccess { expr: base, member } = &func.kind
                     && self.method_handle_chain_ok(base)
@@ -9000,7 +9153,18 @@ impl<'a> BytecodeCompiler<'a> {
                     if ok {
                         let dest = self.alloc_reg();
                         let n = arg_values.len() as u32;
+                        // Reserve ALL n contiguous arg slots. The old code
+                        // allocated only the FIRST (`arg_start`) while the
+                        // moves and the runtime read (`base + i`) use slots
+                        // arg_start..arg_start+n-1 — registers next_reg never
+                        // counted. Latent until a block's register file was
+                        // sized exactly (vm_regs.resize(block.num_regs)), then
+                        // any 2+-arg call indexed past the end (found on a
+                        // 3-argument class-method wrapper).
                         let arg_start = self.alloc_reg();
+                        for _ in 1..arg_values.len() {
+                            self.alloc_reg();
+                        }
                         for (i, &v) in arg_values.iter().enumerate() {
                             let slot = (arg_start as usize + i) as RegId;
                             if slot != v {
@@ -11099,7 +11263,9 @@ impl<'a> BytecodeCompiler<'a> {
         class_shadow_names: &HashSet<String>,
         member_safe_names: &HashSet<String>,
         bare_member_names: &HashSet<String>,
-        result: Option<(&str, u32, bool)>,
+        member_class_names: &HashSet<String>,
+        string_formals: &HashSet<String>,
+        result: Option<(&str, u32, bool, bool)>,
         body: &[&crate::ast::stmt::Statement],
     ) -> Option<(CompiledBlock, RegId, Option<RegId>, Option<RegId>)> {
         use crate::ast::stmt::StatementKind;
@@ -11113,6 +11279,8 @@ impl<'a> BytecodeCompiler<'a> {
         self.class_shadow_names = class_shadow_names.clone();
         self.member_safe_names = member_safe_names.clone();
         self.bare_member_names = bare_member_names.clone();
+        self.member_class_names = member_class_names.clone();
+        self.string_formal_names = string_formals.clone();
 
         // `this` handle lives in a dedicated register.
         let this_reg = self.alloc_reg();
@@ -11146,7 +11314,7 @@ impl<'a> BytecodeCompiler<'a> {
         // so the Return handler and the function-name binding land on the
         // same cell.
         let (result_reg, return_val_reg): (Option<RegId>, Option<RegId>) = match result {
-            Some((rname, rw, is_class)) => {
+            Some((rname, rw, is_class, is_string)) => {
                 let r = self.alloc_reg();
                 // Return-handler writes also resize to the shared cell width.
                 self.local_var_regs.insert(rname.to_string(), (r, rw));
@@ -11156,6 +11324,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.method_result_reg = Some(r);
                 self.method_result_width = if rw > 0 { Some(rw) } else { None };
                 self.method_result_is_class = is_class;
+                self.method_result_is_string = is_string;
                 self.method_return_val_reg = Some(r);
                 (Some(r), Some(r))
             }
@@ -11187,6 +11356,8 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_return_val_reg = None;
             self.method_result_width = None;
             self.method_result_is_class = false;
+            self.method_result_is_string = false;
+            self.string_formal_names.clear();
             self.method_ret_jumps.clear();
             self.bail_reset();
             return None;
@@ -13465,7 +13636,7 @@ mod tests {
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -13529,7 +13700,7 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -13568,7 +13739,7 @@ mod tests {
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &shadow, &HashSet::default(), &HashSet::default(), Some(("f", 32, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &shadow, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );

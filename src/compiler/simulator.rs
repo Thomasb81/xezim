@@ -116949,6 +116949,27 @@ impl Simulator {
         out
     }
 
+    fn class_typed_member_names(&self, cname: &str) -> HashSet<String> {
+        let mut out = HashSet::default();
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            for (p, dt) in cd.property_types.iter() {
+                if self.typeref_names_class(dt) {
+                    out.insert(p.clone());
+                }
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out
+    }
+
     /// class-perf Step 6: members that a DOTTED member access (`base.m`)
     /// may lower to a bare-key heap access. The interpreter's dotted read
     /// AND write use the instance's runtime key (`properties["m"]`) — the
@@ -117049,10 +117070,14 @@ impl Simulator {
                 self.compiled_method_skip.insert((cid, mid));
                 return None; // Tasks keep waits/scheduling on the AST interpreter.
             };
-            if ret_is_string {
-                self.compiled_method_skip.insert((cid, mid));
-                return None; // String returns go through the signal-store path.
-            }
+            // Step 8: a STRING return compiles like a class handle — the
+            // result Value is a byte-vector register passed through untouched
+            // (width 0, no signedness). The interpreter seeds the implicit
+            // return cell to `""` and returns the local's bytes verbatim;
+            // the register does the same. (The signal-store fallback below
+            // only services interpreter concat writes — the block computes
+            // the identical bytes in-register.)
+            let is_string_result = ret_is_string;
             let Some(rname) = fn_ret_name.as_ref() else {
                 // No implicit return-variable name: the method is a plain
                 // `function void ...` body with no result cell. Keep AST.
@@ -117073,7 +117098,9 @@ impl Simulator {
             // stamped — the interpreter never touches a non-`plainly_integral`
             // (Typeref) return, so a handle must round-trip unchanged.
             let is_class_result = self.typeref_names_class(&_f.return_type);
-            let (static_result_width, result_signed) = if is_class_result {
+            let (static_result_width, result_signed) = if is_string_result {
+                (0u32, false)
+            } else if is_class_result {
                 // class handle: width meaningless; pass through untouched.
                 (0u32, false)
             } else if let Some(pair) = self.scalar_formal_integral(&_f.return_type) {
@@ -117092,25 +117119,34 @@ impl Simulator {
             // method on the AST path (safe).
             let mut formals: Vec<(String, u32)> = Vec::with_capacity(ports.len());
             let mut class_formals: HashSet<String> = Default::default();
+            let mut string_formals: HashSet<String> = Default::default();
             for port in ports {
                 // Forward typedefs (`typedef class uvm_component;`) make
                 // resolve_dt_ref erase the class identity, so the OLD check saw
                 // every UVM class formal as non-class and skip-cached the method
                 // as non-scalar. The walk checks the class table first.
                 let is_class = self.typeref_names_class(&port.data_type);
+                // Step 8: a STRING formal binds the actual UNRESIZED in the
+                // interpreter (no branch of the binding matches Simple{String})
+                // — seed width 0 (keep source) and record the name so the
+                // compiler bails on every non-pass-through use.
+                let is_string = Self::is_string_data_type(&port.data_type);
+                if is_string {
+                    string_formals.insert(port.name.name.clone());
+                }
                 let w = if is_class {
                     0 // class handle formal; width irrelevant (heap member access)
+                } else if is_string {
+                    0 // string formal; raw byte-vector actual, keep source width
                 } else {
                     // Scalar-integral GATE (bail to AST if not): the type must be
-                    // a compile-able integer vector/atom.
+                    // a compile-able integer vector/atom. (String formals are
+                    // handled above — allowed, not skipped.)
                     let Some(pw) = self.scalar_formal_integral(&port.data_type).map(|(w, _)| w)
                     else {
-                        // real/enum/collection formal: AST. String formals land
-                        // here too (uvm_pool::exists(KEY key) with KEY=string,
-                        // m_find_successor_by_name(string name), ...) and these
-                        // are HOT — memoize the skip so the per-call gate cost
-                        // is paid once (decision is instance-independent: the
-                        // declared formal type cannot change per instance).
+                        // real/enum/collection formal: AST — memoize the skip
+                        // (the decision is instance-independent: the declared
+                        // formal type cannot change per instance).
                         self.compiled_method_skip.insert((cid, mid));
                         return None;
                     };
@@ -117143,7 +117179,10 @@ impl Simulator {
             // non-literal bounds) needs the INSTANCE's param scope — flagged so
             // the per-call resolution below runs just for those. Integer atoms,
             // literal-bounded packed vectors and class TypeReferences are fixed.
+            // String returns pass through untouched (width 0), so they are
+            // never param-resolved either.
             let param_able_result = !is_class_result
+                && !is_string_result
                 && !matches!(&_f.return_type, crate::ast::types::DataType::IntegerAtom { .. })
                 && !Self::packed_dims_are_literal(&_f.return_type);
             let pre = std::rc::Rc::new(super::bytecode::PreboundCompiledMethod {
@@ -117152,6 +117191,8 @@ impl Simulator {
                 return_type: std::rc::Rc::new(_f.return_type.clone()),
                 fn_ret_name: rname.clone(),
                 is_class_result,
+                is_string_result,
+                string_formals: std::rc::Rc::new(string_formals),
                 static_result_width,
                 result_signed,
                 param_able_result,
@@ -117195,6 +117236,11 @@ impl Simulator {
                 // set: any reference bails to AST instead of reading garbage.
                 shadow_names.extend(self.class_nonloadable_member_names(cname));
                 let bare_members = self.bare_class_member_names(cname);
+                // Dispatch-handle members: the class-typed subset of the
+                // bare set (the CallMethod gate requires BOTH — an integral
+                // member like uvm_reg_field's `value` must not become a
+                // dispatch base).
+                let member_classes = self.class_typed_member_names(cname);
                 // Dotted member accesses faithful by runtime bare key (see
                 // the fn doc): statics/nonloadable/enclosing excluded.
                 let member_safe = self.class_member_access_safe_names(cname);
@@ -117218,7 +117264,14 @@ impl Simulator {
                         &shadow_names,
                         &member_safe,
                         &bare_members,
-                        Some((&pre.fn_ret_name, result_width, pre.is_class_result)),
+                        &member_classes,
+                        &pre.string_formals,
+                        Some((
+                            &pre.fn_ret_name,
+                            result_width,
+                            pre.is_class_result,
+                            pre.is_string_result,
+                        )),
                         &body_refs,
                     )
                 };
@@ -117309,6 +117362,16 @@ impl Simulator {
         if v.is_real {
             return Expression::new(
                 ExprKind::Number(NumberLiteral::Real(v.to_f64())),
+                crate::ast::Span::dummy(),
+            );
+        }
+        // Step 8: an EMPTY string (width 0) has no hex form — the sized
+        // integer below would coerce it to `1'd0` (width 1), and the callee's
+        // binding would see a 1-bit value instead of an empty string. Emit a
+        // string literal so eval_expr re-creates the exact width-0 bytes.
+        if v.width == 0 {
+            return Expression::new(
+                ExprKind::StringLiteral(String::new()),
                 crate::ast::Span::dummy(),
             );
         }
