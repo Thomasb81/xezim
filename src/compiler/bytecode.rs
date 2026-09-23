@@ -3114,10 +3114,14 @@ impl<'a> BytecodeCompiler<'a> {
                     && h.path[0].selects.is_empty() =>
             {
                 let name = h.path[0].name.name.as_str();
-                // Dispatch-handle members must be class-typed (see
-                // `member_class_names`) as well as bare-key loadable.
-                self.bare_member_names.contains(name)
-                    && self.member_class_names.contains(name)
+                // Chain roots: (a) a handle local/formal/result cell — always
+                // class-typed by construction; (b) a bare member that is
+                // BOTH bare-key loadable AND class-typed — an integral
+                // member is a value, not a dispatch handle (see
+                // `member_class_names`).
+                self.method_handle_names.contains(name)
+                    || (self.bare_member_names.contains(name)
+                        && self.member_class_names.contains(name))
             }
             crate::ast::expr::ExprKind::MemberAccess { expr: inner, member } => {
                 let m = member.name.as_str();
