@@ -78,6 +78,11 @@ static FUSED_BINOP_CONST: [std::sync::atomic::AtomicU64; BinOpConstKind::COUNT] 
 /// the assign's value operand (see `forward_move_into_assign`).
 static FUSED_MOVE_FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FUSED_COPY_FWD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Store folds kept in the persisted bytecode (`XEZIM_FOLD_STORES`, default
+/// 1: dynamic-bound range stores only; the array element folds live in the
+/// two-state lowering's copy).
+const FOLD_STORES_PERSISTED: u32 = 1;
+const FOLD_STORES_LOWERING: u32 = 6;
 
 /// Static count of `ClearSigned` insns deleted because the register provably
 /// held an unsigned value already (see `elide_provably_unsigned_scrubs`).
@@ -11114,7 +11119,17 @@ impl<'a> BytecodeCompiler<'a> {
         // pattern is disjoint from `fuse_array_read_nba`'s, so the order
         // between the two does not matter.
         Self::fuse_binop_const(&mut self.insns);
-        Self::fold_const_regs(&mut self.insns, signal_widths);
+        {
+            use std::sync::OnceLock;
+            static FOLD_STORES: OnceLock<u32> = OnceLock::new();
+            let m = *FOLD_STORES.get_or_init(|| {
+                std::env::var("XEZIM_FOLD_STORES")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(FOLD_STORES_PERSISTED)
+            });
+            Self::fold_const_regs_masked(&mut self.insns, signal_widths, m);
+        }
         // Folding turns `Mul(t, K0, K8)` into a constant the pass above had
         // already walked past; a second pass fuses those too.
         Self::fuse_binop_const(&mut self.insns);
@@ -12326,6 +12341,17 @@ impl<'a> BytecodeCompiler<'a> {
     /// 20 dynamic bit writes — 250 M interpreter instructions per CoreMark
     /// run doing arithmetic on numbers known at compile time.
     fn fold_const_regs(insns: &mut Vec<Insn>, signal_widths: &[u32]) {
+        Self::fold_const_regs_masked(insns, signal_widths, FOLD_STORES_PERSISTED);
+    }
+
+    /// `fold_const_regs` with an explicit store-fold mask (see
+    /// `XEZIM_FOLD_STORES`). The array element folds (2, 4) are applied only
+    /// on the two-state lowering's private copy of a stream: as ARRAY writes
+    /// the edge-skip census arms the block on the element, so a sibling
+    /// writing an overlapping slice re-fires it and it may still skip idle
+    /// edges; as plain range stores on the element signal the census has to
+    /// reject the overlap (147 C910 flops lost their skip).
+    pub(crate) fn fold_const_regs_masked(insns: &mut Vec<Insn>, signal_widths: &[u32], mask: u32) {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
         if !*ON.get_or_init(|| {
@@ -12364,6 +12390,7 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => {}
             }
         }
+        let fold_stores = mask;
         // Static index from a constant register, mirroring `dyn_bit_index`:
         // an X/Z index drops the write at run time, so it stays dynamic.
         let const_index = |v: &Value| -> Option<u32> {
@@ -12504,6 +12531,83 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some(u) = known.get(idx).and_then(|v| const_index(v)) {
                         insns[i] = Insn::BitSelectConst(*d, *base, u);
                         folded += 1;
+                    }
+                }
+                // A range store whose bounds were computed from parameters
+                // and only became constants here: the constant form lowers
+                // to two-state, the dynamic one bailed every such flop on
+                // two SoCs (16 on c906, 25 on c910).
+                Insn::BlockingAssignRangeDyn(sig, h, l, val)
+                | Insn::NbaAssignRangeDyn(sig, h, l, val)
+                    if fold_stores & 1 != 0 =>
+                {
+                    let kh = known.get(h).and_then(|v| const_index(v));
+                    let kl = known.get(l).and_then(|v| const_index(v));
+                    if let (Some(uh), Some(ul)) = (kh, kl) {
+                        let w = signal_widths.get(*sig as usize).copied().unwrap_or(0);
+                        let (hi, lo) = (uh.max(ul), uh.min(ul));
+                        if hi < w {
+                            insns[i] = if matches!(insns[i], Insn::NbaAssignRangeDyn(..)) {
+                                Insn::NbaAssignRange(*sig, hi, lo, *val)
+                            } else {
+                                Insn::BlockingAssignRange(*sig, hi, lo, *val)
+                            };
+                            folded += 1;
+                        }
+                    }
+                }
+                // A constant element of a dense array is a signal of its own:
+                // `mem[K][hi:lo] <= v` is a range store on that signal (376
+                // c910 flops bailed on the array form), and `mem[K] <= v` a
+                // whole store when the widths agree.
+                Insn::BlockingAssignArrayRange(arr, idx, h, l, val)
+                | Insn::NbaAssignArrayRange(arr, idx, h, l, val)
+                    if fold_stores & 2 != 0 =>
+                {
+                    let ArrayOperand::Dense { first_id, lo: alo, hi: ahi, .. } = arr.as_ref() else {
+                        continue;
+                    };
+                    let ki = known.get(idx).and_then(|v| const_index(v));
+                    let kh = known.get(h).and_then(|v| const_index(v));
+                    let kl = known.get(l).and_then(|v| const_index(v));
+                    if let (Some(ui), Some(uh), Some(ul)) = (ki, kh, kl) {
+                        let ui = ui as i64;
+                        if ui >= *alo && ui <= *ahi {
+                            let elem = first_id + (ui - alo) as usize;
+                            let w = signal_widths.get(elem).copied().unwrap_or(0);
+                            let (hi, lo) = (uh.max(ul), uh.min(ul));
+                            if hi < w {
+                                let nba = matches!(insns[i], Insn::NbaAssignArrayRange(..));
+                                insns[i] = if nba {
+                                    Insn::NbaAssignRange(elem as SigId, hi, lo, *val)
+                                } else {
+                                    Insn::BlockingAssignRange(elem as SigId, hi, lo, *val)
+                                };
+                                folded += 1;
+                            }
+                        }
+                    }
+                }
+                Insn::BlockingAssignArray(arr, idx, val, w) | Insn::NbaAssignArray(arr, idx, val, w)
+                    if fold_stores & 4 != 0 =>
+                {
+                    let ArrayOperand::Dense { first_id, lo: alo, hi: ahi, .. } = arr.as_ref() else {
+                        continue;
+                    };
+                    if let Some(ui) = known.get(idx).and_then(|v| const_index(v)) {
+                        let ui = ui as i64;
+                        if ui >= *alo && ui <= *ahi {
+                            let elem = first_id + (ui - alo) as usize;
+                            if signal_widths.get(elem).copied() == Some(*w) {
+                                let nba = matches!(insns[i], Insn::NbaAssignArray(..));
+                                insns[i] = if nba {
+                                    Insn::NbaAssign(elem as SigId, *val, *w)
+                                } else {
+                                    Insn::BlockingAssign(elem as SigId, *val, *w)
+                                };
+                                folded += 1;
+                            }
+                        }
                     }
                 }
                 // `[l:r]` with both bounds folded to non-negative 32-bit
@@ -14560,7 +14664,31 @@ pub fn lower_two_state(
     signal_real: &[bool],
     array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
 ) -> Option<TwoStateBlock> {
-    let n = cb.instructions.len();
+    // Constant-index array stores fold to stores on the element signal for
+    // the lowering only (see `fold_const_regs_masked`); the copy is 1:1 with
+    // the original, so every stream index below still names the same
+    // four-state instruction.
+    let folded: Option<Vec<Insn>> = if cb.instructions.iter().any(|i| {
+        matches!(
+            i,
+            Insn::NbaAssignArrayRange(..)
+                | Insn::BlockingAssignArrayRange(..)
+                | Insn::NbaAssignArray(..)
+                | Insn::BlockingAssignArray(..)
+        )
+    }) {
+        let mut v = cb.instructions.clone();
+        BytecodeCompiler::fold_const_regs_masked(&mut v, signal_widths, FOLD_STORES_LOWERING);
+        debug_assert_eq!(v.len(), cb.instructions.len());
+        Some(v)
+    } else {
+        None
+    };
+    let insns: &[Insn] = match &folded {
+        Some(v) => v.as_slice(),
+        None => cb.instructions.as_slice(),
+    };
+    let n = insns.len();
     let mut out: Vec<TsInsn> = Vec::with_capacity(n);
     // Static width per register. A register REDEFINED with a different width
     // (possible for loop-var slots, which are mutable) bails: stream-order
@@ -14702,9 +14830,9 @@ pub fn lower_two_state(
     // TARGET separates from its stream-order definition -- the one place a
     // second definition could reach it. `tcount[i]` counts branch targets at
     // indices <= i, so "no target in between" is one integer compare.
-    let n_ins = cb.instructions.len();
+    let n_ins = insns.len();
     let mut tgts: Vec<u32> = Vec::new();
-    for insn in cb.instructions.iter() {
+    for insn in insns.iter() {
         match insn {
             Insn::BranchIfFalse(_, t)
             | Insn::BranchUnlessZero(_, t)
@@ -14738,7 +14866,7 @@ pub fn lower_two_state(
     }
     // A back edge can re-enter an earlier read from a LATER definition, which
     // the forward-only reasoning above does not model.
-    let back_branch = BytecodeCompiler::has_backward_branch(&cb.instructions);
+    let back_branch = BytecodeCompiler::has_backward_branch(insns);
     // See `ts_raw_hazard`: a block that reads a signal it later overwrites
     // cannot be re-run by the interpreter after a partial two-state run, and
     // every bail is such a re-run.
@@ -14746,7 +14874,7 @@ pub fn lower_two_state(
     // restored by the executor on a bail, so the re-run starts from the
     // values the block saw (`failures++` in a check's failing branch, with
     // an x read later in the block, counted twice before this).
-    let hazards = match ts_raw_hazard(&cb.instructions, array_first_id) {
+    let hazards = match ts_raw_hazard(insns, array_first_id) {
         Ok(h) => h,
         Err(()) => {
             if std::env::var_os("XEZIM_TS_DBG").is_some() {
@@ -14840,12 +14968,12 @@ pub fn lower_two_state(
             return None;
         }};
     }
-    let bt_map = BytecodeCompiler::branch_target_map(&cb.instructions);
+    let bt_map = BytecodeCompiler::branch_target_map(insns);
     // Index of each register's LAST definition (dest or in-place), for the
     // back-edge reset below; `usize::MAX` marks the fused pair form, which
     // the lowering handles but this table does not model.
     let mut last_def: Vec<usize> = vec![0; cb.num_regs as usize];
-    for (j, ins) in cb.instructions.iter().enumerate() {
+    for (j, ins) in insns.iter().enumerate() {
         let mut note = |r: RegId| {
             if let Some(slot) = last_def.get_mut(r as usize) {
                 *slot = j;
@@ -14866,7 +14994,7 @@ pub fn lower_two_state(
             _ => {}
         }
     }
-    for (ins_i, insn) in cb.instructions.iter().enumerate() {
+    for (ins_i, insn) in insns.iter().enumerate() {
         if track {
             TS_BAIL_AT.with(|c| c.set((ins_i, insn_opcode_name(insn))));
             TS_GATE_WHY.with(|c| c.set("-"));
@@ -14986,7 +15114,7 @@ pub fn lower_two_state(
                     // `LoadConst(real ticks); WaitDelayReg(d)` — the
                     // registration's constant-delay fold — lowers to one
                     // wait; any other real constant bails.
-                    if let Some(Insn::WaitDelayReg(r)) = cb.instructions.get(ins_i + 1) {
+                    if let Some(Insn::WaitDelayReg(r)) = insns.get(ins_i + 1) {
                         if r == d {
                             has_wait = true;
                             let resume = ins_i as u32 + 2;
@@ -15793,7 +15921,7 @@ pub fn lower_two_state(
                         if bt_map[j + 1] {
                             break;
                         }
-                        let ins = &cb.instructions[j];
+                        let ins = &insns[j];
                         if BytecodeCompiler::dest_reg(ins) == Some(*lo)
                             || BytecodeCompiler::in_place_reg(ins) == Some(*lo)
                         {
@@ -16017,7 +16145,7 @@ pub fn lower_two_state(
             Insn::NbaAssignRange(sig, hi, lo, r) => {
                 let sig = *sig as usize;
                 if sig >= signal_widths.len() || signal_real[sig] {
-                    return None;
+                    gate!("nba range dest oob/real");
                 }
                 if let Some(bit) = wfill[*r as usize] {
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
@@ -16028,7 +16156,9 @@ pub fn lower_two_state(
                     out.push(TsInsn::RangeFillNbaW { sig: sig as u32, hi: high, lo: low, bit });
                     continue;
                 }
-                let cw = rw[*r as usize]?;
+                let Some(cw) = rw[*r as usize] else {
+                    gate!("untracked source (nba range store)");
+                };
                 let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
                 let w = high - low + 1;
                 if signal_widths[sig] > 64 {
@@ -16056,7 +16186,7 @@ pub fn lower_two_state(
                     continue;
                 }
                 if cw > 64 || high >= 64 {
-                    return None;
+                    gate!("wide source (nba range store)");
                 }
                 if cw < w && mn!(*r) {
                     gate!("signed widening (nba range store)");
@@ -16073,7 +16203,7 @@ pub fn lower_two_state(
             Insn::NbaAssign(sig, r, w) => {
                 let sig = *sig as usize;
                 if sig >= signal_widths.len() || signal_real[sig] {
-                    return None;
+                    gate!("nba dest oob/real");
                 }
                 if let Some(bit) = wfill[*r as usize] {
                     if signal_widths[sig] != *w || *w == 0 {
@@ -16083,10 +16213,12 @@ pub fn lower_two_state(
                     out.push(TsInsn::RangeFillNbaW { sig: sig as u32, hi: *w - 1, lo: 0, bit });
                     continue;
                 }
-                let cw = rw[*r as usize]?;
+                let Some(cw) = rw[*r as usize] else {
+                    gate!("untracked source (nba)");
+                };
                 if *w > 64 {
                     if *w > 512 || cw != *w || signal_signed[sig] {
-                        return None;
+                        gate!("wide nba dest shape");
                     }
                     side_effects = true;
                     out.push(TsInsn::WStoreNba { sig: sig as u32, s: *r as u16, w: *w });
@@ -16107,7 +16239,9 @@ pub fn lower_two_state(
                 }
             }
             Insn::LoadArrayElem(d, array, idx_reg) => {
-                let (first, lo, hi) = array_span(array)?;
+                let Some((first, lo, hi)) = array_span(array) else {
+                    gate!("array elements wide/signed/real");
+                };
                 let _ = side_effects;
                 // A constant, in-range index names one element: that is a
                 // plain signal load with the ordinary x-read contract, not an
@@ -16117,11 +16251,11 @@ pub fn lower_two_state(
                 if let Some(k) = rc[*idx_reg as usize] {
                     let ki = k as i64;
                     if ki < lo || ki > hi {
-                        return None;
+                        gate!("const element out of range");
                     }
                     let eid = first + (ki - lo) as usize;
                     if signal_signed.get(eid).copied().unwrap_or(true) || !sig_ok(eid) {
-                        return None;
+                        gate!("const element signed/wide");
                     }
                     note_read(eid, 0, signal_widths[eid], true, stored.contains(&(eid as u32)), &mut reads_whole, &mut reads_slice);
                     def!(rw, *d, signal_widths[eid]);

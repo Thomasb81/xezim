@@ -100,6 +100,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_FALLBACK_SITES", "Report each construct handed to the AST interpreter: reason, source byte span, scope"),
     ("XEZIM_FOLD_CONST_REGS", "Bytecode: set to 0 to disable register constant propagation (constant add chains, static bit indexes)"),
     ("XEZIM_FOLD_CONST_STATS", "Bytecode: print per-block register constant-folding counts"),
+    ("XEZIM_FOLD_STORES", "Bytecode: bit mask of constant-index store folds (1 dyn range, 2 element range, 4 element whole; default 1)"),
     ("XEZIM_FORCE_PARALLEL", "Parallel: force parallel dispatch even below thresholds"),
     ("XEZIM_FOREACH_REPLAY_LIMIT", "Bytecode: max foreach unroll replay count"),
     ("XEZIM_FUSE", "Bytecode: enable/disable insn fusion peepholes (0/1)"),

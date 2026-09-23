@@ -142,6 +142,33 @@ and the development workflow are in [README.md](README.md).
   range stores at a run-time offset (blocking and non-blocking, into
   vectors wider than 64 bits) all lower now. A DRAM-model reproducer runs
   in a third of the instructions.
+* Clocked blocks whose range-store bounds only become constants after
+  folding — a generate arm writing `v[g*8 +: 8]` or `mem[g][7:4]` — now
+  compile to constant range stores on the element, which the two-state
+  executor runs; the dynamic and array forms they used to take kept the
+  whole block on the four-state VM (16 such flops on a c906 SoC, 400 on a
+  C910 SoC).
+* A block that bails on an x read every time it runs (an unwritten memory
+  element it keeps reading) no longer pays the two-state entry and guard on
+  every evaluation before running interpreted: after eight bails in a row
+  it sleeps, doubling the sleep while the bails continue, and wakes for one
+  attempt so a value that clears after reset gets its fast path back. x-read
+  bails on a c906 SoC fall by 72%.
+* `tests/perf/loop_block_counters.rs` guards this path with work-counter
+  ceilings (two-state admission, bytecode length, backoff engagement).
+* Clocked blocks whose range-store bounds only become constants after
+  folding — a generate arm writing `v[g*8 +: 8]` or `mem[g][7:4]` — now
+  compile to constant range stores on the element, which the two-state
+  executor runs; the dynamic and array forms they used to take kept the
+  whole block on the four-state VM (16 such flops on a c906 SoC, 400 on a
+  C910 SoC).
+* A block that bails on an x read every time it runs (an unwritten memory
+  element it keeps reading) no longer pays the two-state entry and guard on
+  every evaluation before running interpreted: after eight bails in a row
+  it sleeps, doubling the sleep while the bails continue, and wakes for one
+  attempt so a value that clears after reset gets its fast path back.
+* `tests/perf/loop_block_counters.rs` guards this path with work-counter
+  ceilings (two-state admission, bytecode length, backoff engagement).
 * The bytecode such blocks compile to is leaner first: a loop variable's
   reads are forwarded into their consumers instead of being copied into a
   temporary each time, `& K`, `* K`, `- K` and `| K` fold their constant

@@ -4119,6 +4119,24 @@ impl std::ops::DerefMut for SignalMap {
 
 /// Mid-exec ts aborts tolerated per block before demotion.
 const TS_ABORT_DEMOTE: u16 = 8;
+/// Consecutive x-read bails before a block is put to sleep.
+const TS_XBAIL_STREAK: u8 = 8;
+/// First sleep, in successful two-state evaluations design-wide (about half
+/// a clock tick on a CPU SoC); doubles per further streak, up to 2^12 units.
+const TS_XBAIL_SLEEP_UNIT: u64 = 256;
+/// A gap this long between two bails of one block counts as a clean stretch
+/// and restarts its streak.
+const TS_XBAIL_FORGET: u64 = 1 << 16;
+
+/// A sleeping two-state block: what was swapped out, and where.
+struct TsSleepRec {
+    kind: u8,
+    idx: u32,
+    len_kind: u16,
+    slept_at: u64,
+    plan: Option<CombPlan>,
+    slot: Option<TsSlot>,
+}
 
 #[derive(Clone)]
 enum CombPlan {
@@ -6026,6 +6044,32 @@ pub struct Simulator {
     /// to No / Interp for the rest of the run. (Re-promotion after init
     /// settles is future work.)
     ts_edge_abortn: Vec<u16>,
+    /// x-read bail backoff. A block that bails on an x read every time (an
+    /// unwritten memory element it keeps reading) paid the executor entry
+    /// and the guard on every evaluation before running interpreted anyway.
+    /// After `TS_XBAIL_STREAK` bails in a row it is put to SLEEP: its plan
+    /// or slot is swapped for the demoted form, so the hot path pays
+    /// nothing for it, and a record on this heap (keyed by the successful
+    /// two-state evaluation count) wakes it later, sleeping twice as long
+    /// each time the bails continue. Per-entry streak state is touched only
+    /// on a bail; a long clean stretch resets it.
+    ts_sleep: std::collections::BinaryHeap<std::cmp::Reverse<(u64, u32)>>,
+    ts_sleep_recs: Vec<Option<TsSleepRec>>,
+    ts_sleep_free: Vec<u32>,
+    /// `(streak, last bail at, probe until)` per comb entry / edge block.
+    /// `probe until` is set at wake-up to one evaluation cadence of the
+    /// block (measured while it slept): a bail before it means the first
+    /// attempt after waking still read x, and the streak escalates; a bail
+    /// after it means the block ran clean in between, and the streak
+    /// restarts.
+    ts_comb_xb: Vec<(u8, u64, u64)>,
+    ts_edge_xb: Vec<(u8, u64, u64)>,
+    /// Interpreted evaluations of a SLEEPING block, plus one (0 = awake):
+    /// counted on the interpreter paths, which a sleeping block takes.
+    ts_asleep_comb: Vec<u32>,
+    ts_asleep_edge: Vec<u32>,
+    /// Set by `ts_guard_and_exec` when the failure was an x read.
+    ts_last_xbail: bool,
     ts_comb_abortn: Vec<u16>,
     comb_plan_abortn: Vec<u16>,
     /// XEZIM_PROFILE_REPORT=1: reference-style ranked profile (by design
@@ -9563,6 +9607,14 @@ impl Simulator {
             settle_entries_view: (std::ptr::null(), 0),
             ts_xbail_by_entry: HashMap::default(),
             ts_edge_abortn: Vec::new(),
+            ts_sleep: std::collections::BinaryHeap::new(),
+            ts_sleep_recs: Vec::new(),
+            ts_sleep_free: Vec::new(),
+            ts_comb_xb: Vec::new(),
+            ts_edge_xb: Vec::new(),
+            ts_asleep_comb: Vec::new(),
+            ts_asleep_edge: Vec::new(),
+            ts_last_xbail: false,
             ts_comb_abortn: Vec::new(),
             comb_plan_abortn: Vec::new(),
             profile_report: std::env::var("XEZIM_PROFILE_REPORT").ok().as_deref() == Some("1"),
@@ -21425,7 +21477,11 @@ impl Simulator {
                 let ts_ptr: *const super::bytecode::TwoStateBlock =
                     std::sync::Arc::as_ptr(ts);
                 self.ts_cur_eidx = eidx as u32;
-                if self.ts_guard_and_exec(unsafe { &*ts_ptr }) {
+                let ok = self.ts_guard_and_exec(unsafe { &*ts_ptr });
+                if !ok && self.ts_last_xbail {
+                    self.ts_xbail_note(0, eidx);
+                }
+                if ok {
                     if self.trace_comb_paths {
                         self.note_comb_path(eidx, 0);
                     }
@@ -21749,7 +21805,12 @@ impl Simulator {
             );
             if lowered.is_none() && std::env::var("XEZIM_TS_DBG").is_ok() {
                 let (bi, bop) = super::bytecode::ts_last_bail();
-                eprintln!("[TS-NO] bail at #{} opcode={}", bi, bop);
+                eprintln!(
+                    "[TS-NO] bail at #{} opcode={} why={}",
+                    bi,
+                    bop,
+                    super::bytecode::ts_last_gate()
+                );
                 eprintln!(
                     "[TS-NO] edge={} idx={} insns={:?}",
                     edge,
@@ -21776,6 +21837,9 @@ impl Simulator {
         let tp: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
         self.ts_cur_eidx = if edge { u32::MAX } else { eidx as u32 };
         let ok = self.ts_guard_and_exec(unsafe { &*tp });
+        if !ok && self.ts_last_xbail {
+            self.ts_xbail_note(if edge { 2 } else { 1 }, eidx);
+        }
         if !ok && self.ts_exec_aborted {
             let counts = if edge { &mut self.ts_edge_abortn } else { &mut self.ts_comb_abortn };
             if eidx >= counts.len() {
@@ -21794,8 +21858,151 @@ impl Simulator {
     /// filtering), no warn-x (its transition notes live on the 4-state
     /// path), and every read X-free (width ≤ 64 was proven at lower time,
     /// so storage is Inline and raw_bits is exact).
+    /// A two-state attempt just bailed on an x read: count it, and put the
+    /// block to sleep once the streak is long enough. `kind`: 0 = comb entry
+    /// through its plan / arena header, 1 = comb entry through its slot,
+    /// 2 = edge block. Only ever called on a bail, so the hot path is
+    /// untouched.
+    fn ts_xbail_note(&mut self, kind: u8, idx: usize) {
+        let now = self.prof_ts_evals;
+        let v = if kind == 2 { &mut self.ts_edge_xb } else { &mut self.ts_comb_xb };
+        if idx >= v.len() {
+            v.resize(idx + 1, (0, 0, 0));
+        }
+        let (streak, last, probe_until) = &mut v[idx];
+        if *probe_until != 0 {
+            // First bail since waking: inside one cadence, the block still
+            // reads x and the streak escalates; later, it ran clean for a
+            // while and starts over.
+            if now > *probe_until {
+                *streak = 0;
+            }
+            *probe_until = 0;
+        } else if now.saturating_sub(*last) > TS_XBAIL_FORGET {
+            *streak = 0;
+        }
+        *last = now;
+        *streak = streak.saturating_add(1);
+        if *streak < TS_XBAIL_STREAK {
+            return;
+        }
+        let k = (*streak - TS_XBAIL_STREAK).min(12) as u32;
+        let wake_at = now + (TS_XBAIL_SLEEP_UNIT << k);
+        let mut rec =
+            TsSleepRec { kind, idx: idx as u32, len_kind: 0, slept_at: now, plan: None, slot: None };
+        {
+            let a = if kind == 2 { &mut self.ts_asleep_edge } else { &mut self.ts_asleep_comb };
+            if idx >= a.len() {
+                a.resize(idx + 1, 0);
+            }
+            a[idx] = 1;
+        }
+        match kind {
+            0 => {
+                // An entry runs two-state through its arena header, its
+                // plan, or both; swap out whichever it has.
+                let mut any = false;
+                if let Some(h) = self.ts_hdr.get_mut(idx) {
+                    if h.len_kind != 0 {
+                        rec.len_kind = h.len_kind;
+                        h.len_kind = 0;
+                        any = true;
+                    }
+                }
+                if let Some(p) = self.comb_plan.get_mut(idx) {
+                    if matches!(p, CombPlan::Ts(_)) {
+                        rec.plan = Some(std::mem::replace(p, CombPlan::Interp));
+                        any = true;
+                    }
+                }
+                if !any {
+                    return;
+                }
+            }
+            1 => {
+                let Some(sl) = self.ts_comb.get_mut(idx) else { return };
+                rec.slot = Some(std::mem::replace(sl, TsSlot::No));
+            }
+            _ => {
+                let Some(sl) = self.ts_edge.get_mut(idx) else { return };
+                rec.slot = Some(std::mem::replace(sl, TsSlot::No));
+            }
+        }
+        let key = match self.ts_sleep_free.pop() {
+            Some(k) => {
+                self.ts_sleep_recs[k as usize] = Some(rec);
+                k
+            }
+            None => {
+                self.ts_sleep_recs.push(Some(rec));
+                (self.ts_sleep_recs.len() - 1) as u32
+            }
+        };
+        self.ts_sleep.push(std::cmp::Reverse((wake_at, key)));
+    }
+
+    /// Restore every sleeping block whose wake time has passed. Called once
+    /// per settle call, and only while something is asleep.
+    fn ts_wake_sleepers(&mut self) {
+        let now = self.prof_ts_evals;
+        while let Some(&std::cmp::Reverse((t, key))) = self.ts_sleep.peek() {
+            if t > now {
+                break;
+            }
+            self.ts_sleep.pop();
+            let Some(rec) = self.ts_sleep_recs[key as usize].take() else { continue };
+            self.ts_sleep_free.push(key);
+            let idx = rec.idx as usize;
+            // One evaluation cadence, from the interpreted evaluations the
+            // block made while asleep; a block that never ran gets a whole
+            // sleep's worth, so its next bail counts as immediate.
+            let evals = {
+                let a = if rec.kind == 2 { &mut self.ts_asleep_edge } else { &mut self.ts_asleep_comb };
+                let e = a.get(idx).copied().unwrap_or(1).saturating_sub(1) as u64;
+                if let Some(x) = a.get_mut(idx) {
+                    *x = 0;
+                }
+                e
+            };
+            let slept = now.saturating_sub(rec.slept_at).max(1);
+            let cadence = if evals == 0 { slept } else { (slept / evals).max(1) };
+            {
+                let v = if rec.kind == 2 { &mut self.ts_edge_xb } else { &mut self.ts_comb_xb };
+                if let Some(e) = v.get_mut(idx) {
+                    // Four cadences: event-driven blocks evaluate in bursts,
+                    // and a persistent bailer must not be mistaken for a
+                    // clean one because its next evaluation came late.
+                    e.2 = now + cadence * 4;
+                }
+            }
+            match rec.kind {
+                0 => {
+                    if let (Some(p), Some(plan)) = (self.comb_plan.get_mut(idx), rec.plan) {
+                        *p = plan;
+                    }
+                    if rec.len_kind != 0 {
+                        if let Some(h) = self.ts_hdr.get_mut(idx) {
+                            h.len_kind = rec.len_kind;
+                        }
+                    }
+                }
+                1 => {
+                    if let (Some(sl), Some(slot)) = (self.ts_comb.get_mut(idx), rec.slot) {
+                        *sl = slot;
+                    }
+                }
+                _ => {
+                    if let (Some(sl), Some(slot)) = (self.ts_edge.get_mut(idx), rec.slot) {
+                        *sl = slot;
+                    }
+                }
+            }
+        }
+    }
+
     fn ts_guard_and_exec(&mut self, ts: &super::bytecode::TwoStateBlock) -> bool {
         self.ts_exec_aborted = false;
+        self.ts_last_xbail = false;
         if self.warn_x {
             self.prof_ts_bail_warnx += 1;
             return false;
@@ -21820,6 +22027,7 @@ impl Simulator {
             self.ts_restore_saved(save_base);
             if std::mem::take(&mut self.ts_xread_bail) {
                 self.prof_ts_bail_xread += 1;
+                self.ts_last_xbail = true;
                 return false;
             }
             self.prof_ts_bail_abort += 1;
@@ -21898,7 +22106,9 @@ impl Simulator {
     /// `Vec` — the executor's cycles were dominated by those two misses.
     fn ts_guard_and_exec_arena(&mut self, eidx: usize) -> bool {
         let h = self.ts_hdr[eidx];
+        self.ts_cur_eidx = eidx as u32;
         self.ts_exec_aborted = false;
+        self.ts_last_xbail = false;
         if self.warn_x {
             self.prof_ts_bail_warnx += 1;
             return false;
@@ -22932,6 +23142,13 @@ impl Simulator {
     /// Straight-line executor — no pc bookkeeping, compact codegen for the
     /// dominant comb shape. Control-flow variants are unreachable here
     /// (`has_ctrl` routed them to the pc-loop twin).
+    ///
+    /// Kept a function of its own: with a single caller LLVM inlined it into
+    /// the dispatcher once the arm set grew, and the tiny core accessors
+    /// inside (`Value::raw_bits`) then fell out of the inlining budget and
+    /// became calls — a C910 SoC ran 1% more instructions with nothing new
+    /// executing.
+    #[inline(never)]
     fn exec_two_state_line(&mut self, insns: &[super::bytecode::TsInsn], num_regs: u32) -> bool {
         use super::bytecode::TsInsn;
         // Registers live in `self.ts_regs` and are used in place: no callee
@@ -24016,6 +24233,8 @@ impl Simulator {
 
     /// Control executor entered at stream index `start` (process FSMs resume
     /// mid-stream); a wait opcode records the suspend and returns true.
+    /// Standalone for the same reason as `exec_two_state_line`.
+    #[inline(never)]
     fn exec_two_state_ctrl_from(
         &mut self,
         insns: &[super::bytecode::TsInsn],
@@ -27971,8 +28190,12 @@ impl Simulator {
                 // Raw view instead of an `Arc` clone per fire: the slot is
                 // only replaced below, after the executor has returned.
                 let tp: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
-                if self.ts_guard_and_exec(unsafe { &*tp }) {
+                let ok = self.ts_guard_and_exec(unsafe { &*tp });
+                if ok {
                     return true;
+                }
+                if self.ts_last_xbail {
+                    self.ts_xbail_note(2, block_idx);
                 }
                 if self.ts_exec_aborted {
                     if block_idx >= self.ts_edge_abortn.len() {
@@ -28001,6 +28224,13 @@ impl Simulator {
             }
         }
         // Interpreter path.
+        if !self.ts_sleep.is_empty() {
+            if let Some(c) = self.ts_asleep_edge.get_mut(block_idx) {
+                if *c != 0 {
+                    *c = c.saturating_add(1);
+                }
+            }
+        }
         let (insns_ptr, insns_len, num_regs) = match &self.compiled_edge_blocks[block_idx] {
             Some(cb) => (
                 cb.instructions.as_ptr(),
@@ -52398,6 +52628,9 @@ impl Simulator {
     }
 
     fn settle_combinatorial_inner(&mut self) {
+        if !self.ts_sleep.is_empty() {
+            self.ts_wake_sleepers();
+        }
 
         if self.settling {
             return;
@@ -53099,6 +53332,9 @@ if self.profile_report {
                         self.ts_direct_writes = true;
                         let ok = self.ts_guard_and_exec_arena(eidx);
                         self.ts_direct_writes = false;
+                        if !ok && self.ts_last_xbail {
+                            self.ts_xbail_note(0, eidx);
+                        }
                         #[cfg(feature = "jit")]
                         if ok && self.ts_jit_on {
                             if self.ts_jit_evals.len() <= eidx {
@@ -53133,6 +53369,9 @@ if self.profile_report {
                         self.ts_cur_eidx = eidx as u32;
                         let ok = self.ts_guard_and_exec(unsafe { &*tp });
                         self.ts_direct_writes = false;
+                        if !ok && self.ts_last_xbail {
+                            self.ts_xbail_note(0, eidx);
+                        }
                         if ok {
                             ts_fast = true;
                             n_dc += 1;
@@ -53143,6 +53382,13 @@ if self.profile_report {
                     }
                 }
                 if !ts_fast {
+                if !self.ts_sleep.is_empty() {
+                    if let Some(c) = self.ts_asleep_comb.get_mut(eidx) {
+                        if *c != 0 {
+                            *c = c.saturating_add(1);
+                        }
+                    }
+                }
                 match &entries[eidx].item {
                     CombItem::Noop => {}
                     CombItem::FastDirectCopy { dst_id, src_id } => {
