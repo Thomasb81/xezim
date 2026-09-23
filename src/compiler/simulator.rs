@@ -21931,6 +21931,33 @@ impl Simulator {
                 rec.slot = Some(std::mem::replace(sl, TsSlot::No));
             }
         }
+        // XEZIM_TS_DBG: which streams sleep, by opcode set (census input).
+        static SLEEP_DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SLEEP_DBG.get_or_init(|| std::env::var_os("XEZIM_TS_DBG").is_some()) {
+            let stream: Option<&[super::bytecode::TsInsn]> = match (&rec.plan, &rec.slot) {
+                (Some(CombPlan::Ts(b)), _) => Some(&b.insns),
+                (_, Some(TsSlot::Yes(b))) => Some(&b.insns),
+                _ if rec.len_kind != 0 => {
+                    let off = self.ts_hdr[idx].off as usize;
+                    let len = (rec.len_kind as usize) & TS_HDR_LEN_MAX;
+                    Some(&self.ts_arena[off..off + len])
+                }
+                _ => None,
+            };
+            let mut ops: Vec<String> = stream
+                .map(|s| {
+                    s.iter()
+                        .map(|i| {
+                            let d = format!("{i:?}");
+                            d[..d.find(|c: char| c == '(' || c == ' ' || c == '{').unwrap_or(d.len())].to_string()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            ops.sort_unstable();
+            ops.dedup();
+            eprintln!("[TS-SLEEP] kind={} idx={} streak={} len={} ops={}", kind, idx, *streak, stream.map_or(0, |s| s.len()), ops.join(","));
+        }
         let key = match self.ts_sleep_free.pop() {
             Some(k) => {
                 self.ts_sleep_recs[k as usize] = Some(rec);
@@ -21969,6 +21996,10 @@ impl Simulator {
             };
             let slept = now.saturating_sub(rec.slept_at).max(1);
             let cadence = if evals == 0 { slept } else { (slept / evals).max(1) };
+            static WAKE_DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *WAKE_DBG.get_or_init(|| std::env::var_os("XEZIM_TS_DBG").is_some()) {
+                eprintln!("[TS-WAKE] kind={} idx={} evals={}", rec.kind, idx, evals);
+            }
             {
                 let v = if rec.kind == 2 { &mut self.ts_edge_xb } else { &mut self.ts_comb_xb };
                 if let Some(e) = v.get_mut(idx) {
