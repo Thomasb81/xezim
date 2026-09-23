@@ -14759,6 +14759,10 @@ pub fn lower_two_state(
     // are exact only on an x-free selector; the x-plane executor does not
     // get such streams (a z selector bit is a wildcard there, not an x).
     let mut has_wild_case = false;
+    // `===` lowers to the same `Eq`/`EqC` as `==` (they agree on x-free
+    // operands); only the x-plane executor would tell them apart, so a
+    // stream with a case equality stays off it.
+    let mut has_case_eq = false;
     let mut wait_regs: Vec<(u32, Box<[(u16, u32, bool)]>)> = Vec::new();
     let mut skip_next = false;
     // Resume points are moved back onto the hazard saves that follow the
@@ -15547,6 +15551,9 @@ pub fn lower_two_state(
                 }
             }
             Insn::Eq(d, a, b) | Insn::CaseEq(d, a, b) => {
+                if matches!(insn, Insn::CaseEq(..)) {
+                    has_case_eq = true;
+                }
                 let wa = narrow_reg!(rw, *a, "wide operand (eq)");
                 let wb = narrow_reg!(rw, *b, "wide operand (eq)");
                 if sg[*a as usize] && sg[*b as usize] && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
@@ -15648,6 +15655,9 @@ pub fn lower_two_state(
                         out.push(TsInsn::XorC { d: *d as u16, s: *s as u16, k: v });
                     }
                     BinOpConstKind::Eq | BinOpConstKind::CaseEq => {
+                        if matches!(kind, BinOpConstKind::CaseEq) {
+                            has_case_eq = true;
+                        }
                         def!(rw, *d, 1);
                         out.push(TsInsn::EqC { d: *d as u16, s: *s as u16, k: v });
                     }
@@ -16857,7 +16867,7 @@ pub fn lower_two_state(
             eprintln!("[TS-DUMP]   {i:>3} {ti:?}");
         }
     }
-    let tsx = !has_wide && !has_wait && !has_wild_case && out.iter().all(tsx_insn_ok);
+    let tsx = !has_wide && !has_wait && !has_wild_case && !has_case_eq && out.iter().all(tsx_insn_ok);
     Some(TwoStateBlock {
         insns: out,
         num_regs: cb.num_regs,

@@ -131,3 +131,28 @@ fn x_plane_executor_matches_the_four_state_vm() {
     }
     assert!(stat(&text, "x_plane_runs=") >= 100, "the x-plane executor did not run:\n{text}");
 }
+
+/// `===` and `!==` lower to the same two-state compare as `==`/`!=` (they
+/// agree on x-free operands), so a stream holding a case equality must not
+/// take the x-plane path, where `==` yields x on an x operand but `===`
+/// compares the x bits exactly. The first x-plane build answered x here.
+#[test]
+fn case_equality_on_x_operands_stays_exact() {
+    let text = run(
+        "case_eq_x",
+        r#"
+module tb;
+  wire [7:0] a = 8'b1101x001;
+  wire [7:0] b = 8'b1101x001;
+  wire [7:0] m = 8'b1101z001;
+  wire c, d, e, f;
+  assign c = a === b;
+  assign d = a !== b;
+  assign e = a === 8'b1101x001;
+  assign f = a === m;
+  final $display("CASEEQ %b %b %b %b %b", c, d, e, f, a == b);
+endmodule
+"#,
+    );
+    assert!(text.lines().any(|l| l == "CASEEQ 1 0 1 0 x"), "case equality on x operands:\n{text}");
+}
