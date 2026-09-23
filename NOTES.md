@@ -140,6 +140,16 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* A two-state block that reads an x or z bit no longer re-runs on the
+  four-state VM: the same lowered stream runs on an x-plane executor that
+  applies the VM's four-state rules (Kleene logic, `&&`/`||`/`!` through
+  definite-1/definite-0/unknown, ambiguous equality, all-x arithmetic,
+  plane shifts, an x selector merging its arms, `if (x)` taking the else
+  arm, an x index reading all-x and writing nothing). On the SoC
+  benchmarks three quarters of what the VM still executed were such
+  re-runs — tiny muxes whose unselected arm or an unwritten register file
+  holds x. `XEZIM_TS_X=0` restores the VM re-run; `x_plane_runs=` counts
+  them in the profile report.
 * Dynamically indexed reads of memory elements wider than 64 bits — a
   vector register file, a cache-line array — now run on the two-state
   executor, both as operands (`vrf[rs]` in wide logic) and as the fused

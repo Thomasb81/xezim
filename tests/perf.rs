@@ -23,3 +23,5 @@ mod design_shape_regression;
 mod loop_block_counters;
 #[path = "perf/wide_block_counters.rs"]
 mod wide_block_counters;
+#[path = "perf/x_plane_executor.rs"]
+mod x_plane_executor;

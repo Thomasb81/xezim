@@ -2043,6 +2043,8 @@ impl NbaFastIndex {
     }
 }
 
+mod ts_x;
+
 #[cfg(test)]
 mod nba_fast_index_tests {
     use super::{
@@ -6003,6 +6005,13 @@ pub struct Simulator {
     ts_edge: Vec<TsSlot>,
     /// Two-state scratch register file (u64 words).
     ts_regs: Vec<u64>,
+    /// x/z planes of `ts_regs` for the x-plane executor.
+    ts_xregs: Vec<u64>,
+    /// Per arena header: the stream is x-plane runnable (`TwoStateBlock::tsx`).
+    ts_hdr_tsx: Vec<u8>,
+    /// x-plane executor enabled (`XEZIM_TS_X=0` disables).
+    tsx_on: bool,
+    prof_tsx_evals: u64,
     /// Wide (65..=128-bit) two-state register bank; same index space as
     /// `ts_regs` (a register's bank is static, decided at lower time).
     /// Wide two-state banks, flat words viewed as `[u64; N]` registers:
@@ -9596,6 +9605,10 @@ impl Simulator {
             ts_hdr: Vec::new(),
             ts_edge: Vec::new(),
             ts_regs: Vec::new(),
+            ts_xregs: Vec::new(),
+            ts_hdr_tsx: Vec::new(),
+            tsx_on: std::env::var("XEZIM_TS_X").ok().as_deref() != Some("0"),
+            prof_tsx_evals: 0,
             ts_wregs: Vec::new(),
             ts_wregs8: Vec::new(),
             prof_ts_evals: 0,
@@ -21420,6 +21433,10 @@ impl Simulator {
                                     | ((Self::ts_kind_of(&ts) as u16) << TS_HDR_KIND_SHIFT),
                                 num_regs: ts.num_regs as u16,
                             };
+                            if self.ts_hdr_tsx.len() <= eidx {
+                                self.ts_hdr_tsx.resize(eidx + 1, 0);
+                            }
+                            self.ts_hdr_tsx[eidx] = ts.tsx as u8;
                         }
                         TsSlot::Yes(std::sync::Arc::new(ts))
                     }
@@ -22060,6 +22077,14 @@ impl Simulator {
         if !self.exec_two_state(ts) {
             self.ts_restore_saved(save_base);
             if std::mem::take(&mut self.ts_xread_bail) {
+                // An x read: run the same stream on x-planes instead of
+                // handing the block to the four-state VM.
+                if ts.tsx && self.tsx_on && self.exec_two_state_x(&ts.insns, ts.num_regs) {
+                    self.ts_save_list.truncate(save_base);
+                    self.prof_tsx_evals += 1;
+                    self.prof_ts_evals += 1;
+                    return true;
+                }
                 self.prof_ts_bail_xread += 1;
                 self.ts_last_xbail = true;
                 return false;
@@ -22166,6 +22191,15 @@ impl Simulator {
         if !self.exec_two_state_parts(insns, h.num_regs as u32, h.kind()) {
             self.ts_restore_saved(save_base);
             if std::mem::take(&mut self.ts_xread_bail) {
+                if self.tsx_on
+                    && self.ts_hdr_tsx.get(eidx).copied().unwrap_or(0) != 0
+                    && self.exec_two_state_x(insns, h.num_regs as u32)
+                {
+                    self.ts_save_list.truncate(save_base);
+                    self.prof_tsx_evals += 1;
+                    self.prof_ts_evals += 1;
+                    return true;
+                }
                 self.prof_ts_bail_xread += 1;
                 #[cfg(feature = "opcode-census")]
                 {
@@ -22396,7 +22430,7 @@ impl Simulator {
                 TsInsn::Or { d, a, b } => {
                     regs[*d as usize] = regs[*a as usize] | regs[*b as usize];
                 }
-                TsInsn::Sel { d, c, a, b } => {
+                TsInsn::Sel { d, c, a, b, .. } => {
                     regs[*d as usize] = if regs[*c as usize] != 0 {
                         regs[*a as usize]
                     } else {
@@ -23313,7 +23347,7 @@ impl Simulator {
                 TsInsn::Or { d, a, b } => {
                     r!(*d) = r!(*a) | r!(*b);
                 }
-                TsInsn::Sel { d, c, a, b } => {
+                TsInsn::Sel { d, c, a, b, .. } => {
                     r!(*d) = if r!(*c) != 0 {
                         r!(*a)
                     } else {
@@ -24511,7 +24545,7 @@ impl Simulator {
                 TsInsn::Or { d, a, b } => {
                     (*rp.add(*d as usize)) = (*rp.add(*a as usize)) | (*rp.add(*b as usize));
                 }
-                TsInsn::Sel { d, c, a, b } => {
+                TsInsn::Sel { d, c, a, b, .. } => {
                     (*rp.add(*d as usize)) = if (*rp.add(*c as usize)) != 0 {
                         (*rp.add(*a as usize))
                     } else {
@@ -40944,11 +40978,12 @@ impl Simulator {
             > 0
         {
             eprintln!(
-                "[PROF] two_state_bail warn_x={} forced_write={} x_read={} run_abort={}",
+                "[PROF] two_state_bail warn_x={} forced_write={} x_read={} run_abort={} x_plane_runs={}",
                 self.prof_ts_bail_warnx,
                 self.prof_ts_bail_forced,
                 self.prof_ts_bail_xread,
-                self.prof_ts_bail_abort
+                self.prof_ts_bail_abort,
+                self.prof_tsx_evals
             );
         }
         if self.profile_report {

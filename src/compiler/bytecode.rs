@@ -13913,7 +13913,9 @@ pub enum TsInsn {
     /// conditional. Two-state values are X-free by the eval-site prefilter,
     /// so the 4-state arm's unknown-condition bit-merge cannot arise and the
     /// selector reduces to plain SV truthiness (non-zero).
-    Sel { d: u16, c: u16, a: u16, b: u16 },
+    /// `m`: the result width mask, used only by the x-plane executor's
+    /// merge of the two arms under an x selector.
+    Sel { d: u16, c: u16, a: u16, b: u16, m: u64 },
     /// regs[d] = !regs[s] & mask (mask = source width).
     Not { d: u16, s: u16, mask: u64 },
     XorC { d: u16, s: u16, k: u64 },
@@ -14213,6 +14215,9 @@ pub struct TwoStateBlock {
     /// resume pc, the registers the stream defines there as (reg, width,
     /// signed) — the set a VM re-run converts from and to.
     pub has_wait: bool,
+    /// Every instruction has an x-plane form and the stream needs no
+    /// wide bank: the x-plane executor can run it after an x-read bail.
+    pub tsx: bool,
     pub vm_to_ts: Box<[u32]>,
     pub wait_regs: Box<[(u32, Box<[(u16, u32, bool)]>)]>,
     /// Wide (>64-bit) signals read WHOLE — X-checked via words_if_clean.
@@ -14227,6 +14232,40 @@ pub struct TwoStateBlock {
     /// write can land on any id in the span, so a forced id inside one
     /// disqualifies the block.
     pub writes_span: Box<[(u32, u32)]>,
+}
+
+/// Can the x-plane executor run this instruction? Everything except the
+/// wide bank, process waits and AST fallbacks.
+pub fn tsx_insn_ok(i: &TsInsn) -> bool {
+    !matches!(
+        i,
+        TsInsn::Fallback(..)
+            | TsInsn::WaitEdge { .. }
+            | TsInsn::WaitDelayRaw { .. }
+            | TsInsn::WRedOr { .. }
+            | TsInsn::WRedAnd { .. }
+            | TsInsn::WSel { .. }
+            | TsInsn::WLoadSig { .. }
+            | TsInsn::WConst { .. }
+            | TsInsn::WXor { .. }
+            | TsInsn::WAnd { .. }
+            | TsInsn::WOr { .. }
+            | TsInsn::WNot { .. }
+            | TsInsn::WRange { .. }
+            | TsInsn::RangeFromW { .. }
+            | TsInsn::BitFromW { .. }
+            | TsInsn::WConcat { .. }
+            | TsInsn::WMask { .. }
+            | TsInsn::WFromN { .. }
+            | TsInsn::NFromW { .. }
+            | TsInsn::WStore { .. }
+            | TsInsn::WStoreNba { .. }
+            | TsInsn::WRangeStore { .. }
+            | TsInsn::WRangeStoreNba { .. }
+            | TsInsn::WSigRange { .. }
+            | TsInsn::WRepl { .. }
+            | TsInsn::WElemLoad(..)
+    )
 }
 
 fn ts_mask(w: u32) -> u64 {
@@ -14716,6 +14755,10 @@ pub fn lower_two_state(
     let mut max_wide: u32 = 0;
     // Process-FSM wait bookkeeping (see `TwoStateBlock::has_wait`).
     let mut has_wait = false;
+    // Wildcard compares (`casez`/`casex`) lower to masked equalities that
+    // are exact only on an x-free selector; the x-plane executor does not
+    // get such streams (a z selector bit is a wildcard there, not an x).
+    let mut has_wild_case = false;
     let mut wait_regs: Vec<(u32, Box<[(u16, u32, bool)]>)> = Vec::new();
     let mut skip_next = false;
     // Resume points are moved back onto the hazard saves that follow the
@@ -15377,7 +15420,7 @@ pub fn lower_two_state(
                 def!(rw, *d, wa);
                 sg[*d as usize] = sg[*a as usize] && sg[*b as usize];
                 let (d, c, a, b) = (*d as u16, *c as u16, *a as u16, *b as u16);
-                out.push(if wa > 64 { TsInsn::WSel { d, c, a, b } } else { TsInsn::Sel { d, c, a, b } });
+                out.push(if wa > 64 { TsInsn::WSel { d, c, a, b } } else { TsInsn::Sel { d, c, a, b, m: ts_mask(wa) } });
             }
             Insn::BitXor(d, a, b) | Insn::BitAnd(d, a, b) | Insn::BitOr(d, a, b) => {
                 let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
@@ -15472,6 +15515,7 @@ pub fn lower_two_state(
             Insn::BlockingAssignString(..) => return None,
             // 1-bit results. CaseEq/CaseNeq equal Eq/Neq on X-free values.
             Insn::CasezEq(d, a, b) | Insn::CasexEq(d, a, b) => {
+                has_wild_case = true;
                 let sw = narrow_reg!(rw, *a, "wide operand (casez)");
                 let Some(pw) = rw[*b as usize] else {
                     gate!("casez pattern width unknown");
@@ -15823,6 +15867,7 @@ pub fn lower_two_state(
                 out.push(TsInsn::CaseJmp { s: *src as u16, cj: cj.clone() });
             }
             Insn::CaseMaskJump(src, mj) => {
+                has_wild_case = true;
                 let sw = rw[*src as usize]?;
                 if sw > 64 {
                     gate!("casemaskjump sel >64b");
@@ -16812,6 +16857,7 @@ pub fn lower_two_state(
             eprintln!("[TS-DUMP]   {i:>3} {ti:?}");
         }
     }
+    let tsx = !has_wide && !has_wait && !has_wild_case && out.iter().all(tsx_insn_ok);
     Some(TwoStateBlock {
         insns: out,
         num_regs: cb.num_regs,
@@ -16827,6 +16873,7 @@ pub fn lower_two_state(
             2
         },
         has_wait,
+        tsx,
         vm_to_ts: if has_wait { idx_map.clone().into_boxed_slice() } else { Box::new([]) },
         wait_regs: wait_regs.into_boxed_slice(),
         reads_wide: reads_wide.into_boxed_slice(),

@@ -230,6 +230,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ("XEZIM_TS_JIT_HOT", "Two-state native code: compile a stream after this many evaluations (default 64)"),
     ("XEZIM_TS_JIT_RESERVE_MB", "Two-state native code: size of the reserved code region (default 256)"),
     ("XEZIM_TS_WIDE512", "Two-state: set to 0 to keep blocks with registers wider than 128 bits on the interpreter (default on)"),
+    ("XEZIM_TS_X", "Two-state: set to 0 to disable the x-plane executor (blocks that read x re-run on the four-state VM instead)"),
     ("XEZIM_TWO_STATE", "Two-state u64 fast path: 0 disables (default on)"),
     ("XEZIM_UNRESOLVED_DUMP", "Comb settle: name the entries that re-evaluate on every settle call"),
     ("XEZIM_UPF_DUMP", "UPF: print the generated power-intent package and glue processes"),
