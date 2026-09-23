@@ -169,3 +169,5 @@ mod instance_block_locals_shadow_module_names;
 mod instance_collections_resolve_by_scope;
 #[path = "hierarchy/vif_packed_array_elem_nba.rs"]
 mod vif_packed_array_elem_nba;
+#[path = "hierarchy/interface_task_lexical_scope.rs"]
+mod interface_task_lexical_scope;

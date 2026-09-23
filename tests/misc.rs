@@ -357,3 +357,5 @@ mod stdout_flush_at_sim_finish;
 mod elaboration_shape_fixes;
 #[path = "misc/nettype_net_in_submodule.rs"]
 mod nettype_net_in_submodule;
+#[path = "misc/cross_checked_constructs.rs"]
+mod cross_checked_constructs;

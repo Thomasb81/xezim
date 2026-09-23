@@ -97,3 +97,5 @@ mod foreach_live_size_bounds;
 mod foreach_packed_multidim;
 #[path = "collections/std_randomize_multidim.rs"]
 mod std_randomize_multidim;
+#[path = "collections/builtin_class_construction_forms.rs"]
+mod builtin_class_construction_forms;

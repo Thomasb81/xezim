@@ -51,3 +51,5 @@ mod interrupt_finalizes_dumps;
 mod cont_assign_packed2d_unit_inner;
 #[path = "gates/const_cont_assign_time0_seed.rs"]
 mod const_cont_assign_time0_seed;
+#[path = "gates/timing_checks_notifier.rs"]
+mod timing_checks_notifier;

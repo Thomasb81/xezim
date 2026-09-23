@@ -1337,3 +1337,144 @@ fn uvm_2020_printer_renders_enum_array_members() {
     );
 }
 
+
+/// A throughput-shaped bench — constrained items (`dist`, implication,
+/// ranges) through sequencer, driver (clocking block), monitor (covergroup
+/// with a cross), analysis port and scoreboard (associative array) — run
+/// short: every item must reach the scoreboard, with no UVM error and no
+/// failed `randomize()`. The same bench at 10 k-200 k items is the
+/// UVM-throughput benchmark (xezim ~4.9 ms per item, the reference
+/// simulator ~58 us).
+const STRESS_BENCH: &str = r#"
+`include "uvm_macros.svh"
+interface bus_if(input logic clk);
+  logic valid; logic [31:0] addr; logic [31:0] data; logic [3:0] kind;
+  clocking cb @(posedge clk); output valid, addr, data, kind; endclocking
+  clocking mcb @(posedge clk); input valid, addr, data, kind; endclocking
+endinterface
+package stress_pkg;
+  import uvm_pkg::*;
+  class item extends uvm_sequence_item;
+    rand bit [31:0] addr; rand bit [31:0] data; rand bit [3:0] kind; rand bit [7:0] len;
+    constraint c_addr { addr[1:0] == 0; addr inside {[32'h1000:32'h8FFF]}; }
+    constraint c_kind { kind dist { 0 := 40, [1:7] :/ 40, [8:15] :/ 20 }; }
+    constraint c_len  { if (kind < 4) len inside {[1:16]}; else len inside {[17:64]}; }
+    `uvm_object_utils_begin(item)
+      `uvm_field_int(addr, UVM_ALL_ON) `uvm_field_int(data, UVM_ALL_ON)
+      `uvm_field_int(kind, UVM_ALL_ON) `uvm_field_int(len, UVM_ALL_ON)
+    `uvm_object_utils_end
+    function new(string name = "item"); super.new(name); endfunction
+  endclass
+  class seq extends uvm_sequence #(item);
+    `uvm_object_utils(seq)
+    int n = 80;
+    function new(string name = "seq"); super.new(name); endfunction
+    task body();
+      void'($value$plusargs("N=%d", n));
+      repeat (n) begin
+        item it = item::type_id::create("it");
+        start_item(it);
+        if (!it.randomize()) `uvm_error("SEQ", "randomize failed")
+        finish_item(it);
+      end
+    endtask
+  endclass
+  class drv extends uvm_driver #(item);
+    `uvm_component_utils(drv)
+    virtual bus_if vif;
+    function new(string n, uvm_component p); super.new(n, p); endfunction
+    function void build_phase(uvm_phase phase);
+      if (!uvm_config_db#(virtual bus_if)::get(this, "", "vif", vif)) `uvm_fatal("DRV", "no vif")
+    endfunction
+    task run_phase(uvm_phase phase);
+      vif.cb.valid <= 0;
+      forever begin
+        seq_item_port.get_next_item(req);
+        @(vif.cb); vif.cb.valid <= 1; vif.cb.addr <= req.addr; vif.cb.data <= req.data; vif.cb.kind <= req.kind;
+        @(vif.cb); vif.cb.valid <= 0;
+        seq_item_port.item_done();
+      end
+    endtask
+  endclass
+  class mon extends uvm_monitor;
+    `uvm_component_utils(mon)
+    virtual bus_if vif; uvm_analysis_port #(item) ap;
+    covergroup cg with function sample(bit [3:0] k, bit [31:0] a);
+      cp_k: coverpoint k;
+      cp_a: coverpoint a[15:12] { bins lo[] = {[1:4]}; bins hi = {[5:8]}; }
+      x: cross cp_k, cp_a;
+    endgroup
+    function new(string n, uvm_component p); super.new(n, p); ap = new("ap", this); cg = new(); endfunction
+    function void build_phase(uvm_phase phase);
+      void'(uvm_config_db#(virtual bus_if)::get(this, "", "vif", vif));
+    endfunction
+    task run_phase(uvm_phase phase);
+      forever begin
+        @(vif.mcb);
+        if (vif.mcb.valid) begin
+          item t = item::type_id::create("t");
+          t.addr = vif.mcb.addr; t.data = vif.mcb.data; t.kind = vif.mcb.kind;
+          cg.sample(t.kind, t.addr);
+          ap.write(t);
+        end
+      end
+    endtask
+  endclass
+  class sb extends uvm_scoreboard;
+    `uvm_component_utils(sb)
+    uvm_analysis_imp #(item, sb) imp;
+    int unsigned count; bit [31:0] sig; int kinds[int];
+    function new(string n, uvm_component p); super.new(n, p); imp = new("imp", this); endfunction
+    function void write(item t);
+      count++; sig = {sig[30:0], sig[31]} ^ t.addr ^ (t.data * 3) ^ t.kind;
+      kinds[t.kind]++;
+    endfunction
+    function void report_phase(uvm_phase phase);
+      `uvm_info("SB", $sformatf("count=%0d sig=%h kinds=%0d", count, sig, kinds.num()), UVM_NONE)
+    endfunction
+  endclass
+  class env extends uvm_env;
+    `uvm_component_utils(env)
+    uvm_sequencer #(item) sqr; drv d; mon m; sb s;
+    function new(string n, uvm_component p); super.new(n, p); endfunction
+    function void build_phase(uvm_phase phase);
+      sqr = uvm_sequencer#(item)::type_id::create("sqr", this);
+      d = drv::type_id::create("d", this); m = mon::type_id::create("m", this); s = sb::type_id::create("s", this);
+    endfunction
+    function void connect_phase(uvm_phase phase);
+      d.seq_item_port.connect(sqr.seq_item_export); m.ap.connect(s.imp);
+    endfunction
+  endclass
+  class test extends uvm_test;
+    `uvm_component_utils(test)
+    env e;
+    function new(string n, uvm_component p); super.new(n, p); endfunction
+    function void build_phase(uvm_phase phase); e = env::type_id::create("e", this); endfunction
+    task run_phase(uvm_phase phase);
+      seq s = seq::type_id::create("s");
+      phase.raise_objection(this);
+      s.start(e.sqr);
+      #20;
+      phase.drop_objection(this);
+    endtask
+  endclass
+endpackage
+module tb;
+  import uvm_pkg::*; import stress_pkg::*;
+  logic clk = 0; always #5 clk = ~clk;
+  bus_if bif(clk);
+  initial begin
+    uvm_config_db#(virtual bus_if)::set(null, "*", "vif", bif);
+    run_test("test");
+  end
+endmodule
+"#;
+
+#[test]
+fn stress_bench_items_flow_end_to_end_1_2() {
+    let sim = run_uvm("1.2", &[], STRESS_BENCH.to_string(), "tb").expect("simulate failed");
+    let o: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(o.iter().any(|l| l.contains("[SB] count=80 ")), "not every item reached the scoreboard: {o:?}");
+    assert!(!o.iter().any(|l| l.contains("randomize failed")), "{o:?}");
+    assert!(o.iter().any(|l| l.contains("UVM_ERROR :    0")), "{o:?}");
+}

@@ -293,3 +293,9 @@ mod implication_joint_distribution;
 mod array_of_collections_property;
 #[path = "classes/class_array_property_select.rs"]
 mod class_array_property_select;
+#[path = "classes/randomize_joint_constraints.rs"]
+mod randomize_joint_constraints;
+#[path = "classes/covergroup_bin_arithmetic.rs"]
+mod covergroup_bin_arithmetic;
+#[path = "classes/type_param_replication_localparam.rs"]
+mod type_param_replication_localparam;
