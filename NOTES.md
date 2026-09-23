@@ -154,19 +154,13 @@ and the development workflow are in [README.md](README.md).
   it sleeps, doubling the sleep while the bails continue, and wakes for one
   attempt so a value that clears after reset gets its fast path back. x-read
   bails on a c906 SoC fall by 72%.
-* `tests/perf/loop_block_counters.rs` guards this path with work-counter
-  ceilings (two-state admission, bytecode length, backoff engagement).
-* Clocked blocks whose range-store bounds only become constants after
-  folding — a generate arm writing `v[g*8 +: 8]` or `mem[g][7:4]` — now
-  compile to constant range stores on the element, which the two-state
-  executor runs; the dynamic and array forms they used to take kept the
-  whole block on the four-state VM (16 such flops on a c906 SoC, 400 on a
-  C910 SoC).
-* A block that bails on an x read every time it runs (an unwritten memory
-  element it keeps reading) no longer pays the two-state entry and guard on
-  every evaluation before running interpreted: after eight bails in a row
-  it sleeps, doubling the sleep while the bails continue, and wakes for one
-  attempt so a value that clears after reset gets its fast path back.
+* Combinational blocks with registers wider than 128 bits — up to 512 —
+  run on the two-state executor by default now (`XEZIM_TS_WIDE512=0`
+  restores the old behaviour). Three shapes that kept such blocks on the
+  four-state VM lower as well: a bus read and then rewritten in the same
+  block (`bus = {bus[..], ..}`), a mux between two wide values, and a
+  wide `'x` reset default (`{N{1'bx}}`). c906 memcpy runs 1.2% fewer
+  instructions from the wide class alone, a C910 SoC 2.5%.
 * `tests/perf/loop_block_counters.rs` guards this path with work-counter
   ceilings (two-state admission, bytecode length, backoff engagement).
 * The bytecode such blocks compile to is leaner first: a loop variable's

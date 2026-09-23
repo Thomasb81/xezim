@@ -4119,6 +4119,9 @@ impl std::ops::DerefMut for SignalMap {
 
 /// Mid-exec ts aborts tolerated per block before demotion.
 const TS_ABORT_DEMOTE: u16 = 8;
+/// Flag bit in a `ts_save_list` id marking a wide save entry (signal ids
+/// stay below it).
+const TS_SAVE_WIDE: u32 = 1 << 31;
 /// Consecutive x-read bails before a block is put to sleep.
 const TS_XBAIL_STREAK: u8 = 8;
 /// First sleep, in successful two-state evaluations design-wide (about half
@@ -22737,7 +22740,11 @@ impl Simulator {
                 // so the executor loop's register allocation stays as it was
                 // (three inline arms cost a c906 SoC 0.8%, outlined bodies
                 // still 0.5%).
-                insn @ (TsInsn::SigRangeDyn { .. } | TsInsn::RangeStoreDyn { .. } | TsInsn::RangeStoreNbaDyn { .. }) => {
+                insn @ (TsInsn::SigRangeDyn { .. }
+                | TsInsn::RangeStoreDyn { .. }
+                | TsInsn::RangeStoreNbaDyn { .. }
+                | TsInsn::SaveSigW { .. }
+                | TsInsn::RangeFillXW { .. }) => {
                     match unsafe { self.ts_exec_dyn(insn, regs.as_mut_ptr()) } {
                         0 => {}
                         1 => return false,
@@ -23061,6 +23068,10 @@ impl Simulator {
                         r[i] = x[i] & y[i];
                     }
                     wregs[*d as usize] = r;
+                }
+                TsInsn::WSel { d, c, a, b } => {
+                    let pick = if regs[*c as usize] != 0 { *a } else { *b };
+                    wregs[*d as usize] = wregs[pick as usize];
                 }
                 TsInsn::WOr { d, a, b } => {
                     let (x, y) = (wregs[*a as usize], wregs[*b as usize]);
@@ -23587,7 +23598,11 @@ impl Simulator {
                 // so the executor loop's register allocation stays as it was
                 // (three inline arms cost a c906 SoC 0.8%, outlined bodies
                 // still 0.5%).
-                TsInsn::SigRangeDyn { .. } | TsInsn::RangeStoreDyn { .. } | TsInsn::RangeStoreNbaDyn { .. } => {
+                TsInsn::SigRangeDyn { .. }
+                | TsInsn::RangeStoreDyn { .. }
+                | TsInsn::RangeStoreNbaDyn { .. }
+                | TsInsn::SaveSigW { .. }
+                | TsInsn::RangeFillXW { .. } => {
                     match unsafe { self.ts_exec_dyn(insn, rp) } {
                         0 => {}
                         1 => return false,
@@ -23794,6 +23809,7 @@ impl Simulator {
                 | TsInsn::WXor { .. }
                 | TsInsn::WAnd { .. }
                 | TsInsn::WOr { .. }
+                | TsInsn::WSel { .. }
                 | TsInsn::WNot { .. }
                 | TsInsn::WRange { .. }
                 | TsInsn::RangeFromW { .. }
@@ -23928,9 +23944,70 @@ impl Simulator {
     /// Undo the two-state stores to the block's read-after-write signals
     /// (`TsInsn::SaveSig`), oldest value last, so the four-state re-run after
     /// a bail starts from what the block saw.
+    /// `sig[hi:lo] = {N{1'bx}}` / `{N{1'bz}}` on a wide signal: both planes
+    /// filled, 64 bits at a time.
+    fn ts_wide_range_fill_xz(&mut self, id: usize, lo: u32, hi: u32, vbit: u8) {
+        let fill_v = if vbit != 0 { u64::MAX } else { 0 };
+        let mut pos = lo as usize;
+        let end = hi as usize + 1;
+        let mut changed = false;
+        while pos < end {
+            let n = (end - pos).min(64);
+            let m = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+            if self.signal_table[id].splice_bits64(pos, fill_v & m, m, n) {
+                changed = true;
+            }
+            pos += n;
+        }
+        if !changed {
+            return;
+        }
+        self.sync_mirror(id);
+        if self.ts_direct_writes {
+            if self.dirty_list.last() != Some(&id) {
+                self.dirty_list.push(id);
+            }
+        } else if !self.dirty_signals[id] {
+            self.dirty_signals[id] = true;
+            self.dirty_list.push(id);
+            self.dirty_any = true;
+        }
+        self.table_modified = true;
+        self.after_signal_write(id);
+    }
+
     fn ts_restore_saved(&mut self, base: usize) {
         while self.ts_save_list.len() > base {
             let Some((sig, v, x)) = self.ts_save_list.pop() else { break };
+            if sig & TS_SAVE_WIDE != 0 {
+                // A wide save: `v` words follow, highest first.
+                let id = (sig & !TS_SAVE_WIDE) as usize;
+                let nw = v as usize;
+                let w = self.signal_widths[id] as usize;
+                let mut changed = false;
+                for i in (0..nw).rev() {
+                    let Some((_, wv, wx)) = self.ts_save_list.pop() else { break };
+                    let n = (w - i * 64).min(64);
+                    if self.signal_table[id].splice_bits64(i * 64, wv, wx, n) {
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.sync_mirror(id);
+                    if self.ts_direct_writes {
+                        if self.dirty_list.last() != Some(&id) {
+                            self.dirty_list.push(id);
+                        }
+                    } else if !self.dirty_signals[id] {
+                        self.dirty_signals[id] = true;
+                        self.dirty_list.push(id);
+                        self.dirty_any = true;
+                    }
+                    self.table_modified = true;
+                    self.after_signal_write(id);
+                }
+                continue;
+            }
             let id = sig as usize;
             let entry: &mut Value = &mut self.signal_table[id];
             if entry.raw_bits() == (v, x) {
@@ -24154,6 +24231,26 @@ impl Simulator {
             TsInsn::RangeStoreNbaDyn { sig, i, s, w, sw, mask } => {
                 let (lo, v) = (*regs.add(*i as usize), *regs.add(*s as usize) & mask);
                 (!self.ts_range_store_dyn(*sig, lo, v, *w, *sw, true)) as u8
+            }
+            TsInsn::SaveSigW { sig } => {
+                // One entry per 64-bit word, then a marker (`TS_SAVE_WIDE`
+                // in the id, word count in `v`, `u64::MAX` in `x`) that
+                // `ts_restore_saved` meets first. Rides the narrow save list
+                // so a hazard on a wide signal adds nothing per attempt.
+                let id = *sig as usize;
+                let w = self.signal_widths[id] as usize;
+                let nw = w.div_ceil(64);
+                for i in 0..nw {
+                    let n = (w - i * 64).min(64);
+                    let (wv, wx) = Self::raw_bits_slice(&self.signal_table[id], (i * 64) as u16, n as u16);
+                    self.ts_save_list.push((*sig | TS_SAVE_WIDE, wv, wx));
+                }
+                self.ts_save_list.push((*sig | TS_SAVE_WIDE, nw as u64, u64::MAX));
+                0
+            }
+            TsInsn::RangeFillXW { sig, hi, lo, v } => {
+                self.ts_wide_range_fill_xz(*sig as usize, *lo, *hi, *v);
+                0
             }
             _ => 0,
         }
@@ -24720,7 +24817,11 @@ impl Simulator {
                 // so the executor loop's register allocation stays as it was
                 // (three inline arms cost a c906 SoC 0.8%, outlined bodies
                 // still 0.5%).
-                insn @ (TsInsn::SigRangeDyn { .. } | TsInsn::RangeStoreDyn { .. } | TsInsn::RangeStoreNbaDyn { .. }) => {
+                insn @ (TsInsn::SigRangeDyn { .. }
+                | TsInsn::RangeStoreDyn { .. }
+                | TsInsn::RangeStoreNbaDyn { .. }
+                | TsInsn::SaveSigW { .. }
+                | TsInsn::RangeFillXW { .. }) => {
                     match unsafe { self.ts_exec_dyn(insn, rp) } {
                         0 => {}
                         1 => return false,
@@ -24988,6 +25089,7 @@ impl Simulator {
                 | TsInsn::WXor { .. }
                 | TsInsn::WAnd { .. }
                 | TsInsn::WOr { .. }
+                | TsInsn::WSel { .. }
                 | TsInsn::WNot { .. }
                 | TsInsn::WRange { .. }
                 | TsInsn::RangeFromW { .. }

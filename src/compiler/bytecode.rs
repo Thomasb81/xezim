@@ -14034,6 +14034,15 @@ pub enum TsInsn {
     RangeStoreDyn { sig: u32, i: u16, s: u16, w: u16, sw: u32, mask: u64 },
     /// `sig[i +: w] <= s` at a run-time offset.
     RangeStoreNbaDyn { sig: u32, i: u16, s: u16, w: u16, sw: u32, mask: u64 },
+    /// Save a WIDE (65..=512-bit) signal the block reads before writing,
+    /// so a later bail can restore it; the narrow form is `SaveSig`.
+    SaveSigW { sig: u32 },
+    /// Wide mux: `d = c ? a : b` on the wide register file (`c` narrow).
+    WSel { d: u16, c: u16, a: u16, b: u16 },
+    /// `sig[hi:lo] = {N{bit}}` where the bit is x or z: fill both planes
+    /// (`v` is the value bit, x is always set). A reset default of `'x` on
+    /// a wide bus takes this form.
+    RangeFillXW { sig: u32, hi: u32, lo: u32, v: u8 },
     /// Blocking store of a folded 4-state constant (`y = 'x;`). `v`/`x` are
     /// the raw value/xz planes, already masked to the assigned width.
     ConstStoreX { sig: u32, v: u64, x: u64 },
@@ -14885,13 +14894,17 @@ pub fn lower_two_state(
     };
     for &sig in &hazards {
         let sg = sig as usize;
-        if sg >= signal_widths.len() || signal_widths[sg] > 64 || signal_widths[sg] == 0 || signal_real[sg] {
+        if sg >= signal_widths.len() || signal_widths[sg] > 512 || signal_widths[sg] == 0 || signal_real[sg] {
             if std::env::var_os("XEZIM_TS_DBG").is_some() {
                 TS_BAIL_AT.with(|c| c.set((usize::MAX, "RawHazard")));
+                TS_GATE_WHY.with(|c| c.set("raw hazard on a >512b/real signal"));
             }
             return None;
         }
-        out.push(TsInsn::SaveSig { sig });
+        // A wide read-modify-write (`bus = {bus[..], ..}` on a >64-bit bus)
+        // saves the whole value: cheaper than the interpreter these blocks
+        // ran on, and it was 32% of a C910 SoC's interpreted evaluations.
+        out.push(if signal_widths[sg] > 64 { TsInsn::SaveSigW { sig } } else { TsInsn::SaveSig { sig } });
     }
     let mut wconf: Vec<bool> = vec![false; cb.num_regs as usize];
     let mut wconf_list: Vec<RegId> = Vec::new();
@@ -14909,6 +14922,9 @@ pub fn lower_two_state(
     // materialised: the register only remembers the bit, `rw` stays None so
     // every ordinary consumer bails, and the store arms turn it into a fill.
     let mut wfill: Vec<Option<u8>> = vec![None; cb.num_regs as usize];
+    // `{N{1'bx}}` wider than the banks, the x/z twin of `wfill`: the register
+    // remembers (value bit, x bit); only a blocking store may consume it.
+    let mut xfill: Vec<Option<(u8, u8)>> = vec![None; cb.num_regs as usize];
     macro_rules! def {
         ($rw:ident, $r:expr, $w:expr) => {{
             let r = $r as usize;
@@ -14918,6 +14934,7 @@ pub fn lower_two_state(
             }
             sg[r] = false;
             wfill[r] = None;
+            xfill[r] = None;
             match $rw[r] {
                 Some(prev) if prev != w => {
                     if !wconf[r] {
@@ -15000,7 +15017,7 @@ pub fn lower_two_state(
             TS_GATE_WHY.with(|c| c.set("-"));
         }
         if !deny.is_empty() && deny.iter().any(|d| d == insn_opcode_name(insn)) {
-            return None;
+            gate!("bare bail at bytecode.rs:15020");
         }
         cur_i = ins_i;
         // A back edge re-enters a branch target from a LATER definition, so
@@ -15088,7 +15105,7 @@ pub fn lower_two_state(
                 let signed = signal_signed.get(sig).copied().unwrap_or(true)
                     || matches!(insn, Insn::LoadSignalSigned(..));
                 if signed && !sig_ok(sig) {
-                    return None;
+                    gate!("wide signed signal");
                 }
                 if sig_ok(sig) {
                     note_read(sig, 0, signal_widths[sig], true, stored.contains(&(sig as u32)), &mut reads_whole, &mut reads_slice);
@@ -15106,7 +15123,7 @@ pub fn lower_two_state(
                     def!(rw, *d, signal_widths[sig]);
                     out.push(TsInsn::WLoadSig { d: *d as u16, sig: sig as u32 });
                 } else {
-                    return None;
+                    gate!("signal >512b");
                 }
             }
             Insn::LoadConst(d, k) => {
@@ -15137,11 +15154,11 @@ pub fn lower_two_state(
                 }
                 if k.width > 64 {
                     if k.width > 512 || k.is_signed {
-                        return None;
+                        gate!("bare bail at bytecode.rs:15157");
                     }
                     let mut wv = vec![0u64; (k.width as usize).div_ceil(64)];
                     if !k.words_if_clean(&mut wv) {
-                        return None;
+                        gate!("bare bail at bytecode.rs:15161");
                     }
                     def!(rw, *d, k.width);
                     out.push(TsInsn::WConst { d: *d as u16, v: wv.into_boxed_slice() });
@@ -15177,7 +15194,7 @@ pub fn lower_two_state(
             Insn::LoadSignalBit(d, sig, idx) => {
                 let sig = *sig as usize;
                 if !sig_ok_slice(sig) || *idx >= signal_widths[sig] || *idx > u16::MAX as u32 {
-                    return None;
+                    gate!("bare bail at bytecode.rs:15197");
                 }
                 let narrow = signal_widths[sig] <= 64;
                 note_read(sig, *idx, 1, narrow, stored.contains(&(sig as u32)), &mut reads_whole, &mut reads_slice);
@@ -15192,12 +15209,12 @@ pub fn lower_two_state(
                 let sig = *sig as usize;
                 let (hi, lo) = (*l.max(r), *l.min(r));
                 if !sig_ok_slice(sig) || hi >= signal_widths[sig] || hi > u16::MAX as u32 {
-                    return None;
+                    gate!("bare bail at bytecode.rs:15212");
                 }
                 let w = hi - lo + 1;
                 if w > 64 {
                     if w > 512 {
-                        return None;
+                        gate!("bare bail at bytecode.rs:15217");
                     }
                     // Wide slice of a signal, noted as ≤64-bit chunks.
                     let mut off = 0;
@@ -15244,7 +15261,7 @@ pub fn lower_two_state(
             Insn::BitSelectConst(d, s, idx) => {
                 let sw = rw[*s as usize]?;
                 if *idx >= sw || *idx > 511 {
-                    return None;
+                    gate!("bare bail at bytecode.rs:15264");
                 }
                 def!(rw, *d, 1);
                 out.push(if sw > 64 {
@@ -15257,7 +15274,7 @@ pub fn lower_two_state(
                 let sw = rw[*s as usize]?;
                 let (hi, lo) = (*l.max(r), *l.min(r));
                 if hi >= sw || hi > 511 {
-                    return None;
+                    gate!("bare bail at bytecode.rs:15277");
                 }
                 let w = hi - lo + 1;
                 def!(rw, *d, w);
@@ -15294,7 +15311,21 @@ pub fn lower_two_state(
             // was not doing anything two-state could not express, it just
             // had no lowering.
             Insn::Move(d, s) => {
-                let w = rw[*s as usize]?;
+                if let Some(f) = xfill[*s as usize] {
+                    def!(rw, *d, 1);
+                    rw[*d as usize] = None;
+                    xfill[*d as usize] = Some(f);
+                    continue;
+                }
+                if let Some(bit) = wfill[*s as usize] {
+                    def!(rw, *d, 1);
+                    rw[*d as usize] = None;
+                    wfill[*d as usize] = Some(bit);
+                    continue;
+                }
+                let Some(w) = rw[*s as usize] else {
+                    gate!("move source width unknown");
+                };
                 if let Some(k) = xc[*s as usize] {
                     def!(rw, *d, w);
                     xc[*d as usize] = Some(k);
@@ -15325,17 +15356,19 @@ pub fn lower_two_state(
                     rw[*a as usize]?,
                     rw[*b as usize]?,
                 );
-                if wa != wb || wa > 64 || wc > 64 {
-                    return None;
+                if wa != wb {
+                    gate!("select branch widths differ");
+                }
+                if wc > 64 {
+                    gate!("wide select condition");
+                }
+                if wa > 512 {
+                    gate!("select >512b");
                 }
                 def!(rw, *d, wa);
                 sg[*d as usize] = sg[*a as usize] && sg[*b as usize];
-                out.push(TsInsn::Sel {
-                    d: *d as u16,
-                    c: *c as u16,
-                    a: *a as u16,
-                    b: *b as u16,
-                });
+                let (d, c, a, b) = (*d as u16, *c as u16, *a as u16, *b as u16);
+                out.push(if wa > 64 { TsInsn::WSel { d, c, a, b } } else { TsInsn::Sel { d, c, a, b } });
             }
             Insn::BitXor(d, a, b) | Insn::BitAnd(d, a, b) | Insn::BitOr(d, a, b) => {
                 let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
@@ -15343,7 +15376,7 @@ pub fn lower_two_state(
                 if aw != bw {
                     // Mixed-bank operands — bail rather than model the
                     // zero-extension across banks.
-                    return None;
+                    gate!("mixed-width bitop");
                 }
                 let both_sg = sg[*a as usize] && sg[*b as usize];
                 if both_sg && wa != wb && (if wa < wb { mn!(*a) } else { mn!(*b) }) {
@@ -15373,7 +15406,7 @@ pub fn lower_two_state(
                 sg[*d as usize] = s_sg;
                 out.push(if w > 64 {
                     if w > 512 {
-                        return None;
+                        gate!("bare bail at bytecode.rs:15409");
                     }
                     TsInsn::WNot { d: *d as u16, s: *s as u16, w: w as u16 }
                 } else {
@@ -15589,7 +15622,7 @@ pub fn lower_two_state(
                             gate!("in-place binop-const");
                         }
                         if k.width > 64 {
-                            return None;
+                            gate!("bare bail at bytecode.rs:15625");
                         }
                         let wr = w.max(k.width);
                         def!(rw, *d, wr);
@@ -15610,9 +15643,11 @@ pub fn lower_two_state(
                 let mut any_wide = false;
                 let mut lowered: Vec<(u16, u16, bool)> = Vec::with_capacity(parts.len());
                 for &p in parts.iter() {
-                    let w = rw[p as usize]?;
+                    let Some(w) = rw[p as usize] else {
+                        gate!("concat part width unknown");
+                    };
                     if w > 512 {
-                        return None;
+                        gate!("concat part >512b");
                     }
                     total += w;
                     if w > 64 {
@@ -15621,7 +15656,7 @@ pub fn lower_two_state(
                     lowered.push((p as u16, w as u16, w > 64));
                 }
                 if total == 0 || total > 512 {
-                    return None;
+                    gate!("concat total >512b");
                 }
                 def!(rw, *d, total);
                 out.push(if total > 64 || any_wide {
@@ -15659,7 +15694,7 @@ pub fn lower_two_state(
             Insn::Resize(r, w) => {
                 let cur = rw[*r as usize]?;
                 if *w > 512 {
-                    return None;
+                    gate!("bare bail at bytecode.rs:15697");
                 }
                 if *w > cur && mn!(*r) {
                     gate!("signed widening (resize)");
@@ -15706,7 +15741,7 @@ pub fn lower_two_state(
                 if *bit == u32::MAX {
                     // Whole-value truthiness needs the value in one word.
                     if !sig_ok(sig) {
-                        return None;
+                        gate!("bare bail at bytecode.rs:15744");
                     }
                     note_read(sig, 0, signal_widths[sig], true, stored.contains(&(sig as u32)), &mut reads_whole, &mut reads_slice);
                 } else {
@@ -15714,7 +15749,7 @@ pub fn lower_two_state(
                         || *bit >= signal_widths[sig]
                         || *bit > u16::MAX as u32
                     {
-                        return None;
+                        gate!("bare bail at bytecode.rs:15752");
                     }
                     let narrow = signal_widths[sig] <= 64;
                     note_read(sig, *bit, 1, narrow, stored.contains(&(sig as u32)), &mut reads_whole, &mut reads_slice);
@@ -15999,6 +16034,15 @@ pub fn lower_two_state(
             }
             Insn::BlockingAssign(sig, r, w) => {
                 let sig = *sig as usize;
+                if let Some((v, _)) = xfill[*r as usize] {
+                    if sig >= signal_widths.len() || signal_widths[sig] != *w || signal_real[sig] || *w == 0 {
+                        gate!("x-fill dest shape");
+                    }
+                    side_effects = true;
+                    stored.push(sig as u32);
+                    out.push(TsInsn::RangeFillXW { sig: sig as u32, hi: *w - 1, lo: 0, v });
+                    continue;
+                }
                 if let Some(bit) = wfill[*r as usize] {
                     if sig >= signal_widths.len() || signal_widths[sig] != *w || signal_real[sig] || *w == 0 {
                         gate!("fill dest shape");
@@ -16029,20 +16073,20 @@ pub fn lower_two_state(
                 // Same-width, non-real destination only: the 4-state slow
                 // path's fit/resize semantics are not reproduced here.
                 if sig >= signal_widths.len() || signal_widths[sig] != *w || signal_real[sig] {
-                    return None;
+                    gate!("bare bail at bytecode.rs:16076");
                 }
                 if *w > 64 {
                     // Wide store: register and destination agree exactly (a
                     // Resize precedes otherwise); signed wide targets bail.
                     if *w > 512 || cw != *w || signal_signed[sig] {
-                        return None;
+                        gate!("bare bail at bytecode.rs:16082");
                     }
                     side_effects = true;
                     stored.push(sig as u32);
                     out.push(TsInsn::WStore { sig: sig as u32, s: *r as u16 });
                 } else {
                     if cw > 64 {
-                        return None;
+                        gate!("bare bail at bytecode.rs:16089");
                     }
                     if cw < *w && mn!(*r) {
                         gate!("signed widening (store)");
@@ -16055,7 +16099,7 @@ pub fn lower_two_state(
             Insn::NbaAssignConst(sig, k, w) => {
                 let sig = *sig as usize;
                 if sig >= signal_widths.len() || signal_real[sig] || *w > 64 {
-                    return None;
+                    gate!("bare bail at bytecode.rs:16102");
                 }
                 let v = clean_const(k)?;
                 side_effects = true;
@@ -16069,6 +16113,16 @@ pub fn lower_two_state(
                 let sig = *sig as usize;
                 if sig >= signal_widths.len() || signal_real[sig] {
                     gate!("dest oob/real");
+                }
+                if let Some((v, _)) = xfill[*r as usize] {
+                    let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
+                    if high >= signal_widths[sig] {
+                        gate!("x-fill range past dest");
+                    }
+                    side_effects = true;
+                    stored.push(sig as u32);
+                    out.push(TsInsn::RangeFillXW { sig: sig as u32, hi: high, lo: low, v });
+                    continue;
                 }
                 if let Some(bit) = wfill[*r as usize] {
                     let (low, high) = if hi >= lo { (*lo, *hi) } else { (*hi, *lo) };
@@ -16224,7 +16278,7 @@ pub fn lower_two_state(
                     out.push(TsInsn::WStoreNba { sig: sig as u32, s: *r as u16, w: *w });
                 } else {
                     if cw > 64 {
-                        return None;
+                        gate!("bare bail at bytecode.rs:16281");
                     }
                     if cw < *w && mn!(*r) {
                         gate!("signed widening (nba store)");
@@ -16282,7 +16336,7 @@ pub fn lower_two_state(
                 let (first, lo, hi) = array_span(array)?;
                 let vw = narrow_reg!(rw, *val_reg, "wide store source");
                 if *w > 64 || signal_widths[first] != *w {
-                    return None;
+                    gate!("bare bail at bytecode.rs:16339");
                 }
                 if vw < *w && mn!(*val_reg) {
                     gate!("signed widening (array store)");
@@ -16319,7 +16373,7 @@ pub fn lower_two_state(
                 let (first, lo, hi) = array_span(array)?;
                 let vw = narrow_reg!(rw, *val_reg, "wide store source");
                 if *w > 64 || signal_widths[first] != *w {
-                    return None;
+                    gate!("bare bail at bytecode.rs:16376");
                 }
                 if vw < *w && mn!(*val_reg) {
                     gate!("signed widening (array store)");
@@ -16357,7 +16411,7 @@ pub fn lower_two_state(
                     || d >= signal_widths.len()
                     || signal_real[d]
                 {
-                    return None;
+                    gate!("bare bail at bytecode.rs:16414");
                 }
                 // Historically the read was ABORTABLE (X index, X data,
                 // out-of-range), so it had to precede every side effect: a
@@ -16378,7 +16432,7 @@ pub fn lower_two_state(
                     && !stored.contains(&(isig as u32));
                 let _ = statically_in_range;
                 if false {
-                    return None;
+                    gate!("bare bail at bytecode.rs:16435");
                 }
                 note_read(isig, 0, signal_widths[isig], true, stored.contains(&(isig as u32)), &mut reads_whole, &mut reads_slice);
                 side_effects = true;
@@ -16394,7 +16448,7 @@ pub fn lower_two_state(
             Insn::Mul(d, a, b) => {
                 let (wa, wb) = (rw[*a as usize]?, rw[*b as usize]?);
                 if wa > 64 || wb > 64 {
-                    return None;
+                    gate!("bare bail at bytecode.rs:16451");
                 }
                 let w = wa.max(wb);
                 let both_sg = sg[*a as usize] && sg[*b as usize];
@@ -16432,12 +16486,18 @@ pub fn lower_two_state(
                     }
                 }
                 if n == 0 || sw > 64 || n > 512 {
-                    return None;
+                    gate!("bare bail at bytecode.rs:16489");
                 }
                 let total = sw.saturating_mul(n);
                 if let Some((v, x)) = xc[*src as usize] {
                     if total > 64 {
-                        gate!("x-const repl >64b");
+                        if sw != 1 || x & 1 == 0 {
+                            gate!("x-const repl >64b");
+                        }
+                        def!(rw, *d, 1);
+                        rw[*d as usize] = None;
+                        xfill[*d as usize] = Some(((v & 1) as u8, 1));
+                        continue;
                     }
                     let (mut rv, mut rx) = (0u64, 0u64);
                     for i in 0..n {
@@ -16450,7 +16510,7 @@ pub fn lower_two_state(
                     continue;
                 }
                 if total == 0 || total > 512 {
-                    return None;
+                    gate!("concat total >512b");
                 }
                 def!(rw, *d, total);
                 out.push(if total > 64 {
@@ -16494,7 +16554,7 @@ pub fn lower_two_state(
             | TsInsn::Jmp { t } => {
                 let old = *t as usize;
                 if old >= idx_map.len() {
-                    return None;
+                    gate!("bare bail at bytecode.rs:16557");
                 }
                 *t = idx_map[old];
             }
@@ -16506,7 +16566,7 @@ pub fn lower_two_state(
                 for t in mj.table.iter_mut().chain(std::iter::once(&mut mj.xz_path)) {
                     let old = *t as usize;
                     if old >= idx_map.len() {
-                        return None;
+                        gate!("bare bail at bytecode.rs:16569");
                     }
                     *t = idx_map[old];
                 }
@@ -16515,7 +16575,7 @@ pub fn lower_two_state(
                 for t in cj.table.iter_mut().chain(std::iter::once(&mut cj.default)) {
                     let old = *t as usize;
                     if old >= idx_map.len() {
-                        return None;
+                        gate!("bare bail at bytecode.rs:16578");
                     }
                     *t = idx_map[old];
                 }
@@ -16549,6 +16609,7 @@ pub fn lower_two_state(
                     | TsInsn::BitStoreNbaDyn { .. }
                     | TsInsn::RangeStoreDyn { .. }
                     | TsInsn::RangeStoreNbaDyn { .. }
+                    | TsInsn::RangeFillXW { .. }
                     | TsInsn::ConstStoreX { .. }
                     | TsInsn::RangeStoreX(..)
                     | TsInsn::RangeStoreW { .. }
@@ -16569,17 +16630,18 @@ pub fn lower_two_state(
             )
         })
     {
-        return None;
+        gate!("bare bail at bytecode.rs:16633");
     }
-    // 512-bit wide class, opt-in (XEZIM_TS_WIDE512=1): admitting the c906
-    // vector-unit buses measured +5.4% instructions at it=300 — 200k x-read
-    // bails per 100 iterations from entries that never demote, and only 2.3M
-    // interpreter instructions moved. Off, blocks whose widest register
-    // exceeds 128 bits stay on the interpreter as before.
+    // 512-bit wide class, on by default (XEZIM_TS_WIDE512=0 disables). It
+    // was opt-in while admitting the c906 vector-unit buses cost +5.4%:
+    // entries that x-bailed on every evaluation and never demoted. Those now
+    // sleep (see the executor's x-bail backoff), and with wide hazard saves,
+    // wide selects and x-fill stores lowering as well the class measures
+    // c906 memcpy -1.2% and C910 memcpy -2.5%, outputs identical.
     static WIDE512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let wide512 = *WIDE512.get_or_init(|| std::env::var("XEZIM_TS_WIDE512").ok().as_deref() == Some("1"));
+    let wide512 = *WIDE512.get_or_init(|| std::env::var("XEZIM_TS_WIDE512").ok().as_deref() != Some("0"));
     if max_wide > 128 && !wide512 {
-        return None;
+        gate!("bare bail at bytecode.rs:16643");
     }
     let has_wide = out.iter().any(|i| {
         matches!(
@@ -16593,6 +16655,7 @@ pub fn lower_two_state(
                 | TsInsn::WXor { .. }
                 | TsInsn::WAnd { .. }
                 | TsInsn::WOr { .. }
+                | TsInsn::WSel { .. }
                 | TsInsn::WNot { .. }
                 | TsInsn::WRange { .. }
                 | TsInsn::RangeFromW { .. }
@@ -16643,6 +16706,7 @@ pub fn lower_two_state(
             | TsInsn::BitStoreNbaDyn { sig, .. }
             | TsInsn::RangeStoreDyn { sig, .. }
             | TsInsn::RangeStoreNbaDyn { sig, .. }
+            | TsInsn::RangeFillXW { sig, .. }
             | TsInsn::RangeStoreNbaW { sig, .. }
             | TsInsn::RangeFillW { sig, .. }
             | TsInsn::RangeFillNbaW { sig, .. }
