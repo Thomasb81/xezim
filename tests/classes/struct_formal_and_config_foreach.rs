@@ -117,12 +117,12 @@ fn foreach_string_queue_and_assoc() {
     let src = r#"module top;
   initial begin
     string q[$];
-    q.push_back("aa"); q.push_back("bb");
     int n = 0;
-    foreach (q[i]) n++;
     string m[int];
-    m[5] = "five";
     int n2 = 0;
+    q.push_back("aa"); q.push_back("bb");
+    foreach (q[i]) n++;
+    m[5] = "five";
     foreach (m[k]) n2++;
     if (n == 2 && n2 == 1) $display("TAG_PASS foreach-string-cols");
     else $display("TAG_FAIL foreach-string-cols n=%0d n2=%0d", n, n2);

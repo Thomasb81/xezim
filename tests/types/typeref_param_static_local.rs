@@ -84,10 +84,12 @@ module top;
   initial begin
     C a = new(7);
     G#(C)::add(a);
-    C r = G#(C)::pick(0);
-    if (r == null) $display("TAG_FAIL null");
-    else if (r.v != 7) $display("TAG_FAIL v=%0d", r.v);
-    else $display("TAG_PASS");
+    begin
+      C r = G#(C)::pick(0);
+      if (r == null) $display("TAG_FAIL null");
+      else if (r.v != 7) $display("TAG_FAIL v=%0d", r.v);
+      else $display("TAG_PASS");
+    end
   end
 endmodule
 "#;

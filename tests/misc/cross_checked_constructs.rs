@@ -87,10 +87,10 @@ endmodule
     assert!(!has(&o, "SHOULD NOT PRINT"), "{o:?}");
 }
 
-/// §17 — a checker whose event formal takes `posedge clk` as its actual.
-/// The reference parses it and flags the one non-one-hot value.
+/// §17 — a checker whose event formal takes `posedge clk` as its actual
+/// (the actual used to be a parse error). The reference flags the one
+/// non-one-hot value, sampled at the 25 ns rising edge.
 #[test]
-#[ignore = "an event-expression actual (`posedge clk`) to a checker formal does not parse (fix pending)"]
 fn checker_with_event_expression_actual() {
     let o = out(r#"
 checker chk_onehot(logic [3:0] v, event clk);
@@ -111,10 +111,39 @@ endmodule
 
 /// §9.3.1 — block item declarations precede the statements of a
 /// `begin`-`end` block. The reference rejects this source ("Illegal
-/// declaration after the statement"); xezim accepts it today.
+/// declaration after the statement"); so does the strict check now
+/// (`--no-strict` accepts it).
 #[test]
-#[ignore = "a declaration after a statement in a begin-end block is accepted (fix pending)"]
 fn declaration_after_statement_is_rejected() {
     let src = "module tb;\n  initial begin\n    int a;\n    a = 1;\n    int b;\n    b = a;\n    $display(\"B=%0d\", b);\n  end\nendmodule\n";
     assert!(simulate(src, 100).is_err(), "a declaration after a statement must be a compile error");
+}
+
+/// §9.4.2 / §16.5 — a clocking event without an edge (`@(clk)`, or `@clk`
+/// on a checker event formal bound to `clk`) samples on ANY change of the
+/// clock. The reference reports the violation at both 25 ns (rise) and
+/// 30 ns (fall); these used to be clocked on the rising edge only.
+#[test]
+fn edgeless_clocking_event_samples_on_both_edges() {
+    let module_level = out(r#"
+module tb;
+  logic clk = 0; always #5 clk = ~clk;
+  logic [3:0] v = 0;
+  a_oh: assert property (@(clk) $onehot0(v)) else $error("M onehot0 violated v=%b", v);
+  initial begin #12 v = 4'b0010; #10 v = 4'b0110; #10 v = 4'b1000; #10 $finish; end
+endmodule
+"#);
+    assert_eq!(module_level.iter().filter(|l| l.contains("onehot0 violated")).count(), 2, "{module_level:?}");
+    let checker = out(r#"
+checker chk_onehot(logic [3:0] v, event clk);
+  a_oh: assert property (@clk $onehot0(v)) else $error("C onehot0 violated v=%b", v);
+endchecker
+module tb;
+  logic clk = 0; always #5 clk = ~clk;
+  logic [3:0] v = 0;
+  chk_onehot u_chk(v, clk);
+  initial begin #12 v = 4'b0010; #10 v = 4'b0110; #10 v = 4'b1000; #10 $finish; end
+endmodule
+"#);
+    assert_eq!(checker.iter().filter(|l| l.contains("onehot0 violated")).count(), 2, "{checker:?}");
 }

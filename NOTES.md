@@ -9,6 +9,14 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* A concurrent assertion clocked by an event without an edge (`@(clk)`, or
+  `@clk` on a checker's event formal) samples on every change of the clock,
+  as §9.4.2 defines; it used to sample on the rising edge only.
+* A checker's event formal accepts an edge actual (`chk u(v, posedge clk)`),
+  which used to be a parse error, and the checker's assertions clock on
+  that edge.
+* A declaration after a statement in a `begin`-`end` or `fork`-`join` block
+  or a subroutine body is rejected (§9.3.1); `--no-strict` still accepts it.
 * A replication whose count is a signed constant expression is read as
   signed: `{$bits(T) - 1{1'b1}}` in a type-parameterized class whose type
   parameter is unresolved replicates nothing instead of wrapping to about

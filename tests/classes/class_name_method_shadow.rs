@@ -37,14 +37,15 @@ endclass
 
 module top;
   initial begin
-    // Enum reflection must still work.
     color_t col;
+    Widget w;
+    Widget w2;
+    // Enum reflection must still work.
     col = GREEN;
     if (col.name() != "GREEN")
       $display("FAIL enum-name got='%s'", col.name());
 
     // User class `name()` — flattened-Ident path (local var receiver).
-    Widget w;
     w = new("gadget");
     if (w.name() == "gadget" && w.get_type_name() == "Widget")
       $display("PASS class-name");
@@ -52,7 +53,6 @@ module top;
       $display("FAIL class-name got='%s' gtn='%s'", w.name(), w.get_type_name());
 
     // User class `name()` — also confirm `name` returning a literal works.
-    Widget w2;
     w2 = new();
     if (w2.name() == "widget")
       $display("PASS class-name-default");

@@ -230,9 +230,11 @@ module top;
     msg.add();
     msg.add();
     // Both captured and chained reads must agree.
-    container c = msg.get_ec();
-    $display("captured %0d", c.len());
-    $display("chained %0d", msg.get_ec().len());
+    begin
+      container c = msg.get_ec();
+      $display("captured %0d", c.len());
+      $display("chained %0d", msg.get_ec().len());
+    end
     $finish;
   end
 endmodule

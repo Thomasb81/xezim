@@ -29,11 +29,11 @@ module top;
   initial begin
     string value;
     int n;
+    string t = "";
     value = "abcdefghijk";          // 11 chars
     n = packlen(value);
     $display("LEN %0d", n);          // must be 11
     // build a string the way uvm unpack does: append then char-write
-    string t = "";
     t = {t, " "}; t[0] = "A";
     t = {t, " "}; t[1] = "B";
     t = {t, " "}; t[2] = "C";

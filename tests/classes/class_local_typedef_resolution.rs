@@ -48,10 +48,10 @@ module top;
   initial begin
     Alpha#(int) a;
     Beta#(int)  b;
-    a = new();
-    b = new();
     Alpha#(int) ac;
     Beta#(int)  bc;
+    a = new();
+    b = new();
     ac = a.clone();
     bc = b.clone();
     if (ac.kind() == "alpha" && bc.kind() == "beta")

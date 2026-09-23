@@ -101,13 +101,13 @@ module top;
   initial begin
     Node n1=new(1), n2=new(2), n3=new(3), n4=new(4);
     Node nodes[] = new[4];
+    int total_edges = 0;
     nodes[0]=n1; nodes[1]=n2; nodes[2]=n3; nodes[3]=n4;
     // 1->2, 2->3, 3->4  (chain via array-element writes)
     nodes[0].link(nodes[1]);
     nodes[1].link(nodes[2]);
     nodes[2].link(nodes[3]);
     // traverse: for each node, foreach its successors
-    int total_edges = 0;
     foreach (nodes[n]) begin
       foreach (nodes[n].m_succs[s]) begin
         total_edges++;
