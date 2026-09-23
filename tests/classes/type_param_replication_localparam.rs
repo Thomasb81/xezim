@@ -1,14 +1,14 @@
 //! A localparam in a type-parameterized class whose replication count comes
-//! from `$bits` of the type parameter (`{$bits(DT) - 1{1'b1}}`). The
-//! reference simulator elaborates it and runs; xezim never finishes (the
-//! sv-tests `class_test_52` shape). Run through the binary under a
-//! watchdog so a hang fails the test instead of stalling the suite.
+//! from `$bits` of the type parameter (`{$bits(DT) - 1{1'b1}}`, the sv-tests
+//! `class_test_52` shape). The signed count `0 - 1` used to be read as
+//! unsigned — ~4 G copies, concatenated one at a time — so elaboration
+//! never finished. Run through the binary under a watchdog so a hang fails
+//! the test instead of stalling the suite.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 #[test]
-#[ignore = "elaboration never finishes on a $bits-sized replication in a type-parameterized class (fix pending)"]
 fn bits_of_type_parameter_as_replication_count_elaborates() {
     let dir = std::env::temp_dir().join(format!("xezim_type_param_repl_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temporary directory");
@@ -45,4 +45,26 @@ fn bits_of_type_parameter_as_replication_count_elaborates() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The same localparam in two specializations takes each one's width:
+/// `int` gives 31 ones, `byte` gives 7.
+#[test]
+fn replication_localparam_width_follows_the_specialization() {
+    let sim = xezim::simulate(
+        r#"
+class base; endclass
+class how_wide #(type DT=int) extends base;
+  localparam Max_int = {$bits(DT) - 1{1'b1}};
+  static function int show(); return $bits(Max_int); endfunction
+endclass
+module tb;
+  initial $display("W_int=%0d W_byte=%0d", how_wide#()::show(), how_wide#(byte)::show());
+endmodule
+"#,
+        100,
+    )
+    .expect("simulate failed");
+    let o: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(o.iter().any(|l| l == "W_int=31 W_byte=7"), "{o:?}");
 }

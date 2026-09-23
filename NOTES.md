@@ -9,6 +9,11 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* A replication whose count is a signed constant expression is read as
+  signed: `{$bits(T) - 1{1'b1}}` in a type-parameterized class whose type
+  parameter is unresolved replicates nothing instead of wrapping to about
+  four billion copies, which never finished elaborating. Specializations
+  keep their widths (`int` gives 31 ones, `byte` gives 7).
 * `mailbox` and `semaphore` objects are constructed by every form of
   `new`: a parenthesis-less `mailbox mb = new;` or `mb = new;`, and a
   declaration inside a block (`automatic mailbox #(int) mb = new(2);`,
