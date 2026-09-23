@@ -9,6 +9,11 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* `mailbox` and `semaphore` objects are constructed by every form of
+  `new`: a parenthesis-less `mailbox mb = new;` or `mb = new;`, and a
+  declaration inside a block (`automatic mailbox #(int) mb = new(2);`,
+  `automatic semaphore s = new(1);`). These left the mailbox null (the run
+  stopped at "null mailbox handle") or the semaphore without its keys.
 * Reading an unpacked-array element with an out-of-range index yields x at
   the element's width (§7.4.6). Three paths produced a 1-bit x that the
   store then zero-extended to `0000000X`: the fused memory-read flop

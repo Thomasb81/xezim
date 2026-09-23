@@ -2,10 +2,11 @@
 //! yield a live object. Cross-checked against the reference simulator: all
 //! forms below construct in both the LRM and the reference.
 //!
-//! The `#[ignore]`d tests pin forms xezim gets wrong today — a bare `new`
-//! (no parentheses) and a block-local declaration initializer leave a
-//! mailbox null (the run stops at "null mailbox handle"), and a block-local
-//! semaphore initializer loses its keys. They are kept so they gate the fix.
+//! A bare `new` (no parentheses) arrives as an identifier rather than a
+//! call, and a block-local declaration initializer takes the declaration
+//! path rather than the assignment path; both used to skip the built-in
+//! constructor, leaving a mailbox null ("null mailbox handle") and a
+//! semaphore without its keys.
 
 use xezim::simulate;
 
@@ -49,21 +50,18 @@ fn procedural_mailbox_new_with_bound() {
 }
 
 #[test]
-#[ignore = "bare `new` without parentheses leaves the mailbox null (fix pending)"]
 fn module_mailbox_bare_new() {
     let o = mailbox_roundtrip("mailbox mb = new;", "");
     assert!(o.contains("X=7"), "{o}");
 }
 
 #[test]
-#[ignore = "bare `new` without parentheses leaves the mailbox null (fix pending)"]
 fn procedural_mailbox_bare_new() {
     let o = mailbox_roundtrip("mailbox mb;", "mb = new;");
     assert!(o.contains("X=7"), "{o}");
 }
 
 #[test]
-#[ignore = "a block-local mailbox declaration initializer is never run (fix pending)"]
 fn block_local_mailbox_initializer() {
     let o = out(
         "module t;
@@ -92,7 +90,6 @@ fn procedural_semaphore_holds_its_key() {
 }
 
 #[test]
-#[ignore = "a block-local semaphore initializer loses its keys: try_get(1) returns 0 (fix pending)"]
 fn block_local_semaphore_initializer_holds_its_key() {
     let o = out("module t;\n  initial begin\n    automatic semaphore sem = new(1);\n    $display(\"K=%0d\", sem.try_get(1));\n  end\nendmodule\n");
     assert!(o.contains("K=1"), "{o}");

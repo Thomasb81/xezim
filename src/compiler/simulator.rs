@@ -68554,6 +68554,16 @@ if self.profile_report {
             _ => (false, &[]),
         };
         if is_new_call {
+            // §15.3/§15.4: a parenthesis-less `new` into a mailbox or
+            // semaphore (`mb = new;`) arrives here as a bare identifier;
+            // the argument-carrying form is handled by the container arm
+            // below, which only sees `new(...)` calls.
+            if let Some(kind) = self.lvalue_container_kind(lvalue) {
+                let handle = self.alloc_builtin_container(kind, ctor_args);
+                self.assign_value(lvalue, &Value::from_u64(handle as u64, 32).resize(w));
+                self.settle_after_proc_write();
+                return;
+            }
             let type_name = self.get_expr_type_name(lvalue);
 
             // §6.20.3 type-parameter construction: if the declared
@@ -68787,25 +68797,7 @@ if self.profile_report {
                     // misreports (it returns the enclosing class name for
                     // a property, or None for an untracked local).
                     if let Some(kind) = self.lvalue_container_kind(lvalue) {
-                        let handle = self.heap.len();
-                        self.heap.push(Some(ClassInstance {
-                            class_name: kind.to_string(),
-                            properties: PropMap::default(),
-                            type_bindings: HashMap::default(),
-                        spec: None,
-                        creation_scope: self.active_instance_scope(),
-                        }));
-                        if kind == "semaphore" {
-                            let n = args
-                                .first()
-                                .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
-                                .unwrap_or(0);
-                            self.semaphores.insert(handle, n);
-                        } else {
-                            self.mailboxes
-                                .insert(handle, std::collections::VecDeque::new());
-                            self.record_mailbox_bound(handle, args);
-                        }
+                        let handle = self.alloc_builtin_container(kind, args);
                         self.assign_value(
                             lvalue,
                             &Value::from_u64(handle as u64, 32).resize(w),
@@ -71285,6 +71277,19 @@ if self.profile_report {
                         // eval and the local read x. Mirror the
                         // assignment arm: extract the spec, carry it
                         // through `current_spec`, construct the base.
+                        // §15.3/§15.4: `mailbox mb = new(2);` /
+                        // `semaphore s = new(1);` as a block-local
+                        // declaration — the built-in containers are not in
+                        // `module.classes`, so the constructor was skipped
+                        // and the local stayed null.
+                        if produced.is_none() && !self.module.classes.contains_key(cn) {
+                            if let (Some(kind), Some(call_args)) =
+                                (Self::container_base(cn), is_new.as_ref())
+                            {
+                                let handle = self.alloc_builtin_container(kind, call_args);
+                                produced = Some(Value::from_u64(handle as u64, 32));
+                            }
+                        }
                         if produced.is_none()
                             && is_new.is_some()
                             && !self.module.classes.contains_key(cn)
@@ -84615,6 +84620,31 @@ if self.profile_report {
 
     /// §15.4.1 — record a bounded mailbox's capacity from its `new(N)` arg.
     /// N absent or 0 leaves it unbounded (no entry).
+    /// Allocate a built-in `mailbox` / `semaphore` object (§15.3, §15.4) on
+    /// the class heap and register its queue or key count; `args` are the
+    /// constructor arguments (bound / initial key count).
+    fn alloc_builtin_container(&mut self, kind: &str, args: &[Expression]) -> usize {
+        let handle = self.heap.len();
+        self.heap.push(Some(ClassInstance {
+            class_name: kind.to_string(),
+            properties: PropMap::default(),
+            type_bindings: HashMap::default(),
+            spec: None,
+            creation_scope: self.active_instance_scope(),
+        }));
+        if kind == "semaphore" {
+            let n = args
+                .first()
+                .map(|a| self.eval_expr(a).to_u64().unwrap_or(0) as i64)
+                .unwrap_or(0);
+            self.semaphores.insert(handle, n);
+        } else {
+            self.mailboxes.insert(handle, std::collections::VecDeque::new());
+            self.record_mailbox_bound(handle, args);
+        }
+        handle
+    }
+
     fn record_mailbox_bound(&mut self, handle: usize, args: &[Expression]) {
         let bound = args
             .first()
