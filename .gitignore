@@ -73,3 +73,4 @@ Cargo.lock
 
 # Local PGO/experiment build dirs (cargo-local variants)
 target-*/
+*-target/

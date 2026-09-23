@@ -164,34 +164,50 @@ is a git dependency, and `cargo build` pulls it automatically:
 ```bash
 git clone git@github.com:<you>/xezim.git
 cd xezim
-cargo build            # debug
-cargo build --release  # optimized (recommended for large designs)
+cargo build              # debug
+cargo build --release    # optimized
+./scripts/build-pgo.sh   # optimized + profile-guided (recommended for release)
 ```
 
-The release binary is produced at `target/release/xezim`.
+The release binary is produced at `target/release/xezim`; the profile-guided
+one at `pgo-target/release/xezim`.
 
-### Profile-guided build (recommended for long runs)
+### Profile-guided build (recommended for release)
 
-`./scripts/build-pgo.sh <training-command>` instruments, trains on the command
-you give it, and rebuilds with the profile. Measured on the C906 memcpy
-benchmark (interleaved, same machine):
+`./scripts/build-pgo.sh` instruments the release build, trains it and
+rebuilds with the profile. It is the build to ship or benchmark with.
+
+Run **without arguments** it trains on a bundled set — the `tests/perf`
+shape designs, the `scripts/pgo-train` designs and the `xezim-bench`
+workloads — which takes a few minutes on top of two release builds. Measured
+against a plain release build of the same sources (interleaved, same
+machine, host instructions): a C906 SoC CoreMark −0.4% to −0.7%, a C910 SoC
+CoreMark −0.3% to −0.7%, and a loop-heavy DRAM-model stress −12%. Output is
+bit-exact (both SoC gates and the UVM AVIP suite unchanged). The bundled
+trainer covers the executors and the scheduler; what it cannot know is
+*your* design's hot mix, so the SoC gain is modest.
+
+Run **with a training command** (`./scripts/build-pgo.sh xezim --simulate …`,
+the binary path is substituted) it trains on that run instead. A profile
+trained on the workload itself is worth far more — the C906 memcpy
+benchmark:
 
 | | instructions | wall |
 |---|---|---|
 | release | 176.92 B | 51.5 s |
-| **PGO** | **151.31 B (−14.5%)** | **44.0 s (−14.6%)** |
+| **PGO, trained on the run** | **151.31 B (−14.5%)** | **44.0 s (−14.6%)** |
 
-Output stays bit-exact (C906 gate, C910 hello, and the UVM AVIP suite all
-unchanged).
+— and it generalizes: a C906-trained profile gave Ibex −11.1% instructions
+against −10.6% for an Ibex-trained one. Budget for the instrumented run,
+though: the instrumented binary is far slower than release, so train on a
+short run (one benchmark iteration, a few hundred thousand cycles), not the
+full-length one. An unrepresentative trainer can *deoptimize* the paths you
+care about.
 
-Two things worth knowing before you reach for it. **The wall-clock gain
-depends on the design being instruction-bound**: Ibex CoreMark also loses
-~11% of its instructions but its wall time does not move, because its host
-bottleneck is memory rather than instruction count — so measure, do not
-assume. And the profile **generalizes better than expected**: a C906-trained
-profile gave Ibex −11.1% instructions against −10.6% for an Ibex-trained one,
-so a single representative trainer is usually enough. Do not stack BOLT on a
-PGO build — measured net negative; PGO alone wins.
+Two more measured facts: **the wall-clock gain depends on the design being
+instruction-bound** (Ibex CoreMark loses ~11% of its instructions but its
+wall time does not move — its host bottleneck is memory), and **BOLT on top
+of a PGO build is net negative**; PGO alone wins.
 
 ### Modifying xezim-core
 

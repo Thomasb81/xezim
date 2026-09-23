@@ -135,6 +135,11 @@ and the development workflow are in [README.md](README.md).
 
 **Performance** (instruction counts, output identical)
 
+* `scripts/build-pgo.sh` run without a training command builds a
+  profile-guided binary from a bundled trainer (the `tests/perf` shapes,
+  `scripts/pgo-train`, `xezim-bench`): about −0.5% host instructions on the
+  SoC benchmarks, −12% on a loop-heavy DRAM model, output identical. It is
+  the recommended release build; see README.
 * Loop-heavy clocked blocks with `int` counters — memory models that walk
   lanes, byte-lane writes into a packed memory, per-lane write pointers —
   now run on the two-state executor instead of the four-state VM. The
