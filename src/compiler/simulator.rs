@@ -66413,9 +66413,19 @@ impl Simulator {
                     // `(a<<4)>>2` in an 8-bit context otherwise evaluates the
                     // inner shift at 12 bits and the dropped carry returns.
                     // (Unknown shapes keep the historical infer_width.)
-                    self.lrm_self_width(left)
-                        .unwrap_or_else(|| self.infer_width(left))
-                        .max(ctx_width)
+                    let lw = self
+                        .lrm_self_width(left)
+                        .unwrap_or_else(|| self.infer_width(left));
+                    // §11.6.1: `/` and `%` size from BOTH operands (only a
+                    // shift amount or an exponent is self-determined), so
+                    // `(a + b) / 3` over 8-bit a, b divides at the literal's
+                    // 32 bits, as the compiled path already does.
+                    let rw = if matches!(op, BinaryOp::Div | BinaryOp::Mod) {
+                        self.lrm_self_width(right).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    lw.max(rw).max(ctx_width)
                 } else if is_comparison {
                     // §11.6.1: a comparison's operands take the MAX OF EACH
                     // OTHER's widths — never the SURROUNDING context. The

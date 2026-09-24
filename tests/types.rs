@@ -77,6 +77,8 @@ mod default_assignment_pattern_packed;
 mod defparam_override;
 #[path = "types/diag_kind_limit_env.rs"]
 mod diag_kind_limit_env;
+#[path = "types/division_operand_width.rs"]
+mod division_operand_width;
 #[path = "types/dollar_lvalue_and_assoc_width.rs"]
 mod dollar_lvalue_and_assoc_width;
 #[path = "types/enum_member_per_instance.rs"]
