@@ -29,6 +29,8 @@ mod class_queue_struct_member_arrays;
 mod class_struct_collection_elements;
 #[path = "classes/class_time_field_neg_one.rs"]
 mod class_time_field_neg_one;
+#[path = "classes/class_type_param_default_width.rs"]
+mod class_type_param_default_width;
 #[path = "classes/class_unpacked_struct_array_store.rs"]
 mod class_unpacked_struct_array_store;
 #[path = "classes/collection_of_handles_new.rs"]
