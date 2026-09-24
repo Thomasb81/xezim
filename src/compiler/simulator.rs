@@ -119867,6 +119867,15 @@ impl Simulator {
             let mut assignments: HashMap<String, Expression> = HashMap::default();
             for con in &constraints {
                 for item in &con.items {
+                    // §18.5.8.1: `arr.size() == n` sizes the rand array FROM
+                    // n; reading the current size back into n pinned n to
+                    // the previous call's length forever.
+                    if rand_colls
+                        .iter()
+                        .any(|c| c.kind == CollKind::Dyn && Self::item_has_size_call(item, &c.prop))
+                    {
+                        continue;
+                    }
                     if let ConstraintItem::Expr(expr) = item {
                         if let ExprKind::Binary {
                             op: BinaryOp::Eq,
