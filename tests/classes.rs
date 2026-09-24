@@ -214,6 +214,8 @@ mod typename_param_class;
 mod unpacked_struct_class_property_whole_value;
 #[path = "classes/uvm_config_db_tests.rs"]
 mod uvm_config_db_tests;
+#[path = "classes/uvm_dpi_library.rs"]
+mod uvm_dpi_library;
 #[path = "classes/uvm_factory_linkage.rs"]
 mod uvm_factory_linkage;
 #[path = "classes/uvm_genuine_2017.rs"]

@@ -19,7 +19,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use xezim::*;
 
-fn uvm_dir() -> PathBuf {
+pub(crate) fn uvm_dir() -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         if let Ok(d) = std::env::var("XEZIM_UVM_DIR") {
