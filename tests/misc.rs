@@ -73,6 +73,8 @@ mod force_release_semantics;
 mod forever_break_continue;
 #[path = "misc/function_return_bit_select.rs"]
 mod function_return_bit_select;
+#[path = "misc/generate_item_restrictions.rs"]
+mod generate_item_restrictions;
 #[path = "misc/iface_functions_and_vif_locals.rs"]
 mod iface_functions_and_vif_locals;
 #[path = "misc/ifu_ibuf_casez_dispatch_c910.rs"]
