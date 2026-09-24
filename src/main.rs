@@ -557,12 +557,17 @@ fn resolve_rel(base: &Path, p: &str) -> String {
     }
 }
 
+/// Per source: where each line of its preprocessed text came from.
+type LineMaps = Vec<Option<xezim::sv_parser::source_map::LineMap>>;
+
+/// Preprocessed text of each source and its line map. On failure, the
+/// rendered preprocessor diagnostics.
 fn preprocess_sources(
     sources: &[String],
     source_files: &[String],
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, LineMaps), Vec<String>> {
     let mut pp = xezim::preprocessor::Preprocessor::new();
     for dir in include_dirs {
         pp.add_include_dir(std::path::PathBuf::from(dir));
@@ -579,16 +584,18 @@ fn preprocess_sources(
     }
 
     let mut preprocessed = Vec::with_capacity(sources.len());
+    let mut maps = Vec::with_capacity(sources.len());
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(|p| std::path::PathBuf::from(p));
         preprocessed.push(pp.preprocess_file(source, source_path.as_deref()));
+        maps.push(pp.take_line_map());
     }
-    // §22 strict-mode directive errors (`\`line`/`\`pragma`/`\`resetall`/…).
-    // Collected only when strict checks are on; a non-empty list fails the run.
+    // §22 strict-mode directive errors (`\`line`/`\`pragma`/`\`resetall`/…)
+    // and failed `include`s; a non-empty list fails the run.
     if !pp.errors().is_empty() {
-        return Err(pp.errors().join("; "));
+        return Err(pp.errors().to_vec());
     }
-    Ok(preprocessed)
+    Ok((preprocessed, maps))
 }
 
 /// Expand `$VAR` and `${VAR}` style references against the process
@@ -2717,11 +2724,14 @@ suppressed but the explicit SDF annotation still applies."
         top_module = Some(wrap_name.to_string());
     }
 
-    let preprocessed_sources =
+    let (preprocessed_sources, line_maps) =
         match preprocess_sources(&sources, &source_files, &include_dirs, &defines) {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("Error: preprocessing failed: {}", e);
+            Err(errors) => {
+                for e in &errors {
+                    eprintln!("{}", e);
+                }
+                eprintln!("Error: preprocessing failed ({} error(s))", errors.len());
                 std::process::exit(1);
             }
         };
@@ -2878,13 +2888,7 @@ suppressed but the explicit SDF annotation still applies."
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
-            for err in diags
-                .iter()
-                .filter(|d| d.severity == xezim::diagnostics::Severity::Error)
-            {
-                let (line, col) = byte_to_line_col(source, err.span.start);
-                eprintln!("[{}] {}:{}: error: {}", label, line, col, err.message);
-            }
+            report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
             total_desc += source_ast.descriptions.len();
             total_err += diags
                 .iter()
@@ -2938,13 +2942,7 @@ suppressed but the explicit SDF annotation still applies."
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
-            for err in diags
-                .iter()
-                .filter(|d| d.severity == xezim::diagnostics::Severity::Error)
-            {
-                let (line, col) = byte_to_line_col(source, err.span.start);
-                eprintln!("[{}] {}:{}: error: {}", label, line, col, err.message);
-            }
+            report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
             total_desc += source_ast.descriptions.len();
             total_err += diags
                 .iter()
@@ -3032,7 +3030,7 @@ suppressed but the explicit SDF annotation still applies."
                 }
             }
             Err(e) => {
-                eprintln!("Simulation error: {}", e);
+                report_fatal_error(&e);
                 std::process::exit(1);
             }
         }
@@ -3140,7 +3138,7 @@ suppressed but the explicit SDF annotation still applies."
             std::process::exit(0);
         }
         Err(e) => {
-            eprintln!("Simulation error: {}", e);
+            report_fatal_error(&e);
             std::process::exit(1);
         }
     }
@@ -3161,19 +3159,45 @@ fn exit_status_for_severities(sim: &xezim::compiler::Simulator, error_exit: bool
     0
 }
 
-fn byte_to_line_col(source: &str, byte_offset: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut col = 1;
-    for (i, ch) in source.char_indices() {
-        if i >= byte_offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
+/// Print one file's parser errors and warnings (and, under --verbose, its
+/// informational notes), each at its original `file:line:col` with the
+/// source line (identical repeats dropped).
+fn report_parse_diagnostics(
+    diags: &[xezim::diagnostics::Diagnostic],
+    source: &str,
+    map: Option<&xezim::sv_parser::source_map::LineMap>,
+    label: &str,
+) {
+    use xezim::diagnostics::Severity;
+    let notes = if xezim::verbose() {
+        Some(Severity::Info)
+    } else {
+        None
+    };
+    for sev in [Severity::Error, Severity::Warning]
+        .into_iter()
+        .chain(notes)
+    {
+        for d in xezim::render_parse_diagnostics(diags, sev, source, map, label) {
+            xezim::progress_clear();
+            eprintln!("{}", d);
         }
     }
-    (line, col)
+}
+
+/// Print a fatal parse/elaboration error. A message that is already a
+/// located diagnostic (`file:line:col: error: ...`, or a "Parse errors in"
+/// block of them) stands on its own; anything else gets the generic prefix.
+fn report_fatal_error(e: &str) {
+    let first = e.lines().next().unwrap_or("");
+    let located = first.starts_with("In file included from")
+        || first.starts_with("Parse errors in")
+        || first.starts_with("Strict check failed in")
+        || first.starts_with("Preprocessing failed in")
+        || first.contains(": error: ");
+    if located {
+        eprintln!("{}", e);
+    } else {
+        eprintln!("Simulation error: {}", e);
+    }
 }

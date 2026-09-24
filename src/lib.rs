@@ -46,8 +46,9 @@ pub use xezim_core::{
     LibraryCli, ModuleTimescaleCli, ParseResult, SourceDefinition, XEZIM_BYTECODE_MAGIC,
     adopted_lib_files, ast, diagnostics, lexer, log_eprintln, log_println, parse,
     parse_and_elaborate_multi, parse_str, preprocess_adopted_lib, preprocessor, progress_clear,
-    progress_status, read_compiled, set_compile_verbose, set_implicit_net_warn, set_library_cli,
-    set_module_timescale_cli, set_strict_top, sv_parser, tokenize_file, write_compiled,
+    progress_status, read_compiled, render_parse_diagnostics, set_compile_verbose,
+    set_implicit_net_warn, set_library_cli, set_module_timescale_cli, set_strict_top, sv_parser,
+    tokenize_file, write_compiled,
 };
 
 /// Content-addressed cache for elaborated designs. The payload uses the
@@ -124,7 +125,11 @@ fn design_cache_key(
     top_module_name: Option<&str>,
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
-) -> (String, Vec<String>) {
+) -> (
+    String,
+    Vec<String>,
+    Vec<Option<sv_parser::source_map::LineMap>>,
+) {
     let mut hash = CacheHash::new();
     hash.bytes(XEZIM_BYTECODE_MAGIC);
     hash.text(env!("CARGO_PKG_VERSION"));
@@ -170,6 +175,7 @@ fn design_cache_key(
     // fresh parse would — the artifact itself skips the (large) texts.
     // `begin_top_level_file` matches the parse-time preprocessor state.
     let mut preprocessed_texts: Vec<String> = Vec::with_capacity(sources.len());
+    let mut line_maps = Vec::with_capacity(sources.len());
     for (idx, source) in sources.iter().enumerate() {
         let source_path = source_paths.get(idx).map(std::path::PathBuf::from);
         hash.text(source_paths.get(idx).map_or("", String::as_str));
@@ -177,6 +183,7 @@ fn design_cache_key(
         let text = pp.preprocess_file(source, source_path.as_deref());
         hash.text(&text);
         preprocessed_texts.push(text);
+        line_maps.push(pp.take_line_map());
     }
 
     let mut dependencies = config.dependency_files.clone();
@@ -206,7 +213,7 @@ fn design_cache_key(
             Err(err) => hash.text(&format!("<unreadable:{:?}>", err.kind())),
         }
     }
-    (hash.finish(), preprocessed_texts)
+    (hash.finish(), preprocessed_texts, line_maps)
 }
 
 fn read_design_cache(config: &DesignCacheConfig, key: &str) -> Option<elaborate::ElaboratedModule> {
@@ -368,7 +375,7 @@ mod design_cache_tests {
             &[],
         );
         let _ = std::fs::remove_dir_all(dir);
-        assert_ne!(before, after);
+        assert_ne!((before.0, before.1), (after.0, after.1));
     }
 }
 
@@ -894,8 +901,9 @@ fn simulate_multi_inner(
         .collect();
     let cache = design_cache_config();
     let mut cache_pp_texts: Vec<String> = Vec::new();
+    let mut cache_line_maps = Vec::new();
     let cache_key = cache.as_ref().map(|config| {
-        let (key, texts) = design_cache_key(
+        let (key, texts, maps) = design_cache_key(
             config,
             &sources,
             source_paths,
@@ -904,6 +912,7 @@ fn simulate_multi_inner(
             defines,
         );
         cache_pp_texts = texts;
+        cache_line_maps = maps;
         key
     });
     let cached_elab = cache
@@ -917,6 +926,7 @@ fn simulate_multi_inner(
         // resolution on cache hits. `source_files` / `src_file_of_module`
         // travel inside the artifact.
         elab.source_texts = std::mem::take(&mut cache_pp_texts);
+        elab.source_line_maps = std::mem::take(&mut cache_line_maps);
         if elab.source_files.is_empty() {
             elab.source_files = source_paths.to_vec();
         }

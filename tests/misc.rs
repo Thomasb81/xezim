@@ -291,6 +291,8 @@ mod class_queue_locators;
 mod cross_checked_constructs;
 #[path = "misc/dead_giant_declaration_elision.rs"]
 mod dead_giant_declaration_elision;
+#[path = "misc/diagnostic_locations.rs"]
+mod diagnostic_locations;
 #[path = "misc/elaboration_shape_fixes.rs"]
 mod elaboration_shape_fixes;
 #[path = "misc/env_var_registry.rs"]

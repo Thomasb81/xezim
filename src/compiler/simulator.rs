@@ -40800,6 +40800,17 @@ impl Simulator {
                 hit?
             }
         };
+        // The line map names the file the text really came from (an
+        // `include`d one) and its own line and column.
+        if let Some(loc) = self
+            .module
+            .source_line_maps
+            .get(i)
+            .and_then(|m| m.as_ref())
+            .and_then(|m| m.locate(&texts[i], span))
+        {
+            return Some(loc.short());
+        }
         let line = 1 + texts[i].as_bytes()[..span.start]
             .iter()
             .filter(|&&b| b == b'\n')

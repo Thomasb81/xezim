@@ -283,7 +283,16 @@ A run prints the design's own output (`$display`, UVM messages, assertion
 failures), warnings and errors, and one closing line —
 `Simulation finished at time N`, with ` ($finish called)` when the design
 finished itself. The version banner, `[PHASE]` timings and engine counters are
-behind `--verbose` (or `--profile`).
+behind `--verbose` (or `--profile`). Parse, preprocessor and elaboration errors
+name the original file, line and column — the `include`d file a line came
+from, and the macro invocation for text a macro produced — and quote the line:
+
+```text
+In file included from top.sv:2:
+body.svh:4:10: error: expected expression, found Semicolon ';'
+    4 |   x = 3 +;
+      |          ^
+```
 
 Common options:
 

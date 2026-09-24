@@ -124,7 +124,7 @@ fn check_module_item(
         }
         ModuleItem::AlwaysConstruct(a) => {
             for_each_stmt_expr(&a.stmt, &mut |e| check_zero_slice(e, elab, errs));
-            check_always_has_timing_control(a, errs);
+            check_always_has_timing_control(a, elab, errs);
         }
         ModuleItem::InitialConstruct(i) => {
             for_each_stmt_expr(&i.stmt, &mut |e| check_zero_slice(e, elab, errs));
@@ -2019,7 +2019,11 @@ fn check_implicit_ports(
 /// Over-reject guards: any user TASK call is assumed potentially timed (the
 /// delay may live in the task body), and `always_comb`/`always_latch`/
 /// `always_ff` are governed by their own §9.2.2 rules, not this one.
-fn check_always_has_timing_control(a: &crate::ast::decl::AlwaysConstruct, errs: &mut Vec<String>) {
+fn check_always_has_timing_control(
+    a: &crate::ast::decl::AlwaysConstruct,
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
     use crate::ast::decl::AlwaysKind;
     if a.kind != AlwaysKind::Always {
         return;
@@ -2066,11 +2070,13 @@ fn check_always_has_timing_control(a: &crate::ast::decl::AlwaysConstruct, errs: 
         }
     }
     if !stmt_may_yield(&a.stmt) {
+        let at = xezim_core::elaborate::span_location(elab, a.span)
+            .unwrap_or_else(|| format!("byte {}..{}", a.span.start, a.span.end));
         errs.push(format!(
             "`always` block with no timing control anywhere in its body — it can never \
 yield, so simulated time cannot advance (IEEE 1800-2017 §9.2.1). Add a `#delay`, \
-`@(...)`, or `wait`, or use `always_comb` (at byte {}..{})",
-            a.span.start, a.span.end
+`@(...)`, or `wait`, or use `always_comb` (at {})",
+            at
         ));
     }
 }
