@@ -4,8 +4,9 @@
 //! earlier loop iteration (yosys `simple_generate`). The check for names
 //! declared nowhere in the design, run over INSTANTIATED module bodies, did
 //! not count generate labels as declarations and rejected these designs
-//! ("Undeclared identifier 'block'"). Cross-checked against the reference
-//! simulator.
+//! ("Undeclared identifier 'block'"); once accepted, the call still read 0
+//! inside an instance, because the branch's functions are registered without
+//! the label. Cross-checked against the reference simulator.
 
 fn lines(src: &str) -> Vec<String> {
     xezim::simulate(src, 10)
@@ -52,9 +53,30 @@ module top ();
 endmodule
 "#,
     );
-    // Elaborates, and the loop-carried chain reads the earlier iteration.
-    assert!(
-        o.iter().any(|l| l.starts_with("G|") && l.ends_with(" 111")),
-        "{o:?}"
+    assert!(o.iter().any(|l| l == "G|1 5 111"), "{o:?}");
+}
+
+/// The branch's subroutines are flattened into the module without the label,
+/// so `blk.f` must still reach them — from inside the instance (`u.f`) and
+/// through the instance path from its parent (`u.blk.f`).
+#[test]
+fn labelled_branch_subroutine_called_through_the_label() {
+    let o = lines(
+        r#"
+module test2;
+  parameter param = 1;
+  reg [2:0] d1, d2;
+  initial begin d1 = block.f(0); d2 = block.g(); #1 $display("T|%m %0d %0d", d1, d2); end
+  generate
+    if (param == 1) begin : block
+      function [2:0] f; input i; begin f = param + 2; end endfunction
+      function [2:0] g(); return 3'd6; endfunction
+    end
+  endgenerate
+endmodule
+module top; test2 u(); initial #2 $display("X|%0d", u.block.f(0)); endmodule
+"#,
     );
+    assert!(o.iter().any(|l| l == "T|top.u 3 6"), "{o:?}");
+    assert!(o.iter().any(|l| l == "X|3"), "{o:?}");
 }
