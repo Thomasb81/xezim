@@ -25,6 +25,8 @@ mod array_read_unknown_index_is_x;
 mod ascending_indexed_part_select;
 #[path = "types/assoc_of_queue_enumeration.rs"]
 mod assoc_of_queue_enumeration;
+#[path = "types/bits_builtin_type_in_instance.rs"]
+mod bits_builtin_type_in_instance;
 #[path = "types/bits_of_signal_in_const_expr.rs"]
 mod bits_of_signal_in_const_expr;
 #[path = "types/bits_of_type_operands.rs"]
