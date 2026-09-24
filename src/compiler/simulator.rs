@@ -56548,6 +56548,20 @@ impl Simulator {
                     out.push(']');
                     return Some(out);
                 }
+                // A CLASS-MEMBER associative array is registered only under
+                // its instance-scoped name (`<h>#aa`); key it by that store's
+                // format too, or `aa["k"]` in a method names element `aa[107]`
+                // while every read keys it `aa[k]`.
+                if !self.no_class_objects()
+                    && !self.module.arrays.contains_key(&base)
+                    && !self.module.dynamic_arrays.contains(&base)
+                {
+                    let st = self.resolve_locator_storage(&base);
+                    if st != base && self.is_associative_array(&st) {
+                        let key = self.assoc_key_str(&st, &iv);
+                        return Some(format!("{}[{}]", base, key));
+                    }
+                }
                 let i = iv.to_i64()?;
                 // `format!` drags in the whole core::fmt machinery, which the
                 // profile showed dominating this path. A nested index builds

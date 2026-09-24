@@ -19,6 +19,8 @@ mod assoc_typedef_element_class;
 mod bit_class_property_signedness;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
+#[path = "classes/class_assoc_struct_string_keys.rs"]
+mod class_assoc_struct_string_keys;
 #[path = "classes/class_formal_typedef_widen.rs"]
 mod class_formal_typedef_widen;
 #[path = "classes/class_struct_collection_elements.rs"]
