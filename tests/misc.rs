@@ -367,3 +367,5 @@ mod two_state_wide_reduction;
 mod udn_resolver_compiled;
 #[path = "misc/while_continue_final_iter.rs"]
 mod while_continue_final_iter;
+#[path = "misc/zero_width_select_unselected_generate.rs"]
+mod zero_width_select_unselected_generate;

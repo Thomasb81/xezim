@@ -46,7 +46,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 for it in &m.items {
-                    check_module_item(it, elab, &local_types, &mut errs);
+                    check_module_item(it, elab, &local_types, true, &mut errs);
                 }
                 check_proc_net_assign(&m.items, &mut errs);
                 check_enum_assign(&m.items, elab, &mut errs);
@@ -60,7 +60,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 for it in &m.items {
-                    check_module_item(it, elab, &local_types, &mut errs);
+                    check_module_item(it, elab, &local_types, true, &mut errs);
                 }
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
@@ -71,7 +71,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 for it in &m.items {
-                    check_module_item(it, elab, &local_types, &mut errs);
+                    check_module_item(it, elab, &local_types, true, &mut errs);
                 }
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
@@ -100,10 +100,15 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
 }
 
 /// Classes can appear nested inside module/interface/program bodies.
+///
+/// `live` is false inside a generate branch that is not (provably) the one
+/// elaborated: value-dependent checks (a zero-width select) are skipped there,
+/// since §27.5 never elaborates an unselected branch.
 fn check_module_item(
     item: &ModuleItem,
     elab: &ElaboratedModule,
     local_types: &std::collections::HashSet<String>,
+    live: bool,
     errs: &mut Vec<String>,
 ) {
     match item {
@@ -123,16 +128,22 @@ fn check_module_item(
             check_packed_dims(&d.data_type, elab, errs);
         }
         ModuleItem::AlwaysConstruct(a) => {
-            for_each_stmt_expr(&a.stmt, &mut |e| check_zero_slice(e, elab, errs));
+            if live {
+                for_each_stmt_expr(&a.stmt, &mut |e| check_zero_slice(e, elab, errs));
+            }
             check_always_has_timing_control(a, elab, errs);
         }
         ModuleItem::InitialConstruct(i) => {
-            for_each_stmt_expr(&i.stmt, &mut |e| check_zero_slice(e, elab, errs));
+            if live {
+                for_each_stmt_expr(&i.stmt, &mut |e| check_zero_slice(e, elab, errs));
+            }
         }
         ModuleItem::ContinuousAssign(ca) => {
-            for (l, r) in &ca.assignments {
-                for_each_expr(l, &mut |e| check_zero_slice(e, elab, errs));
-                for_each_expr(r, &mut |e| check_zero_slice(e, elab, errs));
+            if live {
+                for (l, r) in &ca.assignments {
+                    for_each_expr(l, &mut |e| check_zero_slice(e, elab, errs));
+                    for_each_expr(r, &mut |e| check_zero_slice(e, elab, errs));
+                }
             }
         }
         ModuleItem::FunctionDeclaration(f) => check_output_port_defaults(&f.ports, errs),
@@ -143,25 +154,47 @@ fn check_module_item(
         // the library resolver's).
         ModuleItem::GenerateRegion(gr) => {
             for it in &gr.items {
-                check_module_item(it, elab, local_types, errs);
+                check_module_item(it, elab, local_types, live, errs);
             }
         }
         ModuleItem::GenerateIf(gi) => {
-            for (_c, items) in &gi.branches {
+            // The selected branch is known only while every condition before
+            // it evaluates confidently.
+            let mut decided = live;
+            let mut taken = false;
+            for (c, items) in &gi.branches {
+                let this_live = match c {
+                    _ if !decided || taken => false,
+                    None => true,
+                    Some(c) => match (
+                        width_is_confident(c, elab),
+                        xezim_core::elaborate::const_eval_i64_with_params(
+                            c,
+                            Some(&elab.parameters),
+                        ),
+                    ) {
+                        (true, Some(v)) => v != 0,
+                        _ => {
+                            decided = false;
+                            false
+                        }
+                    },
+                };
+                taken |= this_live;
                 for it in items {
-                    check_module_item(it, elab, local_types, errs);
+                    check_module_item(it, elab, local_types, this_live, errs);
                 }
             }
         }
         ModuleItem::GenerateFor(gf) => {
             for it in &gf.items {
-                check_module_item(it, elab, local_types, errs);
+                check_module_item(it, elab, local_types, live, errs);
             }
         }
         ModuleItem::GenerateCase(gc) => {
             for arm in &gc.arms {
                 for it in &arm.items {
-                    check_module_item(it, elab, local_types, errs);
+                    check_module_item(it, elab, local_types, false, errs);
                 }
             }
         }
