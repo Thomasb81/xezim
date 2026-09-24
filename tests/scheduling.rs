@@ -79,6 +79,8 @@ mod event_features_15_5;
 mod event_triggered_in_event_control;
 #[path = "scheduling/event_wait_same_time.rs"]
 mod event_wait_same_time;
+#[path = "scheduling/expect_statement_blocks.rs"]
+mod expect_statement_blocks;
 #[path = "scheduling/explicit_level_suspend.rs"]
 mod explicit_level_suspend;
 #[path = "scheduling/explicit_sensitivity_and_delay_task.rs"]
