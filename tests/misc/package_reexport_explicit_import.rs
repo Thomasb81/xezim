@@ -37,6 +37,9 @@ fn all_wildcard_export_reexports_explicit_import() {
     assert!(o.iter().any(|l| l == "E|123"), "{o:?}");
 }
 
+/// §26.6: "declarations imported into a package are not visible by way of
+/// subsequent imports of that package" unless exported. Pinned to the LRM:
+/// the reference simulator is lenient here and resolves the name.
 #[test]
 fn unexported_name_is_still_not_visible() {
     let src = "package P1; integer x = 123; endpackage
