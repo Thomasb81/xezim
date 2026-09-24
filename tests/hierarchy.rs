@@ -173,6 +173,8 @@ mod multi_top_typedef_packed_dims;
 mod nonansi_modport_port_decl;
 #[path = "hierarchy/ref_formal_same_name.rs"]
 mod ref_formal_same_name;
+#[path = "hierarchy/single_element_instance_array.rs"]
+mod single_element_instance_array;
 #[path = "hierarchy/unit_scope_library_subroutine.rs"]
 mod unit_scope_library_subroutine;
 #[path = "hierarchy/vif_packed_array_elem_nba.rs"]
