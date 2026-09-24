@@ -78859,6 +78859,19 @@ impl Simulator {
                                         }
                                     }
                                 }
+                                // A string-valued CALL or concatenation names no
+                                // variable for the typed paths below, so its bytes
+                                // printed as one huge decimal — UVM AVIPs log
+                                // `$sformatf("%0p", cfg.sprint())`.
+                                if matches!(
+                                    arg.kind,
+                                    ExprKind::Call { .. } | ExprKind::Concatenation(_)
+                                ) && self.expr_is_string_valued(arg)
+                                {
+                                    let v = self.eval_expr(arg);
+                                    result.push_str(&Self::render_p_value(&v, true));
+                                    continue;
+                                }
                                 // §7.12.1: an array LOCATOR call (`q.unique()`,
                                 // `q.find with (…)`, `q.min()`) RETURNS a queue.
                                 // Only the ASSIGNMENT path materialized that, so
@@ -100089,6 +100102,10 @@ impl Simulator {
     /// (`'{id:777, active:1}` -> `777 1`). Quoted strings pass through
     /// verbatim, including any braces or commas inside them.
     fn compact_p(s: &str) -> String {
+        // A lone string prints unquoted (`%0p` of "ab" is `ab`).
+        if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+            return s[1..s.len() - 1].to_string();
+        }
         let mut out = String::with_capacity(s.len());
         let mut it = s.chars().peekable();
         let mut in_str = false;
