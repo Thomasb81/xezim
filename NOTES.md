@@ -9,6 +9,64 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* UVM tables print their rows: copying a whole element out of a
+  class-property collection of unpacked structs (`row = m_rows[i]`, queue,
+  dynamic, fixed or associative) gave zeros, so the topology print and
+  `sprint()` tables were blank. Such elements now copy, return, compare and
+  print with `%p` correctly, and `this.q[i].m` reads and writes them. `%s`
+  of a string member reached through a select no longer pads, `%p` of a
+  string-valued call prints the string, and `%0p` prints it unquoted.
+* Unpacked-struct locals in `initial` blocks and subroutines: member writes
+  through selects, packed-member fields and declaration initializers take
+  effect, 2-state members start at 0, and members that are arrays of
+  structs survive whole-struct assignment.
+* Time-0 activation order follows the reference simulator: depth-first
+  source order through the hierarchy, bound instances after their host's
+  own items (several binds into one host in reverse order), and `initial`
+  blocks that cannot suspend run as one group.
+* Assertions: named properties and sequences declared in sub-modules and
+  interfaces work in `assert property`, every instance of an assertion
+  interface evaluates its own assertions (only the first one did), `bind`
+  accepts interface targets by name or path, and an action block reports
+  its assertion's own scope.
+* A virtual interface can be bound to a nested interface instance by
+  hierarchical path (`a.d`, `g[0].a.d`), and tasks can be called through a
+  generate-block path.
+* UVM's DPI-C functions are built in, so `+define+UVM_NO_DPI` is optional:
+  regular expressions and globs for config_db, resource_db, factory
+  overrides and `+uvm_set_*` plusargs, the command-line processor, and the
+  `uvm_hdl_*` backdoor (read, deposit, force, release by hierarchical
+  path). A `--dpi-lib` that defines a symbol still takes precedence.
+* A second hierarchical write such as `u_sub.sig = v` went into a class
+  object instead of the signal once any class object existed (every UVM
+  testbench). 2-state variables in instantiated modules no longer hold x/z,
+  and a released net takes its drivers' value immediately.
+* Specify path delays count the declaring module's timeunit (they ran 1000x
+  short in a 1ns/1ps module). All path forms are modelled (`*>`, polarity,
+  edge-sensitive, `if`/`ifnone`, 2/3/6/12-value delay lists), the delay is
+  chosen per transition and enabled path, and outputs reject pulses
+  narrower than the delay. SDF IOPATH still overrides them.
+* Identifiers declared nowhere in the design are an error inside task,
+  function, class-method, package, interface and program bodies, as they
+  already were elsewhere.
+* Untyped parameters take the width and signedness of their initializer
+  (`localparam C = {8'h1, 8'h2}` is 16 bits, `{4{B}}` and string literals
+  keep all their bits, `parameter unsigned P = 5` is unsigned). A `string`
+  parameter prints with `%s` like a string variable.
+* Several tops each act as their own root: the internal wrapper name no
+  longer appears in `%m`, messages, VPI or VCD/FST/XTrace scopes, a
+  `defparam` path may start at a top, and `$bits(<type>)` in a child
+  instance uses that instance's parameters.
+* From the sv-tests suite (now 94.8%): `` `include `` of a function-like
+  macro expands fully; paren-less `aa.size` counts entries; `item.index`
+  works in locator `with` clauses; `repeat` rounds a real count; `expect`
+  blocks until its attempt finishes; `= @ev rhs` without parentheses waits;
+  input port defaults use the instance's own parameters; subroutines in
+  labelled generate branches resolve; `$bits` of a class type parameter
+  works in class constants. Strict mode rejects a second or mis-sized
+  non-ANSI port redeclaration, `specparam`/module declarations inside
+  generate blocks, class/string/chandle/event nets, and an unqualified
+  interface-class typedef used by an implementing class.
 * Casts evaluate their operand at the cast type's width (IEEE 1800-2017
   §6.24.1): `int'(a + b)` over 8-bit operands is 300, not 44. This holds
   in procedural code, continuous assigns, constants, packed dimensions and
@@ -234,6 +292,16 @@ and the development workflow are in [README.md](README.md).
   method of a class declared inside a module.
 
 **Usability**
+
+* Command lines written for other simulators run as-is: bare or `work.`
+  top names, `-F`, `-g`/`-G` parameter overrides, `-sv_seed`,
+  `-sv_lib`/`-sv_root`, `-svNNcompat`, and a `-do` subset (`run -all`,
+  `run <time>`, `quit`, `exit`, `do <file>`; `log`, `add wave` and
+  `coverage save/report` are accepted with a warning; anything else is an
+  error). Library options (`-work`, `-L`, `-lib`) are ignored with one
+  warning; `-c` and `-l` keep their xezim meanings. `run -all` runs past
+  the default time cap, and after `run <time>` the closing line and
+  `final` blocks see the stop time.
 
 * Runs are quiet by default. The transcript holds the design's output,
   warnings and errors, and one closing line, `Simulation finished at time N
