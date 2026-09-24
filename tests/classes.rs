@@ -29,6 +29,8 @@ mod class_unpacked_struct_array_store;
 mod collection_of_handles_new;
 #[path = "classes/explicit_param_static_coll_read.rs"]
 mod explicit_param_static_coll_read;
+#[path = "classes/function_local_struct_return_shadow.rs"]
+mod function_local_struct_return_shadow;
 #[path = "classes/memory_tasks_fixed_property.rs"]
 mod memory_tasks_fixed_property;
 #[path = "classes/nested_same_named_ref_assoc_formal.rs"]

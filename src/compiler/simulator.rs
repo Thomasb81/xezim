@@ -75274,7 +75274,15 @@ impl Simulator {
                             self.pending_ret_collection = Some(RET_SNAP.to_string());
                         }
                     }
-                    self.return_value = Some(self.eval_expr(e));
+                    // §13.4.1: a subroutine-local unpacked struct
+                    // (`return r;`) is assembled from the frame's leaves.
+                    let v = match self.frame_struct_local(e) {
+                        Some((name, su)) => self
+                            .pack_unpacked_struct(&name, &su)
+                            .unwrap_or_else(|| self.eval_expr(e)),
+                        None => self.eval_expr(e),
+                    };
+                    self.return_value = Some(v);
                     // §25.9: a returned VIRTUAL INTERFACE carries only a
                     // sentinel value; record the instance it is bound to so
                     // the caller's `vd = getter();` can re-establish the
@@ -97824,6 +97832,32 @@ impl Simulator {
                 k += 1;
             }
         }
+    }
+
+    /// `(name, type)` when `e` is a bare unpacked-struct LOCAL of the current
+    /// frame. Its leaves live in the frame, but reading the bare name as a
+    /// value consults the module first: an `initial`-block struct of the same
+    /// name answered `return r;` with its own (x) container.
+    fn frame_struct_local(
+        &self,
+        e: &Expression,
+    ) -> Option<(String, crate::ast::types::StructUnionType)> {
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let name = &h.path[0].name.name;
+        let frame = self.local_stack.last()?;
+        if frame.contains_key(name) {
+            return None;
+        }
+        let su = self.unpacked_struct_of(self.module.var_decl_types.get(name)?)?;
+        let first = self.struct_leaf_suffixes(&su).into_iter().next()?;
+        frame
+            .contains_key(&format!("{}.{}", name, first))
+            .then(|| (name.clone(), su))
     }
 
     /// `class_agg_member` for an already-split `<base>.<field>`.
