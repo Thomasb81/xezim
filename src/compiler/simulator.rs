@@ -100708,6 +100708,11 @@ impl Simulator {
             false
         };
         let saved_item = self.local_stack.last().and_then(|f| f.get("item").cloned());
+        let saved_index = self
+            .local_stack
+            .last()
+            .and_then(|f| f.get("item.index").cloned());
+        let iter_index = iter.map(|nm| format!("{}.index", nm));
         let mut acc: Option<i64> = None;
         // §7.12.3: with a `with` clause the result type is the type of the
         // EXPRESSION, so the accumulation wraps at that width. A 1-bit
@@ -100720,10 +100725,17 @@ impl Simulator {
                 .get_signal_value_by_name(&format!("{}[{}]", arr, i))
                 .unwrap_or_else(|| Value::zero(32));
             if let Some(f) = self.local_stack.last_mut() {
+                // §7.12.4: `item.index` is the element's index (an int).
+                let mut ix = Value::from_u64(i, 32);
+                ix.is_signed = true;
                 if let Some(nm) = iter {
                     f.insert(nm.to_string(), elem.clone());
                 }
+                if let Some(k) = &iter_index {
+                    f.insert(k.clone(), ix.clone());
+                }
                 f.insert("item".to_string(), elem);
+                f.insert("item.index".to_string(), ix);
             }
             let fv = self.eval_expr(filter);
             if expr_w == 0 {
@@ -100747,12 +100759,23 @@ impl Simulator {
             if let Some(nm) = iter {
                 f.remove(nm);
             }
+            if let Some(k) = &iter_index {
+                f.remove(k);
+            }
             match saved_item {
                 Some(v) => {
                     f.insert("item".to_string(), v);
                 }
                 None => {
                     f.remove("item");
+                }
+            }
+            match saved_index {
+                Some(v) => {
+                    f.insert("item.index".to_string(), v);
+                }
+                None => {
+                    f.remove("item.index");
                 }
             }
         }
