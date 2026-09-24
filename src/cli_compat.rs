@@ -259,15 +259,42 @@ pub(crate) enum DoRun {
     All,
 }
 
+/// What the `-do` scripts ask for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DoPlan {
+    pub run: DoRun,
+    /// One warning per kind of command accepted without effect.
+    pub warnings: Vec<String>,
+}
+
+/// Commands accepted as no-ops: waveform logging (xezim dumps through
+/// `$dumpvars` with `--wave`/`--fst`) and coverage database files.
+fn no_op_command(words: &[&str]) -> Option<(&'static str, &'static str)> {
+    const WAVES: &str = "use --fst (or --wave for $dumpvars) for waveforms";
+    const COVERAGE: &str = "xezim writes no coverage database";
+    match words {
+        ["log", ..] => Some(("log", WAVES)),
+        ["add", "wave", ..] => Some(("add wave", WAVES)),
+        ["coverage", "save", ..] => Some(("coverage save", COVERAGE)),
+        ["coverage", "report", ..] => Some(("coverage report", COVERAGE)),
+        _ => None,
+    }
+}
+
 /// The accepted `-do` subset: `run -all`, `run <n><unit>` (also `run <n>
 /// <unit>`), `quit`/`exit` (optionally `-f`/`-force`/`-sim`) and `do <file>`,
-/// separated by `;` or newlines, with `#` comments. Anything else is an
-/// error, never silently skipped.
-pub(crate) fn plan_do_scripts(scripts: &[(String, String)]) -> Result<DoRun, String> {
-    let mut plan = DoRun::Load;
+/// separated by `;` or newlines, with `#` comments; `log`, `add wave`,
+/// `coverage save` and `coverage report` are accepted with a warning and do
+/// nothing. Anything else is an error, never silently skipped.
+pub(crate) fn plan_do_scripts(scripts: &[(String, String)]) -> Result<DoPlan, String> {
+    let mut plan = DoPlan {
+        run: DoRun::Load,
+        warnings: Vec::new(),
+    };
+    let mut warned: Vec<&'static str> = Vec::new();
     let mut depth = 0;
     for (text, origin) in scripts {
-        if walk_do_script(text, origin, &mut plan, &mut depth)? {
+        if walk_do_script(text, origin, &mut plan, &mut warned, &mut depth)? {
             break;
         }
     }
@@ -278,7 +305,8 @@ pub(crate) fn plan_do_scripts(scripts: &[(String, String)]) -> Result<DoRun, Str
 fn walk_do_script(
     text: &str,
     origin: &str,
-    plan: &mut DoRun,
+    plan: &mut DoPlan,
+    warned: &mut Vec<&'static str>,
     depth: &mut u32,
 ) -> Result<bool, String> {
     for line in text.lines() {
@@ -291,11 +319,19 @@ fn walk_do_script(
             let Some((&head, args)) = words.split_first() else {
                 continue;
             };
+            if let Some((kind, why)) = no_op_command(&words) {
+                if !warned.contains(&kind) {
+                    warned.push(kind);
+                    plan.warnings
+                        .push(format!("{}: `{}` is ignored: {}", origin, cmd, why));
+                }
+                continue;
+            }
             match head {
                 "run" => {
                     let step = parse_run_args(args)
                         .map_err(|e| format!("{}: `{}`: {}", origin, cmd, e))?;
-                    *plan = match (*plan, step) {
+                    plan.run = match (plan.run, step) {
                         (DoRun::All, _) | (_, DoRun::All) => DoRun::All,
                         (DoRun::For(a), DoRun::For(b)) => DoRun::For(a.saturating_add(b)),
                         (DoRun::Load, s) | (s, DoRun::Load) => s,
@@ -323,7 +359,8 @@ fn walk_do_script(
                     }
                     let nested = std::fs::read_to_string(file)
                         .map_err(|e| format!("{}: cannot read '{}': {}", origin, file, e))?;
-                    let quit = walk_do_script(&nested, &format!("do {}", file), plan, depth)?;
+                    let quit =
+                        walk_do_script(&nested, &format!("do {}", file), plan, warned, depth)?;
                     *depth -= 1;
                     if quit {
                         return Ok(true);
@@ -332,7 +369,8 @@ fn walk_do_script(
                 _ => {
                     return Err(format!(
                         "{}: unsupported command `{}`; xezim runs the -do subset \
-                         `run -all`, `run <n><unit>`, `quit [-f]`, `exit [-f]`, `do <file>`",
+                         `run -all`, `run <n><unit>`, `quit [-f]`, `exit [-f]`, `do <file>` \
+                         (and ignores `log`, `add wave`, `coverage save`, `coverage report`)",
                         origin, cmd
                     ));
                 }

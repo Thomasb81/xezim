@@ -10,7 +10,7 @@ use std::process::Command;
 #[path = "../../src/cli_compat.rs"]
 mod cli_compat;
 
-use cli_compat::{DoRun, bare_top_name, c_takes_file, plan_do_scripts};
+use cli_compat::{DoPlan, DoRun, bare_top_name, c_takes_file, plan_do_scripts};
 
 fn xezim() -> String {
     let mut p = std::env::current_exe().expect("current_exe");
@@ -50,8 +50,12 @@ fn ok_stdout(dir: &Path, args: &[&str]) -> String {
     out
 }
 
-fn script(text: &str) -> Result<DoRun, String> {
+fn plan(text: &str) -> Result<DoPlan, String> {
     plan_do_scripts(&[(text.to_string(), "-do".to_string())])
+}
+
+fn script(text: &str) -> Result<DoRun, String> {
+    plan(text).map(|p| p.run)
 }
 
 #[test]
@@ -72,15 +76,52 @@ fn do_subset_plans() {
     );
 }
 
+/// The AVIP makefiles' script: waveform logging and coverage saves are
+/// accepted with one warning per kind of command and change nothing else.
+#[test]
+fn do_subset_ignores_logging_and_coverage() {
+    let p = plan(
+        "log -r /*; add wave -r /*; coverage save -onexit -assert -directive -cvg \
+         -codeAll t/t_coverage.ucdb; run -all; exit",
+    )
+    .unwrap();
+    assert_eq!(p.run, DoRun::All);
+    assert_eq!(p.warnings.len(), 3, "{:?}", p.warnings);
+    assert!(
+        p.warnings[0].contains("`log -r /*` is ignored"),
+        "{:?}",
+        p.warnings
+    );
+    assert!(
+        p.warnings[1].contains("`add wave -r /*`"),
+        "{:?}",
+        p.warnings
+    );
+    assert!(
+        p.warnings[2].contains("`coverage save -onexit"),
+        "{:?}",
+        p.warnings
+    );
+    // One warning per kind, however often it appears.
+    let p = plan("log a; log -r /*\nadd wave x; add wave y; coverage report -file c.txt; run 5ns")
+        .unwrap();
+    assert_eq!(p.run, DoRun::For(5));
+    assert_eq!(p.warnings.len(), 3, "{:?}", p.warnings);
+    assert!(plan("run -all").unwrap().warnings.is_empty());
+}
+
 #[test]
 fn do_subset_rejects_everything_else() {
     for bad in [
-        "add wave -r /*",
+        "add list -r /*",
+        "add",
+        "coverage exclude -du tb",
+        "coverage",
         "run",
         "run 100",
         "run 1.5ps",
         "run 10 parsecs",
-        "log -r /*; run -all",
+        "logfile x; run -all",
         "quit -code 3",
         "onfinish stop",
     ] {
@@ -175,13 +216,25 @@ fn do_run_all_lifts_the_default_cap() {
         out
     );
     // An unknown command stops the run before it starts.
-    let (code, _, err) = run_in(&d, &["tb.sv", "-do", "add wave -r /*; run -all"]);
+    let (code, _, err) = run_in(&d, &["tb.sv", "-do", "add list -r /*; run -all"]);
     assert_eq!(code, 1);
     assert!(
-        err.contains("unsupported command `add wave -r /*`"),
+        err.contains("unsupported command `add list -r /*`"),
         "{}",
         err
     );
+    // Logging and coverage commands are warned about once and skipped.
+    let (code, out, err) = run_in(
+        &d,
+        &[
+            "tb.sv",
+            "-do",
+            "log -r /*; add wave -r /*; coverage save -onexit c.ucdb; run -all; exit",
+        ],
+    );
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, native);
+    assert_eq!(err.matches("Warning: -do: `").count(), 3, "{}", err);
 }
 
 const STOPS: &str = "\

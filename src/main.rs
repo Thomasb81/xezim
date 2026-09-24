@@ -2531,7 +2531,13 @@ fn run_main() -> i32 {
     // `-do`: its `run` commands set how long the run goes. An explicit
     // `--max-time` stays a hard cap on top of them.
     if !compat.do_scripts.is_empty() {
-        match cli_compat::plan_do_scripts(&compat.do_scripts) {
+        let plan = cli_compat::plan_do_scripts(&compat.do_scripts).map(|p| {
+            for w in &p.warnings {
+                eprintln!("Warning: {}", w);
+            }
+            p.run
+        });
+        match plan {
             Ok(cli_compat::DoRun::All) => {
                 if !max_time_explicit {
                     max_time = RUN_ALL_NS;
