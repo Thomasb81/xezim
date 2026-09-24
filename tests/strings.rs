@@ -75,6 +75,8 @@ mod string_index_ref_queue;
 mod string_is_dynamic;
 #[path = "strings/string_methods_lrm.rs"]
 mod string_methods_lrm;
+#[path = "strings/string_parameter_format.rs"]
+mod string_parameter_format;
 #[path = "strings/string_property_shadowed_by_local.rs"]
 mod string_property_shadowed_by_local;
 #[path = "strings/string_returning_fn_inline.rs"]
