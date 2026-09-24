@@ -48489,6 +48489,14 @@ impl Simulator {
         let ExprKind::Call { func, .. } = &expr.kind else {
             return false;
         };
+        // §25.5.4/§25.9: a task of an interface or module INSTANCE, reached by
+        // hierarchical path or through a virtual interface, has no class
+        // receiver. The receiver name holds no object handle (a vif property
+        // reads 0), so the check below took `vif.t()` in a `forever` for a
+        // null dereference and silently retired the loop.
+        if self.resolve_hier_task_target(func).is_some() {
+            return false;
+        }
         let rh = match &func.kind {
             // `w.m(...)` / `w.a.m(...)` — flattened multi-segment Ident.
             ExprKind::Ident(h) if h.path.len() >= 2 => {

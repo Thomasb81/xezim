@@ -155,6 +155,8 @@ mod instance_block_locals_shadow_module_names;
 mod instance_collections_resolve_by_scope;
 #[path = "hierarchy/instance_loop_local_shadows_module_var.rs"]
 mod instance_loop_local_shadows_module_var;
+#[path = "hierarchy/instance_task_in_forever_loop.rs"]
+mod instance_task_in_forever_loop;
 #[path = "hierarchy/interface_task_lexical_scope.rs"]
 mod interface_task_lexical_scope;
 #[path = "hierarchy/library_dir_on_demand.rs"]
