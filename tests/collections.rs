@@ -31,6 +31,8 @@ mod assoc_compliance;
 mod assoc_method_dispatch;
 #[path = "collections/assoc_missing_key_default.rs"]
 mod assoc_missing_key_default;
+#[path = "collections/assoc_noparen_size.rs"]
+mod assoc_noparen_size;
 #[path = "collections/collection_write_open_gaps.rs"]
 mod collection_write_open_gaps;
 #[path = "collections/concurrent_local_dyn_arrays.rs"]

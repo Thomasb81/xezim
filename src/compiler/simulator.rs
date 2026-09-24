@@ -65114,6 +65114,9 @@ impl Simulator {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
+        if let Some(v) = self.assoc_size_member(expr) {
+            return v;
+        }
         // `pkg::arr[i]` / `pkg::v[h:l]` as an rvalue: the indexed arms resolve
         // their base by name and only for a plain identifier, so under a
         // task/function frame a package-qualified base read 0. Strip the
@@ -89366,6 +89369,50 @@ impl Simulator {
                 None => return false,
             }
         }
+    }
+
+    /// §7.9.1: `aa.size` / `aa.num` written without parentheses on an
+    /// associative array counts its keys. The collection's `aa.size` signal
+    /// is only a comb-dependency proxy for an associative array (it always
+    /// holds 0), and the dotted-name lookups found it before any
+    /// associative-array handling, so every paren-less `size` read 0.
+    fn assoc_size_member(&self, expr: &Expression) -> Option<Value> {
+        let name = match &expr.kind {
+            ExprKind::MemberAccess { expr: b, member }
+                if matches!(member.name.as_str(), "size" | "num") =>
+            {
+                let ExprKind::Ident(h) = &b.kind else {
+                    return None;
+                };
+                self.resolve_hier_name(h).into_owned()
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.path.last().is_some_and(|s| {
+                        s.selects.is_empty() && matches!(s.name.name.as_str(), "size" | "num")
+                    }) =>
+            {
+                let full = self.resolve_hier_name(h);
+                let base = full
+                    .strip_suffix(".size")
+                    .or_else(|| full.strip_suffix(".num"))?;
+                base.to_string()
+            }
+            _ => return None,
+        };
+        let name = if self.is_associative_array(&name) {
+            name
+        } else {
+            let scoped = self.instance_assoc_member(&name)?;
+            if !self.is_associative_array(&scoped) {
+                return None;
+            }
+            scoped
+        };
+        Some(Value::from_u64(
+            self.assoc_top_level_keys(&name).len() as u64,
+            32,
+        ))
     }
 
     fn is_associative_array(&self, name: &str) -> bool {
