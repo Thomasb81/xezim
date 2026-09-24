@@ -45,6 +45,8 @@ mod flat_actual_struct_port;
 mod foreach_in_inlined_child;
 #[path = "hierarchy/foreach_over_submodule_array.rs"]
 mod foreach_over_submodule_array;
+#[path = "hierarchy/generate_label_hier_roots.rs"]
+mod generate_label_hier_roots;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
 #[path = "hierarchy/generic_interface_ports.rs"]
