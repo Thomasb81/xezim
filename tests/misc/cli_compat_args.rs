@@ -1,0 +1,380 @@
+//! Other simulators' command-line spellings (src/cli_compat.rs): each one runs
+//! a small design and must give the same result as the equivalent native
+//! xezim flags. The `-do` subset parser is a pure function, tested directly by
+//! including the binary's module source.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[allow(dead_code)]
+#[path = "../../src/cli_compat.rs"]
+mod cli_compat;
+
+use cli_compat::{DoRun, bare_top_name, c_takes_file, plan_do_scripts};
+
+fn xezim() -> String {
+    let mut p = std::env::current_exe().expect("current_exe");
+    p.pop();
+    if p.ends_with("deps") {
+        p.pop();
+    }
+    p.join("xezim").to_string_lossy().into_owned()
+}
+
+/// A fresh scratch directory per test (tests run in parallel).
+fn scratch(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("xezim_cli_compat_{}_{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Run xezim in `dir`; returns (exit code, stdout, stderr).
+fn run_in(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(xezim())
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run xezim");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Stdout of a run that must succeed.
+fn ok_stdout(dir: &Path, args: &[&str]) -> String {
+    let (code, out, err) = run_in(dir, args);
+    assert_eq!(code, 0, "xezim {:?} failed:\n{}{}", args, out, err);
+    out
+}
+
+fn script(text: &str) -> Result<DoRun, String> {
+    plan_do_scripts(&[(text.to_string(), "-do".to_string())])
+}
+
+#[test]
+fn do_subset_plans() {
+    assert_eq!(script("run -all; quit -f"), Ok(DoRun::All));
+    assert_eq!(script("run 100ns; quit"), Ok(DoRun::For(100)));
+    assert_eq!(script("run 1us\nrun 500 ns\nexit"), Ok(DoRun::For(1500)));
+    assert_eq!(script("run 2ms"), Ok(DoRun::For(2_000_000)));
+    assert_eq!(script("run 3000ps; quit -force"), Ok(DoRun::For(3)));
+    assert_eq!(script("run 1sec"), Ok(DoRun::For(1_000_000_000)));
+    assert_eq!(script("run 10ns; run -all; run 5ns"), Ok(DoRun::All));
+    // Everything after a quit is never reached.
+    assert_eq!(script("run 10ns; quit; run -all"), Ok(DoRun::For(10)));
+    assert_eq!(script("quit -f"), Ok(DoRun::Load));
+    assert_eq!(
+        script("# setup\nrun 20ns ;# twenty\n\nquit"),
+        Ok(DoRun::For(20))
+    );
+}
+
+#[test]
+fn do_subset_rejects_everything_else() {
+    for bad in [
+        "add wave -r /*",
+        "run",
+        "run 100",
+        "run 1.5ps",
+        "run 10 parsecs",
+        "log -r /*; run -all",
+        "quit -code 3",
+        "onfinish stop",
+    ] {
+        assert!(script(bad).is_err(), "`{}` must be rejected", bad);
+    }
+    let e = script("run 10ns; vcd file x.vcd").unwrap_err();
+    assert!(
+        e.contains("vcd file x.vcd") && e.contains("run -all"),
+        "{}",
+        e
+    );
+}
+
+#[test]
+fn bare_names_and_dash_c() {
+    let libs = vec!["mylib".to_string()];
+    assert_eq!(bare_top_name("tb_top", &libs).as_deref(), Some("tb_top"));
+    assert_eq!(
+        bare_top_name("work.tb_top", &libs).as_deref(),
+        Some("tb_top")
+    );
+    assert_eq!(bare_top_name("mylib.hvl", &libs).as_deref(), Some("hvl"));
+    assert_eq!(bare_top_name("other.hvl", &libs), None);
+    assert_eq!(bare_top_name("missing.sv", &libs), None);
+    assert_eq!(bare_top_name("dir/tb", &libs), None);
+    // `-c` keeps reading an args file whenever one could follow.
+    assert!(c_takes_file(Some("files.f"), &libs));
+    assert!(c_takes_file(Some("sub/files"), &libs));
+    assert!(!c_takes_file(Some("-quiet"), &libs));
+    assert!(!c_takes_file(Some("+UVM_TESTNAME=t"), &libs));
+    assert!(!c_takes_file(Some("tb_top"), &libs));
+    assert!(!c_takes_file(Some("work.tb_top"), &libs));
+    assert!(!c_takes_file(None, &libs));
+}
+
+const TIMED: &str = "\
+module tb;
+  initial begin
+    #5 $display(\"A t=%0t\", $time);
+    #95 $display(\"B t=%0t\", $time);
+    #1 $display(\"C t=%0t\", $time);
+    #199899 $display(\"D t=%0t\", $time);
+    $finish;
+  end
+endmodule
+";
+
+#[test]
+fn do_run_time_matches_max_time() {
+    let d = scratch("dorun");
+    std::fs::write(d.join("tb.sv"), TIMED).unwrap();
+    let native = ok_stdout(&d, &["tb.sv", "--max-time", "100"]);
+    assert!(
+        native.contains("B t=100") && !native.contains("C t="),
+        "{}",
+        native
+    );
+    assert_eq!(ok_stdout(&d, &["tb.sv", "-do", "run 100ns; quit"]), native);
+    assert_eq!(
+        ok_stdout(&d, &["tb.sv", "-do", "run 60 ns\nrun 40ns"]),
+        native
+    );
+    std::fs::write(d.join("run.do"), "# stimulus\nrun 100ns\nquit -f\n").unwrap();
+    assert_eq!(ok_stdout(&d, &["tb.sv", "-do", "run.do"]), native);
+    assert_eq!(ok_stdout(&d, &["tb.sv", "-do", "do run.do"]), native);
+    // --max-time stays a hard cap over the script.
+    assert_eq!(
+        ok_stdout(&d, &["tb.sv", "--max-time", "100", "-do", "run -all"]),
+        native
+    );
+}
+
+#[test]
+fn do_run_all_lifts_the_default_cap() {
+    let d = scratch("doall");
+    std::fs::write(d.join("tb.sv"), TIMED).unwrap();
+    // $finish is at 200 us, past the default 100 us cap.
+    let capped = ok_stdout(&d, &["tb.sv"]);
+    assert!(!capped.contains("D t="), "{}", capped);
+    let native = ok_stdout(&d, &["tb.sv", "--max-time", "1ms"]);
+    assert!(native.contains("D t=200000") && native.contains("$finish called"));
+    assert_eq!(
+        ok_stdout(&d, &["tb.sv", "-do", "run -all; quit -f"]),
+        native
+    );
+    // Quitting before any run only elaborates.
+    let (code, out, _) = run_in(&d, &["tb.sv", "-do", "quit -f"]);
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("Elaboration successful") && !out.contains("A t="),
+        "{}",
+        out
+    );
+    // An unknown command stops the run before it starts.
+    let (code, _, err) = run_in(&d, &["tb.sv", "-do", "add wave -r /*; run -all"]);
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("unsupported command `add wave -r /*`"),
+        "{}",
+        err
+    );
+}
+
+#[test]
+fn defines_incdirs_and_args_files() {
+    let d = scratch("defs");
+    for (dir, file, text) in [
+        ("inc1", "one.svh", "`define ONE 11\n"),
+        ("inc2", "two.svh", "`define TWO 22\n"),
+    ] {
+        std::fs::create_dir_all(d.join(dir)).unwrap();
+        std::fs::write(d.join(dir).join(file), text).unwrap();
+    }
+    std::fs::write(
+        d.join("tb.sv"),
+        "`include \"one.svh\"\n`include \"two.svh\"\n\
+         module tb; initial begin\n\
+         `ifdef FLAG $display(\"FLAG set\"); `endif\n\
+         $display(\"VAL=%0d ONE=%0d TWO=%0d\", `VAL, `ONE, `TWO);\n\
+         end endmodule\n",
+    )
+    .unwrap();
+    let native = ok_stdout(
+        &d,
+        &[
+            "-D", "FLAG", "-D", "VAL=7", "-I", "inc1", "-I", "inc2", "tb.sv",
+        ],
+    );
+    assert!(native.contains("FLAG set") && native.contains("VAL=7 ONE=11 TWO=22"));
+    let compat = ok_stdout(
+        &d,
+        &["-sv", "+define+FLAG+VAL=7", "+incdir+inc1+inc2", "tb.sv"],
+    );
+    assert_eq!(compat, native);
+    // `-F`: +incdir+ paths inside resolve against the args file's directory.
+    std::fs::create_dir_all(d.join("run")).unwrap();
+    std::fs::write(
+        d.join("files.f"),
+        "+define+FLAG+VAL=7\n+incdir+inc1+inc2\n-sv -mfcu -work work\ntb.sv\n",
+    )
+    .unwrap();
+    assert_eq!(ok_stdout(&d.join("run"), &["-F", "../files.f"]), native);
+    assert_eq!(ok_stdout(&d, &["-file", "files.f"]), native);
+}
+
+const TOPS: &str = "\
+module tb #(parameter int W = 4, parameter string S = \"def\") ();
+  sub u_dflt();
+  sub #(.W(3)) u_expl();
+  initial $display(\"%m W=%0d hello=%0d bits=%0d\", W, S == \"hello\", $bits(logic [W-1:0]));
+endmodule
+module sub #(parameter int W = 1) ();
+  initial $display(\"%m W=%0d\", W);
+endmodule
+module other;
+  initial $display(\"%m other\");
+endmodule
+";
+
+#[test]
+fn bare_top_names_select_tops() {
+    let d = scratch("tops");
+    std::fs::write(d.join("t.sv"), TOPS).unwrap();
+    let one = ok_stdout(&d, &["t.sv", "-s", "tb"]);
+    assert!(one.contains("tb W=4") && !one.contains("other"), "{}", one);
+    assert_eq!(ok_stdout(&d, &["t.sv", "tb"]), one);
+    assert_eq!(
+        ok_stdout(&d, &["-c", "-quiet", "-lib", "work", "t.sv", "work.tb"]),
+        one
+    );
+    let two = ok_stdout(&d, &["t.sv", "-s", "tb", "-s", "other"]);
+    assert!(two.contains("other") && two.contains("W=4"), "{}", two);
+    assert_eq!(ok_stdout(&d, &["t.sv", "tb", "other"]), two);
+    // `-c <args file>` keeps xezim's meaning.
+    std::fs::write(d.join("files.f"), "t.sv\n").unwrap();
+    assert_eq!(ok_stdout(&d, &["-c", "files.f", "-s", "tb"]), one);
+}
+
+#[test]
+fn g_overrides_parameter_defaults() {
+    let d = scratch("gpar");
+    std::fs::write(d.join("t.sv"), TOPS).unwrap();
+    let out = ok_stdout(&d, &["t.sv", "tb", "-gW=8", "-gS=hello"]);
+    assert!(out.contains("tb W=8 hello=1 bits=8"), "{}", out);
+    // Every defaulted instance takes it; an explicit instance value wins.
+    assert!(
+        out.contains("tb.u_dflt W=8") && out.contains("tb.u_expl W=3"),
+        "{}",
+        out
+    );
+    let quoted = ok_stdout(&d, &["t.sv", "tb", "-gW=8", "-gS=\"hello\""]);
+    assert_eq!(quoted, out);
+    // `-G` also beats a value given at the instantiation.
+    let forced = ok_stdout(&d, &["t.sv", "tb", "-GW=8"]);
+    assert!(
+        forced.contains("tb W=8") && forced.contains("tb.u_dflt W=8"),
+        "{}",
+        forced
+    );
+    assert!(forced.contains("tb.u_expl W=8"), "{}", forced);
+    // A path limits it to one module.
+    let top_only = ok_stdout(&d, &["t.sv", "tb", "-g/tb/W=6"]);
+    assert!(
+        top_only.contains("tb W=6") && top_only.contains("tb.u_dflt W=1"),
+        "{}",
+        top_only
+    );
+    let (code, _, err) = run_in(&d, &["t.sv", "tb", "-gNOPE=1"]);
+    assert_eq!(code, 0);
+    assert!(err.contains("'NOPE'; ignored"), "{}", err);
+}
+
+const RANDOM: &str = "\
+module tb;
+  int unsigned r;
+  initial begin
+    repeat (4) begin r = $urandom; $display(\"r=%0d\", r); end
+  end
+endmodule
+";
+
+#[test]
+fn sv_seed_matches_plus_seed() {
+    let d = scratch("seed");
+    std::fs::write(d.join("tb.sv"), RANDOM).unwrap();
+    let native = ok_stdout(&d, &["tb.sv", "+seed=42"]);
+    assert_eq!(ok_stdout(&d, &["tb.sv", "-sv_seed", "42"]), native);
+    assert_eq!(ok_stdout(&d, &["tb.sv", "-sv_seed", "42"]), native);
+    assert_ne!(ok_stdout(&d, &["tb.sv", "-sv_seed", "7"]), native);
+    let (code, out, err) = run_in(&d, &["tb.sv", "-sv_seed", "random"]);
+    assert_eq!(code, 0, "{}{}", out, err);
+    assert!(err.contains("random seed:"), "{}", err);
+    let (code, _, err) = run_in(&d, &["tb.sv", "-sv_seed", "abc"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("-sv_seed"), "{}", err);
+}
+
+#[test]
+fn log_file_holds_the_transcript() {
+    let d = scratch("log");
+    std::fs::write(d.join("tb.sv"), TIMED).unwrap();
+    let native = ok_stdout(&d, &["tb.sv", "--max-time", "1ms"]);
+    for flag in ["-l", "-logfile"] {
+        let (code, out, err) = run_in(&d, &["tb.sv", flag, "run.log", "-do", "run -all"]);
+        assert_eq!(code, 0);
+        assert_eq!(out, "", "{} redirects: nothing on the terminal", flag);
+        assert_eq!(err, "");
+        assert_eq!(std::fs::read_to_string(d.join("run.log")).unwrap(), native);
+    }
+}
+
+#[test]
+fn full_reference_style_line_matches_native() {
+    let d = scratch("full");
+    std::fs::write(d.join("t.sv"), TOPS).unwrap();
+    std::fs::write(d.join("r.sv"), RANDOM.replace("module tb;", "module rnd;")).unwrap();
+    std::fs::write(d.join("files.f"), "t.sv\nr.sv\n").unwrap();
+    let native = ok_stdout(
+        &d,
+        &[
+            "-f",
+            "files.f",
+            "-s",
+            "tb",
+            "-s",
+            "rnd",
+            "+seed=5",
+            "--max-time",
+            "1000",
+        ],
+    );
+    let compat = ok_stdout(
+        &d,
+        &[
+            "-sv",
+            "-F",
+            "files.f",
+            "-work",
+            "work",
+            "+acc",
+            "-suppress",
+            "2583",
+            "-c",
+            "-quiet",
+            "-optargs=+acc",
+            "-lib",
+            "work",
+            "tb",
+            "rnd",
+            "-sv_seed",
+            "5",
+            "-do",
+            "run 1us; quit -f",
+        ],
+    );
+    assert_eq!(compat, native);
+}

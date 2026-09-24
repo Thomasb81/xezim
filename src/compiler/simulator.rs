@@ -236,6 +236,15 @@ pub fn set_nospecify(v: bool) {
     NOSPECIFY.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The time limit is a requested run length (`-do "run 100ns"`), so reaching
+/// it is the expected end of the run, not a possible hang to report.
+static RUN_LENGTH_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_run_length_requested(v: bool) {
+    RUN_LENGTH_REQUESTED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn nospecify() -> bool {
     NOSPECIFY.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -41703,7 +41712,7 @@ impl Simulator {
         // Realtime twin for the human-facing report (see crate::WallTimer).
         let sim_start_rt = crate::WallTimer::now();
         let mut iters: u64 = 0;
-        let max_iters = self.max_time * 1000;
+        let max_iters = self.max_time.saturating_mul(1000);
         let mut accum = PerTickAccum::default();
         let cascade_limit = self.cascade_limit;
         // JIT-redesign Stage 1: optional invariant check on
@@ -42103,7 +42112,9 @@ impl Simulator {
             });
 
             if next_time > self.max_time {
-                if !self.finished {
+                if !self.finished
+                    && !RUN_LENGTH_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     eprintln!(
                         "[xezim][hang-report] simulation reached --max-time ({} ticks) without $finish",
                         self.max_time

@@ -303,6 +303,8 @@ mod audit_round45_finds;
 mod class_collection_storage;
 #[path = "misc/class_queue_locators.rs"]
 mod class_queue_locators;
+#[path = "misc/cli_compat_args.rs"]
+mod cli_compat_args;
 #[path = "misc/cross_checked_constructs.rs"]
 mod cross_checked_constructs;
 #[path = "misc/dead_giant_declaration_elision.rs"]

@@ -310,7 +310,7 @@ Common options:
 | `-D<MACRO>[=val]` | Define a preprocessor macro |
 | `-I<dir>` | Add an include directory |
 | `--simulate` | Run the simulation (vs `--parse` / `--compile` / `--preprocess`) |
-| `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); xezim elaborates them all under a synthetic wrapper |
+| `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); xezim elaborates them all under a synthetic wrapper. A bare module name that is not a file does the same (see [below](#command-lines-from-other-simulators)) |
 | `--dpi-lib <path>` | Load a DPI-C shared library (`.so`/`.dylib`/`.dll`). Repeatable. See [docs/dpi-guide.md](docs/dpi-guide.md). |
 | `--vpi-lib <path>` (`-m`) | Load a VPI module and run its `vlog_startup_routines` (system-task registration, design walk). Repeatable. |
 | `--module-timescale [mods=]<unit>/<prec>` | Assign a timescale to modules with no explicit source-level one. See [below](#module-timescale-extension). Repeatable. |
@@ -373,6 +373,47 @@ Example — run the picorv32 testbench against a gate-level netlist:
 ./target/release/xezim testbench.v synth.v \
     +firmware=firmware/firmware.hex --max-time 50000000
 ```
+
+## Command lines from other simulators
+
+One xezim invocation accepts the usual compile and simulate spellings of
+commercial simulators, so a flow's existing arguments can be pasted into a
+single command. Libraries are not persistent — every run compiles its
+sources — so the library options are accepted and ignored:
+
+```bash
+xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
+      -c -quiet -lib work hdl_top hvl_top +UVM_TESTNAME=my_test \
+      -sv_seed 42 -gDEPTH=8 -l run.log -do "run -all; quit -f"
+```
+
+| Spelling | Behaviour in xezim |
+|---|---|
+| `<top> …`, `work.<top>` | A bare design-unit name that is not an existing file names a top module, same as `-s <top>`. Several give several tops. `<lib>.<top>` works for `work` and libraries named by an earlier `-work`/`-L`/`-lib` |
+| `+define+A+B=1`, `+incdir+d1+d2` | Several macros / directories in one flag (as before) |
+| `-f <file>`, `-file <file>` | Args file; relative file names resolve as given, else against the args file's directory |
+| `-F <file>` | Same as `-f`, and `+incdir+` directories inside it resolve the same way |
+| `-do "<cmds>"`, `-do <file>` | A subset of the command language: `run -all` (until `$finish` or no events remain), `run <n><unit>` (`fs`…`sec`; several `run`s add up), `quit`/`exit` (`-f`, `-force`), `do <file>`, separated by `;` or newlines, `#` comments. Any other command is an error. A script that quits before any `run` only elaborates. `--max-time` stays a hard cap |
+| `-gNAME=VAL` | Sets the default of parameter `NAME` in every module, interface or program that declares it overridable (a `string` parameter takes an unquoted value as text); a value given at an instantiation or by `defparam` still wins. `-g/<top>/NAME=VAL` limits it to module `<top>`; deeper paths are ignored with a warning. A name no module declares is warned about and ignored |
+| `-GNAME=VAL` | Like `-g`, and it also replaces values given at instantiations and by `defparam` |
+| `-sv_seed <n>`, `-sv_seed random` | Same as `+seed=<n>` / `+seed=random` |
+| `-sv_lib <name>`, `-sv_root <dir>` | Load `<dir>/<name>.so` as a DPI library (`--dpi-lib`) |
+| `-timescale <u>/<p>` | Default timescale for design elements without one (`--module-timescale`) |
+| `-l <file>`, `-logfile <file>` | xezim's `-l`: all output goes to the file, none to the terminal |
+| `-c` | xezim's args-file flag when a file (or a path) follows; otherwise the batch-mode switch, accepted |
+| `-v <file>`, `-y <dir>`, `+libext+` | Library file / directory, as before |
+| `+notimingchecks` | As before |
+| `-sv12compat`, `-sv17compat` | Same as `--sv2017`. `-sv05compat`/`-sv09compat` do the same with a warning |
+| `-work`, `-L`, `-Lf`, `-lib <lib>` | Ignored, with one warning |
+| `-sv`, `-mfcu`, `-quiet`, `-64`, `-32`, `-batch`, `-nologo`, `+acc[=…]`, `-<step>args=…` (arguments for a separate optimization step), `-suppress <ids>`, `+cover[=…]`, `+fcover`, `-coverage`, `-sva`, `-assertdebug` | Accepted, no effect: SystemVerilog is always on, all files share one compilation unit, every object stays visible, assertions and covergroups are always evaluated |
+| `-sfcu`, `-t <res>`, `-wlf <file>` | Accepted with a warning: xezim always uses one compilation unit and the finest precision declared in the design, and does not write that waveform file (`--fst` / `--wave` dump waveforms) |
+
+Where a spelling means something else in xezim, xezim's meaning is kept:
+`-l` redirects rather than copies the transcript; `-c <file>` reads an args
+file. The glued forms `-s<top>`, `-l<file>` and `-f<file>` lose to the
+spellings above (`-sv`, `-sv_seed`, `-suppress`, `-lib`, `-logfile`,
+`-file`); use `-s <top>` / `-l <file>` / `-f <file>` with a space for such
+names.
 
 ## Native compilation
 

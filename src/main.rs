@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 // CLI-only plumbing, so it lives in the binary, not the library.
 mod report;
 
+// Other simulators' command-line spellings (`-do`, `-g`, `-sv_seed`, ...).
+mod cli_compat;
+
 /// The library's `chatter!` for the CLI: internal lines (run banner, `[PHASE]`
 /// timings) print only under `--verbose`/`--profile`/`--sim-debug`.
 macro_rules! chatter {
@@ -24,6 +27,11 @@ macro_rules! chatter_out {
         }
     };
 }
+
+/// `run -all`: no time cap short of $finish or an empty event queue. Large,
+/// yet small enough that the simulator's conversion to ticks at a 1 fs
+/// precision still leaves room above it.
+const RUN_ALL_NS: u64 = 9_000_000_000_000;
 
 /// The one line every simulating run ends with. Scripts grep its
 /// `Simulation finished at time N` prefix.
@@ -299,6 +307,38 @@ fn print_usage() {
     eprintln!("                   (same seed -> byte-identical run; affects e.g. the");
     eprintln!("                   number of packets a random UVM test collects)");
     eprintln!("  -f/-c filelist   Recursive; options inside filelist are supported");
+    eprintln!("Other simulators' spellings (also accepted inside -f files):");
+    eprintln!("  <top> ...        A bare design-unit name (or work.<top>) that is not a file");
+    eprintln!("                   names a top module, like -s; repeat for several tops");
+    eprintln!("  -F <file>        Args file; +incdir+ paths resolve like file names (as given,");
+    eprintln!("                   else against the args file's directory). -file = -f");
+    eprintln!(
+        "  -do \"<cmds>\"     Also -do <file.do>. Subset: run -all (until $finish), run <n><unit>"
+    );
+    eprintln!(
+        "                   (summed; --max-time still caps), quit [-f], exit [-f], do <file>."
+    );
+    eprintln!(
+        "                   Other commands are an error. No run before quit = elaborate only"
+    );
+    eprintln!(
+        "  -gNAME=VAL       Parameter default for every module declaring an overridable NAME"
+    );
+    eprintln!("                   (instance values still win); -g/<top>/NAME=VAL: one module only");
+    eprintln!("  -GNAME=VAL       Same, and it also replaces instance and defparam values");
+    eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>");
+    eprintln!("  -sv_lib <name>, -sv_root <dir>  DPI library <dir>/<name>.so (see --dpi-lib)");
+    eprintln!("  -logfile <file>  Same as -l (redirects; the terminal gets nothing)");
+    eprintln!("  -c               With no file after it: accepted (batch mode is the only mode)");
+    eprintln!(
+        "  -work/-L/-Lf/-lib <lib>  Ignored with one warning: every run compiles from source"
+    );
+    eprintln!("  -sv12compat, -sv17compat  Same as --sv2017 (-sv05compat/-sv09compat warn)");
+    eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -<step>args=..,");
+    eprintln!("  -suppress <ids>, +cover[=..], +fcover, -coverage, -sva,");
+    eprintln!("  -assertdebug     Accepted, no effect");
+    eprintln!("  -sfcu, -t <res>, -wlf <file>  Accepted with a warning (one compilation unit;");
+    eprintln!("                   finest precision; waveforms come from --fst/--wave)");
 }
 
 fn print_version() {
@@ -687,6 +727,8 @@ fn process_command_file(
     nospecify: &mut bool,
     primitive_verbose: &mut bool,
     module_timescale_args: &mut Vec<String>,
+    compat: &mut cli_compat::CompatArgs,
+    incdir_rel: bool,
 ) -> Result<(), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read command file '{}': {}", path, e))?;
@@ -727,7 +769,18 @@ fn process_command_file(
         let mut i = 0usize;
         while i < toks.len() {
             let t = toks[i].as_str();
+            let used = cli_compat::handle_flag(&toks, i, compat, plusargs)
+                .map_err(|e| format!("{} (in args file '{}')", e, path))?;
+            if used > 0 {
+                i += used;
+                continue;
+            }
             match t {
+                // `-c` with no file after it: batch-mode switch, nothing to do.
+                "-c" if !cli_compat::c_takes_file(
+                    toks.get(i + 1).map(|s| s.as_str()),
+                    &compat.libs,
+                ) => {}
                 "-I" => {
                     i += 1;
                     if i < toks.len() {
@@ -763,7 +816,11 @@ fn process_command_file(
                 "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {
                     xezim::compiler::simulator::set_no_timing_checks(true);
                 }
-                "-f" | "-c" => {
+                // `-F` differs from `-f` only in resolving `+incdir+` paths
+                // like file names: as given, else against the args file's own
+                // directory. `-file` is a long spelling of `-f`.
+                "-f" | "-c" | "-F" | "-file" => {
+                    let nested_rel = t == "-F";
                     i += 1;
                     if i < toks.len() {
                         let nested = resolve_rel(base, &toks[i]);
@@ -779,6 +836,8 @@ fn process_command_file(
                             nospecify,
                             primitive_verbose,
                             module_timescale_args,
+                            compat,
+                            nested_rel,
                         )?;
                     }
                 }
@@ -807,10 +866,18 @@ fn process_command_file(
                         nospecify,
                         primitive_verbose,
                         module_timescale_args,
+                        compat,
+                        false,
                     )?;
                 }
                 _ if t.starts_with("+incdir+") => {
+                    let first = include_dirs.len();
                     push_plus_incdir(t, include_dirs);
+                    if incdir_rel {
+                        for d in &mut include_dirs[first..] {
+                            *d = resolve_rel(base, d);
+                        }
+                    }
                 }
                 "--primitive-verbose" => {
                     *primitive_verbose = true;
@@ -1586,7 +1653,6 @@ fn run_main() -> i32 {
     // §20.10 / issue #107: opt-in promotion of `$error` occurrences to a
     // failing exit status. `$fatal` always fails regardless of this flag.
     let mut error_exit = false;
-    let mut sv2023_mode = true;
     let mut strict_checks = true;
     let mut source_delay_select: u8 = 1;
     // Warm-start design cache is EXPERIMENTAL and OFF by default — every run
@@ -1661,9 +1727,25 @@ fn run_main() -> i32 {
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<(String, Option<String>)> = Vec::new();
 
+    let mut compat = cli_compat::CompatArgs::default();
+    let mut max_time_explicit = false;
+
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
+        // Other simulators' spellings first: several (`-sv_seed`, `-suppress`,
+        // `-lib`) would otherwise read as the glued `-s<top>` / `-l<file>`.
+        match cli_compat::handle_flag(&args, i, &mut compat, &mut plusargs) {
+            Ok(0) => {}
+            Ok(n) => {
+                i += n;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         match arg.as_str() {
             "-h" | "--help" => {
                 print_usage();
@@ -1700,7 +1782,7 @@ fn run_main() -> i32 {
             _ if arg.starts_with("-o") && arg.len() > 2 => {
                 _output_file = Some(arg[2..].to_string());
             }
-            "-l" | "--log" => {
+            "-l" | "--log" | "-logfile" => {
                 i += 1;
                 if i < args.len() {
                     log_file = Some(args[i].clone());
@@ -1723,7 +1805,15 @@ fn run_main() -> i32 {
                 top_module = Some(arg[2..].to_string());
                 top_modules.push(arg[2..].to_string());
             }
-            "-c" | "-f" => {
+            // `-c` with no file after it: batch-mode switch, nothing to do.
+            "-c" if !cli_compat::c_takes_file(
+                args.get(i + 1).map(|s| s.as_str()),
+                &compat.libs,
+            ) => {}
+            // `-F` also resolves `+incdir+` paths against the args file's
+            // directory when they do not exist as given; `-file` is `-f`.
+            "-c" | "-f" | "-F" | "-file" => {
+                let incdir_rel = arg == "-F";
                 i += 1;
                 if i < args.len() {
                     match process_command_file(
@@ -1738,6 +1828,8 @@ fn run_main() -> i32 {
                         &mut nospecify,
                         &mut primitive_verbose,
                         &mut module_timescale_args,
+                        &mut compat,
+                        incdir_rel,
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -1760,6 +1852,8 @@ fn run_main() -> i32 {
                     &mut nospecify,
                     &mut primitive_verbose,
                     &mut module_timescale_args,
+                    &mut compat,
+                    false,
                 ) {
                     Ok(()) => {}
                     Err(e) => {
@@ -1936,11 +2030,9 @@ fn run_main() -> i32 {
             "--sv2023" => {
                 // No-op now (default), kept for back-compat with existing scripts.
                 sv_parser::set_sv2023(true);
-                sv2023_mode = true;
             }
             "--sv2017" => {
                 sv_parser::set_sv2023(false);
-                sv2023_mode = false;
             }
             // Strict negative-test diagnostics (reject LRM-illegal constructs).
             // ON by default; `--no-strict` (alias `--lenient`) turns it off.
@@ -1997,7 +2089,10 @@ fn run_main() -> i32 {
                 i += 1;
                 if i < args.len() {
                     match parse_max_time(&args[i]) {
-                        Ok(v) => max_time = v,
+                        Ok(v) => {
+                            max_time = v;
+                            max_time_explicit = true;
+                        }
                         Err(e) => {
                             eprintln!("{}", e);
                             std::process::exit(1);
@@ -2007,7 +2102,10 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("--max-time=") => {
                 match parse_max_time(&arg["--max-time=".len()..]) {
-                    Ok(v) => max_time = v,
+                    Ok(v) => {
+                        max_time = v;
+                        max_time_explicit = true;
+                    }
                     Err(e) => {
                         eprintln!("{}", e);
                         std::process::exit(1);
@@ -2402,11 +2500,64 @@ fn run_main() -> i32 {
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
             }
-            _ => {
-                source_files.push(arg.clone());
-            }
+            // A design-unit name that is not a file names a top, as `-s` does.
+            _ => match cli_compat::bare_top_name(arg, &compat.libs) {
+                Some(top) => {
+                    top_module = Some(top.clone());
+                    top_modules.push(top);
+                }
+                None => source_files.push(arg.clone()),
+            },
         }
         i += 1;
+    }
+    // `--sv2017`/`--sv2023`, or a `-sv*compat` flag here or in an args file.
+    let sv2023_mode = sv_parser::is_sv2023();
+    dpi_libs.extend(cli_compat::resolve_sv_libs(&compat));
+    if !compat.param_overrides.is_empty() {
+        xezim_core::set_param_overrides(
+            compat
+                .param_overrides
+                .iter()
+                .map(|(module, name, value, force)| xezim_core::ParamOverride {
+                    module: module.clone(),
+                    name: name.clone(),
+                    value: value.clone(),
+                    force: *force,
+                })
+                .collect(),
+        );
+    }
+    // `-do`: its `run` commands set how long the run goes. An explicit
+    // `--max-time` stays a hard cap on top of them.
+    if !compat.do_scripts.is_empty() {
+        match cli_compat::plan_do_scripts(&compat.do_scripts) {
+            Ok(cli_compat::DoRun::All) => {
+                if !max_time_explicit {
+                    max_time = RUN_ALL_NS;
+                }
+            }
+            Ok(cli_compat::DoRun::For(0)) => {
+                eprintln!("Error: -do: a total run time of 0 is not supported");
+                std::process::exit(1);
+            }
+            Ok(cli_compat::DoRun::For(ns)) => {
+                if !max_time_explicit || ns <= max_time {
+                    max_time = ns;
+                    xezim::compiler::simulator::set_run_length_requested(true);
+                }
+            }
+            // Loaded and quit without a `run`: elaborate only.
+            Ok(cli_compat::DoRun::Load) => {
+                if !mode_explicit {
+                    mode = Mode::Compile;
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     // Opt-in statistics footer: the CLI flag wins over XEZIM_REPORT_STATS.
@@ -2557,7 +2708,7 @@ suppressed but the explicit SDF annotation still applies."
             .unwrap_or_else(default_design_cache_dir);
         let dependency_files = design_dependency_files(&lib_files, &lib_dirs, lib_exts.as_deref());
         let semantic_salt = format!(
-            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={}",
+            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={};param_overrides={:?}",
             sv2023_mode,
             strict_checks,
             source_delay_select,
@@ -2566,6 +2717,7 @@ suppressed but the explicit SDF annotation still applies."
             lib_files,
             lib_exts,
             nospecify,
+            compat.param_overrides,
         );
         // Set cache compression settings before cache is used
         if let Some(level) = cache_compression_level {
