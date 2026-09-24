@@ -393,7 +393,7 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `+define+A+B=1`, `+incdir+d1+d2` | Several macros / directories in one flag (as before) |
 | `-f <file>`, `-file <file>` | Args file; relative file names resolve as given, else against the args file's directory |
 | `-F <file>` | Same as `-f`, and `+incdir+` directories inside it resolve the same way |
-| `-do "<cmds>"`, `-do <file>` | A subset of the command language: `run -all` (until `$finish` or no events remain), `run <n><unit>` (`fs`…`sec`; several `run`s add up), `quit`/`exit` (`-f`, `-force`), `do <file>`, separated by `;` or newlines, `#` comments. Any other command is an error. A script that quits before any `run` only elaborates. `--max-time` stays a hard cap |
+| `-do "<cmds>"`, `-do <file>` | A subset of the command language: `run -all` (until `$finish` or no events remain), `run <n><unit>` (`fs`…`sec`; several `run`s add up; the run ends at that time, which `final` blocks and the closing line report), `quit`/`exit` (`-f`, `-force`), `do <file>`, separated by `;` or newlines, `#` comments. Any other command is an error. A script that quits before any `run` only elaborates. `--max-time` stays a hard cap |
 | `-gNAME=VAL` | Sets the default of parameter `NAME` in every module, interface or program that declares it overridable (a `string` parameter takes an unquoted value as text); a value given at an instantiation or by `defparam` still wins. `-g/<top>/NAME=VAL` limits it to module `<top>`; deeper paths are ignored with a warning. A name no module declares is warned about and ignored |
 | `-GNAME=VAL` | Like `-g`, and it also replaces values given at instantiations and by `defparam` |
 | `-sv_seed <n>`, `-sv_seed random` | Same as `+seed=<n>` / `+seed=random` |

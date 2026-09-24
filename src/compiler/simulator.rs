@@ -18226,6 +18226,15 @@ impl Simulator {
             self.dpi_pending_reset_fired = true;
         }
         self.event_loop();
+        // `run <time>` advances the current time to the end of the run even
+        // when nothing is scheduled there, so `final` blocks and the closing
+        // report see the stop time rather than the last event's.
+        if !self.finished
+            && RUN_LENGTH_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+            && self.time < self.max_time
+        {
+            self.time = self.max_time;
+        }
         // Fire cbEndOfSimulation callbacks exactly once after the event loop
         // terminates, before `final` blocks execute.
         if !self.dpi_end_sim_cbs.is_empty() && !self.dpi_pending_end_sim_fired {

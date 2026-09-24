@@ -184,6 +184,47 @@ fn do_run_all_lifts_the_default_cap() {
     );
 }
 
+const STOPS: &str = "\
+module tb;
+  initial begin
+    #5 $display(\"A t=%0t\", $time);
+    #200 $display(\"B t=%0t\", $time);
+  end
+  final $display(\"final t=%0t\", $time);
+endmodule
+";
+
+/// After `run <time>` the current time is the end of the run, not the last
+/// event before it: `final` blocks and the closing line report it, also when
+/// nothing is scheduled any more (cross-checked on the reference simulator).
+#[test]
+fn do_run_time_ends_at_the_stop_time() {
+    let d = scratch("stops");
+    std::fs::write(d.join("tb.sv"), STOPS).unwrap();
+    let out = ok_stdout(&d, &["tb.sv", "-do", "run 100ns; quit -f"]);
+    assert!(
+        out.contains("A t=5\nfinal t=100\nSimulation finished at time 100\n"),
+        "{}",
+        out
+    );
+    let out = ok_stdout(&d, &["tb.sv", "-do", "run 100ns; run 23ns; quit -f"]);
+    assert!(
+        out.contains("final t=123\nSimulation finished at time 123\n"),
+        "{}",
+        out
+    );
+    let out = ok_stdout(&d, &["tb.sv", "-do", "run -all"]);
+    assert!(out.contains("B t=205\nfinal t=205\n"), "{}", out);
+    std::fs::write(
+        d.join("idle.sv"),
+        "`timescale 1ns/1ps\nmodule tb; initial #5 $display(\"A t=%0t\", $time);\n\
+         final $display(\"final t=%0t\", $time); endmodule\n",
+    )
+    .unwrap();
+    let out = ok_stdout(&d, &["idle.sv", "-do", "run 100ns; quit -f"]);
+    assert!(out.contains("A t=5000\nfinal t=100000\n"), "{}", out);
+}
+
 #[test]
 fn defines_incdirs_and_args_files() {
     let d = scratch("defs");
@@ -376,5 +417,13 @@ fn full_reference_style_line_matches_native() {
             "run 1us; quit -f",
         ],
     );
-    assert_eq!(compat, native);
+    // `run 1us` ends the run at 1 us; the `--max-time` cap reports the last
+    // event. Everything before that closing line is the same.
+    let body = |s: &str| s[..s.rfind("Simulation finished").unwrap()].to_string();
+    assert_eq!(body(&compat), body(&native));
+    assert!(
+        compat.ends_with("Simulation finished at time 1000\n"),
+        "{}",
+        compat
+    );
 }
