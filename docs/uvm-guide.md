@@ -110,8 +110,9 @@ directory. xezim implements them natively; a `--dpi-lib` library that defines on
 the symbols takes precedence.
 
 - **Regular expressions** (`uvm_re_match`, `uvm_glob_to_re`, `uvm_dpi_regcomp` /
-  `regexec` / `regfree`, `uvm_dump_re_cache`) — POSIX extended syntax, as UVM's C code
-  gets from the C library. This is what `uvm_config_db` / `uvm_resource_db` wildcard and
+  `regexec` / `regfree`, `uvm_dump_re_cache`, and 1800.2-2020.3's `uvm_re_comp` /
+  `exec` / `free` / `compexec` / `compexecfree` / `deglobbed` / `buffer`) — POSIX
+  extended syntax, as UVM's C code gets from the C library. This is what `uvm_config_db` / `uvm_resource_db` wildcard and
   `/regex/` scopes, `+uvm_set_config_*` / `+uvm_set_*_override` plusargs, factory
   overrides by instance path, and `uvm_cmdline_processor::get_arg_matches("/.../")`
   use. `uvm_glob_to_re` converts globs exactly as the C code does (`*` → `.*`,
@@ -129,6 +130,11 @@ the symbols takes precedence.
   `uvm_hdl_data_t`; a deposit writes the low bits; a force holds until released; a
   release returns a net to its drivers at once and leaves a variable at the forced
   value.
+- **Signal polling** (1800.2-2020.3 with `UVM_PLI_POLLING_ENABLE`): `uvm_hdl_signal_size`
+  gives a path's width; `uvm_polling_create` probes a signal, and once
+  `uvm_polling_setup_notifier` names the notifier bit, every value change of an enabled
+  probe reaches `uvm_polling_value_change_notify` through
+  `uvm_polling_process_changelist`.
 - **Errors** are UVM reports with the C code's ids and texts: `UVM/DPI/REGEX_INV`,
   `UVM/DPI/REGEX_MAX`, `UVM/DPI/REGCOMP`, `UVM/DPI/HDL_GET` / `HDL_SET` ("unable to
   locate hdl path"). Forcing or releasing part of a signal, forcing a
