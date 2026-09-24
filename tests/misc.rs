@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "misc/always_timing_lint_forms.rs"]
+mod always_timing_lint_forms;
 #[path = "misc/artifact_compression_modes.rs"]
 mod artifact_compression_modes;
 #[path = "misc/assign_z_passthrough.rs"]

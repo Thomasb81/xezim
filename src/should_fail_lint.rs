@@ -2031,23 +2031,21 @@ fn check_always_has_timing_control(
     fn stmt_may_yield(st: &crate::ast::stmt::Statement) -> bool {
         use crate::ast::expr::ExprKind;
         use crate::ast::stmt::StatementKind as SK;
+        // Intra-assignment delay / event / cycle controls were canonicalized
+        // to marker calls by the pre-parse rewrite (`crate::intra_delay`).
+        let intra_timed = |rvalue: &crate::ast::expr::Expression| {
+            matches!(&rvalue.kind, ExprKind::SystemCall { name, .. }
+                if name.contains("__xz_intra_"))
+        };
         match &st.kind {
             SK::TimingControl { .. } | SK::Wait { .. } | SK::WaitFork => true,
-            // NBAs/assignments with an intra-assignment delay were
-            // canonicalized to a marker call by the pre-parse rewrite.
-            SK::BlockingAssign { rvalue, .. } => {
-                matches!(&rvalue.kind, ExprKind::SystemCall { name, .. }
-                    if name.contains("__xz_intra_delay"))
-            }
+            SK::BlockingAssign { rvalue, .. } => intra_timed(rvalue),
             // An NBA with an explicit delay (`x <= #5 y`) yields time.
-            SK::NonblockingAssign { delay, rvalue, .. } => {
-                delay.is_some()
-                    || matches!(&rvalue.kind, ExprKind::SystemCall { name, .. }
-                        if name.contains("__xz_intra_delay"))
-            }
+            SK::NonblockingAssign { delay, rvalue, .. } => delay.is_some() || intra_timed(rvalue),
             // A user task may contain the timing control — cannot prove
-            // otherwise here, so treat the block as legal.
-            SK::Expr(e) => matches!(&e.kind, ExprKind::Call { .. }),
+            // otherwise here, so treat the block as legal. A task enable
+            // without parentheses (`always my_task;`) is a bare name.
+            SK::Expr(e) => matches!(&e.kind, ExprKind::Call { .. } | ExprKind::Ident(_)),
             SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
                 stmts.iter().any(stmt_may_yield)
             }
