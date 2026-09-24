@@ -473,6 +473,23 @@ pub enum Insn {
     /// side effects match the AST path. No-op on a null receiver.
     StoreCollElem(RegId, Box<str>, RegId, RegId),
 
+    /// class-perf Step 9c: `$cast(dest, src)` inside a compiled method body.
+    /// (dest_route, src_reg, out_reg, dest_expr, stmt_form).
+    ///
+    /// The runtime compatibility check runs the interpreter's own
+    /// `cast_type_ok` on the carried dest AST — the type overlays it reads
+    /// (`local_type_stack`, `var_class_types`, `var_typedef_types`) are LIVE
+    /// during compiled exec: formals and the return cell were recorded by
+    /// the binding loop, and top-level body decls are pre-recorded at
+    /// method entry. Assignment routes mirror the AST funnel: `Reg` = the
+    /// frame arm's fit into the VM register (the interpreter frame is STALE
+    /// during compiled exec, so a register-backed dest must NOT go through
+    /// `assign_value`); `Member` = `StoreClassMember` semantics;
+    /// `Scope` = `assign_value` on the carried AST (its name resolution
+    /// reads live state). `stmt_form` selects the §8.16 task form, which —
+    /// unlike the silent function form — prints a runtime error on failure.
+    Cast(CastDest, RegId, RegId, Box<Expression>, bool),
+
     Nop,
 
     /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
@@ -592,6 +609,27 @@ impl ArrayOperand {
             Self::Dense { name, .. } | Self::Named(name) => name,
         }
     }
+}
+
+/// class-perf Step 9c: the assignment route for a `$cast` destination.
+/// Selects how the exec arm stores the (type-checked) source value so the
+/// write lands where the AST path's `assign_value` would put it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum CastDest {
+    /// Register-backed formal / top-level local: assign into this VM
+    /// register with the frame arm's fit (resize against the slot's
+    /// current width / realness — the interpreter frame itself is stale
+    /// during compiled exec and must not be written).
+    Reg(RegId),
+    /// Class member: (handle_reg, field) — `fit_class_prop` + heap insert,
+    /// byte-identical to `StoreClassMember`.
+    Member(RegId, Box<str>),
+    /// Any other bare dest (module-scope variable, `this`-member, static
+    /// cell): the carried dest AST is handed to `assign_value`, whose name
+    /// resolution reads LIVE state during compiled exec. Admitted only for
+    /// bare names — a dotted dest whose base is a register-backed local
+    /// would make `assign_value` evaluate the stale frame.
+    Scope,
 }
 
 /// A compiled bytecode program for one always block or continuous assign.
@@ -788,6 +826,17 @@ impl Insn {
                 *b += rb;
                 *c += rb;
             }
+            // `$cast`: rebase the result register, the source register and
+            // whichever register the route targets (dest slot or handle).
+            Cast(dest, s, o, ..) => {
+                match dest {
+                    CastDest::Reg(d) => *d += rb,
+                    CastDest::Member(h, _) => *h += rb,
+                    CastDest::Scope => {}
+                }
+                *s += rb;
+                *o += rb;
+            }
             Select(a, b, c, d) | RangeSelect(a, b, c, d)
             | BlockingAssignArrayRange(_, a, b, c, d) => {
                 *a += rb;
@@ -908,6 +957,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::CallCollMethod(..) => "CallColl,",
         Insn::LoadCollElem(..) => "CollElemR,",
         Insn::StoreCollElem(..) => "CollElemW,",
+        Insn::Cast(..) => "Cast",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
@@ -1102,6 +1152,15 @@ pub struct BytecodeCompiler<'a> {
     /// keeps using `coll_member_names` (a MemberAccess base cannot collide
     /// with a module table name).
     coll_elem_member_names: HashSet<String>,
+    /// class-perf Step 9c: names whose `$cast` destination may take the
+    /// register route — formals, the result cell, and TOP-LEVEL body
+    /// locals. A nested-block local is register-backed too, but its
+    /// declared type is never recorded in the runtime overlay (the
+    /// interpreter records a decl's type when the VarDecl executes, and
+    /// nested blocks are not pre-recorded at method entry), so
+    /// `cast_type_ok` could consult a stale cross-frame entry and disagree
+    /// with the AST path. Such dests decline.
+    cast_reg_ok_locals: HashSet<String>,
     /// Indices of the placeholder `Jump(0)` emitted by method-mode `return`;
     /// back-patched to the method's common exit at the end of the body.
     method_ret_jumps: Vec<usize>,
@@ -1338,6 +1397,7 @@ impl<'a> BytecodeCompiler<'a> {
             coll_member_names: HashSet::default(),
             static_coll_member_names: HashSet::default(),
             coll_elem_member_names: HashSet::default(),
+            cast_reg_ok_locals: HashSet::default(),
             method_ret_jumps: Vec::new(),
             decl_local_regs: std::collections::HashSet::default(),
             process_local_names: HashSet::default(),
@@ -7262,6 +7322,17 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("Expr_Call");
                         return self.emit_fallback(stmt);
                     }
+                    // class-perf Step 9c: `$cast(dest, src);` in statement
+                    // position — the §8.16 task form (failure prints a
+                    // runtime error, unlike the silent function form). Same
+                    // insn as the expression form, `stmt_form` set.
+                    ExprKind::SystemCall { name, args } if name == "$cast" && self.method_mode => {
+                        if self.compile_cast_call(args, 0, true).is_some() {
+                            return true;
+                        }
+                        self.bail("Expr_cast_stmt");
+                        return self.emit_fallback(stmt);
+                    }
                     _ => {}
                 }
                 let n: &'static str = match &e.kind {
@@ -9435,6 +9506,19 @@ impl<'a> BytecodeCompiler<'a> {
                             None
                         }
                     }
+                    // class-perf Step 9c: `$cast(dest, src)` in a compiled
+                    // method body. Method mode only — the module-level
+                    // (always-block) path keeps its existing fallback
+                    // behavior via the `other` arm below.
+                    "$cast" if self.method_mode => {
+                        match self.compile_cast_call(args, ctx_width, false) {
+                            Some(r) => Some(r),
+                            None => {
+                                self.bail("SystemCall_cast");
+                                None
+                            }
+                        }
+                    }
                     other => {
                         let _ = other;
                         if std::env::var_os("XEZIM_PROBE_SYSCALL").is_some() {
@@ -10196,6 +10280,90 @@ impl<'a> BytecodeCompiler<'a> {
                 false
             }
         }
+    }
+
+    /// class-perf Step 9c: lower `$cast(dest, src)` — the function form at
+    /// expression position, or the §8.16 task form at statement position
+    /// when `stmt_form` (the task form prints a runtime error on failure;
+    /// the function form is silent). Admission — dest must be one of:
+    ///   * a bare register-backed formal / top-level local
+    ///     (`cast_reg_ok_locals`) — assigned into its VM register with the
+    ///     frame arm's fit;
+    ///   * a dotted class member off a handle chain
+    ///     (`method_handle_chain_ok`) — `StoreClassMember` semantics;
+    ///   * any other BARE name (module-scope variable, `this`-member,
+    ///     static cell) — `assign_value` on the carried AST.
+    /// Everything else (indexed dests, nested-block locals, compound
+    /// expressions) declines; in method mode a decline bails the whole
+    /// method (all-or-nothing). Returns the result register (1 = success,
+    /// 0 = failure, 32-bit before the context Resize).
+    fn compile_cast_call(
+        &mut self,
+        args: &[Expression],
+        ctx_width: u32,
+        stmt_form: bool,
+    ) -> Option<RegId> {
+        if args.len() != 2 {
+            return None;
+        }
+        let dest = match &args[0].kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let name = h.path[0].name.name.as_str();
+                if let Some(&(r, _)) = self.local_var_regs.get(name) {
+                    if !self.cast_reg_ok_locals.contains(name) {
+                        // A NESTED-block local: register-backed, but its
+                        // declared type was never recorded in the runtime
+                        // overlay (only formals and top-level decls are),
+                        // so `cast_type_ok` could consult a stale
+                        // cross-frame entry and disagree with the AST path.
+                        return None;
+                    }
+                    CastDest::Reg(r)
+                } else {
+                    // Not register-backed: `assign_value` resolves bare
+                    // names through the live funnel at exec — module
+                    // tables, then the frame (absent here), then the
+                    // `this` object's property map, then statics.
+                    CastDest::Scope
+                }
+            }
+            ExprKind::MemberAccess { expr: base, member }
+                if self.method_handle_chain_ok(base) =>
+            {
+                // Same store gate as the BlockingAssign member arm: a
+                // member the heap cannot round-trip refuses.
+                if self.class_shadow_names.contains(member.name.as_str())
+                    && !self.member_safe_names.contains(member.name.as_str())
+                {
+                    self.bail("cast_member_shadow");
+                    return None;
+                }
+                let handle_reg = match self.method_member_handle_reg(base) {
+                    Some(r) => r,
+                    None => match self.compile_expr(base, 0) {
+                        Some(r) => r,
+                        None => return None,
+                    },
+                };
+                CastDest::Member(handle_reg, member.name.clone().into_boxed_str())
+            }
+            _ => return None,
+        };
+        let src_reg = self.compile_expr(&args[1], 0)?;
+        let out = self.alloc_reg();
+        self.emit(Insn::Cast(
+            dest,
+            src_reg,
+            out,
+            Box::new(args[0].clone()),
+            stmt_form,
+        ));
+        if ctx_width > 0 {
+            self.emit(Insn::Resize(out, ctx_width));
+        }
+        Some(out)
     }
 
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
@@ -11835,6 +12003,24 @@ impl<'a> BytecodeCompiler<'a> {
         self.coll_member_names = coll_member_names.clone();
         self.static_coll_member_names = static_coll_member_names.clone();
         self.coll_elem_member_names = coll_elem_members.clone();
+        // Step 9c: the register-route `$cast` admission set — formals, the
+        // result cell, and top-level body decls (their declared types are
+        // pre-recorded in the runtime overlay at method entry, so
+        // `cast_type_ok` sees the same picture as the AST path).
+        self.cast_reg_ok_locals.clear();
+        for (name, _) in formals {
+            self.cast_reg_ok_locals.insert(name.clone());
+        }
+        if let Some((rname, _, _, _)) = result {
+            self.cast_reg_ok_locals.insert(rname.to_string());
+        }
+        for st in body {
+            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+                for d in declarators {
+                    self.cast_reg_ok_locals.insert(d.name.name.clone());
+                }
+            }
+        }
 
         // `this` handle lives in a dedicated register.
         let this_reg = self.alloc_reg();
@@ -11916,6 +12102,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.coll_member_names.clear();
             self.static_coll_member_names.clear();
             self.coll_elem_member_names.clear();
+            self.cast_reg_ok_locals.clear();
             self.method_ret_jumps.clear();
             self.bail_reset();
             return None;
@@ -11993,6 +12180,17 @@ impl<'a> BytecodeCompiler<'a> {
             // reads handle + index + value.
             Insn::LoadCollElem(_, h, _, i) => *h == r || *i == r,
             Insn::StoreCollElem(h, _, i, v) => *h == r || *i == r || *v == r,
+            // `$cast`: reads the source (and, for the register route, the
+            // dest slot's current value for the width fit); the Member route
+            // also reads the base handle.
+            Insn::Cast(dest, s, ..) => {
+                *s == r
+                    || match dest {
+                        CastDest::Reg(d) => *d == r,
+                        CastDest::Member(h, _) => *h == r,
+                        CastDest::Scope => false,
+                    }
+            }
             Insn::Pow(_, l, rr)
             | Insn::Add(_, l, rr)
             | Insn::Sub(_, l, rr)
@@ -13310,6 +13508,15 @@ impl<'a> BytecodeCompiler<'a> {
                 // Collection element store defines nothing (the storage key
                 // is a flat string in `signals`).
                 Insn::StoreCollElem(..) => {}
+                // `$cast`: the 1/0 result's width is statically 32, but the
+                // register route also re-defines the dest slot at a runtime
+                // width (the frame arm's fit) — drop both from tracking.
+                Insn::Cast(dest, _, d, ..) => {
+                    store(&mut rw, *d, None);
+                    if let CastDest::Reg(r) = dest {
+                        store(&mut rw, *r, None);
+                    }
+                }
                 // Two dests; widths follow operand widths — drop tracking.
                 Insn::BinOpConstAdd2(a) => {
                     store(&mut rw, a.d1, None);

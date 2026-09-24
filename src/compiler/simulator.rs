@@ -23825,6 +23825,10 @@ impl Simulator {
                     debug_assert!(false, "collection-elem insn in isolated comb exec");
                     break;
                 }
+                Insn::Cast(..) => {
+                    debug_assert!(false, "cast insn in isolated comb exec");
+                    break;
+                }
                 Insn::LoadConst(dest, val) => {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
@@ -24499,6 +24503,10 @@ impl Simulator {
                 }
                 Insn::LoadCollElem(..) | Insn::StoreCollElem(..) => {
                     debug_assert!(false, "collection-elem insn in isolated comb exec");
+                    break;
+                }
+                Insn::Cast(..) => {
+                    debug_assert!(false, "cast insn in isolated comb exec");
                     break;
                 }
                 Insn::LoadConst(dest, val) => {
@@ -25456,7 +25464,7 @@ impl Simulator {
     /// Core bytecode VM loop.
     #[inline]
     fn exec_insns(&mut self, insns: &[super::bytecode::Insn]) {
-        use super::bytecode::Insn;
+        use super::bytecode::{CastDest, Insn};
         // Process-FSM resume point; 0 (the ordinary case) unless
         // `run_proc_fsm` set it just before this call.
         let mut pc: usize = std::mem::take(&mut self.fsm_start_pc) as usize;
@@ -25863,6 +25871,76 @@ impl Simulator {
                             self.settle_after_proc_write();
                         }
                     }
+                    local_count += 1;
+                }
+                // class-perf Step 9c: `$cast(dest, src)` — the runtime
+                // compatibility check runs the interpreter's own
+                // `cast_type_ok` on the carried dest AST (the type overlays
+                // it reads are LIVE during compiled exec: formals and the
+                // return cell were recorded by the binding loop, top-level
+                // body decls are pre-recorded at method entry). Assignment
+                // routes mirror the AST funnel: Reg = the frame arm's fit
+                // into the VM register; Member = StoreClassMember semantics
+                // (fit_class_prop + heap); Scope = `assign_value` on the
+                // carried AST. The §8.16 task form (stmt_form) prints the
+                // same runtime error on failure that the statement
+                // interpreter does; the function form is silent.
+                Insn::Cast(dest, src_reg, out, dest_expr, stmt_form) => {
+                    let v = self.vm_regs[*src_reg as usize].clone();
+                    let ok = self.cast_type_ok(dest_expr, &v);
+                    if ok {
+                        match dest {
+                            CastDest::Reg(r) => {
+                                // Frame-arm fit (assign_value's local slot):
+                                // resize against the slot's CURRENT
+                                // width/realness, real→int conversion
+                                // included — byte-identical to the AST
+                                // path's frame write.
+                                let r = *r as usize;
+                                let prev = Some(self.vm_regs[r].clone());
+                                let fitted = match prev.as_ref() {
+                                    Some(p) if p.is_real && !v.is_real => {
+                                        Value::from_f64(v.to_f64())
+                                    }
+                                    Some(p) if !p.is_real && !v.is_real && p.width > 0 => {
+                                        v.resize(p.width)
+                                    }
+                                    Some(p) if !p.is_real && v.is_real => {
+                                        let mut f =
+                                            Self::real_to_int(v.to_f64(), p.width.max(1));
+                                        f.is_signed = p.is_signed;
+                                        f
+                                    }
+                                    _ => v.clone(),
+                                };
+                                self.vm_regs[r] = fitted;
+                            }
+                            CastDest::Member(hreg, field) => {
+                                let h = self.vm_regs[*hreg as usize]
+                                    .to_u64()
+                                    .unwrap_or(0) as usize;
+                                let fitted = self.fit_class_prop(h, field, &v);
+                                if let Some(o) =
+                                    self.heap.get_mut(h).and_then(|o| o.as_mut())
+                                {
+                                    o.properties.insert(field.to_string(), fitted);
+                                }
+                            }
+                            CastDest::Scope => {
+                                self.assign_value(dest_expr, &v);
+                            }
+                        }
+                    } else if *stmt_form {
+                        let m = format!(
+                            "[xezim][error] $cast: source object is not \
+                             assignment-compatible with the destination (t={})",
+                            self.time
+                        );
+                        self.record_output(m.clone());
+                        self.stdout_writeln(&m);
+                    }
+                    self.vm_regs[*out as usize] =
+                        if ok { Value::from_u64(1, 32) } else { Value::zero(32) };
                     local_count += 1;
                 }
                 // 10.8% of all executed bytecode — the second most frequent
@@ -38333,6 +38411,7 @@ impl Simulator {
             Insn::CallCollMethod(..) => "CallCollMethod",
             Insn::LoadCollElem(..) => "LoadCollElem",
             Insn::StoreCollElem(..) => "StoreCollElem",
+            Insn::Cast(..) => "Cast",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
@@ -66739,35 +66818,7 @@ impl Simulator {
                         continue;
                     }
                 }
-                let class_name =
-                    if let crate::ast::types::DataType::TypeReference { name, .. } =
-                        data_type
-                    {
-                        // §8.25: the declared type may be a TYPE
-                        // PARAMETER of the enclosing parameterized class
-                        // (e.g. `T obj = new(...)` inside
-                        // `class C #(type T=int);`). Resolve it through
-                        // the active specialization FIRST so the
-                        // constructor form constructs the bound class,
-                        // not a broken instance of the literal "T".
-                        if let Some(bound) =
-                            self.resolve_type_param_binding(&name.name.name)
-                        {
-                            Some(bound)
-                        } else {
-                            // Resolve a typedef/scoped alias (e.g.
-                            // `uvm_resource_types::rsrc_q_t`) to its
-                            // concrete class so `name = new()`
-                            // constructs it; fall back to the bare
-                            // name otherwise.
-                            Some(
-                                self.resolve_typeref_class_name(name)
-                                    .unwrap_or_else(|| name.name.name.clone()),
-                            )
-                        }
-                    } else {
-                        None
-                    };
+                let class_name = self.derive_var_decl_class_name(data_type);
                 let v = if let Some(init_expr) = d.init.as_ref() {
                     let mut produced: Option<Value> = None;
                     if let Some(cn) = &class_name {
@@ -67116,158 +67167,14 @@ impl Simulator {
                 } else {
                     self.forget_string_flag(&d.name.name);
                 }
-                // Record a class-typed local's type so a later
-                // separate `name = new();` knows what to construct.
-                // Covergroup-typed locals (§19.8) are recorded too:
-                // get_expr_type_name consults this map, and both the
-                // bare `c = new;` and `c = new();` assignment paths
-                // already route a covergroup type name to
-                // instantiate_covergroup — they just never saw it
-                // for a procedural local.
-                if let Some(cn) = &class_name {
-                    // §8.25: `class_name` may be a resolved
-                    // VALUE-PARAMETERIZED specialization (e.g. `T me;`
-                    // where T → `base#(1)`), which is NOT a bare key in
-                    // `module.classes`. Accept it when its base class
-                    // is real, so the var's type is recorded and
-                    // `$cast`/`new` resolve the specialization later.
-                    let cn_is_class = self.module.classes.contains_key(cn)
-                        || self.module.covergroups.contains_key(cn)
-                        || (cn.contains('#')
-                            && self
-                                .module
-                                .classes
-                                .contains_key(cn.split('#').next().unwrap_or(cn)));
-                    if cn_is_class {
-                        self.record_local_class_type(&d.name.name, cn);
-                        self.var_class_types
-                            .insert(d.name.name.clone(), cn.clone());
-                        // A typedef'd local (e.g. `table_q_t rq` where
-                        // `table_q_t = shared#(Foo[$])`) resolves to
-                        // `cn` but hides the type_args inside the
-                        // typedef chain. Record them so a separate
-                        // `rq = new()` constructs the right
-                        // specialization with type_bindings populated
-                        // (§8.25 — otherwise `T` stays unbound).
-                        if let crate::ast::types::DataType::TypeReference { name, .. } =
-                            data_type
-                        {
-                            if let Some((_, Some(ta))) =
-                                self.resolve_typeref_class_with_type_args(name)
-                            {
-                                self.var_type_args
-                                    .insert(d.name.name.clone(), ta);
-                            }
-                        }
-                    } else if self.resolve_type_param_binding(cn).is_some() {
-                        // `cn` is a class TYPE parameter (e.g. `T obj;`
-                        // inside a parameterized-class method). Record
-                        // the param name so a separate `obj = new()`
-                        // resolves it to the concrete class.
-                        //
-                        // `resolve_type_param_binding` covers BOTH the
-                        // instance path (a method's `this` instance
-                        // `type_bindings`) AND the static path (the
-                        // active specialization `current_spec`). The
-                        // latter matters for STATIC methods of a
-                        // parameterized class — e.g.
-                        // `callbacks#(T,CB)::get_first` declares
-                        // `CB cb;` with no `this`. Without the static
-                        // branch, `cb` was never registered, so a bare
-                        // `$cast(cb, ...)` assignment and any later
-                        // `new()` could not resolve CB, and the return
-                        // value came back null to the caller.
-                        self.record_local_class_type(&d.name.name, cn);
-                        self.var_class_types.insert(d.name.name.clone(), cn.clone());
-                    }
-                }
-                // Record a parameterized local's declared `#(...)` type
-                // args so a SEPARATE `name = new(...)` constructs the right
-                // specialization (`resource#(T) r; r=new`).
-                // A typedef'd local (e.g. `table_q_t rq` where `table_q_t =
-                // shared#(Foo[$])`) has EMPTY explicit type_args but
-                // the args are hidden in the typedef chain — resolve
-                // them so the new() populates type_bindings (§8.25).
-                // Clear a stale same-named entry when this decl has none.
-                let resolved_ta =
-                    if let crate::ast::types::DataType::TypeReference { name, .. } =
-                        data_type
-                    {
-                        self.resolve_typeref_class_with_type_args(name)
-                            .and_then(|(_, ta)| ta)
-                    } else {
-                        None
-                    };
-                if let crate::ast::types::DataType::TypeReference {
-                    type_args,
-                    ..
-                } = data_type
-                {
-                    if !type_args.is_empty() {
-                        self.var_type_args
-                            .insert(d.name.name.clone(), type_args.clone());
-                    } else if let Some(ta) = resolved_ta {
-                        self.var_type_args
-                            .insert(d.name.name.clone(), ta);
-                    } else {
-                        self.var_type_args.remove(&d.name.name);
-                    }
-                } else {
-                    self.var_type_args.remove(&d.name.name);
-                }
-                // §15.3/§15.4: record a mailbox/semaphore-typed local so
-                // a later separate `name = new(bound)` allocates the right
-                // container. Clear any stale same-named entry from another
-                // frame (var_container_types is a flat map like
-                // var_class_types) when this decl isn't a container.
-                match class_name.as_deref().and_then(Self::container_base) {
-                    Some(k) => {
-                        self.var_container_types
-                            .insert(d.name.name.clone(), k.to_string());
-                    }
-                    None => {
-                        self.var_container_types.remove(&d.name.name);
-                    }
-                }
-                // LRM §6.19.6: track typedef-typed locals so
-                // `local.next()`/`.first()`/etc. find their
-                // enum-member list. We extract the bare type
-                // name from a TypeReference data_type.
-                if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
-                    let tn = name.name.name.clone();
-                    // A local declared with a class TYPE PARAMETER
-                    // (`T e;` in a parameterized class) isn't in the
-                    // flat typedef/enum tables under `T`. Resolve the
-                    // active specialization's binding (T -> e_t) so
-                    // `e.first()/.next()/.last()/.prev()/.num()/`
-                    // names find the CONCRETE enum-member list
-                    // (else they fall through to a generic 0).
-                    let tn = if self.module.enum_members.contains_key(&tn)
-                        || self.module.typedefs.contains_key(&tn)
-                        || self.module.typedef_types.contains_key(&tn)
-                    {
-                        tn
-                    } else if self.current_spec.is_some() {
-                        self.resolve_type_param_binding(&tn).unwrap_or_else(|| tn)
-                    } else {
-                        tn
-                    };
-                    if self.module.enum_members.contains_key(&tn)
-                        || self.module.typedefs.contains_key(&tn)
-                        || self.module.typedef_types.contains_key(&tn)
-                    {
-                        self.var_typedef_types.insert(d.name.name.clone(), tn.clone());
-                        // Record the frame-scoped typedef too so a
-                        // method-local enum type is resolvable without
-                        // the flat `var_class_types`/`var_typedef_types`
-                        // collision across unrelated frames (a same-
-                        // named formal `VISITOR v` in another method
-                        // must not shadow this `uvm_verbosity v;
-                        // local). `local_typedef_type_of` reads the
-                        // innermost active frame. §6.19.6.
-                        self.record_local_typedef_type(&d.name.name, &tn);
-                    }
-                }
+                // Type metadata (class type, #() args, container,
+                // typedef/enum name) — one shared recorder, also used
+                // by the compiled-method entry pre-record (Step 9c).
+                self.record_var_decl_type_metadata(
+                    data_type,
+                    &d.name.name,
+                    class_name.as_deref(),
+                );
             }
         }
         // §6.21 / §13.3.1: a `static` local declared inside a subroutine
@@ -88095,6 +88002,196 @@ impl Simulator {
     fn record_local_typedef_type(&mut self, name: &str, tn: &str) {
         if let Some((_, t)) = self.local_type_stack.last_mut() {
             t.insert(name.to_string(), tn.to_string());
+        }
+    }
+
+    /// Resolve a VarDecl's declared `DataType` to the class (or class TYPE
+    /// parameter) it names — the same resolution the interpreted VarDecl
+    /// exec applies before recording (§8.25 specialization via the active
+    /// `type_bindings` / `current_spec`, then a typedef/alias, then the
+    /// bare name).
+    fn derive_var_decl_class_name(
+        &self,
+        data_type: &crate::ast::types::DataType,
+    ) -> Option<String> {
+        if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+            // §8.25: the declared type may be a TYPE PARAMETER of the
+            // enclosing parameterized class — resolve it through the active
+            // specialization FIRST so the recorded type is the bound class,
+            // not the literal parameter name.
+            if let Some(bound) = self.resolve_type_param_binding(&name.name.name) {
+                return Some(bound);
+            }
+            // Resolve a typedef/scoped alias (e.g.
+            // `uvm_resource_types::rsrc_q_t`) to its concrete class; fall
+            // back to the bare name otherwise.
+            return Some(
+                self.resolve_typeref_class_name(name)
+                    .unwrap_or_else(|| name.name.name.clone()),
+            );
+        }
+        None
+    }
+
+    /// Record ONLY the type metadata a VarDecl exec writes — the class type
+    /// (frame overlay + `var_class_types`), `#()` type args
+    /// (`var_type_args`), container kind (`var_container_types`), and the
+    /// typedef/enum name (`var_typedef_types` + frame overlay). Shared by
+    /// the interpreted decl path and the compiled-method entry pre-record
+    /// (class-perf Step 9c) so `$cast`/`new` see the SAME type picture on
+    /// both paths. `class_name` is `derive_var_decl_class_name(data_type)`;
+    /// the interpreter passes its own already-derived binding.
+    fn record_var_decl_type_metadata(
+        &mut self,
+        data_type: &crate::ast::types::DataType,
+        name: &str,
+        class_name: Option<&str>,
+    ) {
+        // Record a class-typed local's type so a later
+        // separate `name = new();` knows what to construct.
+        // Covergroup-typed locals (§19.8) are recorded too:
+        // get_expr_type_name consults this map, and both the
+        // bare `c = new;` and `c = new();` assignment paths
+        // already route a covergroup type name to
+        // instantiate_covergroup — they just never saw it
+        // for a procedural local.
+        if let Some(cn) = class_name {
+            // §8.25: `class_name` may be a resolved
+            // VALUE-PARAMETERIZED specialization (e.g. `T me;`
+            // where T → `base#(1)`), which is NOT a bare key in
+            // `module.classes`. Accept it when its base class
+            // is real, so the var's type is recorded and
+            // `$cast`/`new` resolve the specialization later.
+            let cn_is_class = self.module.classes.contains_key(cn)
+                || self.module.covergroups.contains_key(cn)
+                || (cn.contains('#')
+                    && self
+                        .module
+                        .classes
+                        .contains_key(cn.split('#').next().unwrap_or(cn)));
+            if cn_is_class {
+                self.record_local_class_type(name, cn);
+                self.var_class_types.insert(name.to_string(), cn.to_string());
+                // A typedef'd local (e.g. `table_q_t rq` where
+                // `table_q_t = shared#(Foo[$])`) resolves to
+                // `cn` but hides the type_args inside the
+                // typedef chain. Record them so a separate
+                // `rq = new()` constructs the right
+                // specialization with type_bindings populated
+                // (§8.25 — otherwise `T` stays unbound).
+                if let crate::ast::types::DataType::TypeReference { name: tref, .. } =
+                    data_type
+                {
+                    if let Some((_, Some(ta))) =
+                        self.resolve_typeref_class_with_type_args(tref)
+                    {
+                        self.var_type_args.insert(name.to_string(), ta);
+                    }
+                }
+            } else if self.resolve_type_param_binding(cn).is_some() {
+                // `cn` is a class TYPE parameter (e.g. `T obj;`
+                // inside a parameterized-class method). Record
+                // the param name so a separate `obj = new()`
+                // resolves it to the concrete class.
+                //
+                // `resolve_type_param_binding` covers BOTH the
+                // instance path (a method's `this` instance
+                // `type_bindings`) AND the static path (the
+                // active specialization `current_spec`). The
+                // latter matters for STATIC methods of a
+                // parameterized class — e.g.
+                // `callbacks#(T,CB)::get_first` declares
+                // `CB cb;` with no `this`. Without the static
+                // branch, `cb` was never registered, so a bare
+                // `$cast(cb, ...)` assignment and any later
+                // `new()` could not resolve CB, and the return
+                // value came back null to the caller.
+                self.record_local_class_type(name, cn);
+                self.var_class_types.insert(name.to_string(), cn.to_string());
+            }
+        }
+        // Record a parameterized local's declared `#(...)` type
+        // args so a SEPARATE `name = new(...)` constructs the right
+        // specialization (`resource#(T) r; r=new`).
+        // A typedef'd local (e.g. `table_q_t rq` where `table_q_t =
+        // shared#(Foo[$])`) has EMPTY explicit type_args but
+        // the args are hidden in the typedef chain — resolve
+        // them so the new() populates type_bindings (§8.25).
+        // Clear a stale same-named entry when this decl has none.
+        let resolved_ta =
+            if let crate::ast::types::DataType::TypeReference { name: tref, .. } =
+                data_type
+            {
+                self.resolve_typeref_class_with_type_args(tref)
+                    .and_then(|(_, ta)| ta)
+            } else {
+                None
+            };
+        if let crate::ast::types::DataType::TypeReference { type_args, .. } = data_type
+        {
+            if !type_args.is_empty() {
+                self.var_type_args
+                    .insert(name.to_string(), type_args.clone());
+            } else if let Some(ta) = resolved_ta {
+                self.var_type_args.insert(name.to_string(), ta);
+            } else {
+                self.var_type_args.remove(name);
+            }
+        } else {
+            self.var_type_args.remove(name);
+        }
+        // §15.3/§15.4: record a mailbox/semaphore-typed local so
+        // a later separate `name = new(bound)` allocates the right
+        // container. Clear any stale same-named entry from another
+        // frame (var_container_types is a flat map like
+        // var_class_types) when this decl isn't a container.
+        match class_name.and_then(Self::container_base) {
+            Some(k) => {
+                self.var_container_types
+                    .insert(name.to_string(), k.to_string());
+            }
+            None => {
+                self.var_container_types.remove(name);
+            }
+        }
+        // LRM §6.19.6: track typedef-typed locals so
+        // `local.next()`/`.first()`/etc. find their
+        // enum-member list. We extract the bare type
+        // name from a TypeReference data_type.
+        if let crate::ast::types::DataType::TypeReference { name: tref, .. } = data_type {
+            let tn = tref.name.name.clone();
+            // A local declared with a class TYPE PARAMETER
+            // (`T e;` in a parameterized class) isn't in the
+            // flat typedef/enum tables under `T`. Resolve the
+            // active specialization's binding (T -> e_t) so
+            // `e.first()/.next()/.last()/.prev()/.num()/`
+            // names find the CONCRETE enum-member list
+            // (else they fall through to a generic 0).
+            let tn = if self.module.enum_members.contains_key(&tn)
+                || self.module.typedefs.contains_key(&tn)
+                || self.module.typedef_types.contains_key(&tn)
+            {
+                tn
+            } else if self.current_spec.is_some() {
+                self.resolve_type_param_binding(&tn).unwrap_or_else(|| tn)
+            } else {
+                tn
+            };
+            if self.module.enum_members.contains_key(&tn)
+                || self.module.typedefs.contains_key(&tn)
+                || self.module.typedef_types.contains_key(&tn)
+            {
+                self.var_typedef_types.insert(name.to_string(), tn.clone());
+                // Record the frame-scoped typedef too so a
+                // method-local enum type is resolvable without
+                // the flat `var_class_types`/`var_typedef_types`
+                // collision across unrelated frames (a same-
+                // named formal `VISITOR v` in another method
+                // must not shadow this `uvm_verbosity v;`
+                // local). `local_typedef_type_of` reads the
+                // innermost active frame. §6.19.6.
+                self.record_local_typedef_type(name, &tn);
+            }
         }
     }
 
@@ -117642,6 +117739,36 @@ impl Simulator {
                     v = v.resize_for_assign(w);
                 }
                 self.vm_regs[reg] = v;
+            }
+        }
+        // class-perf Step 9c: pre-record the type metadata that executing
+        // the body's TOP-LEVEL VarDecls would write (class type, `#()`
+        // args, container kind, typedef/enum name). The AST path records a
+        // local's type when its VarDecl executes — top-level decls run at
+        // method entry — so the compiled path must present the same picture
+        // to `$cast`'s runtime type check (`cast_type_ok` reads
+        // `class_of_var`/`enum_typename_of_var`, which consult these
+        // overlays). Formals and the return cell were already recorded by
+        // the binding loop above. Nested-block decls are NOT pre-recorded
+        // (the interpreter records them only when the block runs); the
+        // compiler declines a `$cast` with such a destination instead.
+        for st in body {
+            if let crate::ast::stmt::StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } = &st.kind
+            {
+                let cn = self.derive_var_decl_class_name(data_type);
+                for d in declarators {
+                    if d.dimensions.is_empty() {
+                        self.record_var_decl_type_metadata(
+                            data_type,
+                            &d.name.name,
+                            cn.as_deref(),
+                        );
+                    }
+                }
             }
         }
         // Run the block.
