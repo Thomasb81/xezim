@@ -68343,13 +68343,47 @@ impl Simulator {
                 } else {
                     None
                 };
-                {
-                    if let Some((mut arr, method)) = parsed {
+                // §7.12: a class-property receiver — `obj.arr`, `obj.in.arr`,
+                // `this.arr`, `objs[i].arr`, `Cls::sarr` — lives at its
+                // instance-scoped (`<handle>#<member>`) or class-qualified
+                // storage. Left unresolved, the `with` clause was dropped and
+                // the plain reduction came back.
+                let parsed = match parsed {
+                    Some((mut arr, method)) => {
                         if let Some(s) = self.instance_assoc_member(&arr) {
                             arr = s;
                         }
-                        let is_arr = self.module.arrays.contains_key(&arr)
-                            || self.module.dynamic_arrays.contains(&arr);
+                        if !self.is_with_receiver_storage(&arr) && arr.contains('.') {
+                            arr = self.resolve_locator_storage(&arr);
+                        }
+                        Some((arr, method))
+                    }
+                    None => None,
+                };
+                let parsed = match parsed {
+                    Some((arr, method)) if self.is_with_receiver_storage(&arr) => {
+                        Some((arr, method))
+                    }
+                    other => {
+                        let recv = match &expr.kind {
+                            ExprKind::Call { func, .. } => match &func.kind {
+                                ExprKind::MemberAccess { expr: r, member } => Some((r, member)),
+                                _ => None,
+                            },
+                            ExprKind::MemberAccess { expr: r, member } => Some((r, member)),
+                            _ => None,
+                        };
+                        recv.and_then(|(r, m)| {
+                            self.expr_assoc_name(r)
+                                .filter(|st| self.is_with_receiver_storage(st))
+                                .map(|st| (st, m.name.clone()))
+                        })
+                        .or(other)
+                    }
+                };
+                {
+                    if let Some((arr, method)) = parsed {
+                        let is_arr = self.is_with_receiver_storage(&arr);
                         if is_arr {
                             if matches!(
                                 method.as_str(),
@@ -100441,6 +100475,14 @@ impl Simulator {
         }
         self.handle_collection_name(handle, segs[segs.len() - 1])
             .unwrap_or_else(|| name.to_string())
+    }
+
+    /// Does `name` store a collection a `with`-clause reduction or sort can
+    /// walk? A `<handle>#<member>` class collection counts.
+    fn is_with_receiver_storage(&self, name: &str) -> bool {
+        self.module.arrays.contains_key(name)
+            || self.module.dynamic_arrays.contains(name)
+            || (name.contains('#') && !self.is_associative_array(name))
     }
 
     /// `(array, method, filter)` when `e` is a locator call on an array/queue,

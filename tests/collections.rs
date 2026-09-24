@@ -83,6 +83,8 @@ mod struct_collections_across_calls;
 mod void_cast_queue_ops;
 #[path = "collections/whole_array_continuous_assign.rs"]
 mod whole_array_continuous_assign;
+#[path = "collections/with_clause_class_receivers.rs"]
+mod with_clause_class_receivers;
 
 #[path = "collections/queue_dyn_write_semantics.rs"]
 mod queue_dyn_write_semantics;
