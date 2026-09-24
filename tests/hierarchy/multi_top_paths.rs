@@ -162,3 +162,31 @@ module other; logic [7:0] y = 9; endmodule
         );
     }
 }
+
+/// §23.10.1: a `defparam` path may start at a top — the declaring module's
+/// own name, or another top. It resolves from the root, not from the
+/// declaring scope.
+#[test]
+fn defparam_paths_start_at_a_top() {
+    let src = r#"
+module tb;
+  defparam tb.u.P = 9;
+  defparam other.v.P = 8;
+  leaf u();
+endmodule
+module other; leaf v(); endmodule
+module leaf #(parameter P = 1); initial $display("%m P=%0d", P); endmodule
+"#;
+    for args in [&[][..], &["-s", "tb", "-s", "other"][..]] {
+        let (out, _) = run("defparam", src, args);
+        assert!(
+            out.contains("tb.u P=9") && out.contains("other.v P=8"),
+            "{:?}:\n{}",
+            args,
+            out
+        );
+    }
+    let single = src.replace("  defparam other.v.P = 8;\n", "");
+    let (out, _) = run("defparam1", &single, &["-s", "tb"]);
+    assert!(out.contains("tb.u P=9"), "{}", out);
+}
