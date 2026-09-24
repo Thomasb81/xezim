@@ -335,7 +335,8 @@ enum Ae {
         w: u32,
         s: bool,
     },
-    /// Cast: `inner` evaluated at its own `(iw, is)`, converted to `(w, s)`.
+    /// Cast: `inner` evaluated in the context `(iw, is)` — never narrower
+    /// than the target (§6.24.1) — then converted to `(w, s)`.
     Cast {
         inner: Box<Ae>,
         iw: u32,
@@ -1870,6 +1871,26 @@ impl Simulator {
                     let w = self.csp_const(n, env)?.to_u64()? as u32;
                     return self.csp_cast(csp, inner, w, None, env);
                 }
+                // `T'(e)` with `T` a typedef/enum, or a constant size.
+                ("$__xz_named_cast", [t, inner]) => {
+                    let ExprKind::Ident(h) = &t.kind else {
+                        return None;
+                    };
+                    let nm = h.path.last()?.name.name.as_str();
+                    let (w, s) = if let Some(dt) = self.module.typedef_types.get(nm) {
+                        if is_type_real(dt) {
+                            return None;
+                        }
+                        (self.cast_context_width(dt), Some(is_type_signed(dt)))
+                    } else if let Some(&w) = self.module.typedefs.get(nm) {
+                        (w, Some(false))
+                    } else if self.csp_free(csp, t, env) {
+                        (self.csp_const(t, env)?.to_u64()? as u32, None)
+                    } else {
+                        return None;
+                    };
+                    return self.csp_cast(csp, inner, w, s, env);
+                }
                 ("$signed", [inner]) | ("$unsigned", [inner]) => {
                     let a = self.csp_ae(csp, inner, env)?;
                     let (iw, _) = Self::csp_ws(&a);
@@ -1909,7 +1930,10 @@ impl Simulator {
         env: &Env,
     ) -> Option<Ae> {
         let a = self.csp_ae(csp, inner, env)?;
+        // §6.24.1: the cast width is the operand's context, so the operand
+        // is evaluated at no less than the target width.
         let (iw, is) = Self::csp_ws(&a);
+        let iw = iw.max(w);
         if w == 0 || w > 64 || iw > 64 {
             return None;
         }

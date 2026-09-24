@@ -63070,29 +63070,6 @@ impl Simulator {
             // → real cast widens; otherwise resize to the type's width and
             // stamp its signedness.
             "$__xz_type_cast" => {
-                // §11.4.14.2: a cast is an assignment context for a
-                // streaming concatenation, so the cast width has to reach
-                // the stream for it to left-justify (`int'({<<8{16'hABCD}})`
-                // is 32'hcdab_0000). Only a stream operand gets the width —
-                // every other operand keeps the self-determined evaluation
-                // it has always had.
-                if let Some(inner) = args.get(1).filter(|a| Self::expr_is_stream(a)) {
-                    if let Some(ExprKind::TypeLiteral(dt)) = args.first().map(|a| &a.kind) {
-                        let dt = dt.clone();
-                        if !super::elaborate::is_type_real(&dt) {
-                            let w = super::elaborate::resolve_type_width(
-                                &dt,
-                                Some(&self.module.parameters),
-                                Some(&self.module.typedefs),
-                            )
-                            .max(1);
-                            let inner = inner.clone();
-                            let mut out = self.eval_expr_ctx(&inner, w).resize(w);
-                            out.is_signed = super::elaborate::is_type_signed(&dt);
-                            return out;
-                        }
-                    }
-                }
                 let Some(ExprKind::TypeLiteral(dt)) = args.first().map(|a| &a.kind) else {
                     return args
                         .get(1)
@@ -63102,10 +63079,17 @@ impl Simulator {
                 let dt = dt.clone();
                 let inner_is_call =
                     matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
-                let mut v = args
-                    .get(1)
-                    .map(|a| self.eval_expr(a))
-                    .unwrap_or_else(|| Value::zero(1));
+                // §6.24.1: the result is what a variable of the cast type
+                // holds after being ASSIGNED the operand, so an integral
+                // target is the operand's context width — `int'(a + b)` over
+                // 8-bit operands sums at 32 bits, and a streaming operand
+                // left-justifies in it (§11.4.14.2).
+                let ctx_w = self.cast_context_width(&dt);
+                let mut v = match args.get(1) {
+                    Some(a) if ctx_w > 0 && !inner_is_call => self.eval_expr_ctx(a, ctx_w),
+                    Some(a) => self.eval_expr(a),
+                    None => Value::zero(1),
+                };
                 // §6.24.1: cast of a CALL returning a dynamic array/queue
                 // packs the returned elements, element 0 most significant,
                 // each sliced to the target's per-element width (ivtest
@@ -63165,10 +63149,34 @@ impl Simulator {
             "$__xz_named_cast" => {
                 let inner_is_call =
                     matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
-                let mut inner_v = args
-                    .get(1)
-                    .map(|a| self.eval_expr(a))
-                    .unwrap_or_else(|| Value::zero(1));
+                // §6.24.1: an integral target (typedef, enum, or a constant
+                // size) is the operand's context width — see the type-cast
+                // arm above.
+                let target = args.first().and_then(|a| match &a.kind {
+                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+                    _ => None,
+                });
+                let ctx_w = match target.as_deref() {
+                    Some(nm) => {
+                        if let Some(dt) = self.module.typedef_types.get(nm) {
+                            self.cast_context_width(dt)
+                        } else if let Some(&w) = self.module.typedefs.get(nm) {
+                            w.max(1)
+                        } else if self.module.parameters.contains_key(nm)
+                            || self.get_signal_value_by_name(nm).is_some()
+                        {
+                            self.eval_expr(&args[0]).to_u64().unwrap_or(32).max(1) as u32
+                        } else {
+                            0
+                        }
+                    }
+                    None => 0,
+                };
+                let mut inner_v = match args.get(1) {
+                    Some(a) if ctx_w > 0 && !inner_is_call => self.eval_expr_ctx(a, ctx_w),
+                    Some(a) => self.eval_expr(a),
+                    None => Value::zero(1),
+                };
                 // §6.24.1: a cast whose operand is a CALL returning a
                 // dynamic array/queue packs the returned elements —
                 // element 0 most significant, each sliced to the target's
@@ -63176,25 +63184,18 @@ impl Simulator {
                 // collection was recorded at the call's `return`; the
                 // target width resolves from the cast's leaf name.
                 if inner_is_call && self.pending_ret_collection.is_some() {
-                    let leaf_w: Option<u32> = args.first().and_then(|a| {
-                        if let ExprKind::Ident(h) = &a.kind {
-                            h.path.last().and_then(|s| {
-                                let nm = &s.name.name;
-                                self.module
-                                    .typedef_types
-                                    .get(nm)
-                                    .map(|t| {
-                                        super::elaborate::resolve_type_width(
-                                            t,
-                                            Some(&self.module.parameters),
-                                            Some(&self.module.typedefs),
-                                        )
-                                    })
-                                    .or_else(|| self.module.typedefs.get(nm).copied())
+                    let leaf_w: Option<u32> = target.as_ref().and_then(|nm| {
+                        self.module
+                            .typedef_types
+                            .get(nm)
+                            .map(|t| {
+                                super::elaborate::resolve_type_width(
+                                    t,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                )
                             })
-                        } else {
-                            None
-                        }
+                            .or_else(|| self.module.typedefs.get(nm).copied())
                     });
                     if let Some(w) = leaf_w.filter(|&w| w > 0) {
                         let src = self.pending_ret_collection.take().unwrap();
@@ -63203,14 +63204,7 @@ impl Simulator {
                         }
                     }
                 }
-                let leaf = args.first().and_then(|a| {
-                    if let ExprKind::Ident(h) = &a.kind {
-                        h.path.last().map(|s| s.name.name.clone())
-                    } else {
-                        None
-                    }
-                });
-                if let Some(nm) = leaf {
+                if let Some(nm) = target {
                     // (a) Full typedef (carries signedness / real-ness).
                     if let Some(dt) = self.module.typedef_types.get(&nm).cloned() {
                         if super::elaborate::is_type_real(&dt) {
@@ -110168,6 +110162,41 @@ impl Simulator {
         }
         // `f64::round` is already ties-away-from-zero.
         Value::from_u64(f.round() as i64 as u64, width.max(1))
+    }
+
+    /// §6.24.1: the operand context width a cast to `dt` imposes — the
+    /// type's width for an integral target (keyword, enum, packed struct, or
+    /// a typedef chain ending in one), 0 for any other target (real, string,
+    /// unpacked aggregate, class), whose operand stays self-determined.
+    fn cast_context_width(&self, dt: &crate::ast::types::DataType) -> u32 {
+        use crate::ast::types::DataType;
+        let mut cur = dt;
+        for _ in 0..16 {
+            match cur {
+                DataType::IntegerAtom { .. } | DataType::IntegerVector { .. } => break,
+                DataType::Enum(_) => break,
+                DataType::Struct(su) if su.packed => break,
+                DataType::TypeReference { name, .. } => {
+                    let key = &name.name.name;
+                    match self.module.typedef_types.get(key) {
+                        Some(next)
+                            if !matches!(next, DataType::TypeReference { name: n, .. }
+                                if &n.name.name == key) =>
+                        {
+                            cur = next
+                        }
+                        _ if self.module.typedefs.contains_key(key) => break,
+                        _ => return 0,
+                    }
+                }
+                _ => return 0,
+            }
+        }
+        super::elaborate::resolve_type_width(
+            dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        )
     }
 
     /// `$rtoi` TRUNCATES toward zero rather than rounding (§20.5).

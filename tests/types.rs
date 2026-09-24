@@ -41,6 +41,8 @@ mod byte_local_narrow;
 mod callback_typedef_static;
 #[path = "types/cast_class_member_enum_range.rs"]
 mod cast_class_member_enum_range;
+#[path = "types/cast_operand_context.rs"]
+mod cast_operand_context;
 #[path = "types/cast_typeparam.rs"]
 mod cast_typeparam;
 #[path = "types/cast_valparam_typeparam_static.rs"]

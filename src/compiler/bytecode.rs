@@ -8590,8 +8590,8 @@ impl<'a> BytecodeCompiler<'a> {
                 // a collection the runtime packs — see the AST handler),
                 // as does a target that is a runtime signal or a real type.
                 // §6.24.1 type cast (`real'(x)`, `int'(x)`) — mirror
-                // the interpreter: self-determined operand, then convert.
-                // A REAL target converts numerically (`emit_to_real`);
+                // the interpreter: operand in the target's context, then
+                // convert. A REAL target converts numerically (`emit_to_real`);
                 // an integral target resizes and takes the type's
                 // signedness (a real operand rounds per §10.7 inside
                 // `Value::resize`). Stream operands and exotic targets
@@ -8621,15 +8621,24 @@ impl<'a> BytecodeCompiler<'a> {
                         self.bail("type_cast_stream");
                         return None;
                     }
-                    let src = self.compile_expr(inner, 0)?;
+                    let is_real = crate::compiler::elaborate::is_type_real(&dt);
+                    let w = crate::compiler::elaborate::resolve_type_width(&dt, self.params, None)
+                        .max(1);
+                    // §6.24.1: an integral target is the operand's context
+                    // width (`int'(a + b)` sums 8-bit operands at 32 bits);
+                    // `string'` and real targets leave it self-determined.
+                    let integral = matches!(
+                        dt.as_ref(),
+                        crate::ast::types::DataType::IntegerAtom { .. }
+                            | crate::ast::types::DataType::IntegerVector { .. }
+                    );
+                    let src = self.compile_expr(inner, if integral { w } else { 0 })?;
                     let r = self.alloc_reg();
                     self.emit(Insn::Move(r, src));
-                    if crate::compiler::elaborate::is_type_real(&dt) {
+                    if is_real {
                         self.emit_to_real(r);
                         return Some(r);
                     }
-                    let w = crate::compiler::elaborate::resolve_type_width(&dt, self.params, None)
-                        .max(1);
                     self.emit(Insn::Resize(r, w));
                     if crate::compiler::elaborate::is_type_signed(&dt) {
                         self.emit(Insn::SetSigned(r));
@@ -8670,13 +8679,12 @@ impl<'a> BytecodeCompiler<'a> {
                         })
                     });
                     if let (Some((w, signed)), false) = (known, inner_is_call) {
-                        // Mirror the interpreter EXACTLY: the operand is
-                        // evaluated self-determined, then resized. (§6.24.1
-                        // arguably makes the cast type the operand's
-                        // context, but the interpreter — and the reference
-                        // simulator, per the bit-exact ibex traces — do
-                        // not widen the operand's intermediate arithmetic.)
-                        let src = self.compile_expr(args.get(1)?, 0)?;
+                        // §6.24.1: the target width is the operand's
+                        // context — `my_int_t'(a + b)` over 8-bit operands
+                        // sums at 32 bits (a narrowing cast is unaffected:
+                        // the context never drops below the operand's own
+                        // width). Mirrors the interpreter.
+                        let src = self.compile_expr(args.get(1)?, w)?;
                         // NEVER resize `src` in place: for a bare local
                         // (a loop variable, say) compile_expr hands back
                         // the variable's OWN register, and an in-place
