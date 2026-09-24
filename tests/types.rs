@@ -346,6 +346,8 @@ mod multi_dim_unpacked_arrays;
 mod nettype_struct_variable_driver;
 #[path = "types/package_data_members_in_subroutine.rs"]
 mod package_data_members_in_subroutine;
+#[path = "types/package_param_declared_signedness.rs"]
+mod package_param_declared_signedness;
 #[path = "types/packed_member_select_name_collision.rs"]
 mod packed_member_select_name_collision;
 #[path = "types/packed_member_self_determined_width.rs"]
