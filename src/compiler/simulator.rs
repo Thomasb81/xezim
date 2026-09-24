@@ -78140,6 +78140,7 @@ impl Simulator {
                     || self.class_member_is_string(expr)
                     || self.get_expr_type_name(expr).is_some_and(|t| t == "string")
                     || self.local_struct_member_is_string(h)
+                    || self.member_chain_is_string(expr)
             }
             ExprKind::Index { expr: base, .. } => {
                 (if let ExprKind::Ident(h) = &base.kind {
@@ -78158,6 +78159,7 @@ impl Simulator {
                 // queues-of-strings (`node.get_name()` accumulated into `q[$]`)
                 // printed as garbage packed integers instead of text.
                 || self.class_member_is_string(base)
+                || self.member_chain_is_string(expr)
             }
             ExprKind::MemberAccess { expr: base, member } => {
                 // A `this.<prop>` / `obj.<prop>` access where the property is
@@ -78173,6 +78175,7 @@ impl Simulator {
                         .is_some_and(|segs| {
                             self.dotted_member_is_string(&segs.join("."), &member.name)
                         })
+                    || self.member_chain_is_string(expr)
             }
             // A method/function call whose return type is `string`
             // (e.g. `obj.str()`, `this.convert2string()`). Without
@@ -78225,6 +78228,199 @@ impl Simulator {
                 ..
             }
         )
+    }
+
+    /// A member chain that passes through collection ELEMENTS and ends at a
+    /// `string` struct member — `q[i].name`, `o.rows[i].in.name`,
+    /// `this.q[i].name`. The dotted-path checks stop at the first select, so
+    /// `%s` of such a member printed the text padded to the leaf's width.
+    fn member_chain_is_string(&self, e: &Expression) -> bool {
+        use crate::ast::types::{DataType, SimpleType};
+        // Only a member reached through a select (`q[i].name`) is new here;
+        // plain dotted paths are answered by the checks the caller already
+        // ran. Scanned outermost-in without allocating, so the ordinary
+        // `a[i] < b` comparison stays cheap.
+        let mut seen_member = false;
+        let mut cur = e;
+        let through_select = loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, .. } => {
+                    seen_member = true;
+                    cur = expr;
+                }
+                ExprKind::Index { expr, .. } => {
+                    if seen_member {
+                        break true;
+                    }
+                    cur = expr;
+                }
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Ident(h) => {
+                    let mut hit = false;
+                    for (k, seg) in h.path.iter().enumerate().rev() {
+                        if !seg.selects.is_empty() && seen_member {
+                            hit = true;
+                            break;
+                        }
+                        if k > 0 {
+                            seen_member = true;
+                        }
+                    }
+                    break hit;
+                }
+                _ => break false,
+            }
+        };
+        if !through_select {
+            return false;
+        }
+        // Steps outermost first: `Some(member)` or `None` for a select.
+        let mut steps: Vec<Option<&str>> = Vec::new();
+        let mut cur = e;
+        let root: Option<&str> = loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    steps.push(Some(member.name.as_str()));
+                    cur = expr;
+                }
+                ExprKind::Index { expr, .. } => {
+                    steps.push(None);
+                    cur = expr;
+                }
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::This => break None,
+                ExprKind::Ident(h) => {
+                    for seg in h.path[1..].iter().rev() {
+                        steps.extend(seg.selects.iter().map(|_| None));
+                        steps.push(Some(seg.name.name.as_str()));
+                    }
+                    steps.extend(h.path[0].selects.iter().map(|_| None));
+                    break Some(h.path[0].name.name.as_str());
+                }
+                _ => return false,
+            }
+        };
+        steps.reverse();
+        enum Ty {
+            Dt(DataType),
+            Class(String),
+        }
+        let this_class = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+            .map(|i| i.class_name.clone());
+        let class_prop = |cn: &str, prop: &str| -> Option<Ty> {
+            let mut cur = Some(cn.to_string());
+            while let Some(c) = cur {
+                let cd = self.module.classes.get(&c)?;
+                if let Some(dt) = cd.property_types.get(prop) {
+                    let dt = match dt {
+                        DataType::TypeReference { name, .. } => cd
+                            .typedef_targets
+                            .get(&name.name.name)
+                            .cloned()
+                            .unwrap_or_else(|| dt.clone()),
+                        other => other.clone(),
+                    };
+                    return Some(Ty::Dt(self.resolve_dt(&dt)));
+                }
+                cur = cd.extends.clone();
+            }
+            None
+        };
+        let as_class = |t: Ty| -> Ty {
+            match t {
+                Ty::Dt(DataType::TypeReference { ref name, .. })
+                    if self.module.classes.contains_key(&name.name.name) =>
+                {
+                    Ty::Class(name.name.name.clone())
+                }
+                t => t,
+            }
+        };
+        let mut ty = match root {
+            None | Some("this") => Ty::Class(match &this_class {
+                Some(c) => c.clone(),
+                None => return false,
+            }),
+            Some(n) => {
+                let is_local = self.local_stack.last().is_some_and(|f| {
+                    f.keys().any(|k| {
+                        k.strip_prefix(n)
+                            .is_some_and(|r| r.is_empty() || r.starts_with(['.', '[']))
+                    })
+                });
+                let prop = if is_local {
+                    None
+                } else {
+                    this_class.as_deref().and_then(|c| class_prop(c, n))
+                };
+                match prop {
+                    Some(t) => t,
+                    None => {
+                        if let Some(dt) = self.module.var_decl_types.get(n) {
+                            Ty::Dt(self.resolve_dt(dt))
+                        } else if let Some(cn) = self.var_class_types.get(n) {
+                            Ty::Class(cn.clone())
+                        } else {
+                            return false;
+                        }
+                    }
+                }
+            }
+        };
+        ty = as_class(ty);
+        // Unpacked dimensions of the member just stepped into, still to be
+        // consumed by selects. A root's dimensions are not recorded, so a
+        // select on it is an element select unless the root is a string.
+        let mut dims_left = 0usize;
+        for step in steps {
+            match step {
+                None => {
+                    if dims_left > 0 {
+                        dims_left -= 1;
+                    } else if !matches!(ty, Ty::Class(_) | Ty::Dt(DataType::Struct(_))) {
+                        return false;
+                    }
+                }
+                Some(m) => {
+                    if dims_left > 0 {
+                        return false;
+                    }
+                    ty = match ty {
+                        Ty::Class(cn) => match class_prop(&cn, m) {
+                            Some(t) => t,
+                            None => return false,
+                        },
+                        Ty::Dt(DataType::Struct(su)) => {
+                            let Some((mdt, n)) = su.members.iter().find_map(|mm| {
+                                mm.declarators
+                                    .iter()
+                                    .find(|d| d.name.name == m)
+                                    .map(|d| (mm.data_type.clone(), d.dimensions.len()))
+                            }) else {
+                                return false;
+                            };
+                            dims_left = n;
+                            Ty::Dt(self.resolve_dt(&mdt))
+                        }
+                        _ => return false,
+                    };
+                    ty = as_class(ty);
+                }
+            }
+        }
+        dims_left == 0
+            && matches!(
+                ty,
+                Ty::Dt(DataType::Simple {
+                    kind: SimpleType::String,
+                    ..
+                })
+            )
     }
 
     /// Like `struct_var_member_is_string`, but `base` may be a DOTTED path

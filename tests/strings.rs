@@ -77,6 +77,8 @@ mod string_methods_lrm;
 mod string_property_shadowed_by_local;
 #[path = "strings/string_returning_fn_inline.rs"]
 mod string_returning_fn_inline;
+#[path = "strings/struct_elem_string_member_format.rs"]
+mod struct_elem_string_member_format;
 #[path = "strings/system_task_gaps.rs"]
 mod system_task_gaps;
 #[path = "strings/wide_string2num.rs"]
