@@ -4879,6 +4879,47 @@ impl<'a> BytecodeCompiler<'a> {
         Some(v)
     }
 
+    /// Conservative: true when `e` may evaluate to a real — a real literal,
+    /// a real signal or local, or a real-valued system function.
+    fn expr_may_be_real(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(n) => matches!(n, NumberLiteral::Real(_) | NumberLiteral::Time(_)),
+            ExprKind::Ident(h) => {
+                self.local_var_is_real.contains(&Self::hier_raw_name(h))
+                    || self.lookup_signal_id(h).is_some_and(|id| {
+                        self.signal_real
+                            .is_some_and(|r| r.get(id).copied().unwrap_or(false))
+                    })
+            }
+            ExprKind::SystemCall { name, args } => {
+                matches!(
+                    name.as_str(),
+                    "$realtime"
+                        | "$itor"
+                        | "$bitstoreal"
+                        | "$shortrealtobits"
+                        | "$sqrt"
+                        | "$ln"
+                        | "$log10"
+                        | "$exp"
+                        | "$pow"
+                        | "$floor"
+                        | "$ceil"
+                ) || args.iter().any(|a| self.expr_may_be_real(a))
+            }
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => self.expr_may_be_real(x),
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_may_be_real(left) || self.expr_may_be_real(right)
+            }
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => self.expr_may_be_real(then_expr) || self.expr_may_be_real(else_expr),
+            _ => false,
+        }
+    }
+
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
         let raw = Self::hier_raw_name(hier);
         // Targeted override for for-loop variables — see for_loop_var_ids
@@ -6087,6 +6128,12 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::Repeat { count, body }
                 if self.allow_waits && Self::stmt_is_blocking(body) =>
             {
+                // A real count rounds to an integer (§12.7.2); the counted
+                // loop below would decrement the real itself. Interpret it.
+                if self.expr_may_be_real(count) {
+                    self.bail("Repeat_real_count");
+                    return false;
+                }
                 let Some(cnt) = self.compile_expr(count, 0) else {
                     return false;
                 };

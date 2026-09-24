@@ -112593,6 +112593,12 @@ impl Simulator {
         if v.has_xz() {
             return 0;
         }
+        // §12.7.2/§6.12.2: a real count converts to an integer by rounding
+        // (ties away from zero); read as raw bits, `repeat (10.4)` spun ~2^62
+        // times.
+        if v.is_real {
+            return v.to_f64().round().max(0.0) as u64;
+        }
         if v.is_signed {
             v.to_i64().unwrap_or(0).max(0) as u64
         } else {

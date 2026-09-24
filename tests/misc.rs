@@ -161,6 +161,8 @@ mod part_select_negative_bound_compiled;
 mod port_width_mismatch_explains;
 #[path = "misc/real_call_bytecode.rs"]
 mod real_call_bytecode;
+#[path = "misc/repeat_real_count.rs"]
+mod repeat_real_count;
 #[path = "misc/select_semantics_11_5_1.rs"]
 mod select_semantics_11_5_1;
 #[path = "misc/shadow_name_matrix.rs"]
