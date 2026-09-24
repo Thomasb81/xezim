@@ -9,6 +9,36 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* Specify-block timing checks are modelled: `$setup`, `$hold`,
+  `$setuphold`, `$recovery`, `$removal`, `$recrem`, `$skew`, `$timeskew`,
+  `$fullskew`, `$period`, `$width` and `$nochange`, with edge qualifiers,
+  `&&&` conditions, notifiers (toggled in the NBA region, once per time
+  step) and negative `$setuphold`/`$recrem` limits. A violation prints one
+  `** Error: ... violation in <instance> at time <t>` line, counts toward
+  `--error-exit`, and does not stop the run. `+notimingcheck(s)` and
+  `+nospecify` disable the checks (the flag used to be a no-op), and
+  `+no_notifier` / `+no_tchk_msg` are honoured. A `specparam` declared
+  inside a specify block is now a module-scoped constant instead of being
+  dropped.
+* SDF TIMINGCHECK entries (with edges, `COND` and `INSTANCE *`)
+  back-annotate check limits through `--sdf` and `$sdf_annotate`. SDF
+  delays now scale to the simulation tick: designs with ps precision got
+  delays 1000x too short.
+* A package parameter takes its signedness from its declared type:
+  `parameter bit B = 1` is 1, not -1, and a ranged untyped package
+  parameter takes the declared range's width. The apb AVIP never built its
+  master driver because of this.
+* A task of an interface or module instance, called in a `forever` loop
+  through a virtual interface or a hierarchical path, keeps running. The
+  loop used to stop silently or with a false "null receiver" error.
+* Clock generators keep first-in-first-out order with the other events of
+  their time slot: a `#delay` scheduled after the generator's previous
+  toggle resumes after this one. A reset asserted and released around a
+  clock edge now spans that edge as it does in the reference simulator.
+* A one-element array of instances (`bus_if b[1]`) has its element `b[0]`.
+* `@(cb)` for a clocking block declared in a module or interface instance
+  waits for the block's clock inside that instance's tasks and processes
+  instead of returning at once.
 * `randomize()` solves constraint sets that tie many variables together:
   an array `sum()` (including `with (... item.index ...)`), `unique`,
   orderings between elements or arrays, and `->`/`if` around them. When
