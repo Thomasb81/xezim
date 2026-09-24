@@ -75,6 +75,11 @@ Current capabilities include:
 * **Event-control `iff` guards** (LRM §9.4.2.3) — `@(posedge clk iff rst_n)`
   is honored in both procedural `@` waits and edge-sensitive `always` blocks:
   the process resumes only on an edge where the guard holds.
+* **Deferred immediate assertions** (LRM §16.4) — `assert #0` / `assert final`
+  evaluate where they run, but their action block runs only when the report
+  matures at the end of the time slot; a report is dropped if its process
+  resumes first, and one still pending at `$finish` prints a note instead of
+  running its action.
 * **User-defined nettypes with resolution functions** (LRM §6.6.7) —
   `nettype T wire_t with resolver;` including Z-skip and built-in resolution.
 * **Per-module timescales** (LRM §3.14, §20.3, §21.3.5) — `$time`/`$realtime`
