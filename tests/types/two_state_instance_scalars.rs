@@ -44,3 +44,30 @@ endmodule
     assert_eq!(bits(&sim, "s.li"), "0".repeat(64), "longint holds no z");
     assert_eq!(bits(&sim, "s.l4"), "x1z0", "a 4-state variable keeps x/z");
 }
+
+/// §6.8: an `output bit` port of an unconnected interface instance is a
+/// 2-state variable, 0 at time 0 — a clock toggled from it runs. It came up
+/// x (the 4-state default of an output), so `~clk` stayed x forever.
+/// Reference-validated.
+#[test]
+fn unconnected_output_bit_port_starts_at_zero() {
+    let src = r#"
+interface adder_if(output bit clk);
+endinterface
+module tb;
+  adder_if dif();
+  bit s0, s60, s110;
+  initial begin
+    s0 = dif.clk;
+    #60 s60 = dif.clk;
+    #50 s110 = dif.clk;
+    $finish;
+  end
+  initial forever #50 dif.clk = ~dif.clk;
+endmodule
+"#;
+    let sim = simulate(src, 1000).expect("simulate failed");
+    assert_eq!(bits(&sim, "s0"), "0");
+    assert_eq!(bits(&sim, "s60"), "1");
+    assert_eq!(bits(&sim, "s110"), "0");
+}
