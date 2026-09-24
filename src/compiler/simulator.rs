@@ -57860,6 +57860,15 @@ impl Simulator {
                         self.set_signal_value_by_name(&elem, val.clone());
                         return changed;
                     }
+                    // An element of a CLASS-PROPERTY collection of structs
+                    // (`q[0].arr[i]` in a method) keeps its leaves under the
+                    // instance (`<h>#q[0].arr[i]`).
+                    if let Some(elem) = self.class_coll_elem_leaf(&base, i) {
+                        let prev = self.get_signal_value_by_name(&elem);
+                        let changed = prev.as_ref() != Some(val);
+                        self.set_signal_value_by_name(&elem, val.clone());
+                        return changed;
+                    }
                 }
             }
         }
@@ -60878,7 +60887,20 @@ impl Simulator {
                                     let f2 = format!("{}{}", sc, &flat[cont.len()..]);
                                     (sc, f2)
                                 } else {
-                                    (cont.to_string(), flat.clone())
+                                    // A struct element of a member array
+                                    // inside a collection element
+                                    // (`q[0].rows[1].m = v`): the collection
+                                    // is the first select's base.
+                                    let first = flat.find('[').filter(|&f| f < cont.len());
+                                    match first
+                                        .map(|f| (f, self.resolve_locator_storage(&flat[..f])))
+                                    {
+                                        Some((f, sc)) if sc != flat[..f] => {
+                                            let f2 = format!("{}{}", sc, &flat[f..]);
+                                            (sc, f2)
+                                        }
+                                        _ => (cont.to_string(), flat.clone()),
+                                    }
                                 }
                             };
                             if registered(self, &cont_s)
@@ -64140,7 +64162,21 @@ impl Simulator {
                         if sc != cont {
                             format!("{}{}", sc, &base_flat[cut..])
                         } else {
-                            base_flat
+                            // A struct ELEMENT of a member array inside a
+                            // collection element (`q[0].rows[1].m`): the
+                            // collection is the first select's base.
+                            match base_flat.find('[').filter(|&f| f < cut) {
+                                Some(f) => {
+                                    let sc = self.resolve_locator_storage(&base_flat[..f]);
+                                    if sc != base_flat[..f] && self.queue_elem_struct(&sc).is_some()
+                                    {
+                                        format!("{}{}", sc, &base_flat[f..])
+                                    } else {
+                                        base_flat
+                                    }
+                                }
+                                None => base_flat,
+                            }
                         }
                     } else {
                         base_flat
@@ -67961,6 +67997,11 @@ impl Simulator {
                             let elem = format!("{}[{}]", base, i);
                             if let Some(v) = self.get_signal_value_by_name(&elem) {
                                 return v;
+                            }
+                            if let Some(elem) = self.class_coll_elem_leaf(&base, i) {
+                                if let Some(v) = self.get_signal_value_by_name(&elem) {
+                                    return v;
+                                }
                             }
                             // §7.4.6: a declared array with no such element
                             // is an out-of-range read: x at the element
@@ -98079,6 +98120,21 @@ impl Simulator {
         frame
             .contains_key(&format!("{}.{}", name, first))
             .then(|| (name.clone(), su))
+    }
+
+    /// `<h>#q[k].arr[i]` for the flattened member-array base `q[k].arr` when
+    /// `q` is a class-property collection of unpacked structs; `None`
+    /// otherwise.
+    fn class_coll_elem_leaf(&self, base: &str, i: i64) -> Option<String> {
+        if self.no_class_objects() {
+            return None;
+        }
+        let cut = base.find('[')?;
+        let storage = self.resolve_locator_storage(&base[..cut]);
+        if storage == base[..cut] || self.queue_elem_struct(&storage).is_none() {
+            return None;
+        }
+        Some(format!("{}{}[{}]", storage, &base[cut..], i))
     }
 
     /// The packed value of an unpacked-struct element reference, assembled
