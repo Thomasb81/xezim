@@ -66090,22 +66090,22 @@ impl Simulator {
                     UnaryOp::BitNor => v.reduce_or().logic_not(),
                     UnaryOp::BitXnor => v.reduce_xor().logic_not(),
                     UnaryOp::PreIncr => {
-                        let nv = v.add(&Value::from_u64(1, v.width));
+                        let nv = v.add(&Self::inc_dec_step(&v));
                         self.assign_value(operand, &nv);
                         nv
                     }
                     UnaryOp::PostIncr => {
-                        let nv = v.add(&Value::from_u64(1, v.width));
+                        let nv = v.add(&Self::inc_dec_step(&v));
                         self.assign_value(operand, &nv);
                         v
                     }
                     UnaryOp::PreDecr => {
-                        let nv = v.sub(&Value::from_u64(1, v.width));
+                        let nv = v.sub(&Self::inc_dec_step(&v));
                         self.assign_value(operand, &nv);
                         nv
                     }
                     UnaryOp::PostDecr => {
-                        let nv = v.sub(&Value::from_u64(1, v.width));
+                        let nv = v.sub(&Self::inc_dec_step(&v));
                         self.assign_value(operand, &nv);
                         v
                     }
@@ -76741,12 +76741,12 @@ impl Simulator {
             ExprKind::Unary { op, operand } => match op {
                 UnaryOp::PreIncr | UnaryOp::PostIncr => {
                     let v = self.eval_expr(operand);
-                    let nv = v.add(&Value::from_u64(1, v.width));
+                    let nv = v.add(&Self::inc_dec_step(&v));
                     self.assign_value(operand, &nv);
                 }
                 UnaryOp::PreDecr | UnaryOp::PostDecr => {
                     let v = self.eval_expr(operand);
-                    let nv = v.sub(&Value::from_u64(1, v.width));
+                    let nv = v.sub(&Self::inc_dec_step(&v));
                     self.assign_value(operand, &nv);
                 }
                 _ => {
@@ -110338,6 +110338,15 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// The `1` that `++`/`--` add to or subtract from `v`, carrying `v`'s
+    /// signedness: an unsigned step made the result unsigned, so `++x < 0`
+    /// was false for `int x = -5`.
+    fn inc_dec_step(v: &Value) -> Value {
+        let mut one = Value::from_u64(1, v.width);
+        one.is_signed = v.is_signed;
+        one
     }
 
     /// §6.24.1: the operand context width a cast to `dt` imposes — the

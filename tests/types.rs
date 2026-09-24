@@ -111,6 +111,8 @@ mod header_parameter_declared_signedness;
 mod hierarchy_and_type_overrides;
 #[path = "types/implicit_port_net_and_packed_typedef_array.rs"]
 mod implicit_port_net_and_packed_typedef_array;
+#[path = "types/inc_dec_result_signedness.rs"]
+mod inc_dec_result_signedness;
 #[path = "types/instance_queue_structs_and_loop_scope.rs"]
 mod instance_queue_structs_and_loop_scope;
 #[path = "types/ivtest_cast_cluster.rs"]
