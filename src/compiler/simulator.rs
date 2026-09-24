@@ -2737,7 +2737,7 @@ struct SvaClockedSite {
     span_key: usize,
     /// Instance scope of the registering process: every instance of a
     /// module or interface shares the assertion's span.
-    scope: String,
+    dedup_scope: String,
     /// 0 assert, 1 assume, 2 cover (§16.5): a cover miss is not a failure
     /// and fires no else-action; a cover match fires the pass action.
     kind: u8,
@@ -75657,7 +75657,7 @@ impl Simulator {
                         if !self
                             .sva_sites
                             .iter()
-                            .any(|s| s.span_key == span_key && s.scope == self.current_scope)
+                            .any(|s| s.span_key == span_key && s.dedup_scope == self.current_scope)
                         {
                             // LRM §16.5.1: collect the ids of every signal
                             // referenced in the property body so their
@@ -75682,7 +75682,7 @@ impl Simulator {
                             self.process_scope_hint.insert(action_pid, scope.clone());
                             self.sva_sites.push(SvaClockedSite {
                                 span_key,
-                                scope: self.current_scope.clone(),
+                                dedup_scope: self.current_scope.clone(),
                                 kind,
                                 clock_signal,
                                 edge,
