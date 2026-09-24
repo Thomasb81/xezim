@@ -109,3 +109,80 @@ fn uvm_dpi_builtins_regex_hdl_and_argv() {
         msgs
     );
 }
+
+/// The compile/execute/free regex API of later UVM releases, and UVM
+/// 1.1d's argument-less argv walk (it restarts after reporting the end).
+const LATER_API_SRC: &str = r#"
+module top;
+  import "DPI-C" function chandle uvm_re_comp(string re, bit deglob);
+  import "DPI-C" function int uvm_re_exec(chandle rexp, string str);
+  import "DPI-C" function void uvm_re_free(chandle rexp);
+  import "DPI-C" function string uvm_re_buffer();
+  import "DPI-C" function bit uvm_re_compexecfree(string re, string str, bit deglob,
+                                                   output int exec_ret);
+  import "DPI-C" function string uvm_re_deglobbed(string glob, bit with_brackets);
+  import "DPI-C" function string uvm_dpi_get_next_arg_c();
+  initial begin
+    chandle h;
+    int r;
+    bit ok;
+    h = uvm_re_comp("env.*.mon", 1);
+    $display("T|comp=%0d m=%0d n=%0d", h != null, uvm_re_exec(h, "env.a.mon"),
+             uvm_re_exec(h, "env.a.drv") != 0);
+    uvm_re_free(h);
+    h = uvm_re_comp("/a(/", 0);
+    $display("T|bad=%0d buf=%0d", h == null, uvm_re_buffer() != "");
+    ok = uvm_re_compexecfree("/^x+$/", "xxx", 0, r);
+    $display("T|cef ok=%0d r=%0d", ok, r);
+    $display("T|deglob '%s' '%s'", uvm_re_deglobbed("a*", 0), uvm_re_deglobbed("a*", 1));
+    $display("T|argv %s %s '%s' %s", uvm_dpi_get_next_arg_c(), uvm_dpi_get_next_arg_c(),
+             uvm_dpi_get_next_arg_c(), uvm_dpi_get_next_arg_c());
+  end
+endmodule
+"#;
+
+#[test]
+fn uvm_dpi_builtins_later_regex_api_and_legacy_argv() {
+    let sim = simulate_multi(
+        &[LATER_API_SRC.to_string()],
+        100,
+        Some("top"),
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &["+X".to_string()],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+    )
+    .expect("simulate failed");
+    let got: Vec<String> = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .filter(|m| m.starts_with("T|"))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "T|comp=1 m=0 n=1",
+            "T|bad=1 buf=1",
+            "T|cef ok=1 r=0",
+            "T|deglob '^a.*$' '/^a.*$/'",
+            "T|argv xezim +X '' xezim",
+        ]
+    );
+}
