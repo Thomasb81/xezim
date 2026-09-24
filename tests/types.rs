@@ -195,6 +195,8 @@ mod range_select_param_arith;
 mod real_literal_comb_eval;
 #[path = "types/real_valued_delay.rs"]
 mod real_valued_delay;
+#[path = "types/scoped_type_cast.rs"]
+mod scoped_type_cast;
 #[path = "types/shift_context_width.rs"]
 mod shift_context_width;
 #[path = "types/shift_width_and_scope_hint.rs"]

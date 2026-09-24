@@ -63152,10 +63152,7 @@ impl Simulator {
                 // §6.24.1: an integral target (typedef, enum, or a constant
                 // size) is the operand's context width — see the type-cast
                 // arm above.
-                let target = args.first().and_then(|a| match &a.kind {
-                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
-                    _ => None,
-                });
+                let target = args.first().and_then(|a| self.named_cast_key(a));
                 let ctx_w = match target.as_deref() {
                     Some(nm) => {
                         if let Some(dt) = self.module.typedef_types.get(nm) {
@@ -110162,6 +110159,33 @@ impl Simulator {
         }
         // `f64::round` is already ties-away-from-zero.
         Value::from_u64(f.round() as i64 as u64, width.max(1))
+    }
+
+    /// The table key of a parser-lowered named cast's target (`T'(v)`,
+    /// `pkg::T'(v)`). A package-scoped name prefers its qualified `pkg::T`
+    /// registration, so a same-named module-local typedef cannot capture it.
+    fn named_cast_key(&self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+            ExprKind::MemberAccess { expr, member } => {
+                let ExprKind::Ident(h) = &expr.kind else {
+                    return None;
+                };
+                let key = format!("{}::{}", h.path.last()?.name.name, member.name);
+                let m = &self.module;
+                Some(
+                    if m.typedef_types.contains_key(&key)
+                        || m.typedefs.contains_key(&key)
+                        || m.parameters.contains_key(&key)
+                    {
+                        key
+                    } else {
+                        member.name.clone()
+                    },
+                )
+            }
+            _ => None,
+        }
     }
 
     /// §6.24.1: the operand context width a cast to `dt` imposes — the

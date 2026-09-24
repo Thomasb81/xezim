@@ -1873,10 +1873,8 @@ impl Simulator {
                 }
                 // `T'(e)` with `T` a typedef/enum, or a constant size.
                 ("$__xz_named_cast", [t, inner]) => {
-                    let ExprKind::Ident(h) = &t.kind else {
-                        return None;
-                    };
-                    let nm = h.path.last()?.name.name.as_str();
+                    let nm = self.named_cast_key(t)?;
+                    let nm = nm.as_str();
                     let (w, s) = if let Some(dt) = self.module.typedef_types.get(nm) {
                         if is_type_real(dt) {
                             return None;

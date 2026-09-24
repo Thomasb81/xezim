@@ -8648,8 +8648,18 @@ impl<'a> BytecodeCompiler<'a> {
                     Some(r)
                 }
                 "$__xz_named_cast" => {
+                    // `pkg::T'(x)` prefers the qualified `pkg::T` entry.
                     let target = args.first().and_then(|a| match &a.kind {
                         ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
+                        ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                            ExprKind::Ident(h) => {
+                                let key = format!("{}::{}", h.path.last()?.name.name, member.name);
+                                let known = self.cast_widths.is_some_and(|m| m.contains_key(&key))
+                                    || self.params.is_some_and(|p| p.contains_key(&key));
+                                Some(if known { key } else { member.name.clone() })
+                            }
+                            _ => None,
+                        },
                         _ => None,
                     });
                     // `8'(x)` — the size is a literal, no name lookup.
