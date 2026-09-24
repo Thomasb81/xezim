@@ -313,5 +313,7 @@ mod type_param_replication_localparam;
 mod typedef_receiver_static_task;
 #[path = "classes/vif_property_named_like_instance.rs"]
 mod vif_property_named_like_instance;
+#[path = "classes/vif_resource_db_shape.rs"]
+mod vif_resource_db_shape;
 #[path = "classes/vif_static_roundtrip.rs"]
 mod vif_static_roundtrip;

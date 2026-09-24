@@ -104353,12 +104353,17 @@ impl Simulator {
                 //   string key, otherwise -> flat local/static key.
                 let mut is_vif_prop_of: Option<usize> = None;
                 let mut is_prop_of: Option<usize> = None;
+                // A local or formal of the current frame shadows a property.
+                let frame_local = self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(lname));
                 if let Some(th) = self
                     .this_stack
                     .last()
                     .copied()
                     .flatten()
-                    .filter(|&th| th != 0)
+                    .filter(|&th| th != 0 && !frame_local)
                 {
                     let mut cur: Option<&str> = self
                         .heap
@@ -104410,6 +104415,40 @@ impl Simulator {
         false
     }
 
+    /// Whether the flat `__vif_local__<name>` key — the binding of a
+    /// subroutine formal or local, keyed by bare name across frames —
+    /// speaks for `name` here. A property of `this` that no local of the
+    /// current frame shadows has its own per-instance key; a caller's
+    /// same-named formal must not leak into it (`val == t` in
+    /// uvm_resource::do_write, called from a `set(..., T val, ...)`).
+    fn vif_flat_key_applies(&self, name: &str) -> bool {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(name))
+        {
+            return true;
+        }
+        let Some(th) = self.this_stack.last().copied().flatten() else {
+            return true;
+        };
+        let mut cur = self
+            .heap
+            .get(th)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.as_str());
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if cd.properties.contains_key(name) || cd.virtual_iface_properties.contains_key(name) {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        true
+    }
+
     /// Classify an equality operand as a VIRTUAL-INTERFACE VARIABLE:
     /// `None` — not one; `Some(Some(n))` — bound to instance `n`;
     /// `Some(None)` — a declared vif variable with no binding (null).
@@ -104445,7 +104484,9 @@ impl Simulator {
                     self.signals.get(k.as_str()).map(|v| v.to_sv_string())
                 };
                 if let Some(v) = hit {
-                    return Some(Some(v));
+                    if self.vif_flat_key_applies(raw) {
+                        return Some(Some(v));
+                    }
                 }
                 if let Some(b) = self.iface_alias_for(raw) {
                     return Some(Some(b));
@@ -104540,6 +104581,80 @@ impl Simulator {
                 | crate::ast::types::DataType::TypeReference { .. }
                 | crate::ast::types::DataType::Implicit { .. }
         )
+    }
+
+    /// §25.9 `__vif_local__` keys on call entry: each formal takes its
+    /// actual's interface binding, or none. The keys are flat by formal
+    /// name, so the caller's values are returned for `vif_formals_exit` to
+    /// restore — a nested call with a same-named formal must not clobber
+    /// them.
+    fn vif_formals_enter(
+        &mut self,
+        formals: &[(&str, Option<&Expression>)],
+    ) -> Vec<(String, Option<Value>)> {
+        // Resolve every actual before any key changes: an actual may name
+        // a caller formal that shares a key with an earlier callee formal.
+        let bound: Vec<Option<String>> = formals
+            .iter()
+            .map(|(_, a)| a.and_then(|a| self.resolve_vif_rhs_name_strict(a)))
+            .collect();
+        let mut saved = Vec::with_capacity(formals.len());
+        for ((name, _), nm) in formals.iter().zip(bound) {
+            let key = format!("__vif_local__{}", name);
+            let prev = match nm {
+                Some(nm) => self.signals.insert(key.clone(), Value::from_string(&nm)),
+                None => self.signals.remove(&key),
+            };
+            saved.push((key, prev));
+        }
+        saved
+    }
+
+    /// On call exit: the bindings the `outputs` formals ended with, keyed by
+    /// formal name; then the caller's keys are put back.
+    fn vif_formals_exit(
+        &mut self,
+        saved: Vec<(String, Option<Value>)>,
+        outputs: &[&str],
+    ) -> HashMap<String, String> {
+        let mut ended: HashMap<String, String> = HashMap::default();
+        for pn in outputs {
+            if let Some(v) = self.signals.get(&format!("__vif_local__{}", pn)) {
+                ended.insert(pn.to_string(), v.to_sv_string());
+            }
+        }
+        for (key, prev) in saved {
+            match prev {
+                Some(v) => {
+                    self.signals.insert(key, v);
+                }
+                None => {
+                    self.signals.remove(&key);
+                }
+            }
+        }
+        ended
+    }
+
+    /// Bind an out/inout actual to interface instance `inst`.
+    fn vif_bind_actual(&mut self, caller: &Expression, inst: &str) {
+        let synth = Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: inst.to_string(),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    selects: Vec::new(),
+                }],
+                span: crate::ast::Span::dummy(),
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            crate::ast::Span::dummy(),
+        );
+        let _ = self.try_bind_virtual_iface(caller, &synth);
     }
 
     fn resolve_vif_rhs_name_strict(&self, rvalue: &Expression) -> Option<String> {
@@ -104938,7 +105053,7 @@ impl Simulator {
                     self.signals.get(k.as_str()).map(|v| v.to_sv_string())
                 };
                 if let Some(s) = hit {
-                    if !s.is_empty() {
+                    if !s.is_empty() && self.vif_flat_key_applies(&raw) {
                         return Some(s);
                     }
                 }
@@ -112929,25 +113044,18 @@ impl Simulator {
         // an `int`/`bit`/`string` formal never had a key to set or clear, so
         // the per-port format + resolve + hash was pure overhead on every
         // call of every function.
-        let mut vif_keyed: Vec<&str> = Vec::new();
-        for (i, port) in fd.ports.iter().enumerate() {
-            if !Self::formal_may_carry_vif(&port.data_type) {
-                continue;
-            }
-            let key = format!("__vif_local__{}", port.name.name);
-            match args
-                .get(i)
-                .and_then(|a| self.resolve_vif_rhs_name_strict(a))
-            {
-                Some(nm) => {
-                    self.signals.insert(key, Value::from_string(&nm));
-                    vif_keyed.push(port.name.name.as_str());
-                }
-                None => {
-                    self.signals.remove(&key);
-                }
-            }
-        }
+        let vif_formals: Vec<(&str, Option<&Expression>)> = fd
+            .ports
+            .iter()
+            .enumerate()
+            .filter(|(_, port)| Self::formal_may_carry_vif(&port.data_type))
+            .map(|(i, port)| (port.name.name.as_str(), args.get(i)))
+            .collect();
+        let vif_saved = if vif_formals.is_empty() {
+            Vec::new()
+        } else {
+            self.vif_formals_enter(&vif_formals)
+        };
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut assoc_params: Vec<(String, String, bool, Option<bool>)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
@@ -113474,29 +113582,18 @@ impl Simulator {
             })
             .collect();
         self.pop_local_frame();
+        // A vif binding an out/inout formal ended with propagates to the
+        // caller's actual — instance prop or another plain name — whatever
+        // the actual held on entry.
+        let vif_ended = if vif_saved.is_empty() {
+            HashMap::default()
+        } else {
+            let outs: Vec<&str> = writebacks.iter().map(|(pn, _, _)| pn.as_str()).collect();
+            self.vif_formals_exit(vif_saved, &outs)
+        };
         for (pn, v, caller) in writebacks {
-            // A vif binding recorded on the formal (out/inout) propagates to
-            // the caller's actual — instance prop or another plain name.
-            let key = format!("__vif_local__{}", pn);
-            if vif_keyed.iter().any(|k| *k == pn) && self.signals.contains_key(&key) {
-                let synth = Expression::new(
-                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                        root: None,
-                        path: vec![crate::ast::expr::HierPathSegment {
-                            name: crate::ast::Identifier {
-                                name: pn.clone(),
-                                span: crate::ast::Span::dummy(),
-                            },
-                            selects: Vec::new(),
-                        }],
-                        span: crate::ast::Span::dummy(),
-                        cached_signal_id: std::cell::Cell::new(None),
-                        cached_resolved_name: std::cell::OnceCell::new(),
-                    }),
-                    crate::ast::Span::dummy(),
-                );
-                let _ = self.try_bind_virtual_iface(&caller, &synth);
-                self.signals.remove(&key);
+            if let Some(nm) = vif_ended.get(&pn) {
+                self.vif_bind_actual(&caller, nm);
             }
             self.assign_value(&caller, &v);
         }
@@ -125744,20 +125841,12 @@ impl Simulator {
                 // instr, …)` writing the picked instruction to `instr_list[i]`).
                 let mut output_bindings: Vec<(String, Expression)> = Vec::new();
                 // §25.9 __vif_local__: record vif actuals under formal names.
-                for (i, port) in ports.iter().enumerate() {
-                    let key = format!("__vif_local__{}", port.name.name);
-                    match args
-                        .get(i)
-                        .and_then(|a| self.resolve_vif_rhs_name_strict(a))
-                    {
-                        Some(nm) => {
-                            self.signals.insert(key, Value::from_string(&nm));
-                        }
-                        None => {
-                            self.signals.remove(&key);
-                        }
-                    }
-                }
+                let vif_formals: Vec<(&str, Option<&Expression>)> = ports
+                    .iter()
+                    .enumerate()
+                    .map(|(i, port)| (port.name.name.as_str(), args.get(i)))
+                    .collect();
+                let vif_saved = self.vif_formals_enter(&vif_formals);
                 let mut queue_writebacks: Vec<(String, String)> = Vec::new();
                 let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
                 let mut assoc_params: Vec<(String, String, bool, Option<bool>)> = Vec::new();
@@ -126592,27 +126681,11 @@ impl Simulator {
                 if !array_writebacks.is_empty() {
                     self.writeback_array_args(&array_writebacks);
                 }
+                let outs: Vec<&str> = writebacks.iter().map(|(pn, _, _)| pn.as_str()).collect();
+                let vif_ended = self.vif_formals_exit(vif_saved, &outs);
                 for (pn, v, caller) in writebacks {
-                    let key = format!("__vif_local__{}", pn);
-                    if self.signals.contains_key(&key) {
-                        let synth = Expression::new(
-                            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                                root: None,
-                                path: vec![crate::ast::expr::HierPathSegment {
-                                    name: crate::ast::Identifier {
-                                        name: pn.clone(),
-                                        span: crate::ast::Span::dummy(),
-                                    },
-                                    selects: Vec::new(),
-                                }],
-                                span: crate::ast::Span::dummy(),
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
-                            }),
-                            crate::ast::Span::dummy(),
-                        );
-                        let _ = self.try_bind_virtual_iface(&caller, &synth);
-                        self.signals.remove(&key);
+                    if let Some(nm) = vif_ended.get(&pn) {
+                        self.vif_bind_actual(&caller, nm);
                     }
                     self.assign_value(&caller, &v);
                 }
