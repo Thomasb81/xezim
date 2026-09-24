@@ -41,6 +41,8 @@ mod packed_member_nesting_compiles;
 mod specify_flags;
 #[path = "gates/streaming_op_compiles.rs"]
 mod streaming_op_compiles;
+#[path = "gates/timing_checks_kinds.rs"]
+mod timing_checks_kinds;
 #[path = "gates/timing_checks_notifier.rs"]
 mod timing_checks_notifier;
 #[path = "gates/tran_and_implicit_nets.rs"]

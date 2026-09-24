@@ -256,11 +256,13 @@ fn print_usage() {
   --primitive-verbose  Show parse/adoption diagnostics for explicit -v files
   -y <dir>         Library directory: <module>.<ext> loaded on demand
   +libext+<ext>+.. Extension list for -y search (replaces default .v/.sv/.V)
-  +nospecify       Suppress specify-block path delays (zero-delay gate sim)
+  +nospecify       Suppress specify-block path delays and timing checks (zero-delay gate sim)
   +delay_mode_zero Force all structural (specify/SDF) delays to 0 (fast functional GLS)
   +delay_mode_unit Collapse every nonzero structural delay to 1 time unit
   +mindelays/+typdelays/+maxdelays  min:typ:max selection (specify + SDF; default typ)
-  +notimingcheck   Accepted no-op (specify timing checks are not modeled)"
+  +notimingcheck   Disable specify timing checks ($setup, $hold, $width, ...)
+  +no_notifier     Report timing violations without toggling notifiers
+  +no_tchk_msg     Toggle notifiers without printing timing violations"
     );
     eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
     eprintln!("                   dictionary + time + signal deltas + event records).");
@@ -482,9 +484,9 @@ fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
 /// - Flags whose effect xezim cannot model (`+delay_mode_distributed`, pulse
 ///   control, transport/multisource interconnect delays) warn ONCE so the user
 ///   knows the timing is approximated — never silent.
-/// - Timing-check controls (`+no_notifier`, `+neg_tchk`, …) are recognized
-///   no-ops: xezim does not model specify timing checks, so there is nothing to
-///   toggle (same rationale as `+notimingcheck`).
+/// - `+no_notifier` / `+no_tchk_msg` split a timing violation's two effects
+///   (notifier toggle, message). The other timing-check controls (`+neg_tchk`,
+///   …) are recognized no-ops.
 fn handle_gls_flag(flag: &str) -> bool {
     // `+pulse_e/0`, `+pulse_r/95` etc. carry a trailing value.
     let head = flag.split('/').next().unwrap_or(flag);
@@ -498,10 +500,10 @@ fn handle_gls_flag(flag: &str) -> bool {
         // Path delays are what xezim already uses when a specify block is
         // present — recognized, no behavior change.
         "+delay_mode_path" | "-delay_mode_path" => {}
-        // Timing-check control: nothing to disable (checks aren't modeled).
-        "+no_notifier"
-        | "+no_tchk_msg"
-        | "+neg_tchk"
+        "+no_notifier" => xezim::compiler::simulator::set_no_notifier(true),
+        "+no_tchk_msg" => xezim::compiler::simulator::set_no_tchk_msg(true),
+        // Negative limits are always honored; the rest have no xezim analogue.
+        "+neg_tchk"
         | "+nonegdelay"
         | "+old_ntc"
         | "+ntc_warn"
@@ -758,7 +760,9 @@ fn process_command_file(
                 "+nospecify" | "-nospecify" => {
                     *nospecify = true;
                 }
-                "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {}
+                "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {
+                    xezim::compiler::simulator::set_no_timing_checks(true);
+                }
                 "-f" | "-c" => {
                     i += 1;
                     if i < toks.len() {
@@ -1792,10 +1796,8 @@ fn run_main() -> i32 {
                 push_plus_libext(arg, &mut lib_exts);
             }
             // Commercial GLS flags. `+nospecify` suppresses specify-block path
-            // delays (zero-delay gate sim). `+notimingcheck(s)` is accepted as a
-            // documented no-op: xezim does not model specify timing checks, so
-            // they are permanently "disabled" already. Xcelium's `-` spellings
-            // are accepted too.
+            // delays (zero-delay gate sim) and timing checks; `+notimingcheck(s)`
+            // only the timing checks. Xcelium's `-` spellings are accepted too.
             "+nospecify" | "-nospecify" => {
                 nospecify = true;
             }
@@ -1823,7 +1825,7 @@ fn run_main() -> i32 {
                 }
             }
             "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {
-                // no-op by design; recognized so flows don't carry a mystery plusarg
+                xezim::compiler::simulator::set_no_timing_checks(true);
             }
             _ if handle_gls_flag(arg) => {}
             _ if arg.starts_with('+') => {

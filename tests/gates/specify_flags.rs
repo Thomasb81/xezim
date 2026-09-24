@@ -1,9 +1,9 @@
 //! Commercial gate-level-sim flags: `+nospecify` suppresses specify-block
-//! module path delays (zero-delay GLS); `+notimingcheck`/`+notimingchecks`
-//! are accepted as documented no-ops (xezim does not model specify timing
-//! checks, so they are permanently "disabled" already). Xcelium's `-`
-//! spellings are accepted for both. CLI-level tests because the switch is a
-//! process-global set by argument parsing.
+//! module path delays (zero-delay GLS) and timing checks;
+//! `+notimingcheck`/`+notimingchecks` suppress only the §31 timing checks;
+//! `+no_notifier` / `+no_tchk_msg` keep one of a violation's two effects.
+//! Xcelium's `-` spellings are accepted too. CLI-level tests because the
+//! switches are process-globals set by argument parsing.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -82,10 +82,10 @@ fn nospecify_suppresses_path_delays() {
     }
 }
 
-/// The timing-check disables are recognized no-ops — no unknown-flag warning,
-/// simulation unchanged.
+/// The timing-check disables are recognized — no unknown-flag warning — and
+/// leave path delays alone.
 #[test]
-fn notimingcheck_is_a_quiet_noop() {
+fn notimingcheck_keeps_path_delays() {
     for flag in ["+notimingcheck", "+notimingchecks", "-notimingchecks"] {
         let out = run("ntc", &[flag]);
         assert!(
@@ -101,6 +101,87 @@ fn notimingcheck_is_a_quiet_noop() {
             out
         );
     }
+}
+
+const TCHK_SRC: &str = "`timescale 1ns/1ns
+module ff(input d, input clk);
+  reg n = 0;
+  always @(n) $display(\"N=%b\", n);
+  specify $setup(d, posedge clk, 3, n); endspecify
+endmodule
+module tb;
+  reg d = 0, clk = 0;
+  ff u(.d(d), .clk(clk));
+  initial begin #10 d = 1; #1 clk = 1; #5 $finish; end
+endmodule
+";
+
+/// §31 timing checks: a setup violation prints one error and toggles the
+/// notifier (the reference simulator reports the same violation). The
+/// disables drop both effects or one of them, and `--error-exit` counts the
+/// violation as an error.
+#[test]
+fn timing_check_flags() {
+    let dir = std::env::temp_dir().join(format!("xezim_tchk_flags_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sv = dir.join("tc.sv");
+    std::fs::write(&sv, TCHK_SRC).unwrap();
+    let run = |args: &[&str]| -> (Option<i32>, String) {
+        let o = Command::new(xezim_bin())
+            .args(args)
+            .arg(&sv)
+            .output()
+            .unwrap();
+        (
+            o.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        )
+    };
+    let msg = "$setup( d:10 ns, posedge clk:11 ns, 3 ns ) violation in tb.u at time 11 ns";
+    let (code, out) = run(&[]);
+    assert!(
+        out.contains(msg) && out.contains("N=1"),
+        "default:\n{}",
+        out
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "a violation alone does not fail the run:\n{}",
+        out
+    );
+    let (code, out) = run(&["--error-exit"]);
+    assert_eq!(code, Some(1), "--error-exit counts the violation:\n{}", out);
+    for flag in [
+        "+notimingcheck",
+        "+notimingchecks",
+        "-notimingchecks",
+        "+nospecify",
+    ] {
+        let (_, out) = run(&[flag]);
+        assert!(
+            !out.contains("violation") && !out.contains("N=1"),
+            "{} must disable the check:\n{}",
+            flag,
+            out
+        );
+    }
+    let (_, out) = run(&["+no_notifier"]);
+    assert!(
+        out.contains(msg) && !out.contains("N=1"),
+        "+no_notifier:\n{}",
+        out
+    );
+    let (_, out) = run(&["+no_tchk_msg"]);
+    assert!(
+        !out.contains("violation") && out.contains("N=1"),
+        "+no_tchk_msg:\n{}",
+        out
+    );
 }
 
 const TRIPLET_SRC: &str = "`timescale 1ns/1ns

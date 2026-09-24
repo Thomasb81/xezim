@@ -103,8 +103,9 @@ and testbench flows. Portable code should not rely on them.
   semantics — a variable keeps the deposited value, and a real driver on a net
   overrides a deposit on its next update.
 * Gate-level-simulation CLI flags — `+nospecify`, `+notimingcheck`,
-  `+delay_mode_zero`/`+delay_mode_unit`, `+mindelays`/`+typdelays`/`+maxdelays`,
-  and the `-v`/`-y`/`+libext+` library flags — mirror the commercial spellings.
+  `+no_notifier`/`+no_tchk_msg`, `+delay_mode_zero`/`+delay_mode_unit`,
+  `+mindelays`/`+typdelays`/`+maxdelays`, and the `-v`/`-y`/`+libext+` library
+  flags — mirror the commercial spellings.
 
 ---
 
@@ -321,8 +322,9 @@ Common options:
 | `-v <file>` | Library file: modules compiled only to resolve unresolved instantiations |
 | `-y <dir>` | Library directory: `<module>.<ext>` loaded on demand |
 | `+libext+<ext>+…` | Extension list for `-y` search (replaces the default `.v`/`.sv`/`.V`) |
-| `+nospecify` | Suppress specify-block path delays — zero-delay gate simulation (`-nospecify` also accepted) |
-| `+notimingcheck` | Accepted no-op: specify timing checks are not modeled (also `+notimingchecks`/`-notimingchecks`) |
+| `+nospecify` | Suppress specify-block path delays and timing checks — zero-delay gate simulation (`-nospecify` also accepted) |
+| `+notimingcheck` | Disable the specify-block timing checks (`$setup`, `$hold`, `$width`, …; also `+notimingchecks`/`-notimingchecks`). A violation otherwise prints one `** Error:` line (counted by `--error-exit`) and toggles the check's notifier |
+| `+no_notifier` / `+no_tchk_msg` | Report timing violations without toggling notifiers / toggle notifiers without reporting |
 | `--wave` | Compile the model with waveform support, enabling `$dumpfile`/`$dumpvars` (off by default; `--fst`/`--xtrace` imply it) |
 | `--fst <file>` | Emit an FST (GTKWave binary) waveform dump |
 | `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable) |

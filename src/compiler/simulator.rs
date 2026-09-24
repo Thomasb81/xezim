@@ -188,8 +188,9 @@ fn sim_debug_enabled() -> bool {
 /// the dump, and threading two more arguments through a 24-argument public
 /// signature would churn every caller in the tree.
 /// `+nospecify` (commercial GLS flag): suppress specify-block module path
-/// delays — zero-delay gate simulation. Timing checks are not modeled at all
-/// in xezim, so `+notimingcheck` is accepted by the CLI as a documented no-op.
+/// delays — zero-delay gate simulation — and, as in the reference simulator,
+/// the §31 timing checks (`timing_checks::set_no_timing_checks` disables only
+/// the checks).
 static NOSPECIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `--warn-x`: report the FIRST time each signal takes an X bit after time 0,
@@ -780,6 +781,12 @@ enum CombItem {
     UdpBatch {
         event_ref: BitRef,
         indices: Box<[usize]>,
+    },
+    /// §31 timing check. Evaluated by `eval_timing_check(idx)` against
+    /// `self.timing_checks[idx]`; reads its reference/data terminals and
+    /// writes nothing directly (a notifier toggles through the NBA region).
+    TimingCheck {
+        idx: usize,
     },
 }
 
@@ -2064,7 +2071,9 @@ impl NbaFastIndex {
 }
 
 mod rand_csp;
+mod timing_checks;
 mod ts_x;
+pub use timing_checks::{set_no_notifier, set_no_tchk_msg, set_no_timing_checks};
 
 #[cfg(test)]
 mod nba_fast_index_tests {
@@ -4729,6 +4738,16 @@ pub struct Simulator {
     /// settle path (sequential UDPs need `&mut self` to update their state,
     /// which the parallel/BSP isolated eval cannot provide).
     has_udp: bool,
+    /// §31 timing checks, indexed by `CombItem::TimingCheck{idx}`.
+    timing_checks: Vec<timing_checks::TimingCheckRt>,
+    /// Like `has_udp`: timing checks keep per-check state, so their comb
+    /// entries force the serial settle.
+    has_timing_checks: bool,
+    /// Timing-check events seen by a settle inside a running process,
+    /// evaluated once it suspends: (check, reference, data transition).
+    timing_pending: Vec<(usize, Option<(u8, u8)>, Option<(u8, u8)>)>,
+    /// Armed time-based `$timeskew`/`$fullskew` deadlines: (time, check).
+    timing_timers: Vec<(u64, usize)>,
     module: ElaboratedModule,
     dpi_libraries: Vec<Library>,
     dpi_bindings: HashMap<String, DpiBinding>,
@@ -9350,6 +9369,10 @@ impl Simulator {
             packed_nba: Vec::new(),
             udp_runtime: Vec::new(),
             has_udp: false,
+            timing_checks: Vec::new(),
+            has_timing_checks: false,
+            timing_pending: Vec::new(),
+            timing_timers: Vec::new(),
             module,
             dpi_libraries: Vec::new(),
             dpi_bindings: HashMap::default(),
@@ -15496,6 +15519,7 @@ impl Simulator {
                 // GateRegion: serial-only in v1 (no isolated batch arm yet).
                 CombItem::Udp { .. }
                 | CombItem::UdpBatch { .. }
+                | CombItem::TimingCheck { .. }
                 | CombItem::GateRegion { .. }
                 | CombItem::VectorGate { .. }
                 | CombItem::ScatterGate { .. } => {}
@@ -16180,7 +16204,8 @@ impl Simulator {
             CombItem::Noop => true,
             // §29 UDPs are never evaluated on this isolated (parallel) path —
             // `has_udp` forces the serial settle. Present only for exhaustiveness.
-            CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
+            // Timing checks likewise (`has_timing_checks`).
+            CombItem::Udp { .. } | CombItem::UdpBatch { .. } | CombItem::TimingCheck { .. } => true,
             // Serial-only in v1: fall back to the full-simulator path.
             CombItem::GateRegion { .. }
             | CombItem::VectorGate { .. }
@@ -16339,8 +16364,9 @@ impl Simulator {
     ) -> bool {
         match item {
             CombItem::Noop => true,
-            // §29 UDPs never run on this isolated path (serial forced).
-            CombItem::Udp { .. } | CombItem::UdpBatch { .. } => true,
+            // §29 UDPs and timing checks never run on this isolated path
+            // (serial forced).
+            CombItem::Udp { .. } | CombItem::UdpBatch { .. } | CombItem::TimingCheck { .. } => true,
             CombItem::GateRegion { .. }
             | CombItem::VectorGate { .. }
             | CombItem::ScatterGate { .. } => false,
@@ -17364,7 +17390,9 @@ impl Simulator {
                 CombItem::Noop => SendCombItem::Noop,
                 // §29 UDPs disable parallel settle (has_udp forces serial), so a
                 // UDP never reaches a worker; represent it inertly here.
-                CombItem::Udp { .. } | CombItem::UdpBatch { .. } => SendCombItem::Noop,
+                CombItem::Udp { .. } | CombItem::UdpBatch { .. } | CombItem::TimingCheck { .. } => {
+                    SendCombItem::Noop
+                }
                 // Not par-safe (see extract ctx safety list); never partitioned.
                 CombItem::GateRegion { .. }
                 | CombItem::VectorGate { .. }
@@ -20748,7 +20776,10 @@ impl Simulator {
             // fanout buffers, gate regions, compiled cell bodies); stateful
             // UDPs and no-ops cannot.
             let inputs: Vec<usize> = match &ent.item {
-                CombItem::Udp { .. } | CombItem::UdpBatch { .. } | CombItem::Noop => return None,
+                CombItem::Udp { .. }
+                | CombItem::UdpBatch { .. }
+                | CombItem::TimingCheck { .. }
+                | CombItem::Noop => return None,
                 _ => ent.cold.read_signal_ids.clone(),
             };
             // A non-clock output (an ICG enable latch reads the clock too)
@@ -31881,6 +31912,7 @@ impl Simulator {
     fn prepared_comb_cache_eligible(&self) -> bool {
         self.prepared_comb_cache_path.is_some()
             && self.module.udp_instances.is_empty()
+            && self.module.timing_checks.is_empty()
             && self.sdf_delays.is_empty()
             // Region fusion (XEZIM_REGIONS) rewrites the entry list; a cache
             // written under one setting must not be replayed under the other.
@@ -33318,13 +33350,18 @@ impl Simulator {
         // Add UDPs before ordering so library-cell chains participate in the
         // same writer-before-reader schedule as continuous assignments.
         self.build_udp_entries(&mut entries);
+        self.build_timing_check_entries(&mut entries);
         // Stateful and generic UDP runtimes have observable initialization and
         // event ordering. Keep their established post-combinational position;
         // only proven-pure fused gates participate in the topological pass.
+        // Timing checks ride along, so a `&&&` condition reads settled logic.
         let mut deferred_udp_entries = Vec::new();
         let mut orderable_entries = Vec::with_capacity(entries.len());
         for entry in entries.drain(..) {
-            if matches!(entry.item, CombItem::Udp { .. } | CombItem::UdpBatch { .. }) {
+            if matches!(
+                entry.item,
+                CombItem::Udp { .. } | CombItem::UdpBatch { .. } | CombItem::TimingCheck { .. }
+            ) {
                 deferred_udp_entries.push(entry);
             } else {
                 orderable_entries.push(entry);
@@ -41243,6 +41280,7 @@ impl Simulator {
         if self.fire_due_after_delay_cbs() {
             self.dirty_any = true;
         }
+        self.fire_timing_timers();
         // LRM §16.5.1: capture Preponed (slot-entry) samples of every
         // SVA-referenced signal BEFORE the active/NBA regions run, so a
         // clocked assertion firing later this slot (tick_sva_sites) samples
@@ -42006,7 +42044,7 @@ impl Simulator {
                 next_clk_time,
                 next_delayed,
                 next_nba_time,
-                self.next_vpi_cb_time(),
+                self.next_timer_time(),
             ]
             .into_iter()
             .flatten()
@@ -43580,6 +43618,7 @@ impl Simulator {
                         let id = self.udp_runtime[idx].out_ref.sig_id as usize;
                         self.name_for_id(id)
                     }
+                    CombItem::TimingCheck { .. } => "",
                     CombItem::DirectCopy { dst_id, .. }
                     | CombItem::FastDirectCopy { dst_id, .. } => self.name_for_id(*dst_id),
                     CombItem::FastDirectFanout { dst_ids, .. } => {
@@ -44075,7 +44114,7 @@ impl Simulator {
                 .map(|c| c.next_toggle_time)
                 .min();
             let next_dly = self.next_delayed_time();
-            let next_vpi = self.next_vpi_cb_time();
+            let next_vpi = self.next_timer_time();
             let nt_opt = [next_eq, next_clk, next_dly, next_vpi]
                 .into_iter()
                 .flatten()
@@ -44149,6 +44188,7 @@ impl Simulator {
             // After advancing time and any clock/delay fires, check for
             // edge triggers so always_ff blocks fire within this delay
             // window, then re-snapshot for the next iter.
+            self.fire_timing_timers();
             let vpi_fired = self.fire_due_after_delay_cbs();
             if vpi_fired {
                 self.dirty_any = true;
@@ -44416,6 +44456,7 @@ impl Simulator {
         self.in_edge_block = saved_in_edge_block;
         if self.proc_depth == 0 {
             self.drain_deferred_comb();
+            self.drain_timing_pending();
         }
 
         let mine = std::mem::replace(&mut self.m_scope_stack, outer_m_scope);
@@ -49779,6 +49820,15 @@ impl Simulator {
         self.dpi_after_delay_cbs.iter().map(|(_, t)| *t).min()
     }
 
+    /// Next scheduler-visible timer: a `cbAfterDelay` or a time-based
+    /// timing-check deadline.
+    fn next_timer_time(&self) -> Option<u64> {
+        match (self.next_vpi_cb_time(), self.next_timing_timer()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Fire every `cbAfterDelay` now due. One-shot per §38.36 — each is removed
     /// before its routine runs, so a callback that re-registers (which cocotb
     /// does on every `Timer`) queues a fresh entry instead of re-firing this one.
@@ -53482,7 +53532,11 @@ impl Simulator {
     }
 
     fn settle_dispatch(&mut self) {
-        if self.has_udp || self.proc_settle_defer || !self.deferred_proc_entries.is_empty() {
+        if self.has_udp
+            || self.has_timing_checks
+            || self.proc_settle_defer
+            || !self.deferred_proc_entries.is_empty()
+        {
             self.settle_combinatorial_inner();
         } else if self.perlp_settle.is_some() {
             if self.perlp_shadow {
@@ -54365,6 +54419,10 @@ impl Simulator {
             }
             CombItem::UdpBatch { event_ref, indices } => {
                 self.eval_udp_batch(*event_ref, indices);
+            }
+            CombItem::TimingCheck { idx } => {
+                let idx = *idx;
+                self.eval_timing_check(idx);
             }
             // Copies are always handled by the isolated path; reaching here for
             // them would be a logic error, but eval them correctly regardless.
@@ -55999,6 +56057,11 @@ impl Simulator {
                         CombItem::UdpBatch { event_ref, indices } => {
                             self.eval_udp_batch(*event_ref, indices);
                             n_dc += indices.len() as u64;
+                        }
+                        CombItem::TimingCheck { idx } => {
+                            let idx = *idx;
+                            self.eval_timing_check(idx);
+                            n_dc += 1;
                         }
                     }
                 }
@@ -82608,6 +82671,7 @@ impl Simulator {
                     | CombItem::VectorGate { .. }
                     | CombItem::ScatterGate { .. } => "gate primitive",
                     CombItem::Udp { .. } | CombItem::UdpBatch { .. } => "UDP",
+                    CombItem::TimingCheck { .. } => "timing check",
                     CombItem::DirectCopy { .. }
                     | CombItem::FastDirectCopy { .. }
                     | CombItem::FastDirectFanout { .. } => "continuous assign (copy)",

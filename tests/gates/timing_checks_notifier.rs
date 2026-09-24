@@ -2,16 +2,13 @@
 //! that drives the flop output to x on any violation. The expected values
 //! are the reference simulator's: the first capture is clean (q=0), the
 //! setup violation at 20 ns and the hold violation at 29.6 ns each toggle
-//! the notifier, so q reads x at both later samples (the reference also
-//! prints one timing-violation error per check).
-//!
-//! Timing checks are not modelled today (`+notimingcheck` is documented as
-//! a no-op), so the notifier never toggles and q keeps its captured values.
+//! the notifier, so q reads x at both later samples, and the 1 ns high
+//! pulse at 33.6 ns violates `$width` — one error per violation, three in
+//! all, with the same event times and limits as the reference reports.
 
 use xezim::simulate;
 
 #[test]
-#[ignore = "specify timing checks ($setup/$hold/$width + notifier) are not modelled (fix pending)"]
 fn setup_hold_width_violations_toggle_the_notifier() {
     let sim = simulate(
         r#"
@@ -52,6 +49,19 @@ endmodule
         assert!(
             o.iter().any(|l| l.contains(want)),
             "missing `{want}`: {o:?}"
+        );
+    }
+    let violations: Vec<&String> = o.iter().filter(|l| l.contains(" violation in ")).collect();
+    assert_eq!(violations.len(), 3, "{violations:?}");
+    for want in [
+        "$setup( d:19500 ps, posedge clk:20 ns, 2 ns ) violation in tb.u at time 20 ns",
+        "$hold( posedge clk:29200 ps, d:29600 ps, 1 ns ) violation in tb.u at time 29600 ps",
+        "$width( posedge clk:33600 ps, negedge clk:34600 ps, 3 ns ) violation in tb.u \
+         at time 34600 ps",
+    ] {
+        assert!(
+            violations.iter().any(|l| l.contains(want)),
+            "missing `{want}`: {violations:?}"
         );
     }
 }
