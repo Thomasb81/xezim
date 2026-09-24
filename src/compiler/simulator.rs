@@ -98575,9 +98575,14 @@ impl Simulator {
                     }
                     self.set_queue_size(&d, n);
                 } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
+                    // An array of unpacked STRUCTS has no element leaf of its
+                    // own — each element copies member by member.
+                    let elem_su = self.unpacked_struct_of(&m.data_type);
                     for i in idxs {
                         let (di, si) = (format!("{}[{}]", d, i), format!("{}[{}]", sname, i));
-                        if let Some(v) = self.get_signal_value_by_name(&si) {
+                        if let Some(inner) = &elem_su {
+                            self.copy_unpacked_struct(&di, &si, inner);
+                        } else if let Some(v) = self.get_signal_value_by_name(&si) {
                             self.write_leaf_by_name(&di, v);
                         }
                     }
@@ -98829,8 +98834,16 @@ impl Simulator {
                     }
                     out.push(base);
                 } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
+                    let inner = self.unpacked_struct_of(&m.data_type);
                     for i in idxs {
-                        out.push(format!("{}[{}]", base, i));
+                        match &inner {
+                            Some(inner) => {
+                                for sfx in self.struct_leaf_suffixes(inner) {
+                                    out.push(format!("{}[{}].{}", base, i, sfx));
+                                }
+                            }
+                            None => out.push(format!("{}[{}]", base, i)),
+                        }
                     }
                 }
             }
