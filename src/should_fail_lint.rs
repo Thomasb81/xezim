@@ -96,6 +96,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
             SourceDefinition::Udp(_) => {}
         }
     }
+    check_named_block_refs(defs, &mut errs);
     errs
 }
 
@@ -1687,6 +1688,181 @@ fn check_wildcard_cmp(items: &[ModuleItem], _elab: &ElaboratedModule, errs: &mut
             }
             _ => {}
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §23.6 — a hierarchical name through a named statement block must name
+// something that block declares.
+// ---------------------------------------------------------------------------
+
+/// `U[0].V.a` where `V` is a named `begin`/`fork` block: the name after `V`
+/// is looked up in `V` itself (§23.6 downward resolution), not in the
+/// scopes around it. xezim's runtime resolver falls back outward and found
+/// the generate block's `a`; the reference rejects the reference ("Failed to
+/// find 'a' in hierarchical name"), as does ivtest pr1988302b.
+///
+/// Conservative: a label is only checked when it names nothing BUT statement
+/// blocks design-wide (no instance, generate block, subroutine, variable or
+/// net shares it), and a block's members are over-approximated as every
+/// variable and nested block label anywhere in its body.
+fn check_named_block_refs(defs: &[&SourceDefinition], errs: &mut Vec<String>) {
+    let mut blocks: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut other: HashSet<String> = HashSet::new();
+
+    fn block_members(stmts: &[Statement], out: &mut HashSet<String>) {
+        for st in stmts {
+            for_each_stmt(st, &mut |s| match &s.kind {
+                StatementKind::VarDecl { declarators, .. } => {
+                    out.extend(declarators.iter().map(|d| d.name.name.clone()));
+                }
+                StatementKind::SeqBlock { name: Some(n), .. }
+                | StatementKind::ParBlock { name: Some(n), .. } => {
+                    out.insert(n.name.clone());
+                }
+                _ => {}
+            });
+        }
+    }
+    fn note_stmt(st: &Statement, blocks: &mut HashMap<String, HashSet<String>>) {
+        for_each_stmt(st, &mut |s| {
+            if let StatementKind::SeqBlock {
+                name: Some(n),
+                stmts,
+            }
+            | StatementKind::ParBlock {
+                name: Some(n),
+                stmts,
+                ..
+            } = &s.kind
+            {
+                block_members(stmts, blocks.entry(n.name.clone()).or_default());
+            }
+        });
+    }
+    fn walk_items<'a>(
+        items: &'a [ModuleItem],
+        stmts: &mut Vec<&'a Statement>,
+        exprs: &mut Vec<&'a Expression>,
+        other: &mut HashSet<String>,
+    ) {
+        for it in items {
+            match it {
+                ModuleItem::InitialConstruct(i) => stmts.push(&i.stmt),
+                ModuleItem::AlwaysConstruct(a) => stmts.push(&a.stmt),
+                ModuleItem::FinalConstruct(f) => stmts.push(&f.stmt),
+                ModuleItem::TaskDeclaration(t) => {
+                    other.insert(t.name.name.name.clone());
+                    stmts.extend(t.items.iter());
+                }
+                ModuleItem::FunctionDeclaration(f) => {
+                    other.insert(f.name.name.name.clone());
+                    stmts.extend(f.items.iter());
+                }
+                ModuleItem::ContinuousAssign(ca) => {
+                    for (l, r) in &ca.assignments {
+                        exprs.push(l);
+                        exprs.push(r);
+                    }
+                }
+                ModuleItem::ModuleInstantiation(mi) => {
+                    other.extend(mi.instances.iter().map(|h| h.name.name.clone()));
+                }
+                ModuleItem::DataDeclaration(d) => {
+                    other.extend(d.declarators.iter().map(|x| x.name.name.clone()));
+                }
+                ModuleItem::NetDeclaration(d) => {
+                    other.extend(d.declarators.iter().map(|x| x.name.name.clone()));
+                }
+                ModuleItem::GenerateRegion(g) => walk_items(&g.items, stmts, exprs, other),
+                ModuleItem::GenerateIf(g) => {
+                    other.extend(g.branch_labels.iter().flatten().cloned());
+                    for (_, b) in &g.branches {
+                        walk_items(b, stmts, exprs, other);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => {
+                    other.extend(g.name.iter().cloned());
+                    walk_items(&g.items, stmts, exprs, other);
+                }
+                ModuleItem::GenerateCase(g) => {
+                    for arm in &g.arms {
+                        other.extend(arm.label.iter().cloned());
+                        walk_items(&arm.items, stmts, exprs, other);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut stmts: Vec<&Statement> = Vec::new();
+    let mut exprs: Vec<&Expression> = Vec::new();
+    for def in defs {
+        let items = match def {
+            SourceDefinition::Module(m) => &m.items,
+            SourceDefinition::Interface(m) => &m.items,
+            SourceDefinition::Program(m) => &m.items,
+            _ => continue,
+        };
+        walk_items(items, &mut stmts, &mut exprs, &mut other);
+    }
+    for st in &stmts {
+        note_stmt(st, &mut blocks);
+    }
+    blocks.retain(|label, _| !other.contains(label));
+    if blocks.is_empty() {
+        return;
+    }
+    // `U[0].V.a` parses as nested member accesses over an index; flatten the
+    // scope segments (selects do not add one).
+    fn segments(e: &Expression, out: &mut Vec<String>) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                out.extend(h.path.iter().map(|s| s.name.name.clone()));
+                true
+            }
+            ExprKind::Index { expr, .. } => segments(expr, out),
+            ExprKind::MemberAccess { expr, member } => {
+                segments(expr, out) && {
+                    out.push(member.name.clone());
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+    let check = |e: &Expression, errs: &mut Vec<String>| {
+        if !matches!(e.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. }) {
+            return;
+        }
+        let mut segs = Vec::new();
+        if !segments(e, &mut segs) {
+            return;
+        }
+        for w in segs.windows(2) {
+            let Some(members) = blocks.get(&w[0]) else {
+                continue;
+            };
+            if !members.contains(&w[1]) {
+                let msg = format!(
+                    "'{}' is not declared in block '{}' (hierarchical name '{}', IEEE \
+                     1800-2017 §23.6)",
+                    w[1],
+                    w[0],
+                    segs.join(".")
+                );
+                if !errs.contains(&msg) {
+                    errs.push(msg);
+                }
+                return;
+            }
+        }
+    };
+    for st in &stmts {
+        for_each_stmt_expr(st, &mut |e| for_each_expr(e, &mut |x| check(x, errs)));
+    }
+    for e in &exprs {
+        for_each_expr(e, &mut |x| check(x, errs));
     }
 }
 

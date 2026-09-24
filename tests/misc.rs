@@ -129,6 +129,8 @@ mod method_call_chaining;
 mod monitor_on_change;
 #[path = "misc/monitor_percent_m_scope.rs"]
 mod monitor_percent_m_scope;
+#[path = "misc/named_block_hierarchical_name.rs"]
+mod named_block_hierarchical_name;
 #[path = "misc/nba_array_read_x_index.rs"]
 mod nba_array_read_x_index;
 #[path = "misc/negative_lsb_range_select.rs"]
