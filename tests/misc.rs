@@ -137,6 +137,8 @@ mod named_block_hierarchical_name;
 mod nba_array_read_x_index;
 #[path = "misc/negative_lsb_range_select.rs"]
 mod negative_lsb_range_select;
+#[path = "misc/net_class_data_type.rs"]
+mod net_class_data_type;
 #[path = "misc/nonansi_function_args.rs"]
 mod nonansi_function_args;
 #[path = "misc/nonzero_lsb_indexed_part_select.rs"]
