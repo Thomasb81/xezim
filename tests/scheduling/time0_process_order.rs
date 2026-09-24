@@ -380,3 +380,34 @@ endmodule
         ]
     );
 }
+
+/// Several binds into one host run after the host's own blocks, in REVERSE
+/// bind order — whether the binds sit at compilation-unit scope or inside a
+/// module.
+#[test]
+fn bound_instances_run_in_reverse_bind_order() {
+    let src = r#"
+module mon; initial $display("mon"); endmodule
+module chkA; initial $display("A"); endmodule
+module chkB; initial $display("B"); endmodule
+module chkC; initial $display("C"); endmodule
+module top; mon m(); initial $display("top"); endmodule
+bind mon chkA z1();
+bind mon chkB a2();
+bind mon chkC m3();
+"#;
+    assert_eq!(lines(src), ["mon", "C", "B", "A", "top"]);
+    let src = r#"
+module mon; initial $display("mon"); endmodule
+module chkA; initial $display("A"); endmodule
+module chkB; initial $display("B"); endmodule
+module agent;
+  mon u_mon();
+  bind mon chkA z1();
+  initial $display("agent");
+  bind mon chkB a2();
+endmodule
+module top; agent ag(); initial $display("top"); endmodule
+"#;
+    assert_eq!(lines(src), ["mon", "B", "A", "agent", "top"]);
+}
