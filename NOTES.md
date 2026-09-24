@@ -9,6 +9,16 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* `randomize()` solves constraint sets that tie many variables together:
+  an array `sum()` (including `with (... item.index ...)`), `unique`,
+  orderings between elements or arrays, and `->`/`if` around them. When
+  the per-variable solver fails, a bounded joint search takes over.
+  Infeasible sets of this kind return 0 promptly and leave the random
+  variables, array elements included, unchanged. Sums such as
+  `a + b + c == K` compare at the full context width instead of wrapping
+  at the operand width. A random size variable tied to `arr.size()` is no
+  longer pinned to the previous size, and `item.index` reads the element
+  index inside reduction `with` clauses.
 * String methods on a subroutine formal or local (`name.len()`,
   `name.getc(i)`, `name.substr(i, j)`) read that variable, not a same-named
   signal of some design instance (an interface's `string name`). UVM's
