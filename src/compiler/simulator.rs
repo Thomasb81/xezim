@@ -56536,7 +56536,17 @@ impl Simulator {
                 )
             }
             ExprKind::Index { expr, index } => {
-                let base = self.flat_member_name(expr)?;
+                let base = match &expr.kind {
+                    // `this.q[i]`: name the receiver like `obj.q[i]`; the
+                    // storage resolvers map `this.q` through the handle.
+                    ExprKind::MemberAccess { expr: recv, member }
+                        if matches!(recv.kind, ExprKind::This)
+                            && self.this_stack.last().copied().flatten().is_some() =>
+                    {
+                        format!("this.{}", member.name)
+                    }
+                    _ => self.flat_member_name(expr)?,
+                };
                 let iv = self.eval_expr(index);
                 // §7.8: an ASSOC element key must use the canonical store
                 // format — a STRING key rendered via to_i64 collapsed to its
