@@ -88453,6 +88453,20 @@ if self.profile_report {
         self.set_signal_value_by_name(name, v);
     }
 
+    /// A bare identifier bound in the current subroutine frame (a formal or
+    /// a local). Such a name must not go through `resolve_hier_name`, which
+    /// resolves DESIGN signals and can rewrite `name` into a same-named
+    /// signal of some instance (`u_bfm.name`) — a class method's formal
+    /// `name` then read an interface's string (§6.21 / §13.3: a
+    /// subroutine's own names shadow everything outside it).
+    fn frame_bound_bare_name<'h>(&self, hier: &'h HierarchicalIdentifier) -> Option<&'h str> {
+        if hier.path.len() != 1 || !hier.path[0].selects.is_empty() || hier.root.is_some() {
+            return None;
+        }
+        let n = hier.path[0].name.name.as_str();
+        self.local_stack.last().is_some_and(|l| l.contains_key(n)).then_some(n)
+    }
+
     fn get_local_or_signal(&self, name: &str) -> Option<Value> {
         if let Some(m) = self.local_stack.last() {
             if let Some(v) = m.get(name) {
@@ -105368,7 +105382,10 @@ if self.profile_report {
 
             // Check for built-in methods on identifiers
             if let ExprKind::Ident(hier) = &expr.kind {
-                let mut name = self.resolve_hier_name(hier);
+                let mut name = match self.frame_bound_bare_name(hier) {
+                    Some(n) => std::borrow::Cow::Borrowed(n),
+                    None => self.resolve_hier_name(hier),
+                };
                 if let Some(scoped) = self.instance_assoc_member(&name) {
                     name = std::borrow::Cow::Owned(scoped);
                 }
@@ -105690,11 +105707,15 @@ if self.profile_report {
             // held a string of the right LENGTH but no CONTENT. These methods
             // are read-only, so evaluating the receiver here is safe (`putc`
             // mutates and is deliberately excluded — it needs an lvalue).
+            // A plain identifier receiver takes this path only when it is a
+            // string (`compare` is also `uvm_object::compare`): resolving it
+            // by NAME can find a same-named signal of a design instance
+            // instead of a subroutine formal (see the flattened-call arm).
             if matches!(
                 mname,
                 "substr" | "getc" | "toupper" | "tolower" | "atoi" | "atohex"
                     | "atooct" | "atobin" | "atoreal" | "compare" | "icompare"
-            ) && !matches!(expr.kind, ExprKind::Ident(_))
+            ) && (!matches!(expr.kind, ExprKind::Ident(_)) || self.expr_is_string_valued(expr))
             {
                 let text = self.eval_expr(expr).to_sv_string();
                 match mname {
@@ -106096,6 +106117,13 @@ if self.profile_report {
             {
                 let m = path[len - 1].name.name.clone();
                 let base_expr = self.method_receiver_expr(hier, len - 1);
+                // §6.16 `len`/`getc`/`substr` on a STRING receiver belong to
+                // the string arm below, which reads the receiver's value.
+                // Resolving it here by name found a same-named signal of a
+                // design instance instead of a subroutine formal.
+                let string_method_on_string = matches!(m.as_str(), "len" | "getc" | "substr")
+                    && self.expr_is_string_valued(&base_expr);
+                if !string_method_on_string {
                 if let Some(an) = self.expr_assoc_name(&base_expr) {
                     if let Some(res) = self.eval_builtin_method(&an, &m, args) {
                         return res;
@@ -106116,6 +106144,7 @@ if self.profile_report {
                             return res;
                         }
                     }
+                }
                 }
             }
 
@@ -106161,6 +106190,35 @@ if self.profile_report {
                         .and_then(|o| o.as_ref())
                         .is_some_and(|i| self.class_has_method(&i.class_name, &m));
                 if !is_user_method {
+                    // §6.16: `len`/`getc`/`substr` are string-only methods;
+                    // the receiver's value is already in hand. Re-resolving
+                    // it by NAME found a same-named signal of a design
+                    // instance (an interface's `string name`) instead of a
+                    // class method's formal `name`, so UVM's resource-name
+                    // check read the wrong string.
+                    if matches!(m.as_str(), "len" | "getc" | "substr") && !recv.has_xz() {
+                        let bytes = recv.sv_string_bytes();
+                        let arg = |this: &mut Self, k: usize| -> Option<i64> {
+                            args.get(k).map(|a| this.eval_expr(a).to_i64().unwrap_or(-1))
+                        };
+                        match m.as_str() {
+                            "len" => return Value::from_u64(bytes.len() as u64, 32),
+                            "getc" => {
+                                let i = arg(self, 0).unwrap_or(-1);
+                                let b = if i >= 0 { bytes.get(i as usize).copied().unwrap_or(0) } else { 0 };
+                                return Value::from_u64(b as u64, 8);
+                            }
+                            _ => {
+                                let (i, j) = (arg(self, 0).unwrap_or(-1), arg(self, 1).unwrap_or(-1));
+                                let out = if i < 0 || j < i || j as usize >= bytes.len() {
+                                    String::new()
+                                } else {
+                                    String::from_utf8_lossy(&bytes[i as usize..=j as usize]).into_owned()
+                                };
+                                return Value::from_string(&out);
+                            }
+                        }
+                    }
                     if matches!(m.as_str(), "len" | "size" | "getc" | "substr") {
                         if let ExprKind::Ident(bh) = &base_expr.kind {
                             let bn = self.resolve_hier_name(bh);

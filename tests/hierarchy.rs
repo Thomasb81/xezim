@@ -171,3 +171,5 @@ mod instance_collections_resolve_by_scope;
 mod vif_packed_array_elem_nba;
 #[path = "hierarchy/interface_task_lexical_scope.rs"]
 mod interface_task_lexical_scope;
+#[path = "hierarchy/formal_shadows_instance_signal.rs"]
+mod formal_shadows_instance_signal;

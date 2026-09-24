@@ -9,6 +9,11 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* String methods on a subroutine formal or local (`name.len()`,
+  `name.getc(i)`, `name.substr(i, j)`) read that variable, not a same-named
+  signal of some design instance (an interface's `string name`). UVM's
+  resource-name check read the wrong string, so its `UVM/RSRC/NOREGEX`
+  warning never fired on testbenches with such interfaces.
 * A module or interface task reached through a virtual interface or a
   hierarchical path resolves names in its own scope. Called from a class
   method, an unqualified call in its body used to bind to the calling
