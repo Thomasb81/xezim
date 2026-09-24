@@ -56922,6 +56922,49 @@ impl Simulator {
             .count() as u64;
     }
 
+    /// §10.6.2 `release` / §10.6.1 `deassign` of `target` (the name and table
+    /// slot `force_target` resolved, if any).
+    fn release_override(&mut self, target: Option<(&str, Option<usize>)>) {
+        if let Some((name, id)) = target {
+            self.forced_names.remove(name);
+            self.active_force_exprs.retain(|entry| entry.key != name);
+            if let Some(id) = id {
+                self.forced_signals.remove(&id);
+                // Re-evaluate continuous drivers (nets). For a variable no
+                // comb entry writes it, so the scan finds nothing and the
+                // value is retained.
+                self.redrive_released_signal(id);
+                // The net takes its drivers' value at once: the reference
+                // reads the driven value in the statement after `release`.
+                if !self.settling && !self.in_edge_block {
+                    let drivers: Vec<CombEntry> = self
+                        .comb_entries
+                        .iter()
+                        .filter(|e| e.cold.write_signal_ids.contains(&id))
+                        .cloned()
+                        .collect();
+                    for entry in &drivers {
+                        self.eval_comb_entry_full(entry);
+                    }
+                }
+            }
+        }
+        // A released signal that is a gateable flop's output (`q` in
+        // `always @(posedge clk) q<=d`) may no longer equal its data input —
+        // the force broke the "Q provably unchanged" invariant the EVENT_EDGE
+        // skip relies on. Invalidate every flop snapshot so the next edge
+        // actually re-fires and re-drives the released output, instead of
+        // being skipped for "no data change" and leaving Q stuck at the forced
+        // value. Release is rare, so a one-shot re-fire of all flops is cheap.
+        self.edge_block_snap_valid
+            .iter_mut()
+            .for_each(|v| *v = false);
+        self.edge_block_armed
+            .iter_mut()
+            .for_each(|v| *v |= EDGE_ARMED);
+        self.dirty_any = true;
+    }
+
     fn force_target(&mut self, lv: &Expression) -> Option<(String, Option<usize>)> {
         if let ExprKind::Ident(hier) = &lv.kind {
             if hier.path.iter().all(|s| s.selects.is_empty()) {
@@ -75935,32 +75978,8 @@ impl Simulator {
                     // mark the source signals of every comb entry driving it
                     // dirty so the next settle re-evaluates the drivers.
                     // §10.6.1 `deassign` likewise retains the last value.
-                    if let Some((name, id)) = self.force_target(lvalue) {
-                        self.forced_names.remove(&name);
-                        self.active_force_exprs.retain(|entry| entry.key != name);
-                        if let Some(id) = id {
-                            self.forced_signals.remove(&id);
-                            // Re-evaluate continuous drivers (nets). For a
-                            // variable no comb entry writes it, so the scan
-                            // finds nothing and the value is retained.
-                            self.redrive_released_signal(id);
-                        }
-                    }
-                    // A released signal that is a gateable flop's output (`q` in
-                    // `always @(posedge clk) q<=d`) may no longer equal its data
-                    // input — the force broke the "Q provably unchanged" invariant
-                    // the EVENT_EDGE skip relies on. Invalidate every flop
-                    // snapshot so the next edge actually re-fires and re-drives the
-                    // released output, instead of being skipped for "no data
-                    // change" and leaving Q stuck at the forced value. Release is
-                    // rare, so a one-shot re-fire of all flops is cheap.
-                    self.edge_block_snap_valid
-                        .iter_mut()
-                        .for_each(|v| *v = false);
-                    self.edge_block_armed
-                        .iter_mut()
-                        .for_each(|v| *v |= EDGE_ARMED);
-                    self.dirty_any = true;
+                    let target = self.force_target(lvalue);
+                    self.release_override(target.as_ref().map(|(n, id)| (n.as_str(), *id)));
                 }
             },
             StatementKind::RandCase { items } => {
