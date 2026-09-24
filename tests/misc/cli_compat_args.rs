@@ -387,6 +387,62 @@ fn g_overrides_parameter_defaults() {
     assert!(err.contains("'NOPE'; ignored"), "{}", err);
 }
 
+const LOCALS: &str = "\
+module tb #(parameter int TOPP = 1) ();
+  parameter int BODYP = 2;
+  if (1) begin : g
+    parameter int GP = 3;
+    initial $display(\"GP=%0d\", GP);
+  end
+  for (genvar i = 0; i < 2; i++) begin : fl
+    parameter int FP = 10;
+    initial $display(\"FP=%0d\", FP);
+  end
+  bare u();
+  initial $display(\"TOPP=%0d BODYP=%0d\", TOPP, BODYP);
+endmodule
+module bare;
+  parameter int NP = 1;
+  initial $display(\"NP=%0d\", NP);
+endmodule
+";
+
+/// §6.20.1: a `parameter` inside a generate block, or in the body of a module
+/// that has a parameter port list, is local. Neither `-g` nor `-G` reaches it:
+/// the reference simulator warns that it is not found and runs on the
+/// declared value. A body `parameter` of a module without a port list is
+/// overridable.
+#[test]
+fn g_leaves_local_parameters_alone() {
+    let d = scratch("glocal");
+    std::fs::write(d.join("t.sv"), LOCALS).unwrap();
+    let plain = ok_stdout(&d, &["t.sv"]);
+    assert!(
+        plain.contains("GP=3") && plain.contains("FP=10") && plain.contains("BODYP=2"),
+        "{}",
+        plain
+    );
+    for (flag, name) in [
+        ("-gGP=5", "GP"),
+        ("-GGP=5", "GP"),
+        ("-gFP=11", "FP"),
+        ("-gBODYP=12", "BODYP"),
+        ("-GBODYP=12", "BODYP"),
+    ] {
+        let (code, out, err) = run_in(&d, &["t.sv", flag]);
+        assert_eq!(code, 0, "{}", err);
+        assert_eq!(out, plain, "{}", flag);
+        assert!(
+            err.contains(&format!("'{}'; ignored", name)),
+            "{}: {}",
+            flag,
+            err
+        );
+    }
+    let out = ok_stdout(&d, &["t.sv", "-gNP=7"]);
+    assert!(out.contains("NP=7") && out.contains("TOPP=1"), "{}", out);
+}
+
 const RANDOM: &str = "\
 module tb;
   int unsigned r;
