@@ -1960,12 +1960,9 @@ struct ClockGen {
     /// the toggle, later ones after it. `None` until the time-0 drain
     /// reaches the generator's source position (`t0_rank`).
     ahead: Option<u32>,
-    /// `next_pid` when an `initial` generator was extracted: the time-0
-    /// processes that precede it in source order have lower pids.
-    /// An `always` generator is extracted before any initial block has a
-    /// pid: it takes the pid of the first initial block that follows it in
-    /// the same instance, and `usize::MAX` (none follows) settles at the end
-    /// of the first time-0 drain.
+    /// The generator's slot in the time-0 activation order: the number of
+    /// time-0 processes that run before it (see `order_time0_processes`).
+    /// `usize::MAX` until that order is known.
     t0_rank: usize,
 }
 
@@ -2213,6 +2210,19 @@ impl TimingWheel {
             front_pending: 0,
             last_pop_front: false,
         }
+    }
+
+    /// Pids queued in the wheel slot of `time`, in queue order.
+    fn slot_pids(&self, time: u64) -> Vec<usize> {
+        self.wheel[Self::slot(time)].iter().map(|e| e.0).collect()
+    }
+
+    /// Stable-sort the wheel slot of `time` by a per-pid rank (pids without
+    /// one keep their place ahead of the ranked ones).
+    fn reorder_slot(&mut self, time: u64, rank: &HashMap<usize, usize>) {
+        self.wheel[Self::slot(time)]
+            .make_contiguous()
+            .sort_by_key(|e| rank.get(&e.0).map_or(0, |r| r + 1));
     }
 
     /// Number of events queued for exactly `time`.
@@ -5563,10 +5573,15 @@ pub struct Simulator {
     vm_regs: Vec<Value>,
     /// Built-in clock generators (optimized always #N clk = ~clk)
     clock_generators: Vec<ClockGen>,
-    /// `always` generators still waiting for their time-0 source rank:
+    /// Source position of every clock generator, for its time-0 rank:
     /// `(index into clock_generators, instance scope, source offset)`.
-    /// Consumed while the initial blocks are given pids.
-    always_clock_src: Vec<(usize, String, usize)>,
+    clock_gen_src: Vec<(usize, String, usize)>,
+    /// Pids of `initial` blocks that cannot suspend (no timing control,
+    /// no blocking call); see `order_time0_processes`.
+    t0_timing_free: HashSet<usize>,
+    /// Time-0 activation index of each process queued at time 0, consulted
+    /// by `clock_rank_on_pop` until the first drain settles the generators.
+    t0_pid_ord: HashMap<usize, usize>,
     /// Dynamic-delay simple assignments, keyed by their scheduled process id.
     fast_delay_always: HashMap<usize, FastDelayAlways>,
     /// Compiled process FSMs by pid (roadmap 11-12, opt-in XEZIM_PROC_FSM=1).
@@ -9640,7 +9655,9 @@ impl Simulator {
             edge_block_insn_len: Vec::new(),
             vm_regs: Vec::new(),
             clock_generators: Vec::new(),
-            always_clock_src: Vec::new(),
+            clock_gen_src: Vec::new(),
+            t0_timing_free: HashSet::default(),
+            t0_pid_ord: HashMap::default(),
             fast_delay_always: HashMap::default(),
             proc_fsm: HashMap::default(),
             fsm_start_pc: 0,
@@ -15295,24 +15312,9 @@ impl Simulator {
             // under a sibling's scope stays wrong for the whole run: `user`'s
             // enum member `C` permanently read `shadower`'s local `int C`.
             *self.name_resolve_hint.borrow_mut() = (!scope.is_empty()).then(|| scope.clone());
-            // §4.4.2: an `always` generator ahead of this block in the same
-            // instance ran first at time 0, so its first toggle was queued
-            // before anything this block schedules — its FIFO rank settles
-            // when the time-0 drain reaches this block's pid.
-            if !self.always_clock_src.is_empty() {
-                let next = self.next_pid;
-                let gens = &mut self.clock_generators;
-                self.always_clock_src.retain(|(gi, sc, at)| {
-                    let before = *sc == scope && *at < span.start;
-                    if before {
-                        if let Some(cg) = gens.get_mut(*gi) {
-                            cg.t0_rank = next;
-                        }
-                    }
-                    !before
-                });
-            }
             if let Some(cg) = self.try_extract_initial_clock_gen(&stmts) {
+                self.clock_gen_src
+                    .push((self.clock_generators.len(), scope.clone(), span.start));
                 self.clock_generators.push(cg);
                 continue;
             }
@@ -15360,6 +15362,9 @@ impl Simulator {
             }
             let pid = self.next_pid;
             self.next_pid += 1;
+            if !stmts.iter().any(|st| self.stmt_is_blocking(st)) {
+                self.t0_timing_free.insert(pid);
+            }
             if !scope.is_empty() {
                 self.process_scope_hint.insert(pid, scope);
             }
@@ -15372,6 +15377,7 @@ impl Simulator {
             }
             self.event_queue.schedule(0, pid, stmts.into());
         }
+        self.order_time0_processes();
         // LRM §24: `program` initial blocks execute in the reactive region.
         // Stash each program-initial's statements into `pending_reactive` so
         // `drain_reactive_region` picks them up at the first time-0 reactive
@@ -18644,7 +18650,7 @@ impl Simulator {
             next_toggle_time: half_period,
             edge_signal_position: usize::MAX,
             ahead: None,
-            t0_rank: self.next_pid,
+            t0_rank: usize::MAX,
         })
     }
 
@@ -18845,6 +18851,130 @@ impl Simulator {
         held
     }
 
+    /// Time-0 activation order of the processes queued at time 0 (§4.4.2
+    /// leaves it unspecified; this is the reference simulator's). Each root
+    /// runs as one block, roots in elaboration order. Within a root the
+    /// processes follow the depth-first source order of the instance tree —
+    /// a child instance's processes at its instantiation, a bound instance's
+    /// after all of its host's own items — except that the `initial` blocks
+    /// that cannot suspend all run as one group, at the position of the
+    /// first of them. Static initializers keep running first. Clock
+    /// generators take their slot in the same order (`ClockGen::t0_rank`).
+    fn order_time0_processes(&mut self) {
+        let pids = self.event_queue.slot_pids(0);
+        let (rank, gen_ranks) = {
+            // instance path -> (parent path, position in the parent, index)
+            let mut inst: HashMap<&str, (&str, usize, usize)> = HashMap::default();
+            for (i, e) in self.module.instances.iter().enumerate() {
+                inst.insert(e.path.as_str(), (e.parent.as_str(), e.src_pos, i));
+            }
+            // Several tops elaborate under a synthetic wrapper whose
+            // children are the roots.
+            let multi_top = matches!(
+                self.module.name.as_str(),
+                "__xezim_multi_top" | "__xz_multitop__"
+            );
+            // The innermost instance enclosing a scope (generate scopes are
+            // part of their instance's source).
+            fn nearest<'a>(
+                inst: &HashMap<&str, (&str, usize, usize)>,
+                mut s: &'a str,
+            ) -> Option<&'a str> {
+                loop {
+                    if s.is_empty() {
+                        return None;
+                    }
+                    if inst.contains_key(s) {
+                        return Some(s);
+                    }
+                    s = s.rfind('.').map_or("", |i| &s[..i]);
+                }
+            }
+            // (root, source positions from the root down to the process)
+            let position = |scope: &str, span: usize| -> (usize, Vec<usize>) {
+                let mut chain = vec![span];
+                let mut root = 0;
+                let mut cur = nearest(&inst, scope);
+                while let Some(p) = cur {
+                    let (parent, src_pos, idx) = inst[p];
+                    if multi_top && parent.is_empty() {
+                        root = idx + 1;
+                        break;
+                    }
+                    chain.push(src_pos);
+                    cur = nearest(&inst, parent);
+                }
+                chain.reverse();
+                (root, chain)
+            };
+            let mut placed: Vec<(usize, Option<(usize, Vec<usize>, bool)>)> =
+                Vec::with_capacity(pids.len());
+            let mut anchor: HashMap<usize, Vec<usize>> = HashMap::default();
+            for &pid in &pids {
+                let info = match self.process_origin.get(&pid) {
+                    Some((span, kind @ ("initial block" | "always block"))) => {
+                        let scope = self.process_scope_hint.get(&pid).map_or("", String::as_str);
+                        let (root, pos) = position(scope, span.start);
+                        let grouped =
+                            *kind == "initial block" && self.t0_timing_free.contains(&pid);
+                        if grouped {
+                            let a = anchor.entry(root).or_insert_with(|| pos.clone());
+                            if pos < *a {
+                                *a = pos.clone();
+                            }
+                        }
+                        Some((root, pos, grouped))
+                    }
+                    _ => None,
+                };
+                placed.push((pid, info));
+            }
+            type Key = (u8, usize, Vec<usize>, Vec<usize>, usize);
+            let key_of = |i: usize, info: &Option<(usize, Vec<usize>, bool)>| -> Key {
+                match info {
+                    None => (0, 0, Vec::new(), Vec::new(), i),
+                    Some((root, pos, grouped)) => {
+                        let at = if *grouped {
+                            anchor[root].clone()
+                        } else {
+                            pos.clone()
+                        };
+                        (1, *root, at, pos.clone(), i)
+                    }
+                }
+            };
+            let mut keyed: Vec<(Key, usize)> = placed
+                .iter()
+                .enumerate()
+                .map(|(i, (pid, info))| (key_of(i, info), *pid))
+                .collect();
+            keyed.sort();
+            let gen_ranks: Vec<(usize, usize)> = self
+                .clock_gen_src
+                .iter()
+                .map(|(gi, scope, span)| {
+                    let (root, pos) = position(scope, *span);
+                    let k: Key = (1, root, pos.clone(), pos, usize::MAX);
+                    (*gi, keyed.partition_point(|(kk, _)| *kk < k))
+                })
+                .collect();
+            let rank: HashMap<usize, usize> = keyed
+                .iter()
+                .enumerate()
+                .map(|(r, (_, pid))| (*pid, r))
+                .collect();
+            (rank, gen_ranks)
+        };
+        self.event_queue.reorder_slot(0, &rank);
+        for (gi, r) in gen_ranks {
+            if let Some(cg) = self.clock_generators.get_mut(gi) {
+                cg.t0_rank = r;
+            }
+        }
+        self.t0_pid_ord = rank;
+        self.t0_timing_free = HashSet::default();
+    }
+
     /// Account one event popped from the current slot against the FIFO rank
     /// of the generators due now, and settle the time-0 rank of `initial`
     /// generators once the drain reaches their source position. Called
@@ -18854,12 +18984,14 @@ impl Simulator {
             return;
         }
         let now = self.time;
+        // A process spawned during the drain runs after every time-0 one.
+        let ord = self.t0_pid_ord.get(&pid).copied().unwrap_or(usize::MAX - 1);
         for cg in &mut self.clock_generators {
             match cg.ahead {
                 Some(ref mut a) if cg.next_toggle_time == now => {
                     *a = a.saturating_sub(1);
                 }
-                None if pid >= cg.t0_rank => {
+                None if ord >= cg.t0_rank => {
                     cg.ahead = Some(self.event_queue.len_at(cg.next_toggle_time) as u32);
                 }
                 _ => {}
@@ -18869,6 +19001,7 @@ impl Simulator {
 
     /// Settle every rank still unknown at the end of the time-0 drain.
     fn settle_clock_ranks(&mut self) {
+        self.t0_pid_ord = HashMap::default();
         for cg in &mut self.clock_generators {
             if cg.ahead.is_none() {
                 cg.ahead = Some(self.event_queue.len_at(cg.next_toggle_time) as u32);
@@ -19764,7 +19897,7 @@ impl Simulator {
                             delay_val * 2,
                             delay_val
                         );
-                        self.always_clock_src.push((
+                        self.clock_gen_src.push((
                             self.clock_generators.len(),
                             ab.scope.clone(),
                             ab.stmt.span.start,

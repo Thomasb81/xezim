@@ -169,6 +169,8 @@ mod struct_member_read_sensitivity;
 mod suspending_loop_depth_and_continue;
 #[path = "scheduling/task_body_delay_scaling.rs"]
 mod task_body_delay_scaling;
+#[path = "scheduling/time0_process_order.rs"]
+mod time0_process_order;
 #[path = "scheduling/timing_check_delayed_nets_singlelimit.rs"]
 mod timing_check_delayed_nets_singlelimit;
 #[path = "scheduling/typeparam_pool_wait.rs"]
