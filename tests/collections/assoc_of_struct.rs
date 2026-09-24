@@ -36,7 +36,11 @@ endmodule
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "n"), 1, "num() sees the struct element");
     assert_eq!(u(&sim, "ex"), 1, "exists() sees member-wise leaves");
-    assert_eq!(u(&sim, "fid"), 7, "element member reads through the loop key");
+    assert_eq!(
+        u(&sim, "fid"),
+        7,
+        "element member reads through the loop key"
+    );
     let fkey = sim
         .get_signal("fkey")
         .or_else(|| sim.get_signal("tb.fkey"))

@@ -59,7 +59,9 @@ fn assert_compiled(text: &str) {
 /// Compiles a masked-S-box style `o[b][m] = i[m][b]` (both indices dynamic).
 #[test]
 fn two_level_blocking_write_into_a_packed_2d() {
-    let text = run("two_level_blocking_write_into_a_packed_2d", r#"
+    let text = run(
+        "two_level_blocking_write_into_a_packed_2d",
+        r#"
 // Item 1 variant: 2-level blocking write, PACKED-2D base.
 module t;
   logic clk = 0; always #5 clk = ~clk;
@@ -76,15 +78,21 @@ module t;
     $finish;
   end
 endmodule
-"#);
-    assert!(text.contains("SBOX2 80706c4a1896cc55"), "wrong value:\n{text}");
+"#,
+    );
+    assert!(
+        text.contains("SBOX2 80706c4a1896cc55"),
+        "wrong value:\n{text}"
+    );
     assert_compiled(&text);
 }
 
 /// Compiles an SRAM byte-lane write `mem[ab][(i*W) +: W] <= …` (element and lane both dynamic).
 #[test]
 fn part_select_of_a_dynamic_element_nba() {
-    let text = run("part_select_of_a_dynamic_element_nba", r#"
+    let text = run(
+        "part_select_of_a_dynamic_element_nba",
+        r#"
 // Item 2 variant: NBA part-select of a dyn-index PACKED-2D element.
 module t;
   logic clk = 0; always #5 clk = ~clk;
@@ -102,7 +110,8 @@ module t;
     $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("SRAM2 mem3=deadbeef"), "wrong value:\n{text}");
     assert_compiled(&text);
 }
@@ -110,7 +119,9 @@ endmodule
 /// Compiles `s.arr[i].field <= …`, a member of a dynamically selected element of a member array.
 #[test]
 fn struct_member_of_a_dynamic_element_nba() {
-    let text = run("struct_member_of_a_dynamic_element_nba", r#"
+    let text = run(
+        "struct_member_of_a_dynamic_element_nba",
+        r#"
 // Item 3: NBA into struct-member-in-array-in-struct.
 module t;
   logic clk = 0; always #5 clk = ~clk;
@@ -128,15 +139,21 @@ module t;
     $finish;
   end
 endmodule
-"#);
-    assert!(text.contains("MEMB 5d005c005b005a0000"), "wrong value:\n{text}");
+"#,
+    );
+    assert!(
+        text.contains("MEMB 5d005c005b005a0000"),
+        "wrong value:\n{text}"
+    );
     assert_compiled(&text);
 }
 
 /// Compiles `q[i][ptr[i]] <= …`, two dynamic indices into a packed array of structs.
 #[test]
 fn two_level_dynamic_index_nba() {
-    let text = run("two_level_dynamic_index_nba", r#"
+    let text = run(
+        "two_level_dynamic_index_nba",
+        r#"
 // Item 4: NBA to a 2-level dynamic index of a packed-2D-of-structs.
 module t;
   logic clk = 0; always #5 clk = ~clk;
@@ -155,15 +172,21 @@ module t;
     $finish;
   end
 endmodule
-"#);
-    assert!(text.contains("QUEUE 0000343434000000000000232323000000000000121212000000000000010101"), "wrong value:\n{text}");
+"#,
+    );
+    assert!(
+        text.contains("QUEUE 0000343434000000000000232323000000000000121212000000000000010101"),
+        "wrong value:\n{text}"
+    );
     assert_compiled(&text);
 }
 
 /// Compiles `v[i][2:0] <= …` on a non-zero-based outer dimension.
 #[test]
 fn range_select_on_a_dynamic_element_nba() {
-    let text = run("range_select_on_a_dynamic_element_nba", r#"
+    let text = run(
+        "range_select_on_a_dynamic_element_nba",
+        r#"
 // Item 5 variant: range SELECT on a label-mapped (non-zero-based) packed-2D base.
 module t;
   logic clk = 0; always #5 clk = ~clk;
@@ -183,7 +206,8 @@ module t;
     $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("LABEL2 098e4 got=1"), "wrong value:\n{text}");
     assert_compiled(&text);
 }
@@ -193,7 +217,9 @@ endmodule
 /// labels name, and `-:` runs downward from its base.
 #[test]
 fn unknown_and_out_of_range_indices_modify_nothing() {
-    let text = run("edge", r#"
+    let text = run(
+        "edge",
+        r#"
 // Edge cases for the composed packed-path stores: unknown and out-of-range
 // indices must modify nothing (IEEE 1800 7.4.6 / 11.5.1), non-zero-based and
 // descending dimensions must address the same bits as the interpreter, and
@@ -242,7 +268,8 @@ module t;
     $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(
         text.contains("EDGE q=0000000000080000 nz=0000000006000000 hc=000000770000000000 mem2=00b40000 mem3=00000000"),
         "wrong value:\n{text}"

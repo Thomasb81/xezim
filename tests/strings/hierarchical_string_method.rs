@@ -38,7 +38,11 @@ endmodule
     assert!(
         sim.output.iter().any(|l| l.message == "TAG_PASS"),
         "hierarchical u_if.data.len() must return the string length.\n{}",
-        sim.output.iter().map(|l| l.message.clone()).collect::<Vec<_>>().join("\n")
+        sim.output
+            .iter()
+            .map(|l| l.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -68,7 +72,11 @@ endmodule
     assert!(
         sim.output.iter().any(|l| l.message == "TAG_PASS"),
         "hierarchical getc/substr must read the string field.\n{}",
-        sim.output.iter().map(|l| l.message.clone()).collect::<Vec<_>>().join("\n")
+        sim.output
+            .iter()
+            .map(|l| l.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -97,6 +105,10 @@ endmodule
     assert!(
         sim.output.iter().any(|l| l.message == "TAG_PASS"),
         "a user class method named len() must win over the string builtin.\n{}",
-        sim.output.iter().map(|l| l.message.clone()).collect::<Vec<_>>().join("\n")
+        sim.output
+            .iter()
+            .map(|l| l.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

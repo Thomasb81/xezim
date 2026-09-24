@@ -37,7 +37,10 @@ endmodule
 "#,
     );
     for want in ["S8=1 A=1", "S24=3 A=4", "S16=2 A=6", "S32=4 A=10"] {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
 }
 
@@ -116,7 +119,10 @@ endmodule
 "#,
     );
     for want in ["PROC neg", "CLOG neg", "FF neg=1"] {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
 }
 
@@ -150,8 +156,14 @@ endmodule
         path.display()
     );
     let msgs = messages(&src);
-    assert!(msgs.iter().any(|m| m == "BYTES 65 66 67"), "each $fgetc must run once; got {msgs:?}");
-    assert!(msgs.iter().any(|m| m == "EOF negative"), "$fgetc EOF must compare below zero; got {msgs:?}");
+    assert!(
+        msgs.iter().any(|m| m == "BYTES 65 66 67"),
+        "each $fgetc must run once; got {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m == "EOF negative"),
+        "$fgetc EOF must compare below zero; got {msgs:?}"
+    );
 }
 
 // §16.9.3: `$past` with no history yet yields the operand type's default
@@ -177,5 +189,8 @@ endmodule
 "#,
     );
     assert!(msgs.iter().any(|m| m == "PAST1=xxxxxxxx"), "got {msgs:?}");
-    assert!(msgs.iter().any(|m| m == "PAST2=a5 SAMPLED=a5"), "got {msgs:?}");
+    assert!(
+        msgs.iter().any(|m| m == "PAST2=a5 SAMPLED=a5"),
+        "got {msgs:?}"
+    );
 }

@@ -35,6 +35,9 @@ endmodule
         .map(|o| o.message.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(text.contains("WORDS=a,5"), "fixed property was not loaded:\n{text}");
+    assert!(
+        text.contains("WORDS=a,5"),
+        "fixed property was not loaded:\n{text}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

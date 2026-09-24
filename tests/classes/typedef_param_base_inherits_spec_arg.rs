@@ -77,5 +77,9 @@ fn typedef_param_base_inherits_spec_arg() {
     // elements stored on the concrete `seqlib#(item)` static. Before the fix,
     // the ancestor walk dropped the typedef's `#(item)` args and resolved
     // `this_type::m` against the unbound/default specialization -> got 0.
-    assert_eq!(u(&sim, "got"), 2, "derived base method read wrong per-spec static cell");
+    assert_eq!(
+        u(&sim, "got"),
+        2,
+        "derived base method read wrong per-spec static cell"
+    );
 }

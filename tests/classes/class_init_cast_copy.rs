@@ -32,7 +32,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "is_null"), 1, "$cast task form must not assign on failure");
+    assert_eq!(
+        u(&sim, "is_null"),
+        1,
+        "$cast task form must not assign on failure"
+    );
 }
 
 #[test]
@@ -53,7 +57,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "bx"), 10, "new this shallow-copies, not construct-fresh");
+    assert_eq!(
+        u(&sim, "bx"),
+        10,
+        "new this shallow-copies, not construct-fresh"
+    );
 }
 
 #[test]

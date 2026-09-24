@@ -54,5 +54,9 @@ endmodule
             .unwrap()
     };
     assert_eq!(g("u.w_in"), 4, "port side keeps its declared width");
-    assert_eq!(g("w_out"), 1, "implicit net is scalar, matching the reference");
+    assert_eq!(
+        g("w_out"),
+        1,
+        "implicit net is scalar, matching the reference"
+    );
 }

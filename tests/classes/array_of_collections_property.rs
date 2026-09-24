@@ -43,7 +43,8 @@ module tb;
 endmodule",
     );
     assert!(
-        msgs.iter().any(|m| m == "size=2 q=7 8 outer=2 dq=3/5 aa=1/9 q1=1/11"),
+        msgs.iter()
+            .any(|m| m == "size=2 q=7 8 outer=2 dq=3/5 aa=1/9 q1=1/11"),
         "{msgs:?}"
     );
 }

@@ -24,11 +24,7 @@ fn main() {
                 .ok()
                 .map(|o| !o.stdout.is_empty())
                 .unwrap_or(false);
-            if dirty {
-                format!("{}-dirty", h)
-            } else {
-                h
-            }
+            if dirty { format!("{}-dirty", h) } else { h }
         })
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=XEZIM_GIT_HASH={}", git_hash);
@@ -72,8 +68,7 @@ fn main() {
     // sibling) or an offline build skips it — the tests' own locator clones
     // on demand as a fallback.
     println!("cargo:rerun-if-env-changed=XEZIM_UVM_DIR");
-    let manifest =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let uvm_dest = manifest.join("target/uvm-checkout");
     let uvm_present = std::env::var_os("XEZIM_UVM_DIR").is_some()
         || manifest.join("../UVM/1.2/src/uvm_pkg.sv").exists()

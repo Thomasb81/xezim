@@ -36,7 +36,8 @@ endmodule",
     .expect("simulate failed");
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
-        msgs.iter().any(|m| m.starts_with("RNM done: out=0.700000 acc=")),
+        msgs.iter()
+            .any(|m| m.starts_with("RNM done: out=0.700000 acc=")),
         "{msgs:?}"
     );
 }

@@ -68,7 +68,11 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "w_log"), 7, "$clog2(8192)-6 across packages");
     assert_eq!(u(&sim, "w_t"), 116, "5*7 + 81");
-    assert_eq!(u(&sim, "w_req"), 116, "declaration carved from the healed value");
+    assert_eq!(
+        u(&sim, "w_req"),
+        116,
+        "declaration carved from the healed value"
+    );
 }
 
 /// (2) $unit typedef whose member names a package type.
@@ -92,7 +96,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "w_t"), 148, "member resolved via the package, not 32");
+    assert_eq!(
+        u(&sim, "w_t"),
+        148,
+        "member resolved via the package, not 32"
+    );
     assert_eq!(u(&sim, "w_r"), 148);
 }
 
@@ -134,7 +142,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "u_w.u_i.w_bus"), 292, "carved inside the window: was 128");
+    assert_eq!(
+        u(&sim, "u_w.u_i.w_bus"),
+        292,
+        "carved inside the window: was 128"
+    );
     assert_eq!(u(&sim, "u_w.u_i.w_elem"), 146, "was 1");
     assert_eq!(u(&sim, "u_w.u_i.w_type"), 146);
 }

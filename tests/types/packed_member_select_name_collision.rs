@@ -51,8 +51,14 @@ endmodule
 #[test]
 fn struct_member_bit_select_ignores_same_named_array_elsewhere() {
     let msgs = messages(DESIGN);
-    assert!(msgs.iter().any(|m| m == "COMB q=00 b0=0 b2=1 b3=0"), "compiled comb block; got {msgs:?}");
-    assert!(msgs.iter().any(|m| m == "INTERP b2=1 b3=0 whole=0100"), "interpreter reads; got {msgs:?}");
+    assert!(
+        msgs.iter().any(|m| m == "COMB q=00 b0=0 b2=1 b3=0"),
+        "compiled comb block; got {msgs:?}"
+    );
+    assert!(
+        msgs.iter().any(|m| m == "INTERP b2=1 b3=0 whole=0100"),
+        "interpreter reads; got {msgs:?}"
+    );
 }
 
 // Siblings of the same collision, all red before the fix: a RANGE select on
@@ -86,5 +92,8 @@ module top;
 endmodule
 "#,
     );
-    assert!(msgs.iter().any(|m| m == "P port=1 range=1010 var=1 arr=10"), "got {msgs:?}");
+    assert!(
+        msgs.iter().any(|m| m == "P port=1 range=1010 var=1 arr=10"),
+        "got {msgs:?}"
+    );
 }

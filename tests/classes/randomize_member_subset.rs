@@ -85,6 +85,14 @@ endmodule
     let sim = simulate(src, 100).expect("simulate failed");
     assert_eq!(u(&sim, "ok_pair"), 1, "only the named members are solved");
     assert_eq!(u(&sim, "c_kept"), 30, "the unlisted member is untouched");
-    assert_eq!(u(&sim, "ok_all"), 1, "the whole-object form still solves everything");
-    assert_eq!(u(&sim, "unsat"), 0, "an unsatisfiable state member fails the call");
+    assert_eq!(
+        u(&sim, "ok_all"),
+        1,
+        "the whole-object form still solves everything"
+    );
+    assert_eq!(
+        u(&sim, "unsat"),
+        0,
+        "an unsatisfiable state member fails the call"
+    );
 }

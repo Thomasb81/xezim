@@ -36,5 +36,9 @@ endmodule
     )
     .expect("simulate failed");
     let o: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
-    assert!(o.iter().any(|l| l == "SM plain=cfg[0] len=6 first=cfg hits=1"), "{o:?}");
+    assert!(
+        o.iter()
+            .any(|l| l == "SM plain=cfg[0] len=6 first=cfg hits=1"),
+        "{o:?}"
+    );
 }

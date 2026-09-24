@@ -41,8 +41,29 @@ module top;
 endmodule
 "#;
     let out: Vec<String> = simulate_multi(
-        &[src.to_string()], 1000, Some("top"), &[], &[], None, false, None, None,
-        &[], &[], None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &[src.to_string()],
+        1000,
+        Some("top"),
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
     )
     .expect("sim")
     .output
@@ -51,11 +72,13 @@ endmodule
     .collect();
     assert!(
         out.iter().any(|l| l == "ST first='{-10, -20}"),
-        "T-bound array member `%p` must render a collection, not a scalar 0; got {:?}", out
+        "T-bound array member `%p` must render a collection, not a scalar 0; got {:?}",
+        out
     );
     assert!(
         out.iter().any(|l| l == "ST second='{30, 40}"),
-        "got {:?}", out
+        "got {:?}",
+        out
     );
     assert!(out.iter().any(|l| l == "ST_PASS"), "got {:?}", out);
     assert!(!out.iter().any(|l| l == "ST_FAIL"), "got {:?}", out);

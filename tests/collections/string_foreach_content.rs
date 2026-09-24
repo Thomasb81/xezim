@@ -50,5 +50,8 @@ endmodule
 fn string_foreach_uses_content_len_first() {
     let out = sim_src(STRING_FOREACH_PRECEDENCE);
     let msg = out.join("\n");
-    assert!(msg.contains("TAG_PASS"), "string foreach precedence broke:\n{msg}");
+    assert!(
+        msg.contains("TAG_PASS"),
+        "string foreach precedence broke:\n{msg}"
+    );
 }

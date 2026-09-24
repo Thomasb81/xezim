@@ -86,11 +86,7 @@ fn eq_p(av: u64, ax: u64, bv: u64, bx: u64) -> (u64, u64) {
 #[inline(always)]
 fn ne_p(av: u64, ax: u64, bv: u64, bx: u64) -> (u64, u64) {
     let (v, x) = eq_p(av, ax, bv, bx);
-    if x != 0 {
-        (0, 1)
-    } else {
-        (v ^ 1, 0)
-    }
+    if x != 0 { (0, 1) } else { (v ^ 1, 0) }
 }
 /// `c ? a : b` with an x selector: bits where both arms agree and are
 /// known keep their value, everything else is x (`Value::merge_unknown`).
@@ -101,11 +97,7 @@ fn merge_p(av: u64, ax: u64, bv: u64, bx: u64, mask: u64) -> (u64, u64) {
 }
 #[inline(always)]
 fn xmask(w: u32) -> u64 {
-    if w >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << w) - 1
-    }
+    if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
 }
 
 impl Simulator {
@@ -143,7 +135,11 @@ impl Simulator {
                 let mut nv = Value::from_inline(new_v, new_x, self.signal_widths[id]);
                 nv.is_signed = self.signal_signed[id];
                 self.nba_fast_index.insert(id, self.nba_fast.len());
-                self.nba_fast.push(NbaFast { block_index: 0, signal_id: id, value: nv });
+                self.nba_fast.push(NbaFast {
+                    block_index: 0,
+                    signal_id: id,
+                    value: nv,
+                });
             }
         }
     }
@@ -159,7 +155,11 @@ impl Simulator {
             } else {
                 nv.is_signed = self.signal_signed[id];
                 self.nba_fast_index.insert(id, self.nba_fast.len());
-                self.nba_fast.push(NbaFast { block_index: 0, signal_id: id, value: nv });
+                self.nba_fast.push(NbaFast {
+                    block_index: 0,
+                    signal_id: id,
+                    value: nv,
+                });
             }
         }
     }
@@ -215,13 +215,25 @@ impl Simulator {
                         set!(*d, ((v >> lo) & mask, (x >> lo) & mask));
                     }
                     TsInsn::SigBitW { d, sig, bit } => {
-                        set!(*d, Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1));
+                        set!(
+                            *d,
+                            Self::raw_bits_slice(&self.signal_table[*sig as usize], *bit, 1)
+                        );
                     }
-                    TsInsn::SigRangeW { d, sig, lo, w, mask } => {
-                        let (v, x) = Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
+                    TsInsn::SigRangeW {
+                        d,
+                        sig,
+                        lo,
+                        w,
+                        mask,
+                    } => {
+                        let (v, x) =
+                            Self::raw_bits_slice(&self.signal_table[*sig as usize], *lo, *w);
                         set!(*d, (v & mask, x & mask));
                     }
-                    TsInsn::Bit { d, s, bit } => set!(*d, ((v!(*s) >> bit) & 1, (x!(*s) >> bit) & 1)),
+                    TsInsn::Bit { d, s, bit } => {
+                        set!(*d, ((v!(*s) >> bit) & 1, (x!(*s) >> bit) & 1))
+                    }
                     TsInsn::Range { d, s, lo, mask } => {
                         set!(*d, ((v!(*s) >> lo) & mask, (x!(*s) >> lo) & mask))
                     }
@@ -238,9 +250,13 @@ impl Simulator {
                         };
                         set!(*d, p);
                     }
-                    TsInsn::Not { d, s, mask } => set!(*d, (!v!(*s) & !x!(*s) & mask, x!(*s) & mask)),
+                    TsInsn::Not { d, s, mask } => {
+                        set!(*d, (!v!(*s) & !x!(*s) & mask, x!(*s) & mask))
+                    }
                     TsInsn::XorC { d, s, k } => set!(*d, ((v!(*s) ^ k) & !x!(*s), x!(*s))),
-                    TsInsn::MaskEq { d, s, mask, v } => set!(*d, eq_p(v!(*s) & mask, x!(*s) & mask, *v, 0)),
+                    TsInsn::MaskEq { d, s, mask, v } => {
+                        set!(*d, eq_p(v!(*s) & mask, x!(*s) & mask, *v, 0))
+                    }
                     TsInsn::EqC { d, s, k } => set!(*d, eq_p(v!(*s), x!(*s), *k, 0)),
                     TsInsn::Add { d, a, b, mask } => {
                         let p = if x!(*a) | x!(*b) != 0 {
@@ -251,7 +267,11 @@ impl Simulator {
                         set!(*d, p);
                     }
                     TsInsn::AddC { d, s, k, mask } => {
-                        let p = if x!(*s) != 0 { (0, *mask) } else { (v!(*s).wrapping_add(*k) & mask, 0) };
+                        let p = if x!(*s) != 0 {
+                            (0, *mask)
+                        } else {
+                            (v!(*s).wrapping_add(*k) & mask, 0)
+                        };
                         set!(*d, p);
                     }
                     TsInsn::Sub { d, a, b, mask } => {
@@ -299,22 +319,45 @@ impl Simulator {
                     TsInsn::Eq { d, a, b } => set!(*d, eq_p(v!(*a), x!(*a), v!(*b), x!(*b))),
                     TsInsn::Neq { d, a, b } => set!(*d, ne_p(v!(*a), x!(*a), v!(*b), x!(*b))),
                     TsInsn::Lt { d, a, b } => {
-                        let p = if x!(*a) | x!(*b) != 0 { (0, 1) } else { ((v!(*a) < v!(*b)) as u64, 0) };
+                        let p = if x!(*a) | x!(*b) != 0 {
+                            (0, 1)
+                        } else {
+                            ((v!(*a) < v!(*b)) as u64, 0)
+                        };
                         set!(*d, p);
                     }
                     TsInsn::Leq { d, a, b } => {
-                        let p = if x!(*a) | x!(*b) != 0 { (0, 1) } else { ((v!(*a) <= v!(*b)) as u64, 0) };
+                        let p = if x!(*a) | x!(*b) != 0 {
+                            (0, 1)
+                        } else {
+                            ((v!(*a) <= v!(*b)) as u64, 0)
+                        };
                         set!(*d, p);
                     }
                     TsInsn::Gt { d, a, b } => {
-                        let p = if x!(*a) | x!(*b) != 0 { (0, 1) } else { ((v!(*a) > v!(*b)) as u64, 0) };
+                        let p = if x!(*a) | x!(*b) != 0 {
+                            (0, 1)
+                        } else {
+                            ((v!(*a) > v!(*b)) as u64, 0)
+                        };
                         set!(*d, p);
                     }
                     TsInsn::Geq { d, a, b } => {
-                        let p = if x!(*a) | x!(*b) != 0 { (0, 1) } else { ((v!(*a) >= v!(*b)) as u64, 0) };
+                        let p = if x!(*a) | x!(*b) != 0 {
+                            (0, 1)
+                        } else {
+                            ((v!(*a) >= v!(*b)) as u64, 0)
+                        };
                         set!(*d, p);
                     }
-                    TsInsn::CmpS { d, a, b, kind, sa, sb } => {
+                    TsInsn::CmpS {
+                        d,
+                        a,
+                        b,
+                        kind,
+                        sa,
+                        sb,
+                    } => {
                         let p = if x!(*a) | x!(*b) != 0 {
                             (0, 1)
                         } else {
@@ -337,7 +380,14 @@ impl Simulator {
                         set!(*dl, (v, x));
                         set!(*d, from_t3(not3(t3(v, x))));
                     }
-                    TsInsn::SigRangeEqC { dr, d, sig, lo, w, k } => {
+                    TsInsn::SigRangeEqC {
+                        dr,
+                        d,
+                        sig,
+                        lo,
+                        w,
+                        k,
+                    } => {
                         let mask = xmask(*w as u32);
                         let (v, x) = self.sig_planes(*sig);
                         let (rv, rx) = ((v >> lo) & mask, (x >> lo) & mask);
@@ -361,7 +411,14 @@ impl Simulator {
                         set!(*d, (rv, rx));
                         self.ts_store_xz(*sig as usize, rv & mask, rx & mask);
                     }
-                    TsInsn::AndRangeStore { d, a, b, sig, hi, lo } => {
+                    TsInsn::AndRangeStore {
+                        d,
+                        a,
+                        b,
+                        sig,
+                        hi,
+                        lo,
+                    } => {
                         let mask = xmask(*hi - *lo + 1);
                         let (rv, rx) = and_p(v!(*a), x!(*a), v!(*b), x!(*b));
                         set!(*d, (rv, rx));
@@ -377,7 +434,14 @@ impl Simulator {
                         set!(*d1, self.sig_planes(*sig1));
                         set!(*d2, self.sig_planes(*sig2));
                     }
-                    TsInsn::SigBit2 { d1, sig1, bit1, d2, sig2, bit2 } => {
+                    TsInsn::SigBit2 {
+                        d1,
+                        sig1,
+                        bit1,
+                        d2,
+                        sig2,
+                        bit2,
+                    } => {
                         let (v, x) = self.sig_planes(*sig1);
                         set!(*d1, ((v >> bit1) & 1, (x >> bit1) & 1));
                         let (v, x) = self.sig_planes(*sig2);
@@ -414,22 +478,57 @@ impl Simulator {
                         set!(*dl, self.sig_planes(*sig));
                         set!(*d, and_p(v!(*a), x!(*a), v!(*b), x!(*b)));
                     }
-                    TsInsn::LoadSigRepl { dl, sig, d, w, count } => {
+                    TsInsn::LoadSigRepl {
+                        dl,
+                        sig,
+                        d,
+                        w,
+                        count,
+                    } => {
                         let (v, x) = self.sig_planes(*sig);
                         set!(*dl, (v, x));
-                        set!(*d, (replicate_narrow(v, *w, *count), replicate_narrow(x, *w, *count)));
+                        set!(
+                            *d,
+                            (
+                                replicate_narrow(v, *w, *count),
+                                replicate_narrow(x, *w, *count)
+                            )
+                        );
                     }
-                    TsInsn::LoadSigSigRange { dl, sig, d, sig2, lo, mask } => {
+                    TsInsn::LoadSigSigRange {
+                        dl,
+                        sig,
+                        d,
+                        sig2,
+                        lo,
+                        mask,
+                    } => {
                         set!(*dl, self.sig_planes(*sig));
                         let (v, x) = self.sig_planes(*sig2);
                         set!(*d, ((v >> lo) & mask, (x >> lo) & mask));
                     }
-                    TsInsn::SigRangeAnd { dr, sig, lo, mask, d, a, b } => {
+                    TsInsn::SigRangeAnd {
+                        dr,
+                        sig,
+                        lo,
+                        mask,
+                        d,
+                        a,
+                        b,
+                    } => {
                         let (v, x) = self.sig_planes(*sig);
                         set!(*dr, ((v >> lo) & mask, (x >> lo) & mask));
                         set!(*d, and_p(v!(*a), x!(*a), v!(*b), x!(*b)));
                     }
-                    TsInsn::SigRangeEq { dr, sig, lo, mask, d, a, b } => {
+                    TsInsn::SigRangeEq {
+                        dr,
+                        sig,
+                        lo,
+                        mask,
+                        d,
+                        a,
+                        b,
+                    } => {
                         let (v, x) = self.sig_planes(*sig);
                         set!(*dr, ((v >> lo) & mask, (x >> lo) & mask));
                         set!(*d, eq_p(v!(*a), x!(*a), v!(*b), x!(*b)));
@@ -443,11 +542,25 @@ impl Simulator {
                         set!(*d, (rv, rx));
                         self.ts_store_xz(*sig as usize, rv & mask, rx & mask);
                     }
-                    TsInsn::AndOr { d1, a1, b1, d, a, b } => {
+                    TsInsn::AndOr {
+                        d1,
+                        a1,
+                        b1,
+                        d,
+                        a,
+                        b,
+                    } => {
                         set!(*d1, and_p(v!(*a1), x!(*a1), v!(*b1), x!(*b1)));
                         set!(*d, or_p(v!(*a), x!(*a), v!(*b), x!(*b)));
                     }
-                    TsInsn::OrRangeStore { d, a, b, sig, hi, lo } => {
+                    TsInsn::OrRangeStore {
+                        d,
+                        a,
+                        b,
+                        sig,
+                        hi,
+                        lo,
+                    } => {
                         let mask = xmask(*hi - *lo + 1);
                         let (rv, rx) = or_p(v!(*a), x!(*a), v!(*b), x!(*b));
                         set!(*d, (rv, rx));
@@ -483,7 +596,15 @@ impl Simulator {
                     TsInsn::Concat2 { d, a, wa: _, b, wb } => {
                         set!(*d, ((v!(*a) << *wb) | v!(*b), (x!(*a) << *wb) | x!(*b)))
                     }
-                    TsInsn::Concat3 { d, a, wa: _, b, wb, c, wc } => {
+                    TsInsn::Concat3 {
+                        d,
+                        a,
+                        wa: _,
+                        b,
+                        wb,
+                        c,
+                        wc,
+                    } => {
                         let av = ((v!(*a) << *wb) | v!(*b)) << *wc | v!(*c);
                         let ax = ((x!(*a) << *wb) | x!(*b)) << *wc | x!(*c);
                         set!(*d, (av, ax));
@@ -493,7 +614,13 @@ impl Simulator {
                         x!(*d) &= mask;
                     }
                     TsInsn::Repl { d, s, w, count } => {
-                        set!(*d, (replicate_narrow(v!(*s), *w, *count), replicate_narrow(x!(*s), *w, *count)))
+                        set!(
+                            *d,
+                            (
+                                replicate_narrow(v!(*s), *w, *count),
+                                replicate_narrow(x!(*s), *w, *count)
+                            )
+                        )
                     }
                     TsInsn::BitDyn { d, s, i, w } => {
                         let p = if x!(*i) != 0 || v!(*i) >= *w as u64 {
@@ -550,21 +677,47 @@ impl Simulator {
                         continue;
                     }
                     // ---- dynamic index ----
-                    TsInsn::SigRangeDyn { d, sig, i, w, sw, mask } => {
+                    TsInsn::SigRangeDyn {
+                        d,
+                        sig,
+                        i,
+                        w,
+                        sw,
+                        mask,
+                    } => {
                         let lo = v!(*i);
                         let p = if x!(*i) != 0 || lo + *w as u64 > *sw as u64 {
                             (0, *mask)
                         } else {
-                            let (v, x) = Self::raw_bits_slice(&self.signal_table[*sig as usize], lo as u16, *w);
+                            let (v, x) = Self::raw_bits_slice(
+                                &self.signal_table[*sig as usize],
+                                lo as u16,
+                                *w,
+                            );
                             (v & mask, x & mask)
                         };
                         set!(*d, p);
                     }
-                    TsInsn::RangeStoreDyn { sig, i, s, w, sw, mask }
-                    | TsInsn::RangeStoreNbaDyn { sig, i, s, w, sw, mask } => {
+                    TsInsn::RangeStoreDyn {
+                        sig,
+                        i,
+                        s,
+                        w,
+                        sw,
+                        mask,
+                    }
+                    | TsInsn::RangeStoreNbaDyn {
+                        sig,
+                        i,
+                        s,
+                        w,
+                        sw,
+                        mask,
+                    } => {
                         let lo = v!(*i);
                         if x!(*i) == 0 && lo + *w as u64 <= *sw as u64 {
-                            let (id, lo, hi) = (*sig as usize, lo as u32, lo as u32 + *w as u32 - 1);
+                            let (id, lo, hi) =
+                                (*sig as usize, lo as u32, lo as u32 + *w as u32 - 1);
                             let (pv, px) = (v!(*s) & mask, x!(*s) & mask);
                             let nba = matches!(insn, TsInsn::RangeStoreNbaDyn { .. });
                             match (nba, *sw > 64) {
@@ -575,7 +728,8 @@ impl Simulator {
                             }
                         }
                     }
-                    TsInsn::BitStoreDyn { sig, i, s, w } | TsInsn::BitStoreNbaDyn { sig, i, s, w } => {
+                    TsInsn::BitStoreDyn { sig, i, s, w }
+                    | TsInsn::BitStoreNbaDyn { sig, i, s, w } => {
                         let idx = v!(*i);
                         if x!(*i) == 0 && idx < *w as u64 {
                             let (bv, bx) = (v!(*s) & 1, x!(*s) & 1);
@@ -593,21 +747,69 @@ impl Simulator {
                     TsInsn::Store { sig, s, mask } => {
                         self.ts_store_xz(*sig as usize, v!(*s) & mask, x!(*s) & mask);
                     }
-                    TsInsn::RangeStore { sig, hi, lo, s, mask } => {
-                        self.ts_range_store_xz(*sig as usize, v!(*s) & mask, x!(*s) & mask, *lo, *hi);
+                    TsInsn::RangeStore {
+                        sig,
+                        hi,
+                        lo,
+                        s,
+                        mask,
+                    } => {
+                        self.ts_range_store_xz(
+                            *sig as usize,
+                            v!(*s) & mask,
+                            x!(*s) & mask,
+                            *lo,
+                            *hi,
+                        );
                     }
                     TsInsn::StoreNba { sig, s, w, mask } => {
                         self.ts_store_nba_xz(*sig as usize, v!(*s) & mask, x!(*s) & mask, *w);
                     }
                     TsInsn::ConstStoreNba { sig, v, w } => self.ts_store_nba(*sig as usize, *v, *w),
-                    TsInsn::RangeStoreNba { sig, hi, lo, s, mask } => {
-                        self.ts_range_store_nba_xz(*sig as usize, *lo, *hi, v!(*s) & mask, x!(*s) & mask);
+                    TsInsn::RangeStoreNba {
+                        sig,
+                        hi,
+                        lo,
+                        s,
+                        mask,
+                    } => {
+                        self.ts_range_store_nba_xz(
+                            *sig as usize,
+                            *lo,
+                            *hi,
+                            v!(*s) & mask,
+                            x!(*s) & mask,
+                        );
                     }
-                    TsInsn::RangeStoreW { sig, hi, lo, s, mask } => {
-                        self.ts_wide_range_store(*sig as usize, *lo, *hi, v!(*s) & mask, x!(*s) & mask);
+                    TsInsn::RangeStoreW {
+                        sig,
+                        hi,
+                        lo,
+                        s,
+                        mask,
+                    } => {
+                        self.ts_wide_range_store(
+                            *sig as usize,
+                            *lo,
+                            *hi,
+                            v!(*s) & mask,
+                            x!(*s) & mask,
+                        );
                     }
-                    TsInsn::RangeStoreNbaW { sig, hi, lo, s, mask } => {
-                        self.ts_wide_range_store_nba_xz(*sig as usize, *lo, *hi, v!(*s) & mask, x!(*s) & mask);
+                    TsInsn::RangeStoreNbaW {
+                        sig,
+                        hi,
+                        lo,
+                        s,
+                        mask,
+                    } => {
+                        self.ts_wide_range_store_nba_xz(
+                            *sig as usize,
+                            *lo,
+                            *hi,
+                            v!(*s) & mask,
+                            x!(*s) & mask,
+                        );
                     }
                     TsInsn::ConstStoreX { sig, v, x } => self.ts_store_xz(*sig as usize, *v, *x),
                     TsInsn::RangeStoreX(p) => {

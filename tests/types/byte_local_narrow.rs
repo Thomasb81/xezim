@@ -29,14 +29,31 @@ endmodule
 
     let bin = env!("CARGO_BIN_EXE_xezim");
     let out = Command::new(bin)
-        .arg("--simulate").arg("-s").arg("top")
+        .arg("--simulate")
+        .arg("-s")
+        .arg("top")
         .arg(sv_path.to_str().unwrap())
-        .output().expect("failed to run xezim");
+        .output()
+        .expect("failed to run xezim");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let combined = format!("stdout:\n{stdout}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("B0 ab"),  "byte = 32'hDEAD00AB must truncate to low 8 bits 'ab'.\n{combined}");
-    assert!(stdout.contains("B1 78"),  "int local 0x12345678 into a byte must give 0x78.\n{combined}");
-    assert!(stdout.contains("I0 89abcdef"), "longint into int must keep the low 32 bits.\n{combined}");
-    assert!(stdout.contains("S0 0007"), "int into shortint must keep the low 16 bits.\n{combined}");
+    let combined = format!(
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("B0 ab"),
+        "byte = 32'hDEAD00AB must truncate to low 8 bits 'ab'.\n{combined}"
+    );
+    assert!(
+        stdout.contains("B1 78"),
+        "int local 0x12345678 into a byte must give 0x78.\n{combined}"
+    );
+    assert!(
+        stdout.contains("I0 89abcdef"),
+        "longint into int must keep the low 32 bits.\n{combined}"
+    );
+    assert!(
+        stdout.contains("S0 0007"),
+        "int into shortint must keep the low 16 bits.\n{combined}"
+    );
 }

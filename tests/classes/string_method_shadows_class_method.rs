@@ -96,7 +96,10 @@ fn class_compare_not_shadowed_by_string_builtin() {
         return;
     }
     // The user method must have actually executed.
-    assert!(out.contains("RAN=1"), "user compare() never ran; got:\n{out}");
+    assert!(
+        out.contains("RAN=1"),
+        "user compare() never ran; got:\n{out}"
+    );
     // Distinct tags -> unequal. The string builtin would stringify both
     // object handles (identical text) and return >= 0, masking the
     // mismatch.

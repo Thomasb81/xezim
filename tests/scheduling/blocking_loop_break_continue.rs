@@ -48,7 +48,10 @@ fn blocking_while_honours_break_and_continue() {
 endmodule
 "#;
     let out = run(src, "while");
-    assert!(out.contains("RESULT PASS"), "expected break/continue honoured\n{out}");
+    assert!(
+        out.contains("RESULT PASS"),
+        "expected break/continue honoured\n{out}"
+    );
 }
 
 #[test]
@@ -70,7 +73,10 @@ fn blocking_for_honours_break() {
 endmodule
 "#;
     let out = run(src, "for");
-    assert!(out.contains("RESULT PASS"), "expected for-break honoured\n{out}");
+    assert!(
+        out.contains("RESULT PASS"),
+        "expected for-break honoured\n{out}"
+    );
 }
 
 #[test]
@@ -91,7 +97,10 @@ fn blocking_repeat_honours_break() {
 endmodule
 "#;
     let out = run(src, "repbrk");
-    assert!(out.contains("RESULT PASS"), "expected repeat-break honoured\n{out}");
+    assert!(
+        out.contains("RESULT PASS"),
+        "expected repeat-break honoured\n{out}"
+    );
 }
 
 #[test]
@@ -115,7 +124,10 @@ fn blocking_repeat_honours_continue() {
 endmodule
 "#;
     let out = run(src, "repcon");
-    assert!(out.contains("RESULT PASS"), "expected repeat-continue honoured\n{out}");
+    assert!(
+        out.contains("RESULT PASS"),
+        "expected repeat-continue honoured\n{out}"
+    );
 }
 
 // The cases above all place the blocking control (`#delay`) BEFORE the

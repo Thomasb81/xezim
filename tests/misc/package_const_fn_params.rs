@@ -155,7 +155,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert!(msgs(&sim).iter().any(|m| m == "T|7 7"), "got {:?}", msgs(&sim));
+    assert!(
+        msgs(&sim).iter().any(|m| m == "T|7 7"),
+        "got {:?}",
+        msgs(&sim)
+    );
 }
 
 #[test]
@@ -176,7 +180,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert!(msgs(&sim).iter().any(|m| m == "T|6 6"), "got {:?}", msgs(&sim));
+    assert!(
+        msgs(&sim).iter().any(|m| m == "T|6 6"),
+        "got {:?}",
+        msgs(&sim)
+    );
 }
 
 #[test]
@@ -233,7 +241,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert!(msgs(&sim).iter().any(|m| m == "T|4 6"), "got {:?}", msgs(&sim));
+    assert!(
+        msgs(&sim).iter().any(|m| m == "T|4 6"),
+        "got {:?}",
+        msgs(&sim)
+    );
 }
 
 #[test]

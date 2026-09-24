@@ -191,8 +191,7 @@ endmodule
 fn method_local_shadows_module_signal() {
     let out = run(SHADOW_SRC, "ptc_shadow");
     assert!(
-        out.contains("PASS: local shadows module")
-            && out.contains("PASS: module obj intact"),
+        out.contains("PASS: local shadows module") && out.contains("PASS: module obj intact"),
         "expected both shadow checks to pass; got:\n{out}"
     );
     assert!(

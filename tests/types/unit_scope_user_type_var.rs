@@ -45,5 +45,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 fn unit_scope_user_type_queue_var() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "sz"), 1, "queue must hold the one pushed object");
-    assert_eq!(u(&sim, "got"), 42, "q[0].addr must read back the stored value");
+    assert_eq!(
+        u(&sim, "got"),
+        42,
+        "q[0].addr must read back the stored value"
+    );
 }

@@ -47,8 +47,16 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "xv"), 0x1234, "each item fits one 4-bit element");
-    assert_eq!(u(&sim, "yv"), 0x1234_5678, "a nested pattern in a 4-bit element packs per bit: 0111");
-    assert_eq!(u(&sim, "lpv"), 0b101, "single-dim vector: one item per BIT, real rounds");
+    assert_eq!(
+        u(&sim, "yv"),
+        0x1234_5678,
+        "a nested pattern in a 4-bit element packs per bit: 0111"
+    );
+    assert_eq!(
+        u(&sim, "lpv"),
+        0b101,
+        "single-dim vector: one item per BIT, real rounds"
+    );
 }
 
 /// Continuous assigns — whole signal and an element of an unpacked array.
@@ -74,7 +82,11 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "cwv"), 0x1234, "CA to a packed vector");
-    assert_eq!(u(&sim, "cav"), 0x1234, "CA to an array ELEMENT of packed vectors");
+    assert_eq!(
+        u(&sim, "cav"),
+        0x1234,
+        "CA to an array ELEMENT of packed vectors"
+    );
     assert_eq!(u(&sim, "cs_x"), 1, "struct member from 1'b1");
     assert_eq!(u(&sim, "cs_y"), 2, "real 2.0 CONVERTS to shortint");
     assert_eq!(u(&sim, "cs_z"), 3, "2 + 1");
@@ -97,8 +109,16 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "sv"), 0x00000001_0002_03, "int/shortint/byte each converted");
-    assert_eq!(u(&sim, "nv"), 0x00000001_0002_03_456, "nested struct + nested vector member");
+    assert_eq!(
+        u(&sim, "sv"),
+        0x00000001_0002_03,
+        "int/shortint/byte each converted"
+    );
+    assert_eq!(
+        u(&sim, "nv"),
+        0x00000001_0002_03_456,
+        "nested struct + nested vector member"
+    );
 }
 
 /// §10.9.2 element-type context, and multiplier-vs-concat disambiguation.
@@ -125,11 +145,27 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "e_sum"), 2, "1'b1 + 1'b1 in a 32-bit element context");
-    assert_eq!(u(&sim, "e_signed") as u32 as i32, -11, "signed item sign-extends");
-    assert_eq!(u(&sim, "m_size"), 3, "the pattern multiplier yields three elements");
+    assert_eq!(
+        u(&sim, "e_sum"),
+        2,
+        "1'b1 + 1'b1 in a 32-bit element context"
+    );
+    assert_eq!(
+        u(&sim, "e_signed") as u32 as i32,
+        -11,
+        "signed item sign-extends"
+    );
+    assert_eq!(
+        u(&sim, "m_size"),
+        3,
+        "the pattern multiplier yields three elements"
+    );
     assert_eq!(u(&sim, "m0"), 5);
-    assert_eq!(u(&sim, "c_size"), 1, "the explicit-brace concat is a single item");
+    assert_eq!(
+        u(&sim, "c_size"),
+        1,
+        "the explicit-brace concat is a single item"
+    );
     assert_eq!(u(&sim, "c0"), 0x0A0A0A, "whose value is the 24-bit concat");
 }
 
@@ -164,9 +200,25 @@ endmodule
             .unwrap_or_else(|| panic!("missing {n}"))
             .to_hex_string()
     };
-    assert_eq!(h("snap_range"), "00000000001234000000", "element range (worked before)");
-    assert_eq!(h("snap_elem"), "00004200001234000000", "single element write lands in the struct");
+    assert_eq!(
+        h("snap_range"),
+        "00000000001234000000",
+        "element range (worked before)"
+    );
+    assert_eq!(
+        h("snap_elem"),
+        "00004200001234000000",
+        "single element write lands in the struct"
+    );
     assert_eq!(h("snap_whole"), "ff004200001234000000", "whole element");
-    assert_eq!(h("snap_bits"), "fc004200001234000000", "bit range within an element");
-    assert_eq!(h("snap_b"), "fc00420000123400fffc", "plain member bit range");
+    assert_eq!(
+        h("snap_bits"),
+        "fc004200001234000000",
+        "bit range within an element"
+    );
+    assert_eq!(
+        h("snap_b"),
+        "fc00420000123400fffc",
+        "plain member bit range"
+    );
 }

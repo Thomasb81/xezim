@@ -49,7 +49,11 @@ endmodule
     assert_eq!(u(&sim, "a_dn"), 0x2, "ascending [7 -: 4] takes labels 4..7");
     assert_eq!(u(&sim, "a_const"), 0x2, "the constant form agrees");
     assert_eq!(u(&sim, "a_bit"), 0, "and so does a single-bit select");
-    assert_eq!(u(&sim, "a_wr"), 0x0f00, "an ascending indexed part-WRITE lands by label");
+    assert_eq!(
+        u(&sim, "a_wr"),
+        0x0f00,
+        "an ascending indexed part-WRITE lands by label"
+    );
     assert_eq!(u(&sim, "d_up"), 0x3, "descending is unchanged");
     assert_eq!(u(&sim, "d_dn"), 0x3);
     assert_eq!(u(&sim, "d_bit"), 1);

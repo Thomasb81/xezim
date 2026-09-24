@@ -198,11 +198,23 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "lt_after_e0"), 0xF000, "element 0 is the top slot");
-    assert_eq!(u(&sim, "lt_after_range"), 0x3000, "inner labels stay descending");
+    assert_eq!(
+        u(&sim, "lt_after_range"),
+        0x3000,
+        "inner labels stay descending"
+    );
     assert_eq!(u(&sim, "bar_b1"), 0xFFFC, "labels 14:15 are the low bits");
     assert_eq!(u(&sim, "bar_b2"), 0x3FFF, "labels 0:1 are the top bits");
-    assert_eq!(u(&sim, "bar_a1"), 0x0000_0000_0012_3400, "element range mirrors");
-    assert_eq!(u(&sim, "bar_a2"), 0x0000_4200_0000_0000, "single element mirrors");
+    assert_eq!(
+        u(&sim, "bar_a1"),
+        0x0000_0000_0012_3400,
+        "element range mirrors"
+    );
+    assert_eq!(
+        u(&sim, "bar_a2"),
+        0x0000_4200_0000_0000,
+        "single element mirrors"
+    );
 }
 
 /// §6.16: string equality is by TEXT and 2-state — an out-of-bounds read of a
@@ -228,7 +240,11 @@ module test;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "ex"), 1, "oob queue element compares equal to empty");
+    assert_eq!(
+        u(&sim, "ex"),
+        1,
+        "oob queue element compares equal to empty"
+    );
     assert_eq!(u(&sim, "ey"), 1, "oob dynamic-array element too");
     assert_eq!(u(&sim, "ne"), 1, "!= is 2-state as well");
 }
@@ -258,7 +274,11 @@ module test import fooPkg::*, barPkg::*; #(parameter P = FOO) (input [get_size(7
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "pv"), 5, "the imported FOO reaches the parameter default");
+    assert_eq!(
+        u(&sim, "pv"),
+        5,
+        "the imported FOO reaches the parameter default"
+    );
     assert_eq!(u(&sim, "bv"), 10, "the imported function sizes the port");
 }
 
@@ -283,7 +303,11 @@ endmodule
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "i2"), 1, "2-state base defaults to 0");
     assert_eq!(u(&sim, "x4"), 1, "4-state base defaults to x");
-    assert_eq!(u(&sim, "n2"), 1, "next of invalid stays at the 2-state default");
+    assert_eq!(
+        u(&sim, "n2"),
+        1,
+        "next of invalid stays at the 2-state default"
+    );
     assert_eq!(u(&sim, "n4"), 1, "next of invalid stays x for 4-state");
 }
 

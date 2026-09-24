@@ -47,7 +47,10 @@ endmodule
         "AFTER_TASK scalar=5 arr2=6 vec=0a counter=7",
         "FN_RET=70 AFTER_FN scalar=70",
     ] {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
 }
 
@@ -77,7 +80,10 @@ endmodule
     let sim = simulate(src, 100).expect("simulate failed");
     let msgs = outs(&sim);
     for want in ["TASK arr2=12 arr_k=12 scalar=42 copy=12", "FN=13"] {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
 }
 
@@ -109,5 +115,9 @@ endmodule
     let sim = simulate(src, 100).expect("simulate failed");
     let msgs = outs(&sim);
     assert!(msgs.iter().any(|m| m == "out=3 u.k=5"), "got {msgs:?}");
-    assert_eq!(msgs.iter().filter(|m| m.as_str() == "out=3 u.k=5").count(), 2, "got {msgs:?}");
+    assert_eq!(
+        msgs.iter().filter(|m| m.as_str() == "out=3 u.k=5").count(),
+        2,
+        "got {msgs:?}"
+    );
 }

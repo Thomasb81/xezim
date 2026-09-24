@@ -36,7 +36,13 @@ fn typedef_with_several_packed_dimensions_in_tf_ports() {
     let sv = dir.join("t.sv");
     std::fs::write(&sv, DESIGN).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "top", "--no-cache", sv.to_str().unwrap()])
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            "--no-cache",
+            sv.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();

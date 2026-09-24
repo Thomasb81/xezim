@@ -59,8 +59,16 @@ fn unary_not_and_minus_extend_to_the_context_width() {
     let sim = simulate(SRC, 50).expect("simulate failed");
     assert_eq!(u(&sim, "r_not"), 0xFFFF_FF4B, "~a in a 32-bit context");
     assert_eq!(u(&sim, "r_neg"), 0xFFFF_FF4C, "-a in a 32-bit context");
-    assert_eq!(u(&sim, "r_sub"), 0xFFFF_FFB5, "binary - was already correct");
-    assert_eq!(u(&sim, "r_not_sgn"), 0x0000_000B, "~sn sign-extends the operand first");
+    assert_eq!(
+        u(&sim, "r_sub"),
+        0xFFFF_FFB5,
+        "binary - was already correct"
+    );
+    assert_eq!(
+        u(&sim, "r_not_sgn"),
+        0x0000_000B,
+        "~sn sign-extends the operand first"
+    );
     assert_eq!(u(&sim, "r_neg_sgn"), 0x0000_000C, "-sn");
 }
 

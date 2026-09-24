@@ -10,8 +10,12 @@ fn shipped_upf_example_passes() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/upf");
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .args([
-            "--simulate", "-s", "pwr_demo_tb", "--no-cache",
-            "--upf", root.join("pwr_demo.upf").to_str().unwrap(),
+            "--simulate",
+            "-s",
+            "pwr_demo_tb",
+            "--no-cache",
+            "--upf",
+            root.join("pwr_demo.upf").to_str().unwrap(),
             root.join("pwr_demo.sv").to_str().unwrap(),
             root.join("pwr_demo_tb.sv").to_str().unwrap(),
         ])
@@ -20,7 +24,10 @@ fn shipped_upf_example_passes() {
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     assert!(output.status.success(), "run failed:\n{text}");
-    assert!(text.contains("UPF_EXAMPLE_PASS"), "example checks failed:\n{text}");
+    assert!(
+        text.contains("UPF_EXAMPLE_PASS"),
+        "example checks failed:\n{text}"
+    );
     for want in [
         "[UPF] scope /pwr_demo_tb/dut (pwr_demo_top), 3 supply nets: VDD, VSS, VDD_ACC",
         "[UPF] power switch acc_sw: VDD -> VDD_ACC controlled by ctl=acc_on",
@@ -35,5 +42,10 @@ fn shipped_upf_example_passes() {
         assert!(text.contains(want), "missing `{want}`:\n{text}");
     }
     // The always-on domain has no retained elements of its own.
-    assert!(!text.contains("PD_TOP: elements [], power VDD, ground VSS, 0 corruptible signals, retention"), "retention listed on PD_TOP:\n{text}");
+    assert!(
+        !text.contains(
+            "PD_TOP: elements [], power VDD, ground VSS, 0 corruptible signals, retention"
+        ),
+        "retention listed on PD_TOP:\n{text}"
+    );
 }

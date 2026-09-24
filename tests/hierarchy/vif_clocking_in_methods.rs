@@ -62,8 +62,24 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 500).expect("simulate failed");
-    assert_eq!(u(&sim, "t_edge"), 5, "@(posedge vif.clk) in a method blocks");
-    assert_eq!(u(&sim, "data_after_plain"), 0x22, "a plain drive still lands immediately");
-    assert_eq!(u(&sim, "t_cb"), 15, "@(vif.cb) waits for the NEXT clocking event, not zero time");
-    assert_eq!(u(&sim, "data_after_cb"), 0x11, "the clocking drive lands at the cb edge");
+    assert_eq!(
+        u(&sim, "t_edge"),
+        5,
+        "@(posedge vif.clk) in a method blocks"
+    );
+    assert_eq!(
+        u(&sim, "data_after_plain"),
+        0x22,
+        "a plain drive still lands immediately"
+    );
+    assert_eq!(
+        u(&sim, "t_cb"),
+        15,
+        "@(vif.cb) waits for the NEXT clocking event, not zero time"
+    );
+    assert_eq!(
+        u(&sim, "data_after_cb"),
+        0x11,
+        "the clocking drive lands at the cb edge"
+    );
 }

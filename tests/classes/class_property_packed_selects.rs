@@ -52,10 +52,18 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "part"), 0xAA55, "part-writes above the default width land");
+    assert_eq!(
+        u(&sim, "part"),
+        0xAA55,
+        "part-writes above the default width land"
+    );
     assert_eq!(u(&sim, "bit_hi"), 0x8000, "so does a bit-write above it");
     assert_eq!(u(&sim, "bits16"), 16, "$bits before any write");
-    assert_eq!(u(&sim, "bits4"), 4, "a narrower specialization is independent");
+    assert_eq!(
+        u(&sim, "bits4"),
+        4,
+        "a narrower specialization is independent"
+    );
 }
 
 /// Bit and part selects across descending, ascending and multi-dimensional
@@ -88,5 +96,9 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "r_d"), 0x800F, "descending bit and part writes");
     assert_eq!(u(&sim, "r_a"), 0x8F00, "ascending writes map by label");
-    assert_eq!((u(&sim, "r_m1"), u(&sim, "r_m0")), (0xAB, 0xCD), "multi-dim elements");
+    assert_eq!(
+        (u(&sim, "r_m1"), u(&sim, "r_m0")),
+        (0xAB, 0xCD),
+        "multi-dim elements"
+    );
 }

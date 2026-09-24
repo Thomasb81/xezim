@@ -74,7 +74,11 @@ endmodule
         .filter(|m| m.contains("TAG_") || m.contains("FAIL_A"))
         .collect();
     assert!(sim.finished, "simulation must terminate: {:?}", msgs);
-    assert_eq!(msgs, vec!["TAG_A_PASS"], "event wait/trigger must collaborate");
+    assert_eq!(
+        msgs,
+        vec!["TAG_A_PASS"],
+        "event wait/trigger must collaborate"
+    );
 }
 
 /// [B] `disable fork` must drop the killed subprocesses' FUTURE-time `#delay`

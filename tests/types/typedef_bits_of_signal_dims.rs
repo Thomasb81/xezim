@@ -47,6 +47,10 @@ fn typedef_bits_of_signal_dims() {
     assert_eq!(u(&sim, "wb"), 292, "typedef sized by $bits(292-bit signal)");
     // d[0] occupies exactly bits [81:18] of the flat value (18 = amask 2
     // + mask 16), so the select reads the raw stored 64'h22e0000.
-    assert_eq!(u(&sim, "w_sel") as u32, 0x22e0000, "part-select through cast");
+    assert_eq!(
+        u(&sim, "w_sel") as u32,
+        0x22e0000,
+        "part-select through cast"
+    );
     assert_eq!(u(&sim, "a8"), 0xff, "simple $bits(sig) typedef holds value");
 }

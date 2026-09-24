@@ -24,7 +24,9 @@ fn run(name: &str, src: &str) -> String {
 
 #[test]
 fn packed_memory_reads_take_the_slice_in_place() {
-    let text = run("xidx", r#"
+    let text = run(
+        "xidx",
+        r#"
 // Unknown and out-of-range addresses on a packed memory (7.4.6 / 11.5.1).
 module t;
   logic clk = 0; always #5 clk = ~clk;
@@ -50,7 +52,8 @@ module t;
     $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(
         text.contains("XI ok=33333338 oob=xxxxxxxx x=xxxxxxxx nz=a5"),
         "wrong values:\n{text}"

@@ -11,7 +11,11 @@ use xezim::simulate;
 
 fn out(src: &str) -> String {
     let sim = simulate(src, 10_000).expect("simulate failed");
-    sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -94,6 +98,14 @@ module top;
   end
 endmodule
 "#);
-    assert!(o.contains("CALL5 size=2 head=5 tail=6"), "first call: {}", o);
-    assert!(o.contains("CALL50 size=2 head=50 tail=51"), "second call: {}", o);
+    assert!(
+        o.contains("CALL5 size=2 head=5 tail=6"),
+        "first call: {}",
+        o
+    );
+    assert!(
+        o.contains("CALL50 size=2 head=50 tail=51"),
+        "second call: {}",
+        o
+    );
 }

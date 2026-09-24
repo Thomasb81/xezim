@@ -44,8 +44,8 @@
 //! c910-class designs.
 
 use std::sync::{
-    mpsc::{channel, Receiver, Sender},
     Arc, Condvar, Mutex,
+    mpsc::{Receiver, Sender, channel},
 };
 
 /// Logical-Process identifier (small unsigned). LP 0 is the I/O kernel by
@@ -415,14 +415,16 @@ impl<T: Clone> SignalTable<T> {
 
     /// SAFETY: caller proves no two threads write `id` concurrently.
     #[inline]
-    pub unsafe fn write(&self, id: usize, value: T) { unsafe {
-        if id < self.len {
-            // Use a raw pointer to the element so we never form an
-            // `&mut Vec<T>` that aliases other threads' disjoint borrows.
-            let ptr: *mut T = (*self.cells.get()).as_mut_ptr();
-            std::ptr::write(ptr.add(id), value);
+    pub unsafe fn write(&self, id: usize, value: T) {
+        unsafe {
+            if id < self.len {
+                // Use a raw pointer to the element so we never form an
+                // `&mut Vec<T>` that aliases other threads' disjoint borrows.
+                let ptr: *mut T = (*self.cells.get()).as_mut_ptr();
+                std::ptr::write(ptr.add(id), value);
+            }
         }
-    }}
+    }
 
     /// Clone the value at `id` (suitable for cross-thread reads after
     /// barrier sync). For T=u64 this is a single load. For T=Value with
@@ -448,9 +450,9 @@ impl<T: Clone> SignalTable<T> {
     /// SAFETY: the slice borrow lives only across the closure call and
     /// no writer threads touch the kernel's owned IDs during that window
     /// (per the per-tick phase contract).
-    pub unsafe fn as_slice(&self) -> &[T] { unsafe {
-        (*self.cells.get()).as_slice()
-    }}
+    pub unsafe fn as_slice(&self) -> &[T] {
+        unsafe { (*self.cells.get()).as_slice() }
+    }
 }
 
 // Convenience for the toy: u64 has a `0` default and is Copy, so the
@@ -1373,9 +1375,8 @@ pub fn compute_ddg(sim: &crate::compiler::Simulator) -> DdgStats {
         }
     }
     let mut topo: Vec<usize> = Vec::with_capacity(n_sccs);
-    let mut queue: std::collections::VecDeque<usize> = (0..n_sccs)
-        .filter(|&u| in_deg[u] == 0)
-        .collect();
+    let mut queue: std::collections::VecDeque<usize> =
+        (0..n_sccs).filter(|&u| in_deg[u] == 0).collect();
     while let Some(u) = queue.pop_front() {
         topo.push(u);
         for &v in &scc_adj[u] {
@@ -1497,7 +1498,8 @@ impl PerLpSignalTable {
     pub fn estimated_bytes(&self) -> usize {
         self.values.len() * std::mem::size_of::<xezim_core::Value>()
             + self.local_to_global.len() * std::mem::size_of::<u32>()
-            + self.global_to_local.len() * (std::mem::size_of::<usize>() + std::mem::size_of::<u32>())
+            + self.global_to_local.len()
+                * (std::mem::size_of::<usize>() + std::mem::size_of::<u32>())
             + self.widths.len() * std::mem::size_of::<u32>()
             + self.signed.len() * std::mem::size_of::<bool>()
     }
@@ -1514,7 +1516,9 @@ impl PerLpSignalTable {
     /// Inverse lookup: local idx → global signal_id.
     #[inline]
     pub fn to_global(&self, local_idx: u32) -> Option<usize> {
-        self.local_to_global.get(local_idx as usize).map(|&g| g as usize)
+        self.local_to_global
+            .get(local_idx as usize)
+            .map(|&g| g as usize)
     }
 
     /// Read a value via global signal_id; falls back to None if not
@@ -1771,14 +1775,13 @@ pub fn run_c910_real_bytecode_k(
         let val = &tab_a[id];
         if let Some(u) = val.to_u64() {
             if u != 0 && samples_a < 5 {
-                eprintln!(
-                    "[real-pdes-c910]   LP-A {} = {} (id {})",
-                    name, u, id
-                );
+                eprintln!("[real-pdes-c910]   LP-A {} = {} (id {})", name, u, id);
                 samples_a += 1;
             }
         }
-        if samples_a >= 5 { break; }
+        if samples_a >= 5 {
+            break;
+        }
     }
     for id in 0..ctx.signal_count() {
         let name = ctx.signal_name_at(id);
@@ -1788,14 +1791,13 @@ pub fn run_c910_real_bytecode_k(
         let val = &tab_b[id];
         if let Some(u) = val.to_u64() {
             if u != 0 && samples_b < 5 {
-                eprintln!(
-                    "[real-pdes-c910]   LP-B {} = {} (id {})",
-                    name, u, id
-                );
+                eprintln!("[real-pdes-c910]   LP-B {} = {} (id {})", name, u, id);
                 samples_b += 1;
             }
         }
-        if samples_b >= 5 { break; }
+        if samples_b >= 5 {
+            break;
+        }
     }
     if samples_a == 0 && samples_b == 0 {
         eprintln!(
@@ -1827,7 +1829,11 @@ pub fn build_c910_stub_specs(
     lp_a_prefix: &str,
     n_ticks: u64,
     clock_period_ns: u64,
-) -> (Vec<KernelSpec>, Arc<std::sync::atomic::AtomicU64>, Arc<std::sync::atomic::AtomicU64>) {
+) -> (
+    Vec<KernelSpec>,
+    Arc<std::sync::atomic::AtomicU64>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
     use std::sync::atomic::AtomicU64;
 
     let fire_a = Arc::new(AtomicU64::new(0));

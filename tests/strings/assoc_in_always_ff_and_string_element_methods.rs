@@ -58,9 +58,17 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "e_blk"), 1, "blocking write from always_ff must create the entry");
+    assert_eq!(
+        u(&sim, "e_blk"),
+        1,
+        "blocking write from always_ff must create the entry"
+    );
     assert_eq!(u(&sim, "e_nba"), 1, "non-blocking too");
-    assert_eq!(u(&sim, "e_ini"), 1, "and the initial-block control still works");
+    assert_eq!(
+        u(&sim, "e_ini"),
+        1,
+        "and the initial-block control still works"
+    );
     assert_eq!(u(&sim, "v_blk"), 0xD, "blocking value");
     assert_eq!(u(&sim, "v_nba"), 0xC, "non-blocking value");
     assert_eq!(u(&sim, "v_ini"), 0xE, "initial-block value");
@@ -97,7 +105,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "total"), 2, "two distinct runtime keys were written");
+    assert_eq!(
+        u(&sim, "total"),
+        2,
+        "two distinct runtime keys were written"
+    );
     assert_eq!(u(&sim, "n0"), 7, "key 0 holds what the clocked block wrote");
     assert_eq!(u(&sim, "n1"), 9, "key 1 likewise");
 }
@@ -127,7 +139,11 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "q_sub_ok"), 1, "substr on a queue element");
-    assert_eq!(u(&sim, "q_idx"), b'h' as u64, "character select on a queue element");
+    assert_eq!(
+        u(&sim, "q_idx"),
+        b'h' as u64,
+        "character select on a queue element"
+    );
     assert_eq!(u(&sim, "q_getc"), b'e' as u64, "getc on a queue element");
     assert_eq!(u(&sim, "q_up_ok"), 1, "toupper on a queue element");
     assert_eq!(u(&sim, "aa_sub_ok"), 1, "substr on an assoc element");

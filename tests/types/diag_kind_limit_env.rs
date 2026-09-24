@@ -38,7 +38,10 @@ fn run(limit: Option<&str>) -> (usize, usize) {
     let path = dir.join(format!("diaglim_{}.sv", n));
     std::fs::write(&path, SRC).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
-    cmd.arg("--simulate").arg("-s").arg("top").arg(path.to_str().unwrap());
+    cmd.arg("--simulate")
+        .arg("-s")
+        .arg("top")
+        .arg(path.to_str().unwrap());
     match limit {
         Some(v) => {
             cmd.env("XEZIM_DIAG_LIMIT", v);
@@ -53,7 +56,8 @@ fn run(limit: Option<&str>) -> (usize, usize) {
     let err = String::from_utf8_lossy(&out.stderr);
     (
         err.matches("port width mismatch").count(),
-        err.matches("further messages of this kind are suppressed").count(),
+        err.matches("further messages of this kind are suppressed")
+            .count(),
     )
 }
 

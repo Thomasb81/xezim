@@ -34,7 +34,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert!(outs(&sim).contains(&"T|tag=11 null=0".to_string()), "{:?}", outs(&sim));
+    assert!(
+        outs(&sim).contains(&"T|tag=11 null=0".to_string()),
+        "{:?}",
+        outs(&sim)
+    );
 }
 
 /// Reference: tags 11/22/33/44 both in-class and at module scope — plain
@@ -94,7 +98,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert!(outs(&sim).contains(&"T|counter=2".to_string()), "{:?}", outs(&sim));
+    assert!(
+        outs(&sim).contains(&"T|counter=2".to_string()),
+        "{:?}",
+        outs(&sim)
+    );
 }
 
 /// Module-scope event triggers through selected receivers — the full event

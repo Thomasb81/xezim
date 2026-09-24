@@ -91,6 +91,14 @@ endmodule
     let rb = lookup(&sim, "rb") & 0xFFFFFFFF;
     assert_eq!(za, 1, "at the #0 resume a still holds 1 (§4.5), got {}", za);
     assert_eq!(zb, 2, "at the #0 resume b still holds 2 (§4.5), got {}", zb);
-    assert_eq!(ra, 2, "after the time step a must hold the swapped value 2, got {}", ra);
-    assert_eq!(rb, 1, "after the time step b must hold the swapped value 1, got {}", rb);
+    assert_eq!(
+        ra, 2,
+        "after the time step a must hold the swapped value 2, got {}",
+        ra
+    );
+    assert_eq!(
+        rb, 1,
+        "after the time step b must hold the swapped value 1, got {}",
+        rb
+    );
 }

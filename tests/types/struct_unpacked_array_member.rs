@@ -59,10 +59,18 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "r0"), 0x1111, "element 0 reads back what was written");
+    assert_eq!(
+        u(&sim, "r0"),
+        0x1111,
+        "element 0 reads back what was written"
+    );
     assert_eq!(u(&sim, "r3"), 0x4444, "element 3 likewise");
     assert_eq!(u(&sim, "sc"), 42, "the scalar member still works");
-    assert_eq!(u(&sim, "c0"), 0x1111, "struct copy carries the array member");
+    assert_eq!(
+        u(&sim, "c0"),
+        0x1111,
+        "struct copy carries the array member"
+    );
     assert_eq!(u(&sim, "c3"), 0x4444);
     assert_eq!(u(&sim, "csc"), 42, "and the scalar");
 }
@@ -86,9 +94,17 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "l0"), 0x1111, "a local struct's array member stores");
+    assert_eq!(
+        u(&sim, "l0"),
+        0x1111,
+        "a local struct's array member stores"
+    );
     assert_eq!(u(&sim, "l3"), 0x4444);
-    assert_eq!(u(&sim, "m0"), 0x1111, "and copies out to a module-level struct");
+    assert_eq!(
+        u(&sim, "m0"),
+        0x1111,
+        "and copies out to a module-level struct"
+    );
     assert_eq!(u(&sim, "msc"), 7);
 }
 
@@ -227,10 +243,18 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "loc0"), 0x1111, "local select");
-    assert_eq!(u(&sim, "hier0"), 0x1111, "hierarchical select through a port");
+    assert_eq!(
+        u(&sim, "hier0"),
+        0x1111,
+        "hierarchical select through a port"
+    );
     assert_eq!(u(&sim, "loc3"), 0x4444);
     assert_eq!(u(&sim, "hier3"), 0x4444);
-    assert_eq!(u(&sim, "sub0"), 0x1111, "and a plain hierarchical 2D element");
+    assert_eq!(
+        u(&sim, "sub0"),
+        0x1111,
+        "and a plain hierarchical 2D element"
+    );
 }
 
 /// A struct with an unpacked-array member through a PROCEDURAL-LOCAL queue,
@@ -262,7 +286,11 @@ endmodule
     assert_eq!(u(&sim, "f_s"), 1);
     assert_eq!(u(&sim, "s_a"), 0x2222, "and the second is distinct");
     assert_eq!(u(&sim, "s_s"), 2);
-    assert_eq!(u(&sim, "m_a"), 0x3333, "a module-level struct pushes in too");
+    assert_eq!(
+        u(&sim, "m_a"),
+        0x3333,
+        "a module-level struct pushes in too"
+    );
     assert_eq!(u(&sim, "m_s"), 3);
 }
 

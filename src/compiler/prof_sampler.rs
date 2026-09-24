@@ -7,8 +7,8 @@
 //! simulation thread a single store per evaluation, and the report converts
 //! samples to time from the wall clock the sampler ran for.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -83,7 +83,12 @@ impl ProfSampler {
                 (comb, edge, proc, other, total)
             })
             .ok();
-        Self { cur, stop, handle, started: Instant::now() }
+        Self {
+            cur,
+            stop,
+            handle,
+            started: Instant::now(),
+        }
     }
 
     /// Stop sampling and return the tally.
@@ -95,7 +100,15 @@ impl ProfSampler {
             _ => (Vec::new(), Vec::new(), Vec::new(), 0, 0),
         };
         let ns_per_sample = elapsed_ns as f64 / total.max(1) as f64;
-        SampleTally { comb, edge, proc, other, total, elapsed_ns, ns_per_sample }
+        SampleTally {
+            comb,
+            edge,
+            proc,
+            other,
+            total,
+            elapsed_ns,
+            ns_per_sample,
+        }
     }
 }
 

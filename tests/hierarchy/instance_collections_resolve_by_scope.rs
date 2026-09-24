@@ -89,7 +89,10 @@ endmodule",
     ] {
         assert!(msgs.iter().any(|m| m == want), "missing {want}: {msgs:?}");
     }
-    assert!(!msgs.iter().any(|m| m.starts_with("tb.u0 ")), "u0 has no queue: {msgs:?}");
+    assert!(
+        !msgs.iter().any(|m| m.starts_with("tb.u0 ")),
+        "u0 has no queue: {msgs:?}"
+    );
 }
 
 /// The full shape of the user's report: ten per-client BFM wrappers, each
@@ -99,7 +102,8 @@ endmodule",
 /// the held queue. Every ingredient above was broken in an instance.
 #[test]
 fn bfm_request_queues_grant_and_drain_in_ten_sibling_wrappers() {
-    let msgs = messages_until(r#"`timescale 1ns/1ps
+    let msgs = messages_until(
+        r#"`timescale 1ns/1ps
 
 package slc_pkg;
   typedef struct packed {
@@ -380,9 +384,15 @@ module tb_top;
     $finish;
   end
 endmodule
-"#, 100_000);
+"#,
+        100_000,
+    );
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{msgs:?}");
-    assert!(msgs.iter().any(|m| m == "RESULT grants: c2=3 (want 3)  c7=1 (want 1)"), "{msgs:?}");
+    assert!(
+        msgs.iter()
+            .any(|m| m == "RESULT grants: c2=3 (want 3)  c7=1 (want 1)"),
+        "{msgs:?}"
+    );
 }
 
 /// Sibling audit: queue, associative array, associative array of packed
@@ -390,7 +400,8 @@ endmodule
 /// written from a task, across ten generate siblings with distinct IDs.
 #[test]
 fn collection_shapes_stay_per_instance_across_ten_generate_siblings() {
-    let msgs = messages_until(r#"package p; typedef struct packed { logic [31:0] w; logic [7:0] s; } req_t; endpackage
+    let msgs = messages_until(
+        r#"package p; typedef struct packed { logic [31:0] w; logic [7:0] s; } req_t; endpackage
 module unit #(parameter int ID = 0) (input logic clk, input logic go);
   import p::*;
   req_t q[$]; int aa[int]; req_t aq[int]; req_t g2[2][$]; int errs = 0;
@@ -412,19 +423,25 @@ module tb_top; logic clk = 0, go = 0; always #5 clk = ~clk;
   genvar k; generate for (k = 0; k < 10; k++) begin : g unit #(.ID(k+1)) u(.clk(clk), .go(go)); end endgenerate
   initial begin #12 go = 1; #40 go = 0; #30 $finish; end
 endmodule
-"#, 100_000);
+"#,
+        100_000,
+    );
     for k in 0..10 {
         let want = format!("tb_top.g[{k}].u OK q=2 aa=0 g2=2");
         assert!(msgs.iter().any(|m| m == &want), "missing {want}: {msgs:?}");
     }
-    assert!(!msgs.iter().any(|m| m.contains(" E") || m.contains("FAIL")), "{msgs:?}");
+    assert!(
+        !msgs.iter().any(|m| m.contains(" E") || m.contains("FAIL")),
+        "{msgs:?}"
+    );
 }
 
 /// Element field of a queue, fixed array and dynamic array of packed structs
 /// inside an instance, against the same code at the top level.
 #[test]
 fn packed_struct_element_fields_in_instance_containers() {
-    let msgs = messages_until(r#"package p; typedef struct packed { logic [31:0] w; logic [7:0] s; } req_t; endpackage
+    let msgs = messages_until(
+        r#"package p; typedef struct packed { logic [31:0] w; logic [7:0] s; } req_t; endpackage
 module unit(input logic go); import p::*;
   req_t q[$]; req_t arr[2]; req_t sc; req_t da[];
   always @(posedge go) begin
@@ -438,7 +455,9 @@ module tb_top; import p::*; logic go = 0; unit u(.go(go));
     $display("top: queue q[0].w=%0d | fixed arr[0].w=%0d | scalar sc.w=%0d | dyn da[0].w=%0d (want 5 5 5 5)", q[0].w, arr[0].w, sc.w, da[0].w);
     #1 go = 1; #1 $finish; end
 endmodule
-"#, 1_000);
+"#,
+        1_000,
+    );
     for want in [
         "top: queue q[0].w=5 | fixed arr[0].w=5 | scalar sc.w=5 | dyn da[0].w=5 (want 5 5 5 5)",
         "tb_top.u: queue q[0].w=5 | fixed arr[0].w=5 | scalar sc.w=5 | dyn da[0].w=5 (want 5 5 5 5)",

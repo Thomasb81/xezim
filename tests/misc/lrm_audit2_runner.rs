@@ -7,8 +7,8 @@
 use xezim::simulate;
 
 fn run_chapter(name: &str, src: &str, expected_fails: usize) {
-    let sim = simulate(src, 1_000_000)
-        .unwrap_or_else(|e| panic!("{}: simulate failed: {}", name, e));
+    let sim =
+        simulate(src, 1_000_000).unwrap_or_else(|e| panic!("{}: simulate failed: {}", name, e));
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
         msgs.iter().any(|m| m.contains("CHECKS DONE")),
@@ -24,7 +24,11 @@ fn run_chapter(name: &str, src: &str, expected_fails: usize) {
         name,
         expected_fails,
         fails.len(),
-        fails.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n")
+        fails
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -35,7 +39,11 @@ fn lrm2_ch5_lexical() {
 
 #[test]
 fn lrm2_ch14_19_clocking_coverage() {
-    run_chapter("ch14_19", include_str!("../lrm_audit2/ch14_19_clk_cov.sv"), 0);
+    run_chapter(
+        "ch14_19",
+        include_str!("../lrm_audit2/ch14_19_clk_cov.sv"),
+        0,
+    );
 }
 
 #[test]
@@ -55,7 +63,11 @@ fn lrm2_ch22_preprocessor() {
 
 #[test]
 fn lrm2_ch25_26_interfaces_packages() {
-    run_chapter("ch25_26", include_str!("../lrm_audit2/ch25_26_ifc_pkg.sv"), 0);
+    run_chapter(
+        "ch25_26",
+        include_str!("../lrm_audit2/ch25_26_ifc_pkg.sv"),
+        0,
+    );
 }
 
 #[test]

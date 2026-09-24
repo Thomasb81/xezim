@@ -35,5 +35,9 @@ endmodule
 "#;
 
     let sim = xezim::simulate(src, 200).expect("simulation must terminate");
-    assert!(sim.output.iter().any(|line| line.message == "ROLLBACK_PASS"));
+    assert!(
+        sim.output
+            .iter()
+            .any(|line| line.message == "ROLLBACK_PASS")
+    );
 }

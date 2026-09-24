@@ -328,7 +328,14 @@ module tb;
 endmodule
 "#,
     );
-    assert!(out.iter().any(|m| m == "A=0123456789abcdef feedbeef ffffffffffff"), "{out:?}");
+    assert!(
+        out.iter()
+            .any(|m| m == "A=0123456789abcdef feedbeef ffffffffffff"),
+        "{out:?}"
+    );
     assert!(out.iter().any(|m| m == "B=xx0110xx ef"), "{out:?}");
-    assert!(out.iter().any(|m| m == "C=ffff0000ffff0000 fffffffff"), "{out:?}");
+    assert!(
+        out.iter().any(|m| m == "C=ffff0000ffff0000 fffffffff"),
+        "{out:?}"
+    );
 }

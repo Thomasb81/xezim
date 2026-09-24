@@ -9,8 +9,29 @@ use xezim::simulate;
 
 fn line(src: &str, top: &str) -> Vec<String> {
     xezim::simulate_multi(
-        &[src.to_string()], 1000, Some(top), &[], &[], None, false, None, None,
-        &[], &[], None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &[src.to_string()],
+        1000,
+        Some(top),
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
     )
     .expect("sim")
     .output
@@ -40,11 +61,13 @@ endmodule
 "#;
     let out = line(src, "m");
     for w in [
-        "INIT=m",          // initial block -> instance
-        "O=m.outer",       // task
-        "I=m.inner",       // callee's OWN scope, not m.outer.inner
-        "R2=m.rec", "R1=m.rec", "R0=m.rec", // recursion doesn't accumulate
-        "AFTER=m",         // scope restored after the calls
+        "INIT=m",    // initial block -> instance
+        "O=m.outer", // task
+        "I=m.inner", // callee's OWN scope, not m.outer.inner
+        "R2=m.rec",
+        "R1=m.rec",
+        "R0=m.rec", // recursion doesn't accumulate
+        "AFTER=m",  // scope restored after the calls
     ] {
         assert!(out.iter().any(|l| l == w), "missing {:?}; got {:?}", w, out);
     }
@@ -95,9 +118,9 @@ endmodule
         "T=m.t",
         "BLK=m.t.blk",
         "INNER=m.t.blk.inner",
-        "T2=m.t",       // back out of blk, still in t
+        "T2=m.t", // back out of blk, still in t
         "FORK=m.fb",
-        "DONE=m",       // all restored
+        "DONE=m", // all restored
     ] {
         assert!(out.iter().any(|l| l == w), "missing {:?}; got {:?}", w, out);
     }

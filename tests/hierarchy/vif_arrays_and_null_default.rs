@@ -48,8 +48,16 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "r_b0"), u(&sim, "r_b1")), (0x55, 0x99), "writes land on the instances");
-    assert_eq!((u(&sim, "r_v0"), u(&sim, "r_v1")), (0x55, 0x99), "and read back through the elements");
+    assert_eq!(
+        (u(&sim, "r_b0"), u(&sim, "r_b1")),
+        (0x55, 0x99),
+        "writes land on the instances"
+    );
+    assert_eq!(
+        (u(&sim, "r_v0"), u(&sim, "r_v1")),
+        (0x55, 0x99),
+        "and read back through the elements"
+    );
 }
 
 /// A class property that is an ARRAY of vifs, bound bare inside a method.
@@ -88,8 +96,16 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "r_b0"), u(&sim, "r_b1")), (0xA0, 0xA1), "per-element binds reach their instances");
-    assert_eq!((u(&sim, "r_m0"), u(&sim, "r_m1")), (0xA0, 0xA1), "method reads through a variable index");
+    assert_eq!(
+        (u(&sim, "r_b0"), u(&sim, "r_b1")),
+        (0xA0, 0xA1),
+        "per-element binds reach their instances"
+    );
+    assert_eq!(
+        (u(&sim, "r_m0"), u(&sim, "r_m1")),
+        (0xA0, 0xA1),
+        "method reads through a variable index"
+    );
 }
 
 /// The unconnected-vif guard: null before assignment, non-null after,
@@ -114,7 +130,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "before_assign"), 1, "an unassigned vif variable is null, not x");
+    assert_eq!(
+        u(&sim, "before_assign"),
+        1,
+        "an unassigned vif variable is null, not x"
+    );
     assert_eq!(u(&sim, "after_assign"), 0);
     assert_eq!(u(&sim, "after_clear"), 1);
 }

@@ -28,7 +28,13 @@ fn run_profiled_design(src: &str) -> String {
     let path = dir.join("design.sv");
     std::fs::write(&path, src).expect("write temporary design");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "top", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .env("XEZIM_PROFILE_TIMING", "1")
         .output()
         .expect("run profiled design");
@@ -133,13 +139,15 @@ fn comb_datapath_work_stays_bounded() {
         evals <= MAX_EVALS,
         "comb entry evaluations regressed: {} > {} (same answer, more work — \
          suspect the settle dirty-set or a lost fusion)",
-        evals, MAX_EVALS
+        evals,
+        MAX_EVALS
     );
     assert!(
         insns <= MAX_INSNS,
         "bytecode instructions executed regressed: {} > {} (suspect dead \
          instructions left in compiled blocks, or a peephole that stopped firing)",
-        insns, MAX_INSNS
+        insns,
+        MAX_INSNS
     );
 
     // Pin the answer so the counters are always compared against a run that
@@ -192,19 +200,16 @@ module top;
 endmodule
 "#,
     );
-    assert!(text.contains("CHECK=1"), "wrong packed-loop result:\n{text}");
     assert!(
-        profile_count(
-            &text,
-            "[FUSE] packed-loop NBA copies (static sites): "
-        ) >= 1,
+        text.contains("CHECK=1"),
+        "wrong packed-loop result:\n{text}"
+    );
+    assert!(
+        profile_count(&text, "[FUSE] packed-loop NBA copies (static sites): ") >= 1,
         "packed NBA loop silently fell back:\n{text}"
     );
     assert!(
-        profile_count(
-            &text,
-            "[FUSE] packed blocking fills (dynamic executions): "
-        ) >= 1,
+        profile_count(&text, "[FUSE] packed blocking fills (dynamic executions): ") >= 1,
         "packed blocking fill silently fell back:\n{text}"
     );
 }
@@ -268,20 +273,17 @@ module top;
 endmodule
 "#,
     );
-    assert!(text.contains("CHECK=1"), "guarded fallback was wrong:\n{text}");
+    assert!(
+        text.contains("CHECK=1"),
+        "guarded fallback was wrong:\n{text}"
+    );
     assert_eq!(
-        profile_count(
-            &text,
-            "[FUSE] packed-loop NBA copies (static sites): "
-        ),
+        profile_count(&text, "[FUSE] packed-loop NBA copies (static sites): "),
         0,
         "unsafe packed NBA shape was vectorized:\n{text}"
     );
     assert_eq!(
-        profile_count(
-            &text,
-            "[FUSE] packed blocking fills (dynamic executions): "
-        ),
+        profile_count(&text, "[FUSE] packed blocking fills (dynamic executions): "),
         0,
         "mutable-bound packed fill was collapsed:\n{text}"
     );

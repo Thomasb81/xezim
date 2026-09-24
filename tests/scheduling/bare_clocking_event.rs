@@ -100,7 +100,11 @@ endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
     assert_eq!(u(&sim, "s1"), 0x11, "first edge samples the pre-edge value");
-    assert_eq!(u(&sim, "s2"), 0x33, "second edge sees the update made before it");
+    assert_eq!(
+        u(&sim, "s2"),
+        0x33,
+        "second edge sees the update made before it"
+    );
 }
 
 /// An ordinary named event called `e` must still behave as an event — the
@@ -122,5 +126,9 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "t_ev"), 22, "@e still waits for the event, not a clock edge");
+    assert_eq!(
+        u(&sim, "t_ev"),
+        22,
+        "@e still waits for the event, not a clock edge"
+    );
 }

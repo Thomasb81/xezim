@@ -49,6 +49,9 @@ endmodule
     .expect("simulate failed");
     let o: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     for want in ["T1 q=0", "T2 q=x", "T3 q=x"] {
-        assert!(o.iter().any(|l| l.contains(want)), "missing `{want}`: {o:?}");
+        assert!(
+            o.iter().any(|l| l.contains(want)),
+            "missing `{want}`: {o:?}"
+        );
     }
 }

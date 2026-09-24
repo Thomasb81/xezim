@@ -22,7 +22,13 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "test", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "test",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -59,8 +65,14 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|member=leaf"), "member element class:\n{text}");
-    assert!(text.contains("T|local=alt"), "local shadows the member:\n{text}");
+    assert!(
+        text.contains("T|member=leaf"),
+        "member element class:\n{text}"
+    );
+    assert!(
+        text.contains("T|local=alt"),
+        "local shadows the member:\n{text}"
+    );
     assert!(
         text.contains("T|member_after=leaf"),
         "member unaffected by the local:\n{text}"
@@ -92,7 +104,10 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|inh=leaf/leaf"), "inherited + static members:\n{text}");
+    assert!(
+        text.contains("T|inh=leaf/leaf"),
+        "inherited + static members:\n{text}"
+    );
 }
 
 #[test]
@@ -121,7 +136,10 @@ endmodule
 "#,
     );
     assert!(text.contains("T|n=1"), "size written back:\n{text}");
-    assert!(text.contains("nm='inner' v=5"), "struct members written back:\n{text}");
+    assert!(
+        text.contains("nm='inner' v=5"),
+        "struct members written back:\n{text}"
+    );
 }
 
 #[test]
@@ -162,5 +180,8 @@ endmodule
 "#,
     );
     assert!(text.contains("T|n=1 v=6"), "nested compose:\n{text}");
-    assert!(text.contains("T|nm_has_chain=1"), "member string survives nesting:\n{text}");
+    assert!(
+        text.contains("T|nm_has_chain=1"),
+        "member string survives nesting:\n{text}"
+    );
 }

@@ -56,7 +56,11 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 100).expect("sim"));
-    assert_eq!(out, "COUNT=4", "enum walk must visit all 4 members:\n{}", out);
+    assert_eq!(
+        out, "COUNT=4",
+        "enum walk must visit all 4 members:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -133,7 +137,11 @@ endmodule
     assert!(out.contains("D_OK 3"), "DELTA must resolve to 3:\n{}", out);
     assert!(out.contains("N_MISS"), "unknown name must miss:\n{}", out);
     assert!(!out.contains("A_MISS"), "ALPHA must not miss:\n{}", out);
-    assert!(!out.contains("N_BAD"), "unknown name must not resolve:\n{}", out);
+    assert!(
+        !out.contains("N_BAD"),
+        "unknown name must not resolve:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -224,11 +232,21 @@ endmodule
     // Reference-verified (2026-08-28, reference simulator): FE/BE and FN/FN each run
     // ALPHA=0, BETA=1, DELTA=3, GAMMA=2 (lexicographic assoc order), and
     // SZ=4.
-    for (tag, k, val) in [("FE", "ALPHA", 0), ("FE", "BETA", 1), ("FE", "DELTA", 3), ("FE", "GAMMA", 2)] {
+    for (tag, k, val) in [
+        ("FE", "ALPHA", 0),
+        ("FE", "BETA", 1),
+        ("FE", "DELTA", 3),
+        ("FE", "GAMMA", 2),
+    ] {
         let line = format!("{} {}={}", tag, k, val);
         assert!(out.contains(&line), "missing `{}`:\n{}", line, out);
     }
-    for (tag, k, val) in [("FN", "ALPHA", 0), ("FN", "BETA", 1), ("FN", "DELTA", 3), ("FN", "GAMMA", 2)] {
+    for (tag, k, val) in [
+        ("FN", "ALPHA", 0),
+        ("FN", "BETA", 1),
+        ("FN", "DELTA", 3),
+        ("FN", "GAMMA", 2),
+    ] {
         let line = format!("{} {}={}", tag, k, val);
         assert!(out.contains(&line), "missing `{}`:\n{}", line, out);
     }
@@ -280,11 +298,18 @@ endmodule
         ("BB", 100, 5),
     ] {
         let line = format!("{} {}={}", tag, k, val);
-        assert!(out.contains(&line), "missing `{}` (signed key must not wrap):\n{}", line, out);
+        assert!(
+            out.contains(&line),
+            "missing `{}` (signed key must not wrap):\n{}",
+            line,
+            out
+        );
     }
     // A wrapped unsigned key must NOT appear.
     assert!(
-        !out.contains("4294967293") && !out.contains("II 4294") && !out.contains("SS 4294")
+        !out.contains("4294967293")
+            && !out.contains("II 4294")
+            && !out.contains("SS 4294")
             && !out.contains("BB 4294"),
         "signed key wrapped to unsigned:\n{}",
         out
@@ -321,7 +346,11 @@ endmodule
     let out = output_of(&simulate(SRC, 100).expect("sim"));
     // Reference-verified (2026-08-28, reference simulator): SZ=4; foreach visits the
     // string keys ALPHA/BETA/GAMMA/DELTA with their stored values.
-    assert!(out.contains("SZ 4"), "module read saw an empty map:\n{}", out);
+    assert!(
+        out.contains("SZ 4"),
+        "module read saw an empty map:\n{}",
+        out
+    );
     for (tag, k, val) in [
         ("FE", "ALPHA", 0),
         ("FE", "BETA", 1),
@@ -329,6 +358,11 @@ endmodule
         ("FE", "DELTA", 3),
     ] {
         let line = format!("{} {}={}", tag, k, val);
-        assert!(out.contains(&line), "missing `{}` (module read must match in-method write):\n{}", line, out);
+        assert!(
+            out.contains(&line),
+            "missing `{}` (module read must match in-method write):\n{}",
+            line,
+            out
+        );
     }
 }

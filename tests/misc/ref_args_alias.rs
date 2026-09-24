@@ -52,10 +52,22 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "seen_at5"), 10, "callee write visible to a parallel observer mid-call");
-    assert_eq!(u(&sim, "mid"), 20, "observer write visible to the callee after resume");
+    assert_eq!(
+        u(&sim, "seen_at5"),
+        10,
+        "callee write visible to a parallel observer mid-call"
+    );
+    assert_eq!(
+        u(&sim, "mid"),
+        20,
+        "observer write visible to the callee after resume"
+    );
     assert_eq!(u(&sim, "g"), 5, "no copy-out clobber; alias2 leaves g=5");
-    assert_eq!(u(&sim, "ali"), 5, "double-ref of one variable: b reads a's write");
+    assert_eq!(
+        u(&sim, "ali"),
+        5,
+        "double-ref of one variable: b reads a's write"
+    );
 }
 
 /// Reference: foo=8 (formal named like the actual still aliases), loc=8
@@ -104,10 +116,22 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "foo"), 8, "same-named formal/actual aliases the storage");
-    assert_eq!(u(&sim, "g2"), 99, "chained ref writes the original variable");
+    assert_eq!(
+        u(&sim, "foo"),
+        8,
+        "same-named formal/actual aliases the storage"
+    );
+    assert_eq!(
+        u(&sim, "g2"),
+        99,
+        "chained ref writes the original variable"
+    );
     assert_eq!(u(&sim, "chained_saw"), 99);
-    assert_eq!(u(&sim, "loc_out"), 8, "caller-local actual: legacy copy path still lands");
+    assert_eq!(
+        u(&sim, "loc_out"),
+        8,
+        "caller-local actual: legacy copy path still lands"
+    );
 }
 
 /// §13.5.2: `ref arr[i]` freezes the ELEMENT identity at call time — a later
@@ -134,9 +158,19 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
-    let a1 = sim.get_signal("arr[1]").and_then(|v| v.to_u64()).unwrap_or(999);
-    let a3 = sim.get_signal("arr[3]").and_then(|v| v.to_u64()).unwrap_or(999);
-    assert_eq!((a1, a3), (43, 0), "writes stay on the element captured at call time");
+    let a1 = sim
+        .get_signal("arr[1]")
+        .and_then(|v| v.to_u64())
+        .unwrap_or(999);
+    let a3 = sim
+        .get_signal("arr[3]")
+        .and_then(|v| v.to_u64())
+        .unwrap_or(999);
+    assert_eq!(
+        (a1, a3),
+        (43, 0),
+        "writes stay on the element captured at call time"
+    );
 }
 
 /// J2 remnant pin: a user function call inside a DIMENSION width is constant-

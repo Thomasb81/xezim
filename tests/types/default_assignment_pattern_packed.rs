@@ -88,9 +88,21 @@ endmodule
     assert_eq!(u(&sim, "e_s1") & 1, 1, "a 1-bit target is unaffected");
     // A STRUCT's `default:` applies per MEMBER, not per bit: each 4-bit
     // member takes 1'b1 zero-extended, so `0001_0001`. Reference-confirmed.
-    assert_eq!(u(&sim, "e_ps") & 0xFF, 0b0001_0001, "packed struct fills per member");
+    assert_eq!(
+        u(&sim, "e_ps") & 0xFF,
+        0b0001_0001,
+        "packed struct fills per member"
+    );
     assert_eq!(u(&sim, "e_p2") & 0xFFFF, 0, "packed 2-D keeps its own path");
-    assert_eq!(u(&sim, "e_u0") & 0xFF, 0xAB, "unpacked array keeps its own path");
+    assert_eq!(
+        u(&sim, "e_u0") & 0xFF,
+        0xAB,
+        "unpacked array keeps its own path"
+    );
     assert_eq!(u(&sim, "e_u3") & 0xFF, 0xAB);
-    assert_eq!(u(&sim, "e_ord") & 0x3, 0b10, "ordered items still positional");
+    assert_eq!(
+        u(&sim, "e_ord") & 0x3,
+        0b10,
+        "ordered items still positional"
+    );
 }

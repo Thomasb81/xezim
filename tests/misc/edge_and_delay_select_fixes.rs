@@ -92,7 +92,11 @@ endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
     assert_eq!(u(&sim, "got_vec"), 0x5A, "posedge of a packed-vector bit");
-    assert_eq!(u(&sim, "got_arr"), 0x5A, "posedge of bit 0 of unpacked element 1");
+    assert_eq!(
+        u(&sim, "got_arr"),
+        0x5A,
+        "posedge of bit 0 of unpacked element 1"
+    );
 }
 
 /// `always @(one)` where `one` is a constant net resolved by the t0 settle

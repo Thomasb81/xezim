@@ -93,7 +93,10 @@ endmodule
     );
     assert!(text.contains("q=aa"), "a skipped write was lost:\n{text}");
     let (gate, _) = gateable(&text);
-    assert_eq!(gate, 0, "a doubly driven output must not be skippable:\n{text}");
+    assert_eq!(
+        gate, 0,
+        "a doubly driven output must not be skippable:\n{text}"
+    );
 }
 
 /// Disjoint BIT slices of one register, one generate arm each: all skippable.
@@ -116,7 +119,10 @@ endmodule
 "#,
     );
     let (gate, blocks) = gateable(&text);
-    assert_eq!(gate, blocks, "disjoint slice writers lost their skip:\n{text}");
+    assert_eq!(
+        gate, blocks,
+        "disjoint slice writers lost their skip:\n{text}"
+    );
 }
 
 /// Overlapping slices of one register: bit 1 has two drivers, so neither
@@ -145,7 +151,10 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("errors=0"), "a shared bit lost its driver:\n{text}");
+    assert!(
+        text.contains("errors=0"),
+        "a shared bit lost its driver:\n{text}"
+    );
     let (gate, _) = gateable(&text);
     assert_eq!(gate, 0, "overlapping slice writers must not skip:\n{text}");
 }
@@ -171,9 +180,15 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("d=200 m0=199 m3=202"), "element writes went wrong:\n{text}");
+    assert!(
+        text.contains("d=200 m0=199 m3=202"),
+        "element writes went wrong:\n{text}"
+    );
     let (gate, blocks) = gateable(&text);
-    assert_eq!(gate, blocks, "disjoint element writers lost their skip:\n{text}");
+    assert_eq!(
+        gate, blocks,
+        "disjoint element writers lost their skip:\n{text}"
+    );
 }
 
 /// A constant-index writer with a STABLE input beside a run-time-index
@@ -203,13 +218,23 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("errors=0"), "constant writer skipped under a dynamic sibling:\n{text}");
+    assert!(
+        text.contains("errors=0"),
+        "constant writer skipped under a dynamic sibling:\n{text}"
+    );
     // The constant writer is rejected by the dynamic writer's claim on its
     // element, the dynamic writer by the constant writer's; the counter and
     // the checker may skip.
-    assert_eq!(shared(&text), (1, 1), "both array writers must be rejected:\n{text}");
+    assert_eq!(
+        shared(&text),
+        (1, 1),
+        "both array writers must be rejected:\n{text}"
+    );
     let (gate, _) = gateable(&text);
-    assert_eq!(gate, 2, "only the counter and the checker may skip:\n{text}");
+    assert_eq!(
+        gate, 2,
+        "only the counter and the checker may skip:\n{text}"
+    );
 }
 
 /// The everyday form of that hazard: a reset loop clears the array through
@@ -238,7 +263,10 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("after reset m1=11 m2=22"), "element writers did not re-drive:\n{text}");
+    assert!(
+        text.contains("after reset m1=11 m2=22"),
+        "element writers did not re-drive:\n{text}"
+    );
 }
 
 /// Constant element writers on OPPOSITE edges of the same element, with
@@ -267,7 +295,10 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("errors=0"), "an element writer skipped its edge:\n{text}");
+    assert!(
+        text.contains("errors=0"),
+        "an element writer skipped its edge:\n{text}"
+    );
     let (gate, _) = gateable(&text);
     assert_eq!(gate, 0, "two writers of one element must not skip:\n{text}");
 }
@@ -293,9 +324,15 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("d=200 m3=199 m0=202"), "descending range elements:\n{text}");
+    assert!(
+        text.contains("d=200 m3=199 m0=202"),
+        "descending range elements:\n{text}"
+    );
     let (gate, blocks) = gateable(&text);
-    assert_eq!(gate, blocks, "descending range writers lost their skip:\n{text}");
+    assert_eq!(
+        gate, blocks,
+        "descending range writers lost their skip:\n{text}"
+    );
 }
 
 /// Elements of a TWO-dimensional array, one generate arm each.
@@ -322,7 +359,10 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("d=200 g00=199 g11=202"), "2-D element writes went wrong:\n{text}");
+    assert!(
+        text.contains("d=200 g00=199 g11=202"),
+        "2-D element writes went wrong:\n{text}"
+    );
     let (gate, blocks) = gateable(&text);
     assert_eq!(gate, blocks, "2-D element writers lost their skip:\n{text}");
 }
@@ -348,7 +388,10 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("d=200 m0=199 m1=200"), "element writes went wrong:\n{text}");
+    assert!(
+        text.contains("d=200 m0=199 m1=200"),
+        "element writes went wrong:\n{text}"
+    );
     let (gate, blocks) = gateable(&text);
     assert_eq!(gate, blocks, "element writers lost their skip:\n{text}");
 }
@@ -375,5 +418,8 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("d=200 m0=199 m3=9"), "an out-of-range write leaked:\n{text}");
+    assert!(
+        text.contains("d=200 m0=199 m3=9"),
+        "an out-of-range write leaked:\n{text}"
+    );
 }

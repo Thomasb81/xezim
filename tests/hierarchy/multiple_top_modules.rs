@@ -65,7 +65,11 @@ fn single_top_module_unchanged() {
     let o = out(r#"
 module top; initial $display("M=%m"); endmodule
 "#);
-    assert!(o.contains("M=top"), "single-top %m must be the bare name; got: {}", o);
+    assert!(
+        o.contains("M=top"),
+        "single-top %m must be the bare name; got: {}",
+        o
+    );
     assert!(
         !o.contains("__xezim_multi_top"),
         "single-top must not synthesize a wrapper; got: {}",

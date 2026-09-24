@@ -59,8 +59,16 @@ endmodule
     assert_eq!(u(&sim, "q2"), 100, "bare name still works");
     assert_eq!(u(&sim, "q3"), 100, "this.<prop> still works");
     assert_eq!(u(&sim, "q4"), 9, "super.<prop> write reaches the object");
-    assert_eq!(u(&sim, "q5"), 1, "super.<method>() still dispatches to the base");
-    assert_eq!(u(&sim, "q6"), 2, "an unqualified call still dispatches virtually");
+    assert_eq!(
+        u(&sim, "q5"),
+        1,
+        "super.<method>() still dispatches to the base"
+    );
+    assert_eq!(
+        u(&sim, "q6"),
+        2,
+        "an unqualified call still dispatches virtually"
+    );
 }
 
 /// §18.5.7 — a `.size()` constraint nested inside `if/else`. The size solver
@@ -92,7 +100,11 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "ok"), 1, "both randomize calls succeed");
     assert_eq!(u(&sim, "size_when_set"), 2, "the then-branch size applies");
-    assert_eq!(u(&sim, "size_when_clear"), 4, "the else-branch size applies");
+    assert_eq!(
+        u(&sim, "size_when_clear"),
+        4,
+        "the else-branch size applies"
+    );
 }
 
 /// A parenthesis-less `super.new;` is a CONSTRUCTOR call, not a property
@@ -158,6 +170,10 @@ endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
     assert_eq!(u(&sim, "ok"), 1, "the guarded size holds on every draw");
-    assert_eq!(u(&sim, "saw_sel1"), 1, "the guard actually varies (was pinned 0)");
+    assert_eq!(
+        u(&sim, "saw_sel1"),
+        1,
+        "the guard actually varies (was pinned 0)"
+    );
     assert_eq!(u(&sim, "saw_sel0"), 1);
 }

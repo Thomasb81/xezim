@@ -56,9 +56,15 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 fn localparam_class_static_init_runs() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     // The static-call initializer must have run: count went to 1.
-    assert_eq!(u(&sim, "reg_val"), 1,
-        "static-call initializer must run for a class with only body localparams");
+    assert_eq!(
+        u(&sim, "reg_val"),
+        1,
+        "static-call initializer must run for a class with only body localparams"
+    );
     // The localparam is accessible and has its value.
-    assert_eq!(u(&sim, "param_val"), 1,
-        "body localparam must be accessible and correctly valued");
+    assert_eq!(
+        u(&sim, "param_val"),
+        1,
+        "body localparam must be accessible and correctly valued"
+    );
 }

@@ -68,11 +68,13 @@ endmodule
     let msgs = messages(&sim);
     assert!(
         msgs.iter().any(|m| m == "RESULT statics_isolated=1"),
-        "distinct specializations must have distinct static singletons; got {:?}", msgs
+        "distinct specializations must have distinct static singletons; got {:?}",
+        msgs
     );
     assert!(
         msgs.iter().any(|m| m == "RESULT refetch=1"),
-        "each specialization's static must persist; got {:?}", msgs
+        "each specialization's static must persist; got {:?}",
+        msgs
     );
 }
 
@@ -123,6 +125,7 @@ endmodule
     let msgs = messages(&sim);
     assert!(
         msgs.iter().any(|m| m == "RESULT miss_is_null=1"),
-        "assoc miss under a different specialization's ID must return null; got {:?}", msgs
+        "assoc miss under a different specialization's ID must return null; got {:?}",
+        msgs
     );
 }

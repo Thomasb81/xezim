@@ -110,9 +110,21 @@ fn single_level_packed_struct_array_still_resolves() {
 fn nested_struct_array_element_reads_on_the_bytecode_path() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "b_n"), 0xBBBB_BBBB_BBBB_BBB0, "n.wdata[0].wdata[0]");
-    assert_eq!(u(&sim, "b_n_hi"), 0xDDDD_DDDD_DDDD_DDD1, "n.wdata[1].wdata[1]");
-    assert_eq!(u(&sim, "b_na"), 0xBBBB_BBBB_BBBB_BBB0, "na[0].wdata[0].wdata[0]");
-    assert_eq!(u(&sim, "b_ua"), 0xBBBB_BBBB_BBBB_BBB0, "unpacked ua[1][0].wdata[0]");
+    assert_eq!(
+        u(&sim, "b_n_hi"),
+        0xDDDD_DDDD_DDDD_DDD1,
+        "n.wdata[1].wdata[1]"
+    );
+    assert_eq!(
+        u(&sim, "b_na"),
+        0xBBBB_BBBB_BBBB_BBB0,
+        "na[0].wdata[0].wdata[0]"
+    );
+    assert_eq!(
+        u(&sim, "b_ua"),
+        0xBBBB_BBBB_BBBB_BBB0,
+        "unpacked ua[1][0].wdata[0]"
+    );
     assert_eq!(u(&sim, "b_mask"), 0xF1, "narrow nested member element");
 }
 

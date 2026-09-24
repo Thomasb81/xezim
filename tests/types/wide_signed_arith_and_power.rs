@@ -51,8 +51,16 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "q32") as u32 as i32, -1, "-5 / 3 truncates toward zero");
-    assert_eq!(u(&sim, "m32") as u32 as i32, -2, "-5 % 3 keeps the dividend's sign");
+    assert_eq!(
+        u(&sim, "q32") as u32 as i32,
+        -1,
+        "-5 / 3 truncates toward zero"
+    );
+    assert_eq!(
+        u(&sim, "m32") as u32 as i32,
+        -2,
+        "-5 % 3 keeps the dividend's sign"
+    );
     assert_eq!(
         hex(&sim, "uq"),
         "55555555555555555555555555555553",
@@ -76,9 +84,21 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(hex(&sim, "p100"), "00000010000000000000000000000000", "2**100");
-    assert_eq!(hex(&sim, "p64"), "00000000000000010000000000000000", "2**64");
-    assert_eq!(hex(&sim, "p_even"), "00000000000000000000000000000000", "even base past the width");
+    assert_eq!(
+        hex(&sim, "p100"),
+        "00000010000000000000000000000000",
+        "2**100"
+    );
+    assert_eq!(
+        hex(&sim, "p64"),
+        "00000000000000010000000000000000",
+        "2**64"
+    );
+    assert_eq!(
+        hex(&sim, "p_even"),
+        "00000000000000000000000000000000",
+        "even base past the width"
+    );
     assert_eq!(u(&sim, "p_narrow"), 243);
 }
 
@@ -127,8 +147,16 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "ne"), 0, "the LITERAL -16 sign-extends against the unsigned 64-bit");
+    assert_eq!(
+        u(&sim, "ne"),
+        0,
+        "the LITERAL -16 sign-extends against the unsigned 64-bit"
+    );
     assert_eq!(u(&sim, "eq"), 1);
-    assert_eq!(u(&sim, "sx_eq"), 0, "a signed VARIABLE zero-extends (propagated unsigned)");
+    assert_eq!(
+        u(&sim, "sx_eq"),
+        0,
+        "a signed VARIABLE zero-extends (propagated unsigned)"
+    );
     assert_eq!(u(&sim, "sx_ne"), 1);
 }

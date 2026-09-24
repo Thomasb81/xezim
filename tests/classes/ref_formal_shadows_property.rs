@@ -62,7 +62,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "ok"), 1, "ref formal receives property content via value = this.value");
+    assert_eq!(
+        u(&sim, "ok"),
+        1,
+        "ref formal receives property content via value = this.value"
+    );
 }
 
 /// The same shadowing formal filled from a LOCAL (`value = tmp`): the copy must
@@ -97,7 +101,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "ok"), 1, "ref formal filled from a local; property untouched");
+    assert_eq!(
+        u(&sim, "ok"),
+        1,
+        "ref formal filled from a local; property untouched"
+    );
 }
 
 /// Mirror direction: the property as LHS, the shadowing formal as RHS
@@ -137,7 +145,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "ok"), 1, "property receives the shadowing formal's content");
+    assert_eq!(
+        u(&sim, "ok"),
+        1,
+        "property receives the shadowing formal's content"
+    );
 }
 
 /// A registration inherited from an ENCLOSING frame still loses to the

@@ -186,11 +186,7 @@ fn collapse_and_merge_together_are_identical() {
 #[test]
 fn constant_range_copy_is_observationally_identical() {
     let (_, base) = run(RANGE_DESIGN, "range_base", &[]);
-    let (text, lowered) = run(
-        RANGE_DESIGN,
-        "range_on",
-        &[("XEZIM_RANGE_COPY", "1")],
-    );
+    let (text, lowered) = run(RANGE_DESIGN, "range_on", &[("XEZIM_RANGE_COPY", "1")]);
     assert_eq!(base.len(), 4, "baseline did not exercise every vector");
     assert!(
         text.contains("[RANGE-COPY] lowered 1 constant-range assignments"),

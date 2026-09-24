@@ -10,7 +10,8 @@ use std::process::Command;
 
 #[test]
 fn bound_harnesses_count_per_instance_through_module_name_references() {
-    let sv = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/hierarchy/bind_grid_module_name_refs.sv");
+    let sv = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/hierarchy/bind_grid_module_name_refs.sv");
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .args(["--simulate", "-s", "tb", "--no-cache", sv.to_str().unwrap()])
         .output()
@@ -18,6 +19,9 @@ fn bound_harnesses_count_per_instance_through_module_name_references() {
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     assert!(output.status.success(), "run failed:\n{text}");
-    assert!(text.contains("TEST PASSED"), "scoreboard did not pass:\n{text}");
+    assert!(
+        text.contains("TEST PASSED"),
+        "scoreboard did not pass:\n{text}"
+    );
     assert!(!text.contains("Fatal"), "fatal in run:\n{text}");
 }

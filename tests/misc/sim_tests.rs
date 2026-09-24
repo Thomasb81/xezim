@@ -938,14 +938,16 @@ fn test_sv2023_triple_quoted_string_literal() {
     sv_parser::set_sv2023(true);
     // IEEE 1800-2023 §5.9: triple-quoted strings allow embedded `"`
     // and span without needing newline-continuation. We exercise both.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         module test;
             initial begin
                 $display("""hello "world" end""");
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let m = &sim.output[0].message;
     assert!(m.contains("hello \"world\" end"), "{}", m);
 }
@@ -956,7 +958,8 @@ fn test_sv2023_ref_static_task_arg() {
     // IEEE 1800-2023 §13.5.2: `ref static` arg-direction. We accept the
     // syntax and execute it like `ref`; the test asserts the callee
     // mutation is visible in the caller.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         module test;
             int x;
             task automatic bump(ref static int v);
@@ -969,7 +972,8 @@ fn test_sv2023_ref_static_task_arg() {
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let m = &sim.output[0].message;
     assert!(m.contains("x=12"), "{}", m);
 }
@@ -978,14 +982,16 @@ fn test_sv2023_ref_static_task_arg() {
 fn test_sv2023_global_clock() {
     sv_parser::set_sv2023(true);
     // IEEE 1800-2023 §16.16.1.1: $global_clock stub.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         module test;
             initial begin
                 $display("g=%0d", $global_clock);
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let m = &sim.output[0].message;
     assert!(m.contains("g=0"), "{}", m);
 }
@@ -995,7 +1001,8 @@ fn test_sv2023_gclk_sampled_value_fns() {
     sv_parser::set_sv2023(true);
     // IEEE 1800-2023 §16.16.1.2 / §16.16.1.3: gclk sampled-value
     // control functions. Outside an assertion context they return 1'b0.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         module test;
             initial begin
                 $display("r=%0d f=%0d s=%0d c=%0d p=%0d n=%0d",
@@ -1005,7 +1012,8 @@ fn test_sv2023_gclk_sampled_value_fns() {
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let m = &sim.output[0].message;
     assert!(m.contains("r=0 f=0 s=0 c=0 p=0 n=0"), "{}", m);
 }
@@ -1014,7 +1022,8 @@ fn test_sv2023_gclk_sampled_value_fns() {
 fn test_sv2023_final_class_method() {
     sv_parser::set_sv2023(true);
     // IEEE 1800-2023 §8.20.5: `final` qualifier on a virtual method.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         class Base;
             virtual function :final void hello();
                 $display("hi");
@@ -1027,7 +1036,8 @@ fn test_sv2023_final_class_method() {
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let m = &sim.output[0].message;
     assert!(m.contains("hi"), "{}", m);
 }
@@ -1056,7 +1066,11 @@ fn test_sv2023_final_method_override_rejected() {
     "#,
         100_000,
     );
-    assert!(res.is_err(), "expected elaboration error, got {:?}", res.map(|_| ()));
+    assert!(
+        res.is_err(),
+        "expected elaboration error, got {:?}",
+        res.map(|_| ())
+    );
     let msg = res.err().unwrap();
     assert!(
         msg.contains("final") && msg.contains("hello"),
@@ -1090,14 +1104,16 @@ fn test_sv2023_endmodule_label_mismatch_rejected() {
 fn test_sv2023_endmodule_label_match_ok() {
     sv_parser::set_sv2023(true);
     // Positive: matched end-label parses cleanly.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         module foo;
             initial begin
                 $display("ok");
                 $finish;
             end
         endmodule : foo
-    "#);
+    "#,
+    );
     assert!(sim.output[0].message.contains("ok"));
 }
 
@@ -1132,7 +1148,8 @@ fn test_sv2023_endfunction_label_mismatch_rejected() {
 fn test_sv2023_unique0_case_multi_match_warns() {
     sv_parser::set_sv2023(true);
     // IEEE 1800-2023 §12.5.3: unique0 with >1 matching items is a violation.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         module test;
             logic [3:0] x;
             initial begin
@@ -1144,10 +1161,12 @@ fn test_sv2023_unique0_case_multi_match_warns() {
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let all: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
     assert!(
-        all.iter().any(|m| m.contains("§12.5.3") && m.contains("unique0")),
+        all.iter()
+            .any(|m| m.contains("§12.5.3") && m.contains("unique0")),
         "missing violation: {:?}",
         all
     );
@@ -1158,7 +1177,8 @@ fn test_sv2023_unique_case_no_match_warns() {
     sv_parser::set_sv2023(true);
     // IEEE 1800-2023 §12.5.3: `unique case` with no matching item and no
     // default is a violation.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         module test;
             logic [3:0] x;
             initial begin
@@ -1170,7 +1190,8 @@ fn test_sv2023_unique_case_no_match_warns() {
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let all: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
     assert!(
         all.iter().any(|m| m.contains("no item matched")),
@@ -1183,7 +1204,8 @@ fn test_sv2023_unique_case_no_match_warns() {
 fn test_sv2023_type_param_extends_constraint() {
     sv_parser::set_sv2023(true);
     // IEEE 1800-2023 §6.20.2.1: type parameter with `extends` constraint.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         class Base; endclass
         class Sub extends Base; endclass
         module test #(type T extends Base = Sub);
@@ -1192,7 +1214,8 @@ fn test_sv2023_type_param_extends_constraint() {
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let m = &sim.output[0].message;
     assert!(m.contains("ok"), "{}", m);
 }
@@ -1202,14 +1225,16 @@ fn test_sv2023_inferred_clock_disable() {
     sv_parser::set_sv2023(true);
     // IEEE 1800-2023 §16.16: $inferred_clock / $inferred_disable. Outside
     // a property/sequence context we return 1'b0.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         module test;
             initial begin
                 $display("c=%0d d=%0d", $inferred_clock, $inferred_disable);
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let m = &sim.output[0].message;
     assert!(m.contains("c=0 d=0"), "{}", m);
 }
@@ -1231,7 +1256,8 @@ fn test_fork_join_none_shared_locals() {
     // The test uses a task-local int (not a module-level signal) so the
     // bug is exercised. Without the fix the wait deadlocks and the
     // watchdog fires at t=1000. With the fix the parent wakes at t=1.
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         module top;
            bit done;
 
@@ -1265,10 +1291,19 @@ fn test_fork_join_none_shared_locals() {
               $finish;
            end
         endmodule
-    "#);
-    let out: String = sim.output.iter().map(|o| o.message.clone() + "\n").collect();
+    "#,
+    );
+    let out: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone() + "\n")
+        .collect();
     assert!(out.contains("PASS"), "expected PASS, got:\n{}", out);
-    assert!(!out.contains("FAIL"), "unexpected FAIL (deadlock), got:\n{}", out);
+    assert!(
+        !out.contains("FAIL"),
+        "unexpected FAIL (deadlock), got:\n{}",
+        out
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -1282,7 +1317,8 @@ fn test_fork_join_none_shared_locals() {
 
 #[test]
 fn test_class_localparam_string_from_static_method() {
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         class C;
             localparam string prefix = "hello_world";
             static function string get_prefix();
@@ -1295,14 +1331,16 @@ fn test_class_localparam_string_from_static_method() {
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let m = &sim.output[0].message;
     assert!(m.contains("RESULT=hello_world"), "got: {}", m);
 }
 
 #[test]
 fn test_class_localparam_int_from_static_method() {
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         class C;
             localparam int WIDTH = 42;
             static function int get_width();
@@ -1315,14 +1353,16 @@ fn test_class_localparam_int_from_static_method() {
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let m = &sim.output[0].message;
     assert!(m.contains("WIDTH=42"), "got: {}", m);
 }
 
 #[test]
 fn test_class_localparam_from_instance_method() {
-    let sim = sim_ok(r#"
+    let sim = sim_ok(
+        r#"
         class C;
             localparam int W = 7;
             function int get_w();
@@ -1337,7 +1377,8 @@ fn test_class_localparam_from_instance_method() {
                 $finish;
             end
         endmodule
-    "#);
+    "#,
+    );
     let m = &sim.output[0].message;
     assert!(m.contains("IW=7"), "got: {}", m);
 }

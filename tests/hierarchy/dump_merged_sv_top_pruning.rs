@@ -58,7 +58,10 @@ const DESIGN: &[(&str, &str)] = &[
         "pkg_a.sv",
         "package pkg_a;\n  typedef struct packed { logic [7:0] d; logic v; } beat_t;\nendpackage\n",
     ),
-    ("pkg_unused.sv", "package pkg_unused;\n  parameter int NOPE = 1;\nendpackage\n"),
+    (
+        "pkg_unused.sv",
+        "package pkg_unused;\n  parameter int NOPE = 1;\nendpackage\n",
+    ),
     (
         "if_bus.sv",
         "interface bus_if;\n  logic clk;\n  modport mp (input clk);\nendinterface\n",
@@ -78,7 +81,10 @@ const DESIGN: &[(&str, &str)] = &[
         "module dut_top import pkg_a::*; (bus_if.mp b, output beat_t o);\n\
          mid u_mid (.clk(b.clk), .o(o));\nendmodule\n",
     ),
-    ("other_top.sv", "module other_top;\n  unrelated u_x ();\nendmodule\n"),
+    (
+        "other_top.sv",
+        "module other_top;\n  unrelated u_x ();\nendmodule\n",
+    ),
     (
         "unrelated.sv",
         "module unrelated;\n  import pkg_unused::*;\n  initial $display(\"nope %0d\", NOPE);\nendmodule\n",
@@ -125,7 +131,14 @@ fn top_selects_only_reachable_files() {
     got.sort();
     assert_eq!(
         got,
-        vec!["dut_top.sv", "if_bus.sv", "leaf.sv", "mid.sv", "pkg_a.sv", "tb.sv"],
+        vec![
+            "dut_top.sv",
+            "if_bus.sv",
+            "leaf.sv",
+            "mid.sv",
+            "pkg_a.sv",
+            "tb.sv"
+        ],
         "closure from tb"
     );
 }
@@ -172,7 +185,11 @@ fn pruned_dump_reruns_standalone() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(log.contains("$finish called"), "pruned dump did not run: {}", log);
+    assert!(
+        log.contains("$finish called"),
+        "pruned dump did not run: {}",
+        log
+    );
 }
 
 /// Classes in packages, an `interface class` (whose terminator is `endclass`,
@@ -209,7 +226,10 @@ fn class_packages_and_interface_class() {
             "interface class ifc_class;\n  pure virtual function int idv();\nendclass\n\
              interface dut_if;\n  logic clk;\nendinterface\n",
         ),
-        ("dut.sv", "module dut (dut_if vif);\n  always_ff @(posedge vif.clk) ;\nendmodule\n"),
+        (
+            "dut.sv",
+            "module dut (dut_if vif);\n  always_ff @(posedge vif.clk) ;\nendmodule\n",
+        ),
         (
             "tb_uvm.sv",
             "module tb_uvm;\n  import agent_pkg::*;\n  dut_if vif();\n\
@@ -223,10 +243,26 @@ fn class_packages_and_interface_class() {
     let got = sections(&merged);
     // `dut_if` is declared AFTER the interface class in iface.sv, so it is only
     // found at top level if the interface-class terminator was tracked right.
-    assert!(got.contains(&"iface.sv".to_string()), "iface.sv missing: {:?}", got);
-    assert!(got.contains(&"base_pkg.sv".to_string()), "base pkg missing: {:?}", got);
-    assert!(got.contains(&"agent_pkg.sv".to_string()), "agent pkg missing: {:?}", got);
-    assert!(!got.contains(&"sb_pkg.sv".to_string()), "unused pkg kept: {:?}", got);
+    assert!(
+        got.contains(&"iface.sv".to_string()),
+        "iface.sv missing: {:?}",
+        got
+    );
+    assert!(
+        got.contains(&"base_pkg.sv".to_string()),
+        "base pkg missing: {:?}",
+        got
+    );
+    assert!(
+        got.contains(&"agent_pkg.sv".to_string()),
+        "agent pkg missing: {:?}",
+        got
+    );
+    assert!(
+        !got.contains(&"sb_pkg.sv".to_string()),
+        "unused pkg kept: {:?}",
+        got
+    );
 
     let out = Command::new(xezim_bin())
         .args(["--simulate", "-s", "tb_uvm", "--max-time", "100ns"])
@@ -234,7 +270,11 @@ fn class_packages_and_interface_class() {
         .output()
         .expect("rerun");
     let log = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(log.contains("KIND simple SENT 1"), "pruned UVM-style dump: {}", log);
+    assert!(
+        log.contains("KIND simple SENT 1"),
+        "pruned UVM-style dump: {}",
+        log
+    );
 }
 
 /// A top that no input file declares (it may come from a `-v`/`-y` library):
@@ -247,7 +287,11 @@ fn unknown_top_falls_back_to_full_dump() {
     }
     let (merged, log) = dump("unknown", DESIGN, Some("no_such_module"));
     assert_eq!(sections(&merged).len(), DESIGN.len(), "should dump all");
-    assert!(log.contains("not declared by any input file"), "no warning: {}", log);
+    assert!(
+        log.contains("not declared by any input file"),
+        "no warning: {}",
+        log
+    );
 }
 
 /// A name that only appears inside a comment or a string literal must not pull
@@ -258,7 +302,10 @@ fn comments_and_strings_do_not_create_dependencies() {
         return;
     }
     let files: &[(&str, &str)] = &[
-        ("heavy.sv", "module heavy;\n  initial $display(\"heavy\");\nendmodule\n"),
+        (
+            "heavy.sv",
+            "module heavy;\n  initial $display(\"heavy\");\nendmodule\n",
+        ),
         (
             "small_tb.sv",
             "module small_tb;\n  // instantiate heavy here one day\n\
@@ -266,7 +313,11 @@ fn comments_and_strings_do_not_create_dependencies() {
         ),
     ];
     let (merged, _log) = dump("comments", files, Some("small_tb"));
-    assert_eq!(sections(&merged), vec!["small_tb.sv"], "comment pulled a file in");
+    assert_eq!(
+        sections(&merged),
+        vec!["small_tb.sv"],
+        "comment pulled a file in"
+    );
 }
 
 /// A file that declares NO design unit is never referenced by name, so a pure
@@ -296,7 +347,10 @@ fn unit_scope_and_bind_files_are_never_dropped() {
             "module chk (input logic clk, input word_t v);\n\
              always @(posedge clk) if (v === 16'hFFFF) $display(\"CHK\");\nendmodule\n",
         ),
-        ("bindfile.sv", "bind dut_a chk u_chk (.clk(clk), .v(val));\n"),
+        (
+            "bindfile.sv",
+            "bind dut_a chk u_chk (.clk(clk), .v(val));\n",
+        ),
         (
             "dut_a.sv",
             "module dut_a (input logic clk, output word_t val);\n\
@@ -312,10 +366,19 @@ fn unit_scope_and_bind_files_are_never_dropped() {
     let (merged, _log) = dump("unitscope", files, Some("tb2"));
     let got = sections(&merged);
     for needed in ["unit_scope.sv", "bindfile.sv", "tb2.sv", "dut_a.sv"] {
-        assert!(got.contains(&needed.to_string()), "{} dropped: {:?}", needed, got);
+        assert!(
+            got.contains(&needed.to_string()),
+            "{} dropped: {:?}",
+            needed,
+            got
+        );
     }
     // Reachable ONLY through the bind directive.
-    assert!(got.contains(&"checker_mod.sv".to_string()), "bind target dropped: {:?}", got);
+    assert!(
+        got.contains(&"checker_mod.sv".to_string()),
+        "bind target dropped: {:?}",
+        got
+    );
 
     // The decisive check: same answer as the unpruned build, not merely "it
     // compiles". Without the $unit file this printed VAL 1 instead of VAL x.
@@ -325,5 +388,9 @@ fn unit_scope_and_bind_files_are_never_dropped() {
         .output()
         .expect("rerun");
     let log = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(log.contains("VAL x"), "pruned dump changed the answer: {}", log);
+    assert!(
+        log.contains("VAL x"),
+        "pruned dump changed the answer: {}",
+        log
+    );
 }

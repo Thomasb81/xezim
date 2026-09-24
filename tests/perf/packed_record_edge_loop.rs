@@ -3,8 +3,7 @@ use std::process::Command;
 
 #[test]
 fn packed_record_member_loop_stays_compiled_and_matches() {
-    let source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/perf/packed_record_edge.sv");
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/perf/packed_record_edge.sv");
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .args([
             "--simulate",
@@ -19,7 +18,10 @@ fn packed_record_member_loop_stays_compiled_and_matches() {
 
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
-    assert!(output.status.success(), "packed record workload failed:\n{text}");
+    assert!(
+        output.status.success(),
+        "packed record workload failed:\n{text}"
+    );
     assert!(
         text.contains("PACKED_RECORD_OK"),
         "packed record values did not match:\n{text}"

@@ -56,7 +56,11 @@ fn merged_dump_readds_primary_referenced_only_from_library() {
     let dir = std::env::temp_dir().join("xezim_merged_adopted_primary");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir");
-    let (tb, leaf, lib) = (dir.join("tb.sv"), dir.join("leaf.sv"), dir.join("mid_lib.sv"));
+    let (tb, leaf, lib) = (
+        dir.join("tb.sv"),
+        dir.join("leaf.sv"),
+        dir.join("mid_lib.sv"),
+    );
     std::fs::write(&tb, TB).expect("w");
     std::fs::write(&leaf, LEAF).expect("w");
     std::fs::write(&lib, MID_LIB).expect("w");

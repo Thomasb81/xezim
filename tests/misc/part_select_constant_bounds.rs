@@ -20,13 +20,20 @@ fn variable_bound_in_constant_part_select_is_an_error() {
         ("comb", "always_comb r = d[k:0];"),
         ("assign", "assign w = d[k:0];"),
     ] {
-        let (proc_body, item) = if body.starts_with("r = ") { (body, "") } else { ("", body) };
+        let (proc_body, item) = if body.starts_with("r = ") {
+            (body, "")
+        } else {
+            ("", body)
+        };
         let src = format!(
             "module top;\n  logic [7:0] d = 8'hB7; int k = 3, m = 1; logic [3:0] r; wire [3:0] w;\n  {}\n  initial begin {} end\nendmodule\n",
             item, proc_body
         );
         let e = errs(&src);
-        assert!(e.contains("must be constant"), "{tag}: expected the §11.5.1 error, got: {e:?}");
+        assert!(
+            e.contains("must be constant"),
+            "{tag}: expected the §11.5.1 error, got: {e:?}"
+        );
     }
 }
 

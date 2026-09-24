@@ -26,5 +26,8 @@ endmodule
         .map(|o| o.message.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(text.contains("HITS=0"), "compiled expression was widened:\n{text}");
+    assert!(
+        text.contains("HITS=0"),
+        "compiled expression was widened:\n{text}"
+    );
 }

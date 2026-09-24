@@ -100,9 +100,17 @@ fn select_semantics_11_5_1() {
     assert_eq!(s(&sim, "c_up"), "xxxx", "d8[xi +: 4]");
     assert_eq!(s(&sim, "c_dn"), "xxxx", "d8[xi -: 4]");
     assert_eq!(s(&sim, "c_dbit"), "x", "v[2] on [10:3]");
-    assert_eq!(s(&sim, "c_drng"), "101x", "v[5:2] on [10:3]: label 2 is out of range, 5..3 read");
+    assert_eq!(
+        s(&sim, "c_drng"),
+        "101x",
+        "v[5:2] on [10:3]: label 2 is out of range, 5..3 read"
+    );
     assert_eq!(s(&sim, "c_nbit"), "x", "d8[-1]");
-    assert_eq!(s(&sim, "c_hrng"), "xx10", "v[12:9]: labels 12,11 past the MSB");
+    assert_eq!(
+        s(&sim, "c_hrng"),
+        "xx10",
+        "v[12:9]: labels 12,11 past the MSB"
+    );
     assert_eq!(s(&sim, "c_frng"), "xx10", "d8[9:6]: bits 9,8 past the MSB");
     // interpreter: same rules
     assert_eq!(s(&sim, "r_dbit"), "x");
@@ -116,7 +124,11 @@ fn select_semantics_11_5_1() {
     assert_eq!(s(&sim, "r_a11"), "0000000x");
     assert_eq!(s(&sim, "r_adx"), "0000000x");
     // ascending vector writes
-    assert_eq!(s(&sim, "r_aw1"), "01010000", "a[4:6] = 101 lands on bits 6..4");
+    assert_eq!(
+        s(&sim, "r_aw1"),
+        "01010000",
+        "a[4:6] = 101 lands on bits 6..4"
+    );
     assert_eq!(s(&sim, "r_aw8"), "10000000", "a[3] is the MSB");
     assert_eq!(s(&sim, "r_aw10"), "00000001", "a[10] is the LSB");
     assert_eq!(s(&sim, "r_aw2"), "00000000", "out-of-range write discarded");
@@ -125,5 +137,9 @@ fn select_semantics_11_5_1() {
     assert_eq!(s(&sim, "r_pe7"), "xxxxxxxx", "x element index");
     assert_eq!(s(&sim, "r_pe4"), "xxxxxxxx", "element below range");
     assert_eq!(s(&sim, "r_pe3"), "xxxxxxxx", "element above range");
-    assert_eq!(s(&sim, "r_pe8"), "0000111110100101", "x-index element store discarded");
+    assert_eq!(
+        s(&sim, "r_pe8"),
+        "0000111110100101",
+        "x-index element store discarded"
+    );
 }

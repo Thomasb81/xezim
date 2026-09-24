@@ -51,7 +51,11 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "sv") as i32, -2, "signed base type");
     assert_eq!(u(&sim, "uv"), 65534, "unsigned base type unchanged");
-    assert_eq!(u(&sim, "dv") as i32, -1, "default enum base is int (signed)");
+    assert_eq!(
+        u(&sim, "dv") as i32,
+        -1,
+        "default enum base is int (signed)"
+    );
     assert_eq!(u(&sim, "first_neg"), 1, "es.first() must be negative");
     assert_eq!(u(&sim, "cmp"), 1, "$signed() of an unsigned-base member");
 }

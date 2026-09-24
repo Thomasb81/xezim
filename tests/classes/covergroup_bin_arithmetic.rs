@@ -39,7 +39,11 @@ endmodule
     )
     .expect("simulate failed");
     let o: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
-    assert!(o.iter().any(|l| l.contains("COV cg=97.22 op=100.00 mode=100.00 x=91.67")), "{o:?}");
+    assert!(
+        o.iter()
+            .any(|l| l.contains("COV cg=97.22 op=100.00 mode=100.00 x=91.67")),
+        "{o:?}"
+    );
 }
 
 /// Automatic bins above `auto_bin_max`, array bins minus `ignore_bins`, a
@@ -87,11 +91,14 @@ endmodule
     .expect("simulate failed");
     let o: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
-        o.iter().any(|l| l.contains("COV2 g1=80.64 big=59.38 a=100.00 b=75.00 xab=60.71 xac=100.00")),
+        o.iter()
+            .any(|l| l.contains("COV2 g1=80.64 big=59.38 a=100.00 b=75.00 xab=60.71 xac=100.00")),
         "{o:?}"
     );
     assert!(
-        o.iter().any(|l| l.contains("COV2 g2a_inst=100.00 g2b_inst=60.00 g2_type=80.00 g2a_cp_inst=100.00")),
+        o.iter()
+            .any(|l| l
+                .contains("COV2 g2a_inst=100.00 g2b_inst=60.00 g2_type=80.00 g2a_cp_inst=100.00")),
         "{o:?}"
     );
 }
@@ -131,6 +138,9 @@ endmodule
         "M2 a=12.50 b=12.50 type=12.50",
         "M3 p=25.00 q=0.00 type=12.50",
     ] {
-        assert!(o.iter().any(|l| l.contains(want)), "missing `{want}`: {o:?}");
+        assert!(
+            o.iter().any(|l| l.contains(want)),
+            "missing `{want}`: {o:?}"
+        );
     }
 }

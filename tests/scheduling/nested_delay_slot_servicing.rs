@@ -51,7 +51,11 @@ fn run(tag: &str) -> (Vec<String>, Vec<u64>) {
     // Tests in a group share one process, so the path must be per-test or the
     // three runs clobber each other's dump.
     let mut path = std::env::temp_dir();
-    path.push(format!("xezim_slot_service_{}_{}.vcd", tag, std::process::id()));
+    path.push(format!(
+        "xezim_slot_service_{}_{}.vcd",
+        tag,
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&path);
 
     let src = SRC.replace("@VCD@", path.to_str().unwrap());

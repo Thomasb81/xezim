@@ -17,14 +17,11 @@ use xezim_core::elaborate;
 
 // Re-export xezim-core surface so existing `xezim::...` paths keep working.
 pub use xezim_core::{
-    adopted_lib_files, ast, diagnostics, lexer, log_eprintln, log_println, parse, parse_and_elaborate_multi,
-    preprocess_adopted_lib,
-    parse_str, preprocessor, progress_clear, progress_status, read_compiled,
-    set_compile_verbose, set_implicit_net_warn, set_library_cli, set_strict_top,
-    set_module_timescale_cli, sv_parser,
-    LibraryCli,
-    tokenize_file, write_compiled, ModuleTimescaleCli, ParseResult, SourceDefinition,
-    XEZIM_BYTECODE_MAGIC,
+    LibraryCli, ModuleTimescaleCli, ParseResult, SourceDefinition, XEZIM_BYTECODE_MAGIC,
+    adopted_lib_files, ast, diagnostics, lexer, log_eprintln, log_println, parse,
+    parse_and_elaborate_multi, parse_str, preprocess_adopted_lib, preprocessor, progress_clear,
+    progress_status, read_compiled, set_compile_verbose, set_implicit_net_warn, set_library_cli,
+    set_module_timescale_cli, set_strict_top, sv_parser, tokenize_file, write_compiled,
 };
 
 /// Content-addressed cache for elaborated designs. The payload uses the
@@ -130,11 +127,14 @@ fn design_cache_key(
         hash.text(dir);
     }
     for (name, value) in defines {
-        pp.define(name.clone(), preprocessor::MacroDef {
-            name: name.clone(),
-            params: None,
-            body: value.clone().unwrap_or_default(),
-        });
+        pp.define(
+            name.clone(),
+            preprocessor::MacroDef {
+                name: name.clone(),
+                params: None,
+                body: value.clone().unwrap_or_default(),
+            },
+        );
         hash.text(name);
         hash.text(value.as_deref().unwrap_or(""));
     }
@@ -166,11 +166,14 @@ fn design_cache_key(
                     dep_pp.add_include_dir(std::path::PathBuf::from(dir));
                 }
                 for (name, value) in defines {
-                    dep_pp.define(name.clone(), preprocessor::MacroDef {
-                        name: name.clone(),
-                        params: None,
-                        body: value.clone().unwrap_or_default(),
-                    });
+                    dep_pp.define(
+                        name.clone(),
+                        preprocessor::MacroDef {
+                            name: name.clone(),
+                            params: None,
+                            body: value.clone().unwrap_or_default(),
+                        },
+                    );
                 }
                 hash.text(&dep_pp.preprocess_file(&source, Some(&path)));
             }
@@ -197,7 +200,11 @@ fn read_design_cache(config: &DesignCacheConfig, key: &str) -> Option<elaborate:
             None
         }
         Err(err) => {
-            eprintln!("[CACHE] cannot load {}: {}; rebuilding", path.display(), err);
+            eprintln!(
+                "[CACHE] cannot load {}: {}; rebuilding",
+                path.display(),
+                err
+            );
             let _ = std::fs::remove_file(path);
             None
         }
@@ -206,12 +213,17 @@ fn read_design_cache(config: &DesignCacheConfig, key: &str) -> Option<elaborate:
 
 fn write_design_cache(config: &DesignCacheConfig, key: &str, elab: &elaborate::ElaboratedModule) {
     if let Err(err) = std::fs::create_dir_all(&config.directory) {
-        eprintln!("[CACHE] cannot create {}: {}; continuing without cache",
-                  config.directory.display(), err);
+        eprintln!(
+            "[CACHE] cannot create {}: {}; continuing without cache",
+            config.directory.display(),
+            err
+        );
         return;
     }
     let final_path = config.directory.join(format!("{}.xezbc", key));
-    let temp_path = config.directory.join(format!(".{}.{}.tmp", key, std::process::id()));
+    let temp_path = config
+        .directory
+        .join(format!(".{}.{}.tmp", key, std::process::id()));
     if let Err(err) = write_compiled(elab, temp_path.to_string_lossy().as_ref()) {
         eprintln!("[CACHE] cannot write {}: {}", temp_path.display(), err);
         let _ = std::fs::remove_file(temp_path);
@@ -251,23 +263,34 @@ mod design_cache_tests {
             semantic_salt: "sv2023=true;strict=true".to_string(),
             dependency_files: Vec::new(),
         };
-        assert_eq!(key(&base, "module top; endmodule", Some("top")),
-                   key(&base, "module top; endmodule", Some("top")));
-        assert_ne!(key(&base, "module top; endmodule", Some("top")),
-                   key(&base, "module top; wire x; endmodule", Some("top")));
-        assert_ne!(key(&base, "module top; endmodule", Some("top")),
-                   key(&base, "module top; endmodule", Some("other")));
+        assert_eq!(
+            key(&base, "module top; endmodule", Some("top")),
+            key(&base, "module top; endmodule", Some("top"))
+        );
+        assert_ne!(
+            key(&base, "module top; endmodule", Some("top")),
+            key(&base, "module top; wire x; endmodule", Some("top"))
+        );
+        assert_ne!(
+            key(&base, "module top; endmodule", Some("top")),
+            key(&base, "module top; endmodule", Some("other"))
+        );
 
         let mut different_mode = base.clone();
         different_mode.semantic_salt = "sv2023=false;strict=true".to_string();
-        assert_ne!(key(&base, "module top; endmodule", Some("top")),
-                   key(&different_mode, "module top; endmodule", Some("top")));
+        assert_ne!(
+            key(&base, "module top; endmodule", Some("top")),
+            key(&different_mode, "module top; endmodule", Some("top"))
+        );
     }
 
     #[test]
     fn design_cache_key_tracks_library_contents() {
-        let unique = format!("xezim-cache-key-{}-{:?}.sv", std::process::id(),
-                             std::thread::current().id());
+        let unique = format!(
+            "xezim-cache-key-{}-{:?}.sv",
+            std::process::id(),
+            std::thread::current().id()
+        );
         let path = std::env::temp_dir().join(unique);
         std::fs::write(&path, "module cell; endmodule\n").unwrap();
         let config = DesignCacheConfig {
@@ -284,8 +307,11 @@ mod design_cache_tests {
 
     #[test]
     fn design_cache_key_tracks_included_contents() {
-        let unique = format!("xezim-cache-include-{}-{:?}", std::process::id(),
-                             std::thread::current().id());
+        let unique = format!(
+            "xezim-cache-include-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
         let dir = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&dir).unwrap();
         let header = dir.join("defs.svh");
@@ -299,13 +325,21 @@ mod design_cache_tests {
         let source_path = dir.join("design.sv").to_string_lossy().into_owned();
         let include_dir = dir.to_string_lossy().into_owned();
         let before = design_cache_key(
-            &config, &[source.to_string()], &[source_path.clone()], Some("top"),
-            &[include_dir.clone()], &[],
+            &config,
+            &[source.to_string()],
+            &[source_path.clone()],
+            Some("top"),
+            &[include_dir.clone()],
+            &[],
         );
         std::fs::write(&header, "`define WIDTH 16\n").unwrap();
         let after = design_cache_key(
-            &config, &[source.to_string()], &[source_path], Some("top"),
-            &[include_dir], &[],
+            &config,
+            &[source.to_string()],
+            &[source_path],
+            Some("top"),
+            &[include_dir],
+            &[],
         );
         let _ = std::fs::remove_dir_all(dir);
         assert_ne!(before, after);
@@ -407,7 +441,11 @@ fn elab_classifies_const(
         ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
         ExprKind::Ident(hier) => {
             let last = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            let base = hier.path.first().map(|s| s.name.name.as_str()).unwrap_or("");
+            let base = hier
+                .path
+                .first()
+                .map(|s| s.name.name.as_str())
+                .unwrap_or("");
             has_param(last) || (hier.path.len() > 1 && has_param(base))
         }
         ExprKind::Unary { operand, .. } => elab_classifies_const(operand, elab, scope),
@@ -483,8 +521,7 @@ fn walk_module_static_inits(
                         continue;
                     }
                     let Some(init) = &d.init else { continue };
-                    if contains_simtime_syscall(init) && elab_classifies_const(init, elab, scope)
-                    {
+                    if contains_simtime_syscall(init) && elab_classifies_const(init, elab, scope) {
                         out.push(elaborate::InitialBlock {
                             stmt: Statement::new(
                                 StatementKind::BlockingAssign {
@@ -617,7 +654,11 @@ fn reinstall_ooc_constraint_bodies(
             {
                 continue;
             }
-            if let Some(cd) = elab.classes.get_mut(class_name).map(std::sync::Arc::make_mut) {
+            if let Some(cd) = elab
+                .classes
+                .get_mut(class_name)
+                .map(std::sync::Arc::make_mut)
+            {
                 if let Some(con) = cd.constraints.get_mut(constraint_name) {
                     con.items = items.clone();
                     con.has_body = true;
@@ -718,11 +759,29 @@ pub fn simulate_multi(
         .unwrap_or(1024);
     if stack_mb == 0 {
         return simulate_multi_inner(
-            sources, max_time, top_module_name, include_dirs, source_paths,
-            settle_limit, activity_mon, sdf_file, sdf_select, defines, plusargs,
-            xtrace_file, xtrace_scopes, xtrace_from_ns, xtrace_to_ns,
-            fst_file, fst_scopes, emit_hypergraph, load_partition, write_profile,
-            profile_input, collapse_islands, multikernel_scope,
+            sources,
+            max_time,
+            top_module_name,
+            include_dirs,
+            source_paths,
+            settle_limit,
+            activity_mon,
+            sdf_file,
+            sdf_select,
+            defines,
+            plusargs,
+            xtrace_file,
+            xtrace_scopes,
+            xtrace_from_ns,
+            xtrace_to_ns,
+            fst_file,
+            fst_scopes,
+            emit_hypergraph,
+            load_partition,
+            write_profile,
+            profile_input,
+            collapse_islands,
+            multikernel_scope,
         );
     }
     // `Simulator` is not auto-`Send`: it carries raw pointers into its OWN
@@ -740,11 +799,28 @@ pub fn simulate_multi(
             .stack_size(stack_mb * 1024 * 1024)
             .spawn_scoped(scope, || {
                 SendResult(simulate_multi_inner(
-                    sources, max_time, top_module_name, include_dirs, source_paths,
-                    settle_limit, activity_mon, sdf_file, sdf_select, defines,
-                    plusargs, xtrace_file, xtrace_scopes, xtrace_from_ns,
-                    xtrace_to_ns, fst_file, fst_scopes, emit_hypergraph,
-                    load_partition, write_profile, profile_input, collapse_islands,
+                    sources,
+                    max_time,
+                    top_module_name,
+                    include_dirs,
+                    source_paths,
+                    settle_limit,
+                    activity_mon,
+                    sdf_file,
+                    sdf_select,
+                    defines,
+                    plusargs,
+                    xtrace_file,
+                    xtrace_scopes,
+                    xtrace_from_ns,
+                    xtrace_to_ns,
+                    fst_file,
+                    fst_scopes,
+                    emit_hypergraph,
+                    load_partition,
+                    write_profile,
+                    profile_input,
+                    collapse_islands,
                     multikernel_scope,
                 ))
             })
@@ -793,8 +869,14 @@ fn simulate_multi_inner(
     let cache = design_cache_config();
     let mut cache_pp_texts: Vec<String> = Vec::new();
     let cache_key = cache.as_ref().map(|config| {
-        let (key, texts) =
-            design_cache_key(config, &sources, source_paths, top_module_name, include_dirs, defines);
+        let (key, texts) = design_cache_key(
+            config,
+            &sources,
+            source_paths,
+            top_module_name,
+            include_dirs,
+            defines,
+        );
         cache_pp_texts = texts;
         key
     });
@@ -874,9 +956,7 @@ fn simulate_multi_inner(
 
     let mut sim = compiler::Simulator::new(elab, max_time);
     if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
-        sim.set_prepared_comb_cache_path(Some(
-            config.directory.join(format!("{}.xezcomb", key)),
-        ));
+        sim.set_prepared_comb_cache_path(Some(config.directory.join(format!("{}.xezcomb", key))));
     }
     if let Some(limit) = settle_limit {
         sim.settle_limit = limit;
@@ -1230,8 +1310,7 @@ pub fn pdes_c910_stub_multi(
     // no write and no deferred NBA. mismatched/unsupported must be 0 for the
     // per-LP settle to be sound.
     let chk_start = std::time::Instant::now();
-    let (checked, bits_mismatch, repr_diff, unsupported, deferred) =
-        sim.pdes_check_comb_isolated();
+    let (checked, bits_mismatch, repr_diff, unsupported, deferred) = sim.pdes_check_comb_isolated();
     eprintln!(
         "[PHASE] PDES isolated-comb check: {:.1}ms",
         chk_start.elapsed().as_secs_f64() * 1000.0
@@ -1265,7 +1344,10 @@ pub fn pdes_c910_stub_multi(
         "[PDES-SETTLE-MT semantic] LP-A={}/LP-B={} entries, mismatches={}, unsupported={}, settle_seq={:.1}ms, settle_par={:.1}ms, speedup={:.2}x, view_clone={:.1}ms",
         part.lp_entries[0].len(),
         part.lp_entries[1].len(),
-        t_mismatch, t_unsup, seq_ms, par_ms,
+        t_mismatch,
+        t_unsup,
+        seq_ms,
+        par_ms,
         if par_ms > 0.0 { seq_ms / par_ms } else { 0.0 },
         clone_ms
     );
@@ -1288,8 +1370,16 @@ pub fn pdes_c910_stub_multi(
             sim.pdes_boundary_lookahead_report(lp_a_prefix);
         eprintln!(
             "[PDES-LOOKAHEAD] boundary={}, comb_consumed(TRUE blocker)={} [producer: comb={} both={} undriven={}] -> {}",
-            nb, comb_consumed, prod_comb, prod_both, prod_undr,
-            if comb_consumed == 0 { "GO: lookahead-1 sound" } else { "co-locate these cones" }
+            nb,
+            comb_consumed,
+            prod_comb,
+            prod_both,
+            prod_undr,
+            if comb_consumed == 0 {
+                "GO: lookahead-1 sound"
+            } else {
+                "co-locate these cones"
+            }
         );
         if !comb_names.is_empty() {
             eprintln!("[PDES-LOOKAHEAD] comb-consumed-across-cut signals (sample):");
@@ -1300,13 +1390,19 @@ pub fn pdes_c910_stub_multi(
 
         // Phase A.2: cycle-vs-feedforward analysis of the cross-LP coupling.
         let ca_start = std::time::Instant::now();
-        let (a2b, b2a, max_cross, rounds, converged) =
-            sim.pdes_crosslp_cycle_analysis(lp_a_prefix);
+        let (a2b, b2a, max_cross, rounds, converged) = sim.pdes_crosslp_cycle_analysis(lp_a_prefix);
         eprintln!(
             "[PDES-CYCLE] cross-LP comb edges: A->B={}, B->A={} ({}) | wavefront max_crossings={}, rounds={}, converged={} ({})",
-            a2b, b2a,
-            if a2b == 0 || b2a == 0 { "UNIDIRECTIONAL/feedforward" } else { "BIDIRECTIONAL" },
-            max_cross, rounds, converged,
+            a2b,
+            b2a,
+            if a2b == 0 || b2a == 0 {
+                "UNIDIRECTIONAL/feedforward"
+            } else {
+                "BIDIRECTIONAL"
+            },
+            max_cross,
+            rounds,
+            converged,
             if !converged {
                 "COMB CYCLE (or depth>cap) — iteration may not terminate"
             } else if max_cross <= 1 {
@@ -1332,7 +1428,10 @@ pub fn pdes_c910_stub_multi(
         let (e_nba, e_mismatch, e_seq, e_par) = sim.pdes_validate_perlp_edge_threaded(&ep);
         eprintln!(
             "[PDES-EDGE-MT] nba_writes={}, mismatches={}, exec_seq={:.1}ms, exec_par={:.1}ms, speedup={:.2}x (shared snapshot, no clone)",
-            e_nba, e_mismatch, e_seq, e_par,
+            e_nba,
+            e_mismatch,
+            e_seq,
+            e_par,
             if e_par > 0.0 { e_seq / e_par } else { 0.0 }
         );
 
@@ -1351,8 +1450,16 @@ pub fn pdes_c910_stub_multi(
             }
             eprintln!(
                 "[PDES-EDGE-SCALE] threads={}: nba={}, mismatches={}, seq={:.2}ms, par={:.2}ms, speedup={:.2}x",
-                nt, nba, mm, best_seq, best_par,
-                if best_par > 0.0 { best_seq / best_par } else { 0.0 }
+                nt,
+                nba,
+                mm,
+                best_seq,
+                best_par,
+                if best_par > 0.0 {
+                    best_seq / best_par
+                } else {
+                    0.0
+                }
             );
         }
 
@@ -1367,7 +1474,9 @@ pub fn pdes_c910_stub_multi(
             bal.dep_edges_cross_lp,
             if bal.dep_edges_total > 0 {
                 100.0 * bal.dep_edges_cross_lp as f64 / bal.dep_edges_total as f64
-            } else { 0.0 },
+            } else {
+                0.0
+            },
             bal.boundary_signal_ids.len(),
         );
         let (b_mismatch, b_unsup, b_seq, b_par, b_clone) =
@@ -1376,7 +1485,10 @@ pub fn pdes_c910_stub_multi(
             "[PDES-SETTLE-MT balanced] LP-0={}/LP-1={} entries, mismatches={}, unsupported={}, settle_seq={:.1}ms, settle_par={:.1}ms, speedup={:.2}x, view_clone={:.1}ms",
             bal.lp_entries[0].len(),
             bal.lp_entries[1].len(),
-            b_mismatch, b_unsup, b_seq, b_par,
+            b_mismatch,
+            b_unsup,
+            b_seq,
+            b_par,
             if b_par > 0.0 { b_seq / b_par } else { 0.0 },
             b_clone
         );
@@ -1390,7 +1502,11 @@ pub fn pdes_c910_stub_multi(
             let (m, e_nba, t_seq, t_par) = sim.pdes_validate_perlp_tick(cp, &ep);
             eprintln!(
                 "[PDES-TICK {}] edge_nba={}, mismatches={}, tick_seq={:.1}ms, tick_par={:.1}ms, speedup={:.2}x",
-                label, e_nba, m, t_seq, t_par,
+                label,
+                e_nba,
+                m,
+                t_seq,
+                t_par,
                 if t_par > 0.0 { t_seq / t_par } else { 0.0 }
             );
         }
@@ -1407,7 +1523,10 @@ pub fn pdes_c910_stub_multi(
                 sim.pdes_validate_parallel_multitick(&part, &ep, n_ticks, et);
             eprintln!(
                 "[PDES-MULTITICK et={}] {} ticks: seq={:.1}ms par={:.1}ms speedup={:.2}x, final_mismatch={} (settle 2-way, edge {}-way, boundary channel, clone-free/tick)",
-                et, n_ticks, mt_seq, mt_par,
+                et,
+                n_ticks,
+                mt_seq,
+                mt_par,
                 if mt_par > 0.0 { mt_seq / mt_par } else { 0.0 },
                 per_tick_mm.last().copied().unwrap_or(0),
                 et

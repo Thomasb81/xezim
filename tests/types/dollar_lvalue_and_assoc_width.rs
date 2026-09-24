@@ -62,7 +62,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "r_blk"), 77, "blocking q[$] must hit the last element");
+    assert_eq!(
+        u(&sim, "r_blk"),
+        77,
+        "blocking q[$] must hit the last element"
+    );
     assert_eq!(u(&sim, "r_nba"), 88, "non-blocking q[$] must too");
     assert_eq!(u(&sim, "r_const"), 99, "constant index unaffected");
     assert_eq!(u(&sim, "sz"), 2, "writing q[$] must not grow the queue");
@@ -188,8 +192,16 @@ endmodule
     let sim = simulate(src, 40).expect("simulate failed");
     assert_eq!(u(&sim, "first"), 0x03, "untouched element");
     assert_eq!(u(&sim, "sz"), 2, "queue size unchanged by the writes");
-    assert_eq!(u(&sim, "hit"), 99, "inner `$` resolves against the QUEUE, not the array");
-    assert_eq!(u(&sim, "untouched"), 0, "the outer array's own bound was not used");
+    assert_eq!(
+        u(&sim, "hit"),
+        99,
+        "inner `$` resolves against the QUEUE, not the array"
+    );
+    assert_eq!(
+        u(&sim, "untouched"),
+        0,
+        "the outer array's own bound was not used"
+    );
 }
 
 /// An assoc array declared in a CLASS must not take its width from a
@@ -219,7 +231,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "cls_val"), 0xEF, "the 8-bit class member keeps its value");
+    assert_eq!(
+        u(&sim, "cls_val"),
+        0xEF,
+        "the 8-bit class member keeps its value"
+    );
     assert_eq!(u(&sim, "mod_val"), 0xF, "the 4-bit module array truncates");
 }
 
@@ -247,5 +263,8 @@ endmodule
         .expect("u1.seen not found")
         .to_u64()
         .expect("not u64-able");
-    assert_eq!(v, 0xF, "submodule assoc element truncates to its declared width");
+    assert_eq!(
+        v, 0xF,
+        "submodule assoc element truncates to its declared width"
+    );
 }

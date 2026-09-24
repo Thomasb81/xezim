@@ -30,8 +30,16 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "kf"), 10, "first is the small key, not lexicographic");
-    assert_eq!(u(&sim, "kl"), u64::MAX, "last returns the key value, not its string bytes");
+    assert_eq!(
+        u(&sim, "kf"),
+        10,
+        "first is the small key, not lexicographic"
+    );
+    assert_eq!(
+        u(&sim, "kl"),
+        u64::MAX,
+        "last returns the key value, not its string bytes"
+    );
     assert_eq!(u(&sim, "ex"), 1);
 }
 
@@ -72,6 +80,10 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "direct_v"), 11, "element aliases the object, not a copy");
+    assert_eq!(
+        u(&sim, "direct_v"),
+        11,
+        "element aliases the object, not a copy"
+    );
     assert_eq!(u(&sim, "elem_v"), 11);
 }

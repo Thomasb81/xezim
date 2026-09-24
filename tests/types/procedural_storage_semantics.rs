@@ -75,13 +75,29 @@ fn procedural_storage_semantics() {
     assert_eq!(i(&sim, "r_2d"), -1, "2-D int element value");
     assert_eq!(i(&sim, "r_2d_lt"), 1, "2-D int element signed compare");
     assert_eq!(i(&sim, "r_aq"), -8, "array-of-queue element value");
-    assert_eq!(i(&sim, "r_aq_lt"), 1, "array-of-queue element signed compare");
-    assert_eq!(i(&sim, "r_ps"), 0xb4, "block-local part+bit-select writes land");
+    assert_eq!(
+        i(&sim, "r_aq_lt"),
+        1,
+        "array-of-queue element signed compare"
+    );
+    assert_eq!(
+        i(&sim, "r_ps"),
+        0xb4,
+        "block-local part+bit-select writes land"
+    );
     assert_eq!(i(&sim, "r_k0"), -7, "foreach assoc first key numeric order");
     assert_eq!(i(&sim, "r_v0"), 70, "foreach assoc value at negative key");
     assert_eq!(i(&sim, "r_k1"), 3, "foreach assoc second key");
     assert_eq!(i(&sim, "r_v1"), 30, "foreach assoc second value");
-    assert_eq!(i(&sim, "r_na"), 2, "default recurses into struct member (a)");
-    assert_eq!(i(&sim, "r_nb"), 2, "default recurses into struct member (b)");
+    assert_eq!(
+        i(&sim, "r_na"),
+        2,
+        "default recurses into struct member (a)"
+    );
+    assert_eq!(
+        i(&sim, "r_nb"),
+        2,
+        "default recurses into struct member (b)"
+    );
     assert_eq!(i(&sim, "r_nk"), 2, "default fills scalar member");
 }

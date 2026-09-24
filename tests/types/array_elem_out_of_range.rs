@@ -34,8 +34,16 @@ fn out_of_range_element_reads_are_all_x_at_element_width() {
   end
 endmodule",
     );
-    assert!(msgs.iter().any(|m| m == "OOB xxxxxxxx xxxxxxxx xxxxxxxx xxxxxxxx xxxxxxxx"), "{msgs:?}");
-    assert!(msgs.iter().any(|m| m == "IN 00000005 00000005 00000005 00000005"), "{msgs:?}");
+    assert!(
+        msgs.iter()
+            .any(|m| m == "OOB xxxxxxxx xxxxxxxx xxxxxxxx xxxxxxxx xxxxxxxx"),
+        "{msgs:?}"
+    );
+    assert!(
+        msgs.iter()
+            .any(|m| m == "IN 00000005 00000005 00000005 00000005"),
+        "{msgs:?}"
+    );
 }
 
 /// 256-bit elements: an in-range read, a read that walks out of range, and
@@ -69,7 +77,8 @@ fn wide_element_reads_match_four_state() {
 endmodule",
     );
     assert!(
-        msgs.iter().any(|m| m == "W 3000cafe3000caf6 3000cafe xxxxxxxxxxxxxxxx xxxxxxxxxxxxxxxx 0000000000000000 12"),
+        msgs.iter().any(|m| m
+            == "W 3000cafe3000caf6 3000cafe xxxxxxxxxxxxxxxx xxxxxxxxxxxxxxxx 0000000000000000 12"),
         "{msgs:?}"
     );
     assert!(

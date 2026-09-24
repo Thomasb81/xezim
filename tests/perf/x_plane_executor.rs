@@ -19,7 +19,13 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).expect("write temporary design");
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb", "--no-cache", path.to_str().unwrap()])
+        .args([
+            "--simulate",
+            "-s",
+            "tb",
+            "--no-cache",
+            path.to_str().unwrap(),
+        ])
         .env("XEZIM_PROFILE_REPORT", "1")
         .output()
         .expect("run xezim");
@@ -129,7 +135,10 @@ fn x_plane_executor_matches_the_four_state_vm() {
     for e in expected {
         assert!(text.lines().any(|l| l == e), "missing `{e}` in:\n{text}");
     }
-    assert!(stat(&text, "x_plane_runs=") >= 100, "the x-plane executor did not run:\n{text}");
+    assert!(
+        stat(&text, "x_plane_runs=") >= 100,
+        "the x-plane executor did not run:\n{text}"
+    );
 }
 
 /// `===` and `!==` lower to the same two-state compare as `==`/`!=` (they
@@ -154,5 +163,8 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.lines().any(|l| l == "CASEEQ 1 0 1 0 x"), "case equality on x operands:\n{text}");
+    assert!(
+        text.lines().any(|l| l == "CASEEQ 1 0 1 0 x"),
+        "case equality on x operands:\n{text}"
+    );
 }

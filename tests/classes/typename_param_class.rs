@@ -10,7 +10,11 @@ use std::process::Command;
 fn typename_param_class() {
     let test_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let test_file = test_dir.join("typename_param_class.sv");
-    assert!(test_file.exists(), "Test file not found: {}", test_file.display());
+    assert!(
+        test_file.exists(),
+        "Test file not found: {}",
+        test_file.display()
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg(test_file.to_str().unwrap())

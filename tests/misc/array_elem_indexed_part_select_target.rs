@@ -53,10 +53,19 @@ endmodule
 "#,
     );
     // The window is [63:32] and [95:64] respectively — NOT [32:32] / [64:32].
-    assert!(out.contains(&"A_zzzzzzzz44444444zzzzzzzz".to_string()), "{out:?}");
-    assert!(out.contains(&"B_deadbeefzzzzzzzzzzzzzzzz".to_string()), "{out:?}");
+    assert!(
+        out.contains(&"A_zzzzzzzz44444444zzzzzzzz".to_string()),
+        "{out:?}"
+    );
+    assert!(
+        out.contains(&"B_deadbeefzzzzzzzzzzzzzzzz".to_string()),
+        "{out:?}"
+    );
     // The untouched sibling element stays fully undriven.
-    assert!(out.contains(&"C_zzzzzzzzzzzzzzzzzzzzzzzz".to_string()), "{out:?}");
+    assert!(
+        out.contains(&"C_zzzzzzzzzzzzzzzzzzzzzzzz".to_string()),
+        "{out:?}"
+    );
 }
 
 #[test]
@@ -73,7 +82,10 @@ module top;
 endmodule
 "#,
     );
-    assert!(out.contains(&"D_feedfacezzzzzzzzzzzzzzzz".to_string()), "{out:?}");
+    assert!(
+        out.contains(&"D_feedfacezzzzzzzzzzzzzzzz".to_string()),
+        "{out:?}"
+    );
 }
 
 #[test]
@@ -106,6 +118,12 @@ module top;
 endmodule
 "#,
     );
-    assert!(out.contains(&"E_eeeeffffccccdddd00000000".to_string()), "{out:?}");
-    assert!(out.contains(&"F_eeeeffffccccdddd00000000".to_string()), "{out:?}");
+    assert!(
+        out.contains(&"E_eeeeffffccccdddd00000000".to_string()),
+        "{out:?}"
+    );
+    assert!(
+        out.contains(&"F_eeeeffffccccdddd00000000".to_string()),
+        "{out:?}"
+    );
 }

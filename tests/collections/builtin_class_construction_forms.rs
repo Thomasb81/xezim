@@ -12,7 +12,12 @@ use xezim::simulate;
 
 fn out(src: &str) -> String {
     match simulate(src, 1000) {
-        Ok(sim) => sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n"),
+        Ok(sim) => sim
+            .output
+            .iter()
+            .map(|o| o.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n"),
         Err(e) => format!("simulate failed: {e}"),
     }
 }
@@ -63,8 +68,7 @@ fn procedural_mailbox_bare_new() {
 
 #[test]
 fn block_local_mailbox_initializer() {
-    let o = out(
-        "module t;
+    let o = out("module t;
   int x;
   initial begin
     automatic mailbox #(int) mb = new(2);
@@ -72,25 +76,30 @@ fn block_local_mailbox_initializer() {
     $display(\"X=%0d\", x);
   end
 endmodule
-",
-    );
+");
     assert!(o.contains("X=4"), "{o}");
 }
 
 #[test]
 fn module_semaphore_initializer_holds_its_key() {
-    let o = out("module t;\n  semaphore sem = new(1);\n  initial $display(\"K=%0d\", sem.try_get(1));\nendmodule\n");
+    let o = out(
+        "module t;\n  semaphore sem = new(1);\n  initial $display(\"K=%0d\", sem.try_get(1));\nendmodule\n",
+    );
     assert!(o.contains("K=1"), "{o}");
 }
 
 #[test]
 fn procedural_semaphore_holds_its_key() {
-    let o = out("module t;\n  semaphore sem;\n  initial begin\n    sem = new(1);\n    $display(\"K=%0d\", sem.try_get(1));\n  end\nendmodule\n");
+    let o = out(
+        "module t;\n  semaphore sem;\n  initial begin\n    sem = new(1);\n    $display(\"K=%0d\", sem.try_get(1));\n  end\nendmodule\n",
+    );
     assert!(o.contains("K=1"), "{o}");
 }
 
 #[test]
 fn block_local_semaphore_initializer_holds_its_key() {
-    let o = out("module t;\n  initial begin\n    automatic semaphore sem = new(1);\n    $display(\"K=%0d\", sem.try_get(1));\n  end\nendmodule\n");
+    let o = out(
+        "module t;\n  initial begin\n    automatic semaphore sem = new(1);\n    $display(\"K=%0d\", sem.try_get(1));\n  end\nendmodule\n",
+    );
     assert!(o.contains("K=1"), "{o}");
 }

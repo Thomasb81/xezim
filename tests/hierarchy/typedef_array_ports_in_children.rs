@@ -79,5 +79,8 @@ endmodule
         Ok(_) => panic!("undeclared 'ghost' must still error under `default_nettype none"),
         Err(e) => e,
     };
-    assert!(err.contains("ghost"), "diagnostic should name the net, got: {err}");
+    assert!(
+        err.contains("ghost"),
+        "diagnostic should name the net, got: {err}"
+    );
 }

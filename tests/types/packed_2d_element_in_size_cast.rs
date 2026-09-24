@@ -101,5 +101,9 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "r_idx"), 0b10, "idx[0]=0, idx[1]=1");
-    assert_eq!(u(&sim, "r_en"), 0b11, "both lanes enable; a 1-bit element must not read X");
+    assert_eq!(
+        u(&sim, "r_en"),
+        0b11,
+        "both lanes enable; a 1-bit element must not read X"
+    );
 }

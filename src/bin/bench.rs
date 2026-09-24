@@ -137,7 +137,9 @@ fn main() {
             "--json-only" => json_only = true,
             other => {
                 eprintln!("unknown arg: {other}");
-                eprintln!("usage: xezim-bench [--cycles N] [--repeats K] [--filter substr] [--json-only]");
+                eprintln!(
+                    "usage: xezim-bench [--cycles N] [--repeats K] [--filter substr] [--json-only]"
+                );
                 std::process::exit(2);
             }
         }

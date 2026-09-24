@@ -79,12 +79,24 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "w_fwd"), 0xABCD_0000, "a plain stream, wider target");
+    assert_eq!(
+        u(&sim, "w_fwd"),
+        0xABCD_0000,
+        "a plain stream, wider target"
+    );
     assert_eq!(u(&sim, "w_rev"), 0xCDAB_0000, "byte-reversed");
     assert_eq!(u(&sim, "w_nib"), 0xDCBA_0000, "nibble-reversed");
     assert_eq!(u(&sim, "w_bit"), 0x8000_0000, "bit-reversed");
-    assert_eq!(u(&sim, "exact"), 0xDCBA, "an exactly-sized target is unchanged");
-    assert_eq!(u(&sim, "cast_rev"), 0xCDAB_0000, "the cast width reaches the stream");
+    assert_eq!(
+        u(&sim, "exact"),
+        0xDCBA,
+        "an exactly-sized target is unchanged"
+    );
+    assert_eq!(
+        u(&sim, "cast_rev"),
+        0xCDAB_0000,
+        "the cast width reaches the stream"
+    );
     assert_eq!(u(&sim, "cast_fwd"), 0xABCD_0000);
     assert_eq!(u(&sim, "big"), 0x1234_5678_0000_0000, "64-bit target");
 }
@@ -112,10 +124,18 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!((u(&sim, "b0"), u(&sim, "b3")), (0xAA, 0xDD), "unpack into a fixed array");
+    assert_eq!(
+        (u(&sim, "b0"), u(&sim, "b3")),
+        (0xAA, 0xDD),
+        "unpack into a fixed array"
+    );
     assert_eq!(u(&sim, "b1"), 0xBB);
     assert_eq!(u(&sim, "b2"), 0xCC);
-    assert_eq!((u(&sim, "r0"), u(&sim, "r3")), (0x11, 0x44), "unpack into a dynamic array");
+    assert_eq!(
+        (u(&sim, "r0"), u(&sim, "r3")),
+        (0x11, 0x44),
+        "unpack into a dynamic array"
+    );
     assert_eq!(u(&sim, "repacked"), 0x1122_3344, "and repack out of it");
 }
 
@@ -155,7 +175,11 @@ endmodule
     assert_eq!(u(&sim, "absent"), 0);
     // 4-state stays x, at the ELEMENT width — a 1-bit x printed "x" for what
     // must be "xx".
-    assert_eq!(line(&sim, "L="), "L=xx G=x", "4-state defaults are x, full width");
+    assert_eq!(
+        line(&sim, "L="),
+        "L=xx G=x",
+        "4-state defaults are x, full width"
+    );
 }
 
 /// §6.12.2: an array OF reals is indexable; a real SCALAR bit-select is still
@@ -222,12 +246,21 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    let neg = sim.get_signal("top.neg_up").or_else(|| sim.get_signal("neg_up")).expect("neg_up");
+    let neg = sim
+        .get_signal("top.neg_up")
+        .or_else(|| sim.get_signal("neg_up"))
+        .expect("neg_up");
     // bits 3..0 are 'f', bits -1..-4 are x
     assert_eq!(neg.to_hex_string(), "fx", "w[-4 +: 8] is fx, not a panic");
-    let oob = sim.get_signal("top.oob_up").or_else(|| sim.get_signal("oob_up")).expect("oob_up");
+    let oob = sim
+        .get_signal("top.oob_up")
+        .or_else(|| sim.get_signal("oob_up"))
+        .expect("oob_up");
     assert_eq!(oob.to_hex_string(), "x8", "above the MSB reads x");
-    let dn = sim.get_signal("top.neg_dn").or_else(|| sim.get_signal("neg_dn")).expect("neg_dn");
+    let dn = sim
+        .get_signal("top.neg_dn")
+        .or_else(|| sim.get_signal("neg_dn"))
+        .expect("neg_dn");
     assert_eq!(
         dn.to_hex_string(),
         "X",
@@ -255,7 +288,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "lt1"), 1, "\"Jello\" < \"z\" — length must not dominate");
+    assert_eq!(
+        u(&sim, "lt1"),
+        1,
+        "\"Jello\" < \"z\" — length must not dominate"
+    );
     assert_eq!(u(&sim, "gt1"), 0);
     assert_eq!(u(&sim, "le1"), 1);
     assert_eq!(u(&sim, "ge1"), 0);
@@ -333,7 +370,11 @@ endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
     // Out at BOTH ends: source bits 4..1 land in x[3:0] -> 0101, not 1010.
-    assert_eq!(u(&sim, "b_both"), 0b0101, "blocking, both ends out of range");
+    assert_eq!(
+        u(&sim, "b_both"),
+        0b0101,
+        "blocking, both ends out of range"
+    );
     assert_eq!(u(&sim, "b_low"), 0b0001, "blocking, low end out");
     assert_eq!(u(&sim, "b_high"), 0b1000, "blocking, high end out");
     assert_eq!(u(&sim, "b_oob_low"), 0, "entirely below bit 0: no write");

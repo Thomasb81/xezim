@@ -3,7 +3,7 @@
 //! The PROCEDURAL form already worked and is covered by
 //! `struct_named_patterns.rs` (`s = '{x: 5, y: 8'h22};` inside an
 //! initial block). This is the continuous form, which takes a different
-//! path -- `expand_whole_struct_continuous_assigns` -> 
+//! path -- `expand_whole_struct_continuous_assigns` ->
 //! `emit_struct_member_assigns` -- and did not handle named items at all.
 //!
 //! An unpacked struct is stored one signal per member, so
@@ -131,6 +131,9 @@ endmodule
 "#;
     assert_eq!(
         notes(src),
-        vec!["NOTE: parent i=3.0000 v=1.8086", "NOTE: child i=3.0000 v=1.8086"]
+        vec![
+            "NOTE: parent i=3.0000 v=1.8086",
+            "NOTE: child i=3.0000 v=1.8086"
+        ]
     );
 }

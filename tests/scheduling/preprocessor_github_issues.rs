@@ -139,10 +139,10 @@ fn double_backtick_token_pasting_before_macro_lookup() {
     let out = pp("`define FOO_BAR 42\n`define CONCAT(x) `FOO_``x\n`CONCAT(BAR)\n");
     assert_eq!(squash(&out), "42", "got {out:?}");
 
-    let out2 = pp("`define A 1\n`define B 2\n`define AB 99\n`define PASTE(x,y) `x``y\n`PASTE(A,B)\n");
+    let out2 =
+        pp("`define A 1\n`define B 2\n`define AB 99\n`define PASTE(x,y) `x``y\n`PASTE(A,B)\n");
     assert_eq!(squash(&out2), "99", "got {out2:?}");
 }
-
 
 /// The rule that makes the opaque-string treatment necessary: a formal whose
 /// name also appears inside a format string is NOT substituted there.
@@ -179,7 +179,9 @@ fn an_undefined_macro_is_passed_through_unchanged() {
 /// not reached for anything that resolves.
 #[test]
 fn the_same_shape_expands_once_defined() {
-    let out = pp("`define do_with(a, c) begin a.randomize() with c; end\n`do_with(req, {req.wr_en==1;})\n");
+    let out = pp(
+        "`define do_with(a, c) begin a.randomize() with c; end\n`do_with(req, {req.wr_en==1;})\n",
+    );
     assert_eq!(
         squash(&out),
         "begin req.randomize() with {req.wr_en==1;}; end",

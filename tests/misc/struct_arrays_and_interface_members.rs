@@ -56,9 +56,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "p_a"), u(&sim, "p_b")), (0x11, 0x22), "pattern into element");
-    assert_eq!((u(&sim, "m_a"), u(&sim, "m_b")), (0x33, 0x44), "member-wise into element");
-    assert_eq!((u(&sim, "c_a"), u(&sim, "c_b")), (0x11, 0x22), "element-to-element copy");
+    assert_eq!(
+        (u(&sim, "p_a"), u(&sim, "p_b")),
+        (0x11, 0x22),
+        "pattern into element"
+    );
+    assert_eq!(
+        (u(&sim, "m_a"), u(&sim, "m_b")),
+        (0x33, 0x44),
+        "member-wise into element"
+    );
+    assert_eq!(
+        (u(&sim, "c_a"), u(&sim, "c_b")),
+        (0x11, 0x22),
+        "element-to-element copy"
+    );
     assert_eq!(u(&sim, "untouched_x"), 1, "an unwritten element stays x");
 }
 
@@ -96,8 +108,20 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "ua"), u(&sim, "ub")), (0x11, 0x22), "pattern through a modport-less port");
-    assert_eq!((u(&sim, "da"), u(&sim, "db")), (0x33, 0x44), "pattern written directly");
-    assert_eq!((u(&sim, "a0"), u(&sim, "a1")), (0xA0, 0xA1), "array member unaffected");
+    assert_eq!(
+        (u(&sim, "ua"), u(&sim, "ub")),
+        (0x11, 0x22),
+        "pattern through a modport-less port"
+    );
+    assert_eq!(
+        (u(&sim, "da"), u(&sim, "db")),
+        (0x33, 0x44),
+        "pattern written directly"
+    );
+    assert_eq!(
+        (u(&sim, "a0"), u(&sim, "a1")),
+        (0xA0, 0xA1),
+        "array member unaffected"
+    );
     assert_eq!(u(&sim, "pl"), 0x5A, "scalar member unaffected");
 }

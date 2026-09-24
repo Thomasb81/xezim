@@ -14,8 +14,8 @@ use xezim::simulate;
 
 /// A per-test temp subdir so parallel test runs never collide.
 fn subdir(test: &str) -> String {
-    let dir = std::env::temp_dir()
-        .join(format!("xezim_fwrite_mcd_{}_{}", std::process::id(), test));
+    let dir =
+        std::env::temp_dir().join(format!("xezim_fwrite_mcd_{}_{}", std::process::id(), test));
     std::fs::create_dir_all(&dir).unwrap();
     dir.to_string_lossy().into_owned()
 }
@@ -104,10 +104,20 @@ endmodule
     let sim = simulate(&src, 1000).expect("simulate failed");
     // stdout (MCD bit 0) received the line
     let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
-    assert!(outs.iter().any(|s| s.contains("BROADCAST")), "stdout missing broadcast: {:?}", outs);
+    assert!(
+        outs.iter().any(|s| s.contains("BROADCAST")),
+        "stdout missing broadcast: {:?}",
+        outs
+    );
     // both files received it
-    assert_eq!(std::fs::read_to_string(format!("{}/m1.txt", d)).unwrap(), "BROADCAST\n");
-    assert_eq!(std::fs::read_to_string(format!("{}/m2.txt", d)).unwrap(), "BROADCAST\n");
+    assert_eq!(
+        std::fs::read_to_string(format!("{}/m1.txt", d)).unwrap(),
+        "BROADCAST\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{}/m2.txt", d)).unwrap(),
+        "BROADCAST\n"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -159,7 +169,10 @@ endmodule
         d = d,
     );
     let sim = simulate(&src, 1000).expect("simulate failed");
-    assert_eq!(std::fs::read_to_string(format!("{}/rt.txt", d)).unwrap(), "round-trip\n");
+    assert_eq!(
+        std::fs::read_to_string(format!("{}/rt.txt", d)).unwrap(),
+        "round-trip\n"
+    );
     assert_eq!(m(&sim, "n"), 11, "fgets byte count");
     let _ = std::fs::remove_dir_all(&d);
 }

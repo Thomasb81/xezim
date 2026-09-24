@@ -39,8 +39,15 @@ module tb;
   end
 endmodule
 "#);
-    assert!(has(&o, "a_rg failed at cyc 18") && has(&o, "a_rg failed at cyc 19"), "{o:?}");
-    assert_eq!(o.iter().filter(|l| l.contains("a_rg failed")).count(), 2, "{o:?}");
+    assert!(
+        has(&o, "a_rg failed at cyc 18") && has(&o, "a_rg failed at cyc 19"),
+        "{o:?}"
+    );
+    assert_eq!(
+        o.iter().filter(|l| l.contains("a_rg failed")).count(),
+        2,
+        "{o:?}"
+    );
     assert!(has(&o, "DONE cyc=21"), "{o:?}");
 }
 
@@ -81,7 +88,12 @@ module tb;
   end
 endmodule
 "#);
-    for want in ["IFC area=9 let=9", "RSEQ acc=111", "PROC status=KILLED", "PROG done v=0100 t=25"] {
+    for want in [
+        "IFC area=9 let=9",
+        "RSEQ acc=111",
+        "PROC status=KILLED",
+        "PROG done v=0100 t=25",
+    ] {
         assert!(has(&o, want), "missing `{want}`: {o:?}");
     }
     assert!(!has(&o, "SHOULD NOT PRINT"), "{o:?}");
@@ -105,8 +117,15 @@ module tb;
   end
 endmodule
 "#);
-    assert!(has(&o, "onehot0 violated v=0110") && has(&o, "CHK done"), "{o:?}");
-    assert_eq!(o.iter().filter(|l| l.contains("onehot0 violated")).count(), 1, "{o:?}");
+    assert!(
+        has(&o, "onehot0 violated v=0110") && has(&o, "CHK done"),
+        "{o:?}"
+    );
+    assert_eq!(
+        o.iter().filter(|l| l.contains("onehot0 violated")).count(),
+        1,
+        "{o:?}"
+    );
 }
 
 /// §9.3.1 — block item declarations precede the statements of a
@@ -116,7 +135,10 @@ endmodule
 #[test]
 fn declaration_after_statement_is_rejected() {
     let src = "module tb;\n  initial begin\n    int a;\n    a = 1;\n    int b;\n    b = a;\n    $display(\"B=%0d\", b);\n  end\nendmodule\n";
-    assert!(simulate(src, 100).is_err(), "a declaration after a statement must be a compile error");
+    assert!(
+        simulate(src, 100).is_err(),
+        "a declaration after a statement must be a compile error"
+    );
 }
 
 /// §9.4.2 / §16.5 — a clocking event without an edge (`@(clk)`, or `@clk`
@@ -133,7 +155,14 @@ module tb;
   initial begin #12 v = 4'b0010; #10 v = 4'b0110; #10 v = 4'b1000; #10 $finish; end
 endmodule
 "#);
-    assert_eq!(module_level.iter().filter(|l| l.contains("onehot0 violated")).count(), 2, "{module_level:?}");
+    assert_eq!(
+        module_level
+            .iter()
+            .filter(|l| l.contains("onehot0 violated"))
+            .count(),
+        2,
+        "{module_level:?}"
+    );
     let checker = out(r#"
 checker chk_onehot(logic [3:0] v, event clk);
   a_oh: assert property (@clk $onehot0(v)) else $error("C onehot0 violated v=%b", v);
@@ -145,5 +174,12 @@ module tb;
   initial begin #12 v = 4'b0010; #10 v = 4'b0110; #10 v = 4'b1000; #10 $finish; end
 endmodule
 "#);
-    assert_eq!(checker.iter().filter(|l| l.contains("onehot0 violated")).count(), 2, "{checker:?}");
+    assert_eq!(
+        checker
+            .iter()
+            .filter(|l| l.contains("onehot0 violated"))
+            .count(),
+        2,
+        "{checker:?}"
+    );
 }

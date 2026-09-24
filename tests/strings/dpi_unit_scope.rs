@@ -14,8 +14,12 @@ fn manifest_path(rel: &str) -> PathBuf {
 }
 
 fn compile_dpi_lib(c_file: &str, stem: &str) -> PathBuf {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-    let so_path = std::env::temp_dir().join(format!("{}_{}_{}.so", stem, std::process::id(), nanos));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let so_path =
+        std::env::temp_dir().join(format!("{}_{}_{}.so", stem, std::process::id(), nanos));
     let status = Command::new("cc")
         .args(["-shared", "-fPIC", "-I"])
         .arg(manifest_path("include"))

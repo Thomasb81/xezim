@@ -51,7 +51,8 @@ fn int_counter_indexes_arrays_per_lane() {
 endmodule",
     );
     assert!(
-        msgs.iter().any(|m| m.contains("SRAM 2727272e f9f9fa00 11111118 40")),
+        msgs.iter()
+            .any(|m| m.contains("SRAM 2727272e f9f9fa00 11111118 40")),
         "per-lane pointer loop: {msgs:?}"
     );
 }
@@ -81,7 +82,8 @@ fn packed_queue_through_element_pointer() {
 endmodule",
     );
     assert!(
-        msgs.iter().any(|m| m.contains("QUEUE 0000343434000000000000232323000000000000121212000000000000010101")),
+        msgs.iter().any(|m| m
+            .contains("QUEUE 0000343434000000000000232323000000000000121212000000000000010101")),
         "packed queue: {msgs:?}"
     );
 }
@@ -115,7 +117,8 @@ fn lane_table_and_byte_lane_memory() {
 endmodule",
     );
     assert!(
-        msgs.iter().any(|m| m.contains("LANES 180b0209042f765d40434a517c272e35 e5b4c5f6 f1c0d202 20")),
+        msgs.iter()
+            .any(|m| m.contains("LANES 180b0209042f765d40434a517c272e35 e5b4c5f6 f1c0d202 20")),
         "lane table / byte-lane memory: {msgs:?}"
     );
 }

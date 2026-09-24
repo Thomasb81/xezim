@@ -71,8 +71,10 @@ module tb;
   initial t();
 endmodule
 "#);
-    for expect in ["T s1=[frame] n=9 m11=[dddd] m01=[bb] fn=9", "P '{\"task\", \"frame\"}"] {
+    for expect in [
+        "T s1=[frame] n=9 m11=[dddd] m01=[bb] fn=9",
+        "P '{\"task\", \"frame\"}",
+    ] {
         assert!(o.contains(expect), "expected `{expect}` in:\n{o}");
     }
 }
-

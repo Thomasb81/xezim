@@ -49,7 +49,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "ok"), 1, "the inherited property is in scope and constrains");
+    assert_eq!(
+        u(&sim, "ok"),
+        1,
+        "the inherited property is in scope and constrains"
+    );
 }
 
 /// Overriding an inherited constraint by name, and referring to an inherited
@@ -88,6 +92,14 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "ok_d"), 1, "an overriding constraint replaces the base's");
-    assert_eq!(u(&sim, "ok_e"), 1, "an inherited non-rand property is in scope");
+    assert_eq!(
+        u(&sim, "ok_d"),
+        1,
+        "an overriding constraint replaces the base's"
+    );
+    assert_eq!(
+        u(&sim, "ok_e"),
+        1,
+        "an inherited non-rand property is in scope"
+    );
 }

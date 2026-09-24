@@ -51,36 +51,52 @@ fn reports(text: &str) -> Vec<String> {
 
 #[test]
 fn past_in_nonoverlap_consequent_reads_previous_cycle() {
-    let text = run("past_in_nonoverlap_consequent_reads_previous_cycle", r#"
+    let text = run(
+        "past_in_nonoverlap_consequent_reads_previous_cycle",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0; logic [1:0] c = 0;
   p: assert property (@(posedge clk) a |=> c == $past(c)) else $display("FAIL %0d", $time);
   initial begin #1 a = 1; c = 1; #10 c = 2; #30 $finish; end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
-    assert_eq!(fails(&text), vec!["FAIL 15"] as Vec<&str>, "FAIL lines:\n{text}");
+    assert_eq!(
+        fails(&text),
+        vec!["FAIL 15"] as Vec<&str>,
+        "FAIL lines:\n{text}"
+    );
 }
 
 /// §16.8: a sequence after a cycle delay may begin with a unary expression.
 #[test]
 fn delayed_unary_sequence_is_evaluated() {
-    let text = run("delayed_unary_sequence_is_evaluated", r#"
+    let text = run(
+        "delayed_unary_sequence_is_evaluated",
+        r#"
 module t; logic phase = 0; always #5 phase = ~phase;
   logic launch = 0, guard = 1;
   p: assert property (@(posedge phase) launch |-> ##1 !guard)
      else $display("FAIL unary %0d", $time);
   initial begin #1 launch = 1; #10 launch = 0; #30 $finish; end
 endmodule
-"#);
-    assert_eq!(fails(&text), vec!["FAIL unary 15"] as Vec<&str>, "FAIL lines:\n{text}");
+"#,
+    );
+    assert_eq!(
+        fails(&text),
+        vec!["FAIL unary 15"] as Vec<&str>,
+        "FAIL lines:\n{text}"
+    );
 }
 
 /// §16.9.3: one signal is sampled once per property clock even when several
 /// sampled-value calls in the same property reference it.
 #[test]
 fn repeated_sampled_value_calls_share_one_history_step() {
-    let text = run("repeated_sampled_value_calls_share_one_history_step", r#"
+    let text = run(
+        "repeated_sampled_value_calls_share_one_history_step",
+        r#"
 module t;
   logic phase = 0; always #5 phase = ~phase;
   logic serial_level, clear;
@@ -100,52 +116,72 @@ module t;
     $finish;
   end
 endmodule
-"#);
-    assert_eq!(fails(&text), vec!["FAIL sampled 55"] as Vec<&str>, "FAIL lines:\n{text}");
+"#,
+    );
+    assert_eq!(
+        fails(&text),
+        vec!["FAIL sampled 55"] as Vec<&str>,
+        "FAIL lines:\n{text}"
+    );
 }
 
 #[test]
 fn multi_cycle_antecedent_triggers_on_its_last_cycle() {
-    let text = run("multi_cycle_antecedent_triggers_on_its_last_cycle", r#"
+    let text = run(
+        "multi_cycle_antecedent_triggers_on_its_last_cycle",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, c = 0;
   p: assert property (@(posedge clk) a ##1 b |-> c) else $display("FAIL %0d", $time);
   initial begin #1 a = 1; #10 a = 0; b = 1; #30 $finish; end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
-    assert_eq!(fails(&text), vec!["FAIL 15"] as Vec<&str>, "FAIL lines:\n{text}");
+    assert_eq!(
+        fails(&text),
+        vec!["FAIL 15"] as Vec<&str>,
+        "FAIL lines:\n{text}"
+    );
 }
 
 #[test]
 fn delay_range_consequent_waits_for_the_whole_window() {
-    let text = run("delay_range_consequent_waits_for_the_whole_window", r#"
+    let text = run(
+        "delay_range_consequent_waits_for_the_whole_window",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0;
   p: assert property (@(posedge clk) a |-> ##[1:2] b) else $display("FAIL %0d", $time);
   initial begin #1 a = 1; #10 a = 0; #10 b = 1; #30 $finish; end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
     assert_eq!(fails(&text), vec![] as Vec<&str>, "FAIL lines:\n{text}");
 }
 
 #[test]
 fn not_of_a_sequence_fails_only_on_a_match() {
-    let text = run("not_of_a_sequence_fails_only_on_a_match", r#"
+    let text = run(
+        "not_of_a_sequence_fails_only_on_a_match",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0;
   p: assert property (@(posedge clk) not (a ##1 b)) else $display("FAIL %0d", $time);
   initial begin #1 a = 1; #40 $finish; end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
     assert_eq!(fails(&text), vec![] as Vec<&str>, "FAIL lines:\n{text}");
 }
 
 #[test]
 fn disable_iff_cancels_an_attempt_in_flight() {
-    let text = run("disable_iff_cancels_an_attempt_in_flight", r#"
+    let text = run(
+        "disable_iff_cancels_an_attempt_in_flight",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, r = 0;
   p: assert property (@(posedge clk) disable iff (r) a |=> b) else $display("FAIL %0d", $time);
@@ -156,42 +192,51 @@ module t; logic clk = 0; always #5 clk = ~clk;
     repeat (3) @(posedge clk); $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
     assert_eq!(fails(&text), vec![] as Vec<&str>, "FAIL lines:\n{text}");
 }
 
 #[test]
 fn property_and_or_parse_and_run() {
-    let text = run("property_and_or_parse_and_run", r#"
+    let text = run(
+        "property_and_or_parse_and_run",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, c = 0;
   p1: assert property (@(posedge clk) a |-> b or c);
   p2: assert property (@(posedge clk) (a |-> b) and (c |-> a));
   initial #20 $finish;
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
     assert_eq!(fails(&text), vec![] as Vec<&str>, "FAIL lines:\n{text}");
 }
 
 #[test]
 fn parenthesised_consequent_matches_the_bare_form() {
-    let text = run("parenthesised_consequent_matches_the_bare_form", r#"
+    let text = run(
+        "parenthesised_consequent_matches_the_bare_form",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0;
   p1: assert property (@(posedge clk) a |-> ##2 b) else $display("FAIL p1 %0d", $time);
   p2: assert property (@(posedge clk) (a) |-> (##2 (b))) else $display("FAIL p2 %0d", $time);
   initial begin #1 a = 1; #10 a = 0; #10 b = 1; #30 $finish; end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
     assert_eq!(fails(&text), vec![] as Vec<&str>, "FAIL lines:\n{text}");
 }
 
 #[test]
 fn mixed_property_shapes_match_the_reference() {
-    let text = run("mixed", r#"
+    let text = run(
+        "mixed",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, c = 0, d = 0, e = 0, r = 0; logic [1:0] v = 0;
   // property or: a=1 at 5 with b=0,c=1 holds; at 15 with b=0,c=0 fails
@@ -216,7 +261,8 @@ module t; logic clk = 0; always #5 clk = ~clk;
     #40 $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
     let mut expected = vec![
         "FAIL and 5",
@@ -236,7 +282,9 @@ endmodule
 
 #[test]
 fn consecutive_repetition_in_antecedent_and_consequent() {
-    let text = run("s1_repeat", r#"
+    let text = run(
+        "s1_repeat",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, c = 0;
   p1: assert property (@(posedge clk) a |=> b [*2]) else $display("FAIL rep2 %0d", $time);
@@ -254,14 +302,15 @@ module t; logic clk = 0; always #5 clk = ~clk;
     #30 $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
     let mut expected = vec![
         "FAIL antrep 55",
         "FAIL rep12 55",
         "FAIL rep12 75",
         "FAIL rep2 55",
-        "FAIL rep2 75"
+        "FAIL rep2 75",
     ];
     expected.sort();
     assert_eq!(reports(&text), expected, "report lines:\n{text}");
@@ -269,7 +318,9 @@ endmodule
 
 #[test]
 fn throughout_within_and_intersect() {
-    let text = run("s2_within", r#"
+    let text = run(
+        "s2_within",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, c = 0, d = 0, e = 0;
   p1: assert property (@(posedge clk) a |-> (e throughout (b ##1 c))) else $display("FAIL thr %0d", $time);
@@ -283,20 +334,19 @@ module t; logic clk = 0; always #5 clk = ~clk;
     #30 $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
-    let mut expected = vec![
-        "FAIL isect 35",
-        "FAIL thr 25",
-        "FAIL within 55"
-    ];
+    let mut expected = vec!["FAIL isect 35", "FAIL thr 25", "FAIL within 55"];
     expected.sort();
     assert_eq!(reports(&text), expected, "report lines:\n{text}");
 }
 
 #[test]
 fn first_match_stops_at_the_earliest_match() {
-    let text = run("s3_firstmatch", r#"
+    let text = run(
+        "s3_firstmatch",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, c = 0;
   p1: assert property (@(posedge clk) a |-> first_match(##[1:2] b) ##1 c) else $display("FAIL fm %0d", $time);
@@ -308,18 +358,19 @@ module t; logic clk = 0; always #5 clk = ~clk;
     #30 $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
-    let mut expected = vec![
-        "FAIL fm 25"
-    ];
+    let mut expected = vec!["FAIL fm 25"];
     expected.sort();
     assert_eq!(reports(&text), expected, "report lines:\n{text}");
 }
 
 #[test]
 fn negedge_and_iff_clocking_events() {
-    let text = run("s4_clocks", r#"
+    let text = run(
+        "s4_clocks",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, en = 0;
   p1: assert property (@(negedge clk) a |=> b) else $display("FAIL neg %0d", $time);
@@ -333,14 +384,15 @@ module t; logic clk = 0; always #5 clk = ~clk;
     #30 $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
     let mut expected = vec![
         "FAIL iff 35",
         "FAIL neg 20",
         "FAIL neg 40",
         "FAIL neg 60",
-        "FAIL neg 70"
+        "FAIL neg 70",
     ];
     expected.sort();
     assert_eq!(reports(&text), expected, "report lines:\n{text}");
@@ -348,7 +400,9 @@ endmodule
 
 #[test]
 fn sequence_or_and_in_the_antecedent() {
-    let text = run("s5_seqor", r#"
+    let text = run(
+        "s5_seqor",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, c = 0, d = 0;
   p1: assert property (@(posedge clk) (a or b) |-> c) else $display("FAIL or1 %0d", $time);
@@ -363,14 +417,15 @@ module t; logic clk = 0; always #5 clk = ~clk;
     #30 $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
     let mut expected = vec![
         "FAIL or1 15",
         "FAIL or1 5",
         "FAIL or2 25",
         "FAIL or2 25",
-        "FAIL or2 35"
+        "FAIL or2 35",
     ];
     expected.sort();
     assert_eq!(reports(&text), expected, "report lines:\n{text}");
@@ -378,7 +433,9 @@ endmodule
 
 #[test]
 fn if_else_nested_implication_not_and_zero_delay() {
-    let text = run("s6_ifelse", r#"
+    let text = run(
+        "s6_ifelse",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, c = 0, s = 0;
   p1: assert property (@(posedge clk) a |-> if (s) b else c) else $display("FAIL if %0d", $time);
@@ -393,7 +450,8 @@ module t; logic clk = 0; always #5 clk = ~clk;
     #30 $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
     let mut expected = vec![
         "FAIL d0 5",
@@ -402,7 +460,7 @@ endmodule
         "FAIL if 5",
         "FAIL nest 25",
         "FAIL notb 15",
-        "FAIL notb 25"
+        "FAIL notb 25",
     ];
     expected.sort();
     assert_eq!(reports(&text), expected, "report lines:\n{text}");
@@ -410,7 +468,9 @@ endmodule
 
 #[test]
 fn sampled_value_functions_in_sequences() {
-    let text = run("s7_sampled", r#"
+    let text = run(
+        "s7_sampled",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0; logic [1:0] v = 0;
   p1: assert property (@(posedge clk) $rose(a) |-> ##[1:2] $fell(b)) else $display("FAIL rf %0d", $time);
@@ -426,21 +486,19 @@ module t; logic clk = 0; always #5 clk = ~clk;
     #30 $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
-    let mut expected = vec![
-        "FAIL rf 55",
-        "FAIL stb 55",
-        "FAIL stb 65",
-        "FAIL stb 75"
-    ];
+    let mut expected = vec!["FAIL rf 55", "FAIL stb 55", "FAIL stb 65", "FAIL stb 75"];
     expected.sort();
     assert_eq!(reports(&text), expected, "report lines:\n{text}");
 }
 
 #[test]
 fn named_properties_with_formals_disable_iff_and_default_clocking() {
-    let text = run("s8_propdecl", r#"
+    let text = run(
+        "s8_propdecl",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0, r = 0;
   property p_dis; @(posedge clk) disable iff (r) a |=> b; endproperty
@@ -460,20 +518,19 @@ module t; logic clk = 0; always #5 clk = ~clk;
     #30 $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
-    let mut expected = vec![
-        "FAIL dflt 15",
-        "FAIL parg 15",
-        "FAIL sarg 15"
-    ];
+    let mut expected = vec!["FAIL dflt 15", "FAIL parg 15", "FAIL sarg 15"];
     expected.sort();
     assert_eq!(reports(&text), expected, "report lines:\n{text}");
 }
 
 #[test]
 fn cover_sequence_and_strong_obligations_at_end_of_sim() {
-    let text = run("s9_cover_strong", r#"
+    let text = run(
+        "s9_cover_strong",
+        r#"
 module t; logic clk = 0; always #5 clk = ~clk;
   logic a = 0, b = 0;
   c1: cover property (@(posedge clk) a ##[1:2] b) $display("COVER %0d", $time);
@@ -488,13 +545,10 @@ module t; logic clk = 0; always #5 clk = ~clk;
     #30 $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(text.contains("$finish called"), "did not finish:\n{text}");
-    let mut expected = vec![
-        "COVER 15",
-        "FAIL sev 61",
-        "FAIL strong 61"
-    ];
+    let mut expected = vec!["COVER 15", "FAIL sev 61", "FAIL strong 61"];
     expected.sort();
     assert_eq!(reports(&text), expected, "report lines:\n{text}");
 }

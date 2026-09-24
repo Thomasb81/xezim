@@ -58,5 +58,9 @@ endmodule
 #[test]
 fn constructor_new_not_static_dispatch() {
     let sim = simulate(SRC, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "result"), 1, "constructor must run on real instance");
+    assert_eq!(
+        u(&sim, "result"),
+        1,
+        "constructor must run on real instance"
+    );
 }

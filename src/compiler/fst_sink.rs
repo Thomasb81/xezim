@@ -94,7 +94,9 @@ fn apply(body: &mut FstBody, ts: &FstTimestep) {
 
 impl FstSink {
     pub fn inline(body: FstBody) -> Self {
-        FstSink { mode: Mode::Inline(Box::new(body)) }
+        FstSink {
+            mode: Mode::Inline(Box::new(body)),
+        }
     }
 
     pub fn threaded(body: FstBody) -> Self {
@@ -131,7 +133,11 @@ impl FstSink {
     pub fn post(&mut self, ts: FstTimestep) {
         match &mut self.mode {
             Mode::Inline(body) => apply(body, &ts),
-            Mode::Threaded { pending, tx: Some(tx), .. } => {
+            Mode::Threaded {
+                pending,
+                tx: Some(tx),
+                ..
+            } => {
                 pending.push(ts);
                 if pending.len() >= FST_BATCH_FLUSH {
                     let batch = std::mem::take(pending);
@@ -149,7 +155,11 @@ impl FstSink {
             Mode::Inline(body) => {
                 let _ = body.flush();
             }
-            Mode::Threaded { pending, tx: Some(tx), .. } => {
+            Mode::Threaded {
+                pending,
+                tx: Some(tx),
+                ..
+            } => {
                 if !pending.is_empty() {
                     let batch = std::mem::take(pending);
                     let _ = tx.send(Msg::Batch(batch));
@@ -167,12 +177,20 @@ impl FstSink {
             Mode::Inline(_) => {
                 if let Mode::Inline(body) = std::mem::replace(
                     &mut self.mode,
-                    Mode::Threaded { pending: Vec::new(), tx: None, handle: None },
+                    Mode::Threaded {
+                        pending: Vec::new(),
+                        tx: None,
+                        handle: None,
+                    },
                 ) {
                     let _ = body.finish();
                 }
             }
-            Mode::Threaded { pending, tx, handle } => {
+            Mode::Threaded {
+                pending,
+                tx,
+                handle,
+            } => {
                 if let Some(tx_ref) = tx.as_ref() {
                     if !pending.is_empty() {
                         let batch = std::mem::take(pending);

@@ -69,10 +69,26 @@ endmodule
 "#
     );
     let sim = simulate(&src, 5).expect("simulate failed");
-    assert_eq!(lookup(&sim, "a_val"), 500, "local int keeps its initializer, not enum A's 0");
-    assert_eq!(lookup(&sim, "b_is_35"), 1, "local real keeps 3.5, not enum B's 1");
-    assert_eq!(lookup(&sim, "c_field"), 42, "local class handle is usable, not enum C's bits");
-    assert_eq!(lookup(&sim, "a_bits"), 32, "local int is 32 bits, not the enum's 2");
+    assert_eq!(
+        lookup(&sim, "a_val"),
+        500,
+        "local int keeps its initializer, not enum A's 0"
+    );
+    assert_eq!(
+        lookup(&sim, "b_is_35"),
+        1,
+        "local real keeps 3.5, not enum B's 1"
+    );
+    assert_eq!(
+        lookup(&sim, "c_field"),
+        42,
+        "local class handle is usable, not enum C's bits"
+    );
+    assert_eq!(
+        lookup(&sim, "a_bits"),
+        32,
+        "local int is 32 bits, not the enum's 2"
+    );
 }
 
 /// A procedural assignment to the shadowed local must not be masked to the
@@ -117,8 +133,16 @@ endmodule
 "#
     );
     let sim = simulate(&src, 5).expect("simulate failed");
-    assert_eq!(lookup(&sim, "qa"), 0, "pk::A is enum A, not the local int's low bits");
-    assert_eq!(lookup(&sim, "qc"), 2, "pk::C is enum C, not the local handle's id");
+    assert_eq!(
+        lookup(&sim, "qa"),
+        0,
+        "pk::A is enum A, not the local int's low bits"
+    );
+    assert_eq!(
+        lookup(&sim, "qc"),
+        2,
+        "pk::C is enum C, not the local handle's id"
+    );
     assert_eq!(lookup(&sim, "qa_name_ok"), 1, "pk::A stringifies as \"A\"");
     assert_eq!(lookup(&sim, "qc_name_ok"), 1, "pk::C stringifies as \"C\"");
 }
@@ -150,7 +174,11 @@ endmodule
     );
     let sim = simulate(&src, 5).expect("simulate failed");
     assert_eq!(lookup(&sim, "from_initial"), 2, "pk::C in an initial block");
-    assert_eq!(lookup(&sim, "from_func"), 2, "pk::C in a function body, not 0");
+    assert_eq!(
+        lookup(&sim, "from_func"),
+        2,
+        "pk::C in a function body, not 0"
+    );
     assert_eq!(lookup(&sim, "from_task"), 1, "pk::B in a task body, not 0");
 }
 
@@ -179,5 +207,9 @@ endmodule
     assert_eq!(lookup(&sim, "bare_c"), 2, "unshadowed C resolves bare");
     assert_eq!(lookup(&sim, "qual_b"), 1, "unshadowed B resolves qualified");
     assert_eq!(lookup(&sim, "qual_c"), 2, "unshadowed C resolves qualified");
-    assert_eq!(lookup(&sim, "name_c_ok"), 1, "unshadowed C stringifies as \"C\"");
+    assert_eq!(
+        lookup(&sim, "name_c_ok"),
+        1,
+        "unshadowed C stringifies as \"C\""
+    );
 }

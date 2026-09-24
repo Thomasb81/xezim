@@ -73,7 +73,11 @@ endmodule
 fn forward_typedef_class_handle_counts_in_struct_bits() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     // Both the width contribution and the round-trip must hold.
-    assert_eq!(get(&sim, "pass"), 2, "forward-typedef class handle dropped from struct width");
+    assert_eq!(
+        get(&sim, "pass"),
+        2,
+        "forward-typedef class handle dropped from struct width"
+    );
     // And the handle member must make the struct strictly wider than the
     // int alone (the bug made them equal).
     assert!(

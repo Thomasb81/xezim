@@ -58,7 +58,12 @@ endmodule
 #[test]
 fn precedence_directive_global_named_local() {
     let (o, ok) = run(
-        &["--module-timescale", "100ns/1ns", "--module-timescale", "module_c=10ns/1ns"],
+        &[
+            "--module-timescale",
+            "100ns/1ns",
+            "--module-timescale",
+            "module_c=10ns/1ns",
+        ],
         DESIGN,
     );
     assert!(ok, "run failed: {}", o);
@@ -77,7 +82,12 @@ fn a_named_delay_is_scaled() {
     // global assignment; the tool default would be 1ps) fires at 1ns and
     // 100ns; module_c lands between them.
     let (o, ok) = run(
-        &["--module-timescale", "1ns/1ns", "--module-timescale", "module_c=10ns/1ns"],
+        &[
+            "--module-timescale",
+            "1ns/1ns",
+            "--module-timescale",
+            "module_c=10ns/1ns",
+        ],
         r#"
 module module_c;
   initial begin #1; $display("C_AT"); end
@@ -92,7 +102,11 @@ module top; module_c c(); refr r(); endmodule
     let r1 = o.find("R1").unwrap();
     let c = o.find("C_AT").expect("C_AT missing");
     let r100 = o.find("R100").unwrap();
-    assert!(r1 < c && c < r100, "C (#1 = 10ns) must land between R1 and R100: {}", o);
+    assert!(
+        r1 < c && c < r100,
+        "C (#1 = 10ns) must land between R1 and R100: {}",
+        o
+    );
 }
 
 #[test]
@@ -111,18 +125,31 @@ module top; module_a a(); refr r(); endmodule
 "#,
     );
     assert!(ok, "{}", o);
-    assert!(o.contains("ignored"), "should warn the assignment was ignored: {}", o);
+    assert!(
+        o.contains("ignored"),
+        "should warn the assignment was ignored: {}",
+        o
+    );
     // module_a stays 1ns: A_AT fires at 1ns, i.e. NOT after R1..R100 wait —
     // it fires right around R1.
     let a = o.find("A_AT").unwrap();
     let r100 = o.find("R100").unwrap();
-    assert!(a < r100, "module_a #1 must stay 1ns, not become 100ns: {}", o);
+    assert!(
+        a < r100,
+        "module_a #1 must stay 1ns, not become 100ns: {}",
+        o
+    );
 }
 
 #[test]
 fn conflicting_named_assignments_are_an_error() {
     let (o, ok) = run(
-        &["--module-timescale", "m=1ns/1ps", "--module-timescale", "m=10ns/1ns"],
+        &[
+            "--module-timescale",
+            "m=1ns/1ps",
+            "--module-timescale",
+            "m=10ns/1ns",
+        ],
         "module m; endmodule",
     );
     assert!(!ok, "should have failed");
@@ -165,7 +192,12 @@ module top; peripheral u0(); peripheral u1(); endmodule
     );
     assert!(ok, "{}", o);
     // Both instances read 1 (their shared 10ns unit).
-    assert_eq!(o.matches("P=1").count(), 2, "both instances should read 1: {}", o);
+    assert_eq!(
+        o.matches("P=1").count(),
+        2,
+        "both instances should read 1: {}",
+        o
+    );
 }
 
 #[test]
@@ -177,7 +209,12 @@ fn an_edge_block_in_a_scaled_submodule_reads_time_in_its_own_unit() {
     // clock, collapses to the PARENT's `clk` and yields no scope. `top` is
     // pinned to 1ns/1ns by the global assignment (the default would be 1ps).
     let (o, ok) = run(
-        &["--module-timescale", "1ns/1ns", "--module-timescale", "counter=10ns/1ns"],
+        &[
+            "--module-timescale",
+            "1ns/1ns",
+            "--module-timescale",
+            "counter=10ns/1ns",
+        ],
         r#"
 module counter (input logic clk);
   bit [7:0] cnt;
@@ -195,8 +232,16 @@ endmodule
 "#,
     );
     assert!(ok, "{}", o);
-    assert!(o.contains("EDGE1 rt=0.200"), "first edge must be 0.2 (own 10ns unit): {}", o);
-    assert!(o.contains("EDGE2 rt=0.600"), "second edge must be 0.6: {}", o);
+    assert!(
+        o.contains("EDGE1 rt=0.200"),
+        "first edge must be 0.2 (own 10ns unit): {}",
+        o
+    );
+    assert!(
+        o.contains("EDGE2 rt=0.600"),
+        "second edge must be 0.6: {}",
+        o
+    );
 }
 
 #[test]
@@ -204,7 +249,12 @@ fn nested_hierarchy_levels_each_scale_to_their_own_unit() {
     // top(1ns) -> mid(10ns via CLI) -> leaf(100ns via CLI): `#1` and $time
     // scale per level, at any depth.
     let (o, ok) = run(
-        &["--module-timescale", "mid=10ns/1ns", "--module-timescale", "leaf=100ns/1ns"],
+        &[
+            "--module-timescale",
+            "mid=10ns/1ns",
+            "--module-timescale",
+            "leaf=100ns/1ns",
+        ],
         r#"
 module leaf;
   initial begin #1; $display("LEAF t=%0d rt=%0.3f", $time, $realtime); end
@@ -221,8 +271,16 @@ endmodule
 "#,
     );
     assert!(ok, "{}", o);
-    assert!(o.contains("MID t=1 rt=1.000"), "mid #1 = 10ns, reads 1 in its unit: {}", o);
-    assert!(o.contains("LEAF t=1 rt=1.000"), "leaf #1 = 100ns, reads 1 in its unit: {}", o);
+    assert!(
+        o.contains("MID t=1 rt=1.000"),
+        "mid #1 = 10ns, reads 1 in its unit: {}",
+        o
+    );
+    assert!(
+        o.contains("LEAF t=1 rt=1.000"),
+        "leaf #1 = 100ns, reads 1 in its unit: {}",
+        o
+    );
     // Ordering proves the absolute times differ: MID (10ns) before LEAF (100ns).
     let m = o.find("MID t=1").unwrap();
     let l = o.find("LEAF t=1").unwrap();
@@ -243,7 +301,9 @@ fn run_two(args: &[&str], file_a: &str, file_b: &str) -> String {
     let bin = env!("CARGO_BIN_EXE_xezim");
     let mut cmd = Command::new(bin);
     cmd.arg("--sv2017").arg("--max-time").arg("10000000");
-    for a in args { cmd.arg(a); }
+    for a in args {
+        cmd.arg(a);
+    }
     cmd.arg(&pa).arg(&pb);
     let out = cmd.output().expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -259,9 +319,22 @@ const FILE_B: &str = "module sf2; initial $printtimescale; endmodule\n";
 
 #[test]
 fn module_timescale_overrides_cross_file_inherited() {
-    let o = run_two(&["--module-timescale", "1ps/1ps", "-s", "sf2", "--dump-timescales"], FILE_A, FILE_B);
-    assert!(o.contains("sf2                          1ps / 1ps") || o.contains("(sf2) is 1ps / 1ps"),
-        "--module-timescale must override the cross-file-inherited 1ns/1ps; got:\n{}", o);
+    let o = run_two(
+        &[
+            "--module-timescale",
+            "1ps/1ps",
+            "-s",
+            "sf2",
+            "--dump-timescales",
+        ],
+        FILE_A,
+        FILE_B,
+    );
+    assert!(
+        o.contains("sf2                          1ps / 1ps") || o.contains("(sf2) is 1ps / 1ps"),
+        "--module-timescale must override the cross-file-inherited 1ns/1ps; got:\n{}",
+        o
+    );
 }
 
 #[test]
@@ -269,6 +342,9 @@ fn cross_file_inherited_kept_without_cli() {
     // No --module-timescale: the single-compilation-unit sticky behavior is
     // preserved, so sf2 inherits 1ns/1ps from file A (backward compatible).
     let o = run_two(&["-s", "sf2", "--dump-timescales"], FILE_A, FILE_B);
-    assert!(o.contains("(sf2) is 1ns / 1ps") || o.contains("sf2                          1ns / 1ps"),
-        "without CLI, sf2 keeps the inherited 1ns/1ps; got:\n{}", o);
+    assert!(
+        o.contains("(sf2) is 1ns / 1ps") || o.contains("sf2                          1ns / 1ps"),
+        "without CLI, sf2 keeps the inherited 1ns/1ps; got:\n{}",
+        o
+    );
 }

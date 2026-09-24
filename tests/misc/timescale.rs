@@ -15,7 +15,11 @@ use xezim::simulate;
 
 fn out(src: &str) -> String {
     let sim = simulate(src, 10_000_000).expect("simulate failed");
-    sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -64,7 +68,11 @@ module wrap; top t(); u uu(); endmodule
     let i10 = o.find("R10").unwrap();
     let iu = o.find("UDONE").expect("UDONE missing");
     let i10010 = o.find("R10010").unwrap();
-    assert!(i10 < iu && iu < i10010, "UDONE must land between R10 and R10010: {}", o);
+    assert!(
+        i10 < iu && iu < i10010,
+        "UDONE must land between R10 and R10010: {}",
+        o
+    );
 }
 
 #[test]
@@ -81,7 +89,11 @@ module m; initial begin
 end endmodule
 "#);
     // "42.000ns" is 8 chars; width 10 → 2 leading spaces.
-    assert!(o.contains("A[  42.000ns]"), "3-decimal, width-10, suffix: {}", o);
+    assert!(
+        o.contains("A[  42.000ns]"),
+        "3-decimal, width-10, suffix: {}",
+        o
+    );
     assert!(o.contains("B[1.500 us]"), "1500ns shown as 1.500 us: {}", o);
 }
 
@@ -124,8 +136,16 @@ module m; initial begin
   #0.001; $display("B=%0f", $realtime);  // + 1 ps
 end endmodule
 "#);
-    assert!(o.contains("A=0.500000"), "0.5ns must be exact under 1ps precision: {}", o);
-    assert!(o.contains("B=0.501000"), "a 1ps step must advance time: {}", o);
+    assert!(
+        o.contains("A=0.500000"),
+        "0.5ns must be exact under 1ps precision: {}",
+        o
+    );
+    assert!(
+        o.contains("B=0.501000"),
+        "a 1ps step must advance time: {}",
+        o
+    );
 }
 
 #[test]
@@ -134,7 +154,11 @@ fn a_picosecond_timescale_counts_in_picoseconds() {
 `timescale 1ps/1ps
 module m; initial begin #500; $display("T=%0d", $time); end endmodule
 "#);
-    assert!(o.contains("T=500"), "#500 under 1ps must read 500, not 0: {}", o);
+    assert!(
+        o.contains("T=500"),
+        "#500 under 1ps must read 500, not 0: {}",
+        o
+    );
 }
 
 #[test]
@@ -149,10 +173,22 @@ module m; initial begin #1; $display("T=%0d R=%0f", $time, $realtime); end endmo
 #[test]
 fn sub_ns_precision_emits_no_warning() {
     // The old "sim ticks are 1ns" warning was stale and is gone.
-    let sim = simulate("`timescale 1ns/1ps\nmodule m; initial #1.5 $display(\"x\"); endmodule", 100)
-        .expect("simulate failed");
-    let joined = sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n");
-    assert!(!joined.contains("ticks are 1ns"), "stale sub-ns warning leaked: {}", joined);
+    let sim = simulate(
+        "`timescale 1ns/1ps\nmodule m; initial #1.5 $display(\"x\"); endmodule",
+        100,
+    )
+    .expect("simulate failed");
+    let joined = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !joined.contains("ticks are 1ns"),
+        "stale sub-ns warning leaked: {}",
+        joined
+    );
 }
 
 // §3.14.2 / §20.4 — a module with NO `timescale directive (and none preceding
@@ -162,7 +198,11 @@ fn sub_ns_precision_emits_no_warning() {
 #[test]
 fn no_timescale_module_reports_one_ns_default() {
     let o = out("module m; initial $printtimescale; endmodule");
-    assert!(o.contains("is 1ns / 1ns"), "no-timescale module must report 1ns/1ns; got: {}", o);
+    assert!(
+        o.contains("is 1ns / 1ns"),
+        "no-timescale module must report 1ns/1ns; got: {}",
+        o
+    );
 }
 
 // A directive-less module counts delays in its 1ns default unit: `#5` is 5 ns,
@@ -171,12 +211,22 @@ fn no_timescale_module_reports_one_ns_default() {
 #[test]
 fn no_timescale_module_counts_delays_in_ns() {
     let o = out("module m; initial begin #5; $display(\"T=%0d\", $time); end endmodule");
-    assert!(o.contains("T=5"), "delay scaling must use the 1ns default; got: {}", o);
+    assert!(
+        o.contains("T=5"),
+        "delay scaling must use the 1ns default; got: {}",
+        o
+    );
     let o = out(r#"
 `timescale 1ns/1ps
 module timed; initial begin #1; $display("TT=%0d", $time); end endmodule
-"#.to_string().as_str());
-    assert!(o.contains("TT=1"), "timed module reports in its own unit; got: {}", o);
+"#
+    .to_string()
+    .as_str());
+    assert!(
+        o.contains("TT=1"),
+        "timed module reports in its own unit; got: {}",
+        o
+    );
 }
 
 // §20.3 — `$time`/`$realtime` inside a subroutine reference the DEFINING
@@ -191,8 +241,11 @@ module top; sub s(); initial #5 s.show(); endmodule
 `timescale 1ns/1ps
 module sub; task show; $display("XT=%0g rt=%0g", $realtime, $time); endtask endmodule
 "#);
-    assert!(o.contains("XT=5000 rt=5000"),
-        "cross-module task must use the callee's 1ns unit (5000), not the caller's 1us (5); got: {}", o);
+    assert!(
+        o.contains("XT=5000 rt=5000"),
+        "cross-module task must use the callee's 1ns unit (5000), not the caller's 1us (5); got: {}",
+        o
+    );
 }
 
 // Same rule for a FUNCTION returning $realtime across a timescale boundary.
@@ -204,8 +257,11 @@ module top; sub s(); initial #5 $display("XF=%0g", s.gett()); endmodule
 `timescale 1ns/1ps
 module sub; function real gett; gett = $realtime; endfunction endmodule
 "#);
-    assert!(o.contains("XF=5000"),
-        "cross-module function must evaluate $realtime in the callee's 1ns unit (5000); got: {}", o);
+    assert!(
+        o.contains("XF=5000"),
+        "cross-module function must evaluate $realtime in the callee's 1ns unit (5000); got: {}",
+        o
+    );
 }
 
 // §20.3 — `%t` of `$time` must format `$time`'s UNIT-ROUNDED value, not the raw
@@ -221,8 +277,16 @@ module m; initial begin #1.234
   $display("RR=%0t", $realtime);    // full     -> 1234
 end endmodule
 "#);
-    assert!(o.contains("TT=1000"), "%t of $time must be the rounded 1000; got: {}", o);
-    assert!(o.contains("RR=1234"), "%t of $realtime must keep 1234; got: {}", o);
+    assert!(
+        o.contains("TT=1000"),
+        "%t of $time must be the rounded 1000; got: {}",
+        o
+    );
+    assert!(
+        o.contains("RR=1234"),
+        "%t of $realtime must keep 1234; got: {}",
+        o
+    );
 }
 
 // A module WITHOUT its own directive but PRECEDED by one inherits it (sticky
@@ -238,8 +302,13 @@ module inherits_it; initial $printtimescale; endmodule
     // `__xezim_multi_top.inherits_it`. The name is incidental — what matters is
     // that it INHERITED the preceding `1us/1ns` directive instead of defaulting
     // to 1ns/1ns, so assert on the value of the inherits_it line.
-    let inherits_line = o.lines().find(|l| l.contains("inherits_it"))
+    let inherits_line = o
+        .lines()
+        .find(|l| l.contains("inherits_it"))
         .expect("inherits_it $printtimescale line missing");
-    assert!(inherits_line.contains("1us / 1ns"),
-        "module after a directive must inherit it; got: {}", o);
+    assert!(
+        inherits_line.contains("1us / 1ns"),
+        "module after a directive must inherit it; got: {}",
+        o
+    );
 }

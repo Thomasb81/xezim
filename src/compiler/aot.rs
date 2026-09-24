@@ -300,8 +300,7 @@ pub fn gen_block_fn_mapped(
         .windows(2)
         .enumerate()
         .filter_map(|(j, pair)| {
-            let Insn::BinOpConst(h2, l2, k, super::bytecode::BinOpConstKind::Add) = &pair[0]
-            else {
+            let Insn::BinOpConst(h2, l2, k, super::bytecode::BinOpConstKind::Add) = &pair[0] else {
                 return None;
             };
             let Insn::RangeSelect(d, _, h, l) = &pair[1] else {
@@ -370,8 +369,19 @@ pub fn gen_block_fn_mapped(
             }
             let _ = writeln!(w, "{i} => {{");
         }
-        if emit_insn_rust(w, &mut tables, &mut ntab, insn, i, n, &meta, sig_w, sig_signed, sigmap)
-            .is_none()
+        if emit_insn_rust(
+            w,
+            &mut tables,
+            &mut ntab,
+            insn,
+            i,
+            n,
+            &meta,
+            sig_w,
+            sig_signed,
+            sigmap,
+        )
+        .is_none()
         {
             if std::env::var("XEZIM_JIT_VERBOSE").is_ok() {
                 eprintln!(
@@ -381,7 +391,11 @@ pub fn gen_block_fn_mapped(
                 );
                 if std::env::var("XEZIM_JIT_VERBOSE").as_deref() == Ok("2") {
                     for (k, ins) in insns.iter().enumerate() {
-                        eprintln!("[AOT-GEN-BAIL]   [{k}]{} {:?}", if k == i { "*" } else { " " }, ins);
+                        eprintln!(
+                            "[AOT-GEN-BAIL]   [{k}]{} {:?}",
+                            if k == i { "*" } else { " " },
+                            ins
+                        );
                     }
                 }
             }
@@ -557,8 +571,19 @@ pub fn gen_fsm_fn(
             }
             _ => {}
         }
-        if emit_insn_rust(w, &mut tables, &mut ntab, insn, i, n, &meta, sig_w, sig_signed, None)
-            .is_none()
+        if emit_insn_rust(
+            w,
+            &mut tables,
+            &mut ntab,
+            insn,
+            i,
+            n,
+            &meta,
+            sig_w,
+            sig_signed,
+            None,
+        )
+        .is_none()
         {
             if std::env::var_os("XEZIM_JIT_VERBOSE").is_some() {
                 let lo = i.saturating_sub(2);
@@ -596,20 +621,22 @@ pub fn gen_fsm_fn(
             2 * r as usize + 1
         );
     }
-    out.push_str("let mut pc: u32 = start_pc;
+    out.push_str(
+        "let mut pc: u32 = start_pc;
 'sm: loop { match pc {
-");
+",
+    );
     out.push_str(&body);
     out.push_str("_ => { ");
     out.push_str(&spill);
-    out.push_str("*out.add(0) = 0; return 0; }
+    out.push_str(
+        "*out.add(0) = 0; return 0; }
 } }
 }
-");
+",
+    );
     Some(out)
 }
-
-
 
 /// Native process-FSM entry: (sim, start_pc, frame, out) -> resume pc.
 pub type AotFsmFn = unsafe extern "C" fn(*mut u8, u32, *mut u64, *mut u64) -> u32;
@@ -684,10 +711,16 @@ fn emit_insn_rust(
             let (kv, kx) = k.raw_bits();
             match kind {
                 K::And => {
-                    let _ = writeln!(w, "let t = and4(r{sr}v, r{sr}x, {kv:#x}, {kx:#x}); r{d}v = t.0; r{d}x = t.1;");
+                    let _ = writeln!(
+                        w,
+                        "let t = and4(r{sr}v, r{sr}x, {kv:#x}, {kx:#x}); r{d}v = t.0; r{d}x = t.1;"
+                    );
                 }
                 K::Or => {
-                    let _ = writeln!(w, "let t = or4(r{sr}v, r{sr}x, {kv:#x}, {kx:#x}); r{d}v = t.0; r{d}x = t.1;");
+                    let _ = writeln!(
+                        w,
+                        "let t = or4(r{sr}v, r{sr}x, {kv:#x}, {kx:#x}); r{d}v = t.0; r{d}x = t.1;"
+                    );
                 }
                 K::Mul => {
                     let _ = writeln!(
@@ -762,25 +795,46 @@ fn emit_insn_rust(
             );
         }
         Add(d, l, r) => {
-            let _ = writeln!(w, "let t = arith4(r{l}v.wrapping_add(r{r}v), r{l}x, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = arith4(r{l}v.wrapping_add(r{r}v), r{l}x, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         Sub(d, l, r) => {
-            let _ = writeln!(w, "let t = arith4(r{l}v.wrapping_sub(r{r}v), r{l}x, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = arith4(r{l}v.wrapping_sub(r{r}v), r{l}x, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         Mul(d, l, r) => {
-            let _ = writeln!(w, "let t = arith4(r{l}v.wrapping_mul(r{r}v), r{l}x, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = arith4(r{l}v.wrapping_mul(r{r}v), r{l}x, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         BitAnd(d, l, r) => {
-            let _ = writeln!(w, "let t = and4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = and4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         BitOr(d, l, r) => {
-            let _ = writeln!(w, "let t = or4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = or4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         BitXor(d, l, r) => {
-            let _ = writeln!(w, "let t = xor4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = xor4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         BitXnor(d, l, r) => {
-            let _ = writeln!(w, "let t = xnor4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = xnor4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         BitNot(d, s) => {
             let _ = writeln!(w, "let t = not4(r{s}v, r{s}x); r{d}v = t.0; r{d}x = t.1;");
@@ -789,13 +843,22 @@ fn emit_insn_rust(
             let _ = writeln!(w, "let t = neg4(r{s}v, r{s}x); r{d}v = t.0; r{d}x = t.1;");
         }
         LogAnd(d, l, r) => {
-            let _ = writeln!(w, "let t = logand4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = logand4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         LogOr(d, l, r) => {
-            let _ = writeln!(w, "let t = logor4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = logor4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         LogNot(d, s) => {
-            let _ = writeln!(w, "let t = lognot4(r{s}v, r{s}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = lognot4(r{s}v, r{s}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         Eq(d, l, r) | Neq(d, l, r) | Lt(d, l, r) | Leq(d, l, r) | Gt(d, l, r) | Geq(d, l, r) => {
             let op = match insn {
@@ -820,10 +883,16 @@ fn emit_insn_rust(
             );
         }
         Shl(d, l, r) => {
-            let _ = writeln!(w, "let t = shl4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = shl4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         Shr(d, l, r) => {
-            let _ = writeln!(w, "let t = shr4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = shr4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         AShr(d, l, r) => {
             // Pre-sext the left operand (writes back, like the cranelift arm).
@@ -831,18 +900,30 @@ fn emit_insn_rust(
             if rs(*l) && lw > 0 && lw < 64 {
                 let _ = writeln!(w, "r{l}v = sext(r{l}v, {lw}); r{l}x = sext(r{l}x, {lw});");
             }
-            let _ = writeln!(w, "let t = ashr4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = ashr4(r{l}v, r{l}x, r{r}v, r{r}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         ReduceOr(d, s) => {
-            let _ = writeln!(w, "let t = reduceor4(r{s}v, r{s}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = reduceor4(r{s}v, r{s}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         ReduceXor(d, s) => {
-            let _ = writeln!(w, "let t = reducexor4(r{s}v, r{s}x); r{d}v = t.0; r{d}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = reducexor4(r{s}v, r{s}x); r{d}v = t.0; r{d}x = t.1;"
+            );
         }
         Resize(reg, width) => {
             let cw = rw(*reg);
             let sg = rs(*reg);
-            let _ = writeln!(w, "let t = resize4(r{reg}v, r{reg}x, {cw}, {sg}, {width}); r{reg}v = t.0; r{reg}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = resize4(r{reg}v, r{reg}x, {cw}, {sg}, {width}); r{reg}v = t.0; r{reg}x = t.1;"
+            );
         }
         Select(dest, c, t, e) => {
             let _ = writeln!(
@@ -888,7 +969,10 @@ fn emit_insn_rust(
             if bw == 0 {
                 return None;
             }
-            let _ = writeln!(w, "let t = bitsel4(r{base}v, r{base}x, r{idx}v, {bw}); r{dest}v = t.0; r{dest}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = bitsel4(r{base}v, r{base}x, r{idx}v, {bw}); r{dest}v = t.0; r{dest}x = t.1;"
+            );
         }
         BitSelectConst(dest, base, idx) => {
             let bw = rw(*base);
@@ -898,7 +982,10 @@ fn emit_insn_rust(
             if *idx >= bw {
                 let _ = writeln!(w, "r{dest}v = 0; r{dest}x = 1;");
             } else {
-                let _ = writeln!(w, "r{dest}v = (r{base}v >> {idx}) & 1; r{dest}x = (r{base}x >> {idx}) & 1;");
+                let _ = writeln!(
+                    w,
+                    "r{dest}v = (r{base}v >> {idx}) & 1; r{dest}x = (r{base}x >> {idx}) & 1;"
+                );
             }
         }
         RangeSelect(dest, base, l_r, r_r) => {
@@ -906,7 +993,10 @@ fn emit_insn_rust(
             if bw == 0 {
                 return None;
             }
-            let _ = writeln!(w, "let t = rangesel4(r{base}v, r{base}x, r{l_r}v, r{r_r}v, {bw}); r{dest}v = t.0; r{dest}x = t.1;");
+            let _ = writeln!(
+                w,
+                "let t = rangesel4(r{base}v, r{base}x, r{l_r}v, r{r_r}v, {bw}); r{dest}v = t.0; r{dest}x = t.1;"
+            );
         }
         RangeSelectConst(dest, base, l_imm, r_imm) => {
             let bw = rw(*base);
@@ -920,7 +1010,11 @@ fn emit_insn_rust(
             if resw > 64 {
                 return None;
             }
-            let resm: u64 = if resw >= 64 { u64::MAX } else { (1u64 << resw) - 1 };
+            let resm: u64 = if resw >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << resw) - 1
+            };
             let oor: u64 = if lsb >= bw {
                 resm
             } else if msb >= bw {
@@ -971,7 +1065,11 @@ fn emit_insn_rust(
             // are X-marked with the same keep/oor masks as the narrow arm.
             if hi >= 64 {
                 let sw = sig_sw;
-                let full: u64 = if wid >= 64 { u64::MAX } else { (1u64 << wid) - 1 };
+                let full: u64 = if wid >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << wid) - 1
+                };
                 let oor: u64 = if sw > 0 && lo >= sw {
                     full
                 } else if sw > 0 && hi >= sw {
@@ -987,7 +1085,11 @@ fn emit_insn_rust(
                 return Some(());
             }
             let sw = sig_sw;
-            let full: u64 = if wid >= 64 { u64::MAX } else { (1u64 << wid) - 1 };
+            let full: u64 = if wid >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << wid) - 1
+            };
             let oor: u64 = if sw > 0 && lo >= sw {
                 full
             } else if sw > 0 && hi >= sw {
@@ -1009,11 +1111,12 @@ fn emit_insn_rust(
             let sig = sref(*sig);
             let effw = if *width == 0 { sw } else { *width };
             if effw == sw && (1..=64).contains(&effw) {
-                let mask = if effw >= 64 { u64::MAX } else { (1u64 << effw) - 1 };
-                let _ = writeln!(
-                    w,
-                    "st4(sim, {sig}, r{val}v, r{val}x, {width}, {mask:#x});"
-                );
+                let mask = if effw >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << effw) - 1
+                };
+                let _ = writeln!(w, "st4(sim, {sig}, r{val}v, r{val}x, {width}, {mask:#x});");
             } else {
                 let _ = writeln!(w, "(br().store4s)(sim, {sig}, r{val}v, r{val}x, {width});");
             }
@@ -1024,11 +1127,17 @@ fn emit_insn_rust(
         }
         BlockingAssignRange(sig, hi, lo, val) => {
             let sig = sref(*sig);
-            let _ = writeln!(w, "(br().blk_range)(sim, {sig}, {hi}, {lo}, r{val}v, r{val}x);");
+            let _ = writeln!(
+                w,
+                "(br().blk_range)(sim, {sig}, {hi}, {lo}, r{val}v, r{val}x);"
+            );
         }
         BlockingAssignRangeDyn(sig, hi_r, lo_r, val) => {
             let sig = sref(*sig);
-            let _ = writeln!(w, "(br().blk_range)(sim, {sig}, r{hi_r}v, r{lo_r}v, r{val}v, r{val}x);");
+            let _ = writeln!(
+                w,
+                "(br().blk_range)(sim, {sig}, r{hi_r}v, r{lo_r}v, r{val}v, r{val}x);"
+            );
         }
         BlockingAssignBitDyn(sig, idx_r, val) => {
             let sig = sref(*sig);
@@ -1055,11 +1164,17 @@ fn emit_insn_rust(
         }
         NbaAssignRange(sig, hi, lo, val) => {
             let sig = sref(*sig);
-            let _ = writeln!(w, "(br().nba_range)(sim, {sig}, {hi}, {lo}, r{val}v, r{val}x);");
+            let _ = writeln!(
+                w,
+                "(br().nba_range)(sim, {sig}, {hi}, {lo}, r{val}v, r{val}x);"
+            );
         }
         NbaAssignRangeDyn(sig, hi_r, lo_r, val) => {
             let sig = sref(*sig);
-            let _ = writeln!(w, "(br().nba_range)(sim, {sig}, r{hi_r}v, r{lo_r}v, r{val}v, r{val}x);");
+            let _ = writeln!(
+                w,
+                "(br().nba_range)(sim, {sig}, r{hi_r}v, r{lo_r}v, r{val}v, r{val}x);"
+            );
         }
         NbaAssignBitDyn(sig, idx_r, val) => {
             let sig = sref(*sig);
@@ -1071,7 +1186,10 @@ fn emit_insn_rust(
             );
         }
         LoadArrayElem(d, arr, idx_reg) => {
-            let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
+            let ArrayOperand::Dense {
+                first_id, lo, hi, ..
+            } = arr.as_ref()
+            else {
                 return None;
             };
             // A dense array's BASE id is mapped like any other signal id: the
@@ -1087,7 +1205,10 @@ fn emit_insn_rust(
             );
         }
         BlockingAssignArray(arr, idx_reg, val_reg, width) => {
-            let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
+            let ArrayOperand::Dense {
+                first_id, lo, hi, ..
+            } = arr.as_ref()
+            else {
                 return None;
             };
             // A dense array's BASE id is mapped like any other signal id: the
@@ -1103,7 +1224,10 @@ fn emit_insn_rust(
             );
         }
         NbaAssignArray(arr, idx_reg, val_reg, width) => {
-            let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
+            let ArrayOperand::Dense {
+                first_id, lo, hi, ..
+            } = arr.as_ref()
+            else {
                 return None;
             };
             // A dense array's BASE id is mapped like any other signal id: the
@@ -1127,7 +1251,10 @@ fn emit_insn_rust(
             // stays a plain u32 either way, so the type checker cannot flag
             // it; only an audit of every id interpolation finds it.
             let idx_sig = sref(*idx_sig);
-            let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
+            let ArrayOperand::Dense {
+                first_id, lo, hi, ..
+            } = arr.as_ref()
+            else {
                 return None;
             };
             // A dense array's BASE id is mapped like any other signal id: the
@@ -1147,7 +1274,10 @@ fn emit_insn_rust(
         // Ranged NBA into a dense array element: the range bridge already
         // takes a signal id, so the computed element id slots straight in.
         NbaAssignArrayRange(arr, idx_reg, hi_reg, lo_reg, val_reg) => {
-            let ArrayOperand::Dense { first_id, lo, hi, .. } = arr.as_ref() else {
+            let ArrayOperand::Dense {
+                first_id, lo, hi, ..
+            } = arr.as_ref()
+            else {
                 return None;
             };
             // A dense array's BASE id is mapped like any other signal id: the
@@ -1164,13 +1294,19 @@ fn emit_insn_rust(
         }
         BranchIfFalse(cond, target) => {
             let t = jump_pc(*target as usize, n);
-            let _ = writeln!(w, "if (r{cond}v & !r{cond}x) == 0 {{ pc = {t}; continue 'sm; }}");
+            let _ = writeln!(
+                w,
+                "if (r{cond}v & !r{cond}x) == 0 {{ pc = {t}; continue 'sm; }}"
+            );
         }
         // Fused LogNot+BranchIfFalse: jump unless DEFINITE zero (X jumps),
         // the exact composition the interpreter and cranelift implement.
         BranchUnlessZero(cond, target) => {
             let t = jump_pc(*target as usize, n);
-            let _ = writeln!(w, "if (r{cond}v | r{cond}x) != 0 {{ pc = {t}; continue 'sm; }}");
+            let _ = writeln!(
+                w,
+                "if (r{cond}v | r{cond}x) != 0 {{ pc = {t}; continue 'sm; }}"
+            );
         }
         CmpBranch(kind, l, r, tmp, target) => {
             use crate::compiler::bytecode::CmpKind as CK;
@@ -1200,7 +1336,10 @@ fn emit_insn_rust(
                     );
                 }
             }
-            let _ = writeln!(w, "if (r{tmp}v & !r{tmp}x) == 0 {{ pc = {t}; continue 'sm; }}");
+            let _ = writeln!(
+                w,
+                "if (r{tmp}v & !r{tmp}x) == 0 {{ pc = {t}; continue 'sm; }}"
+            );
         }
         Jump(target) => {
             let t = jump_pc(*target as usize, n);
@@ -1281,8 +1420,7 @@ impl AotLib {
         if p.is_null() {
             return None;
         }
-        let f: unsafe extern "C" fn(u32) -> *mut u8 =
-            unsafe { std::mem::transmute(p) };
+        let f: unsafe extern "C" fn(u32) -> *mut u8 = unsafe { std::mem::transmute(p) };
         Some(move |idx: u32| unsafe { f(idx) })
     }
 
@@ -1307,22 +1445,14 @@ impl AotLib {
     }
 }
 
-pub fn compile_and_load(
-    source: &str,
-    verbose: bool,
-    planes: (u64, u32),
-) -> Option<AotLib> {
+pub fn compile_and_load(source: &str, verbose: bool, planes: (u64, u32)) -> Option<AotLib> {
     // Unique per COMPILE, not per process: several Simulators in one
     // process (cargo test threads) would otherwise overwrite each other's
     // crate — and dlopen caches by PATH, silently handing a test another
     // design's library.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "xezim_aot_{}_{}",
-        std::process::id(),
-        seq
-    ));
+    let dir = std::env::temp_dir().join(format!("xezim_aot_{}_{}", std::process::id(), seq));
     std::fs::create_dir_all(&dir).ok()?;
     let rs = dir.join("xezim_aot.rs");
     let so = dir.join("libxezim_aot.so");
@@ -1358,12 +1488,9 @@ pub fn compile_and_load(
             );
             let base = std::env::var_os("XEZIM_CACHE_DIR")
                 .map(std::path::PathBuf::from)
+                .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from))
                 .or_else(|| {
-                    std::env::var_os("XDG_CACHE_HOME").map(std::path::PathBuf::from)
-                })
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(|hm| std::path::PathBuf::from(hm).join(".cache"))
+                    std::env::var_os("HOME").map(|hm| std::path::PathBuf::from(hm).join(".cache"))
                 });
             base.map(|b| {
                 let d = b.join("xezim").join("native");
@@ -1389,7 +1516,14 @@ pub fn compile_and_load(
     // on ibex but may differ on larger generated crates). target-cpu=native
     // lets LLVM use the host's vector/bit ops in the plane algebra.
     let opt = opt_env;
-    let opt_arg = format!("opt-level={}", if matches!(opt.as_str(), "0" | "1" | "2" | "3") { opt.as_str() } else { "2" });
+    let opt_arg = format!(
+        "opt-level={}",
+        if matches!(opt.as_str(), "0" | "1" | "2" | "3") {
+            opt.as_str()
+        } else {
+            "2"
+        }
+    );
     let out = std::process::Command::new("rustc")
         .args([
             "--edition",
@@ -1422,7 +1556,11 @@ pub fn compile_and_load(
         return None;
     }
     if verbose {
-        eprintln!("[AOT] rustc compiled {} bytes of source in {:.1}s", source.len(), t0.elapsed().as_secs_f64());
+        eprintln!(
+            "[AOT] rustc compiled {} bytes of source in {:.1}s",
+            source.len(),
+            t0.elapsed().as_secs_f64()
+        );
     }
     if let Some(cp) = &cache_so {
         // Atomic publish: write beside, rename over.
@@ -1476,7 +1614,8 @@ pub fn module_source(block_fns: &[String]) -> String {
 /// `xezim_native_api(idx) -> *mut u8` table over `names` (in order), so the
 /// loader resolves a single symbol instead of one dlsym per block.
 pub fn module_source_named(block_fns: &[String], names: &[String]) -> String {
-    let mut s = String::with_capacity(PRELUDE.len() + block_fns.iter().map(|b| b.len()).sum::<usize>());
+    let mut s =
+        String::with_capacity(PRELUDE.len() + block_fns.iter().map(|b| b.len()).sum::<usize>());
     s.push_str(PRELUDE);
     for b in block_fns {
         s.push_str(b);
@@ -1566,7 +1705,9 @@ pub fn canon_shape(
                 d.hash(&mut h);
                 i.hash(&mut h);
                 match arr.as_ref() {
-                    ArrayOperand::Dense { first_id, lo, hi, .. } => {
+                    ArrayOperand::Dense {
+                        first_id, lo, hi, ..
+                    } => {
                         (lo, hi).hash(&mut h);
                         canon(*first_id as u32, &mut h);
                     }
@@ -1577,7 +1718,9 @@ pub fn canon_shape(
             Insn::BlockingAssignArray(arr, i, r, w) | Insn::NbaAssignArray(arr, i, r, w) => {
                 (i, r, w).hash(&mut h);
                 match arr.as_ref() {
-                    ArrayOperand::Dense { first_id, lo, hi, .. } => {
+                    ArrayOperand::Dense {
+                        first_id, lo, hi, ..
+                    } => {
                         (lo, hi).hash(&mut h);
                         canon(*first_id as u32, &mut h);
                     }
@@ -1589,7 +1732,9 @@ pub fn canon_shape(
                 canon(*dst, &mut h);
                 canon(*idx, &mut h);
                 match arr.as_ref() {
-                    ArrayOperand::Dense { first_id, lo, hi, .. } => {
+                    ArrayOperand::Dense {
+                        first_id, lo, hi, ..
+                    } => {
                         (lo, hi).hash(&mut h);
                         canon(*first_id as u32, &mut h);
                     }
@@ -1682,5 +1827,11 @@ pub fn gen_templated_blocks(
         }
     }
     let (n_templates, n_blocks) = (tpl_names.len(), blocks.len());
-    TemplateBuild { fns, tpl_names, blocks, n_templates, n_blocks }
+    TemplateBuild {
+        fns,
+        tpl_names,
+        blocks,
+        n_templates,
+        n_blocks,
+    }
 }

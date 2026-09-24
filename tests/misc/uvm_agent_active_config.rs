@@ -88,5 +88,8 @@ endmodule
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(text.contains("RESULT_PASS"), "uvm_agent must read a1=A a2=P: {text}");
+    assert!(
+        text.contains("RESULT_PASS"),
+        "uvm_agent must read a1=A a2=P: {text}"
+    );
 }

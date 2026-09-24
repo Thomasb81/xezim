@@ -17,7 +17,13 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "test", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "test",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -60,13 +66,22 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|call1 -> 0"), "alive entry selected:\n{text}");
-    assert!(text.contains("T|entry 0 dead"), "dead branch taken:\n{text}");
+    assert!(
+        text.contains("T|call1 -> 0"),
+        "alive entry selected:\n{text}"
+    );
+    assert!(
+        text.contains("T|entry 0 dead"),
+        "dead branch taken:\n{text}"
+    );
     assert!(
         text.contains("T|loop exit"),
         "statements after the loop must run when the final iteration continues:\n{text}"
     );
-    assert!(text.contains("T|call2 -> -1"), "second call must return -1, not a stale 0:\n{text}");
+    assert!(
+        text.contains("T|call2 -> -1"),
+        "second call must return -1, not a stale 0:\n{text}"
+    );
 }
 
 #[test]
@@ -115,7 +130,10 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|early choose=0"), "live entry is selectable:\n{text}");
+    assert!(
+        text.contains("T|early choose=0"),
+        "live entry is selectable:\n{text}"
+    );
     assert!(
         text.contains("T|late choose=-1"),
         "all-dead queue must yield -1 (stale-return leak):\n{text}"

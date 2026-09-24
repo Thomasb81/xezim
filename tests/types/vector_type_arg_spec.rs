@@ -27,11 +27,20 @@ fn dimensioned_vector_type_arg_keeps_its_own_specialization() {
     let src = dir.join("top.sv");
     std::fs::write(&src, DESIGN).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "top", src.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            src.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     assert!(output.status.success(), "run failed:\n{text}");
-    assert!(text.contains("W a=8 b=1 c=32"), "wrong specialization widths:\n{text}");
+    assert!(
+        text.contains("W a=8 b=1 c=32"),
+        "wrong specialization widths:\n{text}"
+    );
 }

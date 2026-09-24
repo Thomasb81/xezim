@@ -50,7 +50,11 @@ module top;
 endmodule
 "#;
     let o = out(SRC);
-    assert!(o.contains("V 01101"), "every index must drive its own bit:\n{}", o);
+    assert!(
+        o.contains("V 01101"),
+        "every index must drive its own bit:\n{}",
+        o
+    );
 }
 
 /// The same shape driven from a generate loop, alongside the spellings that
@@ -86,11 +90,19 @@ module top;
 endmodule
 "#;
     let o = out(SRC);
-    assert!(o.contains("E 10110"), "unit inner dim, element assign:\n{}", o);
+    assert!(
+        o.contains("E 10110"),
+        "unit inner dim, element assign:\n{}",
+        o
+    );
     assert!(o.contains("I 10110"), "whole inner dim assign:\n{}", o);
     assert!(o.contains("C 10110"), "cast form:\n{}", o);
     // The undriven upper bit of each 2-bit element stays x.
-    assert!(o.contains("W x1x0x1x1x0"), "2-bit inner dim, element assign:\n{}", o);
+    assert!(
+        o.contains("W x1x0x1x1x0"),
+        "2-bit inner dim, element assign:\n{}",
+        o
+    );
 }
 
 /// A procedural write to the same shape always worked; it takes a different

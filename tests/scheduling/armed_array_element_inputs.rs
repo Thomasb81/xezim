@@ -43,8 +43,16 @@ endmodule
     let sim = simulate(src, 1000).expect("simulate failed");
     assert_eq!(u(&sim, "s_q"), 0x11);
     assert_eq!(u(&sim, "s_q2"), 0x12);
-    assert_eq!(u(&sim, "r_q"), 0x22, "read port did not re-execute after mem[3] changed");
-    assert_eq!(u(&sim, "r_q2"), 0x23, "computed read did not re-execute after mem[3] changed");
+    assert_eq!(
+        u(&sim, "r_q"),
+        0x22,
+        "read port did not re-execute after mem[3] changed"
+    );
+    assert_eq!(
+        u(&sim, "r_q2"),
+        0x23,
+        "computed read did not re-execute after mem[3] changed"
+    );
 }
 
 #[test]
@@ -70,5 +78,9 @@ endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
     assert_eq!(u(&sim, "before_edge"), 0x00);
-    assert_eq!(u(&sim, "after_edge"), 0x5a, "write port did not re-execute after mem2[1] was clobbered");
+    assert_eq!(
+        u(&sim, "after_edge"),
+        0x5a,
+        "write port did not re-execute after mem2[1] was clobbered"
+    );
 }

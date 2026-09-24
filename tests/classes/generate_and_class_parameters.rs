@@ -52,9 +52,17 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "s0"), 8, "generate localparam must reach the override");
+    assert_eq!(
+        u(&sim, "s0"),
+        8,
+        "generate localparam must reach the override"
+    );
     assert_eq!(u(&sim, "s1"), 11);
-    assert_eq!(u(&sim, "hier"), 3, "generate localparam is visible hierarchically");
+    assert_eq!(
+        u(&sim, "hier"),
+        3,
+        "generate localparam is visible hierarchically"
+    );
 }
 
 #[test]
@@ -78,10 +86,18 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "r_a"), 16, "body localparam follows the specialization");
+    assert_eq!(
+        u(&sim, "r_a"),
+        16,
+        "body localparam follows the specialization"
+    );
     assert_eq!(u(&sim, "r_b"), 4);
     assert_eq!(u(&sim, "r_c"), 8, "unspecialized keeps the default");
-    assert_eq!(u(&sim, "bits_a"), 16, "$bits of a class-parameter-sized type");
+    assert_eq!(
+        u(&sim, "bits_a"),
+        16,
+        "$bits of a class-parameter-sized type"
+    );
 }
 
 #[test]
@@ -103,7 +119,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "w16"), 16, "type-param default re-sizes per specialization");
+    assert_eq!(
+        u(&sim, "w16"),
+        16,
+        "type-param default re-sizes per specialization"
+    );
     assert_eq!(u(&sim, "w4"), 4);
     assert_eq!(u(&sim, "wdef"), 8);
 }

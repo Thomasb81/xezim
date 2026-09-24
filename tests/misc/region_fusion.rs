@@ -43,7 +43,8 @@ endmodule
     std::fs::write(&f, src).unwrap();
     let run = |fused: bool| -> Vec<String> {
         let mut c = Command::new(env!("CARGO_BIN_EXE_xezim"));
-        c.args(["--no-cache", "-s", "tb", "--max-time", "1000"]).arg(&f);
+        c.args(["--no-cache", "-s", "tb", "--max-time", "1000"])
+            .arg(&f);
         if fused {
             c.env("XEZIM_REGIONS", "1");
         } else {

@@ -73,7 +73,10 @@ module top;
   end
 endmodule
 "#);
-    assert!(o.contains("R=111 V=0"), "conditional foreach bodies violated:\n{o}");
+    assert!(
+        o.contains("R=111 V=0"),
+        "conditional foreach bodies violated:\n{o}"
+    );
 }
 
 #[test]
@@ -106,7 +109,10 @@ module top;
   end
 endmodule
 "#);
-    assert!(o.contains("UNSAT=0 SAT=1 V=0"), "unsat/sat verdicts wrong:\n{o}");
+    assert!(
+        o.contains("UNSAT=0 SAT=1 V=0"),
+        "unsat/sat verdicts wrong:\n{o}"
+    );
 }
 
 #[test]
@@ -149,6 +155,8 @@ module top;
   end
 endmodule
 "#);
-    assert!(o.contains("MESH r=1 viol=0"), "valid monotone mesh not solved:\n{o}");
+    assert!(
+        o.contains("MESH r=1 viol=0"),
+        "valid monotone mesh not solved:\n{o}"
+    );
 }
-

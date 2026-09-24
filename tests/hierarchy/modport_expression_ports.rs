@@ -39,13 +39,23 @@ fn modport_expression_members_read_write_and_select() {
     let src = dir.join("top.sv");
     std::fs::write(&src, DESIGN).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "top", src.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            src.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     assert!(output.status.success(), "run failed:\n{text}");
-    for want in ["Q1 t=cd hi=cd b=ab b3=1 pair=cdab", "Q2 b=aa", "Q3 word=cd0000aa"] {
+    for want in [
+        "Q1 t=cd hi=cd b=ab b3=1 pair=cdab",
+        "Q2 b=aa",
+        "Q3 word=cd0000aa",
+    ] {
         assert!(text.contains(want), "missing `{want}`:\n{text}");
     }
 }

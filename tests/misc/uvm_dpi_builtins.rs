@@ -87,10 +87,22 @@ fn uvm_dpi_builtins_regex_hdl_and_argv() {
         "glob_to_re translation; output: {:?}",
         msgs
     );
-    assert!(has("T|m1=0 m2=1"), "uvm_re_match search semantics; output: {:?}", msgs);
-    assert!(has("T|x1=0 x2=1"), "regcomp/regexec handles; output: {:?}", msgs);
+    assert!(
+        has("T|m1=0 m2=1"),
+        "uvm_re_match search semantics; output: {:?}",
+        msgs
+    );
+    assert!(
+        has("T|x1=0 x2=1"),
+        "regcomp/regexec handles; output: {:?}",
+        msgs
+    );
     assert!(has("T|chk=1"), "uvm_hdl_check_path; output: {:?}", msgs);
-    assert!(has("T|probe=a5 rd=a5"), "uvm_hdl deposit/read roundtrip; output: {:?}", msgs);
+    assert!(
+        has("T|probe=a5 rd=a5"),
+        "uvm_hdl deposit/read roundtrip; output: {:?}",
+        msgs
+    );
     assert!(
         has("T|arg=1 tool=xezim"),
         "argv walk must surface plusargs and the tool name; output: {:?}",

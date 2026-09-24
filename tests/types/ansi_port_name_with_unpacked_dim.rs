@@ -60,9 +60,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "v0"), 1, "implicit 1-bit port, unpacked dim on the name");
+    assert_eq!(
+        u(&sim, "v0"),
+        1,
+        "implicit 1-bit port, unpacked dim on the name"
+    );
     assert_eq!(u(&sim, "v1"), 0);
-    assert_eq!(u(&sim, "w0"), 0xABCD, "ranged port with unpacked dim on the name");
+    assert_eq!(
+        u(&sim, "w0"),
+        0xABCD,
+        "ranged port with unpacked dim on the name"
+    );
     assert_eq!(u(&sim, "w1"), 0xCAFE);
-    assert_eq!(u(&sim, "tpv"), 0xA55A, "typedef [dims] name still parses as a TYPE");
+    assert_eq!(
+        u(&sim, "tpv"),
+        0xA55A,
+        "typedef [dims] name still parses as a TYPE"
+    );
 }

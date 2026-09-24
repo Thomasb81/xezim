@@ -59,6 +59,14 @@ endmodule
 ";
     let sim = simulate(SRC, 100).expect("simulate failed");
     // sum_{k=1..100} (k + (k+10)) = 2*5050 + 1000 = 11100
-    assert_eq!(u(&sim, "total"), 11100, "accumulated method-call arithmetic");
-    assert_eq!(u(&sim, "chk"), 101, "void method side effect via hierarchy walk");
+    assert_eq!(
+        u(&sim, "total"),
+        11100,
+        "accumulated method-call arithmetic"
+    );
+    assert_eq!(
+        u(&sim, "chk"),
+        101,
+        "void method side effect via hierarchy walk"
+    );
 }

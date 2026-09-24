@@ -50,6 +50,14 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "drove"), 0x6D, "a clocking-block drive still reaches the signal");
-    assert_eq!(u(&sim, "sampled"), 0xA5, "and a clocking-block input still samples");
+    assert_eq!(
+        u(&sim, "drove"),
+        0x6D,
+        "a clocking-block drive still reaches the signal"
+    );
+    assert_eq!(
+        u(&sim, "sampled"),
+        0xA5,
+        "and a clocking-block input still samples"
+    );
 }

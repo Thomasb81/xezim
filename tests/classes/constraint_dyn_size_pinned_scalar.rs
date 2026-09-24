@@ -56,7 +56,11 @@ module top;\n\
     $finish;\n\
   end endmodule";
     let t = tags(src);
-    assert_eq!(t, vec!["TAG_PASS"], "all draws must satisfy the coupled set");
+    assert_eq!(
+        t,
+        vec!["TAG_PASS"],
+        "all draws must satisfy the coupled set"
+    );
 }
 
 /// The SAME set reached through an INLINE `randomize() with {…}` (as the UVM
@@ -77,5 +81,9 @@ module top; initial begin : b\n\
     $display(\"TAG_FAIL vals %0d %0d %0d\", g.m_length, g.m_data.size(), g.m_streaming);\n\
   else $display(\"TAG_PASS\");\n\
   $finish; end endmodule\n";
-    assert_eq!(tags(src), vec!["TAG_PASS"], "inline with + .size must solve");
+    assert_eq!(
+        tags(src),
+        vec!["TAG_PASS"],
+        "inline with + .size must solve"
+    );
 }

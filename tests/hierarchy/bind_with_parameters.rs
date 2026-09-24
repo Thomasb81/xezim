@@ -51,7 +51,15 @@ module tb;
 endmodule
 ",
     );
-    for want in ["HARNESS rows=5 cols=2", "R1 done=0", "R2 done=1", "R3 done=1 rc00=42 rc41=9"] {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+    for want in [
+        "HARNESS rows=5 cols=2",
+        "R1 done=0",
+        "R2 done=1",
+        "R3 done=1 rc00=42 rc41=9",
+    ] {
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
 }

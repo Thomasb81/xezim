@@ -72,7 +72,15 @@ endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
     assert_eq!(u(&sim, "r_okf"), 1, "the fast copy sampled a known value");
-    assert_eq!(u(&sim, "r_oks"), 1, "the slow copy did NOT fire on the fast copy's strobe");
-    assert_eq!(u(&sim, "r_fast"), 0x43, "each copy sees its own grandchild's result");
+    assert_eq!(
+        u(&sim, "r_oks"),
+        1,
+        "the slow copy did NOT fire on the fast copy's strobe"
+    );
+    assert_eq!(
+        u(&sim, "r_fast"),
+        0x43,
+        "each copy sees its own grandchild's result"
+    );
     assert_eq!(u(&sim, "r_slow"), 0x4B);
 }

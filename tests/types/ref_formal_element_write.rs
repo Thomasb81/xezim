@@ -46,7 +46,13 @@ fn run(jit: bool) -> String {
     let sv = dir.join(if jit { "t_jit.sv" } else { "t_default.sv" });
     std::fs::write(&sv, DESIGN).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
-    cmd.args(["--simulate", "-s", "top", "--no-cache", sv.to_str().unwrap()]);
+    cmd.args([
+        "--simulate",
+        "-s",
+        "top",
+        "--no-cache",
+        sv.to_str().unwrap(),
+    ]);
     if jit {
         cmd.env("XEZIM_JIT", "1");
     }
@@ -59,8 +65,19 @@ fn run(jit: bool) -> String {
 
 fn check(text: &str) {
     for want in [
-        "TD1 in 9", "TD1 out 9", "TD2 in 9", "TD2 out 9", "LG2 out 9", "ST1 in 9", "ST1 out 9",
-        "PART out 805a", "UN2 in 9", "UN2 out 9", "UN1 out 9", "Q1 out 1", "DL out 3",
+        "TD1 in 9",
+        "TD1 out 9",
+        "TD2 in 9",
+        "TD2 out 9",
+        "LG2 out 9",
+        "ST1 in 9",
+        "ST1 out 9",
+        "PART out 805a",
+        "UN2 in 9",
+        "UN2 out 9",
+        "UN1 out 9",
+        "Q1 out 1",
+        "DL out 3",
     ] {
         assert!(text.contains(want), "missing `{want}`:\n{text}");
     }

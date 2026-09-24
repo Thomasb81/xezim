@@ -31,7 +31,12 @@ fn xezim() -> String {
 fn run(src: &str) -> String {
     std::fs::write("/tmp/typedef_receiver_static_task.sv", src).unwrap();
     let out = Command::new(xezim())
-        .args(["--simulate", "-s", "top", "/tmp/typedef_receiver_static_task.sv"])
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            "/tmp/typedef_receiver_static_task.sv",
+        ])
         .output()
         .expect("run xezim");
     String::from_utf8_lossy(&out.stdout).into_owned()

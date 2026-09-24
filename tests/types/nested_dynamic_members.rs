@@ -33,7 +33,11 @@ endmodule
     assert_eq!(u(&sim, "sz"), 2, "inner row size");
     assert_eq!(u(&sim, "e0"), 1);
     assert_eq!(u(&sim, "e1"), 2);
-    assert_eq!(u(&sim, "after_val"), 2, "outer row unaffected by later source push");
+    assert_eq!(
+        u(&sim, "after_val"),
+        2,
+        "outer row unaffected by later source push"
+    );
 }
 
 #[test]

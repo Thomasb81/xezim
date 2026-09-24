@@ -52,7 +52,13 @@ fn a_parked_methods_locals_base_does_not_bound_another_process() {
     let src = dir.join("tb.sv");
     std::fs::write(&src, DESIGN).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb", src.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "tb",
+            src.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
@@ -62,5 +68,8 @@ fn a_parked_methods_locals_base_does_not_bound_another_process() {
         text.contains("PARKER tag=222"),
         "a parked process's method-locals base leaked into another process:\n{text}"
     );
-    assert!(text.contains("DEEP done"), "the deep process never finished:\n{text}");
+    assert!(
+        text.contains("DEEP done"),
+        "the deep process never finished:\n{text}"
+    );
 }

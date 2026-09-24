@@ -90,7 +90,12 @@ fn comb_alu_check(sim: &Simulator) {
         a = a.wrapping_add(3);
         b = b.wrapping_add(5);
     }
-    assert_eq!(sig(sim, "acc"), acc as u64, "comb_alu acc after {} cycles", n);
+    assert_eq!(
+        sig(sim, "acc"),
+        acc as u64,
+        "comb_alu acc after {} cycles",
+        n
+    );
 }
 
 // ---------------------------------------------------------------- wide_vec
@@ -169,7 +174,12 @@ fn mem_array_check(sim: &Simulator) {
         mem[idx as usize] = cur.wrapping_add(idx);
         idx = (idx.wrapping_mul(5).wrapping_add(1)) & 0xffff;
     }
-    assert_eq!(sig(sim, "acc") as u32, acc, "mem_array acc after {} cycles", n);
+    assert_eq!(
+        sig(sim, "acc") as u32,
+        acc,
+        "mem_array acc after {} cycles",
+        n
+    );
 }
 
 // ---------------------------------------------------------------- event_ctrl
@@ -247,7 +257,12 @@ fn class_queue_check(sim: &Simulator) {
         }
         let _ = i;
     }
-    assert_eq!(sig(sim, "acc") as u32, acc, "class_queue acc after {} cycles", n);
+    assert_eq!(
+        sig(sim, "acc") as u32,
+        acc,
+        "class_queue acc after {} cycles",
+        n
+    );
     let h0 = sig(sim, "hist[0]");
     assert_eq!(h0, n.div_ceil(17), "class_queue hist[0]");
 }

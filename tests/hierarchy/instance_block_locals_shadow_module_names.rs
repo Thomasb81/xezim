@@ -32,7 +32,15 @@ module host(input logic clk); import p::*; int u = 9; core_m core(.clk(clk));
 endmodule
 module tb; logic clk = 0; host u(.clk(clk)); initial #5 $finish; endmodule",
     );
-    for want in ["blk=5", "mod=9", "hnull=0 hc=3", "hcopy=4", "sib=11", "formal=2", "mod2=9"] {
+    for want in [
+        "blk=5",
+        "mod=9",
+        "hnull=0 hc=3",
+        "hcopy=4",
+        "sib=11",
+        "formal=2",
+        "mod2=9",
+    ] {
         assert!(msgs.iter().any(|m| m == want), "missing {want}: {msgs:?}");
     }
 }

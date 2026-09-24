@@ -96,5 +96,9 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "b8_before"), 0);
     assert_eq!(u(&sim, "b0"), 0);
-    assert_eq!(u(&sim, "b8"), 0xFF, "the expander re-fired on the post-t0 input change");
+    assert_eq!(
+        u(&sim, "b8"),
+        0xFF,
+        "the expander re-fired on the post-t0 input change"
+    );
 }

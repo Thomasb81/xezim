@@ -21,16 +21,33 @@ endmodule
 "#;
 
 fn bits(sim: &xezim::compiler::Simulator, n: &str) -> String {
-    let v = sim.get_signal(n).or_else(|| sim.get_signal(&format!("top.{}", n))).unwrap_or_else(|| panic!("{n}"));
-    (0..v.width as usize).rev().map(|i| match v.get_bit(i) {
-        xezim_core::value::LogicBit::Zero => '0', xezim_core::value::LogicBit::One => '1',
-        xezim_core::value::LogicBit::X => 'x', xezim_core::value::LogicBit::Z => 'z' }).collect()
+    let v = sim
+        .get_signal(n)
+        .or_else(|| sim.get_signal(&format!("top.{}", n)))
+        .unwrap_or_else(|| panic!("{n}"));
+    (0..v.width as usize)
+        .rev()
+        .map(|i| match v.get_bit(i) {
+            xezim_core::value::LogicBit::Zero => '0',
+            xezim_core::value::LogicBit::One => '1',
+            xezim_core::value::LogicBit::X => 'x',
+            xezim_core::value::LogicBit::Z => 'z',
+        })
+        .collect()
 }
 
 #[test]
 fn nba_array_read_with_x_index_is_x() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(bits(&sim, "q_x"), "xxxxxxxx", "x address before any assignment");
-    assert_eq!(bits(&sim, "q_2"), "00110011", "known address reads the element");
+    assert_eq!(
+        bits(&sim, "q_x"),
+        "xxxxxxxx",
+        "x address before any assignment"
+    );
+    assert_eq!(
+        bits(&sim, "q_2"),
+        "00110011",
+        "known address reads the element"
+    );
     assert_eq!(bits(&sim, "q_xagain"), "xxxxxxxx", "x address again");
 }

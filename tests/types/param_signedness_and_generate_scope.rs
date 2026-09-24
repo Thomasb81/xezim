@@ -83,8 +83,16 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(i(&sim, "c_mul"), i(&sim, "r_mul"), "mul: const-eval == runtime");
-    assert_eq!(i(&sim, "c_sub"), i(&sim, "r_sub"), "sub: const-eval == runtime");
+    assert_eq!(
+        i(&sim, "c_mul"),
+        i(&sim, "r_mul"),
+        "mul: const-eval == runtime"
+    );
+    assert_eq!(
+        i(&sim, "c_sub"),
+        i(&sim, "r_sub"),
+        "sub: const-eval == runtime"
+    );
     assert_eq!(i(&sim, "c_mul"), -6);
     assert_eq!(i(&sim, "c_sub"), -4);
 }
@@ -108,10 +116,22 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(i(&sim, "up"), 253, "an unsigned parameter keeps its bit pattern");
-    assert_eq!(i(&sim, "u_add"), 254, "unsigned arithmetic does not sign-extend");
+    assert_eq!(
+        i(&sim, "up"),
+        253,
+        "an unsigned parameter keeps its bit pattern"
+    );
+    assert_eq!(
+        i(&sim, "u_add"),
+        254,
+        "unsigned arithmetic does not sign-extend"
+    );
     assert_eq!(i(&sim, "ss_mul"), -12, "two signed params of equal width");
-    assert_eq!(i(&sim, "mixed"), 250, "one unsigned operand makes it unsigned");
+    assert_eq!(
+        i(&sim, "mixed"),
+        250,
+        "one unsigned operand makes it unsigned"
+    );
 }
 
 /// A third defect, pre-existing and surfaced by fixing the first: a parameter
@@ -139,10 +159,18 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(i(&sim, "shr"), 126, "arithmetic shift of an unsigned parameter");
+    assert_eq!(
+        i(&sim, "shr"),
+        126,
+        "arithmetic shift of an unsigned parameter"
+    );
     assert_eq!(i(&sim, "lt"), 0, "an unsigned parameter is never < 0");
     assert_eq!(i(&sim, "divu"), 126, "unsigned division");
-    assert_eq!(i(&sim, "i_shr"), -2, "an implicit-type parameter IS signed (§6.20.2)");
+    assert_eq!(
+        i(&sim, "i_shr"),
+        -2,
+        "an implicit-type parameter IS signed (§6.20.2)"
+    );
 }
 
 /// §27.6: reach into a NAMED if-generate block by its label.
@@ -167,7 +195,11 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(i(&sim, "seen"), 9, "gblk.u.ID resolves");
-    assert_eq!(i(&sim, "val"), 90, "and the block still elaborates normally");
+    assert_eq!(
+        i(&sim, "val"),
+        90,
+        "and the block still elaborates normally"
+    );
 }
 
 /// §27.6: reach into an INDEXED for-generate iteration.

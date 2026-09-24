@@ -34,7 +34,8 @@ fn run(src: &str, tag: &str) -> String {
 }
 
 fn passes(out: &str, tag: &str) -> bool {
-    out.lines().any(|l| l.contains(tag) && l.contains("TAG_PASS"))
+    out.lines()
+        .any(|l| l.contains(tag) && l.contains("TAG_PASS"))
 }
 
 #[test]

@@ -11,83 +11,83 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
-#[path = "classes/collection_of_handles_new.rs"]
-mod collection_of_handles_new;
-#[path = "classes/class_unpacked_struct_array_store.rs"]
-mod class_unpacked_struct_array_store;
-#[path = "classes/memory_tasks_fixed_property.rs"]
-mod memory_tasks_fixed_property;
-#[path = "classes/static_fixed_array_storage.rs"]
-mod static_fixed_array_storage;
 #[path = "classes/array_equality_class.rs"]
 mod array_equality_class;
-#[path = "classes/class_formal_typedef_widen.rs"]
-mod class_formal_typedef_widen;
 #[path = "classes/assoc_typedef_element_class.rs"]
 mod assoc_typedef_element_class;
 #[path = "classes/bit_class_property_signedness.rs"]
 mod bit_class_property_signedness;
-#[path = "classes/type_param_formal_stale_local.rs"]
-mod type_param_formal_stale_local;
-#[path = "classes/wait_level_sensitive_inactive_delta.rs"]
-mod wait_level_sensitive_inactive_delta;
-#[path = "classes/nested_same_named_ref_assoc_formal.rs"]
-mod nested_same_named_ref_assoc_formal;
-#[path = "classes/class_time_field_neg_one.rs"]
-mod class_time_field_neg_one;
-#[path = "classes/param_type_binding_resolves_enclosing_value_param.rs"]
-mod param_type_binding_resolves_enclosing_value_param;
-#[path = "classes/virtual_method_in_binary_is_evaluated_once.rs"]
-mod virtual_method_in_binary_is_evaluated_once;
-#[path = "classes/typename_type_param_resolves_concrete.rs"]
-mod typename_type_param_resolves_concrete;
-#[path = "classes/static_param_class_collection_reuse.rs"]
-mod static_param_class_collection_reuse;
-#[path = "classes/explicit_param_static_coll_read.rs"]
-mod explicit_param_static_coll_read;
-#[path = "classes/typename_p_subroutine_locals.rs"]
-mod typename_p_subroutine_locals;
 #[path = "classes/blocking_task_super_dispatch.rs"]
 mod blocking_task_super_dispatch;
+#[path = "classes/class_formal_typedef_widen.rs"]
+mod class_formal_typedef_widen;
+#[path = "classes/class_time_field_neg_one.rs"]
+mod class_time_field_neg_one;
+#[path = "classes/class_unpacked_struct_array_store.rs"]
+mod class_unpacked_struct_array_store;
+#[path = "classes/collection_of_handles_new.rs"]
+mod collection_of_handles_new;
+#[path = "classes/explicit_param_static_coll_read.rs"]
+mod explicit_param_static_coll_read;
+#[path = "classes/memory_tasks_fixed_property.rs"]
+mod memory_tasks_fixed_property;
+#[path = "classes/nested_same_named_ref_assoc_formal.rs"]
+mod nested_same_named_ref_assoc_formal;
+#[path = "classes/param_type_binding_resolves_enclosing_value_param.rs"]
+mod param_type_binding_resolves_enclosing_value_param;
+#[path = "classes/static_fixed_array_storage.rs"]
+mod static_fixed_array_storage;
+#[path = "classes/static_param_class_collection_reuse.rs"]
+mod static_param_class_collection_reuse;
+#[path = "classes/type_param_formal_stale_local.rs"]
+mod type_param_formal_stale_local;
+#[path = "classes/typename_p_subroutine_locals.rs"]
+mod typename_p_subroutine_locals;
+#[path = "classes/typename_type_param_resolves_concrete.rs"]
+mod typename_type_param_resolves_concrete;
+#[path = "classes/virtual_method_in_binary_is_evaluated_once.rs"]
+mod virtual_method_in_binary_is_evaluated_once;
+#[path = "classes/wait_level_sensitive_inactive_delta.rs"]
+mod wait_level_sensitive_inactive_delta;
 
+#[path = "classes/bare_parameterless_method_call.rs"]
+mod bare_parameterless_method_call;
 #[path = "classes/blocking_method_keyed_method_local_base.rs"]
 mod blocking_method_keyed_method_local_base;
+#[path = "classes/chained_member_element_access.rs"]
+mod chained_member_element_access;
 #[path = "classes/class_field_named_event.rs"]
 mod class_field_named_event;
-#[path = "classes/this_chain_edge_sensitivity.rs"]
-mod this_chain_edge_sensitivity;
 #[path = "classes/class_handle_return_preservation.rs"]
 mod class_handle_return_preservation;
-#[path = "classes/class_output_handle_copyback.rs"]
-mod class_output_handle_copyback;
-#[path = "classes/typedef_extends_cast.rs"]
-mod typedef_extends_cast;
-#[path = "classes/typedef_param_base_inherits_spec_arg.rs"]
-mod typedef_param_base_inherits_spec_arg;
 #[path = "classes/class_local_typedef_aa.rs"]
 mod class_local_typedef_aa;
 #[path = "classes/class_local_typedef_resolution.rs"]
 mod class_local_typedef_resolution;
 #[path = "classes/class_method_dispatch.rs"]
 mod class_method_dispatch;
-#[path = "classes/bare_parameterless_method_call.rs"]
-mod bare_parameterless_method_call;
-#[path = "classes/method_default_this_call.rs"]
-mod method_default_this_call;
 #[path = "classes/class_name_method_shadow.rs"]
 mod class_name_method_shadow;
+#[path = "classes/class_output_handle_copyback.rs"]
+mod class_output_handle_copyback;
 #[path = "classes/class_packed_and_type_params.rs"]
 mod class_packed_and_type_params;
 #[path = "classes/class_param_siblings.rs"]
 mod class_param_siblings;
 #[path = "classes/class_program_test.rs"]
 mod class_program_test;
+#[path = "classes/class_property_packed_selects.rs"]
+mod class_property_packed_selects;
 #[path = "classes/class_property_param_width.rs"]
 mod class_property_param_width;
 #[path = "classes/class_scoped_enum.rs"]
 mod class_scoped_enum;
 #[path = "classes/class_type_param_properties.rs"]
 mod class_type_param_properties;
+#[path = "classes/class_unpacked_struct_properties.rs"]
+mod class_unpacked_struct_properties;
+#[path = "classes/class_unpacked_struct_property.rs"]
+mod class_unpacked_struct_property;
 #[path = "classes/class_value_params.rs"]
 mod class_value_params;
 #[path = "classes/class_width_copy_fork.rs"]
@@ -102,10 +102,6 @@ mod constraint_arrays_ordering;
 mod constraint_dyn_size_pinned_scalar;
 #[path = "classes/constraint_foreach_and_casts.rs"]
 mod constraint_foreach_and_casts;
-#[path = "classes/chained_member_element_access.rs"]
-mod chained_member_element_access;
-#[path = "classes/foreach_member_multidim.rs"]
-mod foreach_member_multidim;
 #[path = "classes/constraint_foreach_conditional.rs"]
 mod constraint_foreach_conditional;
 #[path = "classes/constraint_funcs_aggregates.rs"]
@@ -126,6 +122,8 @@ mod coverage_auto_bins;
 mod covergroup_coverage_query;
 #[path = "classes/factory_run_test.rs"]
 mod factory_run_test;
+#[path = "classes/foreach_member_multidim.rs"]
+mod foreach_member_multidim;
 #[path = "classes/generate_and_class_parameters.rs"]
 mod generate_and_class_parameters;
 #[path = "classes/inherited_static_shared.rs"]
@@ -144,54 +142,62 @@ mod issue4_coupled_constraints;
 mod ivtest_class_struct_cluster;
 #[path = "classes/localparam_class_not_parameterized.rs"]
 mod localparam_class_not_parameterized;
+#[path = "classes/method_default_this_call.rs"]
+mod method_default_this_call;
+#[path = "classes/module_scope_derived_constraints.rs"]
+mod module_scope_derived_constraints;
+#[path = "classes/nd_array_properties_and_foreach_constraints.rs"]
+mod nd_array_properties_and_foreach_constraints;
+#[path = "classes/nested_seq_method_dispatch.rs"]
+mod nested_seq_method_dispatch;
 #[path = "classes/nonvirtual_dispatch_fscanf_process.rs"]
 mod nonvirtual_dispatch_fscanf_process;
-#[path = "classes/static_member_method_collision.rs"]
-mod static_member_method_collision;
 #[path = "classes/out_of_class_method_shadow.rs"]
 mod out_of_class_method_shadow;
 #[path = "classes/param_typedef_ctor_resolution.rs"]
 mod param_typedef_ctor_resolution;
 #[path = "classes/process_class_9_7.rs"]
 mod process_class_9_7;
+#[path = "classes/pure_sv_phase_objection.rs"]
+mod pure_sv_phase_objection;
 #[path = "classes/randomize_inside_range.rs"]
 mod randomize_inside_range;
-#[path = "classes/scope_randomize_dist_and_foreach.rs"]
-mod scope_randomize_dist_and_foreach;
-#[path = "classes/class_unpacked_struct_properties.rs"]
-mod class_unpacked_struct_properties;
-#[path = "classes/nd_array_properties_and_foreach_constraints.rs"]
-mod nd_array_properties_and_foreach_constraints;
 #[path = "classes/randomize_member_subset.rs"]
 mod randomize_member_subset;
-#[path = "classes/class_property_packed_selects.rs"]
-mod class_property_packed_selects;
-#[path = "classes/module_scope_derived_constraints.rs"]
-mod module_scope_derived_constraints;
+#[path = "classes/scope_randomize_dist_and_foreach.rs"]
+mod scope_randomize_dist_and_foreach;
 #[path = "classes/shadowed_property_storage.rs"]
 mod shadowed_property_storage;
-#[path = "classes/super_property_access.rs"]
-mod super_property_access;
-#[path = "classes/subroutine_local_unpacked_structs.rs"]
-mod subroutine_local_unpacked_structs;
+#[path = "classes/static_member_method_collision.rs"]
+mod static_member_method_collision;
 #[path = "classes/std_randomize_struct.rs"]
 mod std_randomize_struct;
 #[path = "classes/string_method_shadows_class_method.rs"]
 mod string_method_shadows_class_method;
-#[path = "classes/struct_with_class_handle.rs"]
-mod struct_with_class_handle;
-#[path = "classes/struct_output_inout_ref_formal.rs"]
-mod struct_output_inout_ref_formal;
-#[path = "classes/type_param_struct_formal.rs"]
-mod type_param_struct_formal;
 #[path = "classes/struct_formal_and_config_foreach.rs"]
 mod struct_formal_and_config_foreach;
+#[path = "classes/struct_output_formal.rs"]
+mod struct_output_formal;
+#[path = "classes/struct_output_inout_ref_formal.rs"]
+mod struct_output_inout_ref_formal;
+#[path = "classes/struct_with_class_handle.rs"]
+mod struct_with_class_handle;
+#[path = "classes/subroutine_local_unpacked_structs.rs"]
+mod subroutine_local_unpacked_structs;
+#[path = "classes/super_property_access.rs"]
+mod super_property_access;
+#[path = "classes/this_chain_edge_sensitivity.rs"]
+mod this_chain_edge_sensitivity;
+#[path = "classes/type_param_struct_formal.rs"]
+mod type_param_struct_formal;
+#[path = "classes/typedef_extends_cast.rs"]
+mod typedef_extends_cast;
+#[path = "classes/typedef_param_base_inherits_spec_arg.rs"]
+mod typedef_param_base_inherits_spec_arg;
 #[path = "classes/typename_param_class.rs"]
 mod typename_param_class;
 #[path = "classes/unpacked_struct_class_property_whole_value.rs"]
 mod unpacked_struct_class_property_whole_value;
-#[path = "classes/nested_seq_method_dispatch.rs"]
-mod nested_seq_method_dispatch;
 #[path = "classes/uvm_config_db_tests.rs"]
 mod uvm_config_db_tests;
 #[path = "classes/uvm_factory_linkage.rs"]
@@ -200,18 +206,12 @@ mod uvm_factory_linkage;
 mod uvm_genuine_2017;
 #[path = "classes/uvm_integration_tests.rs"]
 mod uvm_integration_tests;
-#[path = "classes/pure_sv_phase_objection.rs"]
-mod pure_sv_phase_objection;
 #[path = "classes/uvm_objection_bridge.rs"]
 mod uvm_objection_bridge;
 #[path = "classes/uvm_printer_fixes.rs"]
 mod uvm_printer_fixes;
 #[path = "classes/virtual_iface_this_binding.rs"]
 mod virtual_iface_this_binding;
-#[path = "classes/class_unpacked_struct_property.rs"]
-mod class_unpacked_struct_property;
-#[path = "classes/struct_output_formal.rs"]
-mod struct_output_formal;
 
 #[path = "classes/class_init_cast_copy.rs"]
 mod class_init_cast_copy;
@@ -231,71 +231,71 @@ mod ctor_dispatch_and_p_format;
 #[path = "classes/assoc_enum_key_class_property.rs"]
 mod assoc_enum_key_class_property;
 
-#[path = "classes/module_scope_handle_access.rs"]
-mod module_scope_handle_access;
-#[path = "classes/struct_prop_whole_copy.rs"]
-mod struct_prop_whole_copy;
-#[path = "classes/randomize_obj_array_property.rs"]
-mod randomize_obj_array_property;
-#[path = "classes/static_assoc_struct_pool.rs"]
-mod static_assoc_struct_pool;
-#[path = "classes/static_instance_assoc_object.rs"]
-mod static_instance_assoc_object;
-#[path = "classes/typedef_receiver_static_task.rs"]
-mod typedef_receiver_static_task;
-#[path = "classes/static_collection_qualified_access.rs"]
-mod static_collection_qualified_access;
-#[path = "classes/vif_static_roundtrip.rs"]
-mod vif_static_roundtrip;
-#[path = "classes/vif_property_named_like_instance.rs"]
-mod vif_property_named_like_instance;
-#[path = "classes/nopack_member_array.rs"]
-mod nopack_member_array;
-#[path = "classes/class_localparam_array.rs"]
-mod class_localparam_array;
-#[path = "classes/member_collection_runtime_class.rs"]
-mod member_collection_runtime_class;
-#[path = "classes/enum_local_shadows_flat_maps.rs"]
-mod enum_local_shadows_flat_maps;
-#[path = "classes/ref_formal_shadows_property.rs"]
-mod ref_formal_shadows_property;
-#[path = "classes/field_init_once_in_order.rs"]
-mod field_init_once_in_order;
-#[path = "classes/caller_local_shadows_this_cast.rs"]
-mod caller_local_shadows_this_cast;
-#[path = "classes/condition_waiter_yields_to_inactive.rs"]
-mod condition_waiter_yields_to_inactive;
-#[path = "classes/package_class_nested_class.rs"]
-mod package_class_nested_class;
-#[path = "classes/sqr_zero_time_loop.rs"]
-mod sqr_zero_time_loop;
-#[path = "classes/member_visibility_local_protected.rs"]
-mod member_visibility_local_protected;
-#[path = "classes/method_local_base_per_process.rs"]
-mod method_local_base_per_process;
-#[path = "classes/class_covergroups.rs"]
-mod class_covergroups;
+#[path = "classes/array_of_collections_property.rs"]
+mod array_of_collections_property;
 #[path = "classes/array_query_handle_qualified_member.rs"]
 mod array_query_handle_qualified_member;
-#[path = "classes/parked_task_local_vif_alias.rs"]
-mod parked_task_local_vif_alias;
-#[path = "classes/class_randomize_multidim.rs"]
-mod class_randomize_multidim;
+#[path = "classes/caller_local_shadows_this_cast.rs"]
+mod caller_local_shadows_this_cast;
+#[path = "classes/class_array_property_select.rs"]
+mod class_array_property_select;
+#[path = "classes/class_covergroups.rs"]
+mod class_covergroups;
+#[path = "classes/class_localparam_array.rs"]
+mod class_localparam_array;
 #[path = "classes/class_method_sibling_instance_oomr.rs"]
 mod class_method_sibling_instance_oomr;
-#[path = "classes/method_int_formal_zero_extends.rs"]
-mod method_int_formal_zero_extends;
+#[path = "classes/class_randomize_multidim.rs"]
+mod class_randomize_multidim;
+#[path = "classes/condition_waiter_yields_to_inactive.rs"]
+mod condition_waiter_yields_to_inactive;
+#[path = "classes/covergroup_bin_arithmetic.rs"]
+mod covergroup_bin_arithmetic;
+#[path = "classes/enum_local_shadows_flat_maps.rs"]
+mod enum_local_shadows_flat_maps;
+#[path = "classes/field_init_once_in_order.rs"]
+mod field_init_once_in_order;
 #[path = "classes/handle_chain_read_in_instance_task.rs"]
 mod handle_chain_read_in_instance_task;
 #[path = "classes/implication_joint_distribution.rs"]
 mod implication_joint_distribution;
-#[path = "classes/array_of_collections_property.rs"]
-mod array_of_collections_property;
-#[path = "classes/class_array_property_select.rs"]
-mod class_array_property_select;
+#[path = "classes/member_collection_runtime_class.rs"]
+mod member_collection_runtime_class;
+#[path = "classes/member_visibility_local_protected.rs"]
+mod member_visibility_local_protected;
+#[path = "classes/method_int_formal_zero_extends.rs"]
+mod method_int_formal_zero_extends;
+#[path = "classes/method_local_base_per_process.rs"]
+mod method_local_base_per_process;
+#[path = "classes/module_scope_handle_access.rs"]
+mod module_scope_handle_access;
+#[path = "classes/nopack_member_array.rs"]
+mod nopack_member_array;
+#[path = "classes/package_class_nested_class.rs"]
+mod package_class_nested_class;
+#[path = "classes/parked_task_local_vif_alias.rs"]
+mod parked_task_local_vif_alias;
 #[path = "classes/randomize_joint_constraints.rs"]
 mod randomize_joint_constraints;
-#[path = "classes/covergroup_bin_arithmetic.rs"]
-mod covergroup_bin_arithmetic;
+#[path = "classes/randomize_obj_array_property.rs"]
+mod randomize_obj_array_property;
+#[path = "classes/ref_formal_shadows_property.rs"]
+mod ref_formal_shadows_property;
+#[path = "classes/sqr_zero_time_loop.rs"]
+mod sqr_zero_time_loop;
+#[path = "classes/static_assoc_struct_pool.rs"]
+mod static_assoc_struct_pool;
+#[path = "classes/static_collection_qualified_access.rs"]
+mod static_collection_qualified_access;
+#[path = "classes/static_instance_assoc_object.rs"]
+mod static_instance_assoc_object;
+#[path = "classes/struct_prop_whole_copy.rs"]
+mod struct_prop_whole_copy;
 #[path = "classes/type_param_replication_localparam.rs"]
 mod type_param_replication_localparam;
+#[path = "classes/typedef_receiver_static_task.rs"]
+mod typedef_receiver_static_task;
+#[path = "classes/vif_property_named_like_instance.rs"]
+mod vif_property_named_like_instance;
+#[path = "classes/vif_static_roundtrip.rs"]
+mod vif_static_roundtrip;

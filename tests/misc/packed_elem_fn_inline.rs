@@ -75,8 +75,16 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert_eq!(bit(&sim, "ok_low"), '1', "low lanes must narrow at full 8-bit width");
-    assert_eq!(bit(&sim, "ok_high"), '1', "lane 15 lands past bit 32 of the result");
+    assert_eq!(
+        bit(&sim, "ok_low"),
+        '1',
+        "low lanes must narrow at full 8-bit width"
+    );
+    assert_eq!(
+        bit(&sim, "ok_high"),
+        '1',
+        "lane 15 lands past bit 32 of the result"
+    );
 }
 
 /// Same shape with the typedefs declared INSIDE the instantiated submodule:
@@ -110,7 +118,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert_eq!(bit(&sim, "ok"), '1', "all 16 elements must be written 8 bits wide");
+    assert_eq!(
+        bit(&sim, "ok"),
+        '1',
+        "all 16 elements must be written 8 bits wide"
+    );
 }
 
 /// Blocking-call form in an initial block: element-by-element identity and
@@ -168,9 +180,21 @@ endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
     assert_eq!(bit(&sim, "ok_copy"), '1', "element identity copy");
-    assert_eq!(bit(&sim, "ok_bump"), '1', "element read + arithmetic + write");
-    assert_eq!(bit(&sim, "ok_mark"), '1', "single element write into zeroed local");
-    assert_eq!(bit(&sim, "ok_pick"), '1', "element read of a literal-bound formal");
+    assert_eq!(
+        bit(&sim, "ok_bump"),
+        '1',
+        "element read + arithmetic + write"
+    );
+    assert_eq!(
+        bit(&sim, "ok_mark"),
+        '1',
+        "single element write into zeroed local"
+    );
+    assert_eq!(
+        bit(&sim, "ok_pick"),
+        '1',
+        "element read of a literal-bound formal"
+    );
 }
 
 /// Widening direction (`{x[i], 2'b00}` into 10-bit lanes) plus a mode ternary
@@ -220,6 +244,14 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert_eq!(bit(&sim, "ok_conv"), '1', "widened lanes at both ends of the vector");
-    assert_eq!(bit(&sim, "ok_byp"), '1', "bypass mode passes the raw vector through");
+    assert_eq!(
+        bit(&sim, "ok_conv"),
+        '1',
+        "widened lanes at both ends of the vector"
+    );
+    assert_eq!(
+        bit(&sim, "ok_byp"),
+        '1',
+        "bypass mode passes the raw vector through"
+    );
 }

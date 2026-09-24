@@ -108,5 +108,8 @@ module tb;
   end
 endmodule",
     );
-    assert!(msgs.iter().any(|m| m == "rise=2.0 fall=4.0 off=6.0"), "{msgs:?}");
+    assert!(
+        msgs.iter().any(|m| m == "rise=2.0 fall=4.0 off=6.0"),
+        "{msgs:?}"
+    );
 }

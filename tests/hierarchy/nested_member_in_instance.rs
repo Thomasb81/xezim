@@ -67,7 +67,13 @@ fn nested_member_reads_resolve_and_stay_compiled() {
     let src = dir.join("top.sv");
     std::fs::write(&src, DESIGN).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "top", src.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            src.to_str().unwrap(),
+            "--no-cache",
+        ])
         .env("XEZIM_PROFILE_TIMING", "1")
         .output()
         .expect("run nested member design");

@@ -106,7 +106,11 @@ module top;
 endmodule
 "#;
     let o = out(SRC);
-    assert!(o.contains("E 00100 F 00000 G 10000"), "index forms that already worked:\n{}", o);
+    assert!(
+        o.contains("E 00100 F 00000 G 10000"),
+        "index forms that already worked:\n{}",
+        o
+    );
 }
 
 /// The arbiter shape the bug was found in: once any input is valid the index
@@ -133,6 +137,14 @@ module top;
 endmodule
 "#;
     let o = out(SRC);
-    assert!(o.contains("RESET 00000"), "no bit written while the index is x:\n{}", o);
-    assert!(o.contains("VALID 00100"), "the real write still lands:\n{}", o);
+    assert!(
+        o.contains("RESET 00000"),
+        "no bit written while the index is x:\n{}",
+        o
+    );
+    assert!(
+        o.contains("VALID 00100"),
+        "the real write still lands:\n{}",
+        o
+    );
 }

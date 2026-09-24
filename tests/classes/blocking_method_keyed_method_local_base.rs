@@ -64,5 +64,8 @@ fn method_local_base_follows_process_through_context_swap() {
         out.contains("PARKER tag=222"),
         "method-local `Right obj` must resolve ahead of the module-scope `Wrong obj` even after the process parks and resumes (base must travel with ProcessContext); got:\n{out}"
     );
-    assert!(!out.contains("PARKER tag=111"), "resolved to module-scope Wrong obj; got:\n{out}");
+    assert!(
+        !out.contains("PARKER tag=111"),
+        "resolved to module-scope Wrong obj; got:\n{out}"
+    );
 }

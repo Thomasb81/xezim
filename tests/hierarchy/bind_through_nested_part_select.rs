@@ -89,10 +89,18 @@ fn ok_flag(src: &str) -> u64 {
 
 #[test]
 fn wildcard_bind_aliases_through_nested_part_selects() {
-    assert_eq!(ok_flag(NESTED_PART_SELECT), 1, "a `.*` bind lost the port-net alias through nested part-selects");
+    assert_eq!(
+        ok_flag(NESTED_PART_SELECT),
+        1,
+        "a `.*` bind lost the port-net alias through nested part-selects"
+    );
 }
 
 #[test]
 fn offset_nested_part_select_still_selects_its_slice() {
-    assert_eq!(ok_flag(OFFSET_PART_SELECT), 1, "an offset nested part-select was wrongly collapsed");
+    assert_eq!(
+        ok_flag(OFFSET_PART_SELECT),
+        1,
+        "an offset nested part-select was wrongly collapsed"
+    );
 }

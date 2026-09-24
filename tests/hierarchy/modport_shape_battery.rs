@@ -104,9 +104,7 @@ endmodule
 fn interface_array_generate_modports() {
     assert_eq!(
         outs(INTERFACE_ARRAY_GENERATE_MODPORTS, "P"),
-        [
-            "P2 101 202 303 404",
-        ]
+        ["P2 101 202 303 404",]
     );
 }
 
@@ -152,9 +150,7 @@ endmodule
 fn virtual_interface_class_driver() {
     assert_eq!(
         outs(VIRTUAL_INTERFACE_CLASS_DRIVER, "P"),
-        [
-            "P3 rdata=edcb5678",
-        ]
+        ["P3 rdata=edcb5678",]
     );
 }
 
@@ -191,9 +187,7 @@ endmodule
 fn modport_typed_virtual_interface() {
     assert_eq!(
         outs(MODPORT_TYPED_VIRTUAL_INTERFACE, "P"),
-        [
-            "P4 a=41 b=42",
-        ]
+        ["P4 a=41 b=42",]
     );
 }
 
@@ -238,9 +232,7 @@ endmodule
 fn clocked_always_through_modport_compiles() {
     assert_eq!(
         outs(CLOCKED_ALWAYS_THROUGH_MODPORT_COMPILES, "P"),
-        [
-            "P5 q=7534 d=7530",
-        ]
+        ["P5 q=7534 d=7530",]
     );
 }
 
@@ -277,10 +269,7 @@ endmodule
 fn interface_function_via_modport_and_direct() {
     assert_eq!(
         outs(INTERFACE_FUNCTION_VIA_MODPORT_AND_DIRECT, "P"),
-        [
-            "P6A peek=123",
-            "P6B direct=101",
-        ]
+        ["P6A peek=123", "P6B direct=101",]
     );
 }
 
@@ -320,8 +309,6 @@ endmodule
 fn nested_interface_instance_members() {
     assert_eq!(
         outs(NESTED_INTERFACE_INSTANCE_MEMBERS, "P"),
-        [
-            "P8 x=5a y=a5",
-        ]
+        ["P8 x=5a y=a5",]
     );
 }

@@ -98,7 +98,11 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "idx"), 2, "the forever exits on break");
     assert_eq!(u(&sim, "after_ran"), 1, "and the statements after it run");
-    assert_eq!(u(&sim, "second_loop"), 3, "continue then break in a forever");
+    assert_eq!(
+        u(&sim, "second_loop"),
+        3,
+        "continue then break in a forever"
+    );
 }
 
 /// §7.4.6: an out-of-bounds or x/z element write is discarded, while the
@@ -129,7 +133,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "a0"), 23, "element 0 untouched by every out-of-range write");
+    assert_eq!(
+        u(&sim, "a0"),
+        23,
+        "element 0 untouched by every out-of-range write"
+    );
     assert_eq!(u(&sim, "a1"), 42, "and element 1");
     assert_eq!(u(&sim, "calls"), 6, "the RHS ran all six times");
 }

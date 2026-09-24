@@ -53,9 +53,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(text(&sim, "u.cmd"), "XabcdefY", "$sformatf over a sibling var");
-    assert_eq!(text(&sim, "u.cat"), "abcdef/z", "concatenation over a sibling var");
-    assert_eq!(u(&sim, "u.m"), 6, "int initializer reading a sibling (was 1)");
+    assert_eq!(
+        text(&sim, "u.cmd"),
+        "XabcdefY",
+        "$sformatf over a sibling var"
+    );
+    assert_eq!(
+        text(&sim, "u.cat"),
+        "abcdef/z",
+        "concatenation over a sibling var"
+    );
+    assert_eq!(
+        u(&sim, "u.m"),
+        6,
+        "int initializer reading a sibling (was 1)"
+    );
     assert_eq!(u(&sim, "u.k"), 12, "declaration order is preserved");
 }
 
@@ -78,8 +90,16 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "u.derived"), 8);
-    assert_eq!(u(&sim, "u.seen"), 8, "initializer must precede the initial block");
-    assert_eq!(text(&sim, "u.lit"), "plain", "constant initializers still fold");
+    assert_eq!(
+        u(&sim, "u.seen"),
+        8,
+        "initializer must precede the initial block"
+    );
+    assert_eq!(
+        text(&sim, "u.lit"),
+        "plain",
+        "constant initializers still fold"
+    );
 }
 
 /// A rand field wider than 64 bits must actually be randomized.

@@ -57,13 +57,21 @@ fn shift_operands_take_the_lrm_context_not_the_carry_width() {
     assert_eq!(u(&sim, "r2"), 0x0C, ">>> variant");
     assert_eq!(u(&sim, "r3"), 0x23, "(a+a)>>1 — carry must not return");
     assert_eq!(u(&sim, "r4"), 0x3C, "(b-a)>>1 — borrow must not return");
-    assert_eq!(u(&sim, "w3"), 0x1FFF_FFF3, "signed >> in a 32-bit context sign-extends FIRST");
+    assert_eq!(
+        u(&sim, "w3"),
+        0x1FFF_FFF3,
+        "signed >> in a 32-bit context sign-extends FIRST"
+    );
 }
 
 #[test]
 fn div_mod_are_context_determined_in_both_operands() {
     let sim = simulate(SRC, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "w1"), 0x0000_0080, "-128/-1 at 32 bits is +128, not -128");
+    assert_eq!(
+        u(&sim, "w1"),
+        0x0000_0080,
+        "-128/-1 at 32 bits is +128, not -128"
+    );
     assert_eq!(u(&sim, "xz1"), 1, "a/0 is x across the full context width");
 }
 
@@ -71,7 +79,15 @@ fn div_mod_are_context_determined_in_both_operands() {
 fn ternary_unary_and_relational_context() {
     let sim = simulate(SRC, 50).expect("simulate failed");
     assert_eq!(u(&sim, "w4"), 0x0000_009C, "mixed-sign ternary is unsigned");
-    assert_eq!(u(&sim, "u1"), 0xFFFF_FF5C, "~a extends before the op (both paths)");
+    assert_eq!(
+        u(&sim, "u1"),
+        0xFFFF_FF5C,
+        "~a extends before the op (both paths)"
+    );
     assert_eq!(u(&sim, "u2"), 0xFFFF_FF5D, "-a likewise");
-    assert_eq!(u(&sim, "t32"), 0, "assignment width must NOT leak into > operands");
+    assert_eq!(
+        u(&sim, "t32"),
+        0,
+        "assignment width must NOT leak into > operands"
+    );
 }

@@ -132,7 +132,11 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "ma"), 9, "package struct-param member in const");
     assert_eq!(u(&sim, "bw"), 12, "$bits of struct member");
-    assert_eq!(u(&sim, "d_a"), 9, "default (package-scoped) header param member");
+    assert_eq!(
+        u(&sim, "d_a"),
+        9,
+        "default (package-scoped) header param member"
+    );
     assert_eq!(u(&sim, "d_b"), 0xABC);
     assert_eq!(u(&sim, "o_a"), 3, "overridden header param member");
     assert_eq!(u(&sim, "o_b"), 0x123);
@@ -172,6 +176,10 @@ endmodule
     assert_eq!(u(&sim, "mp1"), 0xAA);
     assert_eq!(u(&sim, "ua01"), 2, "2-D unpacked parameter array");
     assert_eq!(u(&sim, "ua10"), 3);
-    assert_eq!(u(&sim, "catlen"), 10, "string parameter concat is text (pre_widget)");
+    assert_eq!(
+        u(&sim, "catlen"),
+        10,
+        "string parameter concat is text (pre_widget)"
+    );
     assert_eq!(u(&sim, "pii"), 314, "$rtoi in constant context");
 }

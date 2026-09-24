@@ -15,8 +15,7 @@
 use xezim::simulate;
 
 fn run_chapter(name: &str, src: &str, expected_fails: usize) {
-    let sim = simulate(src, 100_000)
-        .unwrap_or_else(|e| panic!("{}: simulate failed: {}", name, e));
+    let sim = simulate(src, 100_000).unwrap_or_else(|e| panic!("{}: simulate failed: {}", name, e));
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     let done = msgs.iter().any(|m| m.contains("CHECKS DONE"));
     assert!(
@@ -59,7 +58,11 @@ fn lrm_ch7_packed_module_scope() {
 
 #[test]
 fn lrm_ch7_packed_local_scope() {
-    run_chapter("ch7c", include_str!("../lrm_audit/ch7c_local_typedef.sv"), 0);
+    run_chapter(
+        "ch7c",
+        include_str!("../lrm_audit/ch7c_local_typedef.sv"),
+        0,
+    );
 }
 
 #[test]

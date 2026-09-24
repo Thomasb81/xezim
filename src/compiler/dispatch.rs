@@ -217,7 +217,9 @@ pub struct DispatchTable {
 
 impl DispatchTable {
     pub fn new() -> Self {
-        Self { opcode_count: NUM_OPCODES }
+        Self {
+            opcode_count: NUM_OPCODES,
+        }
     }
 
     #[inline]
@@ -240,7 +242,7 @@ mod tests {
     fn test_opcode_from_insn() {
         let insn = Insn::Add(0, 1, 2);
         assert_eq!(Opcode::from_insn(&insn), Opcode::Add);
-        
+
         let insn = Insn::Nop;
         assert_eq!(Opcode::from_insn(&insn), Opcode::Nop);
     }

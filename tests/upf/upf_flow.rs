@@ -13,11 +13,20 @@ fn run(extra: &[&str]) -> (bool, String) {
     let core = root.join("pwr_core.sv");
     let tb = root.join("pwr_tb.sv");
     let mut args: Vec<&str> = vec![
-        "--simulate", "-s", "pwr_tb", "--no-cache", "--upf", upf.to_str().unwrap(),
-        core.to_str().unwrap(), tb.to_str().unwrap(),
+        "--simulate",
+        "-s",
+        "pwr_tb",
+        "--no-cache",
+        "--upf",
+        upf.to_str().unwrap(),
+        core.to_str().unwrap(),
+        tb.to_str().unwrap(),
     ];
     args.extend_from_slice(extra);
-    let output = Command::new(env!("CARGO_BIN_EXE_xezim")).args(&args).output().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(&args)
+        .output()
+        .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     (output.status.success(), text)
@@ -27,7 +36,10 @@ fn run(extra: &[&str]) -> (bool, String) {
 fn switched_domain_isolation_and_retention_follow_the_power_intent() {
     let (ok, text) = run(&[]);
     assert!(ok, "run failed:\n{text}");
-    assert!(text.contains("UPF_TEST_PASS"), "power-aware checks failed:\n{text}");
+    assert!(
+        text.contains("UPF_TEST_PASS"),
+        "power-aware checks failed:\n{text}"
+    );
     for want in [
         "[UPF] scope /pwr_tb/dut/u_core (core_blk), 4 supply nets: VMAIN, VLOW, GND, VMUL",
         "[UPF] power switch mul_sw: VMAIN -> VMUL controlled by ctrl_off=mul_off",
@@ -45,15 +57,24 @@ fn switched_domain_isolation_and_retention_follow_the_power_intent() {
         assert!(text.contains(want), "missing `{want}`:\n{text}");
     }
     // No spurious power-down reports before any supply is turned on.
-    assert!(!text.contains("Time: 0, Power domain"), "time-0 domain messages:\n{text}");
+    assert!(
+        !text.contains("Time: 0, Power domain"),
+        "time-0 domain messages:\n{text}"
+    );
 }
 
 #[test]
 fn explicit_scope_path_selects_the_same_instance() {
     let (ok, text) = run(&["--upf-top", "/pwr_tb/dut/u_core"]);
     assert!(ok, "run failed:\n{text}");
-    assert!(text.contains("UPF_TEST_PASS"), "power-aware checks failed:\n{text}");
-    assert!(text.contains("[UPF] scope /pwr_tb/dut/u_core (core_blk)"), "scope not resolved:\n{text}");
+    assert!(
+        text.contains("UPF_TEST_PASS"),
+        "power-aware checks failed:\n{text}"
+    );
+    assert!(
+        text.contains("[UPF] scope /pwr_tb/dut/u_core (core_blk)"),
+        "scope not resolved:\n{text}"
+    );
 }
 
 #[test]
@@ -66,11 +87,24 @@ fn design_without_upf_flag_is_unaffected() {
     let tb = dir.join("plain_tb.sv");
     std::fs::write(&tb, "module plain_tb; logic clk=0, rst_n=1, go=0, en=0, we=0, mul_off=0, mul_iso=0; logic [3:0] a=2, b=3; logic [7:0] d=0; logic [7:0] y, q; logic zero, busy;\n lp_soc_top dut(.*);\n always #5 clk = ~clk;\n initial begin #12 go = 1; #10 go = 0; #10 $display(\"PLAIN y=%0d\", y); $finish; end\nendmodule\n").unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "plain_tb", "--no-cache", root.join("pwr_core.sv").to_str().unwrap(), tb.to_str().unwrap()])
+        .args([
+            "--simulate",
+            "-s",
+            "plain_tb",
+            "--no-cache",
+            root.join("pwr_core.sv").to_str().unwrap(),
+            tb.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
-    assert!(output.status.success() && text.contains("PLAIN y=6"), "plain run broke:\n{text}");
-    assert!(!text.contains("[UPF]"), "UPF glue leaked into a run without --upf:\n{text}");
+    assert!(
+        output.status.success() && text.contains("PLAIN y=6"),
+        "plain run broke:\n{text}"
+    );
+    assert!(
+        !text.contains("[UPF]"),
+        "UPF glue leaked into a run without --upf:\n{text}"
+    );
 }

@@ -207,7 +207,12 @@ endmodule
             "{} grandchild len",
             inst
         );
-        assert_eq!(u(&sim, &format!("{}.gg.gc0", inst)), b'H' as u64, "{}", inst);
+        assert_eq!(
+            u(&sim, &format!("{}.gg.gc0", inst)),
+            b'H' as u64,
+            "{}",
+            inst
+        );
     }
 }
 

@@ -28,7 +28,15 @@ fn labeled_block_locals_stay_distinct_and_hierarchically_reachable() {
     let src = dir.join("tb.sv");
     std::fs::write(&src, DESIGN).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb", src.to_str().unwrap(), "--no-cache", "--max-time", "10"])
+        .args([
+            "--simulate",
+            "-s",
+            "tb",
+            src.to_str().unwrap(),
+            "--no-cache",
+            "--max-time",
+            "10",
+        ])
         .output()
         .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();

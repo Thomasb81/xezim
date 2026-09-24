@@ -25,7 +25,13 @@ fn run(src: &str) -> String {
     let path = dir.join("tb.sv");
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb_shape", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "tb_shape",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -36,7 +42,8 @@ fn run(src: &str) -> String {
 
 #[test]
 fn hierarchical_force_survives_driver_reevaluation() {
-    let text = run(r#"module dut (input clk, input [7:0] a, output [7:0] oport);
+    let text = run(
+        r#"module dut (input clk, input [7:0] a, output [7:0] oport);
   wire [7:0] internal;
   reg  [7:0] flop;
   assign internal = a + 8'd1;
@@ -67,7 +74,8 @@ module tb_shape;
     $finish;
   end
 endmodule
-"#);
+"#,
+    );
     for expect in [
         "T1 int=aa oport=bb flop=cc",
         "T2 int=aa oport=bb flop=cc",
@@ -82,7 +90,8 @@ endmodule
 fn hierarchical_force_reaches_generate_and_array_targets() {
     // A force through a generate-block index (`G[0].u_gen.q`) and one onto a
     // fixed-array element, both re-driven every clock. Reference-verified.
-    let text = run(r#"module blk (input clk, input [31:0] din, output reg [31:0] q);
+    let text = run(
+        r#"module blk (input clk, input [31:0] din, output reg [31:0] q);
   initial q = 0;
   always @(posedge clk) q <= (din ^ 32'h5A5A_1234) + 32'd7;
 endmodule
@@ -108,7 +117,8 @@ module tb_shape;
           $finish;
   end
 endmodule
-"#);
+"#,
+    );
     assert!(
         text.contains("F qg=feedface mem1=c3"),
         "generate-indexed or array-element force did not hold:\n{text}"

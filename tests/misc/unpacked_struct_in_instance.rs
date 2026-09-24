@@ -59,8 +59,16 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "one_a"), 0x11);
     assert_eq!(u(&sim, "one_b"), 0x22);
-    assert_eq!(u(&sim, "two_a_unknown"), 1, "an unwritten struct must stay x, not alias");
-    assert_eq!(u(&sim, "two_b_unknown"), 1, "an unwritten struct must stay x, not alias");
+    assert_eq!(
+        u(&sim, "two_a_unknown"),
+        1,
+        "an unwritten struct must stay x, not alias"
+    );
+    assert_eq!(
+        u(&sim, "two_b_unknown"),
+        1,
+        "an unwritten struct must stay x, not alias"
+    );
 }
 
 /// Patterns, member writes and whole copies all work inside an instance,
@@ -92,9 +100,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "na"), u(&sim, "nb")), (0x11, 0x22), "named pattern");
-    assert_eq!((u(&sim, "oa"), u(&sim, "ob")), (0x33, 0x44), "ordered pattern");
-    assert_eq!((u(&sim, "ia"), u(&sim, "ib")), (0x55, 0x66), "inline struct type");
+    assert_eq!(
+        (u(&sim, "na"), u(&sim, "nb")),
+        (0x11, 0x22),
+        "named pattern"
+    );
+    assert_eq!(
+        (u(&sim, "oa"), u(&sim, "ob")),
+        (0x33, 0x44),
+        "ordered pattern"
+    );
+    assert_eq!(
+        (u(&sim, "ia"), u(&sim, "ib")),
+        (0x55, 0x66),
+        "inline struct type"
+    );
     assert_eq!((u(&sim, "ca"), u(&sim, "cb")), (0x11, 0x22), "whole copy");
 }
 
@@ -119,6 +139,14 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!((u(&sim, "na"), u(&sim, "nb")), (0x77, 0x88), "named via NBA");
-    assert_eq!((u(&sim, "oa"), u(&sim, "ob")), (0x99, 0xAA), "ordered via NBA");
+    assert_eq!(
+        (u(&sim, "na"), u(&sim, "nb")),
+        (0x77, 0x88),
+        "named via NBA"
+    );
+    assert_eq!(
+        (u(&sim, "oa"), u(&sim, "ob")),
+        (0x99, 0xAA),
+        "ordered via NBA"
+    );
 }

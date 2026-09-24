@@ -79,20 +79,36 @@ endmodule
 fn bit_select_reads_use_declared_indices() {
     let sim = simulate(SRC_FORMS, 50).expect("simulate failed");
     assert_eq!(u(&sim, "r_w1"), 1, "w[1] of 3'b101 on logic [3:1]");
-    assert_eq!(u(&sim, "r_w2"), 0, "w[2] — the fused-gate path read declared bit 3 here");
+    assert_eq!(
+        u(&sim, "r_w2"),
+        0,
+        "w[2] — the fused-gate path read declared bit 3 here"
+    );
     assert_eq!(u(&sim, "r_w3"), 1, "w[3]");
     assert_eq!(u(&sim, "r_wi"), 1, "w[i] with i=1 (dynamic index)");
     assert_eq!(u(&sim, "r_cat"), 0b11, "{{w[3], w[1]}}");
     // n[7] and n[4] must differ, or a rebase error is invisible.
     assert_eq!(u(&sim, "r_n7"), 1, "n[7] on logic [7:4] = 4'b1000");
-    assert_eq!(u(&sim, "r_n4"), 0, "n[4] — equal values here would hide a swap");
+    assert_eq!(
+        u(&sim, "r_n4"),
+        0,
+        "n[4] — equal values here would hide a swap"
+    );
 }
 
 #[test]
 fn indexed_part_select_reads_rebase_their_base() {
     let sim = simulate(SRC_FORMS, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "r_range"), 0b01, "w[2:1] — the constant range form was always correct");
-    assert_eq!(u(&sim, "r_up"), 0b01, "w[1 +: 2] must be declared 2:1, not 3:2");
+    assert_eq!(
+        u(&sim, "r_range"),
+        0b01,
+        "w[2:1] — the constant range form was always correct"
+    );
+    assert_eq!(
+        u(&sim, "r_up"),
+        0b01,
+        "w[1 +: 2] must be declared 2:1, not 3:2"
+    );
     assert_eq!(
         u(&sim, "r_down"),
         0b10,
@@ -160,5 +176,9 @@ fn single_bit_nonzero_based_register_reads_back() {
     );
     // Same construct at TOP level — it was broken here too; the earlier
     // top-level probe only looked correct because it printed with $display.
-    assert_eq!(u(&sim, "t_assign"), 1, "top_h[1] read from a top-level assign");
+    assert_eq!(
+        u(&sim, "t_assign"),
+        1,
+        "top_h[1] read from a top-level assign"
+    );
 }

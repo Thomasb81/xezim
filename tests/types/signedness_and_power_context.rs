@@ -52,13 +52,25 @@ fn power_left_operand_takes_the_context_width() {
     let sim = simulate(SRC, 50).expect("simulate failed");
     assert_eq!(u(&sim, "r_pow"), 0x7E90, "180**2 in a 32-bit context");
     assert_eq!(u(&sim, "r_pow16"), 0x7E90, "and in a 16-bit context");
-    assert_eq!(u(&sim, "r_pow8"), 0x90, "8-bit context truncates, correctly");
+    assert_eq!(
+        u(&sim, "r_pow8"),
+        0x90,
+        "8-bit context truncates, correctly"
+    );
 }
 
 #[test]
 fn mixed_sign_and_unsigned_cast_zero_extend() {
     let sim = simulate(SRC, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "r_mix"), 0x0000_00F9, "sa + b is UNSIGNED (§11.8.1)");
+    assert_eq!(
+        u(&sim, "r_mix"),
+        0x0000_00F9,
+        "sa + b is UNSIGNED (§11.8.1)"
+    );
     assert_eq!(u(&sim, "r_uns"), 0x0000_00F4, "unsigned'(sa) zero-extends");
-    assert_eq!(u(&sim, "r_sgn"), 0xFFFF_FFF5, "all-signed still sign-extends");
+    assert_eq!(
+        u(&sim, "r_sgn"),
+        0xFFFF_FFF5,
+        "all-signed still sign-extends"
+    );
 }

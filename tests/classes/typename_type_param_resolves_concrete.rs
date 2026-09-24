@@ -67,7 +67,8 @@ fn typename_type_param_resolves_concrete_binding() {
 {out}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("str=string")) && lines.iter().any(|l| l.contains("int=int")),
+        lines.iter().any(|l| l.contains("str=string"))
+            && lines.iter().any(|l| l.contains("int=int")),
         "builtin type params must report `int` and `string`:
 {out}"
     );
@@ -78,7 +79,9 @@ fn typename_type_param_resolves_concrete_binding() {
     );
     assert!(
         lines.iter().any(|l| l.contains("sig=logic [9:0]"))
-            && lines.iter().any(|l| l.contains("if-local=logic signed [15:0]")),
+            && lines
+                .iter()
+                .any(|l| l.contains("if-local=logic signed [15:0]")),
         "vector signals and block-local vars must report their range (logic [9:0], logic signed [15:0]):\n{out}"
     );
 }

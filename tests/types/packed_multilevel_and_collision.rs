@@ -56,7 +56,11 @@ endmodule
 fn packed_multilevel_selects_survive_instance_collision() {
     let sim = simulate(SRC, 50).expect("simulate failed");
     assert_eq!(u(&sim, "b_all"), 20, "$bits(x) whole signal");
-    assert_eq!(u(&sim, "b_lvl1"), 20, "$bits(x[0]) — outer dim [0:0] element");
+    assert_eq!(
+        u(&sim, "b_lvl1"),
+        20,
+        "$bits(x[0]) — outer dim [0:0] element"
+    );
     assert_eq!(u(&sim, "b_lvl2"), 10, "$bits(x[0][0]) — struct element");
     // 20'hBEEF5: element [0][0] is the LOW struct slot = 10'h2F5.
     assert_eq!(u(&sim, "elem"), 0x2f5, "nested element value");

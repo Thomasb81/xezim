@@ -111,51 +111,71 @@ endmodule
 fn sscanf_wide_hex_preserves_full_width() {
     let sim = simulate(SSCANF_WIDE, 100).expect("simulate failed");
     // 40-hex → 160-bit: all 160 bits survive (was truncated to low-32)
-    assert_eq!(out(&sim, "s_hex160"),
-        "NOTE: s_hex160 1 0123456789abcdef0123456789abcdef01234567");
+    assert_eq!(
+        out(&sim, "s_hex160"),
+        "NOTE: s_hex160 1 0123456789abcdef0123456789abcdef01234567"
+    );
     // 8000000000000000 → 64-bit: full 64-bit value (was 0)
     assert_eq!(out(&sim, "s_hex64"), "NOTE: s_hex64 1 8000000000000000");
     // deadbeefdeadbeef → 32-bit: low 32 = deadbeef (was 0)
     assert_eq!(out(&sim, "s_hex32"), "NOTE: s_hex32 1 deadbeef");
     // 3ab4901f2c3d5e60 < 2^63 → 160-bit: full value (was low-32 only)
-    assert_eq!(out(&sim, "s_hexsmall"),
-        "NOTE: s_hexsmall 1 0000000000000000000000003ab4901f2c3d5e60");
+    assert_eq!(
+        out(&sim, "s_hexsmall"),
+        "NOTE: s_hexsmall 1 0000000000000000000000003ab4901f2c3d5e60"
+    );
 }
 
 #[test]
 fn sscanf_wide_bin_and_oct() {
     let sim = simulate(SSCANF_WIDE, 100).expect("simulate failed");
     // 80 ones → 160-bit: low 80 bits all 1
-    assert_eq!(out(&sim, "s_bin160"),
-        "NOTE: s_bin160 1 00000000000000000000ffffffffffffffffffff");
+    assert_eq!(
+        out(&sim, "s_bin160"),
+        "NOTE: s_bin160 1 00000000000000000000ffffffffffffffffffff"
+    );
     // 2^63 via octal → 160-bit
-    assert_eq!(out(&sim, "s_oct160"),
-        "NOTE: s_oct160 1 0000000000000000000000008000000000000000");
+    assert_eq!(
+        out(&sim, "s_oct160"),
+        "NOTE: s_oct160 1 0000000000000000000000008000000000000000"
+    );
 }
 
 #[test]
 fn sscanf_wide_decimal_signed() {
     let sim = simulate(SSCANF_WIDE, 100).expect("simulate failed");
     // 12345678901234567890 mod 2^64 = 0xab54a98ceb1f0ad2
-    assert_eq!(out(&sim, "s_posdec64"), "NOTE: s_posdec64 1 ab54a98ceb1f0ad2");
+    assert_eq!(
+        out(&sim, "s_posdec64"),
+        "NOTE: s_posdec64 1 ab54a98ceb1f0ad2"
+    );
     // Two's complement: 2^64 - 0xab54a98ceb1f0ad2 = 0x54ab567314e0f52e
-    assert_eq!(out(&sim, "s_negdec64"), "NOTE: s_negdec64 1 54ab567314e0f52e");
+    assert_eq!(
+        out(&sim, "s_negdec64"),
+        "NOTE: s_negdec64 1 54ab567314e0f52e"
+    );
     // Same payload into 160 bits: the two's complement belongs to the
     // destination, so everything above the magnitude has to come back ones.
     // A `Value::add`-based negation stops carrying at bit 127 and answers
     // 0x00000000ffffffff_ffffffff_ffffffff54ab567314e0f52e instead.
-    assert_eq!(out(&sim, "s_negdec160"),
-        "NOTE: s_negdec160 1 ffffffffffffffffffffffff54ab567314e0f52e");
-    assert_eq!(out(&sim, "s_negone160"),
-        "NOTE: s_negone160 1 ffffffffffffffffffffffffffffffffffffffff");
+    assert_eq!(
+        out(&sim, "s_negdec160"),
+        "NOTE: s_negdec160 1 ffffffffffffffffffffffff54ab567314e0f52e"
+    );
+    assert_eq!(
+        out(&sim, "s_negone160"),
+        "NOTE: s_negone160 1 ffffffffffffffffffffffffffffffffffffffff"
+    );
 }
 
 #[test]
 fn sscanf_field_width_16x() {
     let sim = simulate(SSCANF_WIDE, 100).expect("simulate failed");
     assert_eq!(out(&sim, "s_w16x"), "NOTE: s_w16x 1 0123456789abcdef");
-    assert_eq!(out(&sim, "s_w16xwide"),
-        "NOTE: s_w16xwide 1 0000000000000000000000008000000000000000");
+    assert_eq!(
+        out(&sim, "s_w16xwide"),
+        "NOTE: s_w16xwide 1 0000000000000000000000008000000000000000"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -200,8 +220,14 @@ fn fscanf_wide_advances_past_large_token() {
     let path = temp_file_path("wide_fscanf.txt");
     let path_sv = path.to_string_lossy().replace('\\', "\\\\");
     let sim = simulate(&fscanf_wide_src(&path_sv), 100).expect("simulate failed");
-    assert_eq!(out(&sim, "f_hexsmall"), "NOTE: f_hexsmall 1 00000000000000000000000003ab4901f2c3d5e60");
-    assert_eq!(out(&sim, "f_hexlarge"), "NOTE: f_hexlarge 1 0000000000000000000000000deadbeefdeadbeef");
+    assert_eq!(
+        out(&sim, "f_hexsmall"),
+        "NOTE: f_hexsmall 1 00000000000000000000000003ab4901f2c3d5e60"
+    );
+    assert_eq!(
+        out(&sim, "f_hexlarge"),
+        "NOTE: f_hexlarge 1 0000000000000000000000000deadbeefdeadbeef"
+    );
     // After consuming all tokens, $fscanf returns -1 or 0 (clean EOF)
     let eof = out(&sim, "f_eof");
     let n: i32 = eof.split_whitespace().last().unwrap().parse().unwrap();
@@ -313,8 +339,10 @@ fn value_plusargs_wide_decimal_keeps_all_160_bits() {
     // low 64 bits of a 160-bit destination was lost regardless of the payload.
     let sim = sim_with_plusargs(VALUE_PLUSARGS_WIDE, VALUE_PLUSARGS);
     // 12345678901234567890 = 0xAB54A98CEB1F0AD2, zero-extended to 160.
-    assert_eq!(out(&sim, "vp_wpos"),
-        "NOTE: vp_wpos 1 000000000000000000000000ab54a98ceb1f0ad2");
+    assert_eq!(
+        out(&sim, "vp_wpos"),
+        "NOTE: vp_wpos 1 000000000000000000000000ab54a98ceb1f0ad2"
+    );
     // 2^64+5 truncated to a 64-bit destination.
     assert_eq!(out(&sim, "vp_n64"), "NOTE: vp_n64 1 0000000000000005");
 }
@@ -326,14 +354,20 @@ fn value_plusargs_wide_decimal_applies_sign_at_destination_width() {
     // same bits. Two's complement has to be taken at the destination width.
     let sim = sim_with_plusargs(VALUE_PLUSARGS_WIDE, VALUE_PLUSARGS);
     // 2^160 - 12345678901234567890
-    assert_eq!(out(&sim, "vp_wneg"),
-        "NOTE: vp_wneg 1 ffffffffffffffffffffffff54ab567314e0f52e");
+    assert_eq!(
+        out(&sim, "vp_wneg"),
+        "NOTE: vp_wneg 1 ffffffffffffffffffffffff54ab567314e0f52e"
+    );
     // -1 into 160 bits is all ones, not 1.
-    assert_eq!(out(&sim, "vp_wall"),
-        "NOTE: vp_wall 1 ffffffffffffffffffffffffffffffffffffffff");
+    assert_eq!(
+        out(&sim, "vp_wall"),
+        "NOTE: vp_wall 1 ffffffffffffffffffffffffffffffffffffffff"
+    );
     // 2^160 - 98765432109876543210, into a signed destination.
-    assert_eq!(out(&sim, "vp_sneg"),
-        "NOTE: vp_sneg 1 fffffffffffffffffffffffaa55ab2c71ad98116");
+    assert_eq!(
+        out(&sim, "vp_sneg"),
+        "NOTE: vp_sneg 1 fffffffffffffffffffffffaa55ab2c71ad98116"
+    );
 }
 
 #[test]

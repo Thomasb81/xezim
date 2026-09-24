@@ -17,7 +17,10 @@ fn default_design_cache_dir() -> PathBuf {
         return PathBuf::from(path).join("xezim").join("designs");
     }
     if let Some(home) = env::var_os("HOME").filter(|p| !p.is_empty()) {
-        return PathBuf::from(home).join(".cache").join("xezim").join("designs");
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("xezim")
+            .join("designs");
     }
     PathBuf::from(".xezim-cache")
 }
@@ -31,10 +34,14 @@ fn design_dependency_files(
     let default_exts = ["v".to_string(), "sv".to_string(), "V".to_string()];
     let exts = lib_exts.unwrap_or(&default_exts);
     for dir in lib_dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if path.is_file() && exts.iter().any(|candidate| candidate == ext) {
                 files.push(path);
             }
@@ -116,7 +123,9 @@ fn print_usage() {
     eprintln!("  --preprocess     Run the preprocessor only; emit expanded text");
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
-    eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
+    eprintln!(
+        "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)"
+    );
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
     eprintln!("  --strict-top     Error out if -s names a module that does not exist (default)");
     eprintln!("  --no-strict-top  Warn and auto-detect the design root instead when -s names");
@@ -124,17 +133,25 @@ fn print_usage() {
     eprintln!("                   recorded top names are known-stale)");
     eprintln!("  --profile        Print the [PROF] end-of-run profile report (edge-block, settle");
     eprintln!("                   and timing counters). Same as XEZIM_PROFILE_REPORT=1.");
-    eprintln!("  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
+    eprintln!(
+        "  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
   --relax-implicit-static  Accept `int x = ...;` inside a static subroutine
                    (§6.21) with a warning instead of an error. Also enabled by
-                   XEZIM_ALLOW_IMPLICIT_STATIC=1.");
+                   XEZIM_ALLOW_IMPLICIT_STATIC=1."
+    );
     eprintln!("  --verbose        Per-file compile progress: each file as it is parsed and the");
     eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
     eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
     eprintln!("                     sources in parse order, -v library files, -y library dirs");
-    eprintln!("  --upf <file>             Load IEEE 1801 power intent (repeatable): supply nets, power");
-    eprintln!("                           switches, domain corruption, isolation; UPF package functions");
-    eprintln!("  --upf-top <path>         Instance the UPF scope applies to (default: first instance of");
+    eprintln!(
+        "  --upf <file>             Load IEEE 1801 power intent (repeatable): supply nets, power"
+    );
+    eprintln!(
+        "                           switches, domain corruption, isolation; UPF package functions"
+    );
+    eprintln!(
+        "  --upf-top <path>         Instance the UPF scope applies to (default: first instance of"
+    );
     eprintln!("                           the set_design_top module)");
     eprintln!("  --dump-merged-sv <file>  Write the sources, fully preprocessed (`ifdef");
     eprintln!("                     resolved, macros expanded, `includes inlined), into one");
@@ -159,12 +176,20 @@ fn print_usage() {
     eprintln!("                   XEZIM_TRACE_SIGNAL=name[,name...]  Trace elaboration");
     eprintln!("                   signal-table writes for matching names (debug).");
     eprintln!("                   XEZIM_TRACE_TYPE=name[,name...]  Trace typedef-width table");
-    eprintln!("                   writes and type-width resolutions for matching type names (debug).");
+    eprintln!(
+        "                   writes and type-width resolutions for matching type names (debug)."
+    );
     eprintln!("                   Also settable as X_WARN_LIMIT=N.");
     eprintln!("  --module-timescale <unit>/<prec>            Timescale for every module with no");
-    eprintln!("                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the");
-    eprintln!("                     named form limits it to the listed modules). Repeatable. Never");
-    eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
+    eprintln!(
+        "                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the"
+    );
+    eprintln!(
+        "                     named form limits it to the listed modules). Repeatable. Never"
+    );
+    eprintln!(
+        "                     overrides a `timeunit`/`timeprecision` decl or an active `timescale."
+    );
     eprintln!("  --timescale <unit>/<prec>  Alias for the un-named --module-timescale form,");
     eprintln!("  -timescale <unit>/<prec>     spelled as other simulators spell it. Same rule:");
     eprintln!("                     it is a DEFAULT for design elements with no timescale");
@@ -173,9 +198,13 @@ fn print_usage() {
     eprintln!("                   (human text; '=json' emits one JSON line instead). Off by");
     eprintln!("                   default. XEZIM_REPORT_STATS=1|json enables it too; the");
     eprintln!("                   flag wins over the environment.");
-    eprintln!("  --cache          Enable the EXPERIMENTAL warm-start design cache (off by default;");
+    eprintln!(
+        "  --cache          Enable the EXPERIMENTAL warm-start design cache (off by default;"
+    );
     eprintln!("                   also enabled by XEZIM_ENABLE_CACHE=1 or --cache-dir).");
-    eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)");
+    eprintln!(
+        "  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)"
+    );
     eprintln!("                    (default: $XEZIM_CACHE_DIR or $XDG_CACHE_HOME/xezim/designs).");
     eprintln!("  --no-cache       Force-disable the design cache (default; XEZIM_NO_CACHE=1 too).");
     eprintln!("  --artifact-compression <none|1-22>  -o artifact compression: 'none' writes raw");
@@ -186,7 +215,8 @@ fn print_usage() {
     eprintln!("                   Can also be set via XEZIM_CACHE_COMPRESSION_LEVEL=N.");
     eprintln!("  --cache-stats    Print compression statistics when reading/writing cache files.");
     eprintln!("                   Can also be set via XEZIM_CACHE_STATS=1.");
-    eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
+    eprintln!(
+        "  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
   -v <file>        Library file: modules compiled only to resolve instantiations
   --primitive-verbose  Show parse/adoption diagnostics for explicit -v files
   -y <dir>         Library directory: <module>.<ext> loaded on demand
@@ -195,7 +225,8 @@ fn print_usage() {
   +delay_mode_zero Force all structural (specify/SDF) delays to 0 (fast functional GLS)
   +delay_mode_unit Collapse every nonzero structural delay to 1 time unit
   +mindelays/+typdelays/+maxdelays  min:typ:max selection (specify + SDF; default typ)
-  +notimingcheck   Accepted no-op (specify timing checks are not modeled)");
+  +notimingcheck   Accepted no-op (specify timing checks are not modeled)"
+    );
     eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
     eprintln!("                   dictionary + time + signal deltas + event records).");
     eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
@@ -238,7 +269,11 @@ fn print_version() {
     // parsed by scripts. The build provenance follows in the same shape the
     // run banner uses, so a log and a `-V` can be matched by eye.
     println!("xezim version {}", env!("CARGO_PKG_VERSION"));
-    println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
+    println!(
+        "git {} ({})",
+        env!("XEZIM_GIT_HASH"),
+        env!("XEZIM_GIT_DATE")
+    );
     println!("tag {}", env!("XEZIM_GIT_TAG"));
 }
 
@@ -252,7 +287,12 @@ fn parse_time_literal(s: &str) -> Result<i32, String> {
         "1" => 0,
         "10" => 1,
         "100" => 2,
-        other => return Err(format!("invalid time mantissa '{}' (must be 1, 10, or 100)", other)),
+        other => {
+            return Err(format!(
+                "invalid time mantissa '{}' (must be 1, 10, or 100)",
+                other
+            ));
+        }
     };
     let unit_exp = match unit.trim() {
         "s" => 0,
@@ -269,7 +309,10 @@ fn parse_time_literal(s: &str) -> Result<i32, String> {
 /// Parse a `<unit>/<precision>` timescale value, checking precision <= unit.
 fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
     let (u, p) = d.split_once('/').ok_or_else(|| {
-        format!("invalid --module-timescale value '{}' (expected <unit>/<precision>)", d)
+        format!(
+            "invalid --module-timescale value '{}' (expected <unit>/<precision>)",
+            d
+        )
     })?;
     let ue = parse_time_literal(u)?;
     let pe = parse_time_literal(p)?;
@@ -311,10 +354,12 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     } else {
         (lower.as_str(), 1.0)
     };
-    let num: f64 = num_str
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])", raw))?;
+    let num: f64 = num_str.trim().parse().map_err(|_| {
+        format!(
+            "invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])",
+            raw
+        )
+    })?;
     if !(num > 0.0) {
         return Err(format!("--max-time must be positive, got '{}'", raw));
     }
@@ -419,9 +464,16 @@ fn handle_gls_flag(flag: &str) -> bool {
         // present — recognized, no behavior change.
         "+delay_mode_path" | "-delay_mode_path" => {}
         // Timing-check control: nothing to disable (checks aren't modeled).
-        "+no_notifier" | "+no_tchk_msg" | "+neg_tchk" | "+nonegdelay"
-        | "+old_ntc" | "+ntc_warn" | "+nosdferror" | "+nocelldefinepragma"
-        | "+sdf_verbose" | "+sdfverbose" => {}
+        "+no_notifier"
+        | "+no_tchk_msg"
+        | "+neg_tchk"
+        | "+nonegdelay"
+        | "+old_ntc"
+        | "+ntc_warn"
+        | "+nosdferror"
+        | "+nocelldefinepragma"
+        | "+sdf_verbose"
+        | "+sdfverbose" => {}
         // Behavior xezim cannot model — warn once, don't pretend.
         "+delay_mode_distributed" | "-delay_mode_distributed" => {
             eprintln!(
@@ -431,8 +483,12 @@ fn handle_gls_flag(flag: &str) -> bool {
                 flag
             );
         }
-        "+pulse_e" | "+pulse_r" | "+pulse_int_e" | "+pulse_int_r"
-        | "+transport_int_delays" | "+transport_path_delays"
+        "+pulse_e"
+        | "+pulse_r"
+        | "+pulse_int_e"
+        | "+pulse_int_r"
+        | "+transport_int_delays"
+        | "+transport_path_delays"
         | "+multisource_int_delays" => {
             eprintln!(
                 "Warning: {} (pulse/transport/multisource delay control) is not modeled by xezim; \
@@ -835,11 +891,7 @@ fn redirect_stdio_to_log(path: &str) -> std::io::Result<()> {
 /// runtime objects and the right column counts unique parsed definitions —
 /// a sanity check that the whole design was analyzed.
 fn print_design_summary(
-    defs: &std::collections::HashMap<
-        String,
-        xezim::SourceDefinition,
-        impl std::hash::BuildHasher,
-    >,
+    defs: &std::collections::HashMap<String, xezim::SourceDefinition, impl std::hash::BuildHasher>,
     elab: &xezim::compiler::ElaboratedModule,
 ) {
     use xezim::SourceDefinition as SD;
@@ -983,9 +1035,7 @@ fn emit_run_stats(
 /// but `package`s, which is where classes normally live) — otherwise an ANSI
 /// port list's `interface foo_if.mp p` would register `foo_if` as *defined* by
 /// the instantiating file and misroute every reference to it.
-fn scan_units_and_refs(
-    text: &str,
-) -> (Vec<String>, std::collections::HashSet<String>, bool) {
+fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<String>, bool) {
     use xezim::lexer::TokenKind as TK;
     let toks = xezim::lexer::Lexer::new(text).tokenize();
     let mut declared = Vec::new();
@@ -1021,8 +1071,8 @@ fn scan_units_and_refs(
             // `interface class C` is a CLASS declaration — don't also open an
             // interface scope for it, or the missing `endinterface` unbalances
             // everything that follows.
-            let iface_class = kind == "interface"
-                && toks.get(i + 1).is_some_and(|n| n.text == "class");
+            let iface_class =
+                kind == "interface" && toks.get(i + 1).is_some_and(|n| n.text == "class");
             // `typedef class C;` is a §6.18 forward declaration, not a
             // definition; the real one may live in another file entirely.
             let fwd = kind == "class" && prev == "typedef";
@@ -1144,17 +1194,21 @@ fn strip_duplicate_unit_subroutines(
     // first `(` or `;` minus qualifiers and the return type, i.e. the LAST
     // identifier token ("automatic logic [7:0] foo" -> "foo").
     fn header_name(rest: &str) -> Option<String> {
-        let head = rest
-            .split(['(', ';'])
-            .next()
-            .unwrap_or("");
+        let head = rest.split(['(', ';']).next().unwrap_or("");
         head.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
             .filter(|t| !t.is_empty() && !t.chars().next().is_some_and(|c| c.is_ascii_digit()))
             .next_back()
             .map(|t| t.to_string())
     }
     const OPENERS: [&str; 8] = [
-        "module", "macromodule", "interface", "package", "program", "class", "checker", "primitive",
+        "module",
+        "macromodule",
+        "interface",
+        "package",
+        "program",
+        "class",
+        "checker",
+        "primitive",
     ];
     const CLOSERS: [&str; 8] = [
         "endmodule",
@@ -1213,7 +1267,11 @@ fn strip_duplicate_unit_subroutines(
                         out.push_str(&format!(
                             "// [xezim] duplicate $unit {first} '{name}' suppressed; first definition kept\n"
                         ));
-                        let end_kw = if first == "task" { "endtask" } else { "endfunction" };
+                        let end_kw = if first == "task" {
+                            "endtask"
+                        } else {
+                            "endfunction"
+                        };
                         // A one-liner closes on this very line; only a
                         // multi-line body needs the skip state.
                         if !closes_here(t, end_kw) {
@@ -1318,7 +1376,10 @@ fn append_adopted_libs_to_merged(
     // further dropped primaries). Mirrors elaboration order — a name declared
     // by a primary resolves there before any library fallback.
     if let Some(kept) = kept {
-        let scanned: Vec<_> = primary_texts.iter().map(|t| scan_units_and_refs(t)).collect();
+        let scanned: Vec<_> = primary_texts
+            .iter()
+            .map(|t| scan_units_and_refs(t))
+            .collect();
         let mut owner: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (fi, (declared, _, _)) in scanned.iter().enumerate() {
             for name in declared {
@@ -1370,7 +1431,10 @@ fn append_adopted_libs_to_merged(
         .open(merged_out)
         .and_then(|mut f| std::io::Write::write_all(&mut f, extra.as_bytes()))
     {
-        eprintln!("Warning: cannot append libraries to '{}': {}", merged_out, e);
+        eprintln!(
+            "Warning: cannot append libraries to '{}': {}",
+            merged_out, e
+        );
         return;
     }
     println!(
@@ -1489,7 +1553,7 @@ fn run_main() -> i32 {
     // Cache compression settings
     let mut cache_compression_level: Option<i32> = None;
     let mut cache_stats = false;
-    
+
     // Check environment variables for cache compression settings
     if let Ok(level_str) = env::var("XEZIM_CACHE_COMPRESSION_LEVEL") {
         if let Ok(level) = level_str.parse::<i32>() {
@@ -2078,7 +2142,10 @@ fn run_main() -> i32 {
                 if fmt == "json" {
                     report_stats_cli = Some(report::ReportMode::Json);
                 } else {
-                    eprintln!("Error: --report-stats={}: unknown format (expected 'json')", fmt);
+                    eprintln!(
+                        "Error: --report-stats={}: unknown format (expected 'json')",
+                        fmt
+                    );
                     std::process::exit(1);
                 }
             }
@@ -2112,7 +2179,9 @@ fn run_main() -> i32 {
                     _ => match v.parse::<i32>() {
                         Ok(n) if (1..=22).contains(&n) => xezim_core::set_zstd_level(n),
                         _ => {
-                            eprintln!("Error: --artifact-compression takes 'none' or a zstd level 1-22");
+                            eprintln!(
+                                "Error: --artifact-compression takes 'none' or a zstd level 1-22"
+                            );
                             std::process::exit(1);
                         }
                     },
@@ -2125,7 +2194,9 @@ fn run_main() -> i32 {
                     _ => match v.parse::<i32>() {
                         Ok(n) if (1..=22).contains(&n) => xezim_core::set_zstd_level(n),
                         _ => {
-                            eprintln!("Error: --artifact-compression takes 'none' or a zstd level 1-22");
+                            eprintln!(
+                                "Error: --artifact-compression takes 'none' or a zstd level 1-22"
+                            );
                             std::process::exit(1);
                         }
                     },
@@ -2137,7 +2208,9 @@ fn run_main() -> i32 {
                     if let Ok(level) = args[i].parse::<i32>() {
                         cache_compression_level = Some(level);
                     } else {
-                        eprintln!("Error: --cache-compression-level requires a number between 1 and 22");
+                        eprintln!(
+                            "Error: --cache-compression-level requires a number between 1 and 22"
+                        );
                         std::process::exit(1);
                     }
                 } else {
@@ -2149,7 +2222,9 @@ fn run_main() -> i32 {
                 if let Ok(level) = arg["--cache-compression-level=".len()..].parse::<i32>() {
                     cache_compression_level = Some(level);
                 } else {
-                    eprintln!("Error: --cache-compression-level requires a number between 1 and 22");
+                    eprintln!(
+                        "Error: --cache-compression-level requires a number between 1 and 22"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -2420,12 +2495,20 @@ suppressed but the explicit SDF annotation still applies."
     }
 
     if design_cache_enabled && mode == Mode::Simulate {
-        let directory = design_cache_dir.clone().unwrap_or_else(default_design_cache_dir);
+        let directory = design_cache_dir
+            .clone()
+            .unwrap_or_else(default_design_cache_dir);
         let dependency_files = design_dependency_files(&lib_files, &lib_dirs, lib_exts.as_deref());
         let semantic_salt = format!(
             "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={}",
-            sv2023_mode, strict_checks, source_delay_select, module_timescale_args,
-            lib_dirs, lib_files, lib_exts, nospecify,
+            sv2023_mode,
+            strict_checks,
+            source_delay_select,
+            module_timescale_args,
+            lib_dirs,
+            lib_files,
+            lib_exts,
+            nospecify,
         );
         // Set cache compression settings before cache is used
         if let Some(level) = cache_compression_level {
@@ -2434,7 +2517,7 @@ suppressed but the explicit SDF annotation still applies."
         if cache_stats {
             xezim_core::set_compression_stats(true);
         }
-        
+
         xezim::set_design_cache(Some(xezim::DesignCacheConfig {
             directory,
             semantic_salt,
@@ -2456,7 +2539,11 @@ suppressed but the explicit SDF annotation still applies."
                 match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
                         println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-                        println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
+                        println!(
+                            "git {} ({})",
+                            env!("XEZIM_GIT_HASH"),
+                            env!("XEZIM_GIT_DATE")
+                        );
                         println!("Loaded compiled: {}", sf);
                         println!("Max time: {} ns", max_time);
                         println!("------------------------------");
@@ -2505,15 +2592,15 @@ suppressed but the explicit SDF annotation still applies."
                         );
                         println!("------------------------------");
                         println!("Simulation finished at time {}", sim.time);
-            {
-                let (hits, last_t) = sim.settle_limit_report();
-                if hits > 0 {
-                    eprintln!(
-                        "[WARN] settle limit was exhausted {} time(s) during this run (last at time {}) — results in those slots may not have converged; raise --settle-limit.",
-                        hits, last_t
-                    );
-                }
-            }
+                        {
+                            let (hits, last_t) = sim.settle_limit_report();
+                            if hits > 0 {
+                                eprintln!(
+                                    "[WARN] settle limit was exhausted {} time(s) during this run (last at time {}) — results in those slots may not have converged; raise --settle-limit.",
+                                    hits, last_t
+                                );
+                            }
+                        }
                         if sim.finished {
                             println!("($finish called)");
                         }
@@ -2685,7 +2772,11 @@ suppressed but the explicit SDF annotation still applies."
     // situation those modes are used in: debugging with a specific build.
     if mode != Mode::Preprocess {
         println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-        println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
+        println!(
+            "git {} ({})",
+            env!("XEZIM_GIT_HASH"),
+            env!("XEZIM_GIT_DATE")
+        );
     }
 
     if mode == Mode::Preprocess {
@@ -2722,10 +2813,18 @@ suppressed but the explicit SDF annotation still applies."
         let mut total_desc = 0;
         let mut total_err = 0;
         let mut total_warn = 0;
-        for (fi, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+        for (fi, (label, source)) in file_labels
+            .iter()
+            .zip(preprocessed_sources.iter())
+            .enumerate()
+        {
             xezim::progress_status(&format!(
                 "[{}] parsing {}/{}: {}",
-                if mode == Mode::Parse { "parse" } else { "compile" },
+                if mode == Mode::Parse {
+                    "parse"
+                } else {
+                    "compile"
+                },
                 fi + 1,
                 file_labels.len(),
                 label.rsplit('/').next().unwrap_or(label)
@@ -2774,10 +2873,18 @@ suppressed but the explicit SDF annotation still applies."
         let mut total_err = 0;
         let mut total_warn = 0;
 
-        for (fi, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+        for (fi, (label, source)) in file_labels
+            .iter()
+            .zip(preprocessed_sources.iter())
+            .enumerate()
+        {
             xezim::progress_status(&format!(
                 "[{}] parsing {}/{}: {}",
-                if mode == Mode::Parse { "parse" } else { "compile" },
+                if mode == Mode::Parse {
+                    "parse"
+                } else {
+                    "compile"
+                },
                 fi + 1,
                 file_labels.len(),
                 label.rsplit('/').next().unwrap_or(label)

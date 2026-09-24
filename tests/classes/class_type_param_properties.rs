@@ -120,9 +120,21 @@ fn s(sim: &xezim::compiler::Simulator, n: &str) -> String {
 fn type_param_property_clamps_to_its_bound_type() {
     let sim = simulate(CLAMP, 100).expect("simulate failed");
     assert_eq!(u(&sim, "byte_after"), 8, "T = byte gives an 8-bit property");
-    assert_eq!(u(&sim, "byte_over_bits"), 8, "an over-wide store stays 8 bits");
-    assert_eq!(u(&sim, "byte_over_val"), 0x78, "32'h12345678 into a byte keeps 0x78");
-    assert_eq!(u(&sim, "int_default_bits"), 32, "the `int` DEFAULT binds and sizes");
+    assert_eq!(
+        u(&sim, "byte_over_bits"),
+        8,
+        "an over-wide store stays 8 bits"
+    );
+    assert_eq!(
+        u(&sim, "byte_over_val"),
+        0x78,
+        "32'h12345678 into a byte keeps 0x78"
+    );
+    assert_eq!(
+        u(&sim, "int_default_bits"),
+        32,
+        "the `int` DEFAULT binds and sizes"
+    );
 }
 
 /// The parser drops a type argument's packed range, so these must keep the
@@ -133,19 +145,35 @@ fn vector_type_argument_stays_unclamped() {
     // Unclamped means the property keeps the stored value as-is, so `$bits`
     // reports the assigned literal's width (64) rather than a declared one.
     // The assertion that matters is that it is not 1.
-    assert_eq!(u(&sim, "vec_bits"), 64, "unclamped: reports the stored 64'h literal's width");
-    assert_eq!(u(&sim, "vec_val"), 0xFEDC_BA98, "the value must not be truncated to 1 bit");
+    assert_eq!(
+        u(&sim, "vec_bits"),
+        64,
+        "unclamped: reports the stored 64'h literal's width"
+    );
+    assert_eq!(
+        u(&sim, "vec_val"),
+        0xFEDC_BA98,
+        "the value must not be truncated to 1 bit"
+    );
 }
 
 #[test]
 fn struct_type_param_property_projects_fields() {
     let sim = simulate(STRUCT_PARAM, 100).expect("simulate failed");
     assert_eq!(u(&sim, "dflt_a"), 0x7F, "declared default struct type");
-    assert_eq!(u(&sim, "dflt_d"), 0x1234_5678, "declared default struct type");
+    assert_eq!(
+        u(&sim, "dflt_d"),
+        0x1234_5678,
+        "declared default struct type"
+    );
     assert_eq!(u(&sim, "expl_a"), 0x7F, "explicit $unit typedef");
     assert_eq!(u(&sim, "expl_d"), 0x1234_5678, "explicit $unit typedef");
     assert_eq!(u(&sim, "pkg_a"), 0x7F, "package-scoped type argument");
-    assert_eq!(u(&sim, "pkg_d"), 0x1234_5678, "package-scoped type argument");
+    assert_eq!(
+        u(&sim, "pkg_d"),
+        0x1234_5678,
+        "package-scoped type argument"
+    );
     assert_eq!(u(&sim, "pkg_bits"), 40, "packed struct width");
 }
 
@@ -153,6 +181,14 @@ fn struct_type_param_property_projects_fields() {
 #[test]
 fn string_type_param_property_is_not_truncated() {
     let sim = simulate(STRING_PARAM, 100).expect("simulate failed");
-    assert_eq!(s(&sim, "got_default"), "a_reasonably_long_string", "defaulted string T");
-    assert_eq!(s(&sim, "got_explicit"), "a_reasonably_long_string", "explicit string T");
+    assert_eq!(
+        s(&sim, "got_default"),
+        "a_reasonably_long_string",
+        "defaulted string T"
+    );
+    assert_eq!(
+        s(&sim, "got_explicit"),
+        "a_reasonably_long_string",
+        "explicit string T"
+    );
 }

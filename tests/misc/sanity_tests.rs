@@ -245,7 +245,9 @@ fn test_parse_function_task() {
 
 #[test]
 fn test_parse_generate() {
-    let result = parse("module top; genvar i; generate for (i=0; i<4; i++) begin : blk sub u(); end endgenerate endmodule");
+    let result = parse(
+        "module top; genvar i; generate for (i=0; i<4; i++) begin : blk sub u(); end endgenerate endmodule",
+    );
     assert!(result.errors.is_empty());
     assert_eq!(result.source.descriptions.len(), 1);
 }

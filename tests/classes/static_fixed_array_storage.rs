@@ -74,7 +74,11 @@ fn test_static_fixed_array_shared_storage() {
     // Control: the non-static member was never broken.
     assert!(has("M_1_2_3"), "non-static control array: {:?}", msgs);
     // §8.9 — one copy per class, shared across instances.
-    assert!(has("B_10_20_30"), "static array not shared across handles: {:?}", msgs);
+    assert!(
+        has("B_10_20_30"),
+        "static array not shared across handles: {:?}",
+        msgs
+    );
     // Array-query returns the SIZE, not the collapsed scalar's bit width.
     assert!(has("SIZE_S_3"), "$size of static array: {:?}", msgs);
     assert!(has("SIZE_M_3"), "$size of non-static array: {:?}", msgs);

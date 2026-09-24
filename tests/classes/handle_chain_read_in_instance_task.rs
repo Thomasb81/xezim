@@ -31,7 +31,13 @@ module host(input logic clk); import p::*; B b = new(); core_m core(.clk(clk));
 endmodule
 module tb; logic clk = 0; host u(.clk(clk)); initial #5 $finish; endmodule",
     );
-    for want in ["plain=7", "static=8", "mailbox=9", "forked=10", "sibling_name=11"] {
+    for want in [
+        "plain=7",
+        "static=8",
+        "mailbox=9",
+        "forked=10",
+        "sibling_name=11",
+    ] {
         assert!(msgs.iter().any(|m| m == want), "missing {want}: {msgs:?}");
     }
 }

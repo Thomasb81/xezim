@@ -25,7 +25,13 @@ fn bits_of_type_parameter_as_replication_count_elaborates() {
     )
     .expect("write design");
     let mut child = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb", "--no-cache", path.to_str().unwrap()])
+        .args([
+            "--simulate",
+            "-s",
+            "tb",
+            "--no-cache",
+            path.to_str().unwrap(),
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()

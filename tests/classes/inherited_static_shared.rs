@@ -126,7 +126,8 @@ endmodule
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("PASS per-spec-int") && stdout.contains("PASS per-spec-byte")
+        stdout.contains("PASS per-spec-int")
+            && stdout.contains("PASS per-spec-byte")
             && !stdout.contains("FAIL"),
         "inherited static from a parameterized ancestor was not per-spec.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );

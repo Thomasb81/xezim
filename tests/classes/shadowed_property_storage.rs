@@ -66,10 +66,18 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "p1"), 31, "super.s write reaches the base's copy");
-    assert_eq!(u(&sim, "p2"), 200, "the derived keeps its constructor value");
+    assert_eq!(
+        u(&sim, "p2"),
+        200,
+        "the derived keeps its constructor value"
+    );
     assert_eq!(u(&sim, "p3"), 100, "super.s reads the base's copy");
     assert_eq!(u(&sim, "p4"), 200, "external access sees the leaf's copy");
-    assert_eq!(u(&sim, "p5"), 55, "base method write visible to base method");
+    assert_eq!(
+        u(&sim, "p5"),
+        55,
+        "base method write visible to base method"
+    );
     assert_eq!(u(&sim, "p6"), 200, "and invisible to the derived");
     assert_eq!(u(&sim, "p7"), 200, "and invisible externally");
     assert_eq!(u(&sim, "p8"), 55, "external write invisible to the base");
@@ -106,7 +114,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "b_len"), 4, "the base's string survives the derived int");
+    assert_eq!(
+        u(&sim, "b_len"),
+        4,
+        "the base's string survives the derived int"
+    );
     assert_eq!(u(&sim, "b_s"), 0xF, "the base's width survives too");
     assert_eq!(u(&sim, "d_n"), 42);
     assert_eq!(u(&sim, "d_s"), 0xBEEF);

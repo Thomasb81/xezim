@@ -64,7 +64,10 @@ fn static_string_through_type_param() {
 endmodule
 "#;
     let out = run(src, "str");
-    assert!(out.contains("TAG_PASS"), "T::static_string must resolve\n{out}");
+    assert!(
+        out.contains("TAG_PASS"),
+        "T::static_string must resolve\n{out}"
+    );
 }
 
 /// `T::static_int` through a type parameter — same path, integral type.
@@ -87,7 +90,10 @@ fn static_int_through_type_param() {
 endmodule
 "#;
     let out = run(src, "int");
-    assert!(out.contains("TAG_PASS"), "T::static_int must resolve\n{out}");
+    assert!(
+        out.contains("TAG_PASS"),
+        "T::static_int must resolve\n{out}"
+    );
 }
 
 /// The full UVM `predictor` shape: an INHERITED static that the bound class
@@ -122,7 +128,10 @@ fn inherited_shadowed_static_through_type_param() {
 endmodule
 "#;
     let out = run(src, "inherit");
-    assert!(out.contains("TAG_PASS"), "shadowed inherited static via T must resolve\n{out}");
+    assert!(
+        out.contains("TAG_PASS"),
+        "shadowed inherited static via T must resolve\n{out}"
+    );
 }
 
 /// The genuine UVM factory idiom: `BUSTYPE::type_id::create("t")` where
@@ -168,7 +177,10 @@ fn factory_typedef_create_through_type_param() {
 endmodule
 "#;
     let out = run(src, "factory");
-    assert!(out.contains("TAG_PASS"), "BUSTYPE::type_id::create via T must resolve\n{out}");
+    assert!(
+        out.contains("TAG_PASS"),
+        "BUSTYPE::type_id::create via T must resolve\n{out}"
+    );
 }
 
 /// The INSTANCE-METHOD path: `T::static_prop` resolved through the instance's
@@ -201,5 +213,8 @@ fn static_through_type_param_in_instance_method() {
 endmodule
 "#;
     let out = run(src, "inst");
-    assert!(out.contains("TAG_PASS"), "T::static via this must resolve\n{out}");
+    assert!(
+        out.contains("TAG_PASS"),
+        "T::static via this must resolve\n{out}"
+    );
 }

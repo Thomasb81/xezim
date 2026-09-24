@@ -59,7 +59,15 @@ endmodule
 fn void_cast_pop_front_executes_in_always_block() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "h1"), 0x11, "head before any pop");
-    assert_eq!(u(&sim, "h2"), 0x22, "head after first void'(pop_front) — stale 0x11 means the pop was dropped");
+    assert_eq!(
+        u(&sim, "h2"),
+        0x22,
+        "head after first void'(pop_front) — stale 0x11 means the pop was dropped"
+    );
     assert_eq!(u(&sim, "h3"), 0x33, "head after second pop");
-    assert_eq!(u(&sim, "sz_after"), 1, "two pops must actually shrink the queue");
+    assert_eq!(
+        u(&sim, "sz_after"),
+        1,
+        "two pops must actually shrink the queue"
+    );
 }

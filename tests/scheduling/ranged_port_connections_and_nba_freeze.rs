@@ -64,7 +64,10 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert!(u(&sim, "pulses") >= 2, "lp must pulse (was never written at all)");
+    assert!(
+        u(&sim, "pulses") >= 2,
+        "lp must pulse (was never written at all)"
+    );
 }
 
 /// NBA member writes with a loop index must capture the index at schedule
@@ -150,5 +153,9 @@ endmodule
         0b1001000010000000001011,
         "p[11] through .p(arr[15:0]) is element 11"
     );
-    assert_eq!(u(&sim, "hl"), 0b1011, "member reads through the ranged port");
+    assert_eq!(
+        u(&sim, "hl"),
+        0b1011,
+        "member reads through the ranged port"
+    );
 }

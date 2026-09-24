@@ -98,7 +98,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "a_in"), 1, "read inside a method (was -1: 1 bit, signed)");
+    assert_eq!(
+        u(&sim, "a_in"),
+        1,
+        "read inside a method (was -1: 1 bit, signed)"
+    );
     assert_eq!(u(&sim, "b_in"), 2, "was 0: truncated to 1 bit");
     assert_eq!(u(&sim, "w_in"), 300, "wider value keeps its bits");
     assert_eq!(u(&sim, "chk_in"), 1, "comparisons inside the method");

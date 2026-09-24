@@ -143,9 +143,7 @@ fn extract_delay_and_rhs(b: &[u8], i: usize) -> Option<(usize, usize)> {
     } else {
         // `#5`, `#1.5ns`, `#delay_id` — one literal/identifier token.
         let mut k = j;
-        while k < b.len()
-            && (b[k].is_ascii_alphanumeric() || matches!(b[k], b'_' | b'$' | b'.'))
-        {
+        while k < b.len() && (b[k].is_ascii_alphanumeric() || matches!(b[k], b'_' | b'$' | b'.')) {
             k += 1;
         }
         if k == j {
@@ -275,8 +273,18 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
             let blocking = p1 == b'='
                 && !matches!(
                     p2,
-                    b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|'
-                        | b'^' | b'~'
+                    b'=' | b'!'
+                        | b'<'
+                        | b'>'
+                        | b'+'
+                        | b'-'
+                        | b'*'
+                        | b'/'
+                        | b'%'
+                        | b'&'
+                        | b'|'
+                        | b'^'
+                        | b'~'
                 );
             let nba = p1 == b'=' && p2 == b'<' && p3 != b'<';
             if blocking || nba {
@@ -341,8 +349,18 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
             let blocking_c = p1 == b'='
                 && !matches!(
                     p2,
-                    b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&'
-                        | b'|' | b'^' | b'~'
+                    b'=' | b'!'
+                        | b'<'
+                        | b'>'
+                        | b'+'
+                        | b'-'
+                        | b'*'
+                        | b'/'
+                        | b'%'
+                        | b'&'
+                        | b'|'
+                        | b'^'
+                        | b'~'
                 );
             let nba_c = p1 == b'=' && p2 == b'<' && p3 != b'<';
             if blocking_c || nba_c {

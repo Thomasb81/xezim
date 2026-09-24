@@ -44,8 +44,29 @@ module top;
 endmodule
 "#;
     let out: Vec<String> = simulate_multi(
-        &[src.to_string()], 1000, Some("top"), &[], &[], None, false, None, None,
-        &[], &[], None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &[src.to_string()],
+        1000,
+        Some("top"),
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
     )
     .expect("sim")
     .output
@@ -54,10 +75,12 @@ endmodule
     .collect();
     assert!(
         out.iter().any(|l| l == "VP_PASS got=[cfg]"),
-        "bound value param must reach the callee, not its default; got {:?}", out
+        "bound value param must reach the callee, not its default; got {:?}",
+        out
     );
     assert!(
         !out.iter().any(|l| l.starts_with("VP_FAIL")),
-        "default leaked through; got {:?}", out
+        "default leaked through; got {:?}",
+        out
     );
 }

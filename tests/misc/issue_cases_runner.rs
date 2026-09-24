@@ -24,7 +24,10 @@ fn issue_17_dynamic_array_of_mailboxes() {
 
 #[test]
 fn issue_17_mailbox_in_interface() {
-    let msgs = outputs(include_str!("../issue_cases/mbox_in_interface.sv"), 2_000_000);
+    let msgs = outputs(
+        include_str!("../issue_cases/mbox_in_interface.sv"),
+        2_000_000,
+    );
     let received = msgs.iter().filter(|m| m.contains("Received")).count();
     // 1000 post-reset cycles: sender0 every 3, sender1 every 5.
     assert_eq!(received, 533, "1000/3 + 1000/5 sender puts must arrive");
@@ -32,7 +35,10 @@ fn issue_17_mailbox_in_interface() {
 
 #[test]
 fn issue_22_final_blocks() {
-    let msgs = outputs(include_str!("../issue_cases/final.blocks.test.case.sv"), 100_000);
+    let msgs = outputs(
+        include_str!("../issue_cases/final.blocks.test.case.sv"),
+        100_000,
+    );
     assert!(msgs.iter().any(|m| m.contains("TEST PASSED")), "{:?}", msgs);
     let finals = msgs.iter().filter(|m| m.contains("inal block")).count();
     assert!(finals >= 4, "all four final blocks must run: {:?}", msgs);
@@ -40,13 +46,19 @@ fn issue_22_final_blocks() {
 
 #[test]
 fn issue_23_string_methods() {
-    let msgs = outputs(include_str!("../issue_cases/string.compliance.tests.sv"), 100_000);
+    let msgs = outputs(
+        include_str!("../issue_cases/string.compliance.tests.sv"),
+        100_000,
+    );
     assert!(msgs.iter().any(|m| m.contains("TEST PASSED")), "{:?}", msgs);
 }
 
 #[test]
 fn issue_24_swrite_sformat() {
-    let msgs = outputs(include_str!("../issue_cases/data.to.string.fmt.sv"), 100_000);
+    let msgs = outputs(
+        include_str!("../issue_cases/data.to.string.fmt.sv"),
+        100_000,
+    );
     assert!(msgs.iter().any(|m| m.contains("TEST PASSED")), "{:?}", msgs);
 }
 
@@ -63,7 +75,8 @@ fn issue_25_format_specifiers() {
 fn orphan_fork_wait_deadlock() {
     let msgs = outputs(include_str!("../fork_wait_deadlock.sv"), 100_000);
     assert!(
-        msgs.iter().any(|m| m.contains("PASS: fork-local variable sharing works")),
+        msgs.iter()
+            .any(|m| m.contains("PASS: fork-local variable sharing works")),
         "{:?}",
         msgs
     );
@@ -79,15 +92,12 @@ fn fork_child_blocking_live_share() {
     // parent. This regression compiles that exact child-blocks-forever idiom.
     let msgs = outputs(include_str!("../fork_child_blocking_share.sv"), 100_000);
     assert!(
-        msgs.iter().any(|m| m.contains("PASS: fork-child live-shared write wakes a parked wait")),
+        msgs.iter()
+            .any(|m| m.contains("PASS: fork-child live-shared write wakes a parked wait")),
         "{:?}",
         msgs
     );
-    assert!(
-        !msgs.iter().any(|m| m.starts_with("FAIL")),
-        "{:?}",
-        msgs
-    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:?}", msgs);
 }
 
 #[test]
@@ -95,38 +105,53 @@ fn orphan_force_release_compliance_ratchet() {
     let msgs = outputs(include_str!("../dpi/force_release_compliance.sv"), 100_000);
     let fails = msgs.iter().filter(|m| m.starts_with("FAIL")).count();
     assert_eq!(
-        fails, 0,
+        fails,
+        0,
         "force/release known-gap count changed — new regression or a fixed \
          gap (lower the count): {:?}",
-        msgs.iter().filter(|m| m.starts_with("FAIL")).collect::<Vec<_>>()
+        msgs.iter()
+            .filter(|m| m.starts_with("FAIL"))
+            .collect::<Vec<_>>()
     );
 }
 
 #[test]
 fn issue_21_timescale_handling() {
     // §3.14.3 precision quantization + per-module directive scales.
-    let msgs = outputs(include_str!("../issue_cases/timescale.handling.sv"), 1_000_000);
+    let msgs = outputs(
+        include_str!("../issue_cases/timescale.handling.sv"),
+        1_000_000,
+    );
     assert!(msgs.iter().any(|m| m.contains("TEST PASSED")), "{:?}", msgs);
 }
 
 #[test]
 fn issue_18_type_parameters() {
     // §6.20.3 type params: structs, arrays, class handles.
-    let msgs = outputs(include_str!("../issue_cases/type-parameter-compliance.sv"), 100_000);
+    let msgs = outputs(
+        include_str!("../issue_cases/type-parameter-compliance.sv"),
+        100_000,
+    );
     assert!(msgs.iter().any(|m| m.contains("TEST PASSED")), "{:?}", msgs);
 }
 
 #[test]
 fn issue_28_constraint_foreach() {
     // §18.5.7 foreach constraint bodies beyond `inside`.
-    let msgs = outputs(include_str!("../issue_cases/constraint.foreach.sv"), 100_000);
+    let msgs = outputs(
+        include_str!("../issue_cases/constraint.foreach.sv"),
+        100_000,
+    );
     assert!(msgs.iter().any(|m| m.contains("TEST_PASS")), "{:?}", msgs);
 }
 
 #[test]
 fn issue_29_constraint_typecast() {
     // §18.3/§6.24.1/§11.6.1 casts inside constraint expressions.
-    let msgs = outputs(include_str!("../issue_cases/constraint.typecast.sv"), 100_000);
+    let msgs = outputs(
+        include_str!("../issue_cases/constraint.typecast.sv"),
+        100_000,
+    );
     assert!(msgs.iter().any(|m| m.contains("TEST_PASS")), "{:?}", msgs);
 }
 
@@ -138,9 +163,29 @@ fn issue_26_static_init_sysfuncs() {
     let src = include_str!("../issue_cases/static.init.sysfuncs.sv").to_string();
     let plusargs = vec!["TEST_MODE".to_string(), "SEED_VAL=42".to_string()];
     let sim = xezim::simulate_multi(
-        &[src], 100_000, None, &[], &[], None, false, None, None, &[],
-        &plusargs, None, &[], 0, u64::MAX, None, &[], None, None, None,
-        None, false, None,
+        &[src],
+        100_000,
+        None,
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &plusargs,
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
     )
     .expect("simulate failed");
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();

@@ -8,7 +8,11 @@ use std::process::Command;
 fn reg4712_visitor_traversal() {
     let test_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let test_file = test_dir.join("reg4712_visitor_traversal.sv");
-    assert!(test_file.exists(), "Test file not found: {}", test_file.display());
+    assert!(
+        test_file.exists(),
+        "Test file not found: {}",
+        test_file.display()
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg(test_file.to_str().unwrap())
@@ -19,10 +23,16 @@ fn reg4712_visitor_traversal() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}\n{stderr}");
 
-    assert!(!combined.contains("Parse errors"),
-        "Parse error in reg4712_visitor_traversal.sv:\n{combined}");
-    assert!(!combined.contains("Simulation error"),
-        "Simulation error in reg4712_visitor_traversal.sv:\n{combined}");
-    assert!(combined.contains("TAG_PASS"),
-        "Test did not pass.\nOutput:\n{combined}");
+    assert!(
+        !combined.contains("Parse errors"),
+        "Parse error in reg4712_visitor_traversal.sv:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Simulation error"),
+        "Simulation error in reg4712_visitor_traversal.sv:\n{combined}"
+    );
+    assert!(
+        combined.contains("TAG_PASS"),
+        "Test did not pass.\nOutput:\n{combined}"
+    );
 }

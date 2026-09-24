@@ -66,9 +66,21 @@ endmodule
 "
     );
     let sim = simulate(&src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "e0"), 0xA0, "an element connection carries the child's drive");
-    assert_eq!(u(&sim, "rd"), 0xA0, "and is readable through a second element port");
-    assert_eq!(u(&sim, "s"), 0xA2, "a whole-instance connection still works");
+    assert_eq!(
+        u(&sim, "e0"),
+        0xA0,
+        "an element connection carries the child's drive"
+    );
+    assert_eq!(
+        u(&sim, "rd"),
+        0xA0,
+        "and is readable through a second element port"
+    );
+    assert_eq!(
+        u(&sim, "s"),
+        0xA2,
+        "a whole-instance connection still works"
+    );
     assert_eq!(u(&sim, "untouched"), 1, "an unconnected element stays x");
 }
 
@@ -126,5 +138,8 @@ endmodule
 "
     );
     let sim = simulate(&src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "v0"), u(&sim, "v1"), u(&sim, "v2")), (0xB0, 0xB1, 0xB2));
+    assert_eq!(
+        (u(&sim, "v0"), u(&sim, "v1"), u(&sim, "v2")),
+        (0xB0, 0xB1, 0xB2)
+    );
 }

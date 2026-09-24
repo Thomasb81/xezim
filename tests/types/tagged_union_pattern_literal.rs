@@ -49,5 +49,9 @@ fn tagged_union_pattern_literal_selects_member() {
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "byte_val"), 0x5a, "tagged pattern b member value");
     assert_eq!(u(&sim, "half_val"), 0x1234, "tagged pattern h member value");
-    assert_eq!(u(&sim, "again_h"), 0xABCD, "re-tagged pattern selects new member");
+    assert_eq!(
+        u(&sim, "again_h"),
+        0xABCD,
+        "re-tagged pattern selects new member"
+    );
 }

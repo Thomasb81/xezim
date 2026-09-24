@@ -35,9 +35,17 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "b_both"), 0b0101, "blocking, both ends out of range");
+    assert_eq!(
+        u(&sim, "b_both"),
+        0b0101,
+        "blocking, both ends out of range"
+    );
     assert_eq!(u(&sim, "b_low"), 0b0001, "blocking, low end out");
-    assert_eq!(u(&sim, "n_both"), 0b0101, "NBA, both ends out of range: no fifth bit");
+    assert_eq!(
+        u(&sim, "n_both"),
+        0b0101,
+        "NBA, both ends out of range: no fifth bit"
+    );
     assert_eq!(u(&sim, "z"), 0b0101);
 }
 

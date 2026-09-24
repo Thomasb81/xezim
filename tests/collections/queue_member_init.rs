@@ -40,7 +40,11 @@ endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
     let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
-    assert!(outs.iter().any(|s| s.contains("size 3")), "outs: {:?}", outs);
+    assert!(
+        outs.iter().any(|s| s.contains("size 3")),
+        "outs: {:?}",
+        outs
+    );
 }
 
 /// Assigning FROM a class member queue to a local must copy all elements.
@@ -62,7 +66,11 @@ endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
     let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
-    assert!(outs.iter().any(|s| s.contains("b.size 3")), "outs: {:?}", outs);
+    assert!(
+        outs.iter().any(|s| s.contains("b.size 3")),
+        "outs: {:?}",
+        outs
+    );
 }
 
 /// Returning a queue member from a class method must propagate the elements.
@@ -88,7 +96,11 @@ endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
     let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
-    assert!(outs.iter().any(|s| s.contains("size 3")), "outs: {:?}", outs);
+    assert!(
+        outs.iter().any(|s| s.contains("size 3")),
+        "outs: {:?}",
+        outs
+    );
 }
 
 /// A typedef'd queue return type (UVM `queue_of_element` pattern) must work
@@ -130,7 +142,11 @@ endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
     let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
-    assert!(outs.iter().any(|s| s.contains("rq.size 2")), "outs: {:?}", outs);
+    assert!(
+        outs.iter().any(|s| s.contains("rq.size 2")),
+        "outs: {:?}",
+        outs
+    );
 }
 
 /// Queue initialized via push_back in the constructor must also be readable
@@ -161,7 +177,11 @@ endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
     let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
-    assert!(outs.iter().any(|s| s.contains("first 10 second 20")), "outs: {:?}", outs);
+    assert!(
+        outs.iter().any(|s| s.contains("first 10 second 20")),
+        "outs: {:?}",
+        outs
+    );
 }
 
 /// Calling `.size()` / `.len()` as a chained method call on a class handle
@@ -198,7 +218,11 @@ endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
     let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
-    assert!(outs.iter().any(|s| s.contains("chained 3")), "outs: {:?}", outs);
+    assert!(
+        outs.iter().any(|s| s.contains("chained 3")),
+        "outs: {:?}",
+        outs
+    );
 }
 
 /// Same chained-call pattern but with `.len()` instead of `.size()`, and a
@@ -241,6 +265,14 @@ endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
     let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
-    assert!(outs.iter().any(|s| s.contains("captured 2")), "outs: {:?}", outs);
-    assert!(outs.iter().any(|s| s.contains("chained 2")), "outs: {:?}", outs);
+    assert!(
+        outs.iter().any(|s| s.contains("captured 2")),
+        "outs: {:?}",
+        outs
+    );
+    assert!(
+        outs.iter().any(|s| s.contains("chained 2")),
+        "outs: {:?}",
+        outs
+    );
 }

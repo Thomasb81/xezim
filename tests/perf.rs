@@ -15,12 +15,12 @@ mod report_stats;
 #[path = "perf/packed_matrix_workload.rs"]
 mod packed_matrix_workload;
 
-#[path = "perf/packed_record_edge_loop.rs"]
-mod packed_record_edge_loop;
 #[path = "perf/design_shape_regression.rs"]
 mod design_shape_regression;
 #[path = "perf/loop_block_counters.rs"]
 mod loop_block_counters;
+#[path = "perf/packed_record_edge_loop.rs"]
+mod packed_record_edge_loop;
 #[path = "perf/wide_block_counters.rs"]
 mod wide_block_counters;
 #[path = "perf/x_plane_executor.rs"]

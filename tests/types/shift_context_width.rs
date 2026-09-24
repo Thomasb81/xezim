@@ -44,7 +44,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "i32") as u32, 0x7FFF_FFFE, "32-bit context sign-extends first");
+    assert_eq!(
+        u(&sim, "i32") as u32,
+        0x7FFF_FFFE,
+        "32-bit context sign-extends first"
+    );
     assert_eq!(u(&sim, "r8") & 0xFF, 0x7E, "8-bit context");
     assert_eq!(u(&sim, "r4") & 0xF, 0x6, "4-bit context needs no extension");
 }
@@ -68,7 +72,15 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "a"), 6, "unsigned left operand zero-extends");
-    assert_eq!(u(&sim, "b") as u32 as i32, -2, "arithmetic shift keeps the sign");
+    assert_eq!(
+        u(&sim, "b") as u32 as i32,
+        -2,
+        "arithmetic shift keeps the sign"
+    );
     assert_eq!(u(&sim, "c") as u32 as i32, -8, "left shift unchanged");
-    assert_eq!(u(&sim, "d") as u32, 0x7FFF_FFFE, "a signed literal behaves the same");
+    assert_eq!(
+        u(&sim, "d") as u32,
+        0x7FFF_FFFE,
+        "a signed literal behaves the same"
+    );
 }

@@ -32,7 +32,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "dr"), 1, "B::new binds B::f, not the derived override");
+    assert_eq!(
+        u(&sim, "dr"),
+        1,
+        "B::new binds B::f, not the derived override"
+    );
 }
 
 #[test]

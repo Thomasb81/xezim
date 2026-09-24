@@ -122,19 +122,51 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 #[test]
 fn this_prefixed_virtual_interface_binding_works() {
     let sim = simulate(THIS_BINDING, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "bare_addr"), 0xA5, "bare `vif = bus` binding (control)");
-    assert_eq!(u(&sim, "bare_data"), 0x5A, "bare-bound: this.vif write lands");
-    assert_eq!(u(&sim, "this_addr"), 0xA5, "`this.vif = bus` must bind identically");
-    assert_eq!(u(&sim, "this_data"), 0x5A, "this-bound: this.vif write lands");
+    assert_eq!(
+        u(&sim, "bare_addr"),
+        0xA5,
+        "bare `vif = bus` binding (control)"
+    );
+    assert_eq!(
+        u(&sim, "bare_data"),
+        0x5A,
+        "bare-bound: this.vif write lands"
+    );
+    assert_eq!(
+        u(&sim, "this_addr"),
+        0xA5,
+        "`this.vif = bus` must bind identically"
+    );
+    assert_eq!(
+        u(&sim, "this_data"),
+        0x5A,
+        "this-bound: this.vif write lands"
+    );
 }
 
 #[test]
 fn parameterized_virtual_interface_formal_drives_correctly() {
     let sim = simulate(PARAM_VIF_FORMAL, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "a_dw"), 32, "specialization reaches the polymorphic call");
+    assert_eq!(
+        u(&sim, "a_dw"),
+        32,
+        "specialization reaches the polymorphic call"
+    );
     assert_eq!(u(&sim, "b_dw"), 8, "second specialization is distinct");
-    assert_eq!(u(&sim, "a_addr"), 0x5, "64-bit arg truncated to the 4-bit addr");
-    assert_eq!(u(&sim, "a_data"), 0xCCCC_DDDD, "truncated to the 32-bit data");
-    assert_eq!(u(&sim, "b_addr"), 0x1234, "16-bit addr on the other variant");
+    assert_eq!(
+        u(&sim, "a_addr"),
+        0x5,
+        "64-bit arg truncated to the 4-bit addr"
+    );
+    assert_eq!(
+        u(&sim, "a_data"),
+        0xCCCC_DDDD,
+        "truncated to the 32-bit data"
+    );
+    assert_eq!(
+        u(&sim, "b_addr"),
+        0x1234,
+        "16-bit addr on the other variant"
+    );
     assert_eq!(u(&sim, "b_data"), 0x55, "truncated to the 8-bit data");
 }

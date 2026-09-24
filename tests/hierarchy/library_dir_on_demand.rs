@@ -30,8 +30,12 @@ fn library_dir_loads_only_named_module() {
     .unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
         .args([
-            "--simulate", "--no-cache", "-s", "top",
-            "-y", dir.join("lib").to_str().unwrap(),
+            "--simulate",
+            "--no-cache",
+            "-s",
+            "top",
+            "-y",
+            dir.join("lib").to_str().unwrap(),
             "+libext+.v",
             dir.join("top.sv").to_str().unwrap(),
         ])

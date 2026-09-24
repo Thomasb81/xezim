@@ -54,8 +54,24 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 #[test]
 fn cross_spec_cast_fails() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "same1"), 1, "same-spec cast (base#1 on base#1) must succeed");
-    assert_eq!(u(&sim, "cross1"), 0, "cross-spec cast (base#1 on base#2) must fail");
-    assert_eq!(u(&sim, "same2"), 1, "same-spec cast (base#2 on base#2) must succeed");
-    assert_eq!(u(&sim, "cross2"), 0, "cross-spec cast (base#2 on base#1) must fail");
+    assert_eq!(
+        u(&sim, "same1"),
+        1,
+        "same-spec cast (base#1 on base#1) must succeed"
+    );
+    assert_eq!(
+        u(&sim, "cross1"),
+        0,
+        "cross-spec cast (base#1 on base#2) must fail"
+    );
+    assert_eq!(
+        u(&sim, "same2"),
+        1,
+        "same-spec cast (base#2 on base#2) must succeed"
+    );
+    assert_eq!(
+        u(&sim, "cross2"),
+        0,
+        "cross-spec cast (base#2 on base#1) must fail"
+    );
 }

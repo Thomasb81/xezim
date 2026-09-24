@@ -68,7 +68,13 @@ fn run() -> String {
         let sv = dir.join("t.sv");
         std::fs::write(&sv, DESIGN).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-            .args(["--simulate", "-s", "top", "--no-cache", sv.to_str().unwrap()])
+            .args([
+                "--simulate",
+                "-s",
+                "top",
+                "--no-cache",
+                sv.to_str().unwrap(),
+            ])
             .output()
             .unwrap();
         let mut text = String::from_utf8_lossy(&output.stdout).to_string();
@@ -83,7 +89,10 @@ fn run() -> String {
 fn type_param_struct_prop_not_poisoned_by_sibling_binding() {
     let text = run();
     // The int-bound write must not corrupt the struct-bound property's fields.
-    assert!(text.contains("BAD 0"), "cross-binding contamination:\n{text}");
+    assert!(
+        text.contains("BAD 0"),
+        "cross-binding contamination:\n{text}"
+    );
 }
 
 #[test]

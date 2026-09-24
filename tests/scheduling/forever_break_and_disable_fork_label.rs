@@ -50,9 +50,17 @@ endmodule
 "#;
     let sim = simulate(src, 20_000).expect("simulate failed");
     assert_eq!(u(&sim, "bare"), 5, "top-level forever");
-    assert_eq!(u(&sim, "nested"), 5, "forever nested in a block (synchronous)");
+    assert_eq!(
+        u(&sim, "nested"),
+        5,
+        "forever nested in a block (synchronous)"
+    );
     assert_eq!(u(&sim, "susp"), 5, "forever nested in a block (suspending)");
-    assert_eq!(u(&sim, "tail"), 1, "statements after the enclosing block still run");
+    assert_eq!(
+        u(&sim, "tail"),
+        1,
+        "statements after the enclosing block still run"
+    );
 }
 
 /// §9.6.2: disabling a fork child by its own block label terminates it, so a
@@ -80,5 +88,9 @@ endmodule
 "#;
     let sim = simulate(src, 40_000).expect("simulate failed");
     assert_eq!(u(&sim, "kept"), 0, "disabled child must stop advancing");
-    assert_eq!(u(&sim, "done"), 1, "wait fork must not block on a disabled child");
+    assert_eq!(
+        u(&sim, "done"),
+        1,
+        "wait fork must not block on a disabled child"
+    );
 }

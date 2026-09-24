@@ -130,10 +130,7 @@ endmodule
     let formats = [
         (vec!["--wave"], dir.join("lane_trace.vcd")),
         (vec!["--fst", "lane_trace.fst"], dir.join("lane_trace.fst")),
-        (
-            vec!["--xtrace", "lane_trace.xt"],
-            dir.join("lane_trace.xt"),
-        ),
+        (vec!["--xtrace", "lane_trace.xt"], dir.join("lane_trace.xt")),
     ];
     for (args, artifact) in formats {
         let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
@@ -152,6 +149,10 @@ endmodule
         let size = std::fs::metadata(&artifact)
             .unwrap_or_else(|_| panic!("missing trace artifact: {}", artifact.display()))
             .len();
-        assert!(size > 64, "trace artifact is too small: {}", artifact.display());
+        assert!(
+            size > 64,
+            "trace artifact is too small: {}",
+            artifact.display()
+        );
     }
 }

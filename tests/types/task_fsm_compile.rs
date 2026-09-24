@@ -83,10 +83,7 @@ endmodule
 /// Reference-verified end state of the load -> shift -> mix pipeline.
 #[test]
 fn task_structured_fsm_compiles_and_matches_reference() {
-    assert_eq!(
-        notes(FSM),
-        vec!["NOTE: s0=38 s1=108 s2=73 s5=248 s9=176"]
-    );
+    assert_eq!(notes(FSM), vec!["NOTE: s0=38 s1=108 s2=73 s5=248 s9=176"]);
 }
 
 const RAM_LANES: &str = r#"

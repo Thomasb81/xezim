@@ -37,7 +37,11 @@ fn star_is_not_always_comb() {
     let sim = simulate(SRC, 20).expect("simulate failed");
     // g changed after x's last change: @(*) must NOT re-fire on g.
     assert_eq!(u(&sim, "y_star"), 3, "@(*) not sensitive to fn contents");
-    assert_eq!(u(&sim, "y_comb"), 12, "always_comb sensitive to fn contents");
+    assert_eq!(
+        u(&sim, "y_comb"),
+        12,
+        "always_comb sensitive to fn contents"
+    );
     // At t=1 (no input change yet): always_comb ran at t0, @(*) did not.
     assert_eq!(u(&sim, "t0_comb"), 6, "always_comb runs at time 0");
     assert_eq!(u(&sim, "t0_star"), 0, "@(*) does not run at time 0");

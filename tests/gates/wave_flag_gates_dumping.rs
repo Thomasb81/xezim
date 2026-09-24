@@ -70,10 +70,7 @@ fn run(tag: &str, extra: &[&str]) -> (String, bool) {
 #[test]
 fn without_wave_the_dump_tasks_are_ignored_but_the_run_still_completes() {
     let (text, wrote) = run("off", &[]);
-    assert!(
-        !wrote,
-        "a VCD was written without --wave:\n{text}"
-    );
+    assert!(!wrote, "a VCD was written without --wave:\n{text}");
     assert!(
         text.contains("CNT=9"),
         "ignoring the dump must not stop the simulation:\n{text}"
@@ -93,7 +90,10 @@ fn with_wave_the_vcd_is_written() {
         !text.contains("ignored"),
         "--wave must not warn about ignored dump tasks:\n{text}"
     );
-    assert!(text.contains("CNT=9"), "simulation did not complete:\n{text}");
+    assert!(
+        text.contains("CNT=9"),
+        "simulation did not complete:\n{text}"
+    );
 }
 
 #[test]

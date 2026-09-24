@@ -77,7 +77,9 @@ endmodule
 fn test_nonzero_lsb_indexed_part_select() {
     let sim = simulate(SRC, 10_000).expect("simulation failed");
     assert!(
-        sim.output.iter().any(|line| line.message.contains("TAG_PASS")),
+        sim.output
+            .iter()
+            .any(|line| line.message.contains("TAG_PASS")),
         "expected TAG_PASS in output, got: {:?}",
         sim.output
     );

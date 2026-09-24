@@ -27,7 +27,9 @@ fn run(name: &str, src: &str) -> String {
 /// zero, ascending from one.
 #[test]
 fn every_select_form_against_every_declared_direction() {
-    let text = run("matrix", r#"
+    let text = run(
+        "matrix",
+        r#"
 // Differential matrix: every select form against every declared direction.
 module t;
   logic clk = 0; always #5 clk = ~clk;
@@ -162,11 +164,32 @@ module t;
     $finish;
   end
 endmodule
-"#);
-    assert!(text.contains("d0 b=1 bd=1 pb=1 ub=0 c=011 pc=101 uc=011 iu=010 id=010 pu=110 pd=110 uu=110"), "wrong values:\n{text}");
-    assert!(text.contains("dn b=1 bd=0 pb=1 ub=1 c=011 pc=101 uc=011 iu=010 id=010 pu=101 pd=101 uu=101"), "wrong values:\n{text}");
-    assert!(text.contains("a0 b=1 bd=1 pb=0 ub=1 c=110 pc=011 uc=111 iu=010 id=010 pu=110 pd=110 uu=101"), "wrong values:\n{text}");
-    assert!(text.contains("an b=1 bd=0 pb=0 ub=0 c=110 pc=011 uc=111 iu=010 id=010 pu=011 pd=011 uu=010"), "wrong values:\n{text}");
+"#,
+    );
+    assert!(
+        text.contains(
+            "d0 b=1 bd=1 pb=1 ub=0 c=011 pc=101 uc=011 iu=010 id=010 pu=110 pd=110 uu=110"
+        ),
+        "wrong values:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "dn b=1 bd=0 pb=1 ub=1 c=011 pc=101 uc=011 iu=010 id=010 pu=101 pd=101 uu=101"
+        ),
+        "wrong values:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "a0 b=1 bd=1 pb=0 ub=1 c=110 pc=011 uc=111 iu=010 id=010 pu=110 pd=110 uu=101"
+        ),
+        "wrong values:\n{text}"
+    );
+    assert!(
+        text.contains(
+            "an b=1 bd=0 pb=0 ub=0 c=110 pc=011 uc=111 iu=010 id=010 pu=011 pd=011 uu=010"
+        ),
+        "wrong values:\n{text}"
+    );
 }
 
 /// The same shapes inside a clocked block, where a bail would take the whole
@@ -224,5 +247,10 @@ endmodule
         .filter(|l| l.starts_with("[FALLBACK]"))
         .filter(|l| !l.contains("Expr_display") && !l.contains("Expr_finish"))
         .collect();
-    assert_eq!(sites.len(), 1, "unexpected fallbacks:\n{}", sites.join("\n"));
+    assert_eq!(
+        sites.len(),
+        1,
+        "unexpected fallbacks:\n{}",
+        sites.join("\n")
+    );
 }

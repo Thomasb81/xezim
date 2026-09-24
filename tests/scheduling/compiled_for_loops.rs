@@ -115,7 +115,11 @@ endmodule
     let sim = simulate(src, 100).expect("simulate failed");
     let n = u(&sim, "cyc") as i64;
     let acc = u(&sim, "acc") as u32 as i32 as i64;
-    assert_eq!(acc, -2 * n, "descending loop crosses zero with signed compare");
+    assert_eq!(
+        acc,
+        -2 * n,
+        "descending loop crosses zero with signed compare"
+    );
 }
 
 #[test]

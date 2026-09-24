@@ -49,8 +49,12 @@ module tb;
 endmodule
 "#;
     let sim = xezim::simulate(src, 10).expect("wide word operation simulation");
-    let read = |name: &str| sim.get_signal(name)
-        .or_else(|| sim.get_signal(&format!("tb.{name}"))).unwrap().to_u64();
+    let read = |name: &str| {
+        sim.get_signal(name)
+            .or_else(|| sim.get_signal(&format!("tb.{name}")))
+            .unwrap()
+            .to_u64()
+    };
     assert_eq!(read("completed"), Some(1));
     assert_eq!(read("failures"), Some(0));
 }

@@ -42,7 +42,7 @@ fn force_expression_tracks_operands() {
     assert_eq!(u(&sim, "n_post"), 0x21, "forced net tracks src change");
     assert_eq!(u(&sim, "v_post"), 0x22, "forced variable tracks src change");
     assert_eq!(u(&sim, "v_rel"), 0x22, "released variable holds last value");
-  }
+}
 
 const DEPENDENCY_FILTER_SRC: &str = r#"
 module dependency_filter_case;

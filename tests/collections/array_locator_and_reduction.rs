@@ -73,7 +73,10 @@ endmodule
         inline.trim_start_matches("INLINE "),
         "inline and assigned forms must agree"
     );
-    assert!(inline.contains('{'), "inline locator prints a queue: {inline}");
+    assert!(
+        inline.contains('{'),
+        "inline locator prints a queue: {inline}"
+    );
     assert_eq!(get("FIND "), "FIND '{5, 9}", "find with a filter");
     assert_eq!(get("MIN "), "MIN '{3}", "min returns a one-element queue");
     assert_eq!(get("MAX "), "MAX '{9}", "max likewise");
@@ -130,7 +133,11 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "one_bit"), 1, "a 1-bit predicate wraps at 1 bit");
-    assert_eq!(u(&sim, "widened"), 3, "an explicitly 32-bit expression does not");
+    assert_eq!(
+        u(&sim, "widened"),
+        3,
+        "an explicitly 32-bit expression does not"
+    );
     assert_eq!(u(&sim, "casted"), 3, "nor does an int' cast");
     assert_eq!(u(&sim, "plain"), 30, "no with clause: the element type");
 }

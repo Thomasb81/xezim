@@ -48,10 +48,22 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "ry"), 5, "CA with default arg stale after operand init");
+    assert_eq!(
+        u(&sim, "ry"),
+        5,
+        "CA with default arg stale after operand init"
+    );
     assert_eq!(u(&sim, "direct"), 6);
-    assert_eq!(u(&sim, "explicit"), 7, "explicit arg must override the default");
-    assert_eq!(u(&sim, "rx"), 17, "CA must re-fire when a default-arg operand changes");
+    assert_eq!(
+        u(&sim, "explicit"),
+        7,
+        "explicit arg must override the default"
+    );
+    assert_eq!(
+        u(&sim, "rx"),
+        17,
+        "CA must re-fire when a default-arg operand changes"
+    );
 }
 
 /// A side-effecting queue method inside a COMPOUND rvalue must run exactly
@@ -84,7 +96,11 @@ endmodule
     assert_eq!(u(&sim, "sz1"), 3);
     assert_eq!(u(&sim, "si"), 80);
     assert_eq!(u(&sim, "sz2"), 2);
-    assert_eq!(u(&sim, "s37"), 70, "wide LHS width-probe must not evaluate the pop");
+    assert_eq!(
+        u(&sim, "s37"),
+        70,
+        "wide LHS width-probe must not evaluate the pop"
+    );
     assert_eq!(u(&sim, "sz3"), 1);
 }
 

@@ -15,9 +15,16 @@ fn out(src: &str) -> Vec<String> {
 }
 
 fn field(lines: &[String], key: &str) -> i64 {
-    let line = lines.iter().find(|l| l.contains(key)).unwrap_or_else(|| panic!("missing {key}: {lines:?}"));
+    let line = lines
+        .iter()
+        .find(|l| l.contains(key))
+        .unwrap_or_else(|| panic!("missing {key}: {lines:?}"));
     let rest = &line[line.find(key).unwrap() + key.len()..];
-    rest.split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+    rest.split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 #[test]
@@ -53,10 +60,20 @@ endmodule
     // `dist` 1:9 over 800 draws: mean 80, sd ~8.5.
     let en1 = field(&o, "EN1=");
     assert!((40..=130).contains(&en1), "dist weighting off: {o:?}");
-    assert_eq!(field(&o, "SOFT7="), 800, "an unopposed soft constraint must hold: {o:?}");
+    assert_eq!(
+        field(&o, "SOFT7="),
+        800,
+        "an unopposed soft constraint must hold: {o:?}"
+    );
     assert_eq!(field(&o, "BAD="), 0, "implication violated: {o:?}");
-    assert!(!o.iter().any(|l| l.contains("RANDC_UNEVEN")), "randc must cycle through all 8 values every 8 draws: {o:?}");
-    assert!(o.iter().any(|l| l.contains("INLINE R=1 Y=3 XGT5=1")), "{o:?}");
+    assert!(
+        !o.iter().any(|l| l.contains("RANDC_UNEVEN")),
+        "randc must cycle through all 8 values every 8 draws: {o:?}"
+    );
+    assert!(
+        o.iter().any(|l| l.contains("INLINE R=1 Y=3 XGT5=1")),
+        "{o:?}"
+    );
     assert!(o.iter().any(|l| l.contains("INFEASIBLE R=0")), "{o:?}");
 }
 

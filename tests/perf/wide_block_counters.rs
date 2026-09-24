@@ -14,12 +14,19 @@
 use std::process::Command;
 
 fn run(name: &str, src: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("xezim_wide_block_counters_{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("xezim_wide_block_counters_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temporary directory");
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).expect("write temporary design");
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb", "--no-cache", path.to_str().unwrap()])
+        .args([
+            "--simulate",
+            "-s",
+            "tb",
+            "--no-cache",
+            path.to_str().unwrap(),
+        ])
         .env("XEZIM_PROFILE_REPORT", "1")
         .output()
         .expect("run xezim");
@@ -69,8 +76,14 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("RMW 5913d9f059105c58 5206d886ee9465a1 40"), "answer:\n{text}");
-    assert!(stat(&text, "two_state_evals=") >= 40, "the wide RMW block left two-state:\n{text}");
+    assert!(
+        text.contains("RMW 5913d9f059105c58 5206d886ee9465a1 40"),
+        "answer:\n{text}"
+    );
+    assert!(
+        stat(&text, "two_state_evals=") >= 40,
+        "the wide RMW block left two-state:\n{text}"
+    );
 }
 
 /// A 214-bit mux (`WSel`) in a combinational entry.
@@ -93,8 +106,14 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("MUX 000000000000efd8 0000000000000000 40"), "answer:\n{text}");
-    assert!(stat(&text, "two_state_evals=") >= 40, "the wide mux entry left two-state:\n{text}");
+    assert!(
+        text.contains("MUX 000000000000efd8 0000000000000000 40"),
+        "answer:\n{text}"
+    );
+    assert!(
+        stat(&text, "two_state_evals=") >= 40,
+        "the wide mux entry left two-state:\n{text}"
+    );
 }
 
 /// A wide `'x` reset default (`{271{1'bx}}`) stored from a combinational
@@ -119,7 +138,10 @@ endmodule
 "#,
     );
     assert!(text.contains("XF x xxxx 40"), "answer:\n{text}");
-    assert!(stat(&text, "two_state_evals=") >= 40, "the x-fill entry left two-state:\n{text}");
+    assert!(
+        stat(&text, "two_state_evals=") >= 40,
+        "the x-fill entry left two-state:\n{text}"
+    );
 }
 
 /// A plain 300-bit bitwise entry: the wide class itself.
@@ -142,8 +164,14 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("WC 2dd591369b37acca 0000003c3c03fc3f 40"), "answer:\n{text}");
-    assert!(stat(&text, "two_state_evals=") >= 40, "the wide entry left two-state:\n{text}");
+    assert!(
+        text.contains("WC 2dd591369b37acca 0000003c3c03fc3f 40"),
+        "answer:\n{text}"
+    );
+    assert!(
+        stat(&text, "two_state_evals=") >= 40,
+        "the wide entry left two-state:\n{text}"
+    );
 }
 
 /// A dynamically indexed read of a 256-bit memory element (`vrf[rs]`, a
@@ -175,8 +203,14 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("VRF 0808000018080000 0828000008084002 40"), "answer:\n{text}");
-    assert!(stat(&text, "two_state_evals=") >= 40, "the wide element-read block left two-state:\n{text}");
+    assert!(
+        text.contains("VRF 0808000018080000 0828000008084002 40"),
+        "answer:\n{text}"
+    );
+    assert!(
+        stat(&text, "two_state_evals=") >= 40,
+        "the wide element-read block left two-state:\n{text}"
+    );
 }
 
 /// The fused memory-read flop `rdata <= line[raddr]` with 256-bit elements
@@ -206,6 +240,12 @@ module tb;
 endmodule
 "#,
     );
-    assert!(text.contains("LINE deadbeef00070007 deadbeef00070007 40"), "answer:\n{text}");
-    assert!(stat(&text, "two_state_evals=") >= 40, "the wide memory-read flop left two-state:\n{text}");
+    assert!(
+        text.contains("LINE deadbeef00070007 deadbeef00070007 40"),
+        "answer:\n{text}"
+    );
+    assert!(
+        stat(&text, "two_state_evals=") >= 40,
+        "the wide memory-read flop left two-state:\n{text}"
+    );
 }

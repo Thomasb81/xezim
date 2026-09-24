@@ -62,6 +62,9 @@ endmodule
         .map(|o| o.message.clone())
         .filter(|m| m.starts_with("T|W="))
         .collect();
-    assert!(ws.contains(&"T|W=16".to_string()), "override applies: {ws:?}");
+    assert!(
+        ws.contains(&"T|W=16".to_string()),
+        "override applies: {ws:?}"
+    );
     assert!(ws.contains(&"T|W=8".to_string()), "default applies: {ws:?}");
 }

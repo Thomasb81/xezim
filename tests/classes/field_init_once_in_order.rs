@@ -31,7 +31,13 @@ fn call_bearing_field_initializers_run_once_in_declaration_order() {
     let src = dir.join("top.sv");
     std::fs::write(&src, DESIGN).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "top", src.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            src.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();

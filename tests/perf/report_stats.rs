@@ -138,8 +138,11 @@ fn run_binary(extra_args: &[&str], envs: &[(&str, &str)]) -> (String, String) {
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let sv = dir.join("smoke.sv");
-    std::fs::write(&sv, "module report_stats_smoke;\n  initial $finish;\nendmodule\n")
-        .expect("write smoke.sv");
+    std::fs::write(
+        &sv,
+        "module report_stats_smoke;\n  initial $finish;\nendmodule\n",
+    )
+    .expect("write smoke.sv");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
     cmd.arg(sv.to_str().unwrap())
@@ -161,14 +164,20 @@ fn run_binary(extra_args: &[&str], envs: &[(&str, &str)]) -> (String, String) {
 fn binary_emits_json_footer_on_stderr_when_asked() {
     let (stdout, stderr) = run_binary(&["--report-stats=json"], &[]);
     // Normal stdout is untouched.
-    assert!(stdout.contains("Simulation finished at time"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("Simulation finished at time"),
+        "stdout:\n{stdout}"
+    );
     assert!(!stdout.contains("schema_version"), "stdout:\n{stdout}");
     // The footer is one JSON line on stderr with the expected keys.
     let line = stderr
         .lines()
         .find(|l| l.contains("\"schema_version\":1"))
         .unwrap_or_else(|| panic!("no JSON footer on stderr:\n{stderr}"));
-    assert!(line.starts_with('{') && line.ends_with('}'), "footer: {line}");
+    assert!(
+        line.starts_with('{') && line.ends_with('}'),
+        "footer: {line}"
+    );
     for key in [
         "\"version\":\"",
         "\"git_rev\":\"",
@@ -184,7 +193,10 @@ fn binary_emits_json_footer_on_stderr_when_asked() {
 #[test]
 fn binary_emits_no_footer_by_default() {
     let (stdout, stderr) = run_binary(&[], &[]);
-    assert!(stdout.contains("Simulation finished at time"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("Simulation finished at time"),
+        "stdout:\n{stdout}"
+    );
     for stream in [&stdout, &stderr] {
         assert!(!stream.contains("xezim run statistics"), "got:\n{stream}");
         assert!(!stream.contains("schema_version"), "got:\n{stream}");
@@ -195,9 +207,15 @@ fn binary_emits_no_footer_by_default() {
 fn binary_env_switch_and_cli_precedence() {
     // Env alone turns the human footer on.
     let (_, stderr) = run_binary(&[], &[("XEZIM_REPORT_STATS", "1")]);
-    assert!(stderr.contains("--- xezim run statistics ---"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("--- xezim run statistics ---"),
+        "stderr:\n{stderr}"
+    );
     // CLI flag wins over the env: human text despite XEZIM_REPORT_STATS=json.
     let (_, stderr) = run_binary(&["--report-stats"], &[("XEZIM_REPORT_STATS", "json")]);
-    assert!(stderr.contains("--- xezim run statistics ---"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("--- xezim run statistics ---"),
+        "stderr:\n{stderr}"
+    );
     assert!(!stderr.contains("schema_version"), "stderr:\n{stderr}");
 }

@@ -17,12 +17,19 @@ fn run(name: &str, src: &str) -> String {
 }
 
 fn run_env(name: &str, src: &str, env: &[(&str, &str)]) -> String {
-    let dir = std::env::temp_dir().join(format!("xezim_loop_block_counters_{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("xezim_loop_block_counters_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temporary directory");
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).expect("write temporary design");
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb", "--no-cache", path.to_str().unwrap()])
+        .args([
+            "--simulate",
+            "-s",
+            "tb",
+            "--no-cache",
+            path.to_str().unwrap(),
+        ])
         .env("XEZIM_PROFILE_REPORT", "1")
         .env("XEZIM_EDGE_BLOCK_STATS", "1")
         .envs(env.iter().copied())
@@ -85,9 +92,15 @@ endmodule
         text.contains("LANES 180b0209042f765d40434a517c272e35 a67586b6 926172a2 200"),
         "answer:\n{text}"
     );
-    assert!(stat(&text, "two_state_evals=") >= 200, "the loop block left two-state:\n{text}");
+    assert!(
+        stat(&text, "two_state_evals=") >= 200,
+        "the loop block left two-state:\n{text}"
+    );
     let len = stat(&text, "block=0 execs=200 len=");
-    assert!(len <= 110, "the loop block's bytecode grew to {len} instructions:\n{text}");
+    assert!(
+        len <= 110,
+        "the loop block's bytecode grew to {len} instructions:\n{text}"
+    );
 }
 
 /// Per-lane write pointers read from an unpacked array, indexing a packed
@@ -121,7 +134,10 @@ endmodule
         text.contains("QUEUE 0000343434000000000000232323000000000000121212000000000000010101"),
         "answer:\n{text}"
     );
-    assert!(stat(&text, "two_state_evals=") >= 3, "the queue block left two-state:\n{text}");
+    assert!(
+        stat(&text, "two_state_evals=") >= 3,
+        "the queue block left two-state:\n{text}"
+    );
 }
 
 /// Generate arms whose range bounds are constants only after folding
@@ -162,7 +178,10 @@ endmodule
     );
     assert!(text.contains("GEN ff00ff00 7f 4f 20"), "answer:\n{text}");
     // Nine edge blocks (one counter, eight arms), each fired 20 times.
-    assert!(stat(&text, "two_state_evals=") >= 9 * 20, "generate-arm stores left two-state:\n{text}");
+    assert!(
+        stat(&text, "two_state_evals=") >= 9 * 20,
+        "generate-arm stores left two-state:\n{text}"
+    );
 }
 
 /// A block that reads an element nobody ever writes bails on x every
@@ -192,5 +211,8 @@ endmodule
     );
     assert!(text.contains("XB xxxxxxxx 0"), "answer:\n{text}");
     let bails = stat(&text, "x_read=");
-    assert!(bails <= 64, "the x-reading block was re-tried {bails} times:\n{text}");
+    assert!(
+        bails <= 64,
+        "the x-reading block was re-tried {bails} times:\n{text}"
+    );
 }

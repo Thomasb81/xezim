@@ -21,24 +21,56 @@ pub mod enabled {
     pub unsafe extern "C" fn xezim_tsjit_store(sim: *mut u8, id: u32, v: u64, mask: u64) {
         unsafe { (*(sim as *mut Simulator)).ts_store(id as usize, v, mask) }
     }
-    pub unsafe extern "C" fn xezim_tsjit_range_store(sim: *mut u8, id: u32, v: u64, lo: u32, hi: u32) {
+    pub unsafe extern "C" fn xezim_tsjit_range_store(
+        sim: *mut u8,
+        id: u32,
+        v: u64,
+        lo: u32,
+        hi: u32,
+    ) {
         unsafe { (*(sim as *mut Simulator)).ts_range_store(id as usize, v, lo, hi) }
     }
     pub unsafe extern "C" fn xezim_tsjit_store_nba(sim: *mut u8, id: u32, v: u64, w: u32) {
         unsafe { (*(sim as *mut Simulator)).ts_store_nba(id as usize, v, w) }
     }
-    pub unsafe extern "C" fn xezim_tsjit_range_store_nba(sim: *mut u8, id: u32, v: u64, lo: u32, hi: u32) {
+    pub unsafe extern "C" fn xezim_tsjit_range_store_nba(
+        sim: *mut u8,
+        id: u32,
+        v: u64,
+        lo: u32,
+        hi: u32,
+    ) {
         unsafe { (*(sim as *mut Simulator)).ts_range_store_nba(id as usize, lo, hi, v) }
     }
     pub unsafe extern "C" fn xezim_tsjit_store_xz(sim: *mut u8, id: u32, v: u64, x: u64) {
         unsafe { (*(sim as *mut Simulator)).ts_store_xz(id as usize, v, x) }
     }
-    pub unsafe extern "C" fn xezim_tsjit_range_store_xz(sim: *mut u8, id: u32, v: u64, x: u64, lo: u32, hi: u32) {
+    pub unsafe extern "C" fn xezim_tsjit_range_store_xz(
+        sim: *mut u8,
+        id: u32,
+        v: u64,
+        x: u64,
+        lo: u32,
+        hi: u32,
+    ) {
         unsafe { (*(sim as *mut Simulator)).ts_range_store_xz(id as usize, v, x, lo, hi) }
     }
-    pub unsafe extern "C" fn xezim_tsjit_bit_store_dyn(sim: *mut u8, id: u32, idx: u64, bit: u64, w: u32) {
+    pub unsafe extern "C" fn xezim_tsjit_bit_store_dyn(
+        sim: *mut u8,
+        id: u32,
+        idx: u64,
+        bit: u64,
+        w: u32,
+    ) {
         if idx < w as u64 {
-            unsafe { (*(sim as *mut Simulator)).ts_range_store(id as usize, bit & 1, idx as u32, idx as u32) }
+            unsafe {
+                (*(sim as *mut Simulator)).ts_range_store(
+                    id as usize,
+                    bit & 1,
+                    idx as u32,
+                    idx as u32,
+                )
+            }
         }
     }
 
@@ -60,30 +92,299 @@ pub mod enabled {
     fn unfuse(i: &TsInsn) -> Option<Vec<TsInsn>> {
         use TsInsn as T;
         Some(match i {
-            T::LoadSigNot { dl, d, sig } => vec![T::LoadSig { d: *dl, sig: *sig }, T::LogNot { d: *d, s: *dl }],
-            T::SigRangeEqC { dr, d, sig, lo, w, k } => vec![T::SigRange { d: *dr, sig: *sig, lo: *lo as u16, mask: if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 } }, T::EqC { d: *d, s: *dr, k: *k }],
-            T::LoadSigLogAnd { dl, sig, d, a, b } => vec![T::LoadSig { d: *dl, sig: *sig }, T::LogAnd { d: *d, a: *a, b: *b }],
-            T::LogNotAnd { dn, s, d, a, b } => vec![T::LogNot { d: *dn, s: *s }, T::And { d: *d, a: *a, b: *b }],
-            T::LogNotLogAnd { dn, s, d, a, b } => vec![T::LogNot { d: *dn, s: *s }, T::LogAnd { d: *d, a: *a, b: *b }],
-            T::LogAndStore { d, a, b, sig, mask } => vec![T::LogAnd { d: *d, a: *a, b: *b }, T::Store { sig: *sig, s: *d, mask: *mask }],
-            T::AndRangeStore { d, a, b, sig, hi, lo } => vec![T::And { d: *d, a: *a, b: *b }, T::RangeStore { sig: *sig, hi: *hi, lo: *lo, s: *d, mask: if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 } }],
-            T::SigBitNot { db, d, sig, bit } => vec![T::SigBit { d: *db, sig: *sig, bit: *bit }, T::LogNot { d: *d, s: *db }],
-            T::LoadSig2 { d1, sig1, d2, sig2 } => vec![T::LoadSig { d: *d1, sig: *sig1 }, T::LoadSig { d: *d2, sig: *sig2 }],
-            T::SigBit2 { d1, sig1, bit1, d2, sig2, bit2 } => vec![T::SigBit { d: *d1, sig: *sig1, bit: *bit1 }, T::SigBit { d: *d2, sig: *sig2, bit: *bit2 }],
-            T::LoadSigLogOr { dl, sig, d, a, b } => vec![T::LoadSig { d: *dl, sig: *sig }, T::LogOr { d: *d, a: *a, b: *b }],
-            T::LoadSigAnd { dl, sig, d, a, b } => vec![T::LoadSig { d: *dl, sig: *sig }, T::And { d: *d, a: *a, b: *b }],
-            T::LoadSigRepl { dl, sig, d, w, count } => vec![T::LoadSig { d: *dl, sig: *sig }, T::Repl { d: *d, s: *dl, w: *w, count: *count }],
-            T::LoadSigSigRange { dl, sig, d, sig2, lo, mask } => vec![T::LoadSig { d: *dl, sig: *sig }, T::SigRange { d: *d, sig: *sig2, lo: *lo, mask: *mask }],
-            T::SigRangeAnd { dr, sig, lo, mask, d, a, b } => vec![T::SigRange { d: *dr, sig: *sig, lo: *lo, mask: *mask }, T::And { d: *d, a: *a, b: *b }],
-            T::SigRangeEq { dr, sig, lo, mask, d, a, b } => vec![T::SigRange { d: *dr, sig: *sig, lo: *lo, mask: *mask }, T::Eq { d: *d, a: *a, b: *b }],
-            T::ConstEq { dc, v, d, a, b } => vec![T::Const { d: *dc, v: *v }, T::Eq { d: *d, a: *a, b: *b }],
-            T::LogOrStore { d, a, b, sig, mask } => vec![T::LogOr { d: *d, a: *a, b: *b }, T::Store { sig: *sig, s: *d, mask: *mask }],
-            T::AndOr { d1, a1, b1, d, a, b } => vec![T::And { d: *d1, a: *a1, b: *b1 }, T::Or { d: *d, a: *a, b: *b }],
-            T::OrRangeStore { d, a, b, sig, hi, lo } => vec![T::Or { d: *d, a: *a, b: *b }, T::RangeStore { sig: *sig, hi: *hi, lo: *lo, s: *d, mask: if *hi - *lo + 1 >= 64 { u64::MAX } else { (1u64 << (*hi - *lo + 1)) - 1 } }],
+            T::LoadSigNot { dl, d, sig } => vec![
+                T::LoadSig { d: *dl, sig: *sig },
+                T::LogNot { d: *d, s: *dl },
+            ],
+            T::SigRangeEqC {
+                dr,
+                d,
+                sig,
+                lo,
+                w,
+                k,
+            } => vec![
+                T::SigRange {
+                    d: *dr,
+                    sig: *sig,
+                    lo: *lo as u16,
+                    mask: if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 },
+                },
+                T::EqC {
+                    d: *d,
+                    s: *dr,
+                    k: *k,
+                },
+            ],
+            T::LoadSigLogAnd { dl, sig, d, a, b } => vec![
+                T::LoadSig { d: *dl, sig: *sig },
+                T::LogAnd {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+            ],
+            T::LogNotAnd { dn, s, d, a, b } => vec![
+                T::LogNot { d: *dn, s: *s },
+                T::And {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+            ],
+            T::LogNotLogAnd { dn, s, d, a, b } => vec![
+                T::LogNot { d: *dn, s: *s },
+                T::LogAnd {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+            ],
+            T::LogAndStore { d, a, b, sig, mask } => vec![
+                T::LogAnd {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+                T::Store {
+                    sig: *sig,
+                    s: *d,
+                    mask: *mask,
+                },
+            ],
+            T::AndRangeStore {
+                d,
+                a,
+                b,
+                sig,
+                hi,
+                lo,
+            } => vec![
+                T::And {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+                T::RangeStore {
+                    sig: *sig,
+                    hi: *hi,
+                    lo: *lo,
+                    s: *d,
+                    mask: if *hi - *lo + 1 >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << (*hi - *lo + 1)) - 1
+                    },
+                },
+            ],
+            T::SigBitNot { db, d, sig, bit } => vec![
+                T::SigBit {
+                    d: *db,
+                    sig: *sig,
+                    bit: *bit,
+                },
+                T::LogNot { d: *d, s: *db },
+            ],
+            T::LoadSig2 { d1, sig1, d2, sig2 } => vec![
+                T::LoadSig { d: *d1, sig: *sig1 },
+                T::LoadSig { d: *d2, sig: *sig2 },
+            ],
+            T::SigBit2 {
+                d1,
+                sig1,
+                bit1,
+                d2,
+                sig2,
+                bit2,
+            } => vec![
+                T::SigBit {
+                    d: *d1,
+                    sig: *sig1,
+                    bit: *bit1,
+                },
+                T::SigBit {
+                    d: *d2,
+                    sig: *sig2,
+                    bit: *bit2,
+                },
+            ],
+            T::LoadSigLogOr { dl, sig, d, a, b } => vec![
+                T::LoadSig { d: *dl, sig: *sig },
+                T::LogOr {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+            ],
+            T::LoadSigAnd { dl, sig, d, a, b } => vec![
+                T::LoadSig { d: *dl, sig: *sig },
+                T::And {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+            ],
+            T::LoadSigRepl {
+                dl,
+                sig,
+                d,
+                w,
+                count,
+            } => vec![
+                T::LoadSig { d: *dl, sig: *sig },
+                T::Repl {
+                    d: *d,
+                    s: *dl,
+                    w: *w,
+                    count: *count,
+                },
+            ],
+            T::LoadSigSigRange {
+                dl,
+                sig,
+                d,
+                sig2,
+                lo,
+                mask,
+            } => vec![
+                T::LoadSig { d: *dl, sig: *sig },
+                T::SigRange {
+                    d: *d,
+                    sig: *sig2,
+                    lo: *lo,
+                    mask: *mask,
+                },
+            ],
+            T::SigRangeAnd {
+                dr,
+                sig,
+                lo,
+                mask,
+                d,
+                a,
+                b,
+            } => vec![
+                T::SigRange {
+                    d: *dr,
+                    sig: *sig,
+                    lo: *lo,
+                    mask: *mask,
+                },
+                T::And {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+            ],
+            T::SigRangeEq {
+                dr,
+                sig,
+                lo,
+                mask,
+                d,
+                a,
+                b,
+            } => vec![
+                T::SigRange {
+                    d: *dr,
+                    sig: *sig,
+                    lo: *lo,
+                    mask: *mask,
+                },
+                T::Eq {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+            ],
+            T::ConstEq { dc, v, d, a, b } => vec![
+                T::Const { d: *dc, v: *v },
+                T::Eq {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+            ],
+            T::LogOrStore { d, a, b, sig, mask } => vec![
+                T::LogOr {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+                T::Store {
+                    sig: *sig,
+                    s: *d,
+                    mask: *mask,
+                },
+            ],
+            T::AndOr {
+                d1,
+                a1,
+                b1,
+                d,
+                a,
+                b,
+            } => vec![
+                T::And {
+                    d: *d1,
+                    a: *a1,
+                    b: *b1,
+                },
+                T::Or {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+            ],
+            T::OrRangeStore {
+                d,
+                a,
+                b,
+                sig,
+                hi,
+                lo,
+            } => vec![
+                T::Or {
+                    d: *d,
+                    a: *a,
+                    b: *b,
+                },
+                T::RangeStore {
+                    sig: *sig,
+                    hi: *hi,
+                    lo: *lo,
+                    s: *d,
+                    mask: if *hi - *lo + 1 >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << (*hi - *lo + 1)) - 1
+                    },
+                },
+            ],
             T::LoadSigBrNz { .. } | T::BrFalseLoadSig { .. } | T::EqBrFalse { .. } => return None,
-            T::Concat2 { d, a, wa, b, wb } => vec![T::Concat { d: *d, parts: vec![(*a, *wa), (*b, *wb)].into_boxed_slice() }],
-            T::Concat3 { d, a, wa, b, wb, c, wc } => vec![T::Concat { d: *d, parts: vec![(*a, *wa), (*b, *wb), (*c, *wc)].into_boxed_slice() }],
-            T::ElemStoreNbaFromSig(f) => vec![T::LoadSig { d: f.dl, sig: f.sig }, T::ElemStoreNba(Box::new(f.op.clone()))],
+            T::Concat2 { d, a, wa, b, wb } => vec![T::Concat {
+                d: *d,
+                parts: vec![(*a, *wa), (*b, *wb)].into_boxed_slice(),
+            }],
+            T::Concat3 {
+                d,
+                a,
+                wa,
+                b,
+                wb,
+                c,
+                wc,
+            } => vec![T::Concat {
+                d: *d,
+                parts: vec![(*a, *wa), (*b, *wb), (*c, *wc)].into_boxed_slice(),
+            }],
+            T::ElemStoreNbaFromSig(f) => vec![
+                T::LoadSig {
+                    d: f.dl,
+                    sig: f.sig,
+                },
+                T::ElemStoreNba(Box::new(f.op.clone())),
+            ],
             other => vec![other.clone()],
         })
     }
@@ -97,7 +398,9 @@ pub mod enabled {
             let isa_builder = cranelift_native::builder().ok()?;
             let mut flag_builder = settings::builder();
             let _ = flag_builder.set("opt_level", "speed");
-            let isa = isa_builder.finish(settings::Flags::new(flag_builder)).ok()?;
+            let isa = isa_builder
+                .finish(settings::Flags::new(flag_builder))
+                .ok()?;
             let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
             // One reserved region for all streams: the default provider
             // starts a fresh page-sized mapping after every finalize, which
@@ -113,28 +416,52 @@ pub mod enabled {
                     builder.memory_provider(Box::new(p));
                 }
                 Err(e) => {
-                    eprintln!("[TS-JIT] arena reserve failed ({e}); native two-state path disabled");
+                    eprintln!(
+                        "[TS-JIT] arena reserve failed ({e}); native two-state path disabled"
+                    );
                     return None;
                 }
             }
             builder.symbol("xezim_tsjit_store", xezim_tsjit_store as *const u8);
-            builder.symbol("xezim_tsjit_range_store", xezim_tsjit_range_store as *const u8);
+            builder.symbol(
+                "xezim_tsjit_range_store",
+                xezim_tsjit_range_store as *const u8,
+            );
             builder.symbol("xezim_tsjit_store_nba", xezim_tsjit_store_nba as *const u8);
-            builder.symbol("xezim_tsjit_range_store_nba", xezim_tsjit_range_store_nba as *const u8);
+            builder.symbol(
+                "xezim_tsjit_range_store_nba",
+                xezim_tsjit_range_store_nba as *const u8,
+            );
             builder.symbol("xezim_tsjit_store_xz", xezim_tsjit_store_xz as *const u8);
-            builder.symbol("xezim_tsjit_range_store_xz", xezim_tsjit_range_store_xz as *const u8);
-            builder.symbol("xezim_tsjit_bit_store_dyn", xezim_tsjit_bit_store_dyn as *const u8);
-            Some(Self { module: ClJitModule::new(builder), next_id: 0, compiled: 0, rejected: 0, code_bytes: 0, pending: Vec::new() })
+            builder.symbol(
+                "xezim_tsjit_range_store_xz",
+                xezim_tsjit_range_store_xz as *const u8,
+            );
+            builder.symbol(
+                "xezim_tsjit_bit_store_dyn",
+                xezim_tsjit_bit_store_dyn as *const u8,
+            );
+            Some(Self {
+                module: ClJitModule::new(builder),
+                next_id: 0,
+                compiled: 0,
+                rejected: 0,
+                code_bytes: 0,
+                pending: Vec::new(),
+            })
         }
 
         /// Compile one straight-line stream for comb entry `eidx`; the
         /// function becomes callable after the next `flush`. False when any
         /// instruction is outside the supported subset.
         pub fn compile(&mut self, eidx: usize, insns: &[TsInsn], num_regs: u32) -> bool {
-            let flat: Option<Vec<TsInsn>> = insns.iter().try_fold(Vec::with_capacity(insns.len() + 8), |mut acc, i| {
-                acc.extend(unfuse(i)?);
-                Some(acc)
-            });
+            let flat: Option<Vec<TsInsn>> =
+                insns
+                    .iter()
+                    .try_fold(Vec::with_capacity(insns.len() + 8), |mut acc, i| {
+                        acc.extend(unfuse(i)?);
+                        Some(acc)
+                    });
             let Some(flat) = flat else {
                 self.rejected += 1;
                 return false;
@@ -170,7 +497,9 @@ pub mod enabled {
                 .drain(..)
                 .map(|(eidx, id)| {
                     let code = self.module.get_finalized_function(id);
-                    (eidx, unsafe { std::mem::transmute::<*const u8, TsJitFn>(code) })
+                    (eidx, unsafe {
+                        std::mem::transmute::<*const u8, TsJitFn>(code)
+                    })
                 })
                 .collect();
             out
@@ -209,13 +538,34 @@ pub mod enabled {
             sig_bit.params.push(AbiParam::new(types::I64));
             sig_bit.params.push(AbiParam::new(types::I64));
             sig_bit.params.push(AbiParam::new(types::I32));
-            let f_store: FuncId = self.module.declare_function("xezim_tsjit_store", Linkage::Import, &sig_store).map_err(|_| ())?;
-            let f_range = self.module.declare_function("xezim_tsjit_range_store", Linkage::Import, &sig_range).map_err(|_| ())?;
-            let f_nba = self.module.declare_function("xezim_tsjit_store_nba", Linkage::Import, &sig_nba).map_err(|_| ())?;
-            let f_rnba = self.module.declare_function("xezim_tsjit_range_store_nba", Linkage::Import, &sig_range).map_err(|_| ())?;
-            let f_sxz = self.module.declare_function("xezim_tsjit_store_xz", Linkage::Import, &sig_xz).map_err(|_| ())?;
-            let f_rxz = self.module.declare_function("xezim_tsjit_range_store_xz", Linkage::Import, &sig_rxz).map_err(|_| ())?;
-            let f_bit = self.module.declare_function("xezim_tsjit_bit_store_dyn", Linkage::Import, &sig_bit).map_err(|_| ())?;
+            let f_store: FuncId = self
+                .module
+                .declare_function("xezim_tsjit_store", Linkage::Import, &sig_store)
+                .map_err(|_| ())?;
+            let f_range = self
+                .module
+                .declare_function("xezim_tsjit_range_store", Linkage::Import, &sig_range)
+                .map_err(|_| ())?;
+            let f_nba = self
+                .module
+                .declare_function("xezim_tsjit_store_nba", Linkage::Import, &sig_nba)
+                .map_err(|_| ())?;
+            let f_rnba = self
+                .module
+                .declare_function("xezim_tsjit_range_store_nba", Linkage::Import, &sig_range)
+                .map_err(|_| ())?;
+            let f_sxz = self
+                .module
+                .declare_function("xezim_tsjit_store_xz", Linkage::Import, &sig_xz)
+                .map_err(|_| ())?;
+            let f_rxz = self
+                .module
+                .declare_function("xezim_tsjit_range_store_xz", Linkage::Import, &sig_rxz)
+                .map_err(|_| ())?;
+            let f_bit = self
+                .module
+                .declare_function("xezim_tsjit_bit_store_dyn", Linkage::Import, &sig_bit)
+                .map_err(|_| ())?;
 
             let mut ctx = self.module.make_context();
             ctx.func.signature.params.push(AbiParam::new(ptr_t));
@@ -272,14 +622,19 @@ pub mod enabled {
                     // interpreter re-runs it either way; only the demotion
                     // counter differs, and a wide value cannot appear here
                     // once the stream lowered).
-                    let tag = b.ins().load(types::I8, flags, base, XValue::INLINE_TAG_OFFSET as i32);
+                    let tag =
+                        b.ins()
+                            .load(types::I8, flags, base, XValue::INLINE_TAG_OFFSET as i32);
                     let tag64 = b.ins().uextend(types::I64, tag);
-                    let x = b.ins().load(types::I64, flags, base, XValue::INLINE_XZ_OFFSET as i32);
+                    let x = b
+                        .ins()
+                        .load(types::I64, flags, base, XValue::INLINE_XZ_OFFSET as i32);
                     let bad = b.ins().bor(tag64, x);
                     let ok = b.create_block();
                     b.ins().brif(bad, bail_x, &[], ok, &[]);
                     b.switch_to_block(ok);
-                    b.ins().load(types::I64, flags, base, XValue::INLINE_VAL_OFFSET as i32)
+                    b.ins()
+                        .load(types::I64, flags, base, XValue::INLINE_VAL_OFFSET as i32)
                 }};
             }
             macro_rules! bool64 {
@@ -324,9 +679,21 @@ pub mod enabled {
                         let r = b.ins().band(t, m);
                         set!(*d, r);
                     }
-                    T::Xor { d, a, b: bb } => { let (x, y) = (reg!(*a), reg!(*bb)); let r = b.ins().bxor(x, y); set!(*d, r); }
-                    T::And { d, a, b: bb } => { let (x, y) = (reg!(*a), reg!(*bb)); let r = b.ins().band(x, y); set!(*d, r); }
-                    T::Or { d, a, b: bb } => { let (x, y) = (reg!(*a), reg!(*bb)); let r = b.ins().bor(x, y); set!(*d, r); }
+                    T::Xor { d, a, b: bb } => {
+                        let (x, y) = (reg!(*a), reg!(*bb));
+                        let r = b.ins().bxor(x, y);
+                        set!(*d, r);
+                    }
+                    T::And { d, a, b: bb } => {
+                        let (x, y) = (reg!(*a), reg!(*bb));
+                        let r = b.ins().band(x, y);
+                        set!(*d, r);
+                    }
+                    T::Or { d, a, b: bb } => {
+                        let (x, y) = (reg!(*a), reg!(*bb));
+                        let r = b.ins().bor(x, y);
+                        set!(*d, r);
+                    }
                     T::Sel { d, c, a, b: bb } => {
                         let (cv, x, y) = (reg!(*c), reg!(*a), reg!(*bb));
                         let r = b.ins().select(cv, x, y);
@@ -361,7 +728,9 @@ pub mod enabled {
                         let r = bool64!(c);
                         set!(*d, r);
                     }
-                    T::Add { d, a, b: bb, mask } | T::Sub { d, a, b: bb, mask } | T::Mul { d, a, b: bb, mask } => {
+                    T::Add { d, a, b: bb, mask }
+                    | T::Sub { d, a, b: bb, mask }
+                    | T::Mul { d, a, b: bb, mask } => {
                         let (x, y) = (reg!(*a), reg!(*bb));
                         let t = match insn {
                             T::Add { .. } => b.ins().iadd(x, y),
@@ -380,7 +749,12 @@ pub mod enabled {
                         let r = b.ins().band(t, m);
                         set!(*d, r);
                     }
-                    T::Eq { d, a, b: bb } | T::Neq { d, a, b: bb } | T::Lt { d, a, b: bb } | T::Leq { d, a, b: bb } | T::Gt { d, a, b: bb } | T::Geq { d, a, b: bb } => {
+                    T::Eq { d, a, b: bb }
+                    | T::Neq { d, a, b: bb }
+                    | T::Lt { d, a, b: bb }
+                    | T::Leq { d, a, b: bb }
+                    | T::Gt { d, a, b: bb }
+                    | T::Geq { d, a, b: bb } => {
                         let (x, y) = (reg!(*a), reg!(*bb));
                         let cc = match insn {
                             T::Eq { .. } => IntCC::Equal,
@@ -404,7 +778,11 @@ pub mod enabled {
                         let (x, y) = (reg!(*a), reg!(*bb));
                         let cx = b.ins().icmp_imm(IntCC::NotEqual, x, 0);
                         let cy = b.ins().icmp_imm(IntCC::NotEqual, y, 0);
-                        let c = if matches!(insn, T::LogAnd { .. }) { b.ins().band(cx, cy) } else { b.ins().bor(cx, cy) };
+                        let c = if matches!(insn, T::LogAnd { .. }) {
+                            b.ins().band(cx, cy)
+                        } else {
+                            b.ins().bor(cx, cy)
+                        };
                         let r = bool64!(c);
                         set!(*d, r);
                     }
@@ -427,9 +805,17 @@ pub mod enabled {
                         let r = b.ins().band(sv, m);
                         set!(*d, r);
                     }
-                    T::Shl { d, a, b: bb, w, mask } => {
+                    T::Shl {
+                        d,
+                        a,
+                        b: bb,
+                        w,
+                        mask,
+                    } => {
                         let (x, amt) = (reg!(*a), reg!(*bb));
-                        let ge = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, amt, *w as i64);
+                        let ge =
+                            b.ins()
+                                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, amt, *w as i64);
                         let t = b.ins().ishl(x, amt);
                         let m = b.ins().iconst(types::I64, *mask as i64);
                         let shifted = b.ins().band(t, m);
@@ -439,7 +825,9 @@ pub mod enabled {
                     }
                     T::Shr { d, a, b: bb, w } => {
                         let (x, amt) = (reg!(*a), reg!(*bb));
-                        let ge = b.ins().icmp_imm(IntCC::UnsignedGreaterThanOrEqual, amt, *w as i64);
+                        let ge =
+                            b.ins()
+                                .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, amt, *w as i64);
                         let shifted = b.ins().ushr(x, amt);
                         let zero = b.ins().iconst(types::I64, 0);
                         let r = b.ins().select(ge, zero, shifted);
@@ -470,7 +858,13 @@ pub mod enabled {
                         let id = b.ins().iconst(types::I32, *sig as i64);
                         b.ins().call(r_store, &[sim, id, v, m]);
                     }
-                    T::RangeStore { sig, hi, lo, s, mask } => {
+                    T::RangeStore {
+                        sig,
+                        hi,
+                        lo,
+                        s,
+                        mask,
+                    } => {
                         let sv = reg!(*s);
                         let m = b.ins().iconst(types::I64, *mask as i64);
                         let v = b.ins().band(sv, m);
@@ -493,7 +887,13 @@ pub mod enabled {
                         let ww = b.ins().iconst(types::I32, *w as i64);
                         b.ins().call(r_nba, &[sim, id, vv, ww]);
                     }
-                    T::RangeStoreNba { sig, hi, lo, s, mask } => {
+                    T::RangeStoreNba {
+                        sig,
+                        hi,
+                        lo,
+                        s,
+                        mask,
+                    } => {
                         let sv = reg!(*s);
                         let m = b.ins().iconst(types::I64, *mask as i64);
                         let v = b.ins().band(sv, m);
@@ -543,7 +943,10 @@ pub mod enabled {
             }
             self.next_id += 1;
             let name = format!("xezim_ts_{}", self.next_id);
-            let fid = self.module.declare_function(&name, Linkage::Export, &ctx.func.signature).map_err(|_| ())?;
+            let fid = self
+                .module
+                .declare_function(&name, Linkage::Export, &ctx.func.signature)
+                .map_err(|_| ())?;
             self.module.define_function(fid, &mut ctx).map_err(|_| ())?;
             if let Some(cc) = ctx.compiled_code() {
                 self.code_bytes += cc.code_info().total_size as u64;

@@ -49,7 +49,11 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "f0"), 1);
-    assert_eq!(u(&sim, "f1"), 2, "iteration 2 ran (loop var survived settle)");
+    assert_eq!(
+        u(&sim, "f1"),
+        2,
+        "iteration 2 ran (loop var survived settle)"
+    );
     assert_eq!(u(&sim, "f2"), 3);
     assert_eq!(u(&sim, "f3"), 4);
 }
@@ -118,7 +122,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "mismatches"), 0, "DUT must match the model every edge");
+    assert_eq!(
+        u(&sim, "mismatches"),
+        0,
+        "DUT must match the model every edge"
+    );
     assert_eq!(u(&sim, "l12"), 15, "0 - 1 wraps to 15 in 4 bits");
 }
 

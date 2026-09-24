@@ -89,9 +89,21 @@ fn chained_selects_read_the_declared_element() {
 fn dynamic_indices_in_a_chain_select_the_declared_element() {
     let sim = simulate(SRC, 200).expect("simulate failed");
     // v[0][0] = 2'b10, v[0][1] = 2'b01  =>  v[0][0][1] is 1, v[0][1] is 2'b01
-    assert_eq!(u(&sim, "dyn_full"), 1, "v[di][dj][1] with di=dj=0 — read x before the fix");
-    assert_eq!(u(&sim, "dyn_mixed"), 1, "v[0][dj][1] — constant and dynamic levels mixed");
-    assert_eq!(u(&sim, "dyn_slice"), 0b10, "v[di][dj] — dynamic chain stopping one level short");
+    assert_eq!(
+        u(&sim, "dyn_full"),
+        1,
+        "v[di][dj][1] with di=dj=0 — read x before the fix"
+    );
+    assert_eq!(
+        u(&sim, "dyn_mixed"),
+        1,
+        "v[0][dj][1] — constant and dynamic levels mixed"
+    );
+    assert_eq!(
+        u(&sim, "dyn_slice"),
+        0b10,
+        "v[di][dj] — dynamic chain stopping one level short"
+    );
 }
 
 #[test]

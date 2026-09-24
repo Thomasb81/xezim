@@ -43,10 +43,22 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "base_len"), 130, "130 appends must give 130 chars, not 128");
+    assert_eq!(
+        u(&sim, "base_len"),
+        130,
+        "130 appends must give 130 chars, not 128"
+    );
     assert_eq!(u(&sim, "res_len"), 134, "appending TAIL gives 134");
-    assert_eq!(u(&sim, "first_c"), b'X' as u64, "the FRONT of the text survives");
-    assert_eq!(u(&sim, "last_c"), b'L' as u64, "and so does the appended suffix");
+    assert_eq!(
+        u(&sim, "first_c"),
+        b'X' as u64,
+        "the FRONT of the text survives"
+    );
+    assert_eq!(
+        u(&sim, "last_c"),
+        b'L' as u64,
+        "and so does the appended suffix"
+    );
 }
 
 /// The appended suffix is intact as text, not merely as a length.
@@ -87,7 +99,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "big_len"), 1000, "1000-char string keeps its length");
+    assert_eq!(
+        u(&sim, "big_len"),
+        1000,
+        "1000-char string keeps its length"
+    );
     assert_eq!(u(&sim, "copy_len"), 1000, "and survives a plain assignment");
     assert_eq!(u(&sim, "same"), 1, "the copy compares equal");
 }
@@ -157,8 +173,16 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "q_len"), 200, "queue element keeps 200 chars (push_back path)");
+    assert_eq!(
+        u(&sim, "q_len"),
+        200,
+        "queue element keeps 200 chars (push_back path)"
+    );
     assert_eq!(u(&sim, "aa_len"), 200, "assoc element keeps 200 chars");
-    assert_eq!(u(&sim, "arr_len"), 200, "fixed-array element keeps 200 chars");
+    assert_eq!(
+        u(&sim, "arr_len"),
+        200,
+        "fixed-array element keeps 200 chars"
+    );
     assert_eq!(u(&sim, "q_tail_ok"), 1, "the end of the text is intact");
 }

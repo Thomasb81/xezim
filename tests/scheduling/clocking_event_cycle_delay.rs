@@ -40,7 +40,12 @@ endmodule
 "#;
     let out = output_of(&simulate(SRC, 200).expect("sim"));
     for want in ["T1 t=5", "T2 t=15", "T3 t=25"] {
-        assert!(out.contains(want), "@(cb) must fire on posedge clk, missing `{}`:\n{}", want, out);
+        assert!(
+            out.contains(want),
+            "@(cb) must fire on posedge clk, missing `{}`:\n{}",
+            want,
+            out
+        );
     }
 }
 
@@ -62,8 +67,16 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 200).expect("sim"));
-    assert!(out.contains("HH t=15"), "##2 must wait two posedges:\n{}", out);
-    assert!(out.contains("HH2 t=25"), "##1 stmt must wait one more posedge:\n{}", out);
+    assert!(
+        out.contains("HH t=15"),
+        "##2 must wait two posedges:\n{}",
+        out
+    );
+    assert!(
+        out.contains("HH2 t=25"),
+        "##1 stmt must wait one more posedge:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -88,8 +101,16 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 200).expect("sim"));
-    assert!(out.contains("Z t=5"), "##0 off-edge waits for the event (reference: 5):\n{}", out);
-    assert!(out.contains("Z3 t=35"), "##3 then waits three posedges (reference: 35):\n{}", out);
+    assert!(
+        out.contains("Z t=5"),
+        "##0 off-edge waits for the event (reference: 5):\n{}",
+        out
+    );
+    assert!(
+        out.contains("Z3 t=35"),
+        "##3 then waits three posedges (reference: 35):\n{}",
+        out
+    );
 }
 
 #[test]
@@ -118,7 +139,11 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 200).expect("sim"));
-    assert!(out.contains("NE=5 AE=5"), "##0 waits off-edge, no-ops at the edge:\n{}", out);
+    assert!(
+        out.contains("NE=5 AE=5"),
+        "##0 waits off-edge, no-ops at the edge:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -177,7 +202,19 @@ module top;
 endmodule
 "#;
     let out = output_of(&simulate(SRC, 200).expect("sim"));
-    assert!(out.contains("RT0 t=5"), "runtime 0 waits off-edge:\n{}", out);
-    assert!(out.contains("RT0B t=5"), "runtime 0 no-ops at the edge:\n{}", out);
-    assert!(out.contains("RT2 t=25"), "runtime 2 waits two edges:\n{}", out);
+    assert!(
+        out.contains("RT0 t=5"),
+        "runtime 0 waits off-edge:\n{}",
+        out
+    );
+    assert!(
+        out.contains("RT0B t=5"),
+        "runtime 0 no-ops at the edge:\n{}",
+        out
+    );
+    assert!(
+        out.contains("RT2 t=25"),
+        "runtime 2 waits two edges:\n{}",
+        out
+    );
 }

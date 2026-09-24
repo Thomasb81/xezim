@@ -74,15 +74,31 @@ endmodule
 #[test]
 fn packed_array_of_struct_member_element_writes_land() {
     let sim = simulate(SRC, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "r_plain"), 0x11, "plain struct member element (control)");
-    assert_eq!(u(&sim, "r_e1w0"), 0x22, "c1[1].wdata[0] — this write used to be dropped");
-    assert_eq!(u(&sim, "r_e1w1"), 0x33, "c1[1].wdata[1] — second element of the same member");
+    assert_eq!(
+        u(&sim, "r_plain"),
+        0x11,
+        "plain struct member element (control)"
+    );
+    assert_eq!(
+        u(&sim, "r_e1w0"),
+        0x22,
+        "c1[1].wdata[0] — this write used to be dropped"
+    );
+    assert_eq!(
+        u(&sim, "r_e1w1"),
+        0x33,
+        "c1[1].wdata[1] — second element of the same member"
+    );
     assert_eq!(
         u(&sim, "r_e0w0"),
         0x44,
         "c1[0].wdata[0] — a different array element must not alias c1[1]"
     );
-    assert_eq!(u(&sim, "r_amask"), 0b11, "member with no trailing index (control)");
+    assert_eq!(
+        u(&sim, "r_amask"),
+        0b11,
+        "member with no trailing index (control)"
+    );
 }
 
 /// The reported shape: TWO indices before the member. Both halves needed
@@ -93,9 +109,21 @@ fn packed_array_of_struct_member_element_writes_land() {
 #[test]
 fn two_dim_packed_array_of_struct_round_trips() {
     let sim = simulate(SRC, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "r_c2a"), 0x55, "c2[0][1].wdata[0] through two indices");
-    assert_eq!(u(&sim, "r_c2b"), 0x66, "c2[0][0].wdata[1] — different element and lane");
-    assert_eq!(u(&sim, "r_c2am"), 0b10, "c2[0][0].amask — member with no trailing index");
+    assert_eq!(
+        u(&sim, "r_c2a"),
+        0x55,
+        "c2[0][1].wdata[0] through two indices"
+    );
+    assert_eq!(
+        u(&sim, "r_c2b"),
+        0x66,
+        "c2[0][0].wdata[1] — different element and lane"
+    );
+    assert_eq!(
+        u(&sim, "r_c2am"),
+        0b10,
+        "c2[0][0].amask — member with no trailing index"
+    );
     assert_eq!(
         u(&sim, "r_c2m") & 0xFFFF_FFFF_FFFF_FFFF,
         0,
@@ -103,6 +131,14 @@ fn two_dim_packed_array_of_struct_round_trips() {
     );
     // A failed member resolution used to fall back to the 32-bit default.
     assert_eq!(u(&sim, "b_elem"), 146, "$bits(c2[0][0])");
-    assert_eq!(u(&sim, "b_memb"), 128, "$bits(c2[0][0].wdata) — 32 meant unresolved");
-    assert_eq!(u(&sim, "b_sub"), 64, "$bits(c2[0][0].wdata[0]) — 1 meant a bit-select");
+    assert_eq!(
+        u(&sim, "b_memb"),
+        128,
+        "$bits(c2[0][0].wdata) — 32 meant unresolved"
+    );
+    assert_eq!(
+        u(&sim, "b_sub"),
+        64,
+        "$bits(c2[0][0].wdata[0]) — 1 meant a bit-select"
+    );
 }

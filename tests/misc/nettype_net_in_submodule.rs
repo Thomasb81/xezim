@@ -77,7 +77,8 @@ endmodule
     );
     // The declaration is present, so no implicit net may be synthesized for it.
     assert!(
-        !out.iter().any(|m| m.contains("implicit 1-bit net") && m.contains("dd")),
+        !out.iter()
+            .any(|m| m.contains("implicit 1-bit net") && m.contains("dd")),
         "an implicit net was laid over the declared nettype net: {out:?}"
     );
 }
@@ -126,7 +127,11 @@ endmodule
         pick(&b),
         "adding an uninstantiated module changed the nettype net's value"
     );
-    assert!(pick(&a).contains("3.3000"), "expected 3.3000, got {}", pick(&a));
+    assert!(
+        pick(&a).contains("3.3000"),
+        "expected 3.3000, got {}",
+        pick(&a)
+    );
 }
 
 #[test]

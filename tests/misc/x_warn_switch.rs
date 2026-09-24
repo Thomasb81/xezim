@@ -121,7 +121,10 @@ fn env_switch_reports_signal_module_and_drivers() {
         out.contains("in instance u_inner (module inner)"),
         "must name the instance and its module; got:\n{out}"
     );
-    assert!(out.contains("in module top"), "top-level attribution; got:\n{out}");
+    assert!(
+        out.contains("in module top"),
+        "top-level attribution; got:\n{out}"
+    );
     // Driver attribution, one per kind.
     assert!(out.contains("always_ff"), "register driver; got:\n{out}");
     assert!(out.contains("always_comb"), "comb driver; got:\n{out}");
@@ -166,7 +169,12 @@ fn all_switch_spellings() {
 /// The report cap is honoured and announces itself, via both spellings.
 #[test]
 fn report_limit_is_capped_and_announced() {
-    let out = run("lim", CHAIN, &[], &[("XEZIM_X_WARN", "1"), ("XEZIM_X_WARN_LIMIT", "1")]);
+    let out = run(
+        "lim",
+        CHAIN,
+        &[],
+        &[("XEZIM_X_WARN", "1"), ("XEZIM_X_WARN_LIMIT", "1")],
+    );
     if out.is_empty() {
         return;
     }

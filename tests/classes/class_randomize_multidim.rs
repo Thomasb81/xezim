@@ -17,7 +17,10 @@ fn messages(src: &str) -> Vec<String> {
 
 fn expect(msgs: &[String], wants: &[&str]) {
     for want in wants {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
 }
 
@@ -127,5 +130,8 @@ module tb;
 endmodule
 "
     ));
-    expect(&msgs, &["LT ok=1 bad=0 drawn=1", "FRESH ok=1 bad=0 sticky=0"]);
+    expect(
+        &msgs,
+        &["LT ok=1 bad=0 drawn=1", "FRESH ok=1 bad=0 sticky=0"],
+    );
 }

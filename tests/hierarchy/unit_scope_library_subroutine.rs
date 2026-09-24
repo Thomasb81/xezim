@@ -55,7 +55,9 @@ endmodule
 }
 
 fn run(tb_src: &str, lib_src: &str, name: &str, dump: bool) -> (bool, String, PathBuf) {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("unit_scope_lib").join(name);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("unit_scope_lib")
+        .join(name);
     std::fs::create_dir_all(dir.join("incdir")).unwrap();
     std::fs::write(dir.join("incdir/rnd_wrap.h"), HDR).unwrap();
     let tb = dir.join("tb.sv");
@@ -65,15 +67,25 @@ fn run(tb_src: &str, lib_src: &str, name: &str, dump: bool) -> (bool, String, Pa
     let inc = format!("+incdir+{}", dir.join("incdir").display());
     let merged = dir.join("merged.sv");
     let mut args: Vec<String> = vec![
-        tb.to_str().unwrap().into(), "-v".into(), lib.to_str().unwrap().into(),
-        "-s".into(), "testbench".into(), "--max-time".into(), "50ns".into(),
-        "--module-timescale".into(), "1ns/1ns".into(), inc,
+        tb.to_str().unwrap().into(),
+        "-v".into(),
+        lib.to_str().unwrap().into(),
+        "-s".into(),
+        "testbench".into(),
+        "--max-time".into(),
+        "50ns".into(),
+        "--module-timescale".into(),
+        "1ns/1ns".into(),
+        inc,
     ];
     if dump {
         args.push("--dump-merged-sv".into());
         args.push(merged.to_str().unwrap().into());
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_xezim")).args(&args).output().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(&args)
+        .output()
+        .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     (output.status.success(), text, merged)
@@ -86,12 +98,18 @@ fn unit_scope_function_in_a_library_file_is_callable() {
     assert!(text.contains("DONE q=6"), "wrong result:\n{text}");
     // The merged dump must carry the adopted library file, helper included.
     let dumped = std::fs::read_to_string(&merged).unwrap_or_default();
-    assert!(dumped.contains("function int rnd_mul"), "dump lacks the library helper:\n{dumped}");
+    assert!(
+        dumped.contains("function int rnd_mul"),
+        "dump lacks the library helper:\n{dumped}"
+    );
 }
 
 #[test]
 fn unit_scope_task_in_a_library_file_is_callable() {
     let (ok, text, _) = run(&tb("leaf_task"), LEAF_TASK, "task", false);
     assert!(ok, "library $unit task rejected:\n{text}");
-    assert!(text.contains("DONE q=1"), "task result did not land (d=0, rnd[0]=1):\n{text}");
+    assert!(
+        text.contains("DONE q=1"),
+        "task result did not land (d=0, rnd[0]=1):\n{text}"
+    );
 }

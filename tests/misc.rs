@@ -11,8 +11,6 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
-#[path = "misc/const_chain_fold.rs"]
-mod const_chain_fold;
 #[path = "misc/artifact_compression_modes.rs"]
 mod artifact_compression_modes;
 #[path = "misc/assign_z_passthrough.rs"]
@@ -49,6 +47,8 @@ mod clocked_loop_case_nest_compiled;
 mod comb_regvar_loop_fallback;
 #[path = "misc/compliance_tests.rs"]
 mod compliance_tests;
+#[path = "misc/const_chain_fold.rs"]
+mod const_chain_fold;
 #[path = "misc/cov_assertion_basic.rs"]
 mod cov_assertion_basic;
 #[path = "misc/delay_precision.rs"]
@@ -127,28 +127,22 @@ mod method_call_chaining;
 mod monitor_on_change;
 #[path = "misc/monitor_percent_m_scope.rs"]
 mod monitor_percent_m_scope;
+#[path = "misc/nba_array_read_x_index.rs"]
+mod nba_array_read_x_index;
 #[path = "misc/negative_lsb_range_select.rs"]
 mod negative_lsb_range_select;
 #[path = "misc/nonansi_function_args.rs"]
 mod nonansi_function_args;
 #[path = "misc/nonzero_lsb_indexed_part_select.rs"]
 mod nonzero_lsb_indexed_part_select;
-#[path = "misc/packed_mem_range_store.rs"]
-mod packed_mem_range_store;
-#[path = "misc/nba_array_read_x_index.rs"]
-mod nba_array_read_x_index;
-#[path = "misc/part_select_constant_bounds.rs"]
-mod part_select_constant_bounds;
-#[path = "misc/part_select_negative_bound_compiled.rs"]
-mod part_select_negative_bound_compiled;
-#[path = "misc/package_qualified_access_in_subroutine.rs"]
-mod package_qualified_access_in_subroutine;
-#[path = "misc/select_semantics_11_5_1.rs"]
-mod select_semantics_11_5_1;
 #[path = "misc/obj_assocd_event_disable_fork.rs"]
 mod obj_assocd_event_disable_fork;
 #[path = "misc/operators_11_select_reduce.rs"]
 mod operators_11_select_reduce;
+#[path = "misc/package_qualified_access_in_subroutine.rs"]
+mod package_qualified_access_in_subroutine;
+#[path = "misc/packed_mem_range_store.rs"]
+mod packed_mem_range_store;
 #[path = "misc/param_class_cast_type_args.rs"]
 mod param_class_cast_type_args;
 #[path = "misc/param_pair_this_type_cast.rs"]
@@ -157,10 +151,16 @@ mod param_pair_this_type_cast;
 mod parser_gaps2;
 #[path = "misc/parser_stmt_gaps.rs"]
 mod parser_stmt_gaps;
+#[path = "misc/part_select_constant_bounds.rs"]
+mod part_select_constant_bounds;
+#[path = "misc/part_select_negative_bound_compiled.rs"]
+mod part_select_negative_bound_compiled;
 #[path = "misc/port_width_mismatch_explains.rs"]
 mod port_width_mismatch_explains;
 #[path = "misc/real_call_bytecode.rs"]
 mod real_call_bytecode;
+#[path = "misc/select_semantics_11_5_1.rs"]
+mod select_semantics_11_5_1;
 #[path = "misc/shadow_name_matrix.rs"]
 mod shadow_name_matrix;
 #[path = "misc/spec_static_and_pkg_queue.rs"]
@@ -287,8 +287,12 @@ mod audit_round45_finds;
 mod class_collection_storage;
 #[path = "misc/class_queue_locators.rs"]
 mod class_queue_locators;
+#[path = "misc/cross_checked_constructs.rs"]
+mod cross_checked_constructs;
 #[path = "misc/dead_giant_declaration_elision.rs"]
 mod dead_giant_declaration_elision;
+#[path = "misc/elaboration_shape_fixes.rs"]
+mod elaboration_shape_fixes;
 #[path = "misc/env_var_registry.rs"]
 mod env_var_registry;
 #[path = "misc/exit_codes.rs"]
@@ -309,6 +313,8 @@ mod loop_body_inlines_pure_call;
 mod macro_directive_prefix_names;
 #[path = "misc/nested_struct_string_member_display.rs"]
 mod nested_struct_string_member_display;
+#[path = "misc/nettype_net_in_submodule.rs"]
+mod nettype_net_in_submodule;
 #[path = "misc/package_const_fn_params.rs"]
 mod package_const_fn_params;
 #[path = "misc/package_property_assertions.rs"]
@@ -335,6 +341,8 @@ mod sched_trace_orders_a_time_slot;
 mod severity_exit_status;
 #[path = "misc/static_local_scope_isolation.rs"]
 mod static_local_scope_isolation;
+#[path = "misc/stdout_flush_at_sim_finish.rs"]
+mod stdout_flush_at_sim_finish;
 #[path = "misc/struct_local_declinit_copy.rs"]
 mod struct_local_declinit_copy;
 #[path = "misc/symbol_clash_checks.rs"]
@@ -351,11 +359,3 @@ mod two_state_wide_reduction;
 mod udn_resolver_compiled;
 #[path = "misc/while_continue_final_iter.rs"]
 mod while_continue_final_iter;
-#[path = "misc/stdout_flush_at_sim_finish.rs"]
-mod stdout_flush_at_sim_finish;
-#[path = "misc/elaboration_shape_fixes.rs"]
-mod elaboration_shape_fixes;
-#[path = "misc/nettype_net_in_submodule.rs"]
-mod nettype_net_in_submodule;
-#[path = "misc/cross_checked_constructs.rs"]
-mod cross_checked_constructs;

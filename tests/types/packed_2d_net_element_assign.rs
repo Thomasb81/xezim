@@ -128,7 +128,11 @@ module tb;
 endmodule
 "#,
     );
-    assert!(out.iter().any(|l| l == "D 2211"), "dynamic non-normalized index wrong: {:?}", out);
+    assert!(
+        out.iter().any(|l| l == "D 2211"),
+        "dynamic non-normalized index wrong: {:?}",
+        out
+    );
 }
 
 #[test]

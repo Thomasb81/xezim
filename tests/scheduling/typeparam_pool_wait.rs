@@ -75,6 +75,14 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 2000).expect("simulate failed");
-    assert_eq!(read_int(&sim, "null_flag"), 0, "pool.get must return a non-null element");
-    assert_eq!(read_int(&sim, "wakes"), 2, "each ->mev wakes the forever waiter exactly once");
+    assert_eq!(
+        read_int(&sim, "null_flag"),
+        0,
+        "pool.get must return a non-null element"
+    );
+    assert_eq!(
+        read_int(&sim, "wakes"),
+        2,
+        "each ->mev wakes the forever waiter exactly once"
+    );
 }

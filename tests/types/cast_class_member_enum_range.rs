@@ -62,10 +62,22 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "rc_301"), 0, "301 not a verbosity member -> cast FAILS");
+    assert_eq!(
+        u(&sim, "rc_301"),
+        0,
+        "301 not a verbosity member -> cast FAILS"
+    );
     assert_eq!(u(&sim, "rc_501"), 0, "501 (past U_DEBUG=500) -> cast FAILS");
-    assert_eq!(u(&sim, "rc_400"), 1, "U_FULL=400 is a member -> cast succeeds");
-    assert_eq!(u(&sim, "rc_100"), 1, "U_LOW=100 is a member -> cast succeeds");
+    assert_eq!(
+        u(&sim, "rc_400"),
+        1,
+        "U_FULL=400 is a member -> cast succeeds"
+    );
+    assert_eq!(
+        u(&sim, "rc_100"),
+        1,
+        "U_LOW=100 is a member -> cast succeeds"
+    );
 }
 
 /// Sanity control: the same out-of-range `$cast` on a module-scope enum var is

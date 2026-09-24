@@ -63,6 +63,12 @@ fn test_unpacked_struct_func_and_method_arg() {
     let fa = get_sig(&sim, "res_func_a");
     let ca = get_sig(&sim, "res_class_a");
 
-    assert_eq!(fa, 42, "Function call failed to bind unpacked struct argument");
-    assert_eq!(ca, 42, "Method call failed to bind unpacked struct argument");
+    assert_eq!(
+        fa, 42,
+        "Function call failed to bind unpacked struct argument"
+    );
+    assert_eq!(
+        ca, 42,
+        "Method call failed to bind unpacked struct argument"
+    );
 }

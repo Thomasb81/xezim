@@ -68,7 +68,10 @@ fn warm_cache_replays_elaboration_warnings() {
         e2
     );
     // Behavior identical across warm/cold.
-    assert!(o1.contains("N=1") && o2.contains("N=1"), "sim output differs");
+    assert!(
+        o1.contains("N=1") && o2.contains("N=1"),
+        "sim output differs"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -114,9 +117,18 @@ fn cached_edge_block_keeps_its_time_scope() {
     let cold = run();
     let warm = run();
     for text in [&cold, &warm] {
-        assert!(text.contains("STAMP=4"), "first edge used the wrong unit:\n{text}");
-        assert!(text.contains("STAMP=12"), "second edge used the wrong unit:\n{text}");
-        assert!(!text.contains("STAMP=0"), "scope leaked across processes:\n{text}");
+        assert!(
+            text.contains("STAMP=4"),
+            "first edge used the wrong unit:\n{text}"
+        );
+        assert!(
+            text.contains("STAMP=12"),
+            "second edge used the wrong unit:\n{text}"
+        );
+        assert!(
+            !text.contains("STAMP=0"),
+            "scope leaked across processes:\n{text}"
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

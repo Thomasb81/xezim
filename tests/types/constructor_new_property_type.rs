@@ -71,7 +71,15 @@ fn constructor_new_uses_property_type_not_caller_local() {
     // If the bug were present, the constructor would recurse infinitely
     // (my_class::new -> c = new("c") -> my_class::new -> ...) and we'd never
     // reach `depth = 42`. So `depth == 42` proves the recursion is broken.
-    assert_eq!(u(&sim, "depth"), 42, "constructor must not recurse infinitely");
+    assert_eq!(
+        u(&sim, "depth"),
+        42,
+        "constructor must not recurse infinitely"
+    );
     // And the property c must be a base_class (its handle is non-null).
-    assert_eq!(u(&sim, "c_is_base"), 1, "property c should be constructible");
+    assert_eq!(
+        u(&sim, "c_is_base"),
+        1,
+        "property c should be constructible"
+    );
 }

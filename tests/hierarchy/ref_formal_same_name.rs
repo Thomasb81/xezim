@@ -43,6 +43,9 @@ endmodule
 ",
     );
     for want in ["S1 total=12 cnt0=0 cnt1=7", "S2 cnt1=8"] {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
 }

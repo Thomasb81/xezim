@@ -85,13 +85,13 @@ endmodule
 "#);
     // Reference simulator, verbatim.
     for expect in [
-        "P=5678/xxxx",   // b untouched -> x
+        "P=5678/xxxx", // b untouched -> x
         "W=abdeadbeef/ab/1",
         "S=-1234/42",
-        "X=xx00/9999",   // x in one member only
-        "B=0010/0011",   // read-back of the member just written
+        "X=xx00/9999", // x in one member only
+        "B=0010/0011", // read-back of the member just written
         "F=ffff",
-        "I=0100",        // impure helper still correct
+        "I=0100", // impure helper still correct
     ] {
         assert!(o.contains(expect), "expected {expect} in:\n{o}");
     }

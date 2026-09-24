@@ -33,7 +33,15 @@ module tb; import p::*; import pu::*; PU pu_o = new(); prg p_i();
   end
 endmodule",
     );
-    for want in ["pkg_class=200000", "pkg_task=300000", "unit_task=350000", "unit_class=375000", "mod_class=575000", "pkg_timeunit=3575000", "program=7000"] {
+    for want in [
+        "pkg_class=200000",
+        "pkg_task=300000",
+        "unit_task=350000",
+        "unit_class=375000",
+        "mod_class=575000",
+        "pkg_timeunit=3575000",
+        "program=7000",
+    ] {
         assert!(msgs.iter().any(|m| m == want), "missing {want}: {msgs:?}");
     }
 }

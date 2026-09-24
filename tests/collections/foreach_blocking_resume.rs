@@ -54,7 +54,10 @@ fn foreach_task_with_false_wait_resumes_next_iter() {
 endmodule
 "#;
     let out = run(src, "taskwait");
-    assert!(out.contains("QSIZE 0"), "queue should be empty after 3 pops\n{out}");
+    assert!(
+        out.contains("QSIZE 0"),
+        "queue should be empty after 3 pops\n{out}"
+    );
     assert!(out.contains("RESULT PASS"), "expected PASS\n{out}");
 }
 
@@ -80,5 +83,8 @@ fn foreach_blocking_body_parks_each_iter() {
 endmodule
 "#;
     let out = run(src, "blocking");
-    assert!(out.contains("RESULT PASS"), "expected each element visited once\n{out}");
+    assert!(
+        out.contains("RESULT PASS"),
+        "expected each element visited once\n{out}"
+    );
 }
