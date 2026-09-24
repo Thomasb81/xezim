@@ -100,6 +100,32 @@ endmodule
     assert!(out.contains("tb W=4 bits=4"), "{}", out);
 }
 
+/// An assertion's action block names the assertion's scope, not the process
+/// that happened to run before it (here, a process in another top).
+#[test]
+fn assertion_action_runs_in_its_own_scope() {
+    let src = r#"
+module tb;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  sub u();
+  assert property (@(posedge clk) 0) else $display("tb-assert %m");
+  initial #11 $finish;
+endmodule
+module sub;
+  initial #4 $display("sub-init %m");
+endmodule
+module other;
+  initial #3 $display("other-init %m");
+endmodule
+"#;
+    for args in [&["-s", "tb"][..], &["-s", "tb", "-s", "other"][..]] {
+        let (out, _) = run("sva", src, args);
+        assert!(out.contains("sub-init tb.u"), "{}", out);
+        assert!(out.contains("tb-assert tb\n"), "{:?}:\n{}", args, out);
+    }
+}
+
 /// Each top is a root scope of the VCD, as it is standing alone.
 #[test]
 fn vcd_has_one_root_scope_per_top() {

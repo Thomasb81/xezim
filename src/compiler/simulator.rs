@@ -2773,6 +2773,11 @@ struct SvaClockedSite {
     /// actually reports (e.g. its `else $error(...)`), not just tallies.
     pass_action: Option<Statement>,
     fail_action: Option<Statement>,
+    /// Instance scope the assertion is declared in, and the pid its action
+    /// blocks run under, so `%m` and severity messages name that scope
+    /// rather than whichever process ran last.
+    scope: String,
+    action_pid: usize,
     /// LRM §16.5.1 — signal ids referenced anywhere in `body`. Their
     /// slot-entry (Preponed) values are cached in `Simulator::sva_preponed`
     /// and swapped in while this site's predicate is evaluated, so the
@@ -75662,6 +75667,10 @@ impl Simulator {
                             sampled_ids.sort_unstable();
                             sampled_ids.dedup();
                             let (disable, node) = self.sva_compile_site(&body_expanded);
+                            let scope = self.active_instance_scope();
+                            let action_pid = self.next_pid;
+                            self.next_pid += 1;
+                            self.process_scope_hint.insert(action_pid, scope.clone());
                             self.sva_sites.push(SvaClockedSite {
                                 span_key,
                                 scope: self.current_scope.clone(),
@@ -75677,6 +75686,8 @@ impl Simulator {
                                 past_snapshots: HashMap::default(),
                                 pass_action: a.action.as_deref().cloned(),
                                 fail_action: a.else_action.as_deref().cloned(),
+                                scope,
+                                action_pid,
                                 sampled_ids,
                             });
                         }
@@ -80585,16 +80596,23 @@ impl Simulator {
     }
 
     fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
-        let act = self.sva_sites.get(site_idx).and_then(|s| {
-            if passed {
+        let Some((stmt, scope, pid)) = self.sva_sites.get(site_idx).and_then(|s| {
+            let act = if passed {
                 s.pass_action.clone()
             } else {
                 s.fail_action.clone()
-            }
-        });
-        if let Some(stmt) = act {
-            self.exec_statement(&stmt);
-        }
+            };
+            act.map(|a| (a, s.scope.clone(), s.action_pid))
+        }) else {
+            return;
+        };
+        let saved_pid = std::mem::replace(&mut self.current_pid, pid);
+        let saved_scope = std::mem::replace(&mut self.current_scope, scope);
+        let saved_block_scope = std::mem::take(&mut self.m_block_scope);
+        self.exec_statement(&stmt);
+        self.current_pid = saved_pid;
+        self.current_scope = saved_scope;
+        self.m_block_scope = saved_block_scope;
     }
 
     /// LRM §16.5.1 — walk an SVA property body and collect the ids of every
