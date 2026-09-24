@@ -73837,64 +73837,39 @@ impl Simulator {
                     // the whole-value `v` computed above has nothing to
                     // assemble from and left every member x.
                     if let Some(init_expr) = d.init.clone() {
-                        let lv = crate::ast::expr::Expression::new(
-                            crate::ast::expr::ExprKind::Ident(
-                                crate::ast::expr::HierarchicalIdentifier {
-                                    root: None,
-                                    path: vec![crate::ast::expr::HierPathSegment {
-                                        name: crate::ast::Identifier {
-                                            name: d.name.name.clone(),
-                                            span: d.name.span,
-                                        },
-                                        selects: Vec::new(),
-                                    }],
-                                    span: d.name.span,
-                                    cached_signal_id: std::cell::Cell::new(None),
-                                    cached_resolved_name: std::cell::OnceCell::new(),
-                                },
-                            ),
-                            d.name.span,
-                        );
-                        if self
-                            .try_decompose_struct_class_prop_read_assign(&lv, &init_expr)
-                            .is_none()
-                        {
-                            // §7.2: decl-init from any OTHER struct
-                            // source — another local, a queue/array
-                            // element (`op_s x = accesses[i];`, UVM's
-                            // reg-map bus access loop) — copies member
-                            // -wise exactly like the assignment arm.
-                            // The packed `v` stored above has no
-                            // leaves, so without this every member of
-                            // the fresh local stayed x.
-                            if let crate::ast::types::DataType::Struct(su) =
-                                self.resolve_dt(data_type)
-                            {
-                                let src = self.flat_member_name(&init_expr);
-                                match src {
-                                    Some(src) if self.struct_storage_exists(&src, &su) => {
-                                        self.copy_unpacked_struct(&d.name.name, &src, &su);
-                                    }
-                                    // An element of a class-property
-                                    // collection (UVM's `row_info row =
-                                    // m_rows[i];`) keeps its leaves under
-                                    // the instance, not the flat name.
-                                    _ if Self::is_struct_elem_ref(&init_expr) => {
-                                        self.assign_struct_memberwise(&lv, &init_expr, &su, 0);
-                                    }
-                                    _ => {
-                                        let v = self.eval_expr(&init_expr);
-                                        let _ =
-                                            self.spread_into_unpacked_struct(&d.name.name, &su, &v);
-                                    }
-                                }
-                            }
-                        }
+                        self.init_unpacked_struct_local(d, data_type, &init_expr);
                     }
                 } else if let Some(frame) = self.local_stack.last_mut() {
                     frame.insert(d.name.name.clone(), v);
                 } else {
                     self.signals.insert(d.name.name.clone(), v);
+                    // §7.2: an unpacked-struct local of an `initial`/`always`
+                    // block (no call frame) gets its member leaves as
+                    // signals, as module-scope structs do; a member write
+                    // through a selected member (`t.rows[0].level = 2`) found
+                    // no leaf to land on and vanished.
+                    if d.dimensions.is_empty() {
+                        if let crate::ast::types::DataType::Struct(su) = self.resolve_dt(data_type)
+                        {
+                            if Self::spreads_member_wise(&su) {
+                                let mut leaves = Vec::new();
+                                self.unpacked_struct_leaf_defaults(
+                                    &d.name.name,
+                                    &su,
+                                    0,
+                                    &mut leaves,
+                                );
+                                for (k, dv, mdt) in leaves {
+                                    self.register_packed_leaf_layout(&k, &mdt);
+                                    self.widths.insert(k.clone(), dv.width);
+                                    self.signals.insert(k, dv);
+                                }
+                                if let Some(init_expr) = d.init.clone() {
+                                    self.init_unpacked_struct_local(d, data_type, &init_expr);
+                                }
+                            }
+                        }
+                    }
                     // §6.21/§9.3.2: an explicitly `automatic` block
                     // local is a fresh variable per block entry, and a
                     // fork child must capture ITS entry's value. With
@@ -75990,6 +75965,65 @@ impl Simulator {
                 eprintln!(
                     "[xezim][warning] wait_order reached the non-suspending execution path and was skipped (IEEE 1800-2017 §15.5.3)"
                 );
+            }
+        }
+    }
+
+    /// Member-wise declaration initializer of an unpacked-struct local
+    /// (`row_t r = '{...};`, `op_s x = accesses[i];`, `pair_t p = o.orig;`).
+    fn init_unpacked_struct_local(
+        &mut self,
+        d: &VarDeclarator,
+        data_type: &DataType,
+        init_expr: &Expression,
+    ) {
+        let init_expr = init_expr.clone();
+        let lv = crate::ast::expr::Expression::new(
+            crate::ast::expr::ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: crate::ast::Identifier {
+                        name: d.name.name.clone(),
+                        span: d.name.span,
+                    },
+                    selects: Vec::new(),
+                }],
+                span: d.name.span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            d.name.span,
+        );
+        if self
+            .try_decompose_struct_class_prop_read_assign(&lv, &init_expr)
+            .is_none()
+        {
+            // §7.2: decl-init from any OTHER struct
+            // source — another local, a queue/array
+            // element (`op_s x = accesses[i];`, UVM's
+            // reg-map bus access loop) — copies member
+            // -wise exactly like the assignment arm.
+            // The packed `v` stored above has no
+            // leaves, so without this every member of
+            // the fresh local stayed x.
+            if let crate::ast::types::DataType::Struct(su) = self.resolve_dt(data_type) {
+                let src = self.flat_member_name(&init_expr);
+                match src {
+                    Some(src) if self.struct_storage_exists(&src, &su) => {
+                        self.copy_unpacked_struct(&d.name.name, &src, &su);
+                    }
+                    // An element of a class-property
+                    // collection (UVM's `row_info row =
+                    // m_rows[i];`) keeps its leaves under
+                    // the instance, not the flat name.
+                    _ if Self::is_struct_elem_ref(&init_expr) => {
+                        self.assign_struct_memberwise(&lv, &init_expr, &su, 0);
+                    }
+                    _ => {
+                        let v = self.eval_expr(&init_expr);
+                        let _ = self.spread_into_unpacked_struct(&d.name.name, &su, &v);
+                    }
+                }
             }
         }
     }
@@ -111327,6 +111361,75 @@ impl Simulator {
                         None => out.push((mkey, mexpr, mw, is_real)),
                     },
                 }
+            }
+        }
+    }
+
+    /// Leaf keys of an unpacked struct with each leaf's §6.8 default value
+    /// (0 for a 2-state member, 0.0 for a real one, x otherwise) and type.
+    fn unpacked_struct_leaf_defaults(
+        &mut self,
+        key_prefix: &str,
+        su: &crate::ast::types::StructUnionType,
+        depth: u32,
+        out: &mut Vec<(String, Value, DataType)>,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        for m in &su.members {
+            let mw = super::elaborate::resolve_type_width(
+                &m.data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            let dv = if super::elaborate::is_type_real(&m.data_type) {
+                Value::from_f64(0.0)
+            } else if super::elaborate::is_type_two_state_resolved(
+                &m.data_type,
+                &self.module.typedef_types,
+            ) {
+                Value::zero(mw)
+            } else {
+                Value::new(mw)
+            };
+            let nested = self.unpacked_struct_of(&m.data_type);
+            for md in &m.declarators {
+                let mkey = format!("{}.{}", key_prefix, md.name.name);
+                let keys = if md.dimensions.is_empty() {
+                    vec![mkey]
+                } else {
+                    match self.member_dim_indices(&md.dimensions) {
+                        Some(list) => list.iter().map(|i| format!("{}[{}]", mkey, i)).collect(),
+                        None => continue,
+                    }
+                };
+                for k in keys {
+                    match &nested {
+                        Some(inner) => {
+                            self.unpacked_struct_leaf_defaults(&k, &inner.clone(), depth + 1, out)
+                        }
+                        None => out.push((k, dv.clone(), m.data_type.clone())),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A packed-struct member leaf (`s.p` of `struct { pk_t p; } s`) aliases
+    /// its fields into the leaf, as a packed-struct variable does.
+    fn register_packed_leaf_layout(&mut self, key: &str, dt: &DataType) {
+        if let Some(fields) = super::elaborate::packed_struct_field_layout(
+            dt,
+            &self.module.parameters,
+            &self.module.typedefs,
+            &self.module.typedef_types,
+        ) {
+            if !fields.is_empty() {
+                self.module
+                    .packed_struct_fields
+                    .insert(key.to_string(), fields);
             }
         }
     }

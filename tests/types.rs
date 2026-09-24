@@ -33,6 +33,8 @@ mod bits_of_type_operands;
 mod bits_of_type_param_expr;
 #[path = "types/bits_package_scoped_type_width.rs"]
 mod bits_package_scoped_type_width;
+#[path = "types/block_local_unpacked_struct.rs"]
+mod block_local_unpacked_struct;
 #[path = "types/block_local_width_in_index_shift.rs"]
 mod block_local_width_in_index_shift;
 #[path = "types/byte_local_narrow.rs"]
