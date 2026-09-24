@@ -284,3 +284,29 @@ endmodule
          and a unique-list array slice expands to its elements"
     );
 }
+
+/// §11.6.1 — every term of a sum is extended to the comparison's context
+/// width: 4-bit `15 + 15 + 6` is 36. Masking the partial sum `15 + 15` at the
+/// operands' 4 bits made it 20, so the infeasible first call succeeded and the
+/// feasible second one failed. Cross-checked against the reference simulator.
+#[test]
+fn multi_term_sum_compares_at_context_width() {
+    const SRC: &str = r#"
+class k;
+  rand bit [3:0] w, x, y;
+  constraint c { w == 15; x == 15; y == 6; }
+endclass
+module tb;
+  initial begin
+    automatic k o = new;
+    automatic int r1, r2;
+    r1 = o.randomize() with { w + x + y == 20; };
+    r2 = o.randomize() with { w + x + y == 36; };
+    $display("R1=%0d R2=%0d", r1, r2);
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(out.iter().any(|l| l.contains("R1=0 R2=1")), "{out:?}");
+}

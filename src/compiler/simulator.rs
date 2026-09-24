@@ -121273,75 +121273,54 @@ impl Simulator {
     /// `None` for anything the exact model cannot represent (X/Z, real, > 64
     /// bits) — every caller then falls back to the ordinary evaluator.
     fn exact_int(&mut self, e: &Expression) -> Option<(i128, u32, bool)> {
+        let mut leaves = Vec::new();
+        let (w, s) = self.exact_leaves(e, &mut leaves)?;
+        let v = self.exact_fold(e, &leaves, &mut 0, w, s)?;
+        Some((v, w, s))
+    }
+
+    /// §11.8.2 — the leaves of a context-determined operand tree, evaluated
+    /// once in fold order as `(bits, width, signed)`, and the tree's own
+    /// `(width, signed)`. The expression's signedness governs how EVERY leaf
+    /// is extended, so it has to be known before any operand is converted.
+    fn exact_leaves(
+        &mut self,
+        e: &Expression,
+        out: &mut Vec<(u64, u32, bool)>,
+    ) -> Option<(u32, bool)> {
         match &e.kind {
-            ExprKind::Paren(inner) => self.exact_int(inner),
-            ExprKind::Unary { op, operand } => {
-                let (v, w, s) = self.exact_int(operand)?;
-                match op {
-                    UnaryOp::Plus => Some((v, w, s)),
-                    // Negation of an unsigned operand still wraps at its own
-                    // width; the exact value is carried and masked at the top.
-                    UnaryOp::Minus => Some((-v, w, s)),
-                    _ => None,
+            ExprKind::Paren(inner) => self.exact_leaves(inner, out),
+            ExprKind::Unary {
+                op: UnaryOp::Plus | UnaryOp::Minus,
+                operand,
+            } => self.exact_leaves(operand, out),
+            ExprKind::Unary { .. } => None,
+            ExprKind::Binary { op, left, right } => match op {
+                BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor => {
+                    let (lw, ls) = self.exact_leaves(left, out)?;
+                    let (rw, rs) = self.exact_leaves(right, out)?;
+                    let w = lw.max(rw).max(1);
+                    if w > 64 {
+                        return None;
+                    }
+                    // §11.8.1: unsigned as soon as EITHER operand is.
+                    Some((w, ls && rs))
                 }
-            }
-            ExprKind::Binary { op, left, right } => {
-                let (lv, lw, ls) = self.exact_int(left)?;
-                let (rv, rw, rs) = self.exact_int(right)?;
-                let w = lw.max(rw).max(1);
-                if w > 64 {
-                    return None;
-                }
-                // §11.8.1: the expression is unsigned as soon as EITHER operand
-                // is, and each operand is converted to that signedness BEFORE
-                // width extension.
-                let s = ls && rs;
-                let l = Self::as_ctx(lv, lw, s);
-                let r = Self::as_ctx(rv, rw, s);
-                let v = match op {
-                    BinaryOp::Add => l.checked_add(r)?,
-                    BinaryOp::Sub => l.checked_sub(r)?,
-                    BinaryOp::Mul => l.checked_mul(r)?,
-                    // Not ring operations: reduce to the context width first.
-                    BinaryOp::Div => {
-                        let (a, b) = (Self::as_ctx(l, w, s), Self::as_ctx(r, w, s));
-                        if b == 0 {
-                            return None;
-                        }
-                        a / b
-                    }
-                    BinaryOp::Mod => {
-                        let (a, b) = (Self::as_ctx(l, w, s), Self::as_ctx(r, w, s));
-                        if b == 0 {
-                            return None;
-                        }
-                        a % b
-                    }
-                    BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => {
-                        if !(0..64).contains(&r) {
-                            return None;
-                        }
-                        Self::as_ctx(l, w, s).checked_shl(r as u32)?
-                    }
-                    BinaryOp::ShiftRight => {
-                        if !(0..64).contains(&r) {
-                            return None;
-                        }
-                        (Self::bits_at(l, w) >> r) as i128
-                    }
-                    BinaryOp::ArithShiftRight => {
-                        if !(0..64).contains(&r) {
-                            return None;
-                        }
-                        Self::as_ctx(l, w, s) >> r
-                    }
-                    BinaryOp::BitAnd => (Self::bits_at(l, w) & Self::bits_at(r, w)) as i128,
-                    BinaryOp::BitOr => (Self::bits_at(l, w) | Self::bits_at(r, w)) as i128,
-                    BinaryOp::BitXor => (Self::bits_at(l, w) ^ Self::bits_at(r, w)) as i128,
-                    _ => return None,
-                };
-                Some((v, w, s))
-            }
+                // The shift amount is self-determined and never affects the
+                // result's width or sign; `exact_fold` evaluates it on its own.
+                BinaryOp::ShiftLeft
+                | BinaryOp::ArithShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::ArithShiftRight => self.exact_leaves(left, out),
+                _ => None,
+            },
             // Everything else (identifiers, `$signed({1'b0, l_val})`, packed
             // struct members, array elements, ternaries, function calls) goes
             // through the ordinary evaluator, which already gets width and
@@ -121352,26 +121331,93 @@ impl Simulator {
                     return None;
                 }
                 let raw = v.to_u64()?;
-                Some((
-                    Self::as_ctx(raw as i128, v.width, v.is_signed),
-                    v.width,
-                    v.is_signed,
-                ))
+                out.push((raw, v.width, v.is_signed));
+                Some((v.width, v.is_signed))
+            }
+        }
+    }
+
+    /// Fold an operand tree whose leaves `exact_leaves` collected, in the
+    /// context `(w, s)`. Each leaf is extended per the CONTEXT signedness;
+    /// intermediate +, -, * results stay exact (they are ring operations mod
+    /// 2^w, so the caller masks once) — masking them at a subtree's own width
+    /// turned `a + b + c == 6` over 4-bit operands into a mod-16 compare.
+    fn exact_fold(
+        &mut self,
+        e: &Expression,
+        leaves: &[(u64, u32, bool)],
+        k: &mut usize,
+        w: u32,
+        s: bool,
+    ) -> Option<i128> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.exact_fold(inner, leaves, k, w, s),
+            ExprKind::Unary { op, operand } => {
+                let v = self.exact_fold(operand, leaves, k, w, s)?;
+                Some(if *op == UnaryOp::Minus { -v } else { v })
+            }
+            ExprKind::Binary { op, left, right } => {
+                let l = self.exact_fold(left, leaves, k, w, s)?;
+                if matches!(
+                    op,
+                    BinaryOp::ShiftLeft
+                        | BinaryOp::ArithShiftLeft
+                        | BinaryOp::ShiftRight
+                        | BinaryOp::ArithShiftRight
+                ) {
+                    // §11.4.10: the amount is always read as unsigned.
+                    let (a, aw, _) = self.exact_int(right)?;
+                    let r = Self::bits_at(a, aw);
+                    if r >= 64 {
+                        return None;
+                    }
+                    return Some(match op {
+                        BinaryOp::ShiftRight => (Self::bits_at(l, w) >> r) as i128,
+                        BinaryOp::ArithShiftRight => Self::as_ctx(l, w, s) >> r,
+                        _ => Self::as_ctx(l, w, s).checked_shl(r as u32)?,
+                    });
+                }
+                let r = self.exact_fold(right, leaves, k, w, s)?;
+                Some(match op {
+                    BinaryOp::Add => l.checked_add(r)?,
+                    BinaryOp::Sub => l.checked_sub(r)?,
+                    BinaryOp::Mul => l.checked_mul(r)?,
+                    // Not ring operations: reduce to the context width first.
+                    BinaryOp::Div | BinaryOp::Mod => {
+                        let (a, b) = (Self::as_ctx(l, w, s), Self::as_ctx(r, w, s));
+                        if b == 0 {
+                            return None;
+                        }
+                        if *op == BinaryOp::Div { a / b } else { a % b }
+                    }
+                    BinaryOp::BitAnd => (Self::bits_at(l, w) & Self::bits_at(r, w)) as i128,
+                    BinaryOp::BitOr => (Self::bits_at(l, w) | Self::bits_at(r, w)) as i128,
+                    BinaryOp::BitXor => (Self::bits_at(l, w) ^ Self::bits_at(r, w)) as i128,
+                    _ => return None,
+                })
+            }
+            _ => {
+                let (raw, lw, _) = *leaves.get(*k)?;
+                *k += 1;
+                Some(Self::as_ctx(raw as i128, lw, s))
             }
         }
     }
 
     /// §11.6.1 — judge a constraint comparison with both operands extended to
-    /// the CONTEXT width max(w_lhs, w_rhs). `None` when the exact model does
-    /// not apply (X/Z, real, unsupported operator).
+    /// the CONTEXT width max(w_lhs, w_rhs) and signedness. `None` when the
+    /// exact model does not apply (X/Z, real, unsupported operator).
     fn exact_cmp(&mut self, op: &BinaryOp, left: &Expression, right: &Expression) -> Option<bool> {
-        let (lv, lw, ls) = self.exact_int(left)?;
-        let (rv, rw, rs) = self.exact_int(right)?;
+        let (mut ll, mut rl) = (Vec::new(), Vec::new());
+        let (lw, ls) = self.exact_leaves(left, &mut ll)?;
+        let (rw, rs) = self.exact_leaves(right, &mut rl)?;
         let w = lw.max(rw).max(1);
         if w > 64 {
             return None;
         }
         let signed = ls && rs;
+        let lv = self.exact_fold(left, &ll, &mut 0, w, signed)?;
+        let rv = self.exact_fold(right, &rl, &mut 0, w, signed)?;
         let lb = Self::bits_at(lv, w);
         let rb = Self::bits_at(rv, w);
         Some(match op {
