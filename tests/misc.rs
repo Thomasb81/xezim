@@ -260,6 +260,8 @@ mod sv_compliance_runner;
 mod sv_logic_implication;
 #[path = "misc/sva_action_firing.rs"]
 mod sva_action_firing;
+#[path = "misc/sva_named_property_in_instance.rs"]
+mod sva_named_property_in_instance;
 #[path = "misc/sva_preponed_sampling.rs"]
 mod sva_preponed_sampling;
 #[path = "misc/timescale.rs"]
