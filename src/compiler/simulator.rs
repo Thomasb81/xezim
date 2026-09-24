@@ -104207,6 +104207,9 @@ impl Simulator {
                 if self.is_interface_instance(head) {
                     return Some(head.clone());
                 }
+                if let Some(p) = self.iface_instance_by_path(rvalue) {
+                    return Some(p);
+                }
                 let oh = self.eval_ident_handle(head).unwrap_or(0);
                 self.virtual_iface_bindings
                     .get(&(oh, h.path[1].name.name.clone()))
@@ -104222,11 +104225,16 @@ impl Simulator {
                         }
                     }
                 }
+                if let Some(p) = self.iface_instance_by_path(rvalue) {
+                    return Some(p);
+                }
                 let oh = self.eval_handle_expr(expr).unwrap_or(0);
                 self.virtual_iface_bindings
                     .get(&(oh, member.name.clone()))
                     .map(|(b, _)| b.clone())
             }
+            // `a.b.d` / `g[0].a.d` — a nested interface instance.
+            ExprKind::Ident(_) => self.iface_instance_by_path(rvalue),
             // `INT[i]` — an element of an interface-instance array
             // (`interrupt_if INT[N]()`). Bind to the element's name so
             // `vif.member` resolves to `INT[<i>].member` (interrupt examples set
@@ -104242,6 +104250,77 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// §23.6/§25.9: the instance path of an interface instance named by a
+    /// HIERARCHICAL reference (`a.d`, `g[0].a.d`, `top.a.d`), searched upward
+    /// from the executing instance scope; `None` when it names no interface
+    /// instance. Only the head of a two-segment name was ever tried (as a
+    /// modport view), so `px.vif = a.d` bound nothing and every call through
+    /// the handle returned at once.
+    fn iface_instance_by_path(&self, e: &Expression) -> Option<String> {
+        let mut segs = self.hier_segments(e)?;
+        if segs.len() < 2 {
+            return None;
+        }
+        if segs[0] == "$root" {
+            segs.remove(0);
+        }
+        let path = segs.join(".");
+        if segs.len() >= 2 && segs[0] == self.module.name {
+            let rest = segs[1..].join(".");
+            if self.is_interface_instance(&rest) {
+                return Some(rest);
+            }
+        }
+        // §23.8 upward name resolution from the executing instance.
+        let scope = self.name_resolve_hint.borrow().clone();
+        if let Some(scope) = scope {
+            let mut sc = scope.as_str();
+            loop {
+                let cand = format!("{}.{}", sc, path);
+                if self.is_interface_instance(&cand) {
+                    return Some(cand);
+                }
+                match sc.rfind('.') {
+                    Some(p) => sc = &sc[..p],
+                    None => break,
+                }
+            }
+        }
+        self.is_interface_instance(&path).then_some(path)
+    }
+
+    /// The segments of a hierarchical reference with every select evaluated
+    /// (`g[1].a.d` -> `["g[1]", "a", "d"]`); `None` for any other shape.
+    fn hier_segments(&self, e: &Expression) -> Option<Vec<String>> {
+        fn segs_of(sim: &Simulator, e: &Expression, out: &mut Vec<String>) -> Option<()> {
+            match &e.kind {
+                ExprKind::Ident(h) => {
+                    for seg in &h.path {
+                        let mut s = seg.name.name.clone();
+                        for sel in &seg.selects {
+                            s.push_str(&format!("[{}]", sim.eval_scalar_self(sel)?));
+                        }
+                        out.push(s);
+                    }
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    segs_of(sim, expr, out)?;
+                    out.push(member.name.clone());
+                }
+                ExprKind::Index { expr, index } => {
+                    segs_of(sim, expr, out)?;
+                    let i = sim.eval_scalar_self(index)?;
+                    out.last_mut()?.push_str(&format!("[{}]", i));
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+        let mut segs = Vec::new();
+        segs_of(self, e, &mut segs)?;
+        Some(segs)
     }
 
     /// LRM §25.9: build the `local_iface_aliases` entry (formal_name ->
@@ -104785,6 +104864,14 @@ impl Simulator {
             segs.extend(tail.iter().map(|t| t.as_str()));
             if let Some(full) = in_tasks(segs.join(".")) {
                 return Some(full);
+            }
+        } else if let Some(segs) = self.hier_segments(func) {
+            // A path through generate-block / instance-array selects
+            // (`g[0].a.d.wait_rst()`) names the task by its evaluated path.
+            if segs.len() >= 2 && segs.iter().any(|sg| sg.contains('[')) {
+                if let Some(full) = in_tasks(segs.join(".")) {
+                    return Some(full);
+                }
             }
         }
         // Form 2: nested owner — split the callee into

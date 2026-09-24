@@ -133,6 +133,8 @@ mod unpacked_struct_port;
 mod vif_arrays_and_null_default;
 #[path = "hierarchy/vif_clocking_in_methods.rs"]
 mod vif_clocking_in_methods;
+#[path = "hierarchy/vif_hierarchical_instance_path.rs"]
+mod vif_hierarchical_instance_path;
 #[path = "hierarchy/vif_in_subroutines.rs"]
 mod vif_in_subroutines;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
