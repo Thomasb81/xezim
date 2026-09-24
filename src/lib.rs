@@ -1023,8 +1023,9 @@ fn simulate_multi_inner(
         let sdf = xezim_core::sdf::parse_sdf(&sdf_content)
             .map_err(|e| format!("SDF parse error in '{}': {}", sdf_path, e))?;
         let select = sdf_select.unwrap_or(xezim_core::sdf::DelaySelect::Typ);
-        let sim_timescale = 1e-9;
-        let annotation = xezim_core::sdf::annotate_sdf(&sdf, sim_timescale, select);
+        // SDF values scale to the simulation tick (the finest precision in
+        // the design), like every other delay.
+        let annotation = xezim_core::sdf::annotate_sdf(&sdf, sim.tick_s, select);
         sim.sdf_annotation = Some(annotation);
     }
     sim.compile();

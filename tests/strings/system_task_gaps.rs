@@ -244,6 +244,59 @@ endmodule
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// SDF values count in the SDF TIMESCALE and scale to the simulation tick:
+/// in a 1ns/1ps design the 5 ns IOPATH is 5000 ticks, not 5 (it used to be
+/// scaled as if the tick were always 1 ns). The reference simulator reads
+/// the same file as mid=0 fin=1.
+#[test]
+fn sdf_annotate_scales_to_the_simulation_tick() {
+    let dir = std::env::temp_dir().join(format!("xezim_sdf_ps_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sdf = dir.join("t.sdf");
+    std::fs::write(
+        &sdf,
+        r#"(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 1ns)
+  (CELL (CELLTYPE "andcell") (INSTANCE u1)
+    (DELAY (ABSOLUTE (IOPATH a y (5.0:5.0:5.0) (5.0:5.0:5.0))
+                     (IOPATH b y (5.0:5.0:5.0) (5.0:5.0:5.0)))))
+)
+"#,
+    )
+    .unwrap();
+    let src = format!(
+        r#"
+`timescale 1ns/1ps
+module andcell(input a, input b, output y);
+  assign y = a & b;
+  specify (a => y) = 0; (b => y) = 0; endspecify
+endmodule
+module tb;
+  reg a, b; wire y;
+  reg mid, fin;
+  andcell u1(.a(a), .b(b), .y(y));
+  initial begin
+    $sdf_annotate("{}");
+    a = 1; b = 0;
+    #10 b = 1;
+    #3  mid = y;
+    #10 fin = y;
+  end
+endmodule
+"#,
+        sdf.display()
+    );
+    let sim = simulate(&src, 100_000).expect("simulate failed");
+    assert_eq!(
+        u(&sim, "mid") & 1,
+        0,
+        "5 ns IOPATH must postpone y past t=13"
+    );
+    assert_eq!(u(&sim, "fin") & 1, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn sdf_annotate_missing_file_is_fatal() {
     let src = r#"

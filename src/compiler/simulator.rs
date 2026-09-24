@@ -77260,9 +77260,8 @@ impl Simulator {
                         }
                         Ok(sdf) => {
                             let select = self.sdf_select.unwrap_or(super::sdf::DelaySelect::Typ);
-                            // Same fixed 1ns simulation-timescale assumption as
-                            // the CLI application in lib.rs.
-                            let ann = super::sdf::annotate_sdf(&sdf, 1e-9, select);
+                            // Scaled to the simulation tick, as the CLI's --sdf.
+                            let ann = super::sdf::annotate_sdf(&sdf, self.tick_s, select);
                             self.sdf_annotation = Some(ann);
                             self.apply_sdf_annotation_late();
                         }
