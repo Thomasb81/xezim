@@ -101591,6 +101591,13 @@ impl Simulator {
             false
         };
         let saved_item = self.local_stack.last().and_then(|f| f.get("item").cloned());
+        let saved_index = self
+            .local_stack
+            .last()
+            .and_then(|f| f.get("item.index").cloned());
+        let iter_index = iter_name
+            .filter(|nm| *nm != "item")
+            .map(|nm| format!("{}.index", nm));
         let saved_alias = self.item_alias.take();
         let saved_iter = self.locator_iter.clone();
         self.locator_iter = iter_name.unwrap_or("item").to_string();
@@ -101606,11 +101613,20 @@ impl Simulator {
                 .get_signal_value_by_name(&elem)
                 .unwrap_or_else(|| Value::zero(32));
             if let Some(f) = self.local_stack.last_mut() {
+                // §7.12.4: `item.index` (or `<iterator>.index`) is the
+                // element's index, an int; it was never bound here, so
+                // `find with (item == item.index)` compared against 0.
+                let mut ix = Value::from_u64(i as u64, 32);
+                ix.is_signed = true;
                 f.insert("item".to_string(), v.clone());
+                f.insert("item.index".to_string(), ix.clone());
                 if let Some(nm) = iter_name {
                     if nm != "item" {
                         f.insert(nm.to_string(), v.clone());
                     }
+                }
+                if let Some(k) = &iter_index {
+                    f.insert(k.clone(), ix);
                 }
             }
             match filter {
@@ -101636,6 +101652,17 @@ impl Simulator {
                 None => {
                     f.remove("item");
                 }
+            }
+            match saved_index {
+                Some(v) => {
+                    f.insert("item.index".to_string(), v);
+                }
+                None => {
+                    f.remove("item.index");
+                }
+            }
+            if let Some(k) = &iter_index {
+                f.remove(k);
             }
         }
         if pushed_frame {

@@ -53,6 +53,8 @@ mod fixed_array_member_pattern_forms;
 mod foreach_blocking_resume;
 #[path = "collections/foreach_negative_dims.rs"]
 mod foreach_negative_dims;
+#[path = "collections/locator_item_index.rs"]
+mod locator_item_index;
 #[path = "collections/lrm_clause7_arrays.rs"]
 mod lrm_clause7_arrays;
 #[path = "collections/mailbox_array_new.rs"]
