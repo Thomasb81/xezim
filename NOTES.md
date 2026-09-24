@@ -9,6 +9,22 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* Casts evaluate their operand at the cast type's width (IEEE 1800-2017
+  §6.24.1): `int'(a + b)` over 8-bit operands is 300, not 44. This holds
+  in procedural code, continuous assigns, constants, packed dimensions and
+  constraints; `signed'`/`unsigned'` keep the operand's own width.
+  `pkg::T'(x)` casts are no longer dropped, and interpreted `/` and `%`
+  size by both operands (`(a + b) / 3` gave 14 instead of 100).
+* Typed parameters use their declared width as the context of their value
+  (`localparam int P = A + B`), and module header parameters keep their
+  declared signedness (`parameter bit [7:0] P = 200` read -56).
+* Reductions and sorts with a `with` clause work on class properties
+  (`o.arr.sum() with (item * 2)`, `this.arr`, `objs[i].arr`), and
+  associative arrays reduce over their keys (`aa.sum()` returned 0).
+* Associative-array elements follow their declared type: a missing key
+  reads 0 for `int` and x for `integer`/`logic` (function and task locals
+  read a 1-bit x), stores take the element's signedness, and `++`/`--`
+  keep the operand's signedness (`seen[k]++` on a new key gave x).
 * Specify-block timing checks are modelled: `$setup`, `$hold`,
   `$setuphold`, `$recovery`, `$removal`, `$recrem`, `$skew`, `$timeskew`,
   `$fullskew`, `$period`, `$width` and `$nochange`, with edge qualifiers,
