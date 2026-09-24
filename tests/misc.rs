@@ -375,6 +375,8 @@ mod two_state_lowering_shapes;
 mod two_state_wide_reduction;
 #[path = "misc/udn_resolver_compiled.rs"]
 mod udn_resolver_compiled;
+#[path = "misc/undeclared_in_subroutines.rs"]
+mod undeclared_in_subroutines;
 #[path = "misc/while_continue_final_iter.rs"]
 mod while_continue_final_iter;
 #[path = "misc/zero_width_select_unselected_generate.rs"]
