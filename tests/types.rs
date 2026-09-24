@@ -404,6 +404,8 @@ mod task_fsm_compile;
 mod tf_port_direction_inheritance;
 #[path = "types/tf_port_typedef_packed_dims.rs"]
 mod tf_port_typedef_packed_dims;
+#[path = "types/two_state_instance_scalars.rs"]
+mod two_state_instance_scalars;
 #[path = "types/two_state_loop_blocks.rs"]
 mod two_state_loop_blocks;
 #[path = "types/type_id_create_applies_override.rs"]

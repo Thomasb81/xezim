@@ -90977,6 +90977,10 @@ impl Simulator {
             // after scalar strings had been fixed.
             let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
             let mut resized = if w == 0 || is_str { val } else { val.resize(w) };
+            // §6.11.1: a 2-state destination drops x/z.
+            if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
+                resized = resized.to_two_state();
+            }
             // §6.11.1: storage keeps the SIGNAL'S declared signedness, not the
             // rvalue's. An unsized decimal literal is signed (§5.7.1), so
             // `barr[i] = 9` stamped is_signed onto a `bit [3:0]` element and
@@ -91012,6 +91016,9 @@ impl Simulator {
             let w = self.signal_widths[id];
             let is_str = self.signal_is_string.get(id).copied().unwrap_or(false);
             let mut resized = if is_str { val } else { val.resize(w) };
+            if self.signal_two_state.get(id).copied().unwrap_or(false) && resized.has_xz() {
+                resized = resized.to_two_state();
+            }
             // §6.11.1: storage keeps the ELEMENT'S declared signedness, not the
             // rvalue's. An unsized decimal literal is signed (§5.7.1), so
             // `barr[i] = 9` stamped is_signed onto a `bit [3:0]` cell and every
