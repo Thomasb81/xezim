@@ -490,6 +490,32 @@ pub enum Insn {
     /// unlike the silent function form — prints a runtime error on failure.
     Cast(CastDest, RegId, RegId, Box<Expression>, bool),
 
+    /// class-perf Step 9d: materialize the ITERATION KEYS of a class member
+    /// collection for a compiled `foreach` — `foreach (this.m[k])` /
+    /// `foreach (m[k])` / `foreach (obj.m[k])` — into a compile-time-
+    /// indexed runtime slot. (slot, handle_reg, member). The exec arm
+    /// mirrors the interpreter's single-loop-var foreach materialization on
+    /// the resolved store — `array_iter_keys` (the `.size`-shadow dense
+    /// range, the assoc first-key-seg scan with dedup, string vs numeric
+    /// §7.9 ordering), `assoc_index_width_for` for the key width/signedness
+    /// (§7.8.2), then the exact key→Value conversion of the sync foreach
+    /// arm — so the iteration set and loop-var Values are byte-identical.
+    /// `handle_reg == 0` selects the bare route (`instance_assoc_member`,
+    /// statics included); otherwise the register carries the base handle
+    /// and the store is `handle_collection_name(handle, member)` — an
+    /// unresolved store materializes NO keys, which yields ZERO iterations
+    /// for a null receiver, matching the interpreter's expr_assoc_name
+    /// fall-through. The keys are SNAPSHOT at loop entry (the sync foreach
+    /// materializes once too); the body cannot suspend in method mode
+    /// (`allow_waits = false`), so no resume re-entry can reach them.
+    ForeachKeys(u32, RegId, Box<str>),
+    /// Advance a compiled foreach: pop the next key Value from slot `slot`
+    /// into `var`; `ok` = 0 when the slot is exhausted (loop exit).
+    /// (ok_dest, slot, var_dest). Pairs with ForeachKeys; the loop-var
+    /// binding target is a VM register the compiler inserted into
+    /// `local_var_regs` for the loop's duration.
+    ForeachNext(RegId, u32, RegId),
+
     Nop,
 
     /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
@@ -656,6 +682,10 @@ pub struct CompiledBlock {
     /// overwhelming majority of blocks write each target once and take the
     /// plain push path.
     pub nba_dup_targets: bool,
+    /// class-perf Step 9d: how many distinct foreach key slots this block
+    /// addresses (compile-time indices into the runtime arena). Zero for
+    /// every block without a compiled member-collection foreach.
+    pub foreach_slots: u32,
 }
 
 /// class-perf Step 7: one resolved method-dispatch target, shared by `Rc`
@@ -844,6 +874,13 @@ impl Insn {
                 *c += rb;
                 *d += rb;
             }
+            // Compiled foreach: the key slot is an ARENA index, not a
+            // register — only the var register rebases. No branch targets.
+            ForeachKeys(_, h, _) => *h += rb,
+            ForeachNext(o, _, v) => {
+                *o += rb;
+                *v += rb;
+            }
             Concat(a, v) => {
                 *a += rb;
                 for r in v.iter_mut() {
@@ -958,6 +995,8 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::LoadCollElem(..) => "CollElemR,",
         Insn::StoreCollElem(..) => "CollElemW,",
         Insn::Cast(..) => "Cast",
+        Insn::ForeachKeys(..) => "FeKeys",
+        Insn::ForeachNext(..) => "FeNext",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
@@ -1191,6 +1230,12 @@ pub struct BytecodeCompiler<'a> {
     /// inside such a loop silently reads the loop var as X. Any unsupported
     /// construct must instead fail the whole loop back to the AST path.
     reg_var_loop_depth: u32,
+    /// class-perf Step 9d: number of runtime key slots this compiled block
+    /// needs — one per `foreach` over a member collection. The arena itself
+    /// lives on the Simulator (swapped per method run so nested compiled
+    /// calls never alias an outer loop's keys); the compiler only records
+    /// how many distinct slots the block addresses.
+    foreach_slot_count: u32,
     /// Expression-level fallback is only sound where surrounding analysis
     /// doesn't need to SEE the expression's reads: edge blocks, whose
     /// sensitivity is the explicit clock list. Comb entries build their
@@ -1423,6 +1468,7 @@ impl<'a> BytecodeCompiler<'a> {
             packed_full_dims: None,
             loop_break_patches: Vec::new(),
             loop_continue_patches: Vec::new(),
+            foreach_slot_count: 0,
             string_signals: None,
             local_var_is_string: HashSet::default(),
             local_var_is_real: HashSet::default(),
@@ -3165,6 +3211,167 @@ impl<'a> BytecodeCompiler<'a> {
                     || name == crate::intra_delay::INTRA_EVENT_MARKER
                     || name == crate::intra_delay::INTRA_CYCLE_MARKER
         )
+    }
+
+    /// class-perf Step 9d: compile `foreach (m[k])` / `foreach (this.m[k])`
+    /// / `foreach (obj.m[k])` — a class member collection iterable via the
+    /// 9b element-access machinery — as a REAL bytecode loop:
+    ///
+    /// ```text
+    ///   ForeachKeys(slot, handle_reg, member)      // key snapshot (Values)
+    /// top:
+    ///   pos = 0 (hoisted by the caller shape below)
+    ///   ForeachNext(ok, slot, var_reg)             // pop next key → var
+    ///   BranchIfFalse(ok, end)
+    ///   <body>
+    ///   Jump(top)
+    /// end:
+    /// ```
+    ///
+    /// `continue` patches to the ForeachNext (the var advance IS the loop
+    /// head); `break` patches past the exit branch. The loop var is bound
+    /// to a VM register inserted into `local_var_regs` for the loop's
+    /// duration (outer binding saved/restored, like the For arm's loop
+    /// vars) with `reg_var_loop_depth` raised so no body statement can
+    /// fall back to AST and mis-read the register as a signal.
+    ///
+    /// Returns `Some(false)` when the shape is ADMITTED but any part fails
+    /// to lower (all-or-nothing: the whole method falls back to the AST
+    /// interpreter), `Some(true)` on success, `None` when the shape does
+    /// not belong to this arm (callers keep their existing paths).
+    ///
+    /// Byte-parity notes:
+    /// * the key snapshot and each loop-var Value are produced by the
+    ///   runtime ForeachKeys/ForeachNext exec arms using the interpreter's
+    ///   OWN helpers (`array_iter_keys`, `assoc_index_width_for`, the sync
+    ///   foreach's key→Value conversion) — identical iteration set,
+    ///   ordering, widths and signedness.
+    /// * the body may MUTATE the collection; the interpreter's sync foreach
+    ///   also materializes once at entry (the `ForeachTail` walker carries
+    ///   the frozen `keys` vector), so a snapshot matches. Only a body
+    ///   that SUSPENDS (a wait) can observe the live-size re-check of the
+    ///   blocking-unroll path — impossible here (method mode has no waits;
+    ///   a task call would defect to AST with the whole method).
+    /// * a null dotted receiver resolves no store → NO iterations,
+    ///   matching the interpreter's `expr_assoc_name` fall-through.
+    /// * the loop var has NO interpreter storage; body statements that
+    ///   cannot compile are what force the all-or-nothing fallback, so
+    ///   register-only visibility is sound.
+    fn try_compile_member_foreach(
+        &mut self,
+        array: &crate::ast::expr::Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        body: &crate::ast::stmt::Statement,
+    ) -> Option<bool> {
+        // Single loop variable only.
+        let var = match vars {
+            [Some(v)] => v.name.clone(),
+            _ => return None,
+        };
+        // The iterable must be exactly a member-collection element-access
+        // receiver (bare member / `this.member` / `obj.member`), with the
+        // same collision exclusions as the 9b element reads.
+        let (coll, bare, base_expr) = self.member_coll_elem_target(array)?;
+        // Method mode only; module-level foreach keeps its interpreter paths.
+        if !self.method_mode {
+            return None;
+        }
+        // break/continue inside the body are exactly what the REAL loop
+        // machinery below supports — do not decline them (unlike the
+        // unrolled local-array arm). Body statements that cannot lower
+        // fail the loop compile (all-or-nothing) below.
+        let _ = body;
+
+        // Dotted receiver: the handle register must be live before the
+        // ForeachKeys insn. Bare receivers use the sentinel handle 0.
+        let handle_reg = if bare {
+            0
+        } else {
+            let inner = base_expr.expect("dotted base present");
+            match self.method_member_handle_reg(&inner) {
+                Some(r) => r,
+                None => self.compile_expr(&inner, 0)?,
+            }
+        };
+
+        // Allocate the runtime key slot (an ARENA index, not a register)
+        // and the loop var / ok registers. The per-slot position cursor
+        // lives IN the arena entry — no register needed.
+        let slot = self.next_foreach_slot();
+        let var_reg = self.alloc_reg();
+        let ok = self.alloc_reg();
+
+        // Bind the loop var BEFORE the key materialization: the snapshot
+        // conversion only stores into the var register, but body reads of
+        // the var must resolve through local_var_regs for the whole loop.
+        let saved_local = self.local_var_regs.insert(var.clone(), (var_reg, 0));
+        self.reg_var_loop_depth += 1;
+
+        self.emit(Insn::ForeachKeys(slot, handle_reg, coll.into_boxed_str()));
+        let top = self.insns.len() as u32;
+        self.emit(Insn::ForeachNext(ok, slot, var_reg));
+        let br = self.insns.len();
+        self.emit(Insn::BranchIfFalse(ok, 0));
+
+        self.loop_break_patches.push(Vec::new());
+        self.loop_continue_patches.push(Vec::new());
+        let body_ok = self.compile_stmt(body);
+        let cont_patches = self.loop_continue_patches.pop();
+        let brk_patches = self.loop_break_patches.pop();
+        if !body_ok {
+            // Undo the loop var binding and the depth guard before the
+            // all-or-nothing failure propagates.
+            match saved_local {
+                Some(b) => {
+                    self.local_var_regs.insert(var, b);
+                }
+                None => {
+                    self.local_var_regs.remove(&var);
+                }
+            }
+            self.reg_var_loop_depth -= 1;
+            self.bail("Foreach_member_body");
+            return Some(false);
+        }
+        self.emit(Insn::Jump(top));
+        let end = self.insns.len() as u32;
+        if let Insn::BranchIfFalse(reg, _) = self.insns[br] {
+            self.insns[br] = Insn::BranchIfFalse(reg, end);
+        }
+        // `continue` → the loop head (ForeachNext advances the position).
+        if let Some(patches) = cont_patches {
+            for idx in patches {
+                self.insns[idx] = Insn::Jump(top);
+            }
+        }
+        // `break` → past the exit branch.
+        if let Some(patches) = brk_patches {
+            for idx in patches {
+                self.insns[idx] = Insn::Jump(end);
+            }
+        }
+
+        // Restore the outer loop var binding and the depth guard.
+        match saved_local {
+            Some(b) => {
+                self.local_var_regs.insert(var, b);
+            }
+            None => {
+                self.local_var_regs.remove(&var);
+            }
+        }
+        self.reg_var_loop_depth -= 1;
+        Some(true)
+    }
+
+    /// Mint the next runtime key-slot index for a compiled foreach. The
+    /// arena lives on the Simulator (swapped per method run so nested
+    /// compiled calls never clobber an outer loop's keys); the compiler
+    /// only hands out consecutive indices.
+    fn next_foreach_slot(&mut self) -> u32 {
+        let n = self.foreach_slot_count;
+        self.foreach_slot_count += 1;
+        n
     }
 
     fn stmt_kind_label(stmt: &Statement) -> &'static str {
@@ -7812,6 +8019,22 @@ impl<'a> BytecodeCompiler<'a> {
                 true
             }
             StatementKind::Foreach { array, vars, body } => {
+                // class-perf Step 9d FIRST: `foreach` over a class MEMBER
+                // collection (queue / dynamic / associative) inside a
+                // compiled method — a REAL bytecode loop over a runtime
+                // key snapshot. Admission reuses the 9b-ii element-access
+                // probe (`member_coll_elem_target`): bare receivers must
+                // be in the collision-excluded `coll_elem_member_names`
+                // set and unshadowed; dotted receivers must pass
+                // `method_handle_chain_ok` with the member in
+                // `coll_member_names`. Queue/dynamic-array FORMALS and
+                // locals land in `local_var_regs`, so they decline here
+                // and keep the AST path. Everything else (multi-var,
+                // packed, `$`-shaped, local collections) falls through to
+                // the existing arms below.
+                if let Some(outcome) = self.try_compile_member_foreach(array, vars, body) {
+                    return outcome;
+                }
                 // §12.7.3 foreach over a register-bound local array — an
                 // inlined resolver's dynamic-array formal or a #129 local
                 // buffer. The element count is a compile-time constant, so
@@ -11948,6 +12171,7 @@ impl<'a> BytecodeCompiler<'a> {
             instructions: self.insns,
             has_fallback,
             nba_dup_targets,
+            foreach_slots: self.foreach_slot_count,
         }
     }
 
@@ -12180,6 +12404,11 @@ impl<'a> BytecodeCompiler<'a> {
             // reads handle + index + value.
             Insn::LoadCollElem(_, h, _, i) => *h == r || *i == r,
             Insn::StoreCollElem(h, _, i, v) => *h == r || *i == r || *v == r,
+            // Compiled foreach: ForeachKeys reads only the handle;
+            // ForeachNext WRITES its var register (and the ok flag) — the
+            // liveness check must not fuse away its load.
+            Insn::ForeachKeys(_, h, _) => *h == r,
+            Insn::ForeachNext(..) => false,
             // `$cast`: reads the source (and, for the register route, the
             // dest slot's current value for the width fit); the Member route
             // also reads the base handle.
@@ -13516,6 +13745,14 @@ impl<'a> BytecodeCompiler<'a> {
                     if let CastDest::Reg(r) = dest {
                         store(&mut rw, *r, None);
                     }
+                }
+                // Compiled foreach: ForeachKeys defines only the arena slot
+                // (no register); ForeachNext writes the 1/0 ok flag and the
+                // loop var at the runtime key width — drop both.
+                Insn::ForeachKeys(..) => {}
+                Insn::ForeachNext(o, _, v) => {
+                    store(&mut rw, *o, None);
+                    store(&mut rw, *v, None);
                 }
                 // Two dests; widths follow operand widths — drop tracking.
                 Insn::BinOpConstAdd2(a) => {

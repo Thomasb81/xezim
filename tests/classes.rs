@@ -69,6 +69,9 @@ mod compiled_method_string_members;
 mod compiled_method_collection_calls;
 #[path = "classes/compiled_method_coll_elems.rs"]
 mod compiled_method_coll_elems;
+
+#[path = "classes/compiled_method_foreach.rs"]
+mod compiled_method_foreach;
 #[path = "classes/compiled_method_cast.rs"]
 mod compiled_method_cast;
 #[path = "classes/class_output_handle_copyback.rs"]

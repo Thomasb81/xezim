@@ -93,6 +93,8 @@ pub enum Opcode {
     LoadCollElem,
     StoreCollElem,
     Cast,
+    ForeachKeys,
+    ForeachNext,
 }
 
 impl Opcode {
@@ -196,6 +198,8 @@ impl Opcode {
             Insn::LoadCollElem(..) => Self::LoadCollElem,
             Insn::StoreCollElem(..) => Self::StoreCollElem,
             Insn::Cast(..) => Self::Cast,
+            Insn::ForeachKeys(..) => Self::ForeachKeys,
+            Insn::ForeachNext(..) => Self::ForeachNext,
         }
     }
 
@@ -205,12 +209,12 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 84;
+pub const NUM_OPCODES: usize = 86;
 
 /// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
 /// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to
 /// the last discriminant at compile time instead.
-const _: () = assert!(NUM_OPCODES == Opcode::Cast as usize + 1);
+const _: () = assert!(NUM_OPCODES == Opcode::ForeachNext as usize + 1);
 
 /// Dispatch table - proof of concept.
 #[derive(Debug, Clone)]

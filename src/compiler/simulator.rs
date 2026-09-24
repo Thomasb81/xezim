@@ -4866,6 +4866,16 @@ pub struct Simulator {
     edge_block_insn_len: Vec<u32>,
     /// VM register file (reusable across executions to avoid allocation).
     vm_regs: Vec<Value>,
+    /// class-perf Step 9d: foreach key arenas for compiled methods — slot
+    /// i holds the materialized key `Value`s plus the per-slot position
+    /// cursor of the i-th (compile-time numbered) `foreach` in the
+    /// currently-executing block. Swapped in `try_run_compiled_method`
+    /// alongside `vm_regs` so a nested compiled call never clobbers an
+    /// outer loop's keys; grown lazily to the block's `foreach_slots`.
+    /// The cursor is a `u32` (never `usize::MAX`-sentinel — the executor
+    /// compares against `keys.len()`).
+    foreach_arena: Vec<(Vec<Value>, u32)>,
+    foreach_arena_saved: Vec<(Vec<Value>, u32)>,
     /// Built-in clock generators (optimized always #N clk = ~clk)
     clock_generators: Vec<ClockGen>,
     /// Dynamic-delay simple assignments, keyed by their scheduled process id.
@@ -8759,6 +8769,8 @@ impl Simulator {
             edge_block_light: Vec::new(),
             edge_block_insn_len: Vec::new(),
             vm_regs: Vec::new(),
+            foreach_arena: Vec::new(),
+            foreach_arena_saved: Vec::new(),
             clock_generators: Vec::new(),
             fast_delay_always: HashMap::default(),
             proc_fsm: HashMap::default(),
@@ -22941,6 +22953,7 @@ impl Simulator {
                                 num_regs: 0,
                                 has_fallback: false,
                                 nba_dup_targets: true,
+                                foreach_slots: 0,
                             };
                             let mut ok = true;
                             for &m in chunk {
@@ -23829,6 +23842,10 @@ impl Simulator {
                     debug_assert!(false, "cast insn in isolated comb exec");
                     break;
                 }
+                Insn::ForeachKeys(..) | Insn::ForeachNext(..) => {
+                    debug_assert!(false, "foreach insn in isolated comb exec");
+                    break;
+                }
                 Insn::LoadConst(dest, val) => {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
@@ -24507,6 +24524,10 @@ impl Simulator {
                 }
                 Insn::Cast(..) => {
                     debug_assert!(false, "cast insn in isolated comb exec");
+                    break;
+                }
+                Insn::ForeachKeys(..) | Insn::ForeachNext(..) => {
+                    debug_assert!(false, "foreach insn in isolated comb exec");
                     break;
                 }
                 Insn::LoadConst(dest, val) => {
@@ -25941,6 +25962,86 @@ impl Simulator {
                     }
                     self.vm_regs[*out as usize] =
                         if ok { Value::from_u64(1, 32) } else { Value::zero(32) };
+                    local_count += 1;
+                }
+                // class-perf Step 9d: materialize the iteration keys of a
+                // member collection for a compiled foreach — the same store
+                // resolution as LoadCollElem (bare → `instance_assoc_member`,
+                // dotted → `handle_collection_name`, null receiver → no
+                // store), then the interpreter's OWN key walk: `array_iter_keys`
+                // (dense `.size` range for queue/dynamic, sparse first-key-seg
+                // scan for assoc, string vs numeric §7.9 ordering) and
+                // `assoc_index_width_for` (§7.8.2 key width/signedness). Each
+                // key's loop-var Value is precomputed with the sync foreach
+                // arm's exact conversion so ForeachNext can only move it.
+                Insn::ForeachKeys(slot, handle_reg, member) => {
+                    let store: Option<String> = if *handle_reg == 0 {
+                        self.instance_assoc_member(member)
+                    } else {
+                        let handle = self.vm_regs[*handle_reg as usize]
+                            .to_u64()
+                            .unwrap_or(0) as usize;
+                        if handle == 0 {
+                            // Null receiver: no store → no keys → zero
+                            // iterations, matching the interpreter's
+                            // expr_assoc_name fall-through.
+                            None
+                        } else {
+                            self.handle_collection_name(handle, member)
+                        }
+                    };
+                    let (keys, is_str, kw, ks_sign) = match store {
+                        Some(an) => {
+                            let (ks, is_str) = self.array_iter_keys(&an);
+                            let (kw, ks_sign) =
+                                self.assoc_index_width_for(&an).unwrap_or((32, false));
+                            (ks, is_str, kw, ks_sign)
+                        }
+                        None => (Vec::new(), false, 32, false),
+                    };
+                    // Precompute each iteration's loop-var Value exactly as
+                    // the sync foreach arm does (string → from_string;
+                    // else signed parse at the declared key width).
+                    let vals: Vec<Value> = keys
+                        .iter()
+                        .map(|key| {
+                            if is_str {
+                                Value::from_string(key)
+                            } else {
+                                let mut v = Value::from_u64(
+                                    key.parse::<i64>().unwrap_or(0) as u64,
+                                    kw,
+                                );
+                                v.is_signed = ks_sign;
+                                v
+                            }
+                        })
+                        .collect();
+                    let s = *slot as usize;
+                    if s >= self.foreach_arena.len() {
+                        self.foreach_arena.resize(s + 1, (Vec::new(), 0));
+                    }
+                    self.foreach_arena[s] = (vals, 0);
+                    local_count += 1;
+                }
+                // Advance a compiled foreach: pop the slot's next key into
+                // the var register; `ok` = 0 at exhaustion (loop exit).
+                Insn::ForeachNext(ok, slot, var) => {
+                    let s = *slot as usize;
+                    let exhausted = self
+                        .foreach_arena
+                        .get(s)
+                        .map(|(vals, pos)| *pos as usize >= vals.len())
+                        .unwrap_or(true);
+                    let (o, v) = (*ok as usize, *var as usize);
+                    if exhausted {
+                        self.vm_regs[o] = Value::zero(32);
+                    } else {
+                        self.vm_regs[o] = Value::from_u64(1, 32);
+                        let p = self.foreach_arena[s].1 as usize;
+                        self.vm_regs[v] = self.foreach_arena[s].0[p].clone();
+                        self.foreach_arena[s].1 += 1;
+                    }
                     local_count += 1;
                 }
                 // 10.8% of all executed bytecode — the second most frequent
@@ -31378,6 +31479,7 @@ impl Simulator {
                         num_regs: 0,
                         has_fallback: false,
                         nba_dup_targets: false,
+                        foreach_slots: 0,
                     };
                     for &m in chunk {
                         let mb = match &entries[m].item {
@@ -38412,6 +38514,8 @@ impl Simulator {
             Insn::LoadCollElem(..) => "LoadCollElem",
             Insn::StoreCollElem(..) => "StoreCollElem",
             Insn::Cast(..) => "Cast",
+            Insn::ForeachKeys(..) => "ForeachKeys",
+            Insn::ForeachNext(..) => "ForeachNext",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
@@ -117719,6 +117823,7 @@ impl Simulator {
         // clobber the caller's live registers mid-`exec_insns`. Restored
         // below even if the block defects.
         let saved_vm_regs = std::mem::take(&mut self.vm_regs);
+        let saved_foreach_arena = std::mem::take(&mut self.foreach_arena);
         if (block.num_regs as usize) > self.vm_regs.len() {
             self.vm_regs.resize(block.num_regs as usize, Value::zero(1));
         }
@@ -117780,6 +117885,9 @@ impl Simulator {
             .unwrap_or_else(|| Value::zero(32));
         // Restore the CALLER's register file now that we're done with ours.
         self.vm_regs = saved_vm_regs;
+        // Restore the caller's foreach key arena (swap-in above cleared the
+        // callee's; the Vec's spare capacity is dropped with it).
+        self.foreach_arena = saved_foreach_arena;
         // Clamp width (mirrors the interpreter's dyn_ret clamp) and stamp the
         // declared signedness for plainly-integral returns (mirrors its
         // §13.4.1 signedness stamp). A CLASS-HANDLE return is passed through
