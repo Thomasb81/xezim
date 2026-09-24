@@ -1962,8 +1962,10 @@ struct ClockGen {
     ahead: Option<u32>,
     /// `next_pid` when an `initial` generator was extracted: the time-0
     /// processes that precede it in source order have lower pids.
-    /// `usize::MAX` (an `always` generator, extracted before any initial
-    /// block has a pid) settles at the end of the first time-0 drain.
+    /// An `always` generator is extracted before any initial block has a
+    /// pid: it takes the pid of the first initial block that follows it in
+    /// the same instance, and `usize::MAX` (none follows) settles at the end
+    /// of the first time-0 drain.
     t0_rank: usize,
 }
 
@@ -5558,6 +5560,10 @@ pub struct Simulator {
     vm_regs: Vec<Value>,
     /// Built-in clock generators (optimized always #N clk = ~clk)
     clock_generators: Vec<ClockGen>,
+    /// `always` generators still waiting for their time-0 source rank:
+    /// `(index into clock_generators, instance scope, source offset)`.
+    /// Consumed while the initial blocks are given pids.
+    always_clock_src: Vec<(usize, String, usize)>,
     /// Dynamic-delay simple assignments, keyed by their scheduled process id.
     fast_delay_always: HashMap<usize, FastDelayAlways>,
     /// Compiled process FSMs by pid (roadmap 11-12, opt-in XEZIM_PROC_FSM=1).
@@ -9631,6 +9637,7 @@ impl Simulator {
             edge_block_insn_len: Vec::new(),
             vm_regs: Vec::new(),
             clock_generators: Vec::new(),
+            always_clock_src: Vec::new(),
             fast_delay_always: HashMap::default(),
             proc_fsm: HashMap::default(),
             fsm_start_pc: 0,
@@ -15285,6 +15292,23 @@ impl Simulator {
             // under a sibling's scope stays wrong for the whole run: `user`'s
             // enum member `C` permanently read `shadower`'s local `int C`.
             *self.name_resolve_hint.borrow_mut() = (!scope.is_empty()).then(|| scope.clone());
+            // §4.4.2: an `always` generator ahead of this block in the same
+            // instance ran first at time 0, so its first toggle was queued
+            // before anything this block schedules — its FIFO rank settles
+            // when the time-0 drain reaches this block's pid.
+            if !self.always_clock_src.is_empty() {
+                let next = self.next_pid;
+                let gens = &mut self.clock_generators;
+                self.always_clock_src.retain(|(gi, sc, at)| {
+                    let before = *sc == scope && *at < span.start;
+                    if before {
+                        if let Some(cg) = gens.get_mut(*gi) {
+                            cg.t0_rank = next;
+                        }
+                    }
+                    !before
+                });
+            }
             if let Some(cg) = self.try_extract_initial_clock_gen(&stmts) {
                 self.clock_generators.push(cg);
                 continue;
@@ -19737,6 +19761,11 @@ impl Simulator {
                             delay_val * 2,
                             delay_val
                         );
+                        self.always_clock_src.push((
+                            self.clock_generators.len(),
+                            ab.scope.clone(),
+                            ab.stmt.span.start,
+                        ));
                         self.clock_generators.push(clock_gen);
                         return None;
                     }

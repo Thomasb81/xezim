@@ -45,6 +45,36 @@ fn reset_before_initial_clock_catches_same_slot_edge() {
     assert!(o.iter().any(|l| l == "10 released"), "{o:?}");
 }
 
+// An `always #10 aclk = ~aclk;` generator is a time-0 process too: declared
+// before the reset `initial`, it queues its first toggle first, so the toggle
+// at 10 precedes the reset's `#10` wakeup and the reset waits for the edge at
+// 30. xezim gave every `always` generator the LAST time-0 rank, so it
+// released at 10 regardless of source order.
+fn always_reset_tb(seed: bool, clock_first: bool) -> String {
+    let clk = if seed {
+        "  initial aclk = 1'b0;\n  always #10 aclk = ~aclk;\n"
+    } else {
+        "  always #10 aclk = ~aclk;\n"
+    };
+    let rst = "  initial begin\n    aresetn = 1'b1;\n    #10 aresetn = 1'b0;\n    @(posedge aclk);\n    aresetn = 1'b1;\n    $display(\"%0t released\", $time);\n  end\n";
+    let (a, b) = if clock_first { (clk, rst) } else { (rst, clk) };
+    format!("module top;\n  bit aclk;\n  bit aresetn;\n{a}{b}  initial #100 $finish;\nendmodule\n")
+}
+
+#[test]
+fn always_clock_before_reset_toggles_first() {
+    let o = lines(&always_reset_tb(false, true));
+    assert!(o.iter().any(|l| l == "30 released"), "{o:?}");
+    let o = lines(&always_reset_tb(true, true));
+    assert!(o.iter().any(|l| l == "30 released"), "{o:?}");
+}
+
+#[test]
+fn reset_before_always_clock_catches_same_slot_edge() {
+    let o = lines(&always_reset_tb(false, false));
+    assert!(o.iter().any(|l| l == "10 released"), "{o:?}");
+}
+
 fn later_toggles_tb(always_clock: bool) -> String {
     let clk = if always_clock {
         "  initial clk = 0;\n  always #10 clk = ~clk;\n"
