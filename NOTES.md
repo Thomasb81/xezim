@@ -187,6 +187,25 @@ and the development workflow are in [README.md](README.md).
   (issue #155): `core.seq`, `core.get_seq()` and `u_w.p.peek()` work from a
   method of a class declared inside a module.
 
+**Usability**
+
+* Runs are quiet by default. The transcript holds the design's output,
+  warnings and errors, and one closing line, `Simulation finished at time N
+  ($finish called)`. The version banner, `[PHASE]` timings,
+  `[PROF]`/`[FUSE]`/`[EVENT-EDGE]`/`[COV]` counters, `[CACHE]` hits and
+  `--compile`'s design summary now need `--verbose` (or `XEZIM_VERBOSE=1`,
+  `--profile` or `--sim-debug`). The apb AVIP transcript went from 189 lines
+  to 150.
+* Parse, preprocessor and elaboration errors print `file:line:col` with the
+  source line and a caret. A line that came from an `include`d file names
+  that file, with an "In file included from" chain, and text produced by a
+  macro names the macro invocation. Runtime locations (hang reports,
+  port-width warnings) are no longer shifted by `include`s.
+* Preprocessor errors and warnings print once per run instead of once per
+  pass. Parser warnings, such as an unsupported UDP table, now carry their
+  location, and `` `__LINE__ `` after a multi-line `define` reports the right
+  line.
+
 **Performance** (instruction counts, output identical)
 
 * A two-state block that reads an x or z bit no longer re-runs on the
