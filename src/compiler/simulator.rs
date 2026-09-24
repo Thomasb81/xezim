@@ -73934,15 +73934,19 @@ impl Simulator {
                         if Self::spreads_member_wise(&su) {
                             unpacked_struct_local = true;
                             let base = d.name.name.clone();
-                            let seeds = self.unpacked_struct_leaf_keys(&base, &su);
+                            // §6.8 defaults per leaf (a 2-state member reads
+                            // 0), and packed members alias their fields.
+                            let mut leaves = Vec::new();
+                            self.unpacked_struct_leaf_defaults(&base, &su, 0, &mut leaves);
+                            for (k, _, mdt) in &leaves {
+                                self.register_packed_leaf_layout(k, mdt);
+                            }
+                            // The `<base>.` marker, as `unpacked_struct_leaf_keys`.
+                            self.any_struct_formal_markers = true;
                             if let Some(frame) = self.local_stack.last_mut() {
-                                for (k, w, is_real) in seeds {
-                                    let sv = if is_real {
-                                        Value::from_f64(0.0)
-                                    } else {
-                                        Value::new(w)
-                                    };
-                                    frame.insert(k, sv);
+                                frame.insert(format!("{}.", base), Value::new(0));
+                                for (k, dv, _) in leaves {
+                                    frame.insert(k, dv);
                                 }
                             }
                         }
@@ -111515,8 +111519,7 @@ impl Simulator {
                 &m.data_type,
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
-            )
-            .max(1);
+            );
             let dv = if super::elaborate::is_type_real(&m.data_type) {
                 Value::from_f64(0.0)
             } else if super::elaborate::is_type_two_state_resolved(
@@ -111530,12 +111533,13 @@ impl Simulator {
             let nested = self.unpacked_struct_of(&m.data_type);
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
+                // Same keys as `unpacked_struct_leaves`.
                 let keys = if md.dimensions.is_empty() {
                     vec![mkey]
                 } else {
                     match self.member_dim_indices(&md.dimensions) {
                         Some(list) => list.iter().map(|i| format!("{}[{}]", mkey, i)).collect(),
-                        None => continue,
+                        None => vec![mkey],
                     }
                 };
                 for k in keys {

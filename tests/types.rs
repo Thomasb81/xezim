@@ -229,6 +229,8 @@ mod struct_named_patterns;
 mod struct_unpacked_array_member;
 #[path = "types/submodule_packed_struct_member_contassign.rs"]
 mod submodule_packed_struct_member_contassign;
+#[path = "types/subroutine_local_struct_defaults.rs"]
+mod subroutine_local_struct_defaults;
 #[path = "types/tagged_union_matches.rs"]
 mod tagged_union_matches;
 #[path = "types/tagged_union_pattern_literal.rs"]
