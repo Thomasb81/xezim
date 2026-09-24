@@ -23,6 +23,8 @@ mod array_locator_named_iterator;
 mod array_of_collections;
 #[path = "collections/array_of_queues.rs"]
 mod array_of_queues;
+#[path = "collections/assoc_array_reductions.rs"]
+mod assoc_array_reductions;
 #[path = "collections/assoc_compliance.rs"]
 mod assoc_compliance;
 #[path = "collections/assoc_method_dispatch.rs"]

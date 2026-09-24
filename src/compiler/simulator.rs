@@ -68427,7 +68427,9 @@ impl Simulator {
                             // element filter expression (binds `item` or the
                             // declared iterator). sort/rsort use the filter's
                             // value as the sort key; unique dedups by it.
-                            if matches!(method.as_str(), "sort" | "rsort" | "unique") {
+                            if matches!(method.as_str(), "sort" | "rsort" | "unique")
+                                && !self.is_associative_array(&arr)
+                            {
                                 self.sort_with(&arr, &method, filter, iter_name.as_deref());
                                 return Value::zero(32);
                             }
@@ -100587,12 +100589,29 @@ impl Simulator {
             .unwrap_or_else(|| name.to_string())
     }
 
+    /// Element storage names an array reduction walks: `obj[0]..obj[size-1]`,
+    /// or an associative array's populated keys in key order (§7.8) — which
+    /// are not dense indices, so a reduction over one summed nothing.
+    fn reduction_elem_names(&self, obj: &str) -> Vec<String> {
+        if self.is_associative_array(obj) {
+            self.assoc_top_level_keys(obj)
+                .into_iter()
+                .map(|k| format!("{}[{}]", obj, k))
+                .collect()
+        } else {
+            (0..self.get_queue_size(obj))
+                .map(|i| format!("{}[{}]", obj, i))
+                .collect()
+        }
+    }
+
     /// Does `name` store a collection a `with`-clause reduction or sort can
     /// walk? A `<handle>#<member>` class collection counts.
     fn is_with_receiver_storage(&self, name: &str) -> bool {
         self.module.arrays.contains_key(name)
             || self.module.dynamic_arrays.contains(name)
-            || (name.contains('#') && !self.is_associative_array(name))
+            || name.contains('#')
+            || self.is_associative_array(name)
     }
 
     /// `(array, method, filter)` when `e` is a locator call on an array/queue,
@@ -101057,7 +101076,15 @@ impl Simulator {
         filter: &Expression,
         iter: Option<&str>,
     ) -> Value {
-        let size = self.get_queue_size(arr);
+        // §7.8 / §7.12.3: an associative array reduces over its populated
+        // keys in key order, and `item.index` is the key.
+        let assoc_keys = self
+            .is_associative_array(arr)
+            .then(|| self.assoc_top_level_keys(arr));
+        let size = match &assoc_keys {
+            Some(k) => k.len() as u64,
+            None => self.get_queue_size(arr),
+        };
         // Ensure a local frame exists so `item` has somewhere to live.
         // Initial-block-scope calls (no enclosing function) reach here
         // with an empty local_stack, which previously silenced every
@@ -101082,13 +101109,32 @@ impl Simulator {
         // count (3) where the LRM requires 1.
         let mut expr_w: u32 = 0;
         for i in 0..size {
+            let key = assoc_keys.as_ref().map(|k| k[i as usize].as_str());
             let elem = self
-                .get_signal_value_by_name(&format!("{}[{}]", arr, i))
+                .get_signal_value_by_name(&match key {
+                    Some(k) => format!("{}[{}]", arr, k),
+                    None => format!("{}[{}]", arr, i),
+                })
                 .unwrap_or_else(|| Value::zero(32));
+            // §7.12.4: `item.index` is the element's index (an int), or the
+            // key of an associative array.
+            let ix = match key {
+                Some(k) => match k.parse::<i128>() {
+                    Ok(n) => {
+                        let (kw, ks) = self.assoc_index_width_for(arr).unwrap_or((32, true));
+                        let mut v = Value::from_u64(n as u64, kw.clamp(1, 64));
+                        v.is_signed = ks;
+                        v
+                    }
+                    Err(_) => Value::from_string(k),
+                },
+                None => {
+                    let mut v = Value::from_u64(i, 32);
+                    v.is_signed = true;
+                    v
+                }
+            };
             if let Some(f) = self.local_stack.last_mut() {
-                // §7.12.4: `item.index` is the element's index (an int).
-                let mut ix = Value::from_u64(i, 32);
-                ix.is_signed = true;
                 if let Some(nm) = iter {
                     f.insert(nm.to_string(), elem.clone());
                 }
@@ -101550,6 +101596,22 @@ impl Simulator {
     /// 32-bit result read 439 where the element-typed answer is -73 (0xB7 as
     /// signed 8-bit), and min/max compared signed elements unsigned.
     fn array_elem_sign_width(&self, obj: &str) -> (u32, bool) {
+        // An associative array (module, local or class property) has its
+        // element type on record — elements need not start at key 0.
+        if self.is_associative_array(obj) {
+            if let Some(dt) = self.assoc_elem_decl_type(obj) {
+                let w = self.assoc_elem_width(obj).unwrap_or_else(|| {
+                    super::elaborate::resolve_type_width(
+                        dt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    )
+                });
+                let signed =
+                    super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types);
+                return (w.max(1), signed);
+            }
+        }
         let w = self
             .module
             .arrays
@@ -102104,11 +102166,10 @@ impl Simulator {
             ));
         }
         if matches!(bm, BuiltinM::Sum | BuiltinM::Product) {
-            let cur_size = self.get_queue_size(obj_name) as usize;
             let (w, signed) = self.array_elem_sign_width(obj_name);
             let mut total: u64 = if bm == BuiltinM::Sum { 0 } else { 1 };
-            for i in 0..cur_size {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+            for elem in self.reduction_elem_names(obj_name) {
+                if let Some(v) = self.get_signal_value_by_name(&elem) {
                     let x = if signed {
                         v.to_i64().unwrap_or(0) as u64
                     } else {
@@ -102134,10 +102195,9 @@ impl Simulator {
             return Some(out);
         }
         if matches!(bm, BuiltinM::And | BuiltinM::Or | BuiltinM::Xor) {
-            let cur_size = self.get_queue_size(obj_name) as usize;
             let mut acc: Option<u64> = None;
-            for i in 0..cur_size {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", obj_name, i)) {
+            for elem in self.reduction_elem_names(obj_name) {
+                if let Some(v) = self.get_signal_value_by_name(&elem) {
                     let x = v.to_u64().unwrap_or(0);
                     acc = Some(match (acc, mname) {
                         (None, _) => x,
