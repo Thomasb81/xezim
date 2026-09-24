@@ -55,10 +55,21 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=XEZIM_GIT_TAG={}", git_tag);
     // HEAD ref + index changes should retrigger the build script so the hash
-    // does not go stale between commits.
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
-    println!("cargo:rerun-if-changed=.git/refs/tags");
+    // does not go stale between commits. Ask git for the paths: in a linked
+    // worktree `.git` is a file, and a watched path that does not exist makes
+    // cargo rerun the script (and rebuild the crate) on every invocation.
+    for p in ["HEAD", "index", "refs/tags"] {
+        let path = Command::new("git")
+            .args(["rev-parse", "--git-path", p])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty() && std::path::Path::new(s).exists());
+        if let Some(path) = path {
+            println!("cargo:rerun-if-changed={}", path);
+        }
+    }
 
     // UVM checkout for the UVM integration tests
     // (tests/classes/uvm_integration_tests.rs): a single
