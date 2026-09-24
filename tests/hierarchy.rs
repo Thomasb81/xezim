@@ -17,6 +17,8 @@ mod array_of_module_instances;
 mod bind_directive_basic;
 #[path = "hierarchy/bind_in_module.rs"]
 mod bind_in_module;
+#[path = "hierarchy/bind_into_interface.rs"]
+mod bind_into_interface;
 #[path = "hierarchy/bind_path_through_library_module.rs"]
 mod bind_path_through_library_module;
 #[path = "hierarchy/bind_through_nested_part_select.rs"]
