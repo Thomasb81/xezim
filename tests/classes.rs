@@ -72,6 +72,9 @@ mod compiled_method_coll_elems;
 
 #[path = "classes/compiled_method_foreach.rs"]
 mod compiled_method_foreach;
+
+#[path = "classes/compiled_method_void.rs"]
+mod compiled_method_void;
 #[path = "classes/compiled_method_cast.rs"]
 mod compiled_method_cast;
 #[path = "classes/class_output_handle_copyback.rs"]

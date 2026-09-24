@@ -144,6 +144,8 @@ impl rand::RngCore for SvRng {
 }
 
 thread_local! {
+}
+thread_local! {
     /// Current `run_process_stmts` recursion depth. The suspend-aware loop
     /// handlers trampoline through the event queue (instead of recursing) once
     /// this exceeds `RPS_TRAMPOLINE_DEPTH`, bounding the stack for long
@@ -24943,7 +24945,7 @@ impl Simulator {
                     let id = *sig_id;
                     let w = *width;
                     let mut handled = false;
-                    if w <= 64 && signal_widths[id] == w {
+                    if w > 0 && w <= 64 && signal_widths[id] == w {
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                         let (sv, sx) = vm_regs[*val_reg as usize].raw_bits();
                         let (sv, sx) = (sv & mask, sx & mask);
@@ -26884,6 +26886,13 @@ impl Simulator {
                     // 2-state targets take the slow path so X/Z is dropped
                     // (§6.11.1/§10.7); the raw-bit fast path would keep it.
                     if !handled
+                        // Step 9e: width 0 (a class-handle signal — the plan
+                        // widths of class formals are 0) must skip the raw-bit
+                        // fast path: the mask degenerates to 0 and the write
+                        // is silently dropped. The slow path stores the value
+                        // untouched (fit_value_to_signal's w==0 rule), which
+                        // is exactly what the AST does.
+                        && *width > 0
                         && *width <= 64
                         && self.signal_widths[id] == *width
                         && !self.signal_real[id]
@@ -117270,20 +117279,73 @@ impl Simulator {
     /// the walk checks the class table FIRST, so a class name short-circuits
     /// before its (placeholder) typedef entry can hide it.
     fn typeref_names_class(&self, dt: &DataType) -> bool {
+        self.typeref_class_name(dt).is_some()
+    }
+
+    /// class-perf Step 9e: the STATIC CLASS a class-typed reference names
+    /// (through typedef chains), or None. Companion of `typeref_names_class`
+    /// that keeps the resolved NAME so handle chains can walk it link by
+    /// link.
+    fn typeref_class_name(&self, dt: &DataType) -> Option<String> {
         let mut cur = dt;
         for _ in 0..16 {
             let crate::ast::types::DataType::TypeReference { name: tn, .. } = cur else {
-                return false;
+                return None;
             };
             if self.module.classes.contains_key(&tn.name.name) {
-                return true;
+                return Some(tn.name.name.clone());
             }
             match self.module.typedef_types.get(&tn.name.name) {
                 Some(next) => cur = next,
-                None => return false,
+                None => return None,
             }
         }
-        false
+        None
+    }
+
+    /// class-perf Step 9e: per-class map of member name -> the member's
+    /// static class type (extends-chain walked, leaf-most declarer wins).
+    /// Drives TYPED handle-chain admission in the compiler: a dispatch
+    /// receiver chain (`m_cb.cnt.num()`) must prove every link is
+    /// class-typed. The untyped shadow-only check admitted COLLECTION
+    /// members of other classes (`cnt` is inner's assoc, invisible in
+    /// outer's shadow sets), lowering to a garbage LoadClassMember handle —
+    /// the heartbeat regression (`uvm_heartbeat::remove` never deleted mc1).
+    fn class_handle_member_types(&self) -> HashMap<String, HashMap<String, String>> {
+        let mut out: HashMap<String, HashMap<String, String>> = HashMap::default();
+        for (cn, _) in self.module.classes.iter() {
+            let mut members: HashMap<String, String> = HashMap::default();
+            let mut seen = HashSet::default();
+            let mut cur = cn.clone();
+            while let Some(c) = self.module.classes.get(&cur) {
+                if !seen.insert(cur.clone()) {
+                    break;
+                }
+                for (p, dt) in c.property_types.iter() {
+                    // or_insert: the most-derived declarer wins; ancestors
+                    // only contribute names the chain hasn't declared.
+                    // Step 9e: collection members (queue/dyn-array/assoc)
+                    // whose ELEMENT type is a class also land here so the
+                    // compiler can tell a HANDLE element read from an
+                    // integral one — `LoadCollElem` must then never Resize
+                    // to the context width (a 1-bit if-context destroyed
+                    // uvm_packer::pack_object_with_meta's cycle-detection
+                    // handle, infinite recursion in pack_object, 6693).
+                    // The compiler's scalar-vs-collection paths consult the
+                    // collection-name sets FIRST, so this entry is only
+                    // visible to element-typed logic.
+                    if let Some(t) = self.typeref_class_name(dt) {
+                        members.entry(p.clone()).or_insert(t);
+                    }
+                }
+                match &c.extends {
+                    Some(b) => cur = b.clone(),
+                    None => break,
+                }
+            }
+            out.insert(cn.clone(), members);
+        }
+        out
     }
 
     /// class-perf Step 6: does `dt` (possibly through a typedef chain)
@@ -117493,6 +117555,37 @@ impl Simulator {
         out
     }
 
+    /// class-perf Step 9e: METHOD names visible on `cname`'s chain — the
+    /// admission set for bare this-bounded calls (`helper(2)`) in compiled
+    /// bodies. Runtime re-enters the dispatcher, so any kind (functions,
+    /// ctors included) is safe to admit: §13.3 keeps task calls out of
+    /// function bodies, and a prototype/missing method resolves exactly as
+    /// the AST funnel would.
+    fn class_method_name_set(&self, cname: &str) -> HashSet<String> {
+        let mut out = HashSet::default();
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            out.extend(cd.methods.keys().cloned());
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        // CONSTRUCTORS are excluded: `new(...)` parses as a call to the
+        // name `new`, but it means ALLOCATE A FRESH OBJECT and run its
+        // ctor — never `this.new` (a bare this-bounded call). Admitting it
+        // would compile `m = new;` into `CallMethod(this, "new")`, which
+        // recursively re-runs the ctor on the CURRENT instance and leaves
+        // the target handle null (caught by the virtual-method-in-binary
+        // regression: pre=0, post=0).
+        out.remove("new");
+        out
+    }
+
     /// class-perf Step 9b-ii: the BARE element-access admission set —
     /// `class_coll_member_names ∪ class_static_coll_member_names` MINUS
     /// every module-scope collection-table name. The AST write funnel
@@ -117601,6 +117694,26 @@ impl Simulator {
                     return None;
                 }
             }
+            // Step 9e: a VOID function (`function void f();` — DataType::
+            // Void) or a CONSTRUCTOR (`function new(...)` — parsed as
+            // Implicit with no dimensions) has no observable return VALUE:
+            // the interpreter's epilogue reads back the implicit return
+            // cell's SEED (`return_value.or(implicit)`) and callers discard
+            // it. Compile with a passthrough result cell: width 0 (keep
+            // source, like a string return), no resize, no signedness
+            // stamp; the runtime seeds the register from the frame's
+            // implicit local so a never-written cell reads back exactly the
+            // AST value, and an (illegal-SV) `f = x` write even mirrors
+            // last-write-wins.
+            let is_void_result = matches!(
+                &_f.return_type,
+                crate::ast::types::DataType::Void(_)
+            ) || (_f.name.name.name == "new"
+                && matches!(
+                    &_f.return_type,
+                    crate::ast::types::DataType::Implicit { dimensions, .. }
+                        if dimensions.is_empty()
+                ));
             // Determine the return "kind". Either a SCALAR-INTEGRAL result (the
             // original pilot surface), a CLASS-HANDLE result (a TypeReference
             // naming a class: the value is a heap index passed through untouched),
@@ -117612,6 +117725,9 @@ impl Simulator {
                 (0u32, false)
             } else if is_class_result {
                 // class handle: width meaningless; pass through untouched.
+                (0u32, false)
+            } else if is_void_result {
+                // Step 9e: void / ctor — passthrough result cell.
                 (0u32, false)
             } else if let Some(pair) = self.scalar_formal_integral(&_f.return_type) {
                 pair
@@ -117693,6 +117809,7 @@ impl Simulator {
             // never param-resolved either.
             let param_able_result = !is_class_result
                 && !is_string_result
+                && !is_void_result
                 && !matches!(&_f.return_type, crate::ast::types::DataType::IntegerAtom { .. })
                 && !Self::packed_dims_are_literal(&_f.return_type);
             let pre = std::rc::Rc::new(super::bytecode::PreboundCompiledMethod {
@@ -117702,6 +117819,7 @@ impl Simulator {
                 fn_ret_name: rname.clone(),
                 is_class_result,
                 is_string_result,
+                is_void_result,
                 string_formals: std::rc::Rc::new(string_formals),
                 coll_members: std::rc::Rc::new(self.class_coll_member_names(cname)),
                 static_coll_members: std::rc::Rc::new(self
@@ -117766,6 +117884,12 @@ impl Simulator {
                 // registers; the compiler needs their names (it cannot see
                 // the class table).
                 let class_locals = self.class_typed_local_names(body);
+                // Step 9e: method-name admission set for bare this-bounded
+                // calls.
+                let method_name_set = self.class_method_name_set(cname);
+                // Step 9e: typed handle-chain admission inputs — the
+                // method's own class and every class's handle-member types.
+                let handle_member_types = self.class_handle_member_types();
                 let compiled = {
                     let compiler = BytecodeCompiler::new(
                         &self.signal_name_to_id,
@@ -117779,6 +117903,9 @@ impl Simulator {
                         &pre.formals,
                         &pre.class_formals,
                         &class_locals,
+                        &method_name_set,
+                        cname,
+                        &handle_member_types,
                         &shadow_names,
                         &member_safe,
                         &bare_members,
@@ -117797,6 +117924,17 @@ impl Simulator {
                         &body_refs,
                     )
                 };
+                // Step 9e: a STATIC method's frame has NO `this` — its
+                // register 0 is a null seed. Any instruction that lowers
+                // through the receiver (`CallMethod`/`CallCollMethod` on
+                // `this`, `Load/StoreClassMember`, `Load/StoreCollElem`)
+                // would silently read instance storage or dispatch
+                // exec_method_call(handle=0) -> Value::zero —
+                // uvm_sequence_library::m_static_check rejected every
+                // registered sequence (SEQLIB/NOSEQS, 3623_rand). Statics
+                // whose bodies never touch the receiver (pure formals +
+                // package globals, e.g. `set_default`) still compile.
+                let is_static = self.is_static_method(cname, method_name);
                 let Some((block, this_reg, result_reg, _rv_reg)) = compiled else {
                     self.compiled_method_block_cache.insert(
                         key,
@@ -117804,6 +117942,25 @@ impl Simulator {
                     );
                     return None;
                 };
+                let uses_this = |i: &super::bytecode::Insn| {
+                    use super::bytecode::Insn as I;
+                    match i {
+                        I::CallMethod(_, h, ..)
+                        | I::CallCollMethod(_, h, ..)
+                        | I::LoadClassMember(_, h, _)
+                        | I::StoreClassMember(h, ..)
+                        | I::LoadCollElem(_, h, ..)
+                        | I::StoreCollElem(h, ..) => *h as usize == this_reg as usize,
+                        _ => false,
+                    }
+                };
+                if is_static && block.instructions.iter().any(uses_this) {
+                    self.compiled_method_block_cache.insert(
+                        key,
+                        super::bytecode::CompiledMethodOutcome::Nil,
+                    );
+                    return None;
+                }
                 let entry = super::bytecode::CompiledMethodEntry {
                     block: std::rc::Rc::new(block),
                     this_reg,
@@ -117844,6 +118001,18 @@ impl Simulator {
                     v = v.resize_for_assign(w);
                 }
                 self.vm_regs[reg] = v;
+            }
+        }
+        // Step 9e: seed a void/ctor result cell with the frame's implicit
+        // return local — the interpreter seeded it before entry and its
+        // epilogue reads it back (`return_value.or(implicit)`), so a body
+        // that never writes the cell returns the identical value.
+        if pre.is_void_result {
+            let reg = result_reg as usize;
+            if reg < block.num_regs as usize {
+                self.vm_regs[reg] = frame
+                    .and_then(|fr| fr.get(&pre.fn_ret_name).cloned())
+                    .unwrap_or_else(|| Value::zero(32));
             }
         }
         // class-perf Step 9c: pre-record the type metadata that executing
@@ -117897,7 +118066,7 @@ impl Simulator {
         if result_width > 0 && result.width != result_width {
             result = result.resize_for_assign(result_width);
         }
-        if !pre.is_class_result && !result.is_real {
+        if !pre.is_class_result && !pre.is_void_result && !result.is_real {
             result.is_signed = pre.result_signed;
         }
         Some(result)

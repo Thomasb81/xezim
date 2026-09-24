@@ -747,6 +747,11 @@ pub(super) struct PreboundCompiledMethod {
     /// (per-spec key, collision-aware); a dotted static receiver must stay
     /// AST (it reaches `exec_method_call`'s broken zero path).
     pub static_coll_members: std::rc::Rc<HashSet<String>>,
+    /// class-perf Step 9e: the return is VOID (`function void`) or the
+    /// method is a constructor (`function new`): no observable return
+    /// value — the result register is a passthrough cell seeded from the
+    /// frame's implicit return local (no resize, no signedness stamp).
+    pub is_void_result: bool,
     /// class-perf Step 9b-ii: BARE element-access admission (`q[i]`,
     /// `aa[k]`) — the union of `coll_members`/`static_coll_members` MINUS
     /// every module-scope collection-table name. The AST WRITE funnel
@@ -1132,6 +1137,21 @@ pub struct BytecodeCompiler<'a> {
     /// (32-bit register, default null), and the name joins
     /// `method_handle_names` so `.member` on it is a heap access.
     class_local_names: HashSet<String>,
+    /// class-perf Step 9e: METHOD names of the enclosing class chain
+    /// (plan-provided). A bare-name call (`helper(2)`) inside a method body
+    /// is this-bounded (class scope shadows module functions per SV name
+    /// resolution) and lowers to a CallMethod on the `this` register; the
+    /// runtime re-enters the dispatcher, so virtual dispatch, defaults and
+    /// ref write-backs keep their AST semantics (a function body cannot
+    /// contain a task call per §13.3, so the callee is always a function).
+    class_method_names: HashSet<String>,
+    /// class-perf Step 9e: the static CLASS of the method being compiled —
+    /// the `this` root's type for TYPED handle-chain admission.
+    method_class: Option<String>,
+    /// class-perf Step 9e: per-class map of member name -> its static class
+    /// type (plan-provided), for TYPED handle-chain admission on DISPATCH
+    /// receivers. See `method_handle_chain_class`.
+    handle_member_types: Option<&'a HashMap<String, HashMap<String, String>>>,
     /// Register holding the (implicit) function result cell, so `return` and
     /// `f = ...` writes land where the method-mode prologue reads the result.
     method_result_reg: Option<RegId>,
@@ -1432,6 +1452,9 @@ impl<'a> BytecodeCompiler<'a> {
             member_class_names: HashSet::default(),
             member_safe_names: HashSet::default(),
             class_local_names: HashSet::default(),
+            class_method_names: HashSet::default(),
+            method_class: None,
+            handle_member_types: None,
             method_result_reg: None,
             method_return_val_reg: None,
             method_result_width: None,
@@ -3511,6 +3534,82 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// class-perf Step 9e: the STATIC CLASS a handle chain rooted at
+    /// `this` / a handle local / a bare member evaluates to — TYPED
+    /// admission for DISPATCH receivers (`obj.meth()`) and collection
+    /// receiver bases. Every MemberAccess link must be a class-typed
+    /// member of the previous link's static class: the UNTYPED shadow
+    /// check could not see other classes' members at all, so
+    /// `m_cb.cnt.num()` admitted `cnt` (inner's ASSOC member) and lowered
+    /// it to a garbage `LoadClassMember` "handle" (heartbeat regression:
+    /// `uvm_heartbeat::remove` never deleted mc1). Handle
+    /// formals/locals/result cells have no type here: they admit as
+    /// single-hop roots (the UNTYPED marker) and CHAINS through them
+    /// refuse — a conservative decline to the AST interpreter, never a
+    /// wrong dispatch. The bare-member ROOT additionally keeps the
+    /// bare-key-stability requirement (`bare_member_names`).
+    fn method_handle_chain_class(&self, expr: &crate::ast::expr::Expression) -> Option<String> {
+        const UNTYPED: &str = "\u{0}";
+        if !self.method_mode {
+            return None;
+        }
+        match &expr.kind {
+            crate::ast::expr::ExprKind::This => self.method_class.clone(),
+            crate::ast::expr::ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty() =>
+            {
+                let name = h.path[0].name.name.as_str();
+                // Handle locals/formals/result: a legal single-hop root of
+                // unknown type (the plan carries names, not declared
+                // classes).
+                if self.method_handle_names.contains(name) {
+                    return Some(UNTYPED.to_string());
+                }
+                if self.bare_member_names.contains(name) {
+                    // Step 9e: a COLLECTION member carries its ELEMENT class
+                    // in handle_member_types (element-typed reads), but it is
+                    // not a scalar handle member — a chain through it must
+                    // decline, not dispatch on a collection store.
+                    if self.coll_member_names.contains(name)
+                        || self.static_coll_member_names.contains(name)
+                        || self.coll_elem_member_names.contains(name)
+                    {
+                        return None;
+                    }
+                    let cls = self.method_class.as_deref()?;
+                    return self
+                        .handle_member_types?
+                        .get(cls)?
+                        .get(name)
+                        .cloned();
+                }
+                None
+            }
+            crate::ast::expr::ExprKind::MemberAccess { expr: inner, member } => {
+                let cur = self.method_handle_chain_class(inner)?;
+                if cur == UNTYPED {
+                    return None;
+                }
+                let mname = member.name.as_str();
+                // Step 9e: collection members are not scalar handle links
+                // (see the bare-member arm).
+                if self.coll_member_names.contains(mname)
+                    || self.static_coll_member_names.contains(mname)
+                    || self.coll_elem_member_names.contains(mname)
+                {
+                    return None;
+                }
+                self.handle_member_types?
+                    .get(&cur)?
+                    .get(mname)
+                    .cloned()
+            }
+            _ => None,
+        }
+    }
+
     /// class-perf Step 9b: lower a builtin-collection call on a class
     /// member collection to a `CallCollMethod`. `recv` is the receiver
     /// expression (a bare member Ident `q`, `this.q`, or a dotted chain
@@ -3596,8 +3695,9 @@ impl<'a> BytecodeCompiler<'a> {
             // `obj.coll.meth()` / `this.coll.meth()` — the receiver is the
             // collection `coll` on the object the base evaluates to.
             crate::ast::expr::ExprKind::MemberAccess { expr: inner, member } => {
-                // `this.coll` / provably class-typed chain only.
-                if !self.method_handle_chain_ok(inner) {
+                // `this.coll` / provably class-typed chain only — TYPED
+                // (Step 9e): the base must really evaluate to a handle.
+                if self.method_handle_chain_class(inner).is_none() {
                     return None;
                 }
                 (member.name.as_str(), false)
@@ -3684,7 +3784,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Some((name.to_string(), true, None))
             }
             crate::ast::expr::ExprKind::MemberAccess { expr: base, member }
-                if self.method_handle_chain_ok(base)
+                if self.method_handle_chain_class(base).is_some()
                     && self.coll_member_names.contains(member.name.as_str()) =>
             {
                 Some((member.name.clone(), false, Some((**base).clone())))
@@ -3751,6 +3851,16 @@ impl<'a> BytecodeCompiler<'a> {
             }
         };
         let idx_reg = self.compile_expr(index, 0)?;
+        let elem_is_class = self
+            .method_class
+            .as_deref()
+            .and_then(|cls| {
+                self.handle_member_types?
+                    .get(cls)?
+                    .get(coll.as_str())
+                    .map(|_| true)
+            })
+            .unwrap_or(false);
         let dest = self.alloc_reg();
         self.emit(Insn::LoadCollElem(
             dest,
@@ -3760,7 +3870,12 @@ impl<'a> BytecodeCompiler<'a> {
         ));
         // §11.8.1: honor the enclosing context width like every other read
         // (the exec arm stores the raw store width; the caller resizes).
-        if ctx_width > 0 {
+        // EXCEPTION (Step 9e): a HANDLE-typed element must pass through
+        // untouched — the interpreter never resizes a class-handle read,
+        // and a ctx width of 1 (the `if (refs[i] == v)` condition context)
+        // zeroed the handle, killing uvm_packer's cycle detection and
+        // recursing forever on cyclic object graphs (6693).
+        if ctx_width > 0 && !elem_is_class {
             self.emit(Insn::Resize(dest, ctx_width));
         }
         Some(dest)
@@ -7514,11 +7629,23 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                         if let ExprKind::Ident(h) = &func.kind {
                             let raw = Self::hier_raw_name(h);
-                            if self.try_inline_task_args(&raw, args) {
+                            // Step 9e: a bare name that is a CLASS method of
+                            // the enclosing chain must not inline a
+                            // same-named module task — class scope shadows
+                            // module scope. Fall through to the expression
+                            // path's CallMethod lowering.
+                            let this_bounded = self.method_mode
+                                && h.path.len() == 1
+                                && h.path[0].selects.is_empty()
+                                && self.class_method_names.contains(raw.as_str());
+                            if !this_bounded && self.try_inline_task_args(&raw, args) {
                                 return true;
                             }
                             if let Some(leaf) = raw.rsplit('.').next() {
-                                if leaf != raw && self.try_inline_task_args(leaf, args) {
+                                if !this_bounded
+                                    && leaf != raw
+                                    && self.try_inline_task_args(leaf, args)
+                                {
                                     return true;
                                 }
                             }
@@ -9980,7 +10107,9 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 if self.method_mode
                     && let ExprKind::MemberAccess { expr: base, member } = &func.kind
-                    && self.method_handle_chain_ok(base)
+                    // TYPED chain (Step 9e): a foreign-class collection
+                    // member must never become a dispatch "handle".
+                    && self.method_handle_chain_class(base).is_some()
                 {
                     // Step 6: the receiver may be a chain (`sched.m_parent.get_
                     // phase_type()`) or a bare member (`m.f()` dispatches on
@@ -10036,6 +10165,63 @@ impl<'a> BytecodeCompiler<'a> {
                     self.insns.truncate(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_Call_class_method");
+                    return None;
+                }
+                // Step 9e: a BARE this-bounded call — `helper(2)`,
+                // `early(cnt)` — where the callee name is a method of the
+                // enclosing class chain (class scope shadows module
+                // functions per §8.23). Identical to the receiver form but
+                // with `this` as the receiver register.
+                if self.method_mode
+                    && let ExprKind::Ident(h) = &func.kind
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && self.class_method_names.contains(h.path[0].name.name.as_str())
+                {
+                    let Some(this_reg) = self.method_this_reg else {
+                        self.bail("bare_call_no_this");
+                        return None;
+                    };
+                    let call_start = self.insns.len();
+                    let call_next = self.next_reg;
+                    let mut ok = true;
+                    let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.compile_expr(a, 0) {
+                            Some(r) => arg_values.push(r),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        let dest = self.alloc_reg();
+                        let n = arg_values.len() as u32;
+                        // Contiguous arg slots (same reservation discipline
+                        // as the receiver form above).
+                        let arg_start = self.alloc_reg();
+                        for _ in 1..arg_values.len() {
+                            self.alloc_reg();
+                        }
+                        for (i, &v) in arg_values.iter().enumerate() {
+                            let slot = (arg_start as usize + i) as RegId;
+                            if slot != v {
+                                self.emit(Insn::Move(slot, v));
+                            }
+                        }
+                        self.emit(Insn::CallMethod(
+                            dest,
+                            this_reg,
+                            h.path[0].name.name.clone().into_boxed_str(),
+                            arg_start,
+                            n,
+                        ));
+                        return Some(dest);
+                    }
+                    self.insns.truncate(call_start);
+                    self.next_reg = call_next;
+                    self.bail("Expr_Call_bare_method");
                     return None;
                 }
                 if let Some(r) = self.compile_string_method(func, args, expr.span) {
@@ -10772,7 +10958,12 @@ impl<'a> BytecodeCompiler<'a> {
                         let base_name = hier.path[0].name.name.as_str();
                         let dotted = format!("{}.{}", base_name, member.name);
                         if let Some(id) = self.lookup_signal_id_by_name(&dotted) {
-                            self.emit(Insn::BlockingAssign(as_sig_id(id), val_reg, width));
+                            let w = if width == 0 {
+                                self.signal_widths.get(id).copied().unwrap_or(0)
+                            } else {
+                                width
+                            };
+                            self.emit(Insn::BlockingAssign(as_sig_id(id), val_reg, w));
                             return true;
                         }
                     }
@@ -10839,11 +11030,53 @@ impl<'a> BytecodeCompiler<'a> {
                 false
             }
             ExprKind::Ident(hier) => {
+                // Step 9e: in method mode, a BARE member store (`cnt = v`)
+                // resolves to class scope first — exactly like the bare
+                // READ path (§8.23: the instance member shadows a
+                // same-named module signal). `bare_member_names` is
+                // instance-only and bare-key-stable by construction;
+                // STRING member stores stay AST (Step 9a's width-hazard
+                // note — the string set is disjoint from the bare set).
+                if self.method_mode
+                    && hier.root.is_none()
+                    && hier.path.len() == 1
+                    && hier.path[0].selects.is_empty()
+                {
+                    let bare = hier.path[0].name.name.as_str();
+                    if !self.local_var_regs.contains_key(bare)
+                        && self.bare_member_names.contains(bare)
+                    {
+                        let Some(this) = self.method_this_reg else {
+                            self.bail("blocking_target");
+                            return false;
+                        };
+                        self.emit(Insn::StoreClassMember(
+                            this,
+                            val_reg,
+                            bare.to_string().into_boxed_str(),
+                        ));
+                        return true;
+                    }
+                }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     if self.signal_is_string_name(hier) {
                         self.emit(Insn::BlockingAssignString(as_sig_id(id), val_reg));
                     } else {
-                        self.emit(Insn::BlockingAssign(as_sig_id(id), val_reg, width));
+                        // Step 9e: a class-HANDLE store (width 0 — the plan
+                        // widths of class formals/locals) must keep the
+                        // runtime's tagged handle bits intact. Width 0 would
+                        // fail the executor's raw-bit fast path and `resize`
+                        // the handle into an untagged integer (uvm_printer::
+                        // set_default stored a number where the AST read a
+                        // handle — 7515_printer). Store at the SIGNAL's
+                        // declared width: the fast path copies raw bits,
+                        // preserving handle identity exactly like the AST.
+                        let w = if width == 0 {
+                            self.signal_widths.get(id).copied().unwrap_or(0)
+                        } else {
+                            width
+                        };
+                        self.emit(Insn::BlockingAssign(as_sig_id(id), val_reg, w));
                     }
                     true
                 } else if let Some((base_id, off, mw)) = self.packed_struct_member_target(hier) {
@@ -11280,6 +11513,24 @@ impl<'a> BytecodeCompiler<'a> {
                         return ab.elem_w;
                     }
                 }
+                // Step 9e: in method mode, a BARE class member store
+                // (`m_address = addr`) must evaluate its RHS self-determined
+                // (0), exactly like the interpreter's heap store — the module
+                // widths fallback said 32 and truncated
+                // uvm_tlm_generic_payload::set_address's 64-bit `bit [63:0]`
+                // actual to 32 (20extfunc printed 'h90abcdef).
+                if self.method_mode
+                    && hier.root.is_none()
+                    && hier.path.len() == 1
+                    && hier.path[0].selects.is_empty()
+                {
+                    let bare = hier.path[0].name.name.as_str();
+                    if !self.local_var_regs.contains_key(bare)
+                        && self.bare_member_names.contains(bare)
+                    {
+                        return 0;
+                    }
+                }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.signal_widths[id]
                 } else if let Some((_, _, mw)) = self.packed_struct_member_target(hier) {
@@ -11382,6 +11633,26 @@ impl<'a> BytecodeCompiler<'a> {
             }
             },
             ExprKind::Concatenation(parts) => parts.iter().map(|p| self.infer_lhs_width(p)).sum(),
+            // Step 9e: a `this.member = rhs` store inside a compiled method
+            // evaluates its RHS self-determined, exactly like the bare-member
+            // rule above — the 32-bit default truncated
+            // uvm_reg_item::set_offset's 64-bit actual (6976).
+            ExprKind::MemberAccess { expr, member } if self.method_mode => {
+                let is_this = matches!(&expr.kind, ExprKind::This)
+                    || matches!(
+                        &expr.kind,
+                        ExprKind::Ident(h)
+                            if h.root.is_none()
+                                && h.path.len() == 1
+                                && h.path[0].selects.is_empty()
+                                && h.path[0].name.name.as_str() == "this"
+                    );
+                if is_this && self.bare_member_names.contains(member.name.as_str()) {
+                    0
+                } else {
+                    32
+                }
+            }
             _ => 32,
         }
     }
@@ -12198,6 +12469,9 @@ impl<'a> BytecodeCompiler<'a> {
         formals: &[(String, u32)],
         class_formals: &HashSet<String>,
         class_locals: &HashSet<String>,
+        class_method_names: &HashSet<String>,
+        method_class: &str,
+        handle_member_types: &'a HashMap<String, HashMap<String, String>>,
         class_shadow_names: &HashSet<String>,
         member_safe_names: &HashSet<String>,
         bare_member_names: &HashSet<String>,
@@ -12257,9 +12531,22 @@ impl<'a> BytecodeCompiler<'a> {
         // width when known.)
         for (name, w) in formals {
             let r = self.alloc_reg();
-            if self.local_var_regs.insert(name.clone(), (r, *w)).is_some() {
+            // §6.16: a STRING formal has no fixed width — its slot width
+            // must be 0 so a later assignment to it does NOT Resize the
+            // value to the plan's placeholder width (push_element's
+            // `name = {top.get_element_name(), ".", name}` padded the
+            // text to 1024 bits and every .len() downstream saw 128 —
+            // 7515_printer's columns blew out). Mirrors the task-call
+            // formal site (`let w = if formal_is_string { 0 }`).
+            let w = if string_formals.contains(name.as_str()) { 0 } else { *w };
+            if self.local_var_regs.insert(name.clone(), (r, w)).is_some() {
                 // A duplicated formal name (defensive) bails.
                 self.bail("method_dup_formal");
+            }
+            if string_formals.contains(name.as_str()) {
+                // Mark it string so `infer_lhs_width` keeps 0 instead of
+                // guessing a placeholder width (see the task-path twin).
+                self.local_var_is_string.insert(name.clone());
             }
             if class_formals.contains(name) {
                 self.method_handle_names.insert(name.clone());
@@ -12269,6 +12556,9 @@ impl<'a> BytecodeCompiler<'a> {
         // (the compiler cannot see the class table). Stash the names so the
         // VarDecl arm treats them as handle locals.
         self.class_local_names = class_locals.clone();
+        self.class_method_names = class_method_names.clone();
+        self.method_class = Some(method_class.to_string());
+        self.handle_member_types = Some(handle_member_types);
 
         // Function result CELL: the implicit name and an explicit `return e`
         // share ONE register, so the LAST write wins — exactly the
@@ -12281,9 +12571,20 @@ impl<'a> BytecodeCompiler<'a> {
             Some((rname, rw, is_class, is_string)) => {
                 let r = self.alloc_reg();
                 // Return-handler writes also resize to the shared cell width.
-                self.local_var_regs.insert(rname.to_string(), (r, rw));
-                if is_class {
-                    self.method_handle_names.insert(rname.to_string());
+                // A CONSTRUCTOR's implicit name is `new` — a keyword. It can
+                // never be legally READ as the result variable: `m = new` /
+                // `m = new(...)` are ALLOCATIONS (the primary parser's KwNew
+                // arm), not result-cell reads. Binding the name would
+                // silently compile `m = new;` into "m = <result cell>"
+                // (caught by the virtual-method-in-binary regression:
+                // pre=0, post=0). Leave the name unbound: an Ident("new")
+                // read then bails ident_lookup and the whole body falls to
+                // the AST interpreter, which allocates.
+                if rname != "new" {
+                    self.local_var_regs.insert(rname.to_string(), (r, rw));
+                    if is_class {
+                        self.method_handle_names.insert(rname.to_string());
+                    }
                 }
                 self.method_result_reg = Some(r);
                 self.method_result_width = if rw > 0 { Some(rw) } else { None };
@@ -12316,6 +12617,9 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_mode = false;
             self.method_this_reg = None;
             self.method_handle_names.clear();
+            self.method_class = None;
+            self.handle_member_types = None;
+            self.class_method_names.clear();
             self.method_result_reg = None;
             self.method_return_val_reg = None;
             self.method_result_width = None;
@@ -14654,7 +14958,7 @@ mod tests {
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -14718,7 +15022,7 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -14757,7 +15061,7 @@ mod tests {
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &shadow, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );
