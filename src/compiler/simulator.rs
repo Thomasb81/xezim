@@ -119545,6 +119545,24 @@ impl Simulator {
         // number of full-cost attempts and return 0, rather than paying all
         // 1000 trials (§18.6.2 requires only that we return 0).
         let mut fixed_fe_fail_streak: u32 = 0;
+        // §18.6: a failed randomize() leaves the random variables unchanged.
+        // Scalars come back from each trial's `backup`; collection elements
+        // are written in place by the trials, so remember them up front.
+        let coll_saved: Vec<(&RandColl, u64, Vec<(String, Option<Value>)>)> = rand_colls
+            .iter()
+            .filter(|c| !c.nested && !c.is_object_elem)
+            .map(|c| {
+                let elems = self
+                    .coll_elem_keys(c)
+                    .into_iter()
+                    .map(|k| {
+                        let v = self.read_coll_elem(&k);
+                        (k, v)
+                    })
+                    .collect();
+                (c, self.get_queue_size(&c.scoped), elems)
+            })
+            .collect();
         // The joint solver (`rand_csp`) models integral scalars and 1-D
         // arrays; randc cycles, real values, object handles and unpacked
         // aggregates stay with the trial loop.
@@ -120836,6 +120854,19 @@ impl Simulator {
             }
         }
 
+        for (c, n, elems) in coll_saved {
+            if c.kind == CollKind::Dyn {
+                self.resize_coll(&c.scoped, n);
+            }
+            for (k, v) in elems {
+                match v {
+                    Some(v) => self.write_coll_elem(&k, v),
+                    None => {
+                        self.signals.remove(&k);
+                    }
+                }
+            }
+        }
         // §18.4: randomize() failed — no value was actually produced, so give
         // every tentatively-drawn randc value back to its permutation cycle.
         self.randc_rollback_all();

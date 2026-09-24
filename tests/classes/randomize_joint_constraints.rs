@@ -251,3 +251,37 @@ endmodule
         "{o:?}"
     );
 }
+
+#[test]
+fn infeasible_sum_fails_and_keeps_values() {
+    // 6 increasing values in [1:30] sum to 21..165; 165 has one solution.
+    // A failed randomize() must leave the array as it was.
+    let o = out(r#"
+class hard;
+  rand bit [7:0] a[6];
+  rand int unsigned total;
+  constraint c1 { foreach (a[i]) a[i] inside {[1:30]}; }
+  constraint c2 { a.sum() with (int'(item)) == total; }
+  constraint c3 { unique {a}; }
+  constraint c4 { foreach (a[i]) if (i > 0) a[i] > a[i-1]; }
+endclass
+module tb;
+  initial begin
+    automatic hard h = new;
+    automatic int r1 = 0, r2 = 0, r3 = 0, same = 1;
+    automatic bit [7:0] snap[6];
+    r3 = h.randomize() with { total == 165; };
+    snap = h.a;
+    r1 = h.randomize() with { total == 166; };
+    r2 = h.randomize() with { total == 20; };
+    foreach (snap[i]) if (snap[i] != h.a[i]) same = 0;
+    $display("HI=%0d LO=%0d EDGE=%0d SAME=%0d A0=%0d A5=%0d", r1, r2, r3, same, h.a[0], h.a[5]);
+  end
+endmodule
+"#);
+    assert!(
+        o.iter()
+            .any(|l| l.contains("HI=0 LO=0 EDGE=1 SAME=1 A0=25 A5=30")),
+        "{o:?}"
+    );
+}
