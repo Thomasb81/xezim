@@ -34,8 +34,10 @@ fn warm_cache_replays_elaboration_warnings() {
     let cache = dir.join("cache");
 
     let run = || {
+        // `--verbose`: the "[CACHE] miss/hit" lines asserted below.
         let out = Command::new(xezim_bin())
             .arg(&sv)
+            .arg("--verbose")
             .arg("-s")
             .arg("top")
             .arg("--cache-dir")

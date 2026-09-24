@@ -20,7 +20,15 @@ fn run(name: &str, src: &str) -> String {
         // them could skip on its own; these tests are about the per-block
         // decision.
         .env("XEZIM_EDGE_MERGE", "0")
-        .args(["--simulate", "-s", "tb", "--no-cache", sv.to_str().unwrap()])
+        // `--verbose`: the "[EVENT-EDGE] measure" line read below.
+        .args([
+            "--simulate",
+            "--verbose",
+            "-s",
+            "tb",
+            "--no-cache",
+            sv.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();

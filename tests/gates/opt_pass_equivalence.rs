@@ -33,8 +33,10 @@ fn run(src: &str, tag: &str, env: &[(&str, &str)]) -> (String, Vec<String>) {
     let path = dir.join("dut.sv");
     std::fs::write(&path, src).expect("write");
     let mut cmd = Command::new(xezim());
+    // `--verbose`: the "[EDGE-MERGE] merged" line asserted below.
     cmd.current_dir(&dir)
         .arg("--simulate")
+        .arg("--verbose")
         .arg("-s")
         .arg("tb")
         .arg("--max-time")

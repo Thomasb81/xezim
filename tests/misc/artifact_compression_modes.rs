@@ -55,8 +55,10 @@ fn artifact_modes_round_trip() {
     );
 
     for n in ["b_default", "b_none", "b_19"] {
+        // `--verbose`: "Loaded compiled:" is part of the run banner.
         let o = Command::new(&bin)
             .arg("--simulate")
+            .arg("--verbose")
             .arg(dir.join(n))
             .output()
             .expect("simulate");

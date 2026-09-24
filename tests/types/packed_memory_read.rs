@@ -12,8 +12,16 @@ fn run(name: &str, src: &str) -> String {
     std::fs::create_dir_all(&dir).unwrap();
     let sv = dir.join(format!("{name}.sv"));
     std::fs::write(&sv, src).unwrap();
+    // `--verbose`: the engine instruction counters read below.
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "t", "--no-cache", sv.to_str().unwrap()])
+        .args([
+            "--simulate",
+            "--verbose",
+            "-s",
+            "t",
+            "--no-cache",
+            sv.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();

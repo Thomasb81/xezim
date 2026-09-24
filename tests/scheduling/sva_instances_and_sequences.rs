@@ -47,8 +47,10 @@ fn run(jit: bool) -> String {
     let sv = dir.join(if jit { "t_jit.sv" } else { "t_default.sv" });
     std::fs::write(&sv, DESIGN).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
+    // `--verbose`: the "[COV] assertions" site summary asserted below.
     cmd.args([
         "--simulate",
+        "--verbose",
         "-s",
         "top",
         "--no-cache",

@@ -5,6 +5,36 @@ use std::path::{Path, PathBuf};
 // CLI-only plumbing, so it lives in the binary, not the library.
 mod report;
 
+/// The library's `chatter!` for the CLI: internal lines (run banner, `[PHASE]`
+/// timings) print only under `--verbose`/`--profile`/`--sim-debug`.
+macro_rules! chatter {
+    ($($arg:tt)*) => {
+        if xezim::verbose() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+/// Stdout twin of `chatter!`, for the banner lines that have always gone to
+/// stdout.
+macro_rules! chatter_out {
+    ($($arg:tt)*) => {
+        if xezim::verbose() {
+            println!($($arg)*);
+        }
+    };
+}
+
+/// The one line every simulating run ends with. Scripts grep its
+/// `Simulation finished at time N` prefix.
+fn print_finish_line(time: u64, finished: bool) {
+    if finished {
+        println!("Simulation finished at time {} ($finish called)", time);
+    } else {
+        println!("Simulation finished at time {}", time);
+    }
+}
+
 // The `#[global_allocator]` lives in `xezim-core/src/lib.rs`, not here: Rust
 // allows only one per binary, and declaring it in the shared library covers the
 // test binaries and xezim-b as well as this CLI.
@@ -114,7 +144,6 @@ fn print_usage() {
     eprintln!("  --compile        Parse + elaborate, report diagnostics (no simulation)");
     eprintln!("  --simulate       Parse + elaborate + simulate (default)");
     eprintln!("Options:");
-    eprintln!("  -v               Verbose output");
     eprintln!("  -V               Print version and exit");
     eprintln!("  -I <dir>         Add directory to include search path");
     eprintln!("  -D <name>[=val]  Define a macro");
@@ -126,21 +155,27 @@ fn print_usage() {
     eprintln!(
         "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)"
     );
-    eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
+    eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug);");
+    eprintln!("                   implies the --verbose engine lines");
     eprintln!("  --strict-top     Error out if -s names a module that does not exist (default)");
     eprintln!("  --no-strict-top  Warn and auto-detect the design root instead when -s names");
     eprintln!("                   a module that does not exist (for generated corpora whose");
     eprintln!("                   recorded top names are known-stale)");
     eprintln!("  --profile        Print the [PROF] end-of-run profile report (edge-block, settle");
-    eprintln!("                   and timing counters). Same as XEZIM_PROFILE_REPORT=1.");
+    eprintln!("                   and timing counters) plus the --verbose engine lines ([PHASE]");
+    eprintln!("                   timings etc.). Same as XEZIM_PROFILE_REPORT=1. Adds overhead.");
     eprintln!(
         "  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
   --relax-implicit-static  Accept `int x = ...;` inside a static subroutine
                    (§6.21) with a warning instead of an error. Also enabled by
                    XEZIM_ALLOW_IMPLICIT_STATIC=1."
     );
-    eprintln!("  --verbose        Per-file compile progress: each file as it is parsed and the");
-    eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
+    eprintln!("  --verbose        Internal engine lines, off by default: the version banner,");
+    eprintln!("                   [PHASE] timings, end-of-run engine counters ([PROF]/[FUSE]/");
+    eprintln!("                   [EVENT-EDGE]/[COV]), compile-time optimisation notes and");
+    eprintln!("                   --compile's design summary; plus per-file compile progress");
+    eprintln!("                   (each file as it is parsed and the definitions it contributed).");
+    eprintln!("                   Same as XEZIM_VERBOSE=1.");
     eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
     eprintln!("                     sources in parse order, -v library files, -y library dirs");
     eprintln!(
@@ -2371,9 +2406,22 @@ fn run_main() -> i32 {
         report::mode_from_env_value(env::var("XEZIM_REPORT_STATS").ok().as_deref())
     });
 
+    // XEZIM_VERBOSE=1 is `--verbose` for scripts that cannot add a flag.
+    if env::var("XEZIM_VERBOSE").ok().as_deref() == Some("1") {
+        verbose = true;
+    }
     if verbose {
         xezim::set_compile_verbose(true);
     }
+    // Internal engine chatter (run banner, [PHASE] timings, end-of-run engine
+    // counters) is off by default: a plain run prints the design's own
+    // output, warnings/errors and the final result line. `--profile` sets
+    // XEZIM_PROFILE_REPORT while parsing, so both spellings turn it on, and
+    // XEZIM_PROFILE_TIMING's timers are only ever read from those lines.
+    let env_on = |k: &str| env::var(k).ok().as_deref() == Some("1");
+    xezim::set_verbose(
+        verbose || sim_debug || env_on("XEZIM_PROFILE_REPORT") || env_on("XEZIM_PROFILE_TIMING"),
+    );
 
     // `--dump-files-list`: the fully resolved compilation file set, after every
     // `-f` args file has been expanded. Printed BEFORE the files are read so
@@ -2538,15 +2586,15 @@ suppressed but the explicit SDF annotation still applies."
             if head.len() == 8 && &head[..] == xezim::XEZIM_BYTECODE_MAGIC {
                 match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
-                        println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-                        println!(
+                        chatter_out!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+                        chatter_out!(
                             "git {} ({})",
                             env!("XEZIM_GIT_HASH"),
                             env!("XEZIM_GIT_DATE")
                         );
-                        println!("Loaded compiled: {}", sf);
-                        println!("Max time: {} ns", max_time);
-                        println!("------------------------------");
+                        chatter_out!("Loaded compiled: {}", sf);
+                        chatter_out!("Max time: {} ns", max_time);
+                        chatter_out!("------------------------------");
                         let total_start = std::time::Instant::now();
                         xezim::compiler::simulator::set_sim_debug(sim_debug);
                         xezim::compiler::simulator::set_dump_timescales(dump_timescales);
@@ -2576,22 +2624,21 @@ suppressed but the explicit SDF annotation still applies."
                             }
                             std::process::exit(1);
                         }
-                        eprintln!(
+                        chatter!(
                             "[PHASE] compilation: {:.1}ms",
                             compilation_start.elapsed().as_secs_f64() * 1000.0
                         );
                         let simulation_start = std::time::Instant::now();
                         sim.simulate();
-                        eprintln!(
+                        chatter!(
                             "[PHASE] simulation: {:.1}ms",
                             simulation_start.elapsed().as_secs_f64() * 1000.0
                         );
-                        eprintln!(
+                        chatter!(
                             "[PHASE] total: {:.1}ms",
                             total_start.elapsed().as_secs_f64() * 1000.0
                         );
-                        println!("------------------------------");
-                        println!("Simulation finished at time {}", sim.time);
+                        chatter_out!("------------------------------");
                         {
                             let (hits, last_t) = sim.settle_limit_report();
                             if hits > 0 {
@@ -2601,9 +2648,7 @@ suppressed but the explicit SDF annotation still applies."
                                 );
                             }
                         }
-                        if sim.finished {
-                            println!("($finish called)");
-                        }
+                        print_finish_line(sim.time, sim.finished);
                         // Footer before the exit-status checks so it also
                         // appears for runs that end with a nonzero status.
                         emit_run_stats(report_mode, compile_wall_start, Some(sim.time));
@@ -2771,8 +2816,8 @@ suppressed but the explicit SDF annotation still applies."
     // below. Build identity in --compile/--parse logs matters for exactly the
     // situation those modes are used in: debugging with a specific build.
     if mode != Mode::Preprocess {
-        println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-        println!(
+        chatter_out!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+        chatter_out!(
             "git {} ({})",
             env!("XEZIM_GIT_HASH"),
             env!("XEZIM_GIT_DATE")
@@ -2960,8 +3005,12 @@ suppressed but the explicit SDF annotation still applies."
                         merged_kept.as_deref(),
                     );
                 }
-                print_design_summary(&_defs, &elab);
-                print_resource_usage(compile_wall_start);
+                // The flattened-design table and CPU/memory lines are
+                // engine detail; the verdict above is the mode's result.
+                if xezim::verbose() {
+                    print_design_summary(&_defs, &elab);
+                    print_resource_usage(compile_wall_start);
+                }
                 emit_run_stats(report_mode, compile_wall_start, None);
                 // §6.21: keep compiled artifacts consistent with the simulate
                 // path — re-issue static initializers that call simulation-time
@@ -2990,8 +3039,8 @@ suppressed but the explicit SDF annotation still applies."
         return 0;
     }
 
-    println!("Max time: {} ns", max_time);
-    println!("------------------------------");
+    chatter_out!("Max time: {} ns", max_time);
+    chatter_out!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
     xezim::compiler::simulator::set_dump_timescales(dump_timescales);
     xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
@@ -3049,7 +3098,7 @@ suppressed but the explicit SDF annotation still applies."
         multikernel_scope.as_deref(),
     ) {
         Ok(sim) => {
-            println!("------------------------------");
+            chatter_out!("------------------------------");
             if let Some(ref mo) = dump_merged_sv {
                 append_adopted_libs_to_merged(
                     mo,
@@ -3058,7 +3107,6 @@ suppressed but the explicit SDF annotation still applies."
                     merged_kept.as_deref(),
                 );
             }
-            println!("Simulation finished at time {}", sim.time);
             {
                 let (hits, last_t) = sim.settle_limit_report();
                 if hits > 0 {
@@ -3068,9 +3116,7 @@ suppressed but the explicit SDF annotation still applies."
                     );
                 }
             }
-            if sim.finished {
-                println!("($finish called)");
-            }
+            print_finish_line(sim.time, sim.finished);
             // Footer before the exit-status checks so it also appears for
             // runs that end with a nonzero status.
             emit_run_stats(report_mode, compile_wall_start, Some(sim.time));

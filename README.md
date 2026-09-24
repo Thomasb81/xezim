@@ -279,6 +279,12 @@ Or invoke the binary directly:
 ./target/release/xezim <source_files> [+plusargs] [options]
 ```
 
+A run prints the design's own output (`$display`, UVM messages, assertion
+failures), warnings and errors, and one closing line —
+`Simulation finished at time N`, with ` ($finish called)` when the design
+finished itself. The version banner, `[PHASE]` timings and engine counters are
+behind `--verbose` (or `--profile`).
+
 Common options:
 
 | Option | Purpose |
@@ -295,8 +301,8 @@ Common options:
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
 | `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
 | `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |
-| `--sim-debug` | Print `[DEBUG]` / `[OPT]` diagnostics (`--sim_debug` still accepted) |
-| `--verbose` | Per-file compile progress: each file as it is parsed, and the modules/blocks it contributed to the working library |
+| `--sim-debug` | Print `[DEBUG]` / `[OPT]` diagnostics (`--sim_debug` still accepted); implies `--verbose`'s engine lines |
+| `--verbose` | Internal engine lines, off by default: the version banner, `[PHASE]` timings, the end-of-run engine counters (`[PROF]`/`[FUSE]`/`[EVENT-EDGE]`/`[COV]`), compile-time notes such as `[EDGE-MERGE]` and `[CACHE]` hits, and `--compile`'s design summary; plus per-file compile progress (each file as it is parsed, and the modules/blocks it contributed). Same as `XEZIM_VERBOSE=1` |
 | `--dump-files-list` | Print the fully resolved file list after `-f` expansion, then exit — confirms *which* sources a build actually reads |
 | `--dump-merged-sv <file>` | Write the sources as one preprocessed, self-contained `.sv`. With `-s <top>`, keeps only the files that top needs. See [below](#reducing-a-multi-file-build) |
 | `--artifact-compression <none\|1-22>` | Compression level for the `-o` compiled artifact (`none` writes it raw) |
@@ -315,7 +321,7 @@ Common options:
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for vendor sources you cannot edit |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
-| `--profile` | Print the `[PROF]` end-of-run profile report (edge-block, settle and timing counters). Same as `XEZIM_PROFILE_REPORT=1` |
+| `--profile` | Print the `[PROF]` end-of-run profile report (edge-block, settle and timing counters) together with the `--verbose` engine lines. Same as `XEZIM_PROFILE_REPORT=1`. Adds overhead |
 
 Selected env knobs (off by default unless noted):
 
@@ -336,6 +342,7 @@ Selected env knobs (off by default unless noted):
 | `XEZIM_COMPILE_PHASES=1` | Report detailed simulator compilation phase timings |
 | `XEZIM_ALLOW_IMPLICIT_STATIC=1` | Same as `--relax-implicit-static` |
 | `XEZIM_PROFILE_REPORT=1` | Same as `--profile` |
+| `XEZIM_VERBOSE=1` | Same as `--verbose` (for scripts that grep `[PHASE]`/`[PROF]` lines without adding a flag) |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
 | `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
 | `XEZIM_VALUE_TRACE=<substr>[,...]` | Print every committed change of signals whose hierarchical name contains a pattern: time, name, old→new value, dispatch phase, writing process origin (file:line). NBA commits are labeled `nba` |
@@ -411,8 +418,9 @@ and delay settings, and the xezim executable build.
 
 The default directory is `$XEZIM_CACHE_DIR`, then
 `$XDG_CACHE_HOME/xezim/designs`, then `$HOME/.cache/xezim/designs`. Use
-`--cache-dir` for a workload-local cache or `--no-cache` for a cold run. Xezim
-prints `[CACHE] miss`, `[CACHE] stored`, or `[CACHE] hit` on stderr.
+`--cache-dir` for a workload-local cache or `--no-cache` for a cold run. With
+`--verbose`, xezim prints `[CACHE] miss`, `[CACHE] stored`, or `[CACHE] hit` on
+stderr.
 
 ## Reducing a multi-file build
 

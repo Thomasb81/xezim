@@ -10008,7 +10008,7 @@ impl Simulator {
         };
         let total_ms = phase_total.elapsed().as_secs_f64() * 1000.0;
         if total_ms > 100.0 {
-            eprintln!(
+            chatter!(
                 "[PHASE] simulator construction: {:.1}ms (materialize {:.1}, names {:.1}, static {:.1}, arrays_1d {:.1}, arrays_other {:.1}, prev {:.1}, drop {:.1}; signals {}, named {})",
                 total_ms,
                 materialize_ms,
@@ -15089,7 +15089,7 @@ impl Simulator {
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
         let dt = t_settle0.elapsed();
         if dt.as_millis() > 100 {
-            eprintln!(
+            chatter!(
                 "[PHASE] time-0 settle: {:.1}ms ({} entry_evals, {} settle_iters, {} comb_entries, {} signals)",
                 dt.as_secs_f64() * 1000.0,
                 self.entry_evals - entries_before,
@@ -15097,7 +15097,7 @@ impl Simulator {
                 self.comb_entries.len(),
                 self.signal_table.len()
             );
-            eprintln!(
+            chatter!(
                 "[PHASE] time-0 settle breakdown: DC {:.1}ms/{} ({:.1}µs), CA {:.1}ms/{} ({:.1}µs), AB {:.1}ms/{} ({:.1}µs)",
                 (self.prof_settle_dc_ns - dc_ns_before) as f64 / 1e6,
                 self.prof_settle_dc_count - dc_count_before,
@@ -20177,7 +20177,7 @@ impl Simulator {
                     std::mem::forget(lib);
                 }
             }
-            eprintln!(
+            chatter!(
                 "[AOT] comb entries compiled {}/{} (width-safe candidates {})",
                 n,
                 self.comb_entries.len(),
@@ -27119,9 +27119,11 @@ impl Simulator {
                         }
                     }
                     if merged_members > 0 {
-                        eprintln!(
+                        chatter!(
                             "[EDGE-MERGE] merged {} blocks into {} (cap {})",
-                            merged_members, merged_blocks, cap
+                            merged_members,
+                            merged_blocks,
+                            cap
                         );
                     }
                 }
@@ -27532,7 +27534,7 @@ impl Simulator {
                                         }
                                     }
                                     std::mem::forget(lib);
-                                    eprintln!(
+                                    chatter!(
                                         "[AOT] edge blocks compiled {}/{}",
                                         n,
                                         self.compiled_edge_blocks.len()
@@ -41720,7 +41722,7 @@ impl Simulator {
                 .unwrap_or(0);
             self.build_event_measure_state();
             if event_skip {
-                eprintln!(
+                chatter!(
                     "[EVENT-EDGE] SKIP mode ON (sim_time >= {}) — skipping gateable flop fires with no data-input change",
                     self.event_after
                 );
@@ -42130,7 +42132,7 @@ impl Simulator {
         let t_snap = accum.t_snap;
         let t_sched = accum.t_sched;
         let sim_elapsed = sim_start_rt.elapsed();
-        eprintln!(
+        chatter!(
             "[PROF] settle={:.1}ms edges={:.1}ms nba={:.1}ms process={:.1}ms snap={:.1}ms sched={:.1}ms",
             t_settle as f64 / 1e6,
             t_edges as f64 / 1e6,
@@ -42285,20 +42287,22 @@ impl Simulator {
             .iter()
             .filter(|e| e.has_unresolved_reads)
             .count();
-        eprintln!(
+        chatter!(
             "[PROF] edge_waiters={:.1}ms edge_cg={:.1}ms waiter_iters={}",
             self.prof_edge_waiters as f64 / 1e6,
             self.prof_edge_cg as f64 / 1e6,
             self.prof_waiter_iters
         );
-        eprintln!(
+        chatter!(
             "[PROF] clocks_only_detect={} nba_elided={} (iters with clocks-only scan / NBAs dropped at eval because value matched signal_table)",
-            self.prof_clocks_only_detect, self.prof_nba_elided
+            self.prof_clocks_only_detect,
+            self.prof_nba_elided
         );
         if self.prof_par_ticks > 0 {
-            eprintln!(
+            chatter!(
                 "[PROF] parallel_dispatch ticks={} blocks={} (their insns are NOT counted in insns= below — they run on worker threads)",
-                self.prof_par_ticks, self.prof_par_blocks
+                self.prof_par_ticks,
+                self.prof_par_blocks
             );
         }
         self.dump_comb_paths();
@@ -42309,7 +42313,7 @@ impl Simulator {
         self.dump_cycle_census();
         self.dump_chain_census();
         self.dump_coact_census();
-        eprintln!(
+        chatter!(
             "[PROF] edge_detect={:.1}ms edge_exec={:.1}ms edges_fired={} insns={} ns_per_insn={:.1} fallbacks={}",
             self.prof_edge_detect as f64 / 1e6,
             self.prof_edge_exec as f64 / 1e6,
@@ -42325,15 +42329,15 @@ impl Simulator {
         // Static count of `LoadSignal;LoadArrayElem;NbaAssign` triples the
         // peephole collapsed into `Insn::NbaAssignArrayRead` (see
         // `BytecodeCompiler::fuse_array_read_nba`).
-        eprintln!(
+        chatter!(
             "[FUSE] array-read-NBA fusions (static sites): {}",
             super::bytecode::array_read_nba_fusions()
         );
-        eprintln!(
+        chatter!(
             "[FUSE] packed-loop NBA copies (static sites): {}",
             super::bytecode::packed_loop_nba_copies()
         );
-        eprintln!(
+        chatter!(
             "[FUSE] packed blocking fills (dynamic executions): {}",
             self.packed_blocking_fill_collapses
         );
@@ -42341,7 +42345,7 @@ impl Simulator {
         // into `Insn::BinOpConst` (see `BytecodeCompiler::fuse_binop_const`).
         {
             let f = super::bytecode::binop_const_fusions();
-            eprintln!(
+            chatter!(
                 "[FUSE] const-operand ALU fusions (static sites): Add={} Eq={} CaseEq={} Xor={} And={} Or={} Mul={} Sub={} total={}",
                 f[0],
                 f[1],
@@ -42353,19 +42357,19 @@ impl Simulator {
                 f[7],
                 f.iter().sum::<u64>()
             );
-            eprintln!(
+            chatter!(
                 "[FUSE] Move-into-assign forwards (static sites): {}",
                 super::bytecode::census_pair_fusions()
             );
-            eprintln!(
+            chatter!(
                 "[FUSE] copies forwarded into readers (static sites): {}",
                 super::bytecode::copy_forward_count()
             );
-            eprintln!(
+            chatter!(
                 "[FUSE] provably-unsigned scrubs elided (static sites): {}",
                 super::bytecode::elided_scrub_count()
             );
-            eprintln!(
+            chatter!(
                 "[FUSE] AddC2 superinstructions (static sites): {}",
                 super::bytecode::addc2_count()
             );
@@ -42475,16 +42479,18 @@ impl Simulator {
             }
         }
         if self.event_measure && self.event_gateable_total > 0 {
-            eprintln!(
+            chatter!(
                 "[EVENT-EDGE] would-skip {}/{} gateable main-clk flop-fires ({:.1}%) had NO data-input change since last posedge => event-driven edge could skip them",
                 self.event_would_skip,
                 self.event_gateable_total,
                 100.0 * self.event_would_skip as f64 / self.event_gateable_total as f64,
             );
             if self.event_skip {
-                eprintln!(
+                chatter!(
                     "[EVENT-EDGE] adaptive epoch-fast-exec={} snapshot-checks={} healed={}",
-                    self.event_epoch_fast_exec, self.event_snapshot_checks, self.event_healed
+                    self.event_epoch_fast_exec,
+                    self.event_snapshot_checks,
+                    self.event_healed
                 );
                 if let Some(c) = &self.arm_census {
                     let mut rows: Vec<(usize, u64, u64)> = c
@@ -42513,15 +42519,16 @@ impl Simulator {
                     }
                 }
                 if self.armed_edge {
-                    eprintln!(
+                    chatter!(
                         "[EVENT-EDGE] armed-fast-skips={} shadow-checks={}",
-                        self.armed_fast_skips, self.armed_shadow_checks
+                        self.armed_fast_skips,
+                        self.armed_shadow_checks
                     );
                 }
             }
         }
         if self.prof_par_dispatch_partition + self.prof_par_dispatch_legacy > 0 {
-            eprintln!(
+            chatter!(
                 "[PROF] par_dispatch partition={} legacy={} pdes={} (partition k={})",
                 self.prof_par_dispatch_partition,
                 self.prof_par_dispatch_legacy,
@@ -42535,7 +42542,7 @@ impl Simulator {
             let merge_ms = self.prof_pdes_merge_ns as f64 / 1e6;
             let total_ms = spawn_ms + exec_ms + merge_ms;
             let n = self.prof_par_dispatch_pdes as f64;
-            eprintln!(
+            chatter!(
                 "[PROF-pdes] {} dispatches, total {:.1}ms (spawn {:.1}ms {:.1}%, exec {:.1}ms {:.1}%, merge {:.1}ms {:.1}%); per-tick avg {:.1}µs spawn / {:.1}µs exec / {:.1}µs merge",
                 self.prof_par_dispatch_pdes,
                 total_ms,
@@ -42562,7 +42569,7 @@ impl Simulator {
             } else {
                 0.0
             };
-            eprintln!(
+            chatter!(
                 "[PROF-pdes] thread imbalance: max_total {:.1}ms / min_total {:.1}ms = {:.2}× ratio; idle wait sum {:.1}ms ({:.1}% of merge wall)",
                 max_total_ms,
                 min_total_ms,
@@ -42578,7 +42585,7 @@ impl Simulator {
             .collect();
         reasons.sort_by_key(|(_, _, ns)| std::cmp::Reverse(*ns));
         for (reason, count, ns) in reasons.iter().take(15) {
-            eprintln!(
+            chatter!(
                 "[PROF] fallback_reason {:>30}: count={:>8} total={:>8.1}ms avg={:>7.1}µs",
                 reason,
                 count,
@@ -42586,7 +42593,7 @@ impl Simulator {
                 *ns as f64 / *count as f64 / 1e3
             );
         }
-        eprintln!(
+        chatter!(
             "[PROF] settle_dc={:.1}ms({}) settle_ca={:.1}ms({}) settle_ab={:.1}ms({})",
             self.prof_settle_dc_ns as f64 / 1e6,
             self.prof_settle_dc_count,
@@ -42595,11 +42602,11 @@ impl Simulator {
             self.prof_settle_ab_ns as f64 / 1e6,
             self.prof_settle_ab_count
         );
-        eprintln!(
+        chatter!(
             "[PROF] engine={}",
             if self.cycle_mode { "cycle" } else { "event" }
         );
-        eprintln!(
+        chatter!(
             "[PROF] tables: signals={} sig_to_edge_pos={} edge_signals={} armed_input_ranges={} dirty_signals={} gate_lane_ops={}",
             self.signal_table.len(),
             self.sig_to_edge_pos.len(),
@@ -42608,14 +42615,15 @@ impl Simulator {
             self.dirty_signals.len(),
             self.gate_ops.len()
         );
-        eprintln!("[PROF] vm_insns_total={}", self.prof_insns_executed);
-        eprintln!(
+        chatter!("[PROF] vm_insns_total={}", self.prof_insns_executed);
+        chatter!(
             "[PROF] write_observer: quiet={} observed={}",
-            self.prof_quiet_stores, self.prof_observed_stores
+            self.prof_quiet_stores,
+            self.prof_observed_stores
         );
         #[cfg(feature = "jit")]
         if let Some(m) = self.ts_jit.as_ref() {
-            eprintln!(
+            chatter!(
                 "[PROF] ts_jit: compiled={} rejected={} code_bytes={} pending={}",
                 m.compiled,
                 m.rejected,
@@ -42623,13 +42631,13 @@ impl Simulator {
                 m.pending_len()
             );
         }
-        eprintln!(
+        chatter!(
             "[PROF] clock_tree: roots={} entries={} eager_evals={}",
             self.clock_tree_by_root.len(),
             self.is_clock_tree_entry.iter().filter(|&&b| b).count(),
             self.prof_clock_tree_evals
         );
-        eprintln!(
+        chatter!(
             "[PROF] settle_calls={} settle_iters={} max_iters={} entry_evals={} unresolved_entries={}/{}",
             self.settle_calls,
             self.settle_iters,
@@ -42639,7 +42647,7 @@ impl Simulator {
             self.comb_entries.len()
         );
         let quiet_evals = self.entry_evals.saturating_sub(self.prof_settle_writes);
-        eprintln!(
+        chatter!(
             "[PROF] settle_writes={} ({:.1}% of evals changed a signal, {} quiet) dep_edges={} ({:.1} per write) repass_evals={}",
             self.prof_settle_writes,
             if self.entry_evals > 0 {
@@ -42656,7 +42664,7 @@ impl Simulator {
             },
             self.prof_settle_repass_evals
         );
-        eprintln!(
+        chatter!(
             "[PROF] two_state_evals={} ({} entries lowered)",
             self.prof_ts_evals,
             self.ts_comb
@@ -42670,7 +42678,7 @@ impl Simulator {
             + self.prof_ts_bail_abort
             > 0
         {
-            eprintln!(
+            chatter!(
                 "[PROF] two_state_bail warn_x={} forced_write={} x_read={} run_abort={} x_plane_runs={}",
                 self.prof_ts_bail_warnx,
                 self.prof_ts_bail_forced,
@@ -42942,7 +42950,7 @@ impl Simulator {
                 );
             }
         }
-        eprintln!(
+        chatter!(
             "[PROF] simulation_loop={:.1}ms iters={} avg={:.2}µs/iter",
             sim_elapsed.as_secs_f64() * 1000.0,
             self.loop_iters,
@@ -43099,15 +43107,23 @@ impl Simulator {
         if n_assert_sites == 0 && n_cg_instances == 0 {
             return;
         }
-        eprintln!(
+        chatter!(
             "[COV] assertions: {} sites (assert={}, assume={}, cover={}) — \
              {} passes, {} fails",
-            n_assert_sites, k_assert_sites, k_assume_sites, k_cover_sites, tot_pass, tot_fail
+            n_assert_sites,
+            k_assert_sites,
+            k_assume_sites,
+            k_cover_sites,
+            tot_pass,
+            tot_fail
         );
-        eprintln!(
+        chatter!(
             "[COV] coverage: {} covergroup instances, {} samples, \
              {} unique coverpoint values, {} unique cross tuples",
-            n_cg_instances, tot_samples, n_cp_bins_hit, n_cross_tuples_hit
+            n_cg_instances,
+            tot_samples,
+            n_cp_bins_hit,
+            n_cross_tuples_hit
         );
 
         // Coverage DB: skip if no data; default path used only when there IS
@@ -43188,7 +43204,7 @@ impl Simulator {
         }
         json.push_str("  ]\n}\n");
         match std::fs::write(&db_path, &json) {
-            Ok(()) => eprintln!("[COV] wrote coverage DB to {}", db_path),
+            Ok(()) => chatter!("[COV] wrote coverage DB to {}", db_path),
             Err(e) => eprintln!("[COV] warning: could not write {}: {}", db_path, e),
         }
     }
@@ -44782,7 +44798,7 @@ impl Simulator {
                 }
             }
             std::mem::forget(lib);
-            eprintln!("[AOT] process FSMs compiled {}/{}", n, self.proc_fsm.len());
+            chatter!("[AOT] process FSMs compiled {}/{}", n, self.proc_fsm.len());
         }
     }
 
@@ -83468,7 +83484,7 @@ impl Simulator {
         }
         self.build_armed_edge_state(&arm_extra);
         self.rebuild_signal_commit_plans();
-        eprintln!(
+        chatter!(
             "[EVENT-EDGE] measure (timestamp): {} edge blocks, {} gateable, {} gateable-with-EMPTY-data-reads, avg data-reads/gateable={:.2}",
             nb,
             gateable_n,
@@ -83576,7 +83592,7 @@ impl Simulator {
                 }
             })
             .collect();
-        eprintln!(
+        chatter!(
             "[EVENT-EDGE] ARMED mode ON: {} input signals, {} fanout edges{}",
             input_count,
             self.armed_input_blocks.len(),

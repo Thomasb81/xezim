@@ -14,8 +14,10 @@ fn run_aot(src: &str) -> String {
     let _ = std::fs::create_dir_all(&dir);
     let f = dir.join("aot_native_paths.sv");
     std::fs::write(&f, src).unwrap();
+    // `--verbose`: the "[AOT] comb entries compiled" line asserted below is
+    // engine chatter, off by default.
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--no-cache", "-s", "tb", "--max-time", "1000"])
+        .args(["--no-cache", "--verbose", "-s", "tb", "--max-time", "1000"])
         .arg(&f)
         .env("XEZIM_JIT", "1")
         .env("XEZIM_AOT", "1")

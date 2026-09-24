@@ -887,6 +887,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Comb settle: print vector-coalescing statistics",
     ),
     (
+        "XEZIM_VERBOSE",
+        "Same as --verbose: version banner, [PHASE] timings, end-of-run engine counters (1)",
+    ),
+    (
         "XEZIM_VERIFY_INLINE_BITS",
         "JIT: shadow-verify the inline-bits mirror against Values",
     ),

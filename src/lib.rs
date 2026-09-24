@@ -6,6 +6,32 @@
 //!
 //! For ahead-of-time native compilation, use the `xezim-b` crate.
 
+/// Internal engine chatter (`[PHASE]` timings, end-of-run `[PROF]`/`[FUSE]`
+/// counters, compile-time optimisation notes) goes through this instead of
+/// `eprintln!`: it prints only when [`verbose`] is on, so a default run shows
+/// just the design's output, warnings/errors and the final result line.
+macro_rules! chatter {
+    ($($arg:tt)*) => {
+        if $crate::verbose() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn internal engine chatter on or off (see `chatter!`). The CLI enables
+/// it for `--verbose`, `--profile`, `--sim-debug`, `XEZIM_VERBOSE=1` and the
+/// profiling switches `XEZIM_PROFILE_REPORT=1` / `XEZIM_PROFILE_TIMING=1`.
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether internal engine chatter is printed.
+pub fn verbose() -> bool {
+    VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub mod benchw;
 pub mod compiler;
 pub mod env_vars;
@@ -186,12 +212,12 @@ fn design_cache_key(
 fn read_design_cache(config: &DesignCacheConfig, key: &str) -> Option<elaborate::ElaboratedModule> {
     let path = config.directory.join(format!("{}.xezbc", key));
     if !path.is_file() {
-        eprintln!("[CACHE] miss {}", key);
+        chatter!("[CACHE] miss {}", key);
         return None;
     }
     match read_compiled(path.to_string_lossy().as_ref()) {
         Ok(Some(elab)) => {
-            eprintln!("[CACHE] hit {} ({})", key, path.display());
+            chatter!("[CACHE] hit {} ({})", key, path.display());
             Some(elab)
         }
         Ok(None) => {
@@ -237,7 +263,7 @@ fn write_design_cache(config: &DesignCacheConfig, key: &str, elab: &elaborate::E
         let _ = std::fs::remove_file(temp_path);
         return;
     }
-    eprintln!("[CACHE] stored {} ({})", key, final_path.display());
+    chatter!("[CACHE] stored {} ({})", key, final_path.display());
 }
 
 #[cfg(test)]
@@ -998,7 +1024,7 @@ fn simulate_multi_inner(
     if !sim.compile_errors.is_empty() {
         return Err(sim.compile_errors.join("; "));
     }
-    eprintln!(
+    chatter!(
         "[PHASE] compilation: {:.1}ms",
         compilation_start.elapsed().as_secs_f64() * 1000.0
     );
@@ -1106,7 +1132,7 @@ fn simulate_multi_inner(
 
     let simulation_start = WallTimer::now();
     sim.simulate();
-    eprintln!(
+    chatter!(
         "[PHASE] simulation: {:.1}ms",
         simulation_start.elapsed().as_secs_f64() * 1000.0
     );
@@ -1124,11 +1150,11 @@ fn simulate_multi_inner(
     }
 
     let total_elapsed = total_start.elapsed();
-    eprintln!(
+    chatter!(
         "[PHASE] total: {:.1}ms",
         total_elapsed.as_secs_f64() * 1000.0
     );
-    eprintln!("------------------------------");
+    chatter!("------------------------------");
     // The result line itself is the CLI's to print, on stdout (main.rs). Printing
     // it here too put it on BOTH streams, so it appeared twice in any terminal
     // or merged log.
