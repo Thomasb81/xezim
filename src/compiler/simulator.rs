@@ -23821,6 +23821,10 @@ impl Simulator {
                     debug_assert!(false, "class-member insn in isolated comb exec");
                     break;
                 }
+                Insn::LoadCollElem(..) | Insn::StoreCollElem(..) => {
+                    debug_assert!(false, "collection-elem insn in isolated comb exec");
+                    break;
+                }
                 Insn::LoadConst(dest, val) => {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
@@ -24491,6 +24495,10 @@ impl Simulator {
                 }
                 Insn::CallCollMethod(..) => {
                     debug_assert!(false, "CallCollMethod insn in isolated comb exec");
+                    break;
+                }
+                Insn::LoadCollElem(..) | Insn::StoreCollElem(..) => {
+                    debug_assert!(false, "collection-elem insn in isolated comb exec");
                     break;
                 }
                 Insn::LoadConst(dest, val) => {
@@ -25725,6 +25733,136 @@ impl Simulator {
                         }
                     };
                     self.vm_regs[*dest as usize] = result;
+                    local_count += 1;
+                }
+                // Step 9b-ii: element READ of a class member collection
+                // (`q[i]`, `aa[k]`, `this.aa[k]`, `obj.aa[k]`) inside a
+                // compiled method body. Mirrors the `expr_assoc_name` arm of
+                // the interpreter's Index eval (the only earlier guard that
+                // arm could take for these shapes is the `$` index reject,
+                // which the compiler refuses to emit): resolve the store,
+                // narrow the key (assoc_key_str), read `store[key]` with the
+                // zero(32) missing-key default, NO width fit (the compiler
+                // emitted Resize for the context width; `q[$]` is excluded
+                // so dollar_bound is irrelevant).
+                Insn::LoadCollElem(dest, handle_reg, member, idx_reg) => {
+                    let idx_val = self.vm_regs[*idx_reg as usize].clone();
+                    let store: Option<String> = if *handle_reg == 0 {
+                        // Bare receiver: the collection is a member of
+                        // `this` — the interpreter's own resolution chain
+                        // (instance member, then static / param-bound
+                        // special keys). A None here is unreachable for
+                        // admitted shapes (the compile-side plan set is a
+                        // subset); interpret as zero, like a null read.
+                        self.instance_assoc_member(member)
+                    } else {
+                        let handle = self.vm_regs[*handle_reg as usize]
+                            .to_u64()
+                            .unwrap_or(0) as usize;
+                        // Dotted receiver: null handle reads zero, per the
+                        // funnel's fall-through (`Value::zero(32)`).
+                        if handle == 0 {
+                            None
+                        } else {
+                            self.handle_collection_name(handle, member)
+                        }
+                    };
+                    let value = match store {
+                        Some(an) => {
+                            let key = self.assoc_key_str(&an, &idx_val);
+                            let elem = format!("{}[{}]", an, key);
+                            self.signals
+                                .get(&elem)
+                                .cloned()
+                                .unwrap_or_else(|| Value::zero(32))
+                        }
+                        None => Value::zero(32),
+                    };
+                    self.vm_regs[*dest as usize] = value;
+                    local_count += 1;
+                }
+                // Element WRITE counterpart. Mirrors the `expr_assoc_name`
+                // arm of `assign_value_index` (51285): queue/dynamic-array
+                // append growth, §10.7 width fit off the live store, exact
+                // changed-detect insert, touch_queue on change — then the
+                // same waiter notify `assign_value` would run (the AST path
+                // reaches that check through the `assign_value` wrapper;
+                // a synthetic name-only lvalue walks exactly like the real
+                // one because the name collectors never inspect indexes).
+                Insn::StoreCollElem(handle_reg, member, idx_reg, val_reg) => {
+                    let idx_val = self.vm_regs[*idx_reg as usize].clone();
+                    let val = self.vm_regs[*val_reg as usize].clone();
+                    let store: Option<String> = if *handle_reg == 0 {
+                        self.instance_assoc_member(member)
+                    } else {
+                        let handle = self.vm_regs[*handle_reg as usize]
+                            .to_u64()
+                            .unwrap_or(0) as usize;
+                        if handle == 0 {
+                            // Null-receiver store: the AST funnel's write
+                            // resolves no store and drops silently.
+                            None
+                        } else {
+                            self.handle_collection_name(handle, member)
+                        }
+                    };
+                    if let Some(an) = store {
+                        let key = self.assoc_key_str(&an, &idx_val);
+                        let elem_name = format!("{}[{}]", an, key);
+                        // §7.10.2.3: `q[i] = v` with `i >= size` APPENDS to
+                        // a queue / dynamic array (auto-grows to `i+1`).
+                        if !self.is_associative_array(&an) {
+                            let kval = idx_val.to_i64().unwrap_or(0);
+                            if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
+                                self.set_queue_size(&an, kval as u64 + 1);
+                            }
+                        }
+                        // §10.7: fit to the DECLARED element width when one
+                        // was recorded; otherwise store as-is.
+                        let fitted = match self.assoc_elem_width(&an) {
+                            Some(w) if w != val.width && !val.is_real => {
+                                val.resize_for_assign(w)
+                            }
+                            _ => val.clone(),
+                        };
+                        let changed = self.signals.get(&elem_name) != Some(&fitted);
+                        self.signals.insert(elem_name, fitted);
+                        if changed {
+                            self.touch_queue(&an);
+                            // Waiter notify, as `assign_value` does for the
+                            // AST path. The synthetic lvalue is name-only —
+                            // the target-name collectors ignore indexes.
+                            if !self.condition_waiters.is_empty() {
+                                let lhs = Expression::new(
+                                    ExprKind::Ident(HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![HierPathSegment {
+                                            name: crate::ast::Identifier {
+                                                name: member.to_string(),
+                                                span: crate::ast::Span::dummy(),
+                                            },
+                                            selects: Vec::new(),
+                                        }],
+                                        span: crate::ast::Span::dummy(),
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    }),
+                                    crate::ast::Span::dummy(),
+                                );
+                                self.check_condition_waiters_for_write(&lhs);
+                            }
+                            // The AST statement route settles the comb
+                            // layer after every blocking element write
+                            // (`exec_stmt_blocking_assign` →
+                            // `settle_after_proc_write`), even when the
+                            // value did not change. Here the settle runs
+                            // only on a change: with no cell changed it is
+                            // a pure recompute (no observable effect), and
+                            // skipping it avoids paying a full comb pass
+                            // for same-value stores.
+                            self.settle_after_proc_write();
+                        }
+                    }
                     local_count += 1;
                 }
                 // 10.8% of all executed bytecode — the second most frequent
@@ -38193,6 +38331,8 @@ impl Simulator {
             Insn::StoreClassMember(..) => "StoreClassMember",
             Insn::CallMethod(..) => "CallMethod",
             Insn::CallCollMethod(..) => "CallCollMethod",
+            Insn::LoadCollElem(..) => "LoadCollElem",
+            Insn::StoreCollElem(..) => "StoreCollElem",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
@@ -117152,6 +117292,27 @@ impl Simulator {
         out
     }
 
+    /// class-perf Step 9b-ii: the BARE element-access admission set —
+    /// `class_coll_member_names ∪ class_static_coll_member_names` MINUS
+    /// every module-scope collection-table name. The AST write funnel
+    /// probes the module queue/array/assoc tables BEFORE its class-member
+    /// arm, so a bare name that is also a module collection must keep its
+    /// element accesses on the AST path (see
+    /// `PreboundCompiledMethod::coll_elem_members`).
+    fn class_coll_elem_member_names(&self, cname: &str) -> HashSet<String> {
+        let mut out = self.class_coll_member_names(cname);
+        out.extend(self.class_static_coll_member_names(cname));
+        out.retain(|n| {
+            !self.module.arrays.contains_key(n)
+                && !self.module.arrays_2d.contains_key(n)
+                && !self.module.arrays_nd.contains_key(n)
+                && !self.module.dynamic_arrays.contains(n)
+                && !self.module.associative_arrays.contains_key(n)
+                && !self.module.queue_vars.contains(n)
+        });
+        out
+    }
+
     /// class-perf Step 4b: compile and run a class-FUNCTION method body as
     /// bytecode, all-or-nothing. Returns `None` (fall back to the AST
     /// interpreter) unless EVERYTHING lowerable: the method is a scalar-
@@ -117344,6 +117505,8 @@ impl Simulator {
                 coll_members: std::rc::Rc::new(self.class_coll_member_names(cname)),
                 static_coll_members: std::rc::Rc::new(self
                     .class_static_coll_member_names(cname)),
+                coll_elem_members: std::rc::Rc::new(self
+                    .class_coll_elem_member_names(cname)),
                 static_result_width,
                 result_signed,
                 param_able_result,
@@ -117422,6 +117585,7 @@ impl Simulator {
                         &string_members,
                         &pre.coll_members,
                         &pre.static_coll_members,
+                        &pre.coll_elem_members,
                         &pre.string_formals,
                         Some((
                             &pre.fn_ret_name,

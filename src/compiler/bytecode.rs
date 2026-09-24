@@ -452,6 +452,27 @@ pub enum Insn {
     /// through `handle_collection_name(handle, member)` and re-enters
     /// `eval_builtin_method` on the scoped `<handle>#member` store.
     CallCollMethod(RegId, RegId, Box<str>, Box<str>, RegId, u32, u8), // (dest, handle_reg, member, method, arg_start, n_args, bare)
+
+    /// class-perf Step 9b-ii: ELEMENT read of a class member collection,
+    /// `q[i]` / `aa[k]` / `obj.aa[k]` inside a compiled method body.
+    /// (dest, handle_reg, member, index_reg). The exec arm mirrors the
+    /// interpreter's own member-element read body (the `expr_assoc_name`
+    /// arm of eval_expr's Index) DIRECTLY — `assoc_key_str` narrowing,
+    /// `store[key]` lookup with the zero(32) missing-key default, no width
+    /// fit (the compiler emits the context Resize). `handle_reg == 0`
+    /// selects the bare route (`instance_assoc_member`, statics included);
+    /// otherwise the register carries the base handle and the store is
+    /// `handle_collection_name(handle, member)` — a zero handle reads
+    /// `Value::zero(32)`, matching the funnel's unresolved-store path.
+    LoadCollElem(RegId, RegId, Box<str>, RegId),
+    /// Element WRITE `q[i] = v` / `aa[k] = v` on the same receivers.
+    /// (handle_reg, member, index_reg, value_reg). The exec arm mirrors the
+    /// `expr_assoc_name` arm of `assign_value_index` directly — §7.10.2.3
+    /// queue append, §10.7 width fit off the live store, exact changed-
+    /// detect insert, touch_queue, waiter notify, settle — so storage and
+    /// side effects match the AST path. No-op on a null receiver.
+    StoreCollElem(RegId, Box<str>, RegId, RegId),
+
     Nop,
 
     /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
@@ -658,6 +679,18 @@ pub(super) struct PreboundCompiledMethod {
     /// (per-spec key, collision-aware); a dotted static receiver must stay
     /// AST (it reaches `exec_method_call`'s broken zero path).
     pub static_coll_members: std::rc::Rc<HashSet<String>>,
+    /// class-perf Step 9b-ii: BARE element-access admission (`q[i]`,
+    /// `aa[k]`) — the union of `coll_members`/`static_coll_members` MINUS
+    /// every module-scope collection-table name. The AST WRITE funnel
+    /// (`assign_value_index`) probes the module queues/arrays/assoc tables
+    /// BEFORE its class-member arm, so a bare name that is also a module
+    /// collection writes the MODULE store — an element insn would write the
+    /// class store instead. (AST READS are class-first, so reads of a
+    /// colliding name already diverge from writes in the interpreter;
+    /// excluding the name keeps both shapes on the interpreter's exact
+    /// behavior.) Element reads/writes only — CALLS stay admitted for the
+    /// name (the AST call funnel is class-first too).
+    pub coll_elem_members: std::rc::Rc<HashSet<String>>,
 }
 
 /// class-perf Step 4b: a cached, fully-lowered class-FUNCTION body plus the
@@ -806,7 +839,8 @@ impl Insn {
             LoadProcessLocal(..) | Format(..) | CaseJump(..) | CaseMaskJump(..)
             | StmtFallback(..) | EvalExprFallback(..)
             | WaitDelayReg(..) | WaitEdge(..)
-            | CallMethod(..) | CallCollMethod(..) => return false,
+            | CallMethod(..) | CallCollMethod(..)
+            | LoadCollElem(..) | StoreCollElem(..) => return false,
         }
         true
     }
@@ -872,6 +906,8 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::StoreClassMember(..) => "StoreCls",
         Insn::CallMethod(..) => "CallM,",
         Insn::CallCollMethod(..) => "CallColl,",
+        Insn::LoadCollElem(..) => "CollElemR,",
+        Insn::StoreCollElem(..) => "CollElemW,",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
@@ -1060,6 +1096,12 @@ pub struct BytecodeCompiler<'a> {
     /// receiver must stay AST (it reaches `exec_method_call`'s broken zero
     /// path).
     static_coll_member_names: HashSet<String>,
+    /// class-perf Step 9b-ii: BARE element-access admission — the union of
+    /// the two sets above minus module-scope collection names (see
+    /// `PreboundCompiledMethod::coll_elem_members`). The DOTTED element arm
+    /// keeps using `coll_member_names` (a MemberAccess base cannot collide
+    /// with a module table name).
+    coll_elem_member_names: HashSet<String>,
     /// Indices of the placeholder `Jump(0)` emitted by method-mode `return`;
     /// back-patched to the method's common exit at the end of the body.
     method_ret_jumps: Vec<usize>,
@@ -1295,6 +1337,7 @@ impl<'a> BytecodeCompiler<'a> {
             string_member_names: HashSet::default(),
             coll_member_names: HashSet::default(),
             static_coll_member_names: HashSet::default(),
+            coll_elem_member_names: HashSet::default(),
             method_ret_jumps: Vec::new(),
             decl_local_regs: std::collections::HashSet::default(),
             process_local_names: HashSet::default(),
@@ -3343,6 +3386,168 @@ impl<'a> BytecodeCompiler<'a> {
         Some(dest)
     }
 
+    /// Pure admission probe for member-collection ELEMENT access (Step
+    /// 9b-ii): `expr` is the indexed base expression (`q`, `this.aa`,
+    /// `obj.aa` — no trailing index). Returns `(collection_name, bare,
+    /// dotted_base)` when the receiver shape matches the CallCollMethod
+    /// receiver gate: bare = single-segment Ident, non-shadowed, in the
+    /// plan's collection set (statics admitted bare-only); dotted =
+    /// MemberAccess whose base passes `method_handle_chain_ok` and whose
+    /// member is in the INSTANCE collection set (dotted statics stay AST —
+    /// their store resolution routes through the broken zero path). No
+    /// emission — safe to call speculatively.
+    fn member_coll_elem_target(
+        &self,
+        expr: &crate::ast::expr::Expression,
+    ) -> Option<(String, bool, Option<crate::ast::expr::Expression>)> {
+        match &expr.kind {
+            crate::ast::expr::ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                let name = h.path[0].name.name.as_str();
+                // A block local or formal shadows the member collection.
+                if self.local_var_regs.contains_key(name) {
+                    return None;
+                }
+                // BARE element access: the collision-excluded plan set (see
+                // `PreboundCompiledMethod::coll_elem_members`).
+                if !self.coll_elem_member_names.contains(name) {
+                    return None;
+                }
+                Some((name.to_string(), true, None))
+            }
+            crate::ast::expr::ExprKind::MemberAccess { expr: base, member }
+                if self.method_handle_chain_ok(base)
+                    && self.coll_member_names.contains(member.name.as_str()) =>
+            {
+                Some((member.name.clone(), false, Some((**base).clone())))
+            }
+            _ => None,
+        }
+    }
+
+    /// class-perf Step 9b-ii: lower an ELEMENT READ of a class member
+    /// collection (`q[i]`, `aa[k]`, `this.aa[k]`, `obj.aa[k]`) to
+    /// `LoadCollElem`. The exec arm mirrors the interpreter's member-element
+    /// read body on the resolved store (bare: `instance_assoc_member`;
+    /// dotted: `handle_collection_name`), with the index VALUE in a VM
+    /// register — the same Value the AST eval of the index expression
+    /// produces, so key narrowing is byte-identical.
+    ///
+    /// REJECTED (stay AST, byte-parity hazards):
+    /// * `$` as the index — `q[$]` means LAST-ELEMENT (the live queue
+    ///   size via `dollar_bound`, interpreter-only); `compile_expr` cannot
+    ///   lower `$` in method mode anyway, so this is a belt-and-braces
+    ///   all-or-nothing guard.
+    /// * an INDEX EXPRESSION mentioning a string formal, EXCEPT a whole
+    ///   string-formal Ident (`aa[nm]`): the register read of the seeded
+    ///   formal is byte-exact, while compound string-formal index
+    ///   expressions keep the Step 8 bail (char-select / coercion
+    ///   differences).
+    /// * multi-dim shapes (`q[i][j]`, arrays of collections, fixed
+    ///   arrays): different storage machinery (arrays_nd /
+    ///   array_of_coll / `base[i]` rows), different read arms.
+    fn compile_member_coll_elem_read(
+        &mut self,
+        expr: &crate::ast::expr::Expression,
+        index: &crate::ast::expr::Expression,
+        ctx_width: u32,
+    ) -> Option<RegId> {
+        let Some((coll, bare, base_expr)) = self.member_coll_elem_target(expr) else {
+            return None;
+        };
+        // `$` index: q[$] / aa[$] needs the live queue size (dollar_bound) —
+        // the AST read arm owns it.
+        if matches!(index.kind, crate::ast::expr::ExprKind::Dollar) {
+            return None;
+        }
+        // A string formal anywhere in the index expression: the literal
+        // baking cannot reproduce the char-select / coercion semantics —
+        // EXCEPT a whole string-formal Ident (a plain register read; the
+        // seeded byte-vector Value is exact, and `assoc_key_str`'s narrowing
+        // is identical at runtime — the get_child unlock).
+        if self.touches_string_formal(index)
+            && !self.index_is_whole_string_formal(index)
+        {
+            return None;
+        }
+        // Dotted receiver: the handle register must be live BEFORE the
+        // consumer insn is emitted. A base-compile failure fails the whole
+        // read (the statement-level rollback cleans up).
+        let handle_reg = if bare {
+            0
+        } else {
+            let inner = base_expr.expect("dotted base present");
+            match self.method_member_handle_reg(&inner) {
+                Some(r) => r,
+                None => self.compile_expr(&inner, 0)?,
+            }
+        };
+        let idx_reg = self.compile_expr(index, 0)?;
+        let dest = self.alloc_reg();
+        self.emit(Insn::LoadCollElem(
+            dest,
+            handle_reg,
+            coll.into_boxed_str(),
+            idx_reg,
+        ));
+        // §11.8.1: honor the enclosing context width like every other read
+        // (the exec arm stores the raw store width; the caller resizes).
+        if ctx_width > 0 {
+            self.emit(Insn::Resize(dest, ctx_width));
+        }
+        Some(dest)
+    }
+
+    /// Element WRITE counterpart (`q[i] = v`, `aa[k] = v`, dotted forms).
+    /// Lowers to `StoreCollElem`; the exec arm re-runs the interpreter's
+    /// `assign_value_index` member arm (key narrowing, width fit, queue
+    /// append, waiter notify) on the resolved store. The value register
+    /// arrives at its RAW width — the BlockingAssign hook runs BEFORE the
+    /// `infer_lhs_width` Resize, whose Index arm would guess 1 bit and
+    /// destroy the value (the interpreter fits the element width at
+    /// runtime, off the live store).
+    fn compile_member_coll_elem_store(
+        &mut self,
+        expr: &crate::ast::expr::Expression,
+        index: &crate::ast::expr::Expression,
+        val_reg: RegId,
+    ) -> bool {
+        let Some((coll, bare, base_expr)) = self.member_coll_elem_target(expr) else {
+            return false;
+        };
+        if matches!(index.kind, crate::ast::expr::ExprKind::Dollar) {
+            return false;
+        }
+        if self.touches_string_formal(index)
+            && !self.index_is_whole_string_formal(index)
+        {
+            return false;
+        }
+        let Some(idx_reg) = self.compile_expr(index, 0) else {
+            return false;
+        };
+        let handle_reg = if bare {
+            0
+        } else {
+            let inner = base_expr.expect("dotted base present");
+            match self.method_member_handle_reg(&inner) {
+                Some(r) => r,
+                None => match self.compile_expr(&inner, 0) {
+                    Some(r) => r,
+                    None => return false,
+                },
+            }
+        };
+        self.emit(Insn::StoreCollElem(
+            handle_reg,
+            coll.into_boxed_str(),
+            idx_reg,
+            val_reg,
+        ));
+        true
+    }
+
     /// Bind a small fixed-shape local array to per-element registers. One
     /// dimension, constant bounds, at most 32 elements; every element starts
     /// at the element type's default. Returns false when the shape does not
@@ -4248,6 +4453,22 @@ impl<'a> BytecodeCompiler<'a> {
     /// node whose name matches bails the enclosing lowering, so a field
     /// access whose member name collides with a string formal just keeps
     /// the method on the AST interpreter (all-or-nothing, safe).
+    /// Step 9b-ii: is `e` EXACTLY a whole string-formal Ident (`aa[name]`)?
+    /// Such an index is a plain register read whose seeded byte-vector Value
+    /// is byte-identical to the interpreter's local-frame read, so the
+    /// member-collection element paths admit it where the general
+    /// string-formal guards bail (see the `string_formal_index` relaxation).
+    fn index_is_whole_string_formal(&self, e: &Expression) -> bool {
+        matches!(
+            &e.kind,
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && self.string_formal_names.contains(h.path[0].name.name.as_str())
+        )
+    }
+
     fn touches_string_formal(&self, e: &Expression) -> bool {
         if self.string_formal_names.is_empty() {
             return false;
@@ -6636,6 +6857,51 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("blocking_intra_timing");
                     return self.emit_fallback(stmt);
                 }
+                // class-perf Step 9b-ii: member-collection ELEMENT store
+                // (`q[i] = v`, `aa[k] = v`, dotted forms). Must hook BEFORE
+                // the `infer_lhs_width` Resize below: its Index arm guesses
+                // 1 bit for a member collection (no element-width signal
+                // entry) and would destroy the value before the runtime
+                // store sees it — the interpreter fits the element width
+                // from the live store inside `assign_value_index`. The
+                // rvalue compiles at its RAW width; the exec arm delegates
+                // to the interpreter's §10.7 fit. Admission is the same
+                // receiver matrix as the read; a rejection falls through to
+                // the ordinary AST path (all-or-nothing statement).
+                if self.method_mode
+                    && let ExprKind::Index { expr, index } = &lvalue.kind
+                    && self.member_coll_elem_target(expr).is_some()
+                    // The interpreter's statement path returns EARLY (before
+                    // its member-element arm) for an aggregate-pattern RHS
+                    // (`aa[k] = '{...}` spreads) and for a `new` RHS
+                    // (`mb[i] = new(...)` allocates / constructs) — neither
+                    // is a plain element store. Keep both shapes AST.
+                    && !match &rvalue.kind {
+                        ExprKind::AssignmentPattern(..) => true,
+                        ExprKind::Call { func, .. } => matches!(
+                            &func.kind,
+                            ExprKind::Ident(h)
+                                if h.path.len() == 1 && h.path[0].name.name == "new"
+                        ),
+                        ExprKind::Ident(h) => {
+                            h.path.len() == 1 && h.path[0].name.name == "new"
+                        }
+                        _ => false,
+                    }
+                {
+                    let start = self.insns.len();
+                    let start_reg = self.next_reg;
+                    if let Some(val_reg) = self.compile_expr(rvalue, 0)
+                        && self.compile_member_coll_elem_store(expr, index, val_reg)
+                    {
+                        return true;
+                    }
+                    self.insns.truncate(start);
+                    self.next_reg = start_reg;
+                    // Fall through to the AST fallback below.
+                    self.bail("coll_elem_store");
+                    return self.emit_fallback(stmt);
+                }
                 let width = self.infer_lhs_width(lvalue);
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
@@ -8236,7 +8502,41 @@ impl<'a> BytecodeCompiler<'a> {
                 // registry, out-of-range → NUL byte, not X) — bail. An index
                 // EXPRESSION mentioning a string formal is equally unsafe
                 // (non-integral index coercion differs).
-                if self.touches_string_formal(expr) || self.touches_string_formal(index) {
+                // Step 9b-ii EXCEPTion: a WHOLE string formal used as an
+                // INDEX (`aa[name]` — uvm_component::get_child's
+                // `m_children[name]`) is a plain read of the formal's
+                // register: the seeded byte-vector Value is the exact value
+                // the interpreter's local-frame read sees, and
+                // `assoc_key_str`'s §6.16 narrowing runs identically at
+                // runtime. The relaxation COMMITS to the member-element
+                // read below: if that declines, the whole expression bails
+                // rather than lowering the formal index through any other
+                // arm.
+                let relaxed_formal_index = self.method_mode
+                    && !self.touches_string_formal(expr)
+                    && self.index_is_whole_string_formal(index);
+                if !relaxed_formal_index
+                    && (self.touches_string_formal(expr)
+                        || self.touches_string_formal(index))
+                {
+                    self.bail("string_formal_index");
+                    return None;
+                }
+                // class-perf Step 9b-ii: element READ of a member collection
+                // (`q[i]`, `aa[k]`, `this.aa[k]`, `obj.aa[k]`) inside a
+                // method body — lower to LoadCollElem (delegated exec). Sit
+                // BEFORE the assoc-elem bail (which would keep the read on
+                // the AST path) and before every module-scope arm, which
+                // cannot resolve a member collection receiver.
+                if self.method_mode
+                    && let Some(dest) = self.compile_member_coll_elem_read(expr, index, ctx_width)
+                {
+                    return Some(dest);
+                }
+                if relaxed_formal_index {
+                    // The relaxed index only ever flows here when the
+                    // member-element read declined — nothing else may lower
+                    // a string-formal index (Step 8).
                     self.bail("string_formal_index");
                     return None;
                 }
@@ -11513,6 +11813,7 @@ impl<'a> BytecodeCompiler<'a> {
         string_member_names: &HashSet<String>,
         coll_member_names: &HashSet<String>,
         static_coll_member_names: &HashSet<String>,
+        coll_elem_members: &HashSet<String>,
         string_formals: &HashSet<String>,
         result: Option<(&str, u32, bool, bool)>,
         body: &[&crate::ast::stmt::Statement],
@@ -11533,6 +11834,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.string_member_names = string_member_names.clone();
         self.coll_member_names = coll_member_names.clone();
         self.static_coll_member_names = static_coll_member_names.clone();
+        self.coll_elem_member_names = coll_elem_members.clone();
 
         // `this` handle lives in a dedicated register.
         let this_reg = self.alloc_reg();
@@ -11611,6 +11913,9 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_result_is_string = false;
             self.string_formal_names.clear();
             self.string_member_names.clear();
+            self.coll_member_names.clear();
+            self.static_coll_member_names.clear();
+            self.coll_elem_member_names.clear();
             self.method_ret_jumps.clear();
             self.bail_reset();
             return None;
@@ -11684,6 +11989,10 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::CallCollMethod(_, h, _, _, a, n, _) => {
                 *h == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
             }
+            // Collection element access: Load reads handle + index; Store
+            // reads handle + index + value.
+            Insn::LoadCollElem(_, h, _, i) => *h == r || *i == r,
+            Insn::StoreCollElem(h, _, i, v) => *h == r || *i == r || *v == r,
             Insn::Pow(_, l, rr)
             | Insn::Add(_, l, rr)
             | Insn::Sub(_, l, rr)
@@ -12995,6 +13304,12 @@ impl<'a> BytecodeCompiler<'a> {
                 // Collection builtin: dest width follows the runtime member
                 // (count / exists flag / popped element) — bare dest store.
                 Insn::CallCollMethod(d, ..) => store(&mut rw, *d, None),
+                // Collection element read: width follows the runtime store —
+                // bare dest store (like LoadClassMember).
+                Insn::LoadCollElem(d, ..) => store(&mut rw, *d, None),
+                // Collection element store defines nothing (the storage key
+                // is a flat string in `signals`).
+                Insn::StoreCollElem(..) => {}
                 // Two dests; widths follow operand widths — drop tracking.
                 Insn::BinOpConstAdd2(a) => {
                     store(&mut rw, a.d1, None);
@@ -13895,7 +14210,7 @@ mod tests {
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -13959,13 +14274,13 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
             .instructions
             .iter()
-            .filter(|i| matches!(i, Insn::CallMethod(..) | Insn::CallCollMethod(..)))
+            .filter(|i| matches!(i, Insn::CallMethod(..) | Insn::CallCollMethod(..) | Insn::LoadCollElem(..) | Insn::StoreCollElem(..)))
             .count();
         assert_eq!(cm, 1, "expected one CallMethod, got {cm}");
         assert!(!compiled.0.has_fallback, "method body must have no AST fallback");
@@ -13998,7 +14313,7 @@ mod tests {
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &shadow, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &shadow, &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );
