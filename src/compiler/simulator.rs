@@ -69495,6 +69495,11 @@ impl Simulator {
                                     return;
                                 }
                             }
+                            if Self::is_struct_elem_ref(rvalue) {
+                                self.assign_struct_memberwise(lvalue, rvalue, &su, 0);
+                                self.settle_after_proc_write();
+                                return;
+                            }
                             let v = self.eval_expr(rvalue);
                             if self.spread_into_unpacked_struct(&dst_s, &su, &v) {
                                 self.settle_after_proc_write();
@@ -69550,6 +69555,18 @@ impl Simulator {
                         self.settle_after_proc_write();
                         return;
                     }
+                }
+                // §7.2: an element of a CLASS-PROPERTY collection
+                // (`r = q[i]` in a method, `r = c.q[i]`) has its
+                // leaves under the instance, not under the flat name.
+                if Self::is_struct_elem_ref(rvalue)
+                    && !self.module.dynamic_arrays.contains(&dst)
+                    && !self.module.arrays.contains_key(&dst)
+                    && !self.module.associative_arrays.contains_key(&dst)
+                {
+                    self.assign_struct_memberwise(lvalue, rvalue, &su, 0);
+                    self.settle_after_proc_write();
+                    return;
                 }
                 // §13.4.1: the RHS is a VALUE, not a set of
                 // named leaves — a call returning a struct, or
@@ -73790,6 +73807,13 @@ impl Simulator {
                                     Some(src) if self.struct_storage_exists(&src, &su) => {
                                         self.copy_unpacked_struct(&d.name.name, &src, &su);
                                     }
+                                    // An element of a class-property
+                                    // collection (UVM's `row_info row =
+                                    // m_rows[i];`) keeps its leaves under
+                                    // the instance, not the flat name.
+                                    _ if Self::is_struct_elem_ref(&init_expr) => {
+                                        self.assign_struct_memberwise(&lv, &init_expr, &su, 0);
+                                    }
                                     _ => {
                                         let v = self.eval_expr(&init_expr);
                                         let _ =
@@ -75274,13 +75298,18 @@ impl Simulator {
                             self.pending_ret_collection = Some(RET_SNAP.to_string());
                         }
                     }
-                    // §13.4.1: a subroutine-local unpacked struct
-                    // (`return r;`) is assembled from the frame's leaves.
-                    let v = match self.frame_struct_local(e) {
-                        Some((name, su)) => self
-                            .pack_unpacked_struct(&name, &su)
-                            .unwrap_or_else(|| self.eval_expr(e)),
-                        None => self.eval_expr(e),
+                    // §13.4.1: an unpacked struct that is an ELEMENT of a
+                    // class-property collection (`return q[i];`) or a
+                    // subroutine local (`return r;`) has no container value;
+                    // assemble it from its leaves.
+                    let v = match self.struct_elem_type(e) {
+                        Some(su) => self.pack_struct_elem_ref(e, &su),
+                        None => match self.frame_struct_local(e) {
+                            Some((name, su)) => self
+                                .pack_unpacked_struct(&name, &su)
+                                .unwrap_or_else(|| self.eval_expr(e)),
+                            None => self.eval_expr(e),
+                        },
                     };
                     self.return_value = Some(v);
                     // §25.9: a returned VIRTUAL INTERFACE carries only a
@@ -79009,6 +79038,25 @@ impl Simulator {
                                         .cloned()
                                     {
                                         result.push_str(&Self::render_p_value(&v, true));
+                                        continue;
+                                    }
+                                }
+                                // An ELEMENT of a class-property collection of
+                                // unpacked structs keeps its leaves under the
+                                // instance (`<h>#q[i].<m>`), not the flat name.
+                                if !self.no_class_objects()
+                                    && let Some(flat) = self.flat_member_name(arg)
+                                    && let Some(cut) = flat.find('[')
+                                    && flat.ends_with(']')
+                                    && !flat[cut..].contains('.')
+                                {
+                                    let storage = self.resolve_locator_storage(&flat[..cut]);
+                                    if storage != flat[..cut]
+                                        && let Some(su) = self.queue_elem_struct(&storage)
+                                    {
+                                        let elem = format!("{}{}", storage, &flat[cut..]);
+                                        let s = self.render_p_typed(&elem, &DataType::Struct(su));
+                                        result.push_str(&s);
                                         continue;
                                     }
                                 }
@@ -97834,6 +97882,165 @@ impl Simulator {
         }
     }
 
+    /// §7.2: `rvalue` names an unpacked-struct ELEMENT (`q[i]`, `o.q[i]`,
+    /// `q[i].inner`) through selects, members and side-effect-free indices
+    /// only, so each of its members can be read as `rvalue.<m>` without
+    /// re-running anything.
+    fn is_struct_elem_ref(e: &Expression) -> bool {
+        fn pure(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::Number(_) | ExprKind::StringLiteral(_) | ExprKind::This => true,
+                ExprKind::Ident(h) => h.path.iter().all(|s| s.selects.iter().all(pure)),
+                ExprKind::Index { expr, index } => pure(expr) && pure(index),
+                ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => pure(expr),
+                ExprKind::Unary { op, operand } => {
+                    !matches!(
+                        op,
+                        UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr
+                    ) && pure(operand)
+                }
+                ExprKind::Binary { left, right, .. } => pure(left) && pure(right),
+                _ => false,
+            }
+        }
+        let mut cur = e;
+        let mut indexed = false;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    if !pure(index) {
+                        return false;
+                    }
+                    indexed = true;
+                    cur = expr;
+                }
+                ExprKind::MemberAccess { expr, .. } => cur = expr,
+                ExprKind::Ident(h) => {
+                    return (indexed || h.path.iter().any(|s| !s.selects.is_empty()))
+                        && h.path.iter().all(|s| s.selects.iter().all(pure));
+                }
+                ExprKind::This => return indexed,
+                _ => return false,
+            }
+        }
+    }
+
+    /// §7.2: copy an unpacked struct member by member, `lvalue.<m> =
+    /// rvalue.<m>`, through the per-member read and write paths. Used when the
+    /// source is a collection element whose leaves have no flat name — an
+    /// element of a class-property queue/array lives under the instance
+    /// (`<h>#q[i].<m>` or the object's property map), so the name-to-name copy
+    /// found nothing and the packed fallback stored zeros. Nested unpacked
+    /// structs and fixed member arrays recurse to their leaves.
+    fn assign_struct_memberwise(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+        su: &crate::ast::types::StructUnionType,
+        depth: u32,
+    ) {
+        if depth > 8 {
+            return;
+        }
+        let index_expr = |base: &Expression, i: i64| {
+            Expression::new(
+                ExprKind::Index {
+                    expr: Box::new(base.clone()),
+                    index: Box::new(Expression::new(
+                        ExprKind::Number(NumberLiteral::Integer {
+                            size: None,
+                            signed: true,
+                            base: NumberBase::Decimal,
+                            value: i.to_string(),
+                            cached_val: std::cell::Cell::new(None),
+                        }),
+                        base.span,
+                    )),
+                },
+                base.span,
+            )
+        };
+        for m in &su.members {
+            let nested = self.unpacked_struct_of(&m.data_type);
+            for md in &m.declarators {
+                let mn = md.name.name.as_str();
+                let lhs_f = Self::append_member_expr(lvalue, mn);
+                let rhs_f = Self::append_member_expr(rvalue, mn);
+                let pairs: Vec<(Expression, Expression)> = if md.dimensions.is_empty() {
+                    vec![(lhs_f, rhs_f)]
+                } else {
+                    match self.member_dim_indices(&md.dimensions) {
+                        Some(idxs) if md.dimensions.len() == 1 => idxs
+                            .into_iter()
+                            .map(|i| (index_expr(&lhs_f, i), index_expr(&rhs_f, i)))
+                            .collect(),
+                        // Dynamic or multi-dimensional member: whole-member copy.
+                        _ => {
+                            let v = self.eval_expr(&rhs_f);
+                            self.assign_value(&lhs_f, &v);
+                            continue;
+                        }
+                    }
+                };
+                for (l, r) in pairs {
+                    match &nested {
+                        Some(inner) => self.assign_struct_memberwise(&l, &r, inner, depth + 1),
+                        None => {
+                            let v = self.eval_expr(&r);
+                            self.assign_value(&l, &v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The unpacked-struct type of an element reference (`q[i]`, `o.q[i]`,
+    /// `fa[i]`, `q[i].inner`) whose leaves live under a class instance rather
+    /// than under the flat name. `None` for anything else, including an
+    /// element whose flat leaves exist (the name-based paths own those).
+    fn struct_elem_type(&mut self, e: &Expression) -> Option<crate::ast::types::StructUnionType> {
+        if self.no_class_objects()
+            || !Self::is_struct_elem_ref(e)
+            || !self.lvalue_root_is_unpacked_struct_prop(e, false)
+        {
+            return None;
+        }
+        // A fixed-array property: leaves in the object's property map.
+        if let Some((_, _, su)) = self.class_unpacked_array_prop_of(e) {
+            if self.class_unpacked_elem_is_heap_owned(e) {
+                return Some(su);
+            }
+        }
+        // A queue/dynamic/associative property: leaves at `<h>#q[i].<m>`.
+        let flat = self.flat_member_name(e)?;
+        let cut = flat.find('[')?;
+        let storage = self.resolve_locator_storage(&flat[..cut]);
+        if storage == flat[..cut] {
+            return None;
+        }
+        let mut su = self.queue_elem_struct(&storage)?;
+        // Walk any members below the element (`q[i].inner`).
+        let rest = &flat[cut..];
+        let mut after = rest.find(']').map(|p| &rest[p + 1..])?;
+        while let Some(tail) = after.strip_prefix('.') {
+            let name_end = tail.find(['.', '[']).unwrap_or(tail.len());
+            let (mname, more) = tail.split_at(name_end);
+            if more.starts_with('[') {
+                return None;
+            }
+            let dt = su.members.iter().find_map(|m| {
+                m.declarators
+                    .iter()
+                    .any(|d| d.name.name == mname && d.dimensions.is_empty())
+                    .then(|| m.data_type.clone())
+            })?;
+            su = self.unpacked_struct_of(&dt)?;
+            after = more;
+        }
+        after.is_empty().then_some(su)
+    }
+
     /// `(name, type)` when `e` is a bare unpacked-struct LOCAL of the current
     /// frame. Its leaves live in the frame, but reading the bare name as a
     /// value consults the module first: an `initial`-block struct of the same
@@ -97858,6 +98065,29 @@ impl Simulator {
         frame
             .contains_key(&format!("{}.{}", name, first))
             .then(|| (name.clone(), su))
+    }
+
+    /// The packed value of an unpacked-struct element reference, assembled
+    /// from its leaves read one by one (laid out like `pack_unpacked_struct`).
+    /// A struct travels as a packed value across a function return.
+    fn pack_struct_elem_ref(
+        &mut self,
+        e: &Expression,
+        su: &crate::ast::types::StructUnionType,
+    ) -> Value {
+        let mut leaves = Vec::new();
+        self.unpacked_struct_leaves("X", e, su, 0, &mut leaves);
+        let total: u32 = leaves.iter().map(|l| l.2).sum();
+        let mut out = Value::new(total.max(1));
+        let mut off = 0u32;
+        for (_, le, w, _) in leaves.into_iter().rev() {
+            let v = self.eval_expr(&le);
+            for i in 0..w {
+                out.set_bit((off + i) as usize, v.get_bit(i as usize));
+            }
+            off += w;
+        }
+        out
     }
 
     /// `class_agg_member` for an already-split `<base>.<field>`.
@@ -100695,6 +100925,28 @@ impl Simulator {
     /// always yielded X. An X in any leaf makes the result X, as for vectors.
     /// `None` when either side is not an unpacked struct with storage.
     fn compare_unpacked_structs(&mut self, lhs: &Expression, rhs: &Expression) -> Option<Value> {
+        // An ELEMENT of a class-property collection (`q[i] == q[j]`) keeps its
+        // leaves under the instance: compare leaf by leaf through the read path.
+        if let Some(su) = self
+            .struct_elem_type(lhs)
+            .or_else(|| self.struct_elem_type(rhs))
+        {
+            let (mut ll, mut rl) = (Vec::new(), Vec::new());
+            self.unpacked_struct_leaves("X", lhs, &su, 0, &mut ll);
+            self.unpacked_struct_leaves("X", rhs, &su, 0, &mut rl);
+            let mut equal = true;
+            for ((_, le, ..), (_, re, ..)) in ll.iter().zip(rl.iter()) {
+                let lv = self.eval_expr(le);
+                let rv = self.eval_expr(re);
+                if lv.has_unknown() || rv.has_unknown() {
+                    return Some(Value::new(1));
+                }
+                if lv.is_equal(&rv).to_u64() != Some(1) {
+                    equal = false;
+                }
+            }
+            return Some(Value::from_u64(u64::from(equal), 1));
+        }
         // If EITHER operand is a class-property unpacked struct (members in
         // the heap, not the signal namespace), compare member-wise by
         // appending a member segment and evaluating through the field-read

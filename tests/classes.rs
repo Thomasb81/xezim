@@ -21,6 +21,8 @@ mod bit_class_property_signedness;
 mod blocking_task_super_dispatch;
 #[path = "classes/class_formal_typedef_widen.rs"]
 mod class_formal_typedef_widen;
+#[path = "classes/class_struct_collection_elements.rs"]
+mod class_struct_collection_elements;
 #[path = "classes/class_time_field_neg_one.rs"]
 mod class_time_field_neg_one;
 #[path = "classes/class_unpacked_struct_array_store.rs"]
