@@ -39491,7 +39491,10 @@ impl Simulator {
                 // signal with a posedge edge (the edge `tick_clocking_blocks`
                 // already assumes). Falls through to a plain named event when
                 // `id` is an ordinary `event`/signal, preserving prior behavior.
-                if let Some((clk, _)) = self.clocking_meta.get(&id.name) {
+                if let Some((clk, _)) = self
+                    .resolve_clocking_key(&[id.name.as_str()])
+                    .and_then(|k| self.clocking_meta.get(&k))
+                {
                     vec![Sensitivity {
                         signal_name: clk.clone(),
                         edge: EdgeKind::Posedge,
@@ -103996,12 +103999,37 @@ impl Simulator {
     }
 
     fn resolve_clocking_key(&self, segs: &[&str]) -> Option<String> {
-        if segs.is_empty() {
+        if segs.is_empty() || self.clocking_meta.is_empty() {
             return None;
         }
         let raw = segs.join(".");
         if self.clocking_meta.contains_key(&raw) {
             return Some(raw);
+        }
+        // §14.3: a clocking block declared in a module or interface INSTANCE
+        // is registered under its instance path (`m.cb`). A bare `@(cb)` in
+        // that instance's own task or process resolves through the executing
+        // scope — unresolved, it waited on a signal literally named `cb`,
+        // which in an interface task returned at once and spun the caller's
+        // sampling loop. An inlined instance-task body runs under its frame's
+        // scope, which process re-entry does not keep in the transient hint.
+        {
+            let hint = self.name_resolve_hint.borrow();
+            let scopes = [
+                hint.as_deref(),
+                self.task_cleanup
+                    .last()
+                    .and_then(|c| c.frame_scope_hint.as_deref()),
+                self.process_scope_hint
+                    .get(&self.current_pid)
+                    .map(String::as_str),
+            ];
+            for sc in scopes.into_iter().flatten().filter(|s| !s.is_empty()) {
+                let scoped = format!("{}.{}", sc, raw);
+                if self.clocking_meta.contains_key(&scoped) {
+                    return Some(scoped);
+                }
+            }
         }
         // §25.9 virtual interface: rewrite the head through the vif alias
         // (`vif.cb_main` → `master_if.cb_main`). The CENTRAL binding, so a

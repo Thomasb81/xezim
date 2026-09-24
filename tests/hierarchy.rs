@@ -151,6 +151,8 @@ mod formal_shadows_instance_signal;
 mod iface_port_params;
 #[path = "hierarchy/instance_block_locals_shadow_module_names.rs"]
 mod instance_block_locals_shadow_module_names;
+#[path = "hierarchy/instance_clocking_block_event.rs"]
+mod instance_clocking_block_event;
 #[path = "hierarchy/instance_collections_resolve_by_scope.rs"]
 mod instance_collections_resolve_by_scope;
 #[path = "hierarchy/instance_loop_local_shadows_module_var.rs"]
