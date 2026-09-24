@@ -186,3 +186,143 @@ fn uvm_dpi_builtins_later_regex_api_and_legacy_argv() {
         ]
     );
 }
+
+/// The regex, signal-size and polling C functions of UVM 1800.2-2020.3
+/// (`uvm_regex.cc`, `uvm_hdl_polling.c`), imported directly. Every line was
+/// cross-checked against the reference simulator running those C sources
+/// (compiled as its `-sv_lib`): the deglob forms, `uvm_re_buffer` after a
+/// deglob, a bracket strip and a failed compile, `uvm_re_compexecfree`
+/// reporting REG_NOMATCH when the pattern does not compile, and a probe
+/// whose value changes toggle the notifier bit and reach the exported
+/// `uvm_polling_value_change_notify` once per change until disabled.
+const API_2020_SRC: &str = r#"
+package pollpkg;
+  bit notifier;
+endpackage
+module dut;
+  logic [7:0] cnt = 0;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  always @(posedge clk) cnt <= cnt + 1;
+endmodule
+module top;
+  import "DPI-C" function string uvm_re_deglobbed(string glob, bit with_brackets);
+  import "DPI-C" function string uvm_re_buffer();
+  import "DPI-C" function void uvm_re_free(chandle rexp);
+  import "DPI-C" function chandle uvm_re_comp(string re, bit deglob);
+  import "DPI-C" function int uvm_re_exec(chandle rexp, string str);
+  import "DPI-C" function chandle uvm_re_compexec(string re, string str, bit deglob, output int exec_ret);
+  import "DPI-C" function bit uvm_re_compexecfree(string re, string str, bit deglob, output int exec_ret);
+  import "DPI-C" context function chandle uvm_polling_create(input string name, input int sv_key);
+  import "DPI-C" context function void uvm_polling_set_enable_callback(chandle hnd, int enable);
+  import "DPI-C" context function int uvm_polling_get_callback_enable(chandle hnd);
+  import "DPI-C" context function int uvm_polling_setup_notifier(string fullname);
+  import "DPI-C" context function void uvm_polling_process_changelist();
+  import "DPI-C" context function int uvm_hdl_signal_size(string path);
+  export "DPI-C" function uvm_polling_value_change_notify;
+  export "DPI-C" function m__uvm_report_dpi;
+  function void m__uvm_report_dpi(int severity, string id, string message, int verbosity,
+                                  string filename, int line);
+    $display("REPORT sev=%0d id=%s %s", severity, id, message);
+  endfunction
+  int notes[$];
+  function void uvm_polling_value_change_notify(int sv_key);
+    notes.push_back(sv_key);
+  endfunction
+  dut u();
+  initial begin
+    chandle h;
+    int r;
+    bit ok;
+    $display("T|deglob '%s' '%s' '%s' '%s' '%s'", uvm_re_deglobbed("", 0), uvm_re_deglobbed("", 1),
+             uvm_re_deglobbed("a*b?[c]", 0), uvm_re_deglobbed("a*b?[c]", 1), uvm_re_deglobbed("/x+/", 0));
+    $display("T|buffer '%s'", uvm_re_buffer());
+    h = uvm_re_comp("top.*.u", 1);
+    $display("T|comp glob %0d %0d", uvm_re_exec(h, "top.x.u"), uvm_re_exec(h, "top.x.v") != 0);
+    uvm_re_free(h);
+    h = uvm_re_comp("/^a[0-9]+$/", 0);
+    $display("T|comp re %0d %0d buffer '%s'", uvm_re_exec(h, "a12"), uvm_re_exec(h, "a1b") != 0, uvm_re_buffer());
+    uvm_re_free(h);
+    h = uvm_re_compexec("b.d", "abcde", 0, r);
+    $display("T|compexec null=%0d r=%0d", h == null, r);
+    uvm_re_free(h);
+    r = 5;
+    ok = uvm_re_compexecfree("/a(/", "a", 0, r);
+    $display("T|cef bad ok=%0d r=%0d buffer_set=%0d", ok, r, uvm_re_buffer() != "");
+    ok = uvm_re_compexecfree("x*", "yyy", 1, r);
+    $display("T|cef glob ok=%0d nomatch=%0d", ok, r != 0);
+    $display("T|size %0d %0d %0d", uvm_hdl_signal_size("top.u.cnt"), uvm_hdl_signal_size("top.u.cnt[3:0]"),
+             uvm_hdl_signal_size("top.u.clk"));
+    $display("T|notifier %0d", uvm_polling_setup_notifier("pollpkg.notifier"));
+    h = uvm_polling_create("top.u.cnt", 7);
+    $display("T|create null=%0d enabled=%0d", h == null, uvm_polling_get_callback_enable(h));
+    uvm_polling_set_enable_callback(h, 1);
+    $display("T|enabled=%0d", uvm_polling_get_callback_enable(h));
+    repeat (3) begin
+      @(pollpkg::notifier);
+      uvm_polling_process_changelist();
+      $display("T|t=%0t notes=%p cnt=%0d", $time, notes, u.cnt);
+    end
+    uvm_polling_set_enable_callback(h, 0);
+    #30;
+    $display("T|after disable notes=%0d", notes.size());
+    $finish;
+  end
+endmodule
+"#;
+
+#[test]
+fn uvm_dpi_builtins_2020_regex_and_polling() {
+    let sim = simulate_multi(
+        &[API_2020_SRC.to_string()],
+        1000,
+        Some("top"),
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+    )
+    .expect("simulate failed");
+    let got: Vec<String> = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .filter(|m| m.starts_with("T|") || m.starts_with("REPORT"))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            "T|deglob '^$' '/^$/' '^a.*b.\\[c\\]$' '/^a.*b.\\[c\\]$/' 'x+'",
+            "T|buffer 'x+'",
+            "T|comp glob 0 1",
+            "T|comp re 0 1 buffer '^a[0-9]+$'",
+            "T|compexec null=0 r=0",
+            "T|cef bad ok=0 r=1 buffer_set=1",
+            "T|cef glob ok=1 nomatch=1",
+            "T|size 8 4 1",
+            "T|notifier 1",
+            "T|create null=0 enabled=0",
+            "T|enabled=1",
+            "T|t=5 notes='{7} cnt=1",
+            "T|t=15 notes='{7, 7} cnt=2",
+            "T|t=25 notes='{7, 7, 7} cnt=3",
+            "T|after disable notes=3",
+        ]
+    );
+}

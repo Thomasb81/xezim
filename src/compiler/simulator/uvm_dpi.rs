@@ -20,6 +20,14 @@
 //!   code expands bit by bit, memory words (`mem[5]`) and packed-struct
 //!   members.
 //!
+//! * polling (1800.2-2020.3, `uvm_hdl_polling.c`): `uvm_polling_create`
+//!   probes a signal, `uvm_polling_set_enable_callback` hooks its value
+//!   changes (the VPI value-change callback path), a change toggles the
+//!   notifier bit named by `uvm_polling_setup_notifier`, and
+//!   `uvm_polling_process_changelist` calls the exported
+//!   `uvm_polling_value_change_notify` once per changed probe, newest
+//!   first. `uvm_hdl_signal_size` is the width at a path.
+//!
 //! Errors are reported through UVM's exported `m__uvm_report_dpi` with the C
 //! code's ids and texts. Requests without a faithful mapping (forcing part
 //! of a signal or a packed-arena memory cell, a select into a
@@ -29,8 +37,10 @@ use super::*;
 
 const M_UVM_INFO: i64 = 0;
 const M_UVM_ERROR: i64 = 2;
+const M_UVM_FATAL: i64 = 3;
 const M_UVM_NONE: i64 = 0;
 const M_UVM_LOW: i64 = 100;
+const M_UVM_MEDIUM: i64 = 200;
 /// `UVM_REGEX_MAX_LENGTH` in uvm_regex.cc.
 const UVM_REGEX_MAX_LENGTH: usize = 2048;
 /// `uvm_re_match` compile-cache bound; the cache is dropped when full.
@@ -95,6 +105,32 @@ pub(super) struct UvmDpiState {
     noted: HashSet<String>,
     /// Whether the design imports `uvm_dump_re_cache` (UVM 1.1d/1.2).
     legacy_regex: Option<bool>,
+    /// Probes `uvm_polling_create` made, by chandle.
+    polls: HashMap<u64, PollProbe>,
+    /// Probes with an unserviced value change, oldest first.
+    poll_changes: Vec<u64>,
+    /// Signal-table slot of the notifier bit.
+    poll_notifier: Option<usize>,
+}
+
+/// One `uvm_polling_create` probe.
+pub(super) struct PollProbe {
+    target: HdlTarget,
+    /// Slot whose writes carry the value-change callback.
+    slot: usize,
+    sv_key: i64,
+    enabled: bool,
+    /// The probed bits as last seen, to report changes only.
+    last: Value,
+}
+
+/// Value-change callback of an enabled probe; `user_data` is its chandle.
+extern "C" fn uvm_polling_value_change(cb: *mut s_cb_data) {
+    if cb.is_null() {
+        return;
+    }
+    let h = unsafe { (*cb).user_data } as u64;
+    let _ = try_active_sim("uvm_polling", |sim| sim.uvm_polling_changed(h));
 }
 
 /// Storage behind a `uvm_hdl_*` path.
@@ -218,12 +254,6 @@ impl Simulator {
             "uvm_re_match" => {
                 let re = self.uvm_dpi_str(args, 0);
                 let s = self.uvm_dpi_str(args, 1);
-                // 1800.2-2020 releases pass a `deglob` flag.
-                let re = if self.uvm_dpi_int(args, 2) != 0 {
-                    deglob(&re, true)
-                } else {
-                    re
-                };
                 int_val(self.uvm_re_match(&re, &s))
             }
             "uvm_glob_to_re" => {
@@ -233,9 +263,11 @@ impl Simulator {
             "uvm_re_deglobbed" => {
                 let glob = self.uvm_dpi_str(args, 0);
                 let with_brackets = self.uvm_dpi_int(args, 1) != 0;
-                let re = deglob(&glob, with_brackets);
-                self.uvm_dpi.re_buffer = re.clone();
-                Value::from_string(&re)
+                Value::from_string(
+                    &self
+                        .uvm_re_deglobbed(&glob, with_brackets)
+                        .unwrap_or_default(),
+                )
             }
             "uvm_dump_re_cache" => {
                 self.uvm_dpi_report(
@@ -269,6 +301,9 @@ impl Simulator {
             "uvm_dpi_regexec" | "uvm_re_exec" => {
                 let h = self.uvm_dpi_u64(args, 0);
                 let s = self.uvm_dpi_str(args, 1);
+                if h == 0 && c_name == "uvm_re_exec" {
+                    self.uvm_dpi.re_buffer = "uvm_re_exec: NULL rexp".to_string();
+                }
                 int_val(self.uvm_dpi_handle_exec(c_name, h, &s))
             }
             "uvm_dpi_regfree" | "uvm_re_free" => {
@@ -277,20 +312,25 @@ impl Simulator {
                 Value::zero(32)
             }
             "uvm_re_buffer" => Value::from_string(&self.uvm_dpi.re_buffer.clone()),
-            "uvm_re_compexecfree" => {
+            "uvm_re_compexec" | "uvm_re_compexecfree" => {
                 let re = self.uvm_dpi_str(args, 0);
                 let s = self.uvm_dpi_str(args, 1);
                 let deglobbed = self.uvm_dpi_int(args, 2) != 0;
                 let h = self.uvm_re_comp(&re, deglobbed);
-                if h == 0 {
-                    Value::from_u64(0, 1)
+                // A pattern that fails to compile reports REG_NOMATCH.
+                let r = if h == 0 {
+                    libc::REG_NOMATCH
                 } else {
-                    let r = self.uvm_dpi_handle_exec(c_name, h, &s);
+                    self.uvm_dpi_handle_exec(c_name, h, &s)
+                };
+                if let Some(out) = args.get(3) {
+                    self.assign_value(out, &int_val(r));
+                }
+                if c_name == "uvm_re_compexec" {
+                    chandle_val(h)
+                } else {
                     self.uvm_dpi.handles.remove(&h);
-                    if let Some(out) = args.get(3) {
-                        self.assign_value(out, &int_val(r));
-                    }
-                    Value::from_u64(1, 1)
+                    Value::from_u64((h != 0) as u64, 1)
                 }
             }
             "uvm_dpi_get_next_arg_c" => Value::from_string(&self.uvm_dpi_next_arg(args)),
@@ -342,9 +382,304 @@ impl Simulator {
                 }
                 int_val(ok as i32)
             }
+            "uvm_hdl_signal_size" => {
+                let path = self.uvm_dpi_str(args, 0);
+                int_val(self.uvm_hdl_signal_size(&path) as i32)
+            }
+            "uvm_polling_create" => {
+                let name = self.uvm_dpi_str(args, 0);
+                let key = self.uvm_dpi_int(args, 1);
+                chandle_val(self.uvm_polling_create(&name, key))
+            }
+            "uvm_polling_set_enable_callback" => {
+                let h = self.uvm_dpi_u64(args, 0);
+                let enable = self.uvm_dpi_int(args, 1) != 0;
+                self.uvm_polling_set_enable(h, enable);
+                Value::zero(32)
+            }
+            "uvm_polling_get_callback_enable" => {
+                let h = self.uvm_dpi_u64(args, 0);
+                let on = match self.uvm_dpi.polls.get(&h) {
+                    Some(p) => p.enabled,
+                    None => {
+                        self.uvm_polling_bad_handle();
+                        false
+                    }
+                };
+                int_val(on as i32)
+            }
+            "uvm_polling_setup_notifier" => {
+                let name = self.uvm_dpi_str(args, 0);
+                int_val(self.uvm_polling_setup_notifier(&name) as i32)
+            }
+            "uvm_polling_process_changelist" => {
+                self.uvm_polling_process_changelist();
+                Value::zero(32)
+            }
             _ => return None,
         };
         Some(v)
+    }
+
+    /// uvm_hdl_polling.c `uvm_hdl_signal_size`: the width at `path`, 0 with
+    /// an error when nothing is there.
+    fn uvm_hdl_signal_size(&mut self, path: &str) -> u32 {
+        match self.uvm_hdl_lookup(path) {
+            HdlLookup::Found(t) => match &t.bits {
+                Some(bits) => bits.len() as u32,
+                None => self.uvm_hdl_width(&t.obj),
+            },
+            HdlLookup::Unsupported(why) => {
+                self.uvm_dpi_note(format!("uvm_hdl_signal_size(\"{}\"): {}", path, why));
+                0
+            }
+            HdlLookup::Scope | HdlLookup::Missing => {
+                let msg = format!("uvm_hdl_signal_size : Cannot find name '{}'", path);
+                self.uvm_dpi_report(M_UVM_ERROR, "UVM/DPI/HDL_POLLING", &msg, M_UVM_NONE);
+                0
+            }
+        }
+    }
+
+    /// The probed bits of `t` as they are now.
+    fn uvm_polling_sample(&self, t: &HdlTarget) -> Value {
+        let cur = self.uvm_hdl_value(&t.obj);
+        match &t.bits {
+            Some(bits) => {
+                let mut v = Value::zero(bits.len().max(1) as u32);
+                for (i, &b) in bits.iter().enumerate() {
+                    v.set_bit_code(i, cur.get_bit_code(b as usize));
+                }
+                v
+            }
+            None => cur,
+        }
+    }
+
+    /// uvm_hdl_polling.c `uvm_polling_create`: a probe on the signal at
+    /// `name` reporting as `sv_key`, or null (with the C code's notes).
+    fn uvm_polling_create(&mut self, name: &str, sv_key: i64) -> u64 {
+        let t = match self.uvm_hdl_lookup(name) {
+            HdlLookup::Found(t) => t,
+            HdlLookup::Unsupported(why) => {
+                self.uvm_dpi_note(format!("uvm_polling_create(\"{}\"): {}", name, why));
+                return 0;
+            }
+            HdlLookup::Scope => {
+                let msg = format!(
+                    "uvm_hdl_polling_create(\"{}\"): object is not a variable or net of integral type\n",
+                    name
+                );
+                self.uvm_dpi_report(M_UVM_INFO, "UVM/DPI/HDL_POLLING", &msg, M_UVM_MEDIUM);
+                return 0;
+            }
+            HdlLookup::Missing => {
+                let msg = format!(
+                    "uvm_polling_create: create(\"{}\") could not locate requested signal\n",
+                    name
+                );
+                self.uvm_dpi_report(M_UVM_INFO, "UVM/DPI/HDL_POLLING", &msg, M_UVM_MEDIUM);
+                return 0;
+            }
+        };
+        // Value changes are observed on signal-table writes only.
+        let slot = match t.obj {
+            HdlObj::Slot(id) if !is_packed_id(id) => id,
+            _ => {
+                self.uvm_dpi_note(format!(
+                    "uvm_polling_create(\"{}\"): value changes of this storage cannot be observed",
+                    name
+                ));
+                return 0;
+            }
+        };
+        let last = self.uvm_polling_sample(&t);
+        self.uvm_dpi.next_handle += 1;
+        let h = self.uvm_dpi.next_handle;
+        self.uvm_dpi.polls.insert(
+            h,
+            PollProbe {
+                target: t,
+                slot,
+                sv_key,
+                enabled: false,
+                last,
+            },
+        );
+        h
+    }
+
+    /// chandle_to_hook's complaint about a handle no probe owns.
+    fn uvm_polling_bad_handle(&mut self) {
+        self.uvm_dpi_report(
+            M_UVM_FATAL,
+            "UVM/DPI/HDL_POLLING",
+            "Bad chandle argument is not a valid created hook",
+            M_UVM_NONE,
+        );
+    }
+
+    /// uvm_polling_set_enable_callback: add or remove the probe's
+    /// value-change callback.
+    fn uvm_polling_set_enable(&mut self, h: u64, enable: bool) {
+        let Some(p) = self.uvm_dpi.polls.get_mut(&h) else {
+            self.uvm_polling_bad_handle();
+            return;
+        };
+        if p.enabled == enable {
+            return;
+        }
+        p.enabled = enable;
+        let slot = p.slot;
+        let routine = uvm_polling_value_change as usize;
+        if enable {
+            let t = p.target.clone();
+            let now = self.uvm_polling_sample(&t);
+            if let Some(p) = self.uvm_dpi.polls.get_mut(&h) {
+                p.last = now;
+            }
+            self.dpi_value_change_cbs
+                .entry(slot)
+                .or_default()
+                .push(DpiCbHandle {
+                    cb_type: vpi::CB_VALUE_CHANGE,
+                    signal_id: slot,
+                    cb_routine: routine,
+                    user_data: h as usize,
+                    obj: 0,
+                    value_format: vpi::SUPPRESS_VAL,
+                });
+        } else if let Some(list) = self.dpi_value_change_cbs.get_mut(&slot) {
+            list.retain(|cb| cb.cb_routine != routine || cb.user_data != h as usize);
+        }
+    }
+
+    /// A write to an enabled probe's slot: queue the probe if its bits
+    /// changed, toggling the notifier for the first queued change.
+    fn uvm_polling_changed(&mut self, h: u64) {
+        let Some(p) = self.uvm_dpi.polls.get(&h) else {
+            return;
+        };
+        let t = p.target.clone();
+        let now = self.uvm_polling_sample(&t);
+        let Some(p) = self.uvm_dpi.polls.get_mut(&h) else {
+            return;
+        };
+        if now == p.last {
+            return;
+        }
+        p.last = now;
+        // Nothing listens before the notifier is set up (UVM does so at
+        // time 0, in a process forked when the first probe is created).
+        if self.uvm_dpi.poll_notifier.is_none() || self.uvm_dpi.poll_changes.contains(&h) {
+            return;
+        }
+        let first = self.uvm_dpi.poll_changes.is_empty();
+        self.uvm_dpi.poll_changes.push(h);
+        if first {
+            self.uvm_polling_toggle_notifier();
+        }
+    }
+
+    /// Flip the notifier bit so `@(notifier)` wakes the changelist
+    /// service.
+    fn uvm_polling_toggle_notifier(&mut self) {
+        let Some(id) = self.uvm_dpi.poll_notifier else {
+            return;
+        };
+        let one = self.signal_table[id].get_bit(0) == LogicBit::One;
+        let v = Value::from_u64(!one as u64, 1);
+        // The VPI deposit path: an external write that must wake `@(notifier)`.
+        write_sig!(self, id, v);
+        self.after_signal_write(id);
+        if id < self.dirty_signals.len() && !self.dirty_signals[id] {
+            self.dirty_signals[id] = true;
+            self.dirty_list.push(id);
+        }
+        self.dirty_any = true;
+    }
+
+    /// uvm_polling_setup_notifier: `name` must be a `bit` variable (UVM
+    /// passes `uvm_polling_pkg.notifier`).
+    fn uvm_polling_setup_notifier(&mut self, name: &str) -> bool {
+        let slot = match self.uvm_hdl_lookup(name) {
+            HdlLookup::Found(HdlTarget {
+                obj: HdlObj::Slot(id),
+                bits: None,
+                key,
+            }) if !is_packed_id(id) => Some((id, key)),
+            _ => self.uvm_polling_package_var(name),
+        };
+        let Some((id, key)) = slot else {
+            self.uvm_dpi_report(
+                M_UVM_ERROR,
+                "UVM/DPI/HDL_POLLING",
+                "uvm_polling_setup_notifier() could not locate requested signal",
+                M_UVM_NONE,
+            );
+            return false;
+        };
+        // vpiBitVar: one bit of a 2-state type.
+        let two_state = self.signal_two_state.get(id).copied().unwrap_or(false)
+            || self.module.var_decl_types.get(&key).is_some_and(|dt| {
+                crate::compiler::elaborate::is_type_two_state_resolved(
+                    dt,
+                    &self.module.typedef_types,
+                )
+            });
+        if self.signal_widths[id] != 1 || !two_state {
+            self.uvm_dpi_report(
+                M_UVM_ERROR,
+                "UVM/DPI/HDL_POLLING",
+                "uvm_polling_setup_notifier: object is not a bit variable",
+                M_UVM_NONE,
+            );
+            return false;
+        }
+        self.uvm_dpi.poll_notifier = Some(id);
+        true
+    }
+
+    /// A package variable named `pkg.var` or `pkg::var`. Package variables
+    /// are stored under their bare name unless another package declares
+    /// the same one.
+    fn uvm_polling_package_var(&self, name: &str) -> Option<(usize, String)> {
+        let (pkg, var) = name.split_once("::").or_else(|| name.split_once('.'))?;
+        if !self.module.packages.contains(pkg) || var.contains('.') {
+            return None;
+        }
+        let qualified = format!("{}::{}", pkg, var);
+        if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
+            return Some((id, qualified));
+        }
+        if self.pkg_ambiguous_names.contains(var) {
+            return None;
+        }
+        let id = self.signal_name_to_id.get(var).copied()?;
+        Some((id, var.to_string()))
+    }
+
+    /// uvm_polling_process_changelist: notify SV of each queued probe,
+    /// newest first, until the list is empty.
+    fn uvm_polling_process_changelist(&mut self) {
+        while let Some(h) = self.uvm_dpi.poll_changes.pop() {
+            let Some(key) = self.uvm_dpi.polls.get(&h).map(|p| p.sv_key) else {
+                continue;
+            };
+            let Some(fd) = self
+                .fn_decl_rc("uvm_polling_value_change_notify")
+                .or_else(|| self.fn_decl_rc("uvm_pkg::uvm_polling_value_change_notify"))
+            else {
+                self.uvm_dpi_note(
+                    "uvm_polling_process_changelist: the design exports no \
+                     uvm_polling_value_change_notify"
+                        .to_string(),
+                );
+                self.uvm_dpi.poll_changes.clear();
+                return;
+            };
+            self.exec_function_call(&fd, &[int_lit(key)]);
+        }
     }
 
     fn uvm_dpi_str(&mut self, args: &[Expression], i: usize) -> String {
@@ -459,13 +794,65 @@ impl Simulator {
         code
     }
 
-    /// 1800.2-2020's `uvm_re_comp`: a chandle to the compiled pattern, or
-    /// null with regerror's text left in `uvm_re_buffer`.
+    /// uvm_regex.cc (1800.2-2020.3) `uvm_re_deglobbed`: the glob as a
+    /// regex, with or without the `/.../` brackets; `None` (the C code's
+    /// NULL) when the expansion exceeds the buffer, with the reason in
+    /// `uvm_re_buffer`. Like the C code's static buffer, `uvm_re_buffer`
+    /// then holds the result.
+    fn uvm_re_deglobbed(&mut self, glob: &str, with_brackets: bool) -> Option<String> {
+        if glob.is_empty() || glob == "/" {
+            return Some(if with_brackets { "/^$/" } else { "^$" }.to_string());
+        }
+        let b = glob.as_bytes();
+        let bracketed = b.len() > 1 && b[0] == b'/' && b[b.len() - 1] == b'/';
+        let expanded = if bracketed {
+            glob.len()
+        } else {
+            // The C code's running count: brackets, `^`, two per `*`, `+`
+            // and escaped character, `$`, and the terminating NUL.
+            glob.len()
+                + usize::from(with_brackets) * 2
+                + usize::from(b[0] != b'^')
+                + b.iter()
+                    .filter(|c| matches!(c, b'*' | b'+' | b'.' | b'[' | b']' | b'(' | b')'))
+                    .count()
+                    * 2
+                + usize::from(b[b.len() - 1] != b'$')
+                + 1
+        };
+        if expanded > UVM_REGEX_MAX_LENGTH {
+            self.uvm_dpi.re_buffer = format!(
+                "uvm_glob_to_re() expansion exceeds max length({})",
+                UVM_REGEX_MAX_LENGTH
+            );
+            return None;
+        }
+        let re = deglob(glob, with_brackets);
+        self.uvm_dpi.re_buffer = re.clone();
+        Some(re)
+    }
+
+    /// uvm_regex.cc (1800.2-2020.3) `uvm_re_comp`: a chandle to the
+    /// compiled pattern (brackets stripped, or the glob converted when
+    /// `deglobbed`), or null with the reason in `uvm_re_buffer`.
     fn uvm_re_comp(&mut self, re: &str, deglobbed: bool) -> u64 {
         let rex = if deglobbed {
-            deglob(re, false)
+            match self.uvm_re_deglobbed(re, false) {
+                Some(r) => r,
+                None => return 0,
+            }
+        } else if re.len() > UVM_REGEX_MAX_LENGTH {
+            self.uvm_dpi.re_buffer = format!(
+                "uvm_re_comp() re exceeds max length ({})",
+                UVM_REGEX_MAX_LENGTH
+            );
+            return 0;
         } else {
-            strip_re_brackets(re).to_string()
+            let stripped = strip_re_brackets(re);
+            if stripped.len() != re.len() {
+                self.uvm_dpi.re_buffer = stripped.to_string();
+            }
+            stripped.to_string()
         };
         match PosixRe::compile(&rex, libc::REG_EXTENDED) {
             Ok(compiled) => self.uvm_dpi_new_handle(compiled),
