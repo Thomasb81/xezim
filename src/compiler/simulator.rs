@@ -2708,6 +2708,21 @@ struct ClassInstance {
     creation_scope: String,
 }
 
+/// §16.4 a deferred immediate assertion's pending report: the action block
+/// to run when it matures, unless its process resumes first (a flush).
+#[derive(Debug, Clone)]
+struct DeferredReport {
+    pid: usize,
+    kind: crate::ast::stmt::DeferredAssertion,
+    /// The assertion statement, which identifies it for the flush of a
+    /// re-executed `always_comb`.
+    span: crate::ast::Span,
+    passed: bool,
+    action: Option<Statement>,
+    this_handle: Option<usize>,
+    class_context: Option<String>,
+}
+
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
 /// per-cycle re-evaluation registers one of these into
 /// `Simulator::pending_observed` from its sensitivity trigger (e.g. a
@@ -4646,6 +4661,8 @@ pub struct Simulator {
     /// Concurrent assertions land in M9, which depends on this region
     /// existing. Drain is a no-op when empty so behavior is unchanged.
     pending_observed: Vec<ObservedProbe>,
+    /// §16.4 deferred immediate assertion reports awaiting maturity.
+    deferred_asserts: Vec<DeferredReport>,
     /// LRM §16.5 SVA clocked-assertion sites. Populated lazily on
     /// the first time the AssertionStatement{is_property,
     /// expr:SvaClocked} executes. Each site's `prev_clock` lets us
@@ -9415,6 +9432,7 @@ impl Simulator {
             monitor_m_active: false,
             pending_strobes: Vec::new(),
             pending_observed: Vec::new(),
+            deferred_asserts: Vec::new(),
             sva_sites: Vec::new(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
@@ -18222,6 +18240,11 @@ impl Simulator {
             self.dpi_pending_reset_fired = true;
         }
         self.event_loop();
+        // §16.4: reports of the last time slot (or, after $finish, notes),
+        // before the clock moves to a `run <time>` stop point.
+        if !self.deferred_asserts.is_empty() {
+            self.mature_deferred_asserts();
+        }
         // `run <time>` advances the current time to the end of the run even
         // when nothing is scheduled there, so `final` blocks and the closing
         // report see the stop time rather than the last event's.
@@ -42143,6 +42166,13 @@ impl Simulator {
                 }
                 break;
             }
+            // §16.4: the time slot is over — deferred assertion reports
+            // mature. Their actions may schedule same-time work, so look
+            // again before advancing.
+            if next_time > self.time && !self.deferred_asserts.is_empty() {
+                self.mature_deferred_asserts();
+                continue;
+            }
             let old_time = self.time;
             if next_time > self.time {
                 self.time = next_time;
@@ -45069,6 +45099,7 @@ impl Simulator {
 
     fn run_proc_fsm_inner(&mut self, pid: usize) {
         self.current_pid = pid;
+        self.flush_deferred_asserts(pid);
         // Same per-process zero-delay guard as `run_process_stmts` /
         // `run_fast_delay_always`: a `#0` wait parks the FSM on the inactive
         // queue, which the scheduler drains inside one delta, so the outer
@@ -45273,6 +45304,7 @@ impl Simulator {
 
     fn run_fast_delay_always(&mut self, pid: usize) {
         self.current_pid = pid;
+        self.flush_deferred_asserts(pid);
 
         // Match run_process_stmts' per-process zero-delay protection. The
         // marker was removed from the timing wheel before dispatch, so park it
@@ -45968,6 +46000,7 @@ impl Simulator {
     fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
         let stmts: &[Statement] = pc.frame();
         self.current_pid = pid;
+        self.flush_deferred_asserts(pid);
         // Install THIS process's own instance scope as the resolution hint.
         // The hint is transient sibling-scope state: the previous process (or
         // a $display argument it evaluated) may have left its scope behind,
@@ -75705,6 +75738,10 @@ impl Simulator {
                     return;
                 }
                 let true_branch = self.eval_expr(&a.expr).is_true();
+                if let Some(kind) = a.deferred {
+                    self.queue_deferred_assert(a, kind, true_branch);
+                    return;
+                }
                 // Track per-site tallies for end-of-sim summary + JSON DB.
                 let kind_tag: u8 = match a.kind {
                     AssertionKind::Assert => 0,
@@ -81239,6 +81276,129 @@ impl Simulator {
             self.edge_dispatch_phase = saved;
             let limit = self.cascade_limit;
             let _ = self.drain_edge_cascade(limit);
+        }
+    }
+
+    /// §16.4: record a deferred assertion's outcome; its action block runs
+    /// when the report matures. Arguments of a subroutine-call action are
+    /// evaluated now, as §16.4 requires.
+    fn queue_deferred_assert(
+        &mut self,
+        a: &crate::ast::stmt::AssertionStatement,
+        kind: crate::ast::stmt::DeferredAssertion,
+        passed: bool,
+    ) {
+        let kind_tag: u8 = match a.kind {
+            crate::ast::stmt::AssertionKind::Assert => 0,
+            crate::ast::stmt::AssertionKind::Assume => 1,
+            crate::ast::stmt::AssertionKind::Cover => 2,
+        };
+        let entry = self
+            .assertion_stats
+            .entry(a.span.start)
+            .or_insert(AssertionStat {
+                kind: kind_tag,
+                pass_count: 0,
+                fail_count: 0,
+            });
+        if passed {
+            entry.pass_count += 1;
+        } else {
+            entry.fail_count += 1;
+        }
+        let pid = self.current_pid;
+        // A re-executed assertion of the same activation (an always_comb
+        // evaluated twice in one slot) supersedes its earlier report.
+        self.deferred_asserts
+            .retain(|d| !(d.pid == pid && d.span == a.span));
+        let action = if passed { &a.action } else { &a.else_action };
+        let action = action.as_deref().map(|st| self.capture_deferred_action(st));
+        if action.is_none() && passed {
+            return;
+        }
+        self.deferred_asserts.push(DeferredReport {
+            pid,
+            kind,
+            span: a.span,
+            passed,
+            action,
+            this_handle: self.this_stack.last().copied().flatten(),
+            class_context: self.class_context_stack.last().cloned().flatten(),
+        });
+    }
+
+    /// A deferred action with the arguments of its subroutine call fixed at
+    /// their current values (literals stay, so a format string still reads
+    /// as one).
+    fn capture_deferred_action(&mut self, st: &Statement) -> Statement {
+        let StatementKind::Expr(e) = &st.kind else {
+            return st.clone();
+        };
+        let fix = |sim: &mut Self, args: &[Expression]| -> Vec<Expression> {
+            args.iter()
+                .map(|a| match &a.kind {
+                    ExprKind::StringLiteral(_) | ExprKind::Number(_) => a.clone(),
+                    _ => {
+                        let v = sim.eval_expr(a);
+                        sim.make_intra_saved_expr(v, a.span)
+                    }
+                })
+                .collect()
+        };
+        let kind = match &e.kind {
+            ExprKind::SystemCall { name, args } => ExprKind::SystemCall {
+                name: name.clone(),
+                args: fix(self, args),
+            },
+            ExprKind::Call { func, args } => ExprKind::Call {
+                func: func.clone(),
+                args: fix(self, args),
+            },
+            _ => return st.clone(),
+        };
+        Statement::new(StatementKind::Expr(Expression::new(kind, e.span)), st.span)
+    }
+
+    /// §16.4.2 flush point: process `pid` resumed, dropping its pending
+    /// deferred reports.
+    #[inline]
+    fn flush_deferred_asserts(&mut self, pid: usize) {
+        if !self.deferred_asserts.is_empty() {
+            self.deferred_asserts.retain(|d| d.pid != pid);
+        }
+    }
+
+    /// Mature the pending deferred reports at the end of the time slot:
+    /// `#0` ones (Observed region) first, then `final` ones (Postponed).
+    /// After `$finish` the action blocks do not run; a failure is noted.
+    fn mature_deferred_asserts(&mut self) {
+        let mut pending = std::mem::take(&mut self.deferred_asserts);
+        pending.sort_by_key(|d| d.kind == crate::ast::stmt::DeferredAssertion::Final);
+        for d in pending {
+            if self.finished {
+                if !d.passed {
+                    let loc = self
+                        .span_file_line_in(d.span, None)
+                        .unwrap_or_else(|| "?".to_string());
+                    eprintln!(
+                        "[xezim] note: deferred assertion at {} failed at time {}; \
+                         its action block did not run before $finish",
+                        loc, self.time
+                    );
+                }
+                continue;
+            }
+            let Some(action) = d.action else {
+                continue;
+            };
+            let saved_pid = self.current_pid;
+            self.current_pid = d.pid;
+            self.this_stack.push(d.this_handle);
+            self.class_context_stack.push(d.class_context);
+            self.exec_statement(&action);
+            self.class_context_stack.pop();
+            self.this_stack.pop();
+            self.current_pid = saved_pid;
         }
     }
 

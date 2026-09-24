@@ -59,6 +59,8 @@ mod computed_edge_expressions;
 mod dead_clock_watchdog;
 #[path = "scheduling/decl_init_time_literal_scaling.rs"]
 mod decl_init_time_literal_scaling;
+#[path = "scheduling/deferred_immediate_assertions.rs"]
+mod deferred_immediate_assertions;
 #[path = "scheduling/delay_lands_on_clock_edge.rs"]
 mod delay_lands_on_clock_edge;
 #[path = "scheduling/delay_spike_warning.rs"]
