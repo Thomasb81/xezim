@@ -3460,6 +3460,19 @@ fn atom_type_keyword_width(name: &str) -> Option<u32> {
     })
 }
 
+/// `h` without its last segment. The derived `Clone` copies the resolution
+/// caches, which belong to the full path; left in place, the prefix resolved
+/// as the whole name (`u.sig` evaluated `u` as the signal `u.sig`).
+fn hier_prefix(
+    h: &crate::ast::expr::HierarchicalIdentifier,
+) -> crate::ast::expr::HierarchicalIdentifier {
+    let mut p = h.clone();
+    p.path.pop();
+    p.cached_signal_id = Cell::new(None);
+    p.cached_resolved_name = std::cell::OnceCell::new();
+    p
+}
+
 #[inline]
 fn resolve_array_elem_id(
     name: &str,
@@ -48526,8 +48539,7 @@ impl Simulator {
         let rh = match &func.kind {
             // `w.m(...)` / `w.a.m(...)` — flattened multi-segment Ident.
             ExprKind::Ident(h) if h.path.len() >= 2 => {
-                let mut head = h.clone();
-                head.path.pop();
+                let head = hier_prefix(h);
                 let recv = Expression::new(ExprKind::Ident(head), expr.span);
                 self.eval_handle_expr(&recv)
             }
@@ -59428,11 +59440,16 @@ impl Simulator {
                     }
                 } else if hier.path.len() > 1 {
                     // Property write through a class handle evaluated from the prefix
-                    // (e.g. `stor.handle.val = 777`).
-                    if hier.path.len() >= 2 {
+                    // (e.g. `stor.handle.val = 777`). Not for a hierarchical
+                    // signal (`u_sub.sig`): its prefix is an instance, whose
+                    // value is no handle.
+                    if hier.path.len() >= 2
+                        && !self
+                            .signal_name_to_id
+                            .contains_key(self.resolve_hier_name(hier).as_ref())
+                    {
                         let prop_name = &hier.path.last().unwrap().name.name;
-                        let mut head_hier = hier.clone();
-                        head_hier.path.pop();
+                        let head_hier = hier_prefix(hier);
                         let head_expr = Expression::new(ExprKind::Ident(head_hier), lhs.span);
                         let base_val = self.eval_expr(&head_expr);
                         let handle = base_val.to_u64().unwrap_or(0) as usize;
@@ -65372,8 +65389,7 @@ impl Simulator {
                 if hier.path.len() >= 2
                     && hier.path.last().map(|s| s.name.name.as_str()) == Some("triggered")
                 {
-                    let mut head = hier.clone();
-                    head.path.pop();
+                    let head = hier_prefix(hier);
                     let head_expr = Expression::new(ExprKind::Ident(head), expr.span);
                     let fired = self.event_triggered_now(&head_expr).unwrap_or(false);
                     return if fired {
@@ -65396,8 +65412,7 @@ impl Simulator {
                 {
                     let mname = hier.path.last().unwrap().name.name.clone();
                     if matches!(mname.as_str(), "num" | "first" | "last" | "next" | "prev") {
-                        let mut head = hier.clone();
-                        head.path.pop();
+                        let head = hier_prefix(hier);
                         if head
                             .path
                             .last()
@@ -70126,9 +70141,7 @@ impl Simulator {
                                 // Receiver path = all-but-last segment:
                                 // `a.mid.base` → receiver `a.mid`.
                                 let recv: Option<Expression> = if lh.path.len() >= 2 {
-                                    let mut p = lh.clone();
-                                    p.path.pop();
-                                    p.cached_signal_id = std::cell::Cell::new(None);
+                                    let p = hier_prefix(lh);
                                     Some(Expression::new(ExprKind::Ident(p), lvalue.span))
                                 } else {
                                     None
@@ -85305,8 +85318,7 @@ impl Simulator {
                 if hier.path.len() >= 2
                     && hier.path.last().map(|s| s.name.name.as_str()) == Some("triggered")
                 {
-                    let mut head = hier.clone();
-                    head.path.pop();
+                    let head = hier_prefix(hier);
                     names.push(self.resolve_hier_name(&head).into_owned());
                     return;
                 }
@@ -87536,8 +87548,7 @@ impl Simulator {
                 if let ExprKind::Ident(hier) = &func.kind {
                     if hier.path.len() == 2 && hier.path[1].name.name == "await" {
                         // Clone and truncate to get just the receiver `job`.
-                        let mut recv_hier = hier.clone();
-                        recv_hier.path.pop();
+                        let recv_hier = hier_prefix(hier);
                         let receiver = Expression::new(ExprKind::Ident(recv_hier), func.span);
                         let h = self.eval_expr(&receiver).to_u64().unwrap_or(0);
                         return Self::proc_handle_to_pid(h);
@@ -106711,9 +106722,7 @@ impl Simulator {
             {
                 let n = h.path.len();
                 let member = h.path[n - 1].name.name.clone();
-                let mut recv = h.clone();
-                recv.path.pop();
-                recv.cached_signal_id = std::cell::Cell::new(None);
+                let recv = hier_prefix(h);
                 let recv_expr = Expression::new(ExprKind::Ident(recv), h.span);
                 let hh = self.eval_handle_expr(&recv_expr).unwrap_or(0);
                 if hh != 0 {
@@ -108569,8 +108578,7 @@ impl Simulator {
                                     && h.path[1].name.name == "status"
                                     && h.path.iter().all(|s| s.selects.is_empty()) =>
                             {
-                                let mut base = h.clone();
-                                base.path.pop();
+                                let base = hier_prefix(h);
                                 Some(Expression::new(ExprKind::Ident(base), func.span))
                             }
                             _ => None,
@@ -110381,8 +110389,7 @@ impl Simulator {
                         "num" | "put" | "get" | "peek" | "try_put" | "try_get" | "try_peek"
                     )
                 {
-                    let mut head = hier.clone();
-                    head.path.pop();
+                    let head = hier_prefix(hier);
                     let recv = Expression::new(ExprKind::Ident(head), func.span);
                     let handle = self.eval_expr(&recv).to_u64().unwrap_or(0) as usize;
                     if handle != 0
@@ -110779,10 +110786,7 @@ impl Simulator {
                 // remaining fallbacks to a silent 0. Evaluate the prefix path
                 // as a variable; a live class handle takes the call.
                 {
-                    let mut recv = hier.clone();
-                    recv.path.pop();
-                    recv.cached_signal_id = std::cell::Cell::new(None);
-                    recv.cached_resolved_name = std::cell::OnceCell::new();
+                    let recv = hier_prefix(hier);
                     let recv_expr = Expression::new(ExprKind::Ident(recv), func.span);
                     let h = self.eval_expr(&recv_expr).to_u64().unwrap_or(0) as usize;
                     if h != 0 && self.heap.get(h).and_then(|o| o.as_ref()).is_some() {
@@ -127214,8 +127218,7 @@ impl Simulator {
                     let receiver: Option<Expression> = match &func.kind {
                         ExprKind::MemberAccess { expr: recv, .. } => Some((**recv).clone()),
                         ExprKind::Ident(h) if h.path.len() >= 2 => {
-                            let mut head = h.clone();
-                            head.path.pop();
+                            let head = hier_prefix(h);
                             Some(Expression::new(ExprKind::Ident(head), expr.span))
                         }
                         _ => None,

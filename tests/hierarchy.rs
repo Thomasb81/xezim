@@ -31,6 +31,8 @@ mod c910_scoped_cont_assign;
 mod colliding_actual_child_body;
 #[path = "hierarchy/downward_hier_refs_in_siblings.rs"]
 mod downward_hier_refs_in_siblings;
+#[path = "hierarchy/downward_write_with_live_objects.rs"]
+mod downward_write_with_live_objects;
 #[path = "hierarchy/dump_merged_sv_adopted_primary.rs"]
 mod dump_merged_sv_adopted_primary;
 #[path = "hierarchy/dump_merged_sv_library_dedup.rs"]
