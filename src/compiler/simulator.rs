@@ -2063,6 +2063,7 @@ impl NbaFastIndex {
     }
 }
 
+mod rand_csp;
 mod ts_x;
 
 #[cfg(test)]
@@ -119544,6 +119545,15 @@ impl Simulator {
         // number of full-cost attempts and return 0, rather than paying all
         // 1000 trials (§18.6.2 requires only that we return 0).
         let mut fixed_fe_fail_streak: u32 = 0;
+        // The joint solver (`rand_csp`) models integral scalars and 1-D
+        // arrays; randc cycles, real values, object handles and unpacked
+        // aggregates stay with the trial loop.
+        let mut csp_ok = randc_set.is_empty()
+            && real_rand_props.is_empty()
+            && rand_obj_props.is_empty()
+            && unpacked_agg_props.is_empty()
+            && rand_nd_arrays.is_empty();
+        let mut csp_runs = 0u32;
         self.rand_tight_mode = false;
         for _trial in 0..1000 {
             self.rand_tight_mode = fixed_fe_fail_streak >= 4;
@@ -120706,47 +120716,11 @@ impl Simulator {
                 self.apply_packed_bit_foreach(handle, item, &rand_set);
             }
 
-            let mut all_ok = true;
-            for con in &constraints {
-                for item in &con.items {
-                    // Constraints over a rand COLLECTION (its `.size()`, its
-                    // `foreach` bodies, `unique {}` over it) ARE modeled — check
-                    // them strictly, so an unsatisfied one retries the trial
-                    // instead of being silently accepted.
-                    if let Some(ok) = self.coll_item_check(handle, item, &rand_colls) {
-                        if !ok {
-                            all_ok = false;
-                            break;
-                        }
-                        continue;
-                    }
-                    // Foreach over a FIXED-shape rand array: check strictly,
-                    // so an unsatisfied body retries the trial and an
-                    // UNSATISFIABLE one makes randomize() return 0 (§18.6.2)
-                    // instead of being silently accepted with violating
-                    // values.
-                    if let Some(ok) = self.check_fixed_foreach_item(handle, item) {
-                        if !ok {
-                            fixed_fe_fail_streak += 1;
-                            all_ok = false;
-                            break;
-                        }
-                        continue;
-                    }
-                    // Skip constraints the solver structurally cannot satisfy
-                    // (dynamic-array size/sum/element relations, foreach, solve
-                    // ordering) so they don't block an otherwise-valid config.
-                    if Self::constraint_unmodeled(item) {
-                        continue;
-                    }
-                    if !self.check_constraint_item(handle, item) {
-                        all_ok = false;
-                        break;
-                    }
-                }
-                if !all_ok {
-                    break;
-                }
+            let mut fe_failed = false;
+            let mut all_ok =
+                self.rand_items_accept(handle, &constraints, &rand_colls, &mut fe_failed);
+            if fe_failed {
+                fixed_fe_fail_streak += 1;
             }
 
             // §18.4 concurrent solve: a `rand` object handle's OWN constraints
@@ -120769,6 +120743,58 @@ impl Simulator {
                 self.this_stack.pop();
                 self.class_context_stack.pop();
                 return Value::from_u64(1, 32);
+            }
+
+            // §18.5: constraints that couple many variables at once (an array
+            // `sum()` with `unique` and an ordering chain) defeat the
+            // per-variable repair above; solve the set jointly instead. A
+            // dynamic array keeps the size this trial drew, so an outcome is
+            // final only when no array is sized at random: with fixed shapes
+            // every trial would hand the solver the same problem.
+            if csp_ok && csp_runs < 8 {
+                let sized = rand_colls.iter().any(|c| c.kind == CollKind::Dyn);
+                csp_runs += 1;
+                let array_enums: HashMap<String, String> = rand_arrays
+                    .iter()
+                    .filter_map(|a| a.5.clone().map(|t| (a.0.clone(), t)))
+                    .collect();
+                let colls: Vec<RandColl> = match &self.randomize_subset {
+                    Some(sub) => rand_colls
+                        .iter()
+                        .filter(|c| sub.contains(&c.prop))
+                        .cloned()
+                        .collect(),
+                    None => rand_colls.clone(),
+                };
+                match self.rand_csp_solve(
+                    handle,
+                    &constraints,
+                    &rand_props,
+                    &signed_rand_props,
+                    &enum_prop_types,
+                    &colls,
+                    &array_enums,
+                ) {
+                    rand_csp::CspOutcome::Sat => {
+                        if has_post {
+                            self.exec_method_call(handle, "post_randomize", &[]);
+                        }
+                        self.this_stack.pop();
+                        self.class_context_stack.pop();
+                        return Value::from_u64(1, 32);
+                    }
+                    rand_csp::CspOutcome::Unsat if !sized => {
+                        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                            for (name, val) in backup {
+                                inst.properties.insert(name, val);
+                            }
+                        }
+                        break;
+                    }
+                    rand_csp::CspOutcome::NotApplicable => csp_ok = false,
+                    rand_csp::CspOutcome::GaveUp if !sized => csp_ok = false,
+                    _ => {}
+                }
             }
             if fixed_fe_fail_streak >= 12 {
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
@@ -120816,6 +120842,54 @@ impl Simulator {
         self.this_stack.pop();
         self.class_context_stack.pop();
         Value::zero(32)
+    }
+
+    /// The trial acceptance judge of `exec_randomize_inner`: every constraint
+    /// item the checker models holds. `fe_failed` reports a failed strict
+    /// fixed-array foreach check.
+    fn rand_items_accept(
+        &mut self,
+        handle: usize,
+        constraints: &[ClassConstraint],
+        rand_colls: &[RandColl],
+        fe_failed: &mut bool,
+    ) -> bool {
+        for con in constraints {
+            for item in &con.items {
+                // Constraints over a rand COLLECTION (its `.size()`, its
+                // `foreach` bodies, `unique {}` over it) ARE modeled — check
+                // them strictly, so an unsatisfied one retries the trial
+                // instead of being silently accepted.
+                if let Some(ok) = self.coll_item_check(handle, item, rand_colls) {
+                    if !ok {
+                        return false;
+                    }
+                    continue;
+                }
+                // Foreach over a FIXED-shape rand array: check strictly,
+                // so an unsatisfied body retries the trial and an
+                // UNSATISFIABLE one makes randomize() return 0 (§18.6.2)
+                // instead of being silently accepted with violating
+                // values.
+                if let Some(ok) = self.check_fixed_foreach_item(handle, item) {
+                    if !ok {
+                        *fe_failed = true;
+                        return false;
+                    }
+                    continue;
+                }
+                // Skip constraints the solver structurally cannot satisfy
+                // (dynamic-array size/sum/element relations, foreach, solve
+                // ordering) so they don't block an otherwise-valid config.
+                if Self::constraint_unmodeled(item) {
+                    continue;
+                }
+                if !self.check_constraint_item(handle, item) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// If `expr` is a bare reference to a randomizable scalar property, return

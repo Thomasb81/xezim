@@ -2,10 +2,11 @@
 //! simulator. Assertions are seed-independent (counts and invariants, not
 //! values), so they hold for any conforming solver.
 //!
-//! The `#[ignore]`d test is a feasible problem the reference solves on every
-//! call and xezim's solver cannot: arithmetic (`sum()`), `unique` and an
-//! ordering chain over one array must be solved jointly. Propagation plus
-//! rejection sampling returns 0 from every `randomize()` today.
+//! The joint-solve tests are feasible (or provably infeasible) problems in
+//! which arithmetic (`sum()`), `unique` and orderings couple many variables
+//! at once; per-variable propagation cannot satisfy them, so they exercise
+//! the joint solver. Every expectation was cross-checked against the
+//! reference simulator.
 
 use xezim::simulate;
 
@@ -78,7 +79,6 @@ endmodule
 }
 
 #[test]
-#[ignore = "solver cannot satisfy sum() + unique + ordering jointly (fix pending: needs a real solver)"]
 fn arithmetic_unique_and_ordering_solve_jointly() {
     let o = out(r#"
 class hard;
@@ -106,4 +106,148 @@ module tb;
 endmodule
 "#);
     assert!(o.iter().any(|l| l.contains("OK=50 VALID=50")), "{o:?}");
+}
+
+#[test]
+fn weighted_sum_with_item_index_solves() {
+    // §7.12.4: `item.index` inside a `with` clause is the element's index.
+    let o = out(r#"
+class wsum;
+  rand bit [7:0] a[6];
+  constraint c1 { foreach (a[i]) a[i] inside {[0:15]}; }
+  constraint c2 { a.sum() with (int'(item) * (item.index + 1)) == 100; }
+  constraint c3 { a.sum() with (int'(item)) == 30; }
+endclass
+module tb;
+  initial begin
+    automatic wsum w = new;
+    automatic int ok = 0, valid = 0, changed = 0, prev = -1;
+    for (int i = 0; i < 100; i++) begin
+      if (w.randomize()) begin
+        automatic int s = 0, ws = 0; automatic bit good = 1;
+        ok++;
+        foreach (w.a[j]) begin s += w.a[j]; ws += w.a[j] * (j + 1); if (w.a[j] > 15) good = 0; end
+        if (s == 30 && ws == 100 && good) valid++;
+        if (w.a[0] != prev) changed++;
+        prev = w.a[0];
+      end
+    end
+    $display("OK=%0d VALID=%0d CHANGED=%0d", ok, valid, changed);
+  end
+endmodule
+"#);
+    assert!(o.iter().any(|l| l.contains("OK=100 VALID=100")), "{o:?}");
+    assert!(
+        field(&o, "CHANGED=") >= 50,
+        "solutions must vary between calls: {o:?}"
+    );
+}
+
+#[test]
+fn orderings_between_two_arrays_solve_jointly() {
+    let o = out(r#"
+class win;
+  rand bit [7:0] lo[6];
+  rand bit [7:0] hi[6];
+  constraint c1 { foreach (lo[i]) { lo[i] inside {[0:200]}; hi[i] inside {[0:200]}; hi[i] >= lo[i] + 20; } }
+  constraint c2 { foreach (lo[i]) if (i > 0) lo[i] > hi[i-1]; }
+  constraint c3 { lo.sum() with (int'(item)) + hi.sum() with (int'(item)) <= 1300; }
+endclass
+module tb;
+  initial begin
+    automatic win w = new;
+    automatic int ok = 0, valid = 0;
+    for (int i = 0; i < 100; i++) begin
+      if (w.randomize()) begin
+        automatic int s = 0; automatic bit good = 1;
+        ok++;
+        foreach (w.lo[j]) begin
+          s += w.lo[j] + w.hi[j];
+          if (w.lo[j] > 200 || w.hi[j] > 200 || w.hi[j] < w.lo[j] + 20) good = 0;
+          if (j > 0 && w.lo[j] <= w.hi[j-1]) good = 0;
+        end
+        if (s <= 1300 && good) valid++;
+      end
+    end
+    $display("OK=%0d VALID=%0d", ok, valid);
+  end
+endmodule
+"#);
+    assert!(o.iter().any(|l| l.contains("OK=100 VALID=100")), "{o:?}");
+}
+
+#[test]
+fn unique_scalars_with_sum_cover_every_solution() {
+    // Exactly 12 assignments satisfy this set (the permutations of
+    // {0,1,2,3} with w > z); `w + x + y + z` is summed at 32 bits, not 4.
+    let o = out(r#"
+class us;
+  rand bit [3:0] w, x, y, z;
+  constraint c1 { unique {w, x, y, z}; }
+  constraint c2 { w + x + y + z == 6; }
+  constraint c3 { w > z; }
+endclass
+module tb;
+  initial begin
+    automatic us u = new;
+    automatic int ok = 0, valid = 0;
+    automatic int seen[int];
+    for (int i = 0; i < 200; i++) begin
+      if (u.randomize()) begin
+        ok++;
+        if (u.w + u.x + u.y + u.z == 6 && u.w != u.x && u.w != u.y && u.w != u.z &&
+            u.x != u.y && u.x != u.z && u.y != u.z && u.w > u.z) valid++;
+        seen[{u.w, u.x, u.y, u.z}] = 1;
+      end
+    end
+    $display("OK=%0d VALID=%0d SOLUTIONS=%0d", ok, valid, seen.num());
+  end
+endmodule
+"#);
+    assert!(
+        o.iter()
+            .any(|l| l.contains("OK=200 VALID=200 SOLUTIONS=12")),
+        "{o:?}"
+    );
+}
+
+#[test]
+fn dynamic_array_sum_with_random_size() {
+    // §18.5.8.1: the size is solved first; the sum is feasible at every size.
+    let o = out(r#"
+class dq;
+  rand bit [7:0] d[];
+  rand bit [3:0] n;
+  constraint c1 { d.size() == n; n inside {[3:8]}; }
+  constraint c2 { foreach (d[i]) d[i] inside {[1:20]}; }
+  constraint c3 { d.sum() with (int'(item)) == 40; }
+  constraint c4 { unique {d}; }
+  constraint c5 { foreach (d[i]) if (i > 0) d[i] > d[i-1]; }
+endclass
+module tb;
+  initial begin
+    automatic dq q = new;
+    automatic int ok = 0, valid = 0;
+    automatic int sizes[int];
+    for (int i = 0; i < 100; i++) begin
+      if (q.randomize()) begin
+        automatic int s = 0; automatic bit good = 1;
+        ok++;
+        foreach (q.d[j]) begin
+          s += q.d[j];
+          if (q.d[j] < 1 || q.d[j] > 20) good = 0;
+          if (j > 0 && q.d[j] <= q.d[j-1]) good = 0;
+        end
+        if (s == 40 && good && q.d.size() == q.n) valid++;
+        sizes[q.n] = 1;
+      end
+    end
+    $display("OK=%0d VALID=%0d SIZES=%0d", ok, valid, sizes.num());
+  end
+endmodule
+"#);
+    assert!(
+        o.iter().any(|l| l.contains("OK=100 VALID=100 SIZES=6")),
+        "{o:?}"
+    );
 }
