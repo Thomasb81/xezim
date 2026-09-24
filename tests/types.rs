@@ -231,6 +231,8 @@ mod type_param_bound_to_specialization;
 mod type_param_static_property;
 #[path = "types/type_param_struct_per_instance.rs"]
 mod type_param_struct_per_instance;
+#[path = "types/typed_parameter_value_context.rs"]
+mod typed_parameter_value_context;
 #[path = "types/typedef_declaring_scope.rs"]
 mod typedef_declaring_scope;
 #[path = "types/typedef_same_named_hierarchy.rs"]
