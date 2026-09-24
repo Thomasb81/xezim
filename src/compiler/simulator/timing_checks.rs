@@ -1,12 +1,15 @@
 //! IEEE 1800-2017 §31 timing checks.
 //!
-//! Each flattened check (`ElaboratedModule::timing_checks`) becomes one comb
-//! entry (`CombItem::TimingCheck`) that reads only its reference and data
-//! terminals, so it runs when one of them changes and costs nothing
-//! otherwise. The entry compares each terminal with the value it last saw,
-//! classifies the transition against the event's edge mask, applies the
-//! `&&&` condition (x or z disables the event, as in the reference
-//! simulator) and updates the check's timestamps. A violation prints one
+//! The reference and data terminals of every flattened check
+//! (`ElaboratedModule::timing_checks`) are grouped by the signal they watch,
+//! and each watched signal becomes one comb entry (`CombItem::TimingCheck`),
+//! so checks cost nothing until a terminal changes. The entry classifies the
+//! change once (LSB transition, or per bit for bit-select terminals) and
+//! dispatches it only to the terminals whose edge mask admits it — a clock
+//! shared by thousands of flops is one entry, and its posedge never visits
+//! the negedge-only terminals. Each event applies its `&&&` condition (x or
+//! z disables it, as in the reference simulator) and updates the check's
+//! timestamps. A violation prints one
 //! diagnostic and toggles the notifier (§31.6: x->0, 0->1, 1->0, z stays z)
 //! through the NBA region, so a notifier-driven UDP or `always @(notifier)`
 //! reacts after the design's own response to the same edge. Two violations
@@ -62,8 +65,34 @@ pub(super) struct TcTerm {
     cond: Option<Arc<Expression>>,
     /// Source spelling (`posedge clk &&& en`).
     text: String,
-    /// Value last seen (the selected bit for a bit terminal).
-    prev: Value,
+}
+
+/// Event roles of a terminal: the reference event, the opposite reference
+/// edge that closes a `$width` pulse / `$nochange` window, the data event.
+const ROLE_REF: u8 = 0;
+const ROLE_CLOSE: u8 = 1;
+const ROLE_DATA: u8 = 2;
+
+/// The terminals watching one signal, indexed by `CombItem::TimingCheck`.
+pub(super) struct TcWatch {
+    sig: usize,
+    /// Value last seen: raw planes, or the whole value past 64 bits.
+    prev_v: u64,
+    prev_x: u64,
+    wide: Option<Value>,
+    /// Whole-signal terminals with an edge control, by LSB transition
+    /// `from * 3 + to` (levels 0, 1, 2 = x/z): (check, role).
+    by_tr: [Vec<(u32, u8)>; 9],
+    /// Whole-signal terminals without one: every value change.
+    any: Vec<(u32, u8)>,
+    /// Bit-select terminals: (bit, edge mask, check, role).
+    bits: Vec<(u32, Option<u16>, u32, u8)>,
+}
+
+/// Level (0, 1, 2 = x/z) of bit `b` of raw planes.
+#[inline]
+fn level(v: u64, x: u64, b: u32) -> u8 {
+    ((((x >> b) & 1) << 1) | ((v >> b) & 1)).min(2) as u8
 }
 
 #[derive(Clone, Copy)]
@@ -115,19 +144,10 @@ enum TcKind {
 #[derive(Clone)]
 pub(super) struct TimingCheckRt {
     kind: TcKind,
-    name: String,
-    /// Instance scope and module definition, for SDF matching.
-    scope: String,
-    def_name: String,
-    /// Full instance path for the diagnostics.
-    path: String,
-    loc: Option<String>,
-    reference: TcTerm,
-    data: Option<TcTerm>,
     notifier: Option<BitRef>,
-    /// `$setuphold`/`$recrem` timestamp_condition / timecheck_condition.
-    stamp_cond: Option<Arc<Expression>>,
-    check_cond: Option<Arc<Expression>>,
+    /// Which conditions exist (`COND_*`), so an event reads `cold` only
+    /// when it has one to evaluate.
+    conds: u8,
     ref_time: Option<u64>,
     data_time: Option<u64>,
     /// `$width` pending pulse start; `$nochange` trailing edge.
@@ -138,6 +158,32 @@ pub(super) struct TimingCheckRt {
     open: Option<(bool, u64)>,
     timer: Option<u64>,
     dormant: bool,
+    /// Kept out of line: an event touches only the fields above, and a
+    /// clock shared by thousands of checks walks all of them.
+    cold: Box<TcCold>,
+}
+
+const COND_REF: u8 = 1;
+const COND_DATA: u8 = 2;
+const COND_STAMP: u8 = 4;
+const COND_CHECK: u8 = 8;
+
+/// The parts of a check that events rarely read: diagnostics, SDF matching
+/// and the condition expressions.
+#[derive(Clone)]
+struct TcCold {
+    name: String,
+    /// Instance scope and module definition, for SDF matching.
+    scope: String,
+    def_name: String,
+    /// Full instance path for the diagnostics.
+    path: String,
+    loc: Option<String>,
+    reference: TcTerm,
+    data: Option<TcTerm>,
+    /// `$setuphold`/`$recrem` timestamp_condition / timecheck_condition.
+    stamp_cond: Option<Arc<Expression>>,
+    check_cond: Option<Arc<Expression>>,
 }
 
 /// Swap the direction of every transition in an edge mask.
@@ -181,6 +227,7 @@ impl Simulator {
             return;
         }
         let mut warnings: Vec<String> = Vec::new();
+        let mut watch_of: HashMap<usize, usize> = HashMap::default();
         for tc in checks {
             let arg = |i: usize| tc.args.get(i).and_then(|a| a.as_ref());
             let konst = |i: usize| tc.consts.get(i).copied().flatten();
@@ -360,39 +407,55 @@ impl Simulator {
             } else {
                 (None, None)
             };
-            let mut read_ids = vec![reference.sig];
-            if let Some(d) = &data {
-                if d.sig != reference.sig {
-                    read_ids.push(d.sig);
-                }
+            let idx = self.timing_checks.len() as u32;
+            self.timing_watch(&mut watch_of, &reference, idx, ROLE_REF, reference.edges);
+            if matches!(kind, TcKind::Width { .. } | TcKind::Nochange { .. }) {
+                let close = reference.edges.map(reverse_edges);
+                self.timing_watch(&mut watch_of, &reference, idx, ROLE_CLOSE, close);
             }
-            let idx = self.timing_checks.len();
+            if let Some(d) = &data {
+                self.timing_watch(&mut watch_of, d, idx, ROLE_DATA, d.edges);
+            }
+            let conds = [
+                (reference.cond.is_some(), COND_REF),
+                (data.as_ref().is_some_and(|d| d.cond.is_some()), COND_DATA),
+                (stamp_cond.is_some(), COND_STAMP),
+                (check_cond.is_some(), COND_CHECK),
+            ]
+            .iter()
+            .filter(|(on, _)| *on)
+            .fold(0u8, |a, (_, bit)| a | bit);
             self.timing_checks.push(TimingCheckRt {
                 kind,
-                name: tc.name.clone(),
-                scope: tc.scope.clone(),
-                def_name: tc.def_name.clone(),
-                path,
-                loc,
-                reference,
-                data,
                 notifier,
-                stamp_cond,
-                check_cond,
+                conds,
                 ref_time: None,
                 data_time: None,
                 aux_time: None,
                 open: None,
                 timer: None,
                 dormant: false,
+                cold: Box::new(TcCold {
+                    name: tc.name.clone(),
+                    scope: tc.scope.clone(),
+                    def_name: tc.def_name.clone(),
+                    path,
+                    loc,
+                    reference,
+                    data,
+                    stamp_cond,
+                    check_cond,
+                }),
             });
+        }
+        for (w, watch) in self.timing_watches.iter().enumerate() {
             entries.push(CombEntry {
-                item: CombItem::TimingCheck { idx },
+                item: CombItem::TimingCheck { idx: w },
                 cold: Box::new(CombEntryCold {
                     scope_hint: None,
-                    read_signal_ids: read_ids,
+                    read_signal_ids: vec![watch.sig],
                     write_signal_ids: Vec::new(),
-                    span: tc.span,
+                    span: crate::ast::Span::dummy(),
                 }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,
@@ -429,9 +492,9 @@ impl Simulator {
             let mut hit = false;
             for rt in self.timing_checks.iter_mut() {
                 let inst_ok = if l.instance == "*" {
-                    l.cell_type == rt.def_name
+                    l.cell_type == rt.cold.def_name
                 } else {
-                    l.instance == rt.scope || l.instance == rt.path
+                    l.instance == rt.cold.scope || l.instance == rt.cold.path
                 };
                 if inst_ok && sdf_set_limits(rt, l) {
                     hit = true;
@@ -469,16 +532,57 @@ impl Simulator {
             },
             _ => return None,
         };
-        let mut t = TcTerm {
+        Some(TcTerm {
             sig,
             bit,
             edges: a.edges,
             cond: a.cond.as_ref().map(|c| Arc::new(c.clone())),
             text: a.text.clone(),
-            prev: Value::new(1),
+        })
+    }
+
+    /// Add a terminal's event to the watch of its signal.
+    fn timing_watch(
+        &mut self,
+        watch_of: &mut HashMap<usize, usize>,
+        t: &TcTerm,
+        idx: u32,
+        role: u8,
+        mask: Option<u16>,
+    ) {
+        let w = match watch_of.get(&t.sig) {
+            Some(&w) => w,
+            None => {
+                let cur = &self.signal_table[t.sig];
+                let (prev_v, prev_x) = cur.raw_bits();
+                let wide = (self.signal_widths[t.sig] > 64).then(|| cur.clone());
+                self.timing_watches.push(TcWatch {
+                    sig: t.sig,
+                    prev_v,
+                    prev_x,
+                    wide,
+                    by_tr: Default::default(),
+                    any: Vec::new(),
+                    bits: Vec::new(),
+                });
+                watch_of.insert(t.sig, self.timing_watches.len() - 1);
+                self.timing_watches.len() - 1
+            }
         };
-        t.prev = self.sample_timing_term(&t);
-        Some(t)
+        let watch = &mut self.timing_watches[w];
+        match (t.bit, mask) {
+            (Some(b), _) => watch.bits.push((b, mask, idx, role)),
+            (None, None) => watch.any.push((idx, role)),
+            (None, Some(m)) => {
+                for from in 0..3u8 {
+                    for to in 0..3u8 {
+                        if m & timing_edge_bit(from, to) != 0 {
+                            watch.by_tr[(from * 3 + to) as usize].push((idx, role));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn resolve_notifier(&self, e: &Expression) -> Option<BitRef> {
@@ -494,47 +598,6 @@ impl Simulator {
         }
     }
 
-    #[inline]
-    fn sample_timing_term(&self, t: &TcTerm) -> Value {
-        let v = &self.signal_table[t.sig];
-        match t.bit {
-            Some(b) => {
-                let mut one = Value::new(1);
-                one.set_bit_code(0, v.get_bit_code(b as usize));
-                one
-            }
-            None => v.clone(),
-        }
-    }
-
-    /// Detect whether a terminal changed since it was last seen. Returns
-    /// the LSB transition (levels 0, 1, 2 = x/z) of a change.
-    fn timing_term_change(&mut self, idx: usize, data: bool) -> Option<(u8, u8)> {
-        let cur = {
-            let rt = &self.timing_checks[idx];
-            let t = if data {
-                rt.data.as_ref()?
-            } else {
-                &rt.reference
-            };
-            let cur = self.sample_timing_term(t);
-            if cur == t.prev {
-                return None;
-            }
-            cur
-        };
-        let rt = &mut self.timing_checks[idx];
-        let t = if data {
-            rt.data.as_mut()?
-        } else {
-            &mut rt.reference
-        };
-        let lvl = |v: &Value| v.get_bit_code(0).min(2);
-        let tr = (lvl(&t.prev), lvl(&cur));
-        t.prev = cur;
-        Some(tr)
-    }
-
     /// `&&&` condition / timestamp / timecheck condition: enabled only for
     /// a known nonzero value.
     fn timing_cond_true(&mut self, c: &Option<Arc<Expression>>) -> bool {
@@ -547,19 +610,72 @@ impl Simulator {
         on
     }
 
-    pub(super) fn eval_timing_check(&mut self, idx: usize) {
-        let ref_tr = self.timing_term_change(idx, false);
-        let data_tr = self.timing_term_change(idx, true);
-        if self.time == 0 || (ref_tr.is_none() && data_tr.is_none()) {
+    /// A watched signal changed (or may have): classify the change and
+    /// dispatch it to the terminals that take it.
+    pub(super) fn eval_timing_watch(&mut self, w: usize) {
+        let sig = self.timing_watches[w].sig;
+        let wide = self.timing_watches[w].wide.is_some();
+        // (previous, current) planes; for a wide signal the bit accessors
+        // below read the Values instead.
+        let (pv, px) = (self.timing_watches[w].prev_v, self.timing_watches[w].prev_x);
+        let (cv, cx) = self.signal_table[sig].raw_bits();
+        let mut old_wide = None;
+        if wide {
+            let cur = &self.signal_table[sig];
+            if self.timing_watches[w].wide.as_ref() == Some(cur) {
+                return;
+            }
+            old_wide = self.timing_watches[w].wide.replace(cur.clone());
+        } else {
+            if pv == cv && px == cx {
+                return;
+            }
+            self.timing_watches[w].prev_v = cv;
+            self.timing_watches[w].prev_x = cx;
+        }
+        if self.time == 0 {
             return;
         }
-        // Mid-process settle: the writing process has not suspended yet, so
-        // a condition it assigns next (`clk = 1; en = 0;`) must still be seen.
+        let bit_levels = |sim: &Self, b: u32| -> (u8, u8) {
+            match &old_wide {
+                Some(old) => (
+                    old.get_bit_code(b as usize).min(2),
+                    sim.signal_table[sig].get_bit_code(b as usize).min(2),
+                ),
+                None => (level(pv, px, b), level(cv, cx, b)),
+            }
+        };
+        let (from, to) = bit_levels(self, 0);
+        if from != to {
+            let t = (from * 3 + to) as usize;
+            for k in 0..self.timing_watches[w].by_tr[t].len() {
+                let (idx, role) = self.timing_watches[w].by_tr[t][k];
+                self.timing_dispatch(idx, role);
+            }
+        }
+        for k in 0..self.timing_watches[w].any.len() {
+            let (idx, role) = self.timing_watches[w].any[k];
+            self.timing_dispatch(idx, role);
+        }
+        for k in 0..self.timing_watches[w].bits.len() {
+            let (b, mask, idx, role) = self.timing_watches[w].bits[k];
+            let (from, to) = bit_levels(self, b);
+            if from != to && mask.is_none_or(|m| m & timing_edge_bit(from, to) != 0) {
+                self.timing_dispatch(idx, role);
+            }
+        }
+    }
+
+    /// Mid-process settle: the writing process has not suspended yet, so a
+    /// condition it assigns next (`clk = 1; en = 0;`) must still be seen —
+    /// park the event until it does.
+    #[inline]
+    fn timing_dispatch(&mut self, idx: u32, role: u8) {
         if self.proc_depth > 0 {
-            self.timing_pending.push((idx, ref_tr, data_tr));
-            return;
+            self.timing_pending.push((idx, role));
+        } else {
+            self.timing_role_event(idx as usize, role);
         }
-        self.timing_events(idx, ref_tr, data_tr);
     }
 
     /// Run the timing-check events parked while a process was executing.
@@ -568,8 +684,8 @@ impl Simulator {
             return;
         }
         let pending = std::mem::take(&mut self.timing_pending);
-        for &(idx, ref_tr, data_tr) in &pending {
-            self.timing_events(idx, ref_tr, data_tr);
+        for &(idx, role) in &pending {
+            self.timing_role_event(idx as usize, role);
         }
         let mut pending = pending;
         pending.clear();
@@ -578,40 +694,40 @@ impl Simulator {
         }
     }
 
-    fn timing_events(&mut self, idx: usize, ref_tr: Option<(u8, u8)>, data_tr: Option<(u8, u8)>) {
-        let now = self.time;
-        let matches = |mask: Option<u16>, (from, to): (u8, u8)| match mask {
-            None => true,
-            Some(m) => m & timing_edge_bit(from, to) != 0,
+    /// `$setuphold`/`$recrem` timecheck and timestamp conditions.
+    fn timing_window_conds(
+        &self,
+        idx: usize,
+    ) -> (Option<Arc<Expression>>, Option<Arc<Expression>>) {
+        let rt = &self.timing_checks[idx];
+        if rt.conds & (COND_STAMP | COND_CHECK) == 0 {
+            return (None, None);
+        }
+        (rt.cold.check_cond.clone(), rt.cold.stamp_cond.clone())
+    }
+
+    fn timing_role_event(&mut self, idx: usize, role: u8) {
+        let rt = &self.timing_checks[idx];
+        let bit = if role == ROLE_DATA {
+            COND_DATA
+        } else {
+            COND_REF
         };
-        let kind = self.timing_checks[idx].kind;
-        let ref_mask = self.timing_checks[idx].reference.edges;
-        let data_mask = self.timing_checks[idx].data.as_ref().and_then(|d| d.edges);
-        let ref_cond = self.timing_checks[idx].reference.cond.clone();
-        let data_cond = self.timing_checks[idx]
-            .data
-            .as_ref()
-            .and_then(|d| d.cond.clone());
-        // Reference-terminal edge in the reference mask (and, for $width /
-        // $nochange, the opposite edge that closes the pulse).
-        let ref_ev = ref_tr.is_some_and(|tr| matches(ref_mask, tr));
-        let ref_close = ref_tr.is_some_and(|tr| {
-            matches!(kind, TcKind::Width { .. } | TcKind::Nochange { .. })
-                && matches(ref_mask.map(reverse_edges), tr)
-        });
-        let data_ev = data_tr.is_some_and(|tr| matches(data_mask, tr));
-        if ref_ev || ref_close {
-            if self.timing_cond_true(&ref_cond) {
-                if ref_close {
-                    self.timing_ref_close(idx, now);
-                }
-                if ref_ev {
-                    self.timing_ref_event(idx, now);
-                }
+        if rt.conds & bit != 0 {
+            let cond = if role == ROLE_DATA {
+                rt.cold.data.as_ref().and_then(|d| d.cond.clone())
+            } else {
+                rt.cold.reference.cond.clone()
+            };
+            if !self.timing_cond_true(&cond) {
+                return;
             }
         }
-        if data_ev && self.timing_cond_true(&data_cond) {
-            self.timing_data_event(idx, now);
+        let now = self.time;
+        match role {
+            ROLE_REF => self.timing_ref_event(idx, now),
+            ROLE_CLOSE => self.timing_ref_close(idx, now),
+            _ => self.timing_data_event(idx, now),
         }
     }
 
@@ -623,8 +739,7 @@ impl Simulator {
                 hold,
                 recrem,
             } => {
-                let check = self.timing_checks[idx].check_cond.clone();
-                let stamp = self.timing_checks[idx].stamp_cond.clone();
+                let (check, stamp) = self.timing_window_conds(idx);
                 if let Some(td) = self.timing_checks[idx].data_time {
                     if self.timing_cond_true(&check) {
                         let delta = td as i64 - now as i64;
@@ -657,10 +772,10 @@ impl Simulator {
                     if ((now - tr) as i64) < limit {
                         let msg = format!(
                             "{}( {}:{}, {}:{}, {} )",
-                            rt.name,
-                            rt.reference.text,
+                            rt.cold.name,
+                            rt.cold.reference.text,
                             self.timing_fmt(tr as i64),
-                            rt.reference.text,
+                            rt.cold.reference.text,
                             self.timing_fmt(now as i64),
                             self.timing_fmt(limit)
                         );
@@ -695,16 +810,16 @@ impl Simulator {
                 if let Some(ts) = rt.aux_time {
                     let w = (now - ts) as i64;
                     if w < limit && w > threshold {
-                        let close = terminal_text(&rt.reference.text).to_string();
-                        let close = match rt.reference.edges {
+                        let close = terminal_text(&rt.cold.reference.text).to_string();
+                        let close = match rt.cold.reference.edges {
                             Some(m) if m == TIMING_POSEDGE => format!("negedge {}", close),
                             Some(m) if m == TIMING_NEGEDGE => format!("posedge {}", close),
                             _ => close,
                         };
                         let msg = format!(
                             "{}( {}:{}, {}:{}, {} )",
-                            rt.name,
-                            rt.reference.text,
+                            rt.cold.name,
+                            rt.cold.reference.text,
                             self.timing_fmt(ts as i64),
                             close,
                             self.timing_fmt(now as i64),
@@ -733,8 +848,7 @@ impl Simulator {
                 hold,
                 recrem,
             } => {
-                let check = self.timing_checks[idx].check_cond.clone();
-                let stamp = self.timing_checks[idx].stamp_cond.clone();
+                let (check, stamp) = self.timing_window_conds(idx);
                 if let Some(tr) = self.timing_checks[idx].ref_time {
                     if self.timing_cond_true(&check) {
                         let delta = now as i64 - tr as i64;
@@ -803,15 +917,15 @@ impl Simulator {
     /// `$skew( ref:t1, data:t2, limit )`, or the data-first order.
     fn timing_pair_msg(&self, idx: usize, ref_first: bool, t1: u64, t2: u64, limit: i64) -> String {
         let rt = &self.timing_checks[idx];
-        let data_text = rt.data.as_ref().map(|d| d.text.as_str()).unwrap_or("");
+        let data_text = rt.cold.data.as_ref().map(|d| d.text.as_str()).unwrap_or("");
         let (first, second) = if ref_first {
-            (rt.reference.text.as_str(), data_text)
+            (rt.cold.reference.text.as_str(), data_text)
         } else {
-            (data_text, rt.reference.text.as_str())
+            (data_text, rt.cold.reference.text.as_str())
         };
         format!(
             "{}( {}:{}, {}:{}, {} )",
-            rt.name,
+            rt.cold.name,
             first,
             self.timing_fmt(t1 as i64),
             second,
@@ -909,10 +1023,10 @@ impl Simulator {
         };
         format!(
             "{}( {}:{}, {}:{}, {}, {} )",
-            rt.name,
-            rt.reference.text,
+            rt.cold.name,
+            rt.cold.reference.text,
             self.timing_fmt(tl as i64),
-            rt.data.as_ref().map(|d| d.text.as_str()).unwrap_or(""),
+            rt.cold.data.as_ref().map(|d| d.text.as_str()).unwrap_or(""),
             self.timing_fmt(td as i64),
             self.timing_fmt(start),
             self.timing_fmt(end)
@@ -931,14 +1045,14 @@ impl Simulator {
         limit: i64,
     ) {
         let rt = &self.timing_checks[idx];
-        let data_text = rt.data.as_ref().map(|d| d.text.as_str()).unwrap_or("");
+        let data_text = rt.cold.data.as_ref().map(|d| d.text.as_str()).unwrap_or("");
         let msg = if setup_side {
             format!(
                 "{}( {}:{}, {}:{}, {} )",
                 if recrem { "$removal" } else { "$setup" },
                 data_text,
                 self.timing_fmt(td as i64),
-                rt.reference.text,
+                rt.cold.reference.text,
                 self.timing_fmt(tr as i64),
                 self.timing_fmt(limit)
             )
@@ -946,7 +1060,7 @@ impl Simulator {
             format!(
                 "{}( {}:{}, {}:{}, {} )",
                 if recrem { "$recovery" } else { "$hold" },
-                rt.reference.text,
+                rt.cold.reference.text,
                 self.timing_fmt(tr as i64),
                 data_text,
                 self.timing_fmt(td as i64),
@@ -963,9 +1077,10 @@ impl Simulator {
             let line = format!(
                 "** Error: {} violation in {} at time {}{}",
                 check,
-                rt.path,
+                rt.cold.path,
                 self.timing_fmt(self.time as i64),
-                rt.loc
+                rt.cold
+                    .loc
                     .as_ref()
                     .map(|l| format!(" ({})", l))
                     .unwrap_or_default()
@@ -1087,15 +1202,15 @@ fn sdf_set_limits(rt: &mut TimingCheckRt, l: &crate::compiler::sdf::SdfTimingLim
     let Some(ref_port) = ref_port else {
         return false;
     };
-    if !sdf_port_matches(&rt.reference, ref_port) {
+    if !sdf_port_matches(&rt.cold.reference, ref_port) {
         return false;
     }
-    match (&rt.data, data_port) {
+    match (&rt.cold.data, data_port) {
         (Some(d), Some(p)) if sdf_port_matches(d, p) => {}
         (None, None) => {}
         _ => return false,
     }
-    let name = rt.name.as_str();
+    let name = rt.cold.name.as_str();
     // (setup-side value, hold-side value) for the window kinds.
     let (s, h) = match (l.kind.as_str(), name) {
         ("SETUP", "$setup" | "$setuphold") | ("REMOVAL", "$removal" | "$recrem") => (v(0), None),

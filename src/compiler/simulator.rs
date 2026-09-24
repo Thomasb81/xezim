@@ -782,9 +782,9 @@ enum CombItem {
         event_ref: BitRef,
         indices: Box<[usize]>,
     },
-    /// §31 timing check. Evaluated by `eval_timing_check(idx)` against
-    /// `self.timing_checks[idx]`; reads its reference/data terminals and
-    /// writes nothing directly (a notifier toggles through the NBA region).
+    /// §31 timing checks watching one signal: `eval_timing_watch(idx)`
+    /// against `self.timing_watches[idx]`. Reads that signal and writes
+    /// nothing directly (a notifier toggles through the NBA region).
     TimingCheck {
         idx: usize,
     },
@@ -4738,14 +4738,16 @@ pub struct Simulator {
     /// settle path (sequential UDPs need `&mut self` to update their state,
     /// which the parallel/BSP isolated eval cannot provide).
     has_udp: bool,
-    /// §31 timing checks, indexed by `CombItem::TimingCheck{idx}`.
+    /// §31 timing checks, and the signals their terminals watch (indexed
+    /// by `CombItem::TimingCheck{idx}`).
     timing_checks: Vec<timing_checks::TimingCheckRt>,
+    timing_watches: Vec<timing_checks::TcWatch>,
     /// Like `has_udp`: timing checks keep per-check state, so their comb
     /// entries force the serial settle.
     has_timing_checks: bool,
     /// Timing-check events seen by a settle inside a running process,
-    /// evaluated once it suspends: (check, reference, data transition).
-    timing_pending: Vec<(usize, Option<(u8, u8)>, Option<(u8, u8)>)>,
+    /// evaluated once it suspends: (check, event role).
+    timing_pending: Vec<(u32, u8)>,
     /// Armed time-based `$timeskew`/`$fullskew` deadlines: (time, check).
     timing_timers: Vec<(u64, usize)>,
     module: ElaboratedModule,
@@ -9370,6 +9372,7 @@ impl Simulator {
             udp_runtime: Vec::new(),
             has_udp: false,
             timing_checks: Vec::new(),
+            timing_watches: Vec::new(),
             has_timing_checks: false,
             timing_pending: Vec::new(),
             timing_timers: Vec::new(),
@@ -54422,7 +54425,7 @@ impl Simulator {
             }
             CombItem::TimingCheck { idx } => {
                 let idx = *idx;
-                self.eval_timing_check(idx);
+                self.eval_timing_watch(idx);
             }
             // Copies are always handled by the isolated path; reaching here for
             // them would be a logic error, but eval them correctly regardless.
@@ -56060,7 +56063,7 @@ impl Simulator {
                         }
                         CombItem::TimingCheck { idx } => {
                             let idx = *idx;
-                            self.eval_timing_check(idx);
+                            self.eval_timing_watch(idx);
                             n_dc += 1;
                         }
                     }
