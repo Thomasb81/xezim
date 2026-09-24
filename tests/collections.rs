@@ -27,6 +27,8 @@ mod array_of_queues;
 mod assoc_compliance;
 #[path = "collections/assoc_method_dispatch.rs"]
 mod assoc_method_dispatch;
+#[path = "collections/assoc_missing_key_default.rs"]
+mod assoc_missing_key_default;
 #[path = "collections/collection_write_open_gaps.rs"]
 mod collection_write_open_gaps;
 #[path = "collections/concurrent_local_dyn_arrays.rs"]

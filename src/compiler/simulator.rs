@@ -57926,10 +57926,18 @@ impl Simulator {
             // §10.7: fit to the DECLARED element width when one was
             // recorded; class-member collections often have none, in
             // which case the value is stored as-is (unchanged).
-            let fitted = match self.assoc_elem_width(&an) {
+            let mut fitted = match self.assoc_elem_width(&an) {
                 Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
                 _ => val.clone(),
             };
+            // The element takes its declared signedness, not the RHS's
+            // (`byte m[int]; m[k] = 8'hF0` is -16).
+            if let Some(sg) = self
+                .assoc_elem_signed(&an)
+                .filter(|_| !fitted.is_real && self.is_associative_array(&an))
+            {
+                fitted.is_signed = sg;
+            }
             let changed = self.signals.get(&elem_name) != Some(&fitted);
             self.signals.insert(elem_name, fitted);
             if changed {
@@ -58524,12 +58532,19 @@ impl Simulator {
                 // recorded width is only the elaborator's placeholder,
                 // and fitting to it would chop the text.
                 let elem_is_string = self.is_string_collection(&name);
-                let fitted = match self.assoc_elem_width(&name) {
+                let mut fitted = match self.assoc_elem_width(&name) {
                     Some(w) if w != val.width && !val.is_real && !elem_is_string => {
                         val.resize_for_assign(w)
                     }
                     _ => val.clone(),
                 };
+                // The element takes its declared signedness, not the RHS's
+                // (`bit [3:0] aa[int]; aa[k] = 9` is 9, not -7).
+                if let Some(sg) = self.assoc_elem_signed(&name).filter(|_| {
+                    !fitted.is_real && !elem_is_string && self.is_associative_array(&name)
+                }) {
+                    fitted.is_signed = sg;
+                }
                 if self.warn_x && self.time > 0 {
                     let prev = self.signals.get(&elem_name).cloned();
                     self.warn_x_note_named(&elem_name, prev.as_ref(), &fitted);
@@ -67296,12 +67311,16 @@ impl Simulator {
                     }
                     let idx_str = self.assoc_key_str(&an, &idx_val);
                     let elem_name = format!("{}[{}]", an, idx_str);
-                    let ev = self
-                        .signals
-                        .get(&elem_name)
-                        .cloned()
+                    if let Some(ev) = self.signals.get(&elem_name) {
+                        return ev.clone();
+                    }
+                    // §7.8.6: a missing key reads the element type's default
+                    // (x for `integer m[int]`, a signed 0 for `int`).
+                    return self
+                        .is_associative_array(&an)
+                        .then(|| self.assoc_missing_elem_value(&an))
+                        .flatten()
                         .unwrap_or_else(|| Value::zero(32));
-                    return ev;
                 }
                 // N-dimensional (N >= 3) unpacked array element access
                 {
@@ -67604,17 +67623,24 @@ impl Simulator {
                             // `%h` print a single `x` for what should be `xx`.
                             // (The read still must not CREATE the element —
                             // `num()` is unchanged, which is why this is a
-                            // value-only fallback.)
-                            let ew = self.assoc_elem_width(&name).unwrap_or(1).max(1);
-                            if self.module.two_state_signals.contains(&*name)
-                                || name
-                                    .rsplit('.')
-                                    .next()
-                                    .is_some_and(|l| self.module.two_state_signals.contains(l))
-                            {
-                                Value::zero(ew)
+                            // value-only fallback.) The declared type also
+                            // gives a subroutine-local array its default (it
+                            // read a 1-bit x) and the element's signedness,
+                            // so `aa[k] -= 5` on a new `int` key is -5.
+                            if let Some(v) = self.assoc_missing_elem_value(&name) {
+                                v
                             } else {
-                                Value::new(ew)
+                                let ew = self.assoc_elem_width(&name).unwrap_or(1).max(1);
+                                if self.module.two_state_signals.contains(&*name)
+                                    || name
+                                        .rsplit('.')
+                                        .next()
+                                        .is_some_and(|l| self.module.two_state_signals.contains(l))
+                                {
+                                    Value::zero(ew)
+                                } else {
+                                    Value::new(ew)
+                                }
                             }
                         };
                         if self.signed_signals.contains(&elem_name) {
@@ -88633,6 +88659,82 @@ impl Simulator {
             || self.string_signals.contains(base)
     }
 
+    /// The declared INTEGRAL element type of an associative array, from its
+    /// declaration: a module / subroutine-local array's `var_decl_types`
+    /// entry, or the class property for `<handle>#<member>`. `None` for an
+    /// unknown or non-integral element type (string, real, class handle,
+    /// aggregate).
+    fn assoc_elem_decl_type(&self, name: &str) -> Option<&DataType> {
+        // A class collection is `<handle>#<member>`; a renamed subroutine
+        // local (`@h#3`) also carries a `#` but is keyed like a module array.
+        let class_member = name
+            .split_once('#')
+            .and_then(|(h, m)| h.parse::<usize>().ok().map(|h| (h, m)));
+        let dt: &DataType = if let Some((handle, member)) = class_member {
+            let mut cur = self.heap.get(handle)?.as_ref()?.class_name.as_str();
+            let mut found = None;
+            for _ in 0..32 {
+                let cd = self.module.classes.get(cur)?;
+                if let Some(dt) = cd.property_types.get(member) {
+                    found = Some(dt);
+                    break;
+                }
+                cur = cd.extends.as_deref()?;
+            }
+            found?
+        } else {
+            let leaf = name.rsplit('.').next().unwrap_or(name);
+            self.module
+                .var_decl_types
+                .get(name)
+                .or_else(|| self.module.var_decl_types.get(leaf))?
+        };
+        matches!(
+            self.resolve_dt_ref(dt),
+            DataType::IntegerVector { .. } | DataType::IntegerAtom { .. } | DataType::Enum(_)
+        )
+        .then_some(dt)
+    }
+
+    /// Declared signedness of an associative array's integral elements.
+    fn assoc_elem_signed(&self, name: &str) -> Option<bool> {
+        self.assoc_elem_decl_type(name)
+            .map(|dt| super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types))
+    }
+
+    /// §7.8.6: the value a read of a NONEXISTENT associative-array element
+    /// yields — the element type's default, x for a 4-state integral type and
+    /// 0 for a 2-state one, at the element's width and signedness. `None`
+    /// when the element type is unknown or not integral; the caller keeps its
+    /// own fallback.
+    fn assoc_missing_elem_value(&self, name: &str) -> Option<Value> {
+        use crate::ast::types::{IntegerAtomType as IAT, IntegerVectorType as IVT};
+        let dt = self.assoc_elem_decl_type(name)?;
+        let four_state = match self.resolve_dt_ref(dt) {
+            DataType::IntegerVector { kind, .. } => !matches!(kind, IVT::Bit),
+            DataType::IntegerAtom { kind, .. } => matches!(kind, IAT::Integer | IAT::Time),
+            r => !super::elaborate::is_type_two_state_resolved(r, &self.module.typedef_types),
+        };
+        let w = self
+            .assoc_elem_width(name)
+            .or_else(|| self.widths.get(name).copied())
+            .unwrap_or_else(|| {
+                super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+            })
+            .max(1);
+        let mut v = if four_state {
+            Value::new(w)
+        } else {
+            Value::zero(w)
+        };
+        v.is_signed = super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types);
+        Some(v)
+    }
+
     fn assoc_elem_width(&self, name: &str) -> Option<u32> {
         if let Some(&w) = self.module.assoc_elem_widths.get(name) {
             return Some(w);
@@ -88647,7 +88749,15 @@ impl Simulator {
         if let Some((hstr, member)) = name.split_once('#') {
             let handle: usize = match hstr.parse() {
                 Ok(h) => h,
-                Err(_) => return None,
+                // A renamed subroutine-local array (`@h#3`): its declaration
+                // recorded the element width under that unique name.
+                Err(_) => {
+                    return self
+                        .widths
+                        .get(name)
+                        .copied()
+                        .filter(|_| self.is_associative_array(name));
+                }
             };
             if let Some(w) = self.class_prop_width_of(handle, member) {
                 return Some(w);
