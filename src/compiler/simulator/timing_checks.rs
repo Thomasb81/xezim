@@ -116,6 +116,9 @@ enum TcKind {
 pub(super) struct TimingCheckRt {
     kind: TcKind,
     name: String,
+    /// Instance scope and module definition, for SDF matching.
+    scope: String,
+    def_name: String,
     /// Full instance path for the diagnostics.
     path: String,
     loc: Option<String>,
@@ -367,6 +370,8 @@ impl Simulator {
             self.timing_checks.push(TimingCheckRt {
                 kind,
                 name: tc.name.clone(),
+                scope: tc.scope.clone(),
+                def_name: tc.def_name.clone(),
                 path,
                 loc,
                 reference,
@@ -404,6 +409,48 @@ impl Simulator {
             );
         }
         self.has_timing_checks = !self.timing_checks.is_empty();
+        self.apply_sdf_timing_limits();
+    }
+
+    /// SDF TIMINGCHECK back-annotation: replace the limits of the matching
+    /// checks. An entry matches by instance (scope, full path, or `*` with
+    /// the cell type), check kind, port names, edges and `COND` text; one
+    /// without `COND` covers the conditioned checks too.
+    pub(super) fn apply_sdf_timing_limits(&mut self) {
+        let Some(ann) = self.sdf_annotation.as_ref() else {
+            return;
+        };
+        if ann.timing_limits.is_empty() || self.timing_checks.is_empty() {
+            return;
+        }
+        let entries = ann.timing_limits.clone();
+        let (mut applied, mut unmatched) = (0usize, 0usize);
+        for l in &entries {
+            let mut hit = false;
+            for rt in self.timing_checks.iter_mut() {
+                let inst_ok = if l.instance == "*" {
+                    l.cell_type == rt.def_name
+                } else {
+                    l.instance == rt.scope || l.instance == rt.path
+                };
+                if inst_ok && sdf_set_limits(rt, l) {
+                    hit = true;
+                    applied += 1;
+                }
+            }
+            if !hit {
+                unmatched += 1;
+            }
+        }
+        eprintln!(
+            "[SDF] annotated {} timing check(s){}",
+            applied,
+            if unmatched > 0 {
+                format!("; {} TIMINGCHECK entries matched no check", unmatched)
+            } else {
+                String::new()
+            }
+        );
     }
 
     /// A terminal (§31.2 specify_terminal_descriptor): a signal, or a
@@ -977,6 +1024,124 @@ impl Simulator {
         }
         format!("{} fs", fs)
     }
+}
+
+/// Does an SDF TIMINGCHECK port name the terminal (name, edge, `COND`)?
+fn sdf_port_matches(t: &TcTerm, p: &crate::compiler::sdf::SdfTimingPort) -> bool {
+    if terminal_text(&t.text) != p.port {
+        return false;
+    }
+    if let Some(e) = &p.edge {
+        let level = |c: char| match c {
+            '0' => Some(0u8),
+            '1' => Some(1u8),
+            'x' | 'X' | 'z' | 'Z' => Some(2u8),
+            _ => None,
+        };
+        let mask = match e.as_str() {
+            "posedge" => TIMING_POSEDGE,
+            "negedge" => TIMING_NEGEDGE,
+            d => {
+                let mut cs = d.chars();
+                match (cs.next().and_then(level), cs.next().and_then(level)) {
+                    (Some(f), Some(to)) => timing_edge_bit(f, to),
+                    _ => return false,
+                }
+            }
+        };
+        if t.edges != Some(mask) {
+            return false;
+        }
+    }
+    match &p.cond {
+        None => true,
+        Some(c) => {
+            let norm = |s: &str| {
+                let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+                let s = s.replace("1'b", "").replace("1'B", "");
+                let mut s = s.as_str();
+                while s.starts_with('(') && s.ends_with(')') {
+                    s = &s[1..s.len() - 1];
+                }
+                s.to_string()
+            };
+            t.text
+                .split_once("&&&")
+                .is_some_and(|(_, tc)| norm(tc) == norm(c))
+        }
+    }
+}
+
+/// Apply one SDF TIMINGCHECK entry to a check if it matches; SDF orders
+/// SETUP/HOLD/SETUPHOLD ports (data, reference) and the others (reference,
+/// data).
+fn sdf_set_limits(rt: &mut TimingCheckRt, l: &crate::compiler::sdf::SdfTimingLimit) -> bool {
+    let v = |i: usize| l.limits.get(i).copied().flatten();
+    let port = |i: usize| l.ports.get(i);
+    let data_first = matches!(l.kind.as_str(), "SETUP" | "HOLD" | "SETUPHOLD");
+    let (ref_port, data_port) = if data_first {
+        (port(1), port(0))
+    } else {
+        (port(0), port(1))
+    };
+    let Some(ref_port) = ref_port else {
+        return false;
+    };
+    if !sdf_port_matches(&rt.reference, ref_port) {
+        return false;
+    }
+    match (&rt.data, data_port) {
+        (Some(d), Some(p)) if sdf_port_matches(d, p) => {}
+        (None, None) => {}
+        _ => return false,
+    }
+    let name = rt.name.as_str();
+    // (setup-side value, hold-side value) for the window kinds.
+    let (s, h) = match (l.kind.as_str(), name) {
+        ("SETUP", "$setup" | "$setuphold") | ("REMOVAL", "$removal" | "$recrem") => (v(0), None),
+        ("HOLD", "$hold" | "$setuphold") | ("RECOVERY", "$recovery" | "$recrem") => (None, v(0)),
+        ("SETUPHOLD", "$setuphold" | "$setup" | "$hold") => (v(0), v(1)),
+        ("RECREM", "$recrem" | "$recovery" | "$removal") => (v(1), v(0)),
+        ("SKEW", "$skew" | "$timeskew") | ("WIDTH", "$width") | ("PERIOD", "$period") => {
+            let Some(x) = v(0) else { return false };
+            match &mut rt.kind {
+                TcKind::Skew { limit }
+                | TcKind::TimeSkew { limit, .. }
+                | TcKind::Width { limit, .. }
+                | TcKind::Period { limit } => *limit = x,
+                _ => return false,
+            }
+            return true;
+        }
+        ("NOCHANGE", "$nochange") => {
+            if let TcKind::Nochange { start, end } = &mut rt.kind {
+                *start = v(0).unwrap_or(*start);
+                *end = v(1).unwrap_or(*end);
+            }
+            return true;
+        }
+        _ => return false,
+    };
+    let TcKind::Window { setup, hold, .. } = &mut rt.kind else {
+        return false;
+    };
+    // A single-limit check keeps its one side (negative taken as 0).
+    let single = !matches!(name, "$setuphold" | "$recrem");
+    let (has_s, has_h) = match name {
+        "$setup" | "$removal" => (true, false),
+        "$hold" | "$recovery" => (false, true),
+        _ => (true, true),
+    };
+    let mut set = false;
+    if let (Some(x), true) = (s, has_s) {
+        *setup = if single { x.max(0) } else { x };
+        set = true;
+    }
+    if let (Some(x), true) = (h, has_h) {
+        *hold = if single { x.max(0) } else { x };
+        set = true;
+    }
+    set
 }
 
 fn strip_parens(mut e: &Expression) -> &Expression {

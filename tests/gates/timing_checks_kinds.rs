@@ -843,3 +843,194 @@ endmodule
     ];
     check(src, want_v, want_d);
 }
+
+const SDF1: &str = r#"(DELAYFILE
+  (SDFVERSION "3.0")
+  (DESIGN "tb")
+  (TIMESCALE 1ns)
+  (CELL
+    (CELLTYPE "ffc")
+    (INSTANCE u)
+    (TIMINGCHECK
+      (SETUPHOLD D (posedge CK) (3) (2))
+      (SETUP D (negedge CK) (0.7))
+      (WIDTH (posedge CK) (3))
+      (PERIOD (posedge CK) (8))
+      (RECOVERY (posedge RN) (posedge CK) (4))
+    )
+  )
+)
+"#;
+
+const SDF1_SRC: &str = r#"
+`timescale 1ns/1ps
+module ffc(input D, input CK, input RN);
+  reg n = 0;
+  always @(n) $display("%m n=%b at %0.3f", n, $realtime);
+  specify
+    $setuphold(posedge CK, D, 1, 1, n);
+    $setup(D, negedge CK, 1, n);
+    $width(posedge CK, 1, 0, n);
+    $period(posedge CK, 1, n);
+    $recovery(posedge RN, posedge CK, 1, n);
+  endspecify
+endmodule
+module tb;
+  reg d = 0, ck = 0, rn = 0;
+  ffc u(d, ck, rn);
+  initial begin
+    ANNOTATE
+    #10 d = 1; #2 ck = 1;
+    #1.5 d = 0;
+    #1 ck = 0;
+    #5 ck = 1;
+    #1 rn = 1; #2 ck = 0; #1 ck = 1;
+    #1 d = 1; #0.5 ck = 0;
+    #5 $finish;
+  end
+endmodule
+"#;
+
+/// SDF TIMINGCHECK back-annotation replaces the specify limits (all 1 ns
+/// here, which nothing violates): SETUPHOLD splits into the setup and hold
+/// sides, an edge-qualified SETUP picks the negedge check, and WIDTH,
+/// PERIOD and RECOVERY set their checks — through `$sdf_annotate` and
+/// through `--sdf`. The reference simulator reports the same nine
+/// violations and notifier values from the same files.
+#[test]
+fn sdf_timingcheck_back_annotation() {
+    let dir = std::env::temp_dir().join(format!("xezim_tchk_sdf_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sdf = dir.join("t.sdf");
+    std::fs::write(&sdf, SDF1).unwrap();
+    let want_v: &[&str] = &[
+        "$hold( posedge CK:12 ns, D:13500 ps, 2 ns ) violation in tb.u at time 13500 ps",
+        "$hold( posedge CK:23500 ps, D:24500 ps, 2 ns ) violation in tb.u at time 24500 ps",
+        "$period( posedge CK:12 ns, posedge CK:19500 ps, 8 ns ) violation in tb.u at time 19500 ps",
+        "$period( posedge CK:19500 ps, posedge CK:23500 ps, 8 ns ) violation in tb.u \
+         at time 23500 ps",
+        "$recovery( posedge RN:20500 ps, posedge CK:23500 ps, 4 ns ) violation in tb.u \
+         at time 23500 ps",
+        "$setup( D:10 ns, posedge CK:12 ns, 3 ns ) violation in tb.u at time 12 ns",
+        "$setup( D:24500 ps, negedge CK:25 ns, 700 ps ) violation in tb.u at time 25 ns",
+        "$width( posedge CK:12 ns, negedge CK:14500 ps, 3 ns ) violation in tb.u at time 14500 ps",
+        "$width( posedge CK:23500 ps, negedge CK:25 ns, 3 ns ) violation in tb.u at time 25 ns",
+    ];
+    let want_d: &[&str] = &[
+        "tb.u n=0 at 13.500",
+        "tb.u n=0 at 19.500",
+        "tb.u n=0 at 24.500",
+        "tb.u n=1 at 12.000",
+        "tb.u n=1 at 14.500",
+        "tb.u n=1 at 23.500",
+        "tb.u n=1 at 25.000",
+    ];
+    let src = SDF1_SRC.replace(
+        "ANNOTATE",
+        &format!("$sdf_annotate(\"{}\");", sdf.display()),
+    );
+    check(&src, want_v, want_d);
+
+    let sv = dir.join("t.sv");
+    std::fs::write(&sv, SDF1_SRC.replace("ANNOTATE", "")).unwrap();
+    let mut bin = std::env::current_exe().unwrap();
+    bin.pop();
+    if bin.ends_with("deps") {
+        bin.pop();
+    }
+    let out = std::process::Command::new(bin.join("xezim"))
+        .arg("--sdf")
+        .arg(&sdf)
+        .arg(&sv)
+        .output()
+        .expect("run xezim");
+    let text = String::from_utf8_lossy(&out.stdout);
+    for want in want_v {
+        assert!(text.contains(want), "--sdf: missing `{want}`:\n{text}");
+    }
+    assert_eq!(
+        text.matches(" violation in ").count(),
+        want_v.len(),
+        "--sdf:\n{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SDF `INSTANCE *` annotates every instance of the cell type, a `COND`
+/// entry only the check with that condition (`SE==0` names `SE == 1'b0`,
+/// not `SE == 1'b1`), and RECREM sets both sides of `$recrem`
+/// (cross-checked against the reference simulator).
+#[test]
+fn sdf_timingcheck_wildcard_cond_recrem() {
+    let dir = std::env::temp_dir().join(format!("xezim_tchk_sdf2_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sdf = dir.join("t.sdf");
+    std::fs::write(
+        &sdf,
+        r#"(DELAYFILE
+  (SDFVERSION "3.0")
+  (DESIGN "tb")
+  (TIMESCALE 1ns)
+  (CELL
+    (CELLTYPE "ffc2")
+    (INSTANCE *)
+    (TIMINGCHECK
+      (SETUP D (COND SE==0 (posedge CK)) (3))
+      (RECREM (posedge RN) (posedge CK) (4) (2))
+    )
+  )
+)
+"#,
+    )
+    .unwrap();
+    let src = r#"
+`timescale 1ns/1ps
+module ffc2(input D, input CK, input SE, input RN);
+  reg n = 0;
+  always @(n) $display("%m n=%b at %0.3f", n, $realtime);
+  specify
+    $setup(D, posedge CK &&& (SE == 1'b0), 1, n);
+    $setup(D, posedge CK &&& (SE == 1'b1), 1, n);
+    $recrem(posedge RN, posedge CK, 1, 1, n);
+  endspecify
+endmodule
+module tb;
+  reg d = 0, ck = 0, se = 0, rn = 0;
+  ffc2 u1(d, ck, se, rn);
+  ffc2 u2(d, ck, se, rn);
+  initial begin
+    $sdf_annotate("SDF_PATH");
+    #10 d = 1; #2 ck = 1;        // SE=0: setup 2 < 3 (SDF)
+    #3 ck = 0;
+    #2 se = 1;
+    #3 d = 0; #2 ck = 1;         // SE=1: setup 2 >= 1 (not annotated)
+    #3 ck = 0;
+    #5 rn = 1; #3 ck = 1;        // recovery 3 < 4
+    #1 rn = 0; #1 ck = 0;
+    #5 ck = 1; #1 rn = 1;        // removal 1 < 2
+    #5 $finish;
+  end
+endmodule
+"#
+    .replace("SDF_PATH", &sdf.display().to_string());
+    let want_v: &[&str] = &[
+        "$recovery( posedge RN:30 ns, posedge CK:33 ns, 4 ns ) violation in tb.u1 at time 33 ns",
+        "$recovery( posedge RN:30 ns, posedge CK:33 ns, 4 ns ) violation in tb.u2 at time 33 ns",
+        "$removal( posedge CK:40 ns, posedge RN:41 ns, 2 ns ) violation in tb.u1 at time 41 ns",
+        "$removal( posedge CK:40 ns, posedge RN:41 ns, 2 ns ) violation in tb.u2 at time 41 ns",
+        "$setup( D:10 ns, posedge CK &&& (SE == 1'b0):12 ns, 3 ns ) violation in tb.u1 \
+         at time 12 ns",
+        "$setup( D:10 ns, posedge CK &&& (SE == 1'b0):12 ns, 3 ns ) violation in tb.u2 \
+         at time 12 ns",
+    ];
+    let want_d: &[&str] = &[
+        "tb.u1 n=0 at 33.000",
+        "tb.u1 n=1 at 12.000",
+        "tb.u1 n=1 at 41.000",
+        "tb.u2 n=0 at 33.000",
+        "tb.u2 n=1 at 12.000",
+        "tb.u2 n=1 at 41.000",
+    ];
+    check(&src, want_v, want_d);
+    let _ = std::fs::remove_dir_all(&dir);
+}

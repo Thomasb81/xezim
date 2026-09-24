@@ -76613,6 +76613,7 @@ impl Simulator {
         }
         self.sdf_annotation = Some(ann);
         eprintln!("[SDF] annotated {} signals with delays", count);
+        self.apply_sdf_timing_limits();
         for e in self.comb_entries.iter_mut() {
             if let CombItem::FastDirectCopy { dst_id, src_id } = e.item {
                 if self.sdf_delays.get(dst_id).copied().unwrap_or(0) > 0 {

@@ -310,7 +310,7 @@ Common options:
 | `--max-time <N>[ps\|ns\|us\|ms\|s]` | Stop simulation after `N` of simulated time — **nanoseconds** when no unit is given. The cap is resolved to whole nanoseconds (a sub-ns value rounds to the nearest one; below half a nanosecond is rejected) and then converted to the design's tick, so the same `--max-time` covers the same simulated time whatever the precision |
 | `+trace`, `+<plusarg>` | Passed through to `$value$plusargs` / `$test$plusargs` |
 | `+seed=<n>` | Seed the RNG for a reproducible run (same seed ⇒ byte-identical output; affects e.g. the number of packets a random UVM test collects) |
-| `--sdf <file>` `--sdf-{min,typ,max}` | Annotate standard delays |
+| `--sdf <file>` `--sdf-{min,typ,max}` | Annotate SDF delays (IOPATH/INTERCONNECT) and TIMINGCHECK limits |
 | `--sim-debug` | Print `[DEBUG]` / `[OPT]` diagnostics (`--sim_debug` still accepted); implies `--verbose`'s engine lines |
 | `--verbose` | Internal engine lines, off by default: the version banner, `[PHASE]` timings, the end-of-run engine counters (`[PROF]`/`[FUSE]`/`[EVENT-EDGE]`/`[COV]`), compile-time notes such as `[EDGE-MERGE]` and `[CACHE]` hits, and `--compile`'s design summary; plus per-file compile progress (each file as it is parsed, and the modules/blocks it contributed). Same as `XEZIM_VERBOSE=1` |
 | `--dump-files-list` | Print the fully resolved file list after `-f` expansion, then exit — confirms *which* sources a build actually reads |
