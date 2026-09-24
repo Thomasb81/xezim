@@ -39,6 +39,8 @@ mod packed_member_nba_compiles;
 mod packed_member_nesting_compiles;
 #[path = "gates/specify_flags.rs"]
 mod specify_flags;
+#[path = "gates/specify_path_delays.rs"]
+mod specify_path_delays;
 #[path = "gates/streaming_op_compiles.rs"]
 mod streaming_op_compiles;
 #[path = "gates/timing_checks_kinds.rs"]

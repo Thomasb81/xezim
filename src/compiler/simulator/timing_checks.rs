@@ -87,6 +87,9 @@ pub(super) struct TcWatch {
     any: Vec<(u32, u8)>,
     /// Bit-select terminals: (bit, edge mask, check, role).
     bits: Vec<(u32, Option<u16>, u32, u8)>,
+    /// §30.4 module path inputs (`Simulator::path_srcs`) whose last-change
+    /// time this watch stamps.
+    path_srcs: Vec<u32>,
 }
 
 /// Level (0, 1, 2 = x/z) of bit `b` of raw planes.
@@ -448,6 +451,23 @@ impl Simulator {
                 }),
             });
         }
+        let shown = warnings.len().min(20);
+        for w in &warnings[..shown] {
+            eprintln!("Warning: {}", w);
+        }
+        if warnings.len() > shown {
+            eprintln!(
+                "Warning: {} more timing check warnings",
+                warnings.len() - shown
+            );
+        }
+        self.apply_sdf_timing_limits();
+    }
+
+    /// One comb entry per watched signal — timing-check terminals and
+    /// §30.4 module path inputs alike. Watches keep state, so they force
+    /// the serial settle.
+    pub(super) fn push_timing_watch_entries(&mut self, entries: &mut Vec<CombEntry>) {
         for (w, watch) in self.timing_watches.iter().enumerate() {
             entries.push(CombEntry {
                 item: CombItem::TimingCheck { idx: w },
@@ -461,18 +481,35 @@ impl Simulator {
                 defer_at_time0: false,
             });
         }
-        let shown = warnings.len().min(20);
-        for w in &warnings[..shown] {
-            eprintln!("Warning: {}", w);
+        self.has_timing_checks = !self.timing_watches.is_empty();
+    }
+
+    /// A watch that stamps the last-change time of module path input `slot`.
+    pub(super) fn path_source_watch(&mut self, sig: usize, slot: u32) -> usize {
+        let cur = &self.signal_table[sig];
+        let (prev_v, prev_x) = cur.raw_bits();
+        let wide = (self.signal_widths[sig] > 64).then(|| cur.clone());
+        self.timing_watches.push(TcWatch {
+            sig,
+            prev_v,
+            prev_x,
+            wide,
+            by_tr: Default::default(),
+            any: Vec::new(),
+            bits: Vec::new(),
+            path_srcs: vec![slot],
+        });
+        self.timing_watches.len() - 1
+    }
+
+    /// Has watch `w`'s signal changed since the watch last ran? (Its entry
+    /// has not been evaluated yet in the current settle.)
+    pub(super) fn timing_watch_stale(&self, w: usize, sig: usize) -> bool {
+        let watch = &self.timing_watches[w];
+        match &watch.wide {
+            Some(old) => *old != self.signal_table[sig],
+            None => self.signal_table[sig].raw_bits() != (watch.prev_v, watch.prev_x),
         }
-        if warnings.len() > shown {
-            eprintln!(
-                "Warning: {} more timing check warnings",
-                warnings.len() - shown
-            );
-        }
-        self.has_timing_checks = !self.timing_checks.is_empty();
-        self.apply_sdf_timing_limits();
     }
 
     /// SDF TIMINGCHECK back-annotation: replace the limits of the matching
@@ -564,6 +601,7 @@ impl Simulator {
                     by_tr: Default::default(),
                     any: Vec::new(),
                     bits: Vec::new(),
+                    path_srcs: Vec::new(),
                 });
                 watch_of.insert(t.sig, self.timing_watches.len() - 1);
                 self.timing_watches.len() - 1
@@ -632,6 +670,10 @@ impl Simulator {
             }
             self.timing_watches[w].prev_v = cv;
             self.timing_watches[w].prev_x = cx;
+        }
+        for k in 0..self.timing_watches[w].path_srcs.len() {
+            let slot = self.timing_watches[w].path_srcs[k] as usize;
+            self.path_srcs[slot].last = self.time;
         }
         if self.time == 0 {
             return;
