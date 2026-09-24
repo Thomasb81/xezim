@@ -4663,6 +4663,9 @@ pub struct Simulator {
     pending_observed: Vec<ObservedProbe>,
     /// §16.4 deferred immediate assertion reports awaiting maturity.
     deferred_asserts: Vec<DeferredReport>,
+    /// `typedef_layout_member`'s unpacked-struct typedef layouts by total
+    /// width; dropped when a block-local typedef is registered.
+    typedef_layouts_by_width: Option<HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>>>,
     /// LRM §16.5 SVA clocked-assertion sites. Populated lazily on
     /// the first time the AssertionStatement{is_property,
     /// expr:SvaClocked} executes. Each site's `prev_clock` lets us
@@ -9433,6 +9436,7 @@ impl Simulator {
             pending_strobes: Vec::new(),
             pending_observed: Vec::new(),
             deferred_asserts: Vec::new(),
+            typedef_layouts_by_width: None,
             sva_sites: Vec::new(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
@@ -12822,6 +12826,34 @@ impl Simulator {
     /// for each member. Walks members in reverse (last member at LSB, matching SV packing).
     /// Returns `(field_name, bit_offset, width, is_real)` per member.
     /// Last member at LSB (matches SV packing).
+    /// The first unpacked-struct typedef (in `typedef_types` order) that
+    /// is `width` bits wide and has `member`: its (offset, width, is_real).
+    /// The layouts are built once — resolving every typedef on each lookup
+    /// cost a constraint solver's search seconds per randomize call.
+    fn typedef_layout_member(&mut self, width: u32, member: &str) -> Option<(u32, u32, bool)> {
+        if self.typedef_layouts_by_width.is_none() {
+            let mut by_w: HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>> = HashMap::default();
+            for td in self.module.typedef_types.values() {
+                let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
+                if let Some(fields) = Self::struct_field_layout(&resolved) {
+                    let total: u32 = fields.iter().map(|f| f.2).sum();
+                    by_w.entry(total).or_default().push(fields);
+                }
+            }
+            self.typedef_layouts_by_width = Some(by_w);
+        }
+        self.typedef_layouts_by_width
+            .as_ref()?
+            .get(&width)?
+            .iter()
+            .find_map(|fields| {
+                fields
+                    .iter()
+                    .find(|(m, ..)| m == member)
+                    .map(|&(_, off, w, fr)| (off, w, fr))
+            })
+    }
+
     fn struct_field_layout(dt: &DataType) -> Option<Vec<(String, u32, u32, bool)>> {
         let su = match dt {
             DataType::Struct(su) if !su.packed => su,
@@ -64508,25 +64540,14 @@ impl Simulator {
                 let is_heap_obj =
                     base_h != 0 && base_h < self.heap.len() && self.heap[base_h].is_some();
                 if !is_heap_obj {
-                    for td in self.module.typedef_types.values() {
-                        let resolved = Self::resolve_type_ref(td, &self.module.typedef_types);
-                        if let Some(fields) = Self::struct_field_layout(&resolved) {
-                            let total_w: u32 = fields.iter().map(|(_, _, w, _)| w).sum();
-                            if total_w == base_val.width {
-                                if let Some((_, off, w, fr)) = fields
-                                    .iter()
-                                    .find(|(m, _, _, _)| m == &member.name)
-                                    .cloned()
-                                {
-                                    let mut v =
-                                        base_val.range_select((off + w - 1) as usize, off as usize);
-                                    if fr {
-                                        v.is_real = true;
-                                    }
-                                    return v;
-                                }
-                            }
+                    if let Some((off, w, fr)) =
+                        self.typedef_layout_member(base_val.width, &member.name)
+                    {
+                        let mut v = base_val.range_select((off + w - 1) as usize, off as usize);
+                        if fr {
+                            v.is_real = true;
                         }
+                        return v;
                     }
                 }
             }
@@ -75868,6 +75889,7 @@ impl Simulator {
                 self.module
                     .typedef_types
                     .insert(td.name.name.clone(), td.data_type.clone());
+                self.typedef_layouts_by_width = None;
                 if !td.dimensions.is_empty() {
                     self.module
                         .typedef_unpacked_dims
