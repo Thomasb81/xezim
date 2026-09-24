@@ -45688,6 +45688,14 @@ impl Simulator {
         }
     }
 
+    /// A blocking assignment's rvalue carries an intra-assignment delay or
+    /// event control (the pre-parse markers), so executing it suspends.
+    fn intra_timing_suspends(rvalue: &Expression) -> bool {
+        Self::intra_delay_marker(rvalue).is_some()
+            || matches!(&rvalue.kind, ExprKind::SystemCall { name, args }
+                if name == crate::intra_delay::INTRA_EVENT_MARKER && args.len() == 4)
+    }
+
     fn intra_delay_marker(rvalue: &Expression) -> Option<(&Expression, &Expression)> {
         match &rvalue.kind {
             ExprKind::SystemCall { name, args }
@@ -48404,10 +48412,9 @@ impl Simulator {
                 control: TimingControl::Delay(_),
                 ..
             } => true,
-            // §9.4.5 intra-assignment delay suspends like a `#d` statement.
-            StatementKind::BlockingAssign { rvalue, .. } => {
-                Self::intra_delay_marker(rvalue).is_some()
-            }
+            // §9.4.5 intra-assignment delay / event control suspends like a
+            // `#d` / `@(e)` statement.
+            StatementKind::BlockingAssign { rvalue, .. } => Self::intra_timing_suspends(rvalue),
             StatementKind::SeqBlock { stmts, .. } => {
                 stmts.iter().any(|s| self.stmt_has_event_wait(s))
             }
@@ -48452,10 +48459,10 @@ impl Simulator {
             StatementKind::RandCase { items } => {
                 items.iter().any(|(_, s)| self.stmt_is_blocking(s))
             }
-            // §9.4.5 intra-assignment delay suspends the process for `#d`.
-            StatementKind::BlockingAssign { rvalue, .. } => {
-                Self::intra_delay_marker(rvalue).is_some()
-            }
+            // §9.4.5 intra-assignment delay / event control suspends the
+            // process. Missing the event form ran `always v = @(e) x;` as a
+            // plain statement: no wait, and the marker call evaluated to 0.
+            StatementKind::BlockingAssign { rvalue, .. } => Self::intra_timing_suspends(rvalue),
             StatementKind::SeqBlock { stmts, .. } => stmts.iter().any(|s| self.stmt_is_blocking(s)),
             StatementKind::If {
                 then_stmt,

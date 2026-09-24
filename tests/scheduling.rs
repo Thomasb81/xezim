@@ -103,6 +103,8 @@ mod gap_fixes_scoping_and_nba;
 mod gate_rise_fall_delay;
 #[path = "scheduling/intra_assignment_delay.rs"]
 mod intra_assignment_delay;
+#[path = "scheduling/intra_assignment_event_identifier.rs"]
+mod intra_assignment_event_identifier;
 #[path = "scheduling/ivtest_always_cluster.rs"]
 mod ivtest_always_cluster;
 #[path = "scheduling/local_arrays_and_edge_always.rs"]
