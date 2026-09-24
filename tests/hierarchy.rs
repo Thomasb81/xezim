@@ -75,6 +75,8 @@ mod local_method_static_binding;
 mod module_timescale_cli;
 #[path = "hierarchy/multi_instance_scope.rs"]
 mod multi_instance_scope;
+#[path = "hierarchy/multi_top_paths.rs"]
+mod multi_top_paths;
 #[path = "hierarchy/multiple_top_modules.rs"]
 mod multiple_top_modules;
 #[path = "hierarchy/nested_cross_module_call.rs"]

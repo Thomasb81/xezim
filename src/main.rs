@@ -2860,7 +2860,8 @@ suppressed but the explicit SDF annotation still applies."
     // Appended after the real sources so the instantiated modules are already
     // declared; the wrapper has no macros/includes, so preprocessing is a no-op.
     if top_modules.len() > 1 {
-        let wrap_name = "__xz_multitop__";
+        // The core's own multi-top root name, so every printed path drops it.
+        let wrap_name = xezim_core::MULTI_TOP_WRAPPER;
         let mut body = format!("module {wrap_name};\n");
         // Instance name = module name (legal — separate namespaces), so each
         // top keeps its identity in hierarchical paths: `tb.u_m.u_i` from a

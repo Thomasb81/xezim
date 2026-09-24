@@ -234,11 +234,7 @@ impl Simulator {
         for tc in checks {
             let arg = |i: usize| tc.args.get(i).and_then(|a| a.as_ref());
             let konst = |i: usize| tc.consts.get(i).copied().flatten();
-            let path = if tc.scope.is_empty() {
-                self.module.name.clone()
-            } else {
-                format!("{}.{}", self.module.name, tc.scope)
-            };
+            let path = self.hier_path(&tc.scope);
             let loc = self.span_file_line_in(
                 tc.span,
                 self.module.src_file_of_module.get(&tc.def_name).copied(),

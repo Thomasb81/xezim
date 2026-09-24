@@ -40552,10 +40552,8 @@ impl Simulator {
                     .stall_pid_def_module(pid)
                     .filter(|m| *m != self.module.name);
                 match def_mod {
-                    Some(m) => {
-                        line.push_str(&format!(" ({}.{}, module {})", self.module.name, s, m))
-                    }
-                    None => line.push_str(&format!(" ({}.{})", self.module.name, s)),
+                    Some(m) => line.push_str(&format!(" ({}, module {})", self.hier_path(&s), m)),
+                    None => line.push_str(&format!(" ({})", self.hier_path(&s))),
                 }
             }
             _ => line.push_str(&format!(" ({})", self.module.name)),
@@ -77159,7 +77157,7 @@ impl Simulator {
                             .map(|i| i.def_name.clone())
                         {
                             let ts = self.reported_timescale_exp(&def);
-                            found = Some((ts.0, ts.1, format!("{}.{}", self.module.name, cand)));
+                            found = Some((ts.0, ts.1, self.hier_path(&cand)));
                             break;
                         }
                     }
@@ -77168,17 +77166,15 @@ impl Simulator {
                         None => {
                             let def = self.current_module_def().to_string();
                             let (u, p) = self.reported_timescale_exp(&def);
-                            (u, p, format!("{}.{}", self.module.name, rel))
+                            (u, p, self.hier_path(rel))
                         }
                     }
                 } else {
                     let def = self.current_module_def().to_string();
                     let (u, p) = self.reported_timescale_exp(&def);
                     let scope = match self.process_scope_hint.get(&self.current_pid) {
-                        Some(s) if !s.is_empty() => {
-                            format!("{}.{}", self.module.name, s)
-                        }
-                        _ => self.module.name.clone(),
+                        Some(s) => self.hier_path(s),
+                        None => self.module.name.clone(),
                     };
                     (u, p, scope)
                 };
@@ -77844,8 +77840,8 @@ impl Simulator {
     /// Mirrors the resolution used by `$printtimescale`.
     fn severity_scope(&self) -> String {
         match self.process_scope_hint.get(&self.current_pid) {
-            Some(s) if !s.is_empty() => format!("{}.{}", self.module.name, s),
-            _ => self.module.name.clone(),
+            Some(s) => self.hier_path(s),
+            None => self.module.name.clone(),
         }
     }
 
@@ -79406,12 +79402,15 @@ impl Simulator {
                                             .last()
                                             .map(|(n, _)| n.clone())
                                             .unwrap_or_default();
-                                        let mut out = self.module.name.clone();
-                                        if !creation.is_empty() {
-                                            out.push('.');
-                                            out.push_str(&creation);
-                                        }
-                                        out.push('.');
+                                        // Built outside every top (a package
+                                        // static): no instance under the
+                                        // multi-top wrapper to name.
+                                        let mut out =
+                                            if creation.is_empty() && self.root_is_multi_top() {
+                                                String::new()
+                                            } else {
+                                                self.hier_path(&creation) + "."
+                                            };
                                         out.push_str(cname);
                                         if !method.is_empty() {
                                             out.push('.');
@@ -79438,7 +79437,7 @@ impl Simulator {
                                     // §21.2.1.7: instance path, then the lexical
                                     // scope chain (task / function / named block)
                                     // the `%m` sits in — e.g. `top.u_leaf.t_auto`.
-                                    let mut out = format!("{}.{}", self.module.name, inst_scope);
+                                    let mut out = self.hier_path(inst_scope);
                                     // The process's own flattened block label sits
                                     // between the instance and any nested scopes.
                                     // Skipped inside a subroutine, which replaces
@@ -81269,6 +81268,25 @@ impl Simulator {
     fn is_monitor_time_arg(e: &Expression) -> bool {
         matches!(&e.kind, ExprKind::SystemCall { name, .. }
             if matches!(name.as_str(), "$time" | "$stime" | "$realtime"))
+    }
+
+    /// The design root is the synthetic multi-top wrapper (§23.3.3): its
+    /// children are the real tops, and it never appears in a printed path.
+    pub fn root_is_multi_top(&self) -> bool {
+        self.module.name == xezim_core::MULTI_TOP_WRAPPER
+    }
+
+    /// Printed hierarchical path of an instance scope in signal-key form
+    /// (`u_a.u_b`; empty = the root): `<top>.u_a.u_b`. Under the multi-top
+    /// wrapper the scope already starts with its own top.
+    pub fn hier_path(&self, scope: &str) -> String {
+        if scope.is_empty() {
+            self.module.name.clone()
+        } else if self.root_is_multi_top() {
+            scope.to_string()
+        } else {
+            format!("{}.{}", self.module.name, scope)
+        }
     }
 
     /// The instance scope currently executing — the same precedence `%m` uses:
@@ -86873,16 +86891,29 @@ impl Simulator {
             let _ = writeln!(w, "$upscope $end");
         }
 
-        // Use actual top module name
-        let top_name = self.module.name.clone();
-        let _ = writeln!(hdr, "$scope module {} $end", top_name);
-        for v in &root.signals {
-            emit_var(&mut hdr, v);
+        if self.root_is_multi_top() {
+            // Each top is a root scope of its own, as it is standing alone;
+            // package and compilation-unit variables go under `$unit`.
+            if !root.signals.is_empty() {
+                let _ = writeln!(hdr, "$scope module $unit $end");
+                for v in &root.signals {
+                    emit_var(&mut hdr, v);
+                }
+                let _ = writeln!(hdr, "$upscope $end");
+            }
+            for (child_name, child_node) in &root.children {
+                emit_scope(&mut hdr, child_name, child_node);
+            }
+        } else {
+            let _ = writeln!(hdr, "$scope module {} $end", self.module.name);
+            for v in &root.signals {
+                emit_var(&mut hdr, v);
+            }
+            for (child_name, child_node) in &root.children {
+                emit_scope(&mut hdr, child_name, child_node);
+            }
+            let _ = writeln!(hdr, "$upscope $end");
         }
-        for (child_name, child_node) in &root.children {
-            emit_scope(&mut hdr, child_name, child_node);
-        }
-        let _ = writeln!(hdr, "$upscope $end");
         let _ = writeln!(hdr, "$enddefinitions $end");
 
         // Build the compact per-cycle trace table: (signal_table index, code).
@@ -88144,10 +88175,17 @@ impl Simulator {
         // Module hierarchy (M records): top module is m0; sub-scopes are
         // discovered from dotted signal names in the SAME pass that assigns
         // signal IDs below — each signal's parent path is built exactly once.
-        let top_name = &self.module.name;
+        // Under the multi-top wrapper each top is a root path of its own and
+        // m0 holds only package / compilation-unit signals.
+        let multi_top = self.root_is_multi_top();
+        let top_name: &str = if multi_top { "" } else { &self.module.name };
         let mut modules: Vec<(String, String)> = Vec::new();
         let mut module_map: HashMap<String, String> = HashMap::default();
-        let top_path = format!("/{}", top_name);
+        let top_path = if multi_top {
+            "/$unit".to_string()
+        } else {
+            format!("/{}", top_name)
+        };
         modules.push(("m0".to_string(), top_path.clone()));
         module_map.insert(top_path.clone(), "m0".to_string());
 
@@ -88207,7 +88245,11 @@ impl Simulator {
             // deepest path component is this signal's module.
             let parts: Vec<&str> = name.split('.').collect();
             let (mod_id, leaf) = if parts.len() > 1 {
-                let mut path = format!("/{}", top_name);
+                let mut path = if multi_top {
+                    String::new()
+                } else {
+                    format!("/{}", top_name)
+                };
                 let mut mid = "m0".to_string();
                 for part in &parts[..parts.len() - 1] {
                     path.push('/');
@@ -88790,8 +88832,22 @@ impl Simulator {
             }
             let _ = header.up_scope();
         }
-        let top_name = self.module.name.clone();
-        emit(&mut header, &top_name, &root, &mut trace, &mut id_to_fst);
+        if self.root_is_multi_top() {
+            // One root scope per top, as in the VCD header.
+            if !root.signals.is_empty() {
+                let unit = FstNode {
+                    children: BTreeMap::new(),
+                    signals: std::mem::take(&mut root.signals),
+                };
+                emit(&mut header, "$unit", &unit, &mut trace, &mut id_to_fst);
+            }
+            for (child_name, child) in &root.children {
+                emit(&mut header, child_name, child, &mut trace, &mut id_to_fst);
+            }
+        } else {
+            let top_name = self.module.name.clone();
+            emit(&mut header, &top_name, &root, &mut trace, &mut id_to_fst);
+        }
 
         let mut body = match header.finish() {
             Ok(b) => b,
@@ -95387,7 +95443,12 @@ impl Simulator {
     fn dump_module_timescales(&self) {
         // Every module definition reachable in the design: the top plus every
         // instantiated def_name (deduplicated, sorted for stable output).
-        let mut defs: Vec<String> = vec![self.module.name.clone()];
+        // The multi-top wrapper is not a module of the design.
+        let mut defs: Vec<String> = if self.root_is_multi_top() {
+            Vec::new()
+        } else {
+            vec![self.module.name.clone()]
+        };
         let mut seen: std::collections::HashSet<String> =
             std::iter::once(self.module.name.clone()).collect();
         for inst in &self.module.instances {
@@ -128924,11 +128985,7 @@ fn new_vpi_handle(sim: &Simulator, name: &str, id: usize) -> *mut libc::c_void {
 /// Prefix a design-relative name with the top module, the way
 /// `vpi_get_str(vpiFullName, ..)` must report it.
 fn vpi_full_name(sim: &Simulator, name: &str) -> String {
-    if name.is_empty() {
-        sim.module.name.clone()
-    } else {
-        format!("{}.{}", sim.module.name, name)
-    }
+    sim.hier_path(name)
 }
 
 /// Strip a leading `<top>.` from a hierarchical name. Signal-table names
@@ -129216,7 +129273,9 @@ pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mu
                     return std::ptr::null_mut(); // the top has no parent
                 }
                 let parent = sim.module.instances[h.inst_idx as usize].parent.clone();
-                if parent.is_empty() {
+                if parent.is_empty() && sim.root_is_multi_top() {
+                    std::ptr::null_mut() // a top under the multi-top wrapper
+                } else if parent.is_empty() {
                     vpi_module_handle(sim, -1)
                 } else {
                     match sim.module.instances.iter().position(|i| i.path == parent) {
@@ -129314,9 +129373,21 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
         let scope_path = match scope_h {
             None => {
                 if type_ == vpi::MODULE || type_ == vpi::INSTANCE {
-                    let items = vec![unsafe {
-                        *Box::from_raw(vpi_module_handle(sim, -1) as *mut VpiHandle)
-                    }];
+                    // Under the multi-top wrapper the tops are its children.
+                    let tops: Vec<isize> = if sim.root_is_multi_top() {
+                        (0..sim.module.instances.len())
+                            .filter(|&i| sim.module.instances[i].parent.is_empty())
+                            .map(|i| i as isize)
+                            .collect()
+                    } else {
+                        vec![-1]
+                    };
+                    let items = tops
+                        .into_iter()
+                        .map(|i| unsafe {
+                            *Box::from_raw(vpi_module_handle(sim, i) as *mut VpiHandle)
+                        })
+                        .collect();
                     return vpi_make_iterator(items);
                 }
                 return std::ptr::null_mut();
