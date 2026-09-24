@@ -53,6 +53,14 @@ Current capabilities include:
   testbenches pass. Multiple top
   modules (`-s hdl_top -s hvl_top`) and virtual-interface `config_db` are supported.
   See [docs/uvm-guide.md](docs/uvm-guide.md).
+* **UVM's DPI-C library, built in** — compile UVM without `-DUVM_NO_DPI` and its
+  regex matching (config_db / resource_db wildcards and `/regex/` scopes,
+  `+uvm_set_*` plusargs, factory overrides by path), command-line processing and
+  `uvm_hdl_*` backdoor access (read / deposit / force / release by full path,
+  including bit- and part-selects, memory words and packed-struct members) run
+  natively, with the C code's semantics and `UVM/DPI/*` error reports. A
+  `--dpi-lib` library defining the same symbols takes precedence. See
+  [docs/uvm-guide.md](docs/uvm-guide.md#uvms-dpi-c-library).
 * UVM 1.2 runtime support, also demonstrated by running the `riscv-dv` instruction
   generator end-to-end (random RV32IMC programs that assemble cleanly with
   `riscv64-unknown-elf-as -march=rv32imc_zicsr_zifencei`)

@@ -26,7 +26,9 @@ xezim --simulate -s top \
 ```
 
 - `-I <UVM>/src` makes `` `include "uvm_macros.svh" `` resolve.
-- `-D UVM_NO_DPI` — xezim services UVM reporting/cmdline directly instead of via DPI.
+- `-D UVM_NO_DPI` is optional. Without it UVM imports its DPI-C helpers (regex
+  matching, the command-line walk, `uvm_hdl_*` backdoor access) and xezim serves them
+  from a built-in library — see [UVM's DPI-C library](#uvms-dpi-c-library).
 - `+UVM_TESTNAME=<name>` selects the test; it overrides the `run_test("...")` argument.
 
 ### Worked example — GettingVerilatorStartedWithUVM
@@ -101,6 +103,38 @@ For UVM extensions that need their own DPI-C (e.g. a custom HDL backdoor, a coco
 bridge, or an ISS shim), see [`dpi-guide.md`](dpi-guide.md) — the same `--dpi-lib`
 mechanism works for UVM-side code as for plain SV testbenches.
 
+### UVM's DPI-C library
+
+Compiled without `-D UVM_NO_DPI`, UVM imports the C functions of its `src/dpi`
+directory. xezim implements them natively; a `--dpi-lib` library that defines one of
+the symbols takes precedence.
+
+- **Regular expressions** (`uvm_re_match`, `uvm_glob_to_re`, `uvm_dpi_regcomp` /
+  `regexec` / `regfree`, `uvm_dump_re_cache`) — POSIX extended syntax, as UVM's C code
+  gets from the C library. This is what `uvm_config_db` / `uvm_resource_db` wildcard and
+  `/regex/` scopes, `+uvm_set_config_*` / `+uvm_set_*_override` plusargs, factory
+  overrides by instance path, and `uvm_cmdline_processor::get_arg_matches("/.../")`
+  use. `uvm_glob_to_re` converts globs exactly as the C code does (`*` → `.*`,
+  `+` → `.+`, `?` → `.`, `.[]()` escaped, anchored, `/.../` passed through); an empty
+  glob gives `""` on UVM 1.2 and `/^$/` on 1800.2, following the library you compile.
+- **Command line** — `uvm_cmdline_processor` sees `xezim` followed by every plusarg in
+  command-line order (the same list `$test$plusargs` searches); `get_tool_name()`
+  returns `xezim` and `get_tool_version()` its version.
+- **Backdoor access** (`uvm_hdl_check_path` / `read` / `deposit` / `force` /
+  `release` / `release_and_read`) — paths are absolute, as the register layer builds
+  them: `top.u_dut.r_ctrl`, optionally prefixed with `$root.`; with several top modules
+  each top names its own tree. A path may end in a bit-select (`sig[3]`), a part-select
+  in the declared direction (`sig[7:4]`, `asc[0:3]`), a memory word (`mem[5]`, and
+  `mem[5][3:0]`), or a packed-struct member (`st.field`). Reads zero-extend into
+  `uvm_hdl_data_t`; a deposit writes the low bits; a force holds until released; a
+  release returns a net to its drivers at once and leaves a variable at the forced
+  value.
+- **Errors** are UVM reports with the C code's ids and texts: `UVM/DPI/REGEX_INV`,
+  `UVM/DPI/REGEX_MAX`, `UVM/DPI/REGCOMP`, `UVM/DPI/HDL_GET` / `HDL_SET` ("unable to
+  locate hdl path"). Forcing or releasing part of a signal, forcing a
+  `XEZIM_PACKED_MEM` memory cell, and selecting into a multi-dimensional packed vector
+  are not supported: the call returns 0 and prints a one-time `[DPI] error:` line.
+
 ---
 
 ## Supported
@@ -123,7 +157,8 @@ mechanism works for UVM-side code as for plain SV testbenches.
 - **Deprecated UVM-1.0 API** — `` `uvm_sequencer_utils ``, `` `uvm_sequence_utils ``,
   sequence libraries. These macros are undefined in 1800.2-2017 and will produce a parse
   error.
-- **DPI backdoor access** — `uvm_hdl_*` (force/deposit/read) and DPI-based C stimulus.
+- **Partial forces through the backdoor** — `uvm_hdl_force("top.u.sig[7:4]", …)` (and
+  the matching release) fail with a `[DPI] error:`; force the whole signal instead.
 - **RAL** (register abstraction layer) and sequence lock/grab arbitration beyond the
   common path.
 - **Cosmetic differences vs a reference run:** topology handle ids (`@N`) are xezim heap
