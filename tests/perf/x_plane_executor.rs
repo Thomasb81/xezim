@@ -9,8 +9,9 @@
 //! ambiguous one, reductions, all-x arithmetic, plane shifts, an x
 //! selector merging its arms, an x or out-of-range index reading all-x and
 //! writing nothing, NBAs of x into a memory and a wide vector. The expected
-//! lines are the four-state VM's (`XEZIM_TS_X=0` gives the same output),
-//! and the run must actually take the x-plane path (`x_plane_runs`).
+//! lines are the four-state VM's (`XEZIM_TS_X=0` gives the same output) and
+//! were cross-checked against the reference simulator, and the run must
+//! actually take the x-plane path (`x_plane_runs`).
 use std::process::Command;
 
 fn run(name: &str, src: &str) -> String {
@@ -127,10 +128,10 @@ fn x_plane_executor_matches_the_four_state_vm() {
         "C m1=5a m2=5a m3=XX l1=01 l2=0X l3=00 e1=01 e2=00 e3=01 ar1=b4 ar2=xx sh1=68 sh2=xx r1=a5 r2=xx bd=0X rd=xx wr=xx q1=44 q2=xx q3=xx nq=xx nq2=xx w=xxxxxxxx5555aaaa 0",
         "D m1=5a m2=5a m3=5X l1=01 l2=01 l3=00 e1=01 e2=00 e3=01 ar1=b4 ar2=xx sh1=68 sh2=00 r1=a5 r2=ZZ bd=0X rd=xx wr=xx q1=44 q2=0Z q3=0Z nq=xx nq2=xx w=xxxxxxxx5555aaaa 0",
         "E m1=07 m2=03 m3=87 l1=01 l2=01 l3=00 e1=00 e2=01 e3=00 ar1=0a ar2=7d sh1=18 sh2=20 r1=30 r2=00 bd=00 rd=22 wr=55 q1=33 q2=11 q3=fc nq=xx nq2=xx w=xxxxxxxx5555aaaa 0",
-        "F m1=07 m2=03 m3=87 l1=01 l2=01 l3=00 e1=00 e2=01 e3=00 ar1=0a ar2=7d sh1=18 sh2=20 r1=30 r2=00 bd=00 rd=80 wr=03 q1=33 q2=11 q3=fc nq=03 nq2=87 w=xxxx030303030303 6",
-        "G m1=00 m2=xx m3=ff l1=00 l2=01 l3=0X e1=0X e2=0X e3=0X ar1=xx ar2=fc sh1=xx sh2=3f r1=x0 r2=ff bd=0X rd=80 wr=03 q1=44 q2=11 q3=xx nq=03 nq2=87 w=xxxx030303030303 6",
-        "H m1=00 m2=xx m3=ff l1=00 l2=01 l3=0X e1=0X e2=0X e3=0X ar1=xx ar2=fc sh1=xx sh2=3f r1=x0 r2=ff bd=0X rd=ff wr=03 q1=44 q2=11 q3=xx nq=xx nq2=ff w=xxxx030303030303 12",
-        "I m1=fZ m2=fZ m3=fX l1=0X l2=01 l3=0X e1=00 e2=01 e3=0X ar1=xx ar2=0c sh1=xx sh2=xx r1=Zf r2=ff bd=0X rd=xx wr=xx q1=44 q2=11 q3=fX nq=xx nq2=ff w=xxxx030303030303 12",
+        "F m1=07 m2=03 m3=87 l1=01 l2=01 l3=00 e1=00 e2=01 e3=00 ar1=0a ar2=7d sh1=18 sh2=20 r1=30 r2=00 bd=00 rd=80 wr=03 q1=33 q2=11 q3=fc nq=03 nq2=87 w=xx03030303030303 7",
+        "G m1=00 m2=xx m3=ff l1=00 l2=01 l3=0X e1=0X e2=0X e3=0X ar1=xx ar2=fc sh1=xx sh2=3f r1=x0 r2=ff bd=0X rd=80 wr=03 q1=44 q2=11 q3=xx nq=03 nq2=87 w=xx03030303030303 7",
+        "H m1=00 m2=xx m3=ff l1=00 l2=01 l3=0X e1=0X e2=0X e3=0X ar1=xx ar2=fc sh1=xx sh2=3f r1=x0 r2=ff bd=0X rd=ff wr=03 q1=44 q2=11 q3=xx nq=xx nq2=ff w=xx03030303030303 13",
+        "I m1=fZ m2=fZ m3=fX l1=0X l2=01 l3=0X e1=00 e2=01 e3=0X ar1=xx ar2=0c sh1=xx sh2=xx r1=Zf r2=ff bd=0X rd=xx wr=xx q1=44 q2=11 q3=fX nq=xx nq2=ff w=xx03030303030303 13",
     ];
     for e in expected {
         assert!(text.lines().any(|l| l == e), "missing `{e}` in:\n{text}");

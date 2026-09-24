@@ -1954,6 +1954,17 @@ struct ClockGen {
     /// once at the end of elaboration via `seal_edge_signal_ids`; lets
     /// `fire_clock_generators` fill `toggled_clock_positions` in O(1).
     edge_signal_position: usize,
+    /// §4.4.2 FIFO rank of the next toggle among the wheel events due at the
+    /// same time: how many were already queued when the generator process
+    /// would have scheduled it (at its previous toggle). Those resume before
+    /// the toggle, later ones after it. `None` until the time-0 drain
+    /// reaches the generator's source position (`t0_rank`).
+    ahead: Option<u32>,
+    /// `next_pid` when an `initial` generator was extracted: the time-0
+    /// processes that precede it in source order have lower pids.
+    /// `usize::MAX` (an `always` generator, extracted before any initial
+    /// block has a pid) settles at the end of the first time-0 drain.
+    t0_rank: usize,
 }
 
 /// Reusable scheduler state for `always #(expr) lhs = rhs` when the delay is
@@ -2172,6 +2183,14 @@ struct TimingWheel {
     /// high-water pid and trades memory for nothing. Do not re-litigate without
     /// a benchmark that shows this map is hot.
     pid_counts: HashMap<usize, u32>,
+    /// Entries `schedule_front` put at the head of `front_time`'s slot and
+    /// not yet popped; `last_pop_front` says whether the latest `pop_front`
+    /// returned one. A clock generator's FIFO rank counts only the events
+    /// that were queued when it scheduled its toggle, never fork children
+    /// inserted ahead of them later.
+    front_time: u64,
+    front_pending: u32,
+    last_pop_front: bool,
 }
 
 impl TimingWheel {
@@ -2188,7 +2207,19 @@ impl TimingWheel {
             next_cache: std::cell::Cell::new(None),
             current_time: 0,
             pid_counts: HashMap::default(),
+            front_time: 0,
+            front_pending: 0,
+            last_pop_front: false,
         }
+    }
+
+    /// Number of events queued for exactly `time`.
+    fn len_at(&self, time: u64) -> usize {
+        let mut n = self.overflow.get(&time).map_or(0, |l| l.len());
+        if time >= self.current_time && time < self.current_time + WHEEL_SIZE as u64 {
+            n += self.wheel[Self::slot(time)].len();
+        }
+        n
     }
 
     #[inline(always)]
@@ -2246,6 +2277,11 @@ impl TimingWheel {
     /// Children are inserted in reverse so the group keeps source order.
     fn schedule_front(&mut self, time: u64, pid: usize, stmts: ProcCont) {
         *self.pid_counts.entry(pid).or_insert(0) += 1;
+        if self.front_time != time {
+            self.front_time = time;
+            self.front_pending = 0;
+        }
+        self.front_pending += 1;
         self.narrow_next_cache(time);
         if time < self.current_time + WHEEL_SIZE as u64 {
             let s = Self::slot(time);
@@ -2415,8 +2451,13 @@ impl TimingWheel {
         if self.wheel[s].is_empty() {
             self.bitmap_clear(s);
         }
+        self.last_pop_front = false;
         if let Some((pid, _)) = event.as_ref() {
             self.decrement_pid_count(*pid);
+            if self.front_pending > 0 && self.front_time == time {
+                self.front_pending -= 1;
+                self.last_pop_front = true;
+            }
         }
         event
     }
@@ -2424,6 +2465,9 @@ impl TimingWheel {
     /// Remove and return all events at the given time.
     fn remove(&mut self, time: u64) -> EventList {
         self.current_time = time;
+        if self.front_time == time {
+            self.front_pending = 0;
+        }
         self.move_overflow_into_wheel(time);
         let s = Self::slot(time);
         let events = std::mem::take(&mut self.wheel[s]);
@@ -18572,6 +18616,8 @@ impl Simulator {
             half_period,
             next_toggle_time: half_period,
             edge_signal_position: usize::MAX,
+            ahead: None,
+            t0_rank: self.next_pid,
         })
     }
 
@@ -18634,6 +18680,8 @@ impl Simulator {
                             half_period,
                             next_toggle_time: half_period, // first toggle at t=half_period
                             edge_signal_position: usize::MAX,
+                            ahead: None,
+                            t0_rank: usize::MAX,
                         });
                     }
                 }
@@ -18673,6 +18721,14 @@ impl Simulator {
     /// those positions when no other state changed this iter.
     fn fire_clock_generators(&mut self) {
         self.toggled_clock_positions.clear();
+        self.fire_due_clocks(false);
+    }
+
+    /// Toggle the generators due now — with `ready_only`, only those whose
+    /// FIFO rank (`ClockGen::ahead`) has been reached. Returns whether a due
+    /// generator was left for later in this slot.
+    fn fire_due_clocks(&mut self, ready_only: bool) -> bool {
+        let mut held = false;
         let trace = self.sched_trace_on();
         // Collected inside the &mut borrow of `clock_generators`, printed
         // after it ends (the names live in `id_to_name`).
@@ -18681,6 +18737,10 @@ impl Simulator {
         tree_roots.clear();
         for cg in &mut self.clock_generators {
             if cg.next_toggle_time == self.time {
+                if ready_only && cg.ahead != Some(0) {
+                    held = true;
+                    continue;
+                }
                 let w = self.signal_widths[cg.signal_id];
                 // `always #N clk = ~clk` must apply the real 4-state NOT
                 // (LRM §11.5.1): 0->1, 1->0, X->X, Z->X. The old shortcut
@@ -18715,6 +18775,7 @@ impl Simulator {
                         self.table_modified = true;
                     }
                     cg.next_toggle_time += cg.half_period;
+                    cg.ahead = Some(self.event_queue.len_at(cg.next_toggle_time) as u32);
                     continue;
                 }
                 write_sig!(self, cg.signal_id, new_val);
@@ -18725,6 +18786,7 @@ impl Simulator {
                 self.dirty_any = true;
                 self.table_modified = true;
                 cg.next_toggle_time += cg.half_period;
+                cg.ahead = Some(self.event_queue.len_at(cg.next_toggle_time) as u32);
                 if trace {
                     fired.push((cg.signal_id, u64::from(cur != LogicBit::One)));
                 }
@@ -18752,6 +18814,38 @@ impl Simulator {
                 self.id_to_name.get(sig).map(|n| &**n).unwrap_or("?"),
                 v
             );
+        }
+        held
+    }
+
+    /// Account one event popped from the current slot against the FIFO rank
+    /// of the generators due now, and settle the time-0 rank of `initial`
+    /// generators once the drain reaches their source position. Called
+    /// BEFORE the popped process runs, so its own new events queue behind.
+    fn clock_rank_on_pop(&mut self, pid: usize) {
+        if self.event_queue.last_pop_front {
+            return;
+        }
+        let now = self.time;
+        for cg in &mut self.clock_generators {
+            match cg.ahead {
+                Some(ref mut a) if cg.next_toggle_time == now => {
+                    *a = a.saturating_sub(1);
+                }
+                None if pid >= cg.t0_rank => {
+                    cg.ahead = Some(self.event_queue.len_at(cg.next_toggle_time) as u32);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Settle every rank still unknown at the end of the time-0 drain.
+    fn settle_clock_ranks(&mut self) {
+        for cg in &mut self.clock_generators {
+            if cg.ahead.is_none() {
+                cg.ahead = Some(self.event_queue.len_at(cg.next_toggle_time) as u32);
+            }
         }
     }
 
@@ -41306,9 +41400,17 @@ impl Simulator {
             non_clock_change = true;
         }
 
-        // Clock generators fire AFTER the first wheel drain below — see the
-        // de facto interleave note at the call site.
+        // Clock generators fire at their FIFO rank inside the first wheel
+        // drain below — see the interleave note at the call site.
         let mut clocks_fired = false;
+        self.toggled_clock_positions.clear();
+        let mut clocks_held = self
+            .clock_generators
+            .iter()
+            .any(|c| c.next_toggle_time == self.time);
+        // Pops are ranked while a generator waits for its turn, and at time 0
+        // while `initial` generators still need their source position.
+        let mut rank_pops = clocks_held || (self.time == 0 && !self.clock_generators.is_empty());
 
         let _t = profile_timing.then(std::time::Instant::now);
         let has_active = self.event_queue.next_time() == Some(self.time);
@@ -41330,9 +41432,16 @@ impl Simulator {
                 if self.finished || self.zero_delay_defer_pending {
                     break;
                 }
+                if clocks_held {
+                    clocks_held = self.fire_due_clocks(true);
+                    rank_pops = clocks_held || self.time == 0;
+                }
                 let Some((pid, stmts)) = self.event_queue.pop_front(self.time) else {
                     break;
                 };
+                if rank_pops && !clocks_fired {
+                    self.clock_rank_on_pop(pid);
+                }
                 if self.sched_trace_on() {
                     eprintln!(
                         "[sched] t={} | proc pid={} {}",
@@ -41356,20 +41465,23 @@ impl Simulator {
                     self.child_finished(pid);
                 }
             }
-            // De facto §4.5 interleave (verified against the major
-            // implementations): a process whose `#delay` expires exactly at
-            // a clock-toggle time resumes and runs to its NEXT timing
-            // control BEFORE the clock toggles — so a `@(posedge clk)` it
-            // reaches catches THIS slot's edge, and a `clk` read sees the
-            // pre-toggle value. Firing the generators before the wheel
-            // drain made xezim skip that edge: LRM-legal (§4.7 leaves the
-            // interleave open) but against the run-to-next-time-control
-            // model everyone else implements — a task ending in `#N` that
-            // lands on a posedge shifted the caller's whole
-            // `repeat(M) @(posedge clk)` sequence by one period.
+            // §4.4.2 interleave (reference-simulator verified): a clock
+            // generator is a process whose toggle was scheduled at its
+            // PREVIOUS toggle, so events due in the same slot keep FIFO
+            // order around it. A `#delay` queued before that point resumes
+            // and runs to its next timing control BEFORE the toggle — its
+            // `@(posedge clk)` catches this slot's edge and a `clk` read sees
+            // the pre-toggle value. One queued after it (a process the last
+            // edge woke, or a time-0 process later in source order than an
+            // `initial` generator) resumes AFTER the toggle and waits for the
+            // next edge. The in-drain firing above releases each generator at
+            // its rank; whatever is still held fires here.
             if !clocks_fired {
                 clocks_fired = true;
-                self.fire_clock_generators();
+                if self.time == 0 {
+                    self.settle_clock_ranks();
+                }
+                self.fire_due_clocks(false);
             }
             if self.finished || self.zero_delay_defer_pending {
                 // Pending same-time activations remain in the timing wheel.
