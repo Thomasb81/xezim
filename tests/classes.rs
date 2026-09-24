@@ -39,6 +39,8 @@ mod collection_of_handles_new;
 mod explicit_param_static_coll_read;
 #[path = "classes/function_local_struct_return_shadow.rs"]
 mod function_local_struct_return_shadow;
+#[path = "classes/implements_typedef_scope.rs"]
+mod implements_typedef_scope;
 #[path = "classes/memory_tasks_fixed_property.rs"]
 mod memory_tasks_fixed_property;
 #[path = "classes/nested_same_named_ref_assoc_formal.rs"]
