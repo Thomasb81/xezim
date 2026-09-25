@@ -123,3 +123,37 @@ endmodule
     // 1/2 (1000, sd ~22)
     within(&c, "s2", 880, 1120);
 }
+
+/// The per-variable trials without an ordering: an antecedent with no range
+/// of its own (`bit s`) was drawn uniformly and the consequent repaired, so
+/// `s` came up 1 half the time. It is now weighed over its whole domain by
+/// the solutions each value leaves. The `randc` member keeps F1 and F2 on
+/// the trials; A has neither a dist nor an ordering, so it stays there too.
+#[test]
+fn trials_weigh_an_unranged_antecedent() {
+    let c = counts(
+        r#"
+class A;  rand bit s; rand bit [31:0] d; constraint c { s -> d == 0; } endclass
+class F1; randc bit [1:0] rc; rand bit s; rand bit [31:0] d; constraint c { s -> d == 0; } endclass
+class F2; randc bit [1:0] rc; rand bit s; rand bit [31:0] d; constraint c { s -> d == 0; solve s before d; } endclass
+module top;
+  initial begin
+    automatic A a = new; automatic F1 f1 = new; automatic F2 f2 = new;
+    automatic int fails, bad, sa, s1, s2;
+    for (int i = 0; i < 4000; i++) begin
+      if (!a.randomize()) fails++; sa += a.s; if (a.s && a.d != 0) bad++;
+      if (!f1.randomize()) fails++; s1 += f1.s;
+      if (!f2.randomize()) fails++; s2 += f2.s; if (f2.s && f2.d != 0) bad++;
+    end
+    $display("fails=%0d bad=%0d sa=%0d s1=%0d s2=%0d", fails, bad, sa, s1, s2);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(get(&c, "fails"), 0, "{c:?}");
+    assert_eq!(get(&c, "bad"), 0, "{c:?}");
+    assert!(get(&c, "sa") <= 1, "{c:?}");
+    assert!(get(&c, "s1") <= 1, "{c:?}");
+    // the ordering keeps it 1/2 (2000, sd ~32)
+    within(&c, "s2", 1840, 2160);
+}

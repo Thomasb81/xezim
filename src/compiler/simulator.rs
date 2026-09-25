@@ -122015,6 +122015,7 @@ impl Simulator {
                 Self::collect_solve_pairs(&con.items, &mut solve_pairs);
             }
             let mut pids_to_solve: Vec<usize> = (0..rand_props.len()).collect();
+            let mut ante: HashSet<String> = HashSet::default();
             if !solve_pairs.is_empty() {
                 let name_to_idx: HashMap<String, usize> = rand_props
                     .iter()
@@ -122060,7 +122061,6 @@ impl Simulator {
                 pids_to_solve = topo;
             } else {
                 // Antecedents of implications first (see weighted_antecedent_pick).
-                let mut ante: HashSet<String> = HashSet::default();
                 for (cond, _) in Self::class_implications(&constraints) {
                     let mut ids = HashSet::default();
                     self.collect_expr_idents(cond, &mut ids);
@@ -122220,6 +122220,26 @@ impl Simulator {
                         // §18.3: an `inside`-bounded draw samples the EXACT
                         // (signed) interval and keeps the property's signedness.
                         let sgn = signed_rand_props.contains(name);
+                        // A narrow antecedent with no range of its own (`bit
+                        // s` in `s -> d == 0`) is weighed over its whole domain.
+                        let narrow_ante = if !sgn
+                            && *width <= 6
+                            && ante.contains(name)
+                            && !enum_prop_types.contains_key(name)
+                            && !prop_allowed_ranges.contains_key(name)
+                        {
+                            self.weighted_antecedent_pick(
+                                handle,
+                                name,
+                                *width,
+                                &[(0, (1i128 << *width) - 1)],
+                                &constraints,
+                                &rand_props,
+                                &solved_props,
+                            )
+                        } else {
+                            None
+                        };
                         if let Some(ranges) = prop_allowed_ranges.get(name).cloned() {
                             let weighted = if has_solve_before || sgn {
                                 None
@@ -122239,6 +122259,8 @@ impl Simulator {
                             } else if let Some(p) = self.pick_i128_range(&ranges, *width, sgn) {
                                 val = p;
                             }
+                        } else if let Some(p) = narrow_ante {
+                            val = p;
                         } else if let Some(et) = enum_prop_types.get(name) {
                             // Enum-typed rand field: pick a valid member.
                             let n = self.module.enum_members.get(et).map_or(0, |m| m.len());
