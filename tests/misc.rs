@@ -91,6 +91,8 @@ mod function_return_bit_select;
 mod gate_terminal_counts;
 #[path = "misc/generate_item_restrictions.rs"]
 mod generate_item_restrictions;
+#[path = "misc/generate_loop_genvar.rs"]
+mod generate_loop_genvar;
 #[path = "misc/generate_region_contents.rs"]
 mod generate_region_contents;
 #[path = "misc/iface_functions_and_vif_locals.rs"]
