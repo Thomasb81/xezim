@@ -167,6 +167,8 @@ mod net_declaration_delay;
 mod net_dynamic_array;
 #[path = "misc/nonansi_function_args.rs"]
 mod nonansi_function_args;
+#[path = "misc/nonansi_ranged_subroutine_port.rs"]
+mod nonansi_ranged_subroutine_port;
 #[path = "misc/nonzero_lsb_indexed_part_select.rs"]
 mod nonzero_lsb_indexed_part_select;
 #[path = "misc/obj_assocd_event_disable_fork.rs"]
