@@ -225,6 +225,8 @@ mod real_call_bytecode;
 mod repeat_real_count;
 #[path = "misc/replication_and_cast_operands.rs"]
 mod replication_and_cast_operands;
+#[path = "misc/select_depth.rs"]
+mod select_depth;
 #[path = "misc/select_semantics_11_5_1.rs"]
 mod select_semantics_11_5_1;
 #[path = "misc/shadow_name_matrix.rs"]

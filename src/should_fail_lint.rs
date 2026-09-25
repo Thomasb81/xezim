@@ -148,6 +148,7 @@ fn check_unit(
     check_param_value_refs(u.params, u.items, is_top, pkg_names, elab, errs);
     check_pattern_counts(defs, u.items, elab, is_top, errs);
     check_foreach_dims(u.items, errs);
+    check_select_depth(u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -2712,6 +2713,138 @@ fn check_foreach_dims(items: &[ModuleItem], errs: &mut Vec<String>) {
                  dimension(s) (LRM 1800-2017 §12.7.3)"
             ));
         }
+    }
+}
+
+/// §7.4.6 / §11.5.1: a variable or net takes one index per unpacked and
+/// packed dimension (an integer atom such as `int` has one), and a part-select
+/// only as the last select. More selects than that — `reg [15:0] m[3:0];
+/// m[0][0][3:0]`, a bit-select of a scalar — are errors. Module-level
+/// declarations only, and not where another declaration may shadow the name.
+fn check_select_depth(items: &[ModuleItem], errs: &mut Vec<String>) {
+    // name -> number of selectable dimensions
+    let mut dims: HashMap<&str, usize> = HashMap::new();
+    let mut shadowed: HashSet<&str> = HashSet::new();
+    let packed = |dt: &DataType| match dt {
+        DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } => {
+            Some(dimensions.len())
+        }
+        DataType::IntegerAtom { .. } => Some(1),
+        _ => None,
+    };
+    for it in items {
+        match it {
+            ModuleItem::DataDeclaration(d) => {
+                for v in &d.declarators {
+                    match packed(&d.data_type) {
+                        Some(p) if !dims.contains_key(v.name.name.as_str()) => {
+                            dims.insert(v.name.name.as_str(), p + v.dimensions.len());
+                        }
+                        _ => {
+                            shadowed.insert(v.name.name.as_str());
+                        }
+                    }
+                }
+            }
+            ModuleItem::NetDeclaration(d) => {
+                for v in &d.declarators {
+                    match packed(&d.data_type) {
+                        Some(p) if !dims.contains_key(v.name.name.as_str()) => {
+                            dims.insert(v.name.name.as_str(), p + v.dimensions.len());
+                        }
+                        _ => {
+                            shadowed.insert(v.name.name.as_str());
+                        }
+                    }
+                }
+            }
+            // Ports split their range over several declarations; generate
+            // blocks and subroutines may redeclare a name.
+            ModuleItem::PortDeclaration(d) => {
+                shadowed.extend(d.declarators.iter().map(|v| v.name.name.as_str()))
+            }
+            ModuleItem::FunctionDeclaration(f) => {
+                shadowed.extend(f.ports.iter().map(|p| p.name.name.as_str()))
+            }
+            ModuleItem::TaskDeclaration(t) => {
+                shadowed.extend(t.ports.iter().map(|p| p.name.name.as_str()))
+            }
+            ModuleItem::GenerateRegion(_)
+            | ModuleItem::GenerateIf(_)
+            | ModuleItem::GenerateFor(_)
+            | ModuleItem::GenerateCase(_) => return,
+            _ => {}
+        }
+    }
+    let mut exprs: Vec<&Expression> = Vec::new();
+    let mut stmts: Vec<&Statement> = Vec::new();
+    for it in items {
+        match it {
+            ModuleItem::ContinuousAssign(ca) => {
+                for (l, r) in &ca.assignments {
+                    exprs.push(l);
+                    exprs.push(r);
+                }
+            }
+            ModuleItem::NetDeclaration(d) => {
+                exprs.extend(d.declarators.iter().filter_map(|v| v.init.as_ref()))
+            }
+            ModuleItem::DataDeclaration(d) => {
+                exprs.extend(d.declarators.iter().filter_map(|v| v.init.as_ref()))
+            }
+            ModuleItem::InitialConstruct(i) => stmts.push(&i.stmt),
+            ModuleItem::AlwaysConstruct(a) => stmts.push(&a.stmt),
+            ModuleItem::FunctionDeclaration(f) => stmts.extend(f.items.iter()),
+            ModuleItem::TaskDeclaration(t) => stmts.extend(t.items.iter()),
+            _ => {}
+        }
+    }
+    for st in &stmts {
+        for_each_stmt(st, &mut |s| {
+            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                for d in declarators {
+                    dims.remove(d.name.name.as_str());
+                }
+            }
+        });
+    }
+    for s in shadowed {
+        dims.remove(s);
+    }
+    let mut report = |e: &Expression| {
+        let mut n = 0usize;
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                    n += 1;
+                    cur = expr;
+                }
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return;
+        };
+        if h.path.len() != 1 {
+            return;
+        }
+        let name = h.path[0].name.name.as_str();
+        n += h.path[0].selects.len();
+        if let Some(&have) = dims.get(name)
+            && n > have
+        {
+            errs.push(format!(
+                "'{name}' is selected {n} time(s), but it has {have} dimension(s) \
+                 (LRM 1800-2017 §7.4.6, §11.5.1)"
+            ));
+        }
+    };
+    for e in exprs {
+        for_each_expr(e, &mut report);
+    }
+    for st in stmts {
+        for_each_stmt_expr(st, &mut report);
     }
 }
 
