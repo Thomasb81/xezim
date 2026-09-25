@@ -9,6 +9,24 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* UVM 1800.2 (2020.3) DPI: `uvm_re_comp`/`uvm_re_exec`/`uvm_re_compexec`/
+  `uvm_re_deglobbed` follow UVM's C code, and `uvm_hdl_signal_size` and
+  the `uvm_polling_*` value-change API are built in. UVM testbenches
+  compiled without `UVM_NO_DPI` used to abort at time 0 on unresolved
+  regex symbols.
+* An `inout` or `output` formal passes a virtual-interface handle back to
+  its caller even when the actual was null on entry (`uvm_resource_db::
+  read_by_name` returned nothing), and a formal no longer leaks into a
+  same-named class property.
+* An unconnected 2-state `output` port of an interface or module starts at
+  0 instead of x, so a clock driven through one toggles.
+* Deferred immediate assertions (`assert #0`, `assert final`) run their
+  action blocks at the end of the time slot; a report whose process
+  resumes first is dropped, and one still pending at `$finish` prints a
+  note instead.
+* A path-delayed output also delays its first change at time 0, as the
+  reference simulator does.
+* `randomize() with { ... }` over struct members is about 13x faster.
 * UVM tables print their rows: copying a whole element out of a
   class-property collection of unpacked structs (`row = m_rows[i]`, queue,
   dynamic, fixed or associative) gave zeros, so the topology print and
