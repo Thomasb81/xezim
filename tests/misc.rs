@@ -131,6 +131,8 @@ mod lrm_clause11_operators;
 mod lrm_clause13_subroutines;
 #[path = "misc/lrm_pattern_matching.rs"]
 mod lrm_pattern_matching;
+#[path = "misc/macro_default_after_string_actual.rs"]
+mod macro_default_after_string_actual;
 #[path = "misc/mailbox_method_blocking.rs"]
 mod mailbox_method_blocking;
 #[path = "misc/method_call_chaining.rs"]
