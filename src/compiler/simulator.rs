@@ -5855,6 +5855,14 @@ pub struct Simulator {
     unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// See `struct_prop_name_possible`.
     struct_capable_prop_names: std::cell::OnceCell<HashSet<String>>,
+    /// Every covergroup key and its leaf after the last `::` (see
+    /// `covergroup_def_for`).
+    covergroup_leaf_names: std::cell::OnceCell<HashSet<String>>,
+    /// Class -> the `string_properties` of it and its ancestors, in chain
+    /// order (a method call marks them in `string_signals`).
+    class_string_props: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<String>>>>,
+    /// Class -> `class_enclosing_module` answer.
+    class_enclosing_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
     /// Interned scope hints and head identifiers for `method_receiver_cache` keys (see there).
     method_receiver_hint_ids: HashMap<String, u32>,
     /// `resolve_typeref_class_name` memo: name -> (scope, class ctx) -> (class-table size, answer).
@@ -9850,6 +9858,9 @@ impl Simulator {
             marker_key_scratch: String::new(),
             unpacked_struct_prop_names: std::cell::OnceCell::new(),
             struct_capable_prop_names: std::cell::OnceCell::new(),
+            covergroup_leaf_names: std::cell::OnceCell::new(),
+            class_string_props: std::cell::RefCell::new(HashMap::default()),
+            class_enclosing_cache: std::cell::RefCell::new(HashMap::default()),
             method_receiver_hint_ids: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
@@ -81795,11 +81806,23 @@ impl Simulator {
 
     /// The module a class (or an ancestor of it) is declared inside, if any.
     fn class_enclosing_module(&self, handle: usize) -> Option<String> {
-        let mut cur: Option<String> = self
+        let class_name = self
             .heap
             .get(handle)
             .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.clone());
+            .map(|i| i.class_name.as_str())?;
+        if let Some(hit) = self.class_enclosing_cache.borrow().get(class_name) {
+            return hit.clone();
+        }
+        let v = self.class_enclosing_module_walk(class_name);
+        self.class_enclosing_cache
+            .borrow_mut()
+            .insert(class_name.to_string(), v.clone());
+        v
+    }
+
+    fn class_enclosing_module_walk(&self, class_name: &str) -> Option<String> {
+        let mut cur: Option<String> = Some(class_name.to_string());
         let mut hops = 0;
         while let Some(cn) = cur {
             hops += 1;
@@ -115353,6 +115376,23 @@ impl Simulator {
     /// the bare name, so a derived class that redeclares `cg` gets its own
     /// coverpoints (§19.3); elsewhere the bare name.
     fn covergroup_def_for(&self, tname: &str) -> Option<CovergroupDeclaration> {
+        // Both lookups below can only hit a key equal to `tname` or ending in
+        // `::tname`.
+        if !tname.contains(':') {
+            let leaves = self.covergroup_leaf_names.get_or_init(|| {
+                let mut set: HashSet<String> = HashSet::default();
+                for k in self.module.covergroups.keys() {
+                    set.insert(k.clone());
+                    if let Some((_, leaf)) = k.rsplit_once("::") {
+                        set.insert(leaf.to_string());
+                    }
+                }
+                set
+            });
+            if !leaves.contains(tname) {
+                return None;
+            }
+        }
         let ctx: Option<String> = self
             .this_stack
             .last()
@@ -126801,6 +126841,27 @@ impl Simulator {
         method
     }
 
+    /// The string properties of `class_name` and its ancestors.
+    fn class_string_props_of(&self, class_name: &str) -> std::rc::Rc<Vec<String>> {
+        if let Some(hit) = self.class_string_props.borrow().get(class_name) {
+            return hit.clone();
+        }
+        let mut props: Vec<String> = Vec::new();
+        let mut cur: Option<&str> = Some(class_name);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            props.extend(cd.string_properties.iter().cloned());
+            cur = cd.extends.as_deref();
+        }
+        let props = std::rc::Rc::new(props);
+        self.class_string_props
+            .borrow_mut()
+            .insert(class_name.to_string(), props.clone());
+        props
+    }
+
     fn exec_method_in_class_hierarchy(
         &mut self,
         handle: usize,
@@ -127359,17 +127420,11 @@ impl Simulator {
                 // chain from the callee's class and add each string property
                 // for the duration of this frame (removed on exit below).
                 {
-                    let mut cur = Some(cname.clone());
-                    while let Some(cn) = cur {
-                        if let Some(cd) = self.module.classes.get(&cn) {
-                            for sp in &cd.string_properties {
-                                if self.string_signals.insert(sp.clone()) {
-                                    frame_string_signals.push(sp.clone());
-                                }
-                            }
-                            cur = cd.extends.clone();
-                        } else {
-                            break;
+                    let props = self.class_string_props_of(&cname);
+                    for sp in props.iter() {
+                        if !self.string_signals.contains(sp) {
+                            self.string_signals.insert(sp.clone());
+                            frame_string_signals.push(sp.clone());
                         }
                     }
                 }
@@ -127413,8 +127468,8 @@ impl Simulator {
                 // extract_call_spec's type_args_text).
                 let saved_spec = self.current_spec.clone();
                 if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-                    let cn = inst.class_name.clone();
-                    let bindings = inst.type_bindings.clone();
+                    let cn = &inst.class_name;
+                    let bindings = &inst.type_bindings;
                     // Override the active spec with THIS instance's own
                     // specialization when it differs from the active
                     // spec's class. Prefer the instance's captured full
@@ -127449,7 +127504,7 @@ impl Simulator {
                         // the caller's (base_comp) cell, so typewide
                         // callbacks never propagate to derived types.
                         Some((b, s)) => {
-                            *b != cn
+                            b != cn
                                 || inst
                                     .spec
                                     .as_ref()
@@ -127459,7 +127514,7 @@ impl Simulator {
                     if differs {
                         if inst.spec.is_some() {
                             self.current_spec = inst.spec.clone();
-                        } else if let Some(cd) = self.module.classes.get(&cn) {
+                        } else if let Some(cd) = self.module.classes.get(cn) {
                             let mut param_names = cd.param_order.clone();
                             if param_names.is_empty() {
                                 param_names = cd.type_param_names.clone();
@@ -127514,7 +127569,7 @@ impl Simulator {
                         .heap
                         .get(handle)
                         .and_then(|o| o.as_ref())
-                        .map(|i| i.creation_scope.clone())
+                        .map(|i| i.creation_scope.as_str())
                         .unwrap_or_default();
                     // `creation_scope` is kept in `%m` form (`tb.u_w`, top
                     // module first) for the method's own `%m`; the
@@ -127523,7 +127578,7 @@ impl Simulator {
                     // form made every hinted lookup miss, so a method of an
                     // object built inside `u_w` could not read `u_w`'s own
                     // variables or reach its sibling instances (issue #155).
-                    let mut birth = self.instance_relative_scope(&birth);
+                    let mut birth = self.instance_relative_scope(birth);
                     if birth.is_empty() {
                         // No usable birth scope (the object was built at the
                         // top or in a package): a class declared INSIDE a
