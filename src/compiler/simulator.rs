@@ -102087,8 +102087,16 @@ impl Simulator {
             // in `dynamic_arrays`. Consult `this`-scoped members first so a
             // member name hidden by an unrelated outer bare registration
             // still resolves to its own `<handle>#member` storage.
-            let n = Self::resolve_hier_name_static(h, &self.module);
-            if self.module.dynamic_arrays.contains(&n) {
+            // `resolve_hier_name_static` of one segment is the name itself.
+            let registered = match h.path.as_slice() {
+                [seg] => self.module.dynamic_arrays.contains(seg.name.name.as_str()),
+                _ => {
+                    let n = Self::resolve_hier_name_static(h, &self.module);
+                    self.module.dynamic_arrays.contains(&n)
+                }
+            };
+            if registered {
+                let n = Self::resolve_hier_name_static(h, &self.module);
                 if let Some(m) = self.instance_assoc_member(&n) {
                     return Some(m);
                 }
@@ -102165,13 +102173,14 @@ impl Simulator {
         // member is read by its own leaf signal rather than a whole-struct
         // container that does not exist. An X in any leaf makes the result X.
         let (a, b) = (self.flat_member_name(lhs)?, self.flat_member_name(rhs)?);
-        let dt = self.p_elem_type(&a)?;
-        let DataType::Struct(su) = self.resolve_dt(&dt) else {
-            return None;
+        // Only a member-wise struct needs its type owned.
+        let su = {
+            let dt = self.p_elem_type_ref(&a)?;
+            match self.resolve_dt_ref(&dt) {
+                DataType::Struct(su) if Self::spreads_member_wise(su) => su.clone(),
+                _ => return None,
+            }
         };
-        if !Self::spreads_member_wise(&su) {
-            return None;
-        }
         if !self.struct_storage_exists(&a, &su) || !self.struct_storage_exists(&b, &su) {
             return None;
         }
@@ -106464,6 +106473,34 @@ impl Simulator {
             && self.virtual_iface_bindings.is_empty()
         {
             return None;
+        }
+        // Every rebase resolves the chain's ROOT name (the first segment of
+        // its base identifier) through an alias or a vif property binding;
+        // a root no alias can name and no class declares as a vif property
+        // never rebases.
+        if !self.iface_alias_possible() {
+            let mut cur = e;
+            loop {
+                match &cur.kind {
+                    ExprKind::MemberAccess { expr, .. }
+                    | ExprKind::Index { expr, .. }
+                    | ExprKind::RangeSelect { expr, .. } => cur = expr,
+                    ExprKind::Call { func, .. } => cur = func,
+                    _ => break,
+                }
+            }
+            match &cur.kind {
+                ExprKind::Ident(h) => {
+                    if !h.path.first().is_some_and(|s| {
+                        self.class_member_names()
+                            .vif_props
+                            .contains(s.name.name.as_str())
+                    }) {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
         }
         // Only CHAINS are rebased: a bare `v` read/write is a HANDLE
         // operation (`v2 = v;`, `v == null`) and must stay untouched.
