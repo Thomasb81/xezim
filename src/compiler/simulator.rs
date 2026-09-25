@@ -3359,6 +3359,27 @@ struct FormalMetadataSnapshot {
     typedef_type: Option<String>,
 }
 
+/// The name-keyed type metadata a subroutine-local declaration displaced
+/// (see `decl_shadow_log`).
+#[derive(Debug, Clone)]
+struct DeclShadow {
+    width: Option<u32>,
+    signed: bool,
+    real: bool,
+    string: bool,
+    meta: FormalMetadataSnapshot,
+}
+
+/// One subroutine activation's displaced declarations, restored when it
+/// returns. `frame_gen` is the activation's local-frame generation; `epoch` the
+/// `nested_run_epoch` at entry.
+#[derive(Debug, Clone)]
+struct DeclShadowFrame {
+    frame_gen: u64,
+    epoch: u64,
+    saves: Vec<DeclShadow>,
+}
+
 /// Deferred teardown for an inlined blocking task/method call: the work
 /// `exec_task_call` would normally run synchronously after the body, replayed
 /// at the body's `ScopePop` sentinel so the process can suspend in between.
@@ -5388,6 +5409,19 @@ pub struct Simulator {
     /// Snapshot at frame entry, restore at frame exit, so a
     /// frame can never leak an add OR a remove to its caller.
     string_signals_removed: Vec<Vec<String>>,
+    /// §13.4/§6.21: width, signedness and declared-type tables are keyed by
+    /// bare name, so a callee's local (`logic [7:0] r;`) overwrote the
+    /// entries of a caller's same-named variable, which then kept the
+    /// callee's type after the return — a signed `int r` read back unsigned
+    /// or truncated, including through an `inout`/`output` copy-back. Each
+    /// function, class-method and synchronous task activation logs what its
+    /// declarations displaced and puts it back on exit.
+    decl_shadow_log: Vec<DeclShadowFrame>,
+    /// Bumped whenever other processes may run inside a subroutine call (the
+    /// nested scheduler of a synchronous `#delay`). A shadow frame whose
+    /// activation saw that happen is dropped, not restored: an interleaved
+    /// activation may own the entries by then.
+    nested_run_epoch: u64,
     /// Union of every parked `wait(cond)` waiter's read names, rebuilt lazily
     /// (see `cond_read_union_dirty`) so a blocking write can reject in O(1)
     /// without allocating — `check_condition_waiters_for_write` sits on the
@@ -9673,6 +9707,8 @@ impl Simulator {
             in_const_param_eval: false,
             return_value: None,
             string_signals_removed: Vec::new(),
+            decl_shadow_log: Vec::new(),
+            nested_run_epoch: 0,
             cond_read_union: HashSet::default(),
             cond_read_union_dirty: false,
             colliding_static_colls: HashSet::default(),
@@ -44262,6 +44298,7 @@ impl Simulator {
     }
 
     fn run_events_until(&mut self, target: u64) {
+        self.nested_run_epoch += 1;
         let saved_pid = self.current_pid;
         let saved_break = self.break_flag;
         let saved_return = self.return_flag;
@@ -73304,6 +73341,9 @@ impl Simulator {
             // as a queue.
             {
                 let nm = d.name.name.clone();
+                if !self.decl_shadow_log.is_empty() {
+                    self.note_decl_shadow(&nm, data_type);
+                }
                 // If this local shares its bare name with a caller-frame
                 // queue, preserve the caller's queue storage so it is
                 // restored when this subroutine returns (queue locals are
@@ -113829,6 +113869,7 @@ impl Simulator {
         }
         self.local_iface_aliases.push(iface_alias_frame);
         self.push_local_frame(locals);
+        self.open_decl_shadow_frame();
         self.return_value = None;
         let saved_break = self.break_flag;
         let saved_continue = self.continue_flag;
@@ -113877,6 +113918,7 @@ impl Simulator {
         // global set now that the body is done (see frame_string_signals).
         // §6.21/§23.8: also restore the frame-scoped snapshot (see the push
         // at entry), so this frame's non-string locals can't leak a `remove`.
+        self.close_decl_shadow_frame();
         for n in &frame_string_signals {
             self.string_signals.remove(n);
         }
@@ -114061,6 +114103,7 @@ impl Simulator {
             .take()
             .or_else(|| self.module.func_decl_scope.get(&td.name.name.name).cloned());
         let mut cleanup = self.bind_task_frame(td, args);
+        self.open_decl_shadow_frame();
         if std::mem::take(&mut self.task_clears_this) {
             self.push_instance_task_context(&mut cleanup);
         }
@@ -114073,6 +114116,7 @@ impl Simulator {
             }
         }
         self.pkg_scope_stack.pop();
+        self.close_decl_shadow_frame();
         // §9.6.2: `disable <task>` terminates this invocation and no more —
         // the caller resumes. Clear the unwind signal here, or it would leak
         // out and keep later loops from clearing `break_flag`.
@@ -114325,6 +114369,197 @@ impl Simulator {
         self.module.packed_full_dims.remove(name);
         self.var_class_types.remove(name);
         self.var_typedef_types.remove(name);
+    }
+
+    /// Start logging the declarations of the activation whose frame was just
+    /// pushed (see `decl_shadow_log`).
+    fn open_decl_shadow_frame(&mut self) {
+        if let Some(&frame_gen) = self.local_gen_stack.last() {
+            self.decl_shadow_log.push(DeclShadowFrame {
+                frame_gen,
+                epoch: self.nested_run_epoch,
+                saves: Vec::new(),
+            });
+        }
+    }
+
+    /// Record what a declaration of `name` (of type `dt`) in the logging
+    /// activation is about to overwrite — once per name, and only when there
+    /// is something to put back: a fresh name has no metadata, and one whose
+    /// recorded type is trivially the same gets identical metadata again.
+    fn note_decl_shadow(&mut self, name: &str, dt: &DataType) {
+        let Some(top) = self.decl_shadow_log.last() else {
+            return;
+        };
+        if self.local_gen_stack.last() != Some(&top.frame_gen) {
+            return;
+        }
+        match self.module.var_decl_types.get(name) {
+            Some(old) if Self::dt_trivially_equal(old, dt) => return,
+            None if !self.widths.contains_key(name) => return,
+            _ => {}
+        }
+        if top.saves.iter().any(|d| d.meta.name == name) {
+            return;
+        }
+        // Only a variable still live outside this activation — in the signal
+        // maps or a caller's frame — can observe the stale entries; a name
+        // left over from an earlier, finished call has nothing to protect.
+        let n = self.local_stack.len();
+        if !(self.signals.contains_key(name)
+            || self.signal_name_to_id.contains_key(name)
+            || self.local_stack[..n.saturating_sub(1)]
+                .iter()
+                .any(|f| f.contains_key(name)))
+        {
+            return;
+        }
+        let save = DeclShadow {
+            width: self.widths.get(name).copied(),
+            signed: self.signed_signals.contains(name),
+            real: self.real_signals.contains(name),
+            string: self.string_signals.contains(name),
+            meta: self.take_formal_metadata(name),
+        };
+        if let Some(top) = self.decl_shadow_log.last_mut() {
+            top.saves.push(save);
+        }
+    }
+
+    /// Two declared types that are the same built-in or plain named type
+    /// (no packed dimensions or type arguments). Anything else compares
+    /// unequal.
+    fn dt_trivially_equal(a: &DataType, b: &DataType) -> bool {
+        match (a, b) {
+            (DataType::Simple { kind: x, .. }, DataType::Simple { kind: y, .. }) => x == y,
+            (DataType::Real { kind: x, .. }, DataType::Real { kind: y, .. }) => x == y,
+            (
+                DataType::IntegerAtom {
+                    kind: k1,
+                    signing: s1,
+                    ..
+                },
+                DataType::IntegerAtom {
+                    kind: k2,
+                    signing: s2,
+                    ..
+                },
+            ) => k1 == k2 && s1 == s2,
+            (
+                DataType::IntegerVector {
+                    kind: k1,
+                    signing: s1,
+                    dimensions: d1,
+                    ..
+                },
+                DataType::IntegerVector {
+                    kind: k2,
+                    signing: s2,
+                    dimensions: d2,
+                    ..
+                },
+            ) => k1 == k2 && s1 == s2 && d1.is_empty() && d2.is_empty(),
+            (
+                DataType::TypeReference {
+                    name: n1,
+                    dimensions: d1,
+                    type_args: t1,
+                    ..
+                },
+                DataType::TypeReference {
+                    name: n2,
+                    dimensions: d2,
+                    type_args: t2,
+                    ..
+                },
+            ) => {
+                n1.name.name == n2.name.name
+                    && n1.scope.as_ref().map(|s| &s.name) == n2.scope.as_ref().map(|s| &s.name)
+                    && d1.is_empty()
+                    && d2.is_empty()
+                    && t1.is_empty()
+                    && t2.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    /// `snapshot_formal_metadata` that MOVES the entries out instead of
+    /// cloning them: the declaration about to run re-registers its own.
+    fn take_formal_metadata(&mut self, name: &str) -> FormalMetadataSnapshot {
+        let packed_element_widths = if self.elem_base_has_dotted(name) {
+            let snap = self.snapshot_formal_metadata(name).packed_element_widths;
+            for (k, _) in &snap {
+                self.module.packed_signal_elem_widths.remove(k);
+            }
+            snap
+        } else {
+            self.module
+                .packed_signal_elem_widths
+                .remove_entry(name)
+                .into_iter()
+                .collect()
+        };
+        FormalMetadataSnapshot {
+            name: name.to_string(),
+            declared_type: self.module.var_decl_types.remove(name),
+            packed_fields: self.module.packed_struct_fields.remove(name),
+            packed_element_widths,
+            packed_dimensions: self.module.packed_full_dims.remove(name),
+            class_type: self.var_class_types.remove(name),
+            typedef_type: self.var_typedef_types.remove(name),
+        }
+    }
+
+    /// End the logging activation (its frame still on top): put back what
+    /// its declarations displaced, unless other processes ran meanwhile.
+    fn close_decl_shadow_frame(&mut self) {
+        let Some(&frame_gen) = self.local_gen_stack.last() else {
+            return;
+        };
+        let Some(pos) = self
+            .decl_shadow_log
+            .iter()
+            .rposition(|f| f.frame_gen == frame_gen)
+        else {
+            return;
+        };
+        // Anything above belongs to an activation that never closed (an
+        // unwound body); it can no longer be restored safely.
+        self.decl_shadow_log.truncate(pos + 1);
+        let Some(frame) = self.decl_shadow_log.pop() else {
+            return;
+        };
+        if frame.epoch != self.nested_run_epoch {
+            return;
+        }
+        for d in frame.saves.into_iter().rev() {
+            let name = d.meta.name.clone();
+            match d.width {
+                Some(w) => {
+                    self.widths.insert(name.clone(), w);
+                }
+                None => {
+                    self.widths.remove(&name);
+                }
+            }
+            if d.signed {
+                self.signed_signals.insert(name.clone());
+            } else {
+                self.signed_signals.remove(&name);
+            }
+            if d.real {
+                self.real_signals.insert(name.clone());
+            } else {
+                self.real_signals.remove(&name);
+            }
+            if d.string {
+                self.string_signals.insert(name);
+            } else {
+                self.string_signals.remove(&name);
+            }
+            self.restore_formal_metadata(d.meta);
+        }
     }
 
     fn restore_formal_metadata(&mut self, saved: FormalMetadataSnapshot) {
@@ -127123,6 +127358,7 @@ impl Simulator {
                     }
                 };
                 self.push_local_frame(locals);
+                self.open_decl_shadow_frame();
                 // Re-apply the TYPE-PARAMETER class bindings now that the
                 // callee's own frame is on top of `local_type_stack`. During
                 // the port loop above, `local_type_stack.last_mut()` still
@@ -127191,6 +127427,7 @@ impl Simulator {
                 // method's non-string locals can't leak a `remove` (parking
                 // mirrors the free-function path: the frame is torn down and
                 // re-entered on resume, re-pushing the snapshot).
+                self.close_decl_shadow_frame();
                 for n in &frame_string_signals {
                     self.string_signals.remove(n);
                 }

@@ -43,6 +43,8 @@ mod block_local_width_in_index_shift;
 mod byte_local_narrow;
 #[path = "types/callback_typedef_static.rs"]
 mod callback_typedef_static;
+#[path = "types/callee_local_keeps_caller_type.rs"]
+mod callee_local_keeps_caller_type;
 #[path = "types/cast_class_member_enum_range.rs"]
 mod cast_class_member_enum_range;
 #[path = "types/cast_operand_context.rs"]
