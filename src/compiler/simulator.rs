@@ -120378,6 +120378,112 @@ impl Simulator {
         ok
     }
 
+    /// §18.5.4/§18.5.10 — does the DISTRIBUTION of this constraint set need
+    /// the joint solver? A `solve … before` ordering, a `dist` inside an
+    /// `if`/`->`, or a `dist` on a variable that another constraint also
+    /// reads: the trials draw each variable on its own and repair the rest,
+    /// which ignores the ordering and skews the weights (a repair lands on
+    /// values of whichever item the other constraints leave room for).
+    fn rand_order_sensitive(&self, constraints: &[ClassConstraint]) -> bool {
+        fn has_any(it: &ConstraintItem) -> bool {
+            match it {
+                ConstraintItem::Solve { .. } => true,
+                ConstraintItem::Inside { is_dist, .. } => *is_dist,
+                ConstraintItem::Implication { constraint, .. } => has_any(constraint),
+                ConstraintItem::IfElse {
+                    then_item,
+                    else_item,
+                    ..
+                } => has_any(then_item) || else_item.as_ref().is_some_and(|e| has_any(e)),
+                ConstraintItem::Foreach { item, .. } | ConstraintItem::Soft(item) => has_any(item),
+                ConstraintItem::Block(items) => items.iter().any(has_any),
+                ConstraintItem::Expr(_) | ConstraintItem::Unique { .. } => false,
+            }
+        }
+        if !constraints.iter().any(|c| c.items.iter().any(has_any)) {
+            return false;
+        }
+        // (dist targets, names read elsewhere); true when decided early.
+        fn walk(
+            me: &Simulator,
+            it: &ConstraintItem,
+            guarded: bool,
+            dist: &mut HashSet<String>,
+            other: &mut HashSet<String>,
+        ) -> bool {
+            match it {
+                ConstraintItem::Solve { .. } => true,
+                ConstraintItem::Inside {
+                    expr,
+                    range,
+                    is_dist: true,
+                    ..
+                } => {
+                    let base = match &Simulator::unparen(expr).kind {
+                        ExprKind::Index { expr: b, .. } => Simulator::plain_ident_name(b),
+                        _ => Simulator::plain_ident_name(expr),
+                    };
+                    let Some(base) = base else {
+                        return true;
+                    };
+                    if guarded {
+                        return true;
+                    }
+                    dist.insert(base);
+                    for r in range {
+                        match r {
+                            ConstraintRange::Value(e) => me.collect_expr_idents(e, other),
+                            ConstraintRange::Range { lo, hi } => {
+                                me.collect_expr_idents(lo, other);
+                                me.collect_expr_idents(hi, other);
+                            }
+                        }
+                    }
+                    false
+                }
+                ConstraintItem::Implication {
+                    condition,
+                    constraint,
+                    ..
+                } => {
+                    me.collect_expr_idents(condition, other);
+                    walk(me, constraint, true, dist, other)
+                }
+                ConstraintItem::IfElse {
+                    condition,
+                    then_item,
+                    else_item,
+                    ..
+                } => {
+                    me.collect_expr_idents(condition, other);
+                    walk(me, then_item, true, dist, other)
+                        || else_item
+                            .as_ref()
+                            .is_some_and(|e| walk(me, e, true, dist, other))
+                }
+                ConstraintItem::Foreach { item, .. } | ConstraintItem::Soft(item) => {
+                    walk(me, item, guarded, dist, other)
+                }
+                ConstraintItem::Block(items) => items
+                    .iter()
+                    .fold(false, |hit, i| walk(me, i, guarded, dist, other) || hit),
+                _ => {
+                    me.collect_item_idents(it, other);
+                    false
+                }
+            }
+        }
+        let (mut dist, mut other) = (HashSet::default(), HashSet::default());
+        for con in constraints {
+            for it in &con.items {
+                if walk(self, it, false, &mut dist, &mut other) {
+                    return true;
+                }
+            }
+        }
+        dist.iter().any(|d| other.contains(d))
+    }
+
     /// §18.5.10 — is uniform rejection sampling the right solver for this
     /// class? It reproduces the LRM's solution-space distribution exactly, but
     /// only where every constraint is (a) checkable and (b) free of the
@@ -121491,8 +121597,56 @@ impl Simulator {
             && unpacked_agg_props.is_empty()
             && rand_nd_arrays.is_empty();
         let mut csp_runs = 0u32;
+        let array_enums: HashMap<String, String> = rand_arrays
+            .iter()
+            .filter_map(|a| a.5.clone().map(|t| (a.0.clone(), t)))
+            .collect();
+        // §18.5.4/§18.5.10: a set whose DISTRIBUTION the per-variable trials
+        // below cannot honour (see `rand_order_sensitive`) goes to the joint
+        // solver first; the trials stay the fallback.
+        let mut trials = 1000;
+        if csp_ok
+            && !rand_colls.iter().any(|c| c.kind == CollKind::Dyn)
+            && self.rand_order_sensitive(&constraints)
+        {
+            csp_runs += 1;
+            let saved = self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .map(|i| i.properties.clone());
+            match self.rand_csp_solve(
+                handle,
+                &constraints,
+                &rand_props,
+                &signed_rand_props,
+                &enum_prop_types,
+                &rand_colls,
+                &array_enums,
+                true,
+            ) {
+                rand_csp::CspOutcome::Sat => {
+                    if has_post {
+                        self.exec_method_call(handle, "post_randomize", &[]);
+                    }
+                    self.this_stack.pop();
+                    self.class_context_stack.pop();
+                    return Value::from_u64(1, 32);
+                }
+                out => {
+                    match out {
+                        rand_csp::CspOutcome::Unsat => trials = 0,
+                        rand_csp::CspOutcome::NotApplicable => csp_ok = false,
+                        _ => {}
+                    }
+                    if let (Some(p), Some(Some(inst))) = (saved, self.heap.get_mut(handle)) {
+                        inst.properties = p;
+                    }
+                }
+            }
+        }
         self.rand_tight_mode = false;
-        for _trial in 0..1000 {
+        for _trial in 0..trials {
             self.rand_tight_mode = fixed_fe_fail_streak >= 4;
             // LRM §18.5.4 dist: clear the pick-once gate at each trial so a
             // failed trial doesn't permanently freeze the dist constraint.
@@ -122685,26 +122839,15 @@ impl Simulator {
             if csp_ok && csp_runs < 8 {
                 let sized = rand_colls.iter().any(|c| c.kind == CollKind::Dyn);
                 csp_runs += 1;
-                let array_enums: HashMap<String, String> = rand_arrays
-                    .iter()
-                    .filter_map(|a| a.5.clone().map(|t| (a.0.clone(), t)))
-                    .collect();
-                let colls: Vec<RandColl> = match &self.randomize_subset {
-                    Some(sub) => rand_colls
-                        .iter()
-                        .filter(|c| sub.contains(&c.prop))
-                        .cloned()
-                        .collect(),
-                    None => rand_colls.clone(),
-                };
                 match self.rand_csp_solve(
                     handle,
                     &constraints,
                     &rand_props,
                     &signed_rand_props,
                     &enum_prop_types,
-                    &colls,
+                    &rand_colls,
                     &array_enums,
+                    false,
                 ) {
                     rand_csp::CspOutcome::Sat => {
                         if has_post {

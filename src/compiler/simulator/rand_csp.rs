@@ -20,6 +20,15 @@
 //! choice assigns the variables, so solutions spread over the space. A node
 //! budget bounds the work: exhausting the search proves infeasibility,
 //! running out of budget gives up and leaves the caller's trials in charge.
+//!
+//! Distribution (§18.5.4, §18.5.10): a variable under a `dist` in force is
+//! decided before the others and draws a dist item in proportion to its
+//! weight among the items the current domain still meets, then a value of
+//! that item; `solve a before b` decides `a` first, uniformly over its
+//! feasible values. A variable read by an `if`/`->` condition weighs each
+//! value of a small domain by the product of the other domains after
+//! propagating it, so an antecedent that pins a wide consequent (`s -> d ==
+//! 0`) comes up in proportion to the solutions it leaves.
 use super::*;
 use crate::ast::decl::DistWeight;
 use crate::compiler::elaborate::{is_type_real, is_type_signed, resolve_type_width};
@@ -32,6 +41,10 @@ type Dom = Vec<(i128, i128)>;
 const NODE_BUDGET: u64 = 40_000;
 /// Constraint executions allowed in one solve (propagation work).
 const WORK_BUDGET: u64 = 1_000_000;
+/// Propagation work allowed for weighing values of condition variables.
+const EST_BUDGET: u64 = 200_000;
+/// Largest domain whose values are weighed one by one.
+const EST_MAX_DOM: u128 = 64;
 /// Largest variable count the solver takes on.
 const MAX_VARS: usize = 8192;
 
@@ -262,6 +275,28 @@ enum Node {
     },
 }
 
+/// A `dist` on one solver variable (§18.5.4), in force while every guard
+/// (the enclosing `if`/`->` conditions) holds.
+#[derive(Clone, Debug)]
+struct Dist {
+    var: usize,
+    /// (lo, hi, item weight): `:=` weighs every value of the item, `:/`
+    /// the item as a whole.
+    items: Vec<(i128, i128, f64)>,
+    guards: Vec<Node>,
+}
+
+/// Per-solve search tables derived from the translated problem.
+struct Aux {
+    /// Dists on each variable.
+    dists: Vec<Vec<usize>>,
+    /// `solve p before v`: the variables decided before each one.
+    preds: Vec<Vec<usize>>,
+    succs: Vec<Vec<usize>>,
+    /// Read by some `if`/`->` condition.
+    guard_var: Vec<bool>,
+}
+
 #[derive(Clone, Debug)]
 enum VarKey {
     Prop(String),
@@ -309,6 +344,13 @@ struct Csp {
     /// Whether any `soft` item was seen (translation with `with_soft`).
     has_soft: bool,
     with_soft: bool,
+    dists: Vec<Dist>,
+    /// `solve before after` as variable lists.
+    order: Vec<(Vec<usize>, Vec<usize>)>,
+    /// Some item is left to a checker that does not judge it (a `foreach`
+    /// or `unique` the translation could not model), so a solution is not
+    /// fully verified.
+    opaque: bool,
 }
 
 /// Translation scope: bound `foreach` indices and the `with` iterator.
@@ -317,6 +359,16 @@ struct Env {
     binds: Vec<(String, Value)>,
     /// (iterator name, element variable, element index)
     it: Option<(String, usize, i64)>,
+    /// Conditions of the enclosing `if`/`->` items.
+    guards: Vec<Node>,
+}
+
+impl Env {
+    fn guarded(&self, g: &Node) -> Env {
+        let mut e = self.clone();
+        e.guards.push(g.clone());
+        e
+    }
 }
 
 /// An arithmetic operand before its context is known (§11.8.2).
@@ -352,6 +404,8 @@ struct St {
     trail: Vec<(usize, Dom)>,
     dirty: Vec<usize>,
     work: u64,
+    /// Work spent weighing values (`csp_weigh`), outside `work`.
+    est_work: u64,
 }
 
 impl St {
@@ -498,7 +552,8 @@ impl Simulator {
     /// Solve the constraint set of `handle` jointly (see the module docs).
     /// `rand_props` are the scalar rand properties, `colls` the rand
     /// collections (dynamic ones already sized), `array_enums` the enum type
-    /// of enum-typed fixed-array elements.
+    /// of enum-typed fixed-array elements. `strict` gives up on a set the
+    /// final check cannot fully verify.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn rand_csp_solve(
         &mut self,
@@ -509,6 +564,7 @@ impl Simulator {
         enum_props: &HashMap<String, String>,
         colls: &[RandColl],
         array_enums: &HashMap<String, String>,
+        strict: bool,
     ) -> CspOutcome {
         let Some(mut csp) = self.csp_vars(
             handle,
@@ -524,6 +580,9 @@ impl Simulator {
         if self.csp_translate(&mut csp, constraints).is_none() {
             return CspOutcome::NotApplicable;
         }
+        if strict && csp.opaque {
+            return CspOutcome::GaveUp;
+        }
         let mut out = self.csp_run(&csp, constraints, colls);
         if !matches!(out, CspOutcome::Sat) && csp.has_soft {
             // §18.5.14: soft constraints yield when the hard set cannot
@@ -531,6 +590,8 @@ impl Simulator {
             csp.with_soft = false;
             csp.srcs.clear();
             csp.nodes.clear();
+            csp.dists.clear();
+            csp.order.clear();
             if self.csp_translate(&mut csp, constraints).is_none() {
                 return CspOutcome::NotApplicable;
             }
@@ -559,6 +620,9 @@ impl Simulator {
             nodes: Vec::new(),
             has_soft: false,
             with_soft: false,
+            dists: Vec::new(),
+            order: Vec::new(),
+            opaque: false,
         };
         let enum_dom = |me: &Self, tn: &str| -> Option<Dom> {
             let members = me.module.enum_members.get(tn)?;
@@ -664,6 +728,7 @@ impl Simulator {
                 watch[v].push(i);
             }
         }
+        let aux = Self::csp_aux(csp);
         let mut budget = NODE_BUDGET;
         let mut run_budget: u64 = 1000;
         let mut st = St {
@@ -671,13 +736,14 @@ impl Simulator {
             trail: Vec::new(),
             dirty: Vec::new(),
             work: 0,
+            est_work: 0,
         };
         loop {
             st.d.clone_from(&csp.dom0);
             st.trail.clear();
             st.dirty.clear();
             let mut run = run_budget.min(budget);
-            let r = self.csp_search(csp, &watch, &mut st, &mut run);
+            let r = self.csp_search(csp, &aux, &watch, &mut st, &mut run);
             budget -= run_budget.min(budget) - run;
             match r {
                 Some(true) => break,
@@ -705,6 +771,7 @@ impl Simulator {
     fn csp_search(
         &mut self,
         csp: &Csp,
+        aux: &Aux,
         watch: &[Vec<usize>],
         st: &mut St,
         budget: &mut u64,
@@ -718,16 +785,14 @@ impl Simulator {
         // (variable, value, trail mark) per decision level
         let mut stack: Vec<(usize, i128, usize)> = Vec::new();
         loop {
-            let Some(v) = self.csp_pick_var(st) else {
+            let Some(v) = self.csp_pick_var(csp, aux, st) else {
                 return Some(true);
             };
             if *budget == 0 {
                 return None;
             }
             *budget -= 1;
-            let size = dom_size(&st.d[v]);
-            let k = self.cur_rng().gen_range(0..size);
-            let val = dom_nth(&st.d[v], k);
+            let val = self.csp_pick_val(csp, aux, watch, st, v);
             stack.push((v, val, st.trail.len()));
             st.dirty.clear();
             st.set(v, vec![(val, val)]);
@@ -779,30 +844,234 @@ impl Simulator {
         out
     }
 
-    /// Smallest unfixed domain, ties broken at random.
-    fn csp_pick_var(&mut self, st: &St) -> Option<usize> {
-        let mut best: Option<(u128, usize)> = None;
+    /// The next variable to decide: one whose `solve … before` predecessors
+    /// are all fixed; among those a variable under a dist in force first and
+    /// one whose dist still waits on its guard last; then the smallest
+    /// domain, ties broken at random.
+    fn csp_pick_var(&mut self, csp: &Csp, aux: &Aux, st: &St) -> Option<usize> {
+        let mut best: Option<(u8, u128, usize)> = None;
         let mut ties = 0u32;
         for (v, d) in st.d.iter().enumerate() {
             if dom_fixed(d).is_some() {
                 continue;
             }
+            let blocked = aux.preds[v].iter().any(|&p| st.fixed(p).is_none());
+            let tier = if aux.dists[v].is_empty() {
+                1
+            } else {
+                match self.csp_dist_state(csp, aux, st, v) {
+                    (Some(_), _) => 0,
+                    (None, true) => 2,
+                    (None, false) => 1,
+                }
+            };
+            let rank = blocked as u8 * 3 + tier;
             let n = dom_size(d);
             match best {
-                Some((bn, _)) if n > bn => {}
-                Some((bn, _)) if n == bn => {
+                Some((br, bn, _)) if (rank, n) > (br, bn) => {}
+                Some((br, bn, _)) if (rank, n) == (br, bn) => {
                     ties += 1;
                     if self.cur_rng().gen_range(0..=ties) == 0 {
-                        best = Some((n, v));
+                        best = Some((rank, n, v));
                     }
                 }
                 _ => {
-                    best = Some((n, v));
+                    best = Some((rank, n, v));
                     ties = 0;
                 }
             }
         }
-        best.map(|b| b.1)
+        best.map(|b| b.2)
+    }
+
+    /// The dist in force on `v` (every guard entailed), and whether some
+    /// dist on `v` still has an open guard.
+    fn csp_dist_state(&mut self, csp: &Csp, aux: &Aux, st: &St, v: usize) -> (Option<usize>, bool) {
+        let mut open = false;
+        for &di in &aux.dists[v] {
+            let mut all = true;
+            for g in &csp.dists[di].guards {
+                match self.csp_status(csp, g, st) {
+                    Some(true) => {}
+                    Some(false) => {
+                        all = false;
+                        break;
+                    }
+                    None => {
+                        all = false;
+                        open = true;
+                    }
+                }
+            }
+            if all {
+                return (Some(di), open);
+            }
+        }
+        (None, open)
+    }
+
+    /// A value for `v`: by the dist in force (§18.5.4: an item in proportion
+    /// to its weight among the items the domain still meets, then a value of
+    /// that item), by weighing (`csp_weigh`) for a condition variable, else
+    /// uniformly over the domain.
+    fn csp_pick_val(
+        &mut self,
+        csp: &Csp,
+        aux: &Aux,
+        watch: &[Vec<usize>],
+        st: &mut St,
+        v: usize,
+    ) -> i128 {
+        if !aux.dists[v].is_empty() {
+            if let (Some(di), _) = self.csp_dist_state(csp, aux, st, v) {
+                let mut live: Vec<(Dom, f64)> = Vec::new();
+                let mut total = 0.0;
+                for &(lo, hi, w) in &csp.dists[di].items {
+                    let part = dom_clip(&st.d[v], lo, hi);
+                    if !part.is_empty() {
+                        total += w;
+                        live.push((part, w));
+                    }
+                }
+                if total > 0.0 {
+                    let mut r = self.cur_rng().gen_range(0.0..total);
+                    let mut pick = live.len() - 1;
+                    for (i, (_, w)) in live.iter().enumerate() {
+                        if r < *w {
+                            pick = i;
+                            break;
+                        }
+                        r -= w;
+                    }
+                    let part = &live[pick].0;
+                    let k = self.cur_rng().gen_range(0..dom_size(part));
+                    return dom_nth(part, k);
+                }
+            }
+        }
+        let size = dom_size(&st.d[v]);
+        if aux.guard_var[v] && size <= EST_MAX_DOM && st.est_work < EST_BUDGET {
+            if let Some(x) = self.csp_weigh(csp, aux, watch, st, v) {
+                return x;
+            }
+        }
+        let k = self.cur_rng().gen_range(0..size);
+        dom_nth(&st.d[v], k)
+    }
+
+    /// §18.5.10: without an ordering every solution is equally likely, so a
+    /// value is drawn in proportion to the solutions it leaves — estimated as
+    /// the product of the other domains after propagating it. Variables
+    /// under a dist (their draw follows the weights, not the count) and the
+    /// variables `v` is solved before do not count. None when the estimate
+    /// ran out of budget.
+    fn csp_weigh(
+        &mut self,
+        csp: &Csp,
+        aux: &Aux,
+        watch: &[Vec<usize>],
+        st: &mut St,
+        v: usize,
+    ) -> Option<i128> {
+        let mut after = vec![false; csp.vars.len()];
+        let mut todo: Vec<usize> = aux.succs[v].clone();
+        while let Some(u) = todo.pop() {
+            if !after[u] {
+                after[u] = true;
+                todo.extend(aux.succs[u].iter().copied());
+            }
+        }
+        let vals: Vec<i128> = st.d[v].iter().flat_map(|&(l, h)| l..=h).collect();
+        let mut logs: Vec<f64> = Vec::with_capacity(vals.len());
+        let mut seen = vec![false; csp.vars.len()];
+        let mut touched: Vec<usize> = Vec::new();
+        for &x in &vals {
+            let mark = st.trail.len();
+            let w0 = st.work;
+            st.dirty.clear();
+            st.set(v, vec![(x, x)]);
+            let dirty = std::mem::take(&mut st.dirty);
+            let r = self.csp_propagate(csp, watch, st, &Self::csp_watchers(watch, &dirty));
+            let mut lg = f64::NEG_INFINITY;
+            if r == Some(true) {
+                lg = 0.0;
+                for (u, old) in &st.trail[mark..] {
+                    let u = *u;
+                    if u == v || after[u] || !aux.dists[u].is_empty() || seen[u] {
+                        continue;
+                    }
+                    seen[u] = true;
+                    touched.push(u);
+                    lg += (dom_size(&st.d[u]) as f64).log2() - (dom_size(old) as f64).log2();
+                }
+                for u in touched.drain(..) {
+                    seen[u] = false;
+                }
+            }
+            st.undo(mark);
+            st.est_work += st.work - w0;
+            st.work = w0;
+            r?;
+            logs.push(lg);
+        }
+        let top = logs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if top == f64::NEG_INFINITY {
+            return None;
+        }
+        let ws: Vec<f64> = logs.iter().map(|l| (l - top).exp2()).collect();
+        let total: f64 = ws.iter().sum();
+        let mut r = self.cur_rng().gen_range(0.0..total);
+        for (i, w) in ws.iter().enumerate() {
+            if r < *w {
+                return Some(vals[i]);
+            }
+            r -= w;
+        }
+        Some(vals[vals.len() - 1])
+    }
+
+    fn csp_aux(csp: &Csp) -> Aux {
+        let n = csp.vars.len();
+        let mut aux = Aux {
+            dists: vec![Vec::new(); n],
+            preds: vec![Vec::new(); n],
+            succs: vec![Vec::new(); n],
+            guard_var: vec![false; n],
+        };
+        for (i, d) in csp.dists.iter().enumerate() {
+            aux.dists[d.var].push(i);
+        }
+        for (before, after) in &csp.order {
+            for &a in after {
+                for &b in before {
+                    if a != b {
+                        aux.preds[a].push(b);
+                        aux.succs[b].push(a);
+                    }
+                }
+            }
+        }
+        fn conds(n: &Node, srcs: &[Src], out: &mut Vec<usize>) {
+            match n {
+                Node::And(ns) | Node::Or(ns) => ns.iter().for_each(|m| conds(m, srcs, out)),
+                Node::If {
+                    cond, then, els, ..
+                } => {
+                    cond.deps(srcs, out);
+                    conds(then, srcs, out);
+                    conds(els, srcs, out);
+                }
+                _ => {}
+            }
+        }
+        let mut gv = Vec::new();
+        for nd in &csp.nodes {
+            conds(nd, &csp.srcs, &mut gv);
+        }
+        for v in gv {
+            aux.guard_var[v] = true;
+        }
+        aux
     }
 
     /// Run the queued nodes to a fixpoint. `Some(false)` on a conflict,
@@ -1181,6 +1450,12 @@ impl Simulator {
             // An opaque call may read any rand member.
             deps = (0..csp.vars.len()).collect();
         }
+        if matches!(
+            item,
+            SrcItem::Item(ConstraintItem::Foreach { .. } | ConstraintItem::Unique { .. })
+        ) {
+            csp.opaque = true;
+        }
         deps.sort_unstable();
         deps.dedup();
         let src = self.csp_src(csp, item, env, deps);
@@ -1197,7 +1472,7 @@ impl Simulator {
                 dist_weights,
                 ..
             } => {
-                let range: Vec<ConstraintRange> = if *is_dist {
+                let set: Vec<ConstraintRange> = if *is_dist {
                     // §18.5.4: a zero weight removes the value.
                     let mut kept = Vec::new();
                     for (k, r) in range.iter().enumerate() {
@@ -1215,14 +1490,20 @@ impl Simulator {
                 } else {
                     range.clone()
                 };
-                self.csp_inside(csp, expr, &range, env, false, SrcItem::Item(item.clone()))
+                let n =
+                    self.csp_inside(csp, expr, &set, env, false, SrcItem::Item(item.clone()))?;
+                if *is_dist {
+                    self.csp_dist(csp, expr, &range, dist_weights, env);
+                }
+                Some(n)
             }
             ConstraintItem::Implication {
                 condition,
                 constraint,
                 ..
             } => {
-                let then = self.csp_item(csp, constraint, env)?;
+                let c = self.csp_bool(csp, condition, env, false)?;
+                let then = self.csp_item(csp, constraint, &env.guarded(&c))?;
                 self.csp_if(csp, condition, then, Node::True, env)
             }
             ConstraintItem::IfElse {
@@ -1231,9 +1512,13 @@ impl Simulator {
                 else_item,
                 ..
             } => {
-                let then = self.csp_item(csp, then_item, env)?;
+                let c = self.csp_bool(csp, condition, env, false)?;
+                let then = self.csp_item(csp, then_item, &env.guarded(&c))?;
                 let els = match else_item {
-                    Some(e) => self.csp_item(csp, e, env)?,
+                    Some(e) => {
+                        let nc = self.csp_bool(csp, condition, env, true)?;
+                        self.csp_item(csp, e, &env.guarded(&nc))?
+                    }
                     None => Node::True,
                 };
                 self.csp_if(csp, condition, then, els, env)
@@ -1267,7 +1552,24 @@ impl Simulator {
                 }
                 Some(Self::csp_and(out))
             }
-            ConstraintItem::Solve { .. } => Some(Node::True),
+            ConstraintItem::Solve { before, after, .. } => {
+                let vars = |names: &[crate::ast::Identifier]| -> Vec<usize> {
+                    let mut out = Vec::new();
+                    for id in names {
+                        if let Some(&v) = csp.scalars.get(&id.name) {
+                            out.push(v);
+                        } else if let Some(a) = csp.arrays.get(&id.name) {
+                            out.extend(a.elems.iter().map(|e| e.1));
+                        }
+                    }
+                    out
+                };
+                let (b, a) = (vars(before), vars(after));
+                if !b.is_empty() && !a.is_empty() {
+                    csp.order.push((b, a));
+                }
+                Some(Node::True)
+            }
             ConstraintItem::Soft(inner) => {
                 csp.has_soft = true;
                 if csp.with_soft {
@@ -1309,6 +1611,85 @@ impl Simulator {
                 }
                 Some(Node::AllDiff(vs))
             }
+        }
+    }
+
+    /// Record the weights of `expr dist {…}` when `expr` is one solver
+    /// variable (§18.5.4): a value or range item weighs `w` per value with
+    /// `:=` (the default) and `w` in all with `:/`; a zero weight or an empty
+    /// (reversed) range contributes nothing, and `$` is the variable's own
+    /// bound.
+    fn csp_dist(
+        &mut self,
+        csp: &mut Csp,
+        expr: &Expression,
+        ranges: &[ConstraintRange],
+        weights: &[Option<DistWeight>],
+        env: &Env,
+    ) {
+        let Some(Ae::Var(v, w, s)) = self.csp_ae(csp, expr, env) else {
+            return;
+        };
+        let (vlo, vhi) = ws_range(w, s);
+        let frame: HashMap<String, Value> = env.binds.iter().cloned().collect();
+        self.push_local_frame(frame);
+        let mut items = Vec::with_capacity(ranges.len());
+        let mut ok = true;
+        for (k, r) in ranges.iter().enumerate() {
+            let (wt, per_value) = match weights.get(k).and_then(|w| w.as_ref()) {
+                Some(DistWeight::Each(e)) => (self.csp_const(e, env), true),
+                Some(DistWeight::Total(e)) => (self.csp_const(e, env), false),
+                None => (Some(Value::from_u64(1, 32)), true),
+            };
+            let Some(wt) = wt.and_then(|x| x.to_u64()) else {
+                ok = false;
+                break;
+            };
+            let bound = |me: &mut Self, e: &Expression, dollar: i128| -> Option<i128> {
+                if matches!(e.kind, ExprKind::Dollar) {
+                    return Some(dollar);
+                }
+                if !me.csp_free(csp, e, env) {
+                    return None;
+                }
+                me.exact_int(e).map(|x| x.0)
+            };
+            let (lo, hi) = match r {
+                ConstraintRange::Value(e) => match bound(self, e, vhi) {
+                    Some(x) => (x, x),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                },
+                ConstraintRange::Range { lo, hi } => {
+                    match (bound(self, lo, vlo), bound(self, hi, vhi)) {
+                        (Some(l), Some(h)) => (l, h),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            };
+            let (lo, hi) = (lo.max(vlo), hi.min(vhi));
+            if wt == 0 || lo > hi {
+                continue;
+            }
+            let mass = if per_value {
+                wt as f64 * (hi - lo + 1) as f64
+            } else {
+                wt as f64
+            };
+            items.push((lo, hi, mass));
+        }
+        self.pop_local_frame();
+        if ok && !items.is_empty() {
+            csp.dists.push(Dist {
+                var: v,
+                items,
+                guards: env.guards.clone(),
+            });
         }
     }
 
