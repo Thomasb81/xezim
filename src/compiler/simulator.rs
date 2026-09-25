@@ -5112,7 +5112,8 @@ pub struct Simulator {
     /// a pick that wrapped the cycle, so the rollback can restore it.
     randc_pending: HashMap<(usize, String), (u64, Option<HashSet<u64>>)>,
     /// §18.5.4/§18.10 dist schedules, keyed by (instance handle, variable):
-    /// (weight signature, item schedule, next slot). See `pick_dist_value`.
+    /// one (weight signature, item schedule, next slot) per weight set. See
+    /// `pick_dist_value`.
     dist_decks: HashMap<(usize, String), Vec<(u64, Vec<usize>, usize)>>,
     /// Built-in semaphores (handle -> current count)
     semaphores: HashMap<usize, i64>,
@@ -95297,9 +95298,9 @@ impl Simulator {
     /// histogram tracks the declared distribution over tens of calls instead of
     /// needing thousands to average out sampling noise — which is what
     /// distribution checks in testbenches actually measure. §18.10: the weights
-    /// are expressions re-evaluated on every call, so the schedule is rebuilt
-    /// as soon as they change. Weights too fine for a schedule (`[0:99999] :=
-    /// 1, 100000 := 100`) are drawn independently.
+    /// are expressions re-evaluated on every call, and each set of weights
+    /// keeps a schedule of its own. Weights too fine for a schedule
+    /// (`[0:99999] := 1, 100000 := 100`) are drawn independently.
     fn pick_dist_value(
         &mut self,
         key: Option<(usize, String)>,
@@ -118539,10 +118540,6 @@ impl Simulator {
         }
     }
 
-    /// Every rand collection member of `handle`'s class chain (skipping any
-    /// with `rand_mode(0)`), classified by kind. Fixed unpacked arrays are
-    /// included so `unique {}` / strict checking can see them, but their
-    /// element seeding stays with the legacy enum-pool pass.
     /// §18.11/§18.13: the members of one class that this `randomize()`
     /// draws — its `rand`/`randc` members whose rand_mode is on or, for
     /// `randomize(a, b)`, exactly the members named, declared `rand` or not
@@ -118578,6 +118575,10 @@ impl Simulator {
         }
     }
 
+    /// Every rand collection member of `handle`'s class chain (those
+    /// `randomize_members` draws), classified by kind. Fixed unpacked arrays
+    /// are included so `unique {}` / strict checking can see them, but their
+    /// element seeding stays with the legacy enum-pool pass.
     fn collect_rand_colls(
         &self,
         handle: usize,
