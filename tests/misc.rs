@@ -185,6 +185,8 @@ mod packed_mem_range_store;
 mod param_class_cast_type_args;
 #[path = "misc/param_pair_this_type_cast.rs"]
 mod param_pair_this_type_cast;
+#[path = "misc/parameter_override_legality.rs"]
+mod parameter_override_legality;
 #[path = "misc/parser_gaps2.rs"]
 mod parser_gaps2;
 #[path = "misc/parser_stmt_gaps.rs"]
