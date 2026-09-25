@@ -19,6 +19,9 @@
 //! - §6.21: an automatic variable is not written by a nonblocking assignment
 //!   and not used in a procedural continuous assignment, whose target is a
 //!   whole variable (§10.6.1).
+//! - §6.19: an enum's base type is an integer atom type, or an integer vector
+//!   type with one packed dimension at most; §7.2.1: every member of a packed
+//!   struct or union is packed.
 //!
 //! The same rules apply to declaration initializers, `return` values and
 //! subroutine input arguments, which are assignments too (§13.5).
@@ -45,7 +48,8 @@ use xezim_core::ast::module::PortList;
 use xezim_core::ast::stmt::{ForInit, ProceduralContinuous, Statement, StatementKind};
 use xezim_core::ast::types::{
     DataType, EnumType, IntegerAtomType, IntegerVectorType, Lifetime, PackedDimension,
-    PortDirection, RealType, Signing, SimpleType, UnpackedDimension,
+    PortDirection, RealType, Signing, SimpleType, StructUnionKind, StructUnionType,
+    UnpackedDimension,
 };
 use xezim_core::elaborate::ElaboratedModule;
 
@@ -83,6 +87,14 @@ struct StructTy {
     key: String,
     packed: bool,
     members: Vec<(String, Ty)>,
+}
+
+/// What a typedef names, as an enum base type (§6.19).
+#[derive(Clone, Copy)]
+enum BaseKind {
+    Atom,
+    Vector,
+    Illegal(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -264,6 +276,8 @@ struct Scope {
     nonconst: HashSet<String>,
     /// Automatic variables (§6.21).
     autos: HashSet<String>,
+    /// Typedefs as enum base types.
+    bases: HashMap<String, BaseKind>,
     /// Block-level `static` declarations, which may be `localparam`s (the
     /// parser gives both one shape): neither constant nor variable here.
     unsure: HashSet<String>,
@@ -308,6 +322,9 @@ struct Ck<'a> {
     auto_ctx: bool,
     /// The definition is declared `automatic`.
     default_auto: bool,
+    /// Declarations whose legality was already reported (a type is resolved
+    /// once per use).
+    seen: HashSet<usize>,
     errs: Vec<String>,
 }
 
@@ -326,6 +343,7 @@ impl<'a> Ck<'a> {
             ret: None,
             auto_ctx: false,
             default_auto: false,
+            seen: HashSet::new(),
             errs: Vec::new(),
         }
     }
@@ -459,6 +477,9 @@ impl<'a> Ck<'a> {
                         members.push((d.name.name.clone(), with_dims(t.clone(), &d.dimensions)));
                     }
                 }
+                if su.packed {
+                    self.check_packed_members(su, &members);
+                }
                 Ty::Struct(Rc::new(StructTy {
                     key: format!("struct@{}", su.span.start),
                     packed: su.packed,
@@ -496,6 +517,7 @@ impl<'a> Ck<'a> {
     }
 
     fn resolve_enum(&mut self, et: &EnumType, name: Option<&str>) -> Ty {
+        self.check_enum_base(et);
         if !et.dimensions.is_empty() || et.members.is_empty() {
             return Ty::Unknown;
         }
@@ -526,7 +548,149 @@ impl<'a> Ck<'a> {
             dt => self.resolve(dt),
         };
         let t = with_dims(t, &td.dimensions);
-        self.top().types.insert(td.name.name.clone(), t);
+        let base = self.base_kind(td);
+        let top = self.top();
+        top.types.insert(td.name.name.clone(), t);
+        match base {
+            Some(b) => top.bases.insert(td.name.name.clone(), b),
+            None => top.bases.remove(&td.name.name),
+        };
+    }
+
+    fn base_kind(&self, td: &TypedefDeclaration) -> Option<BaseKind> {
+        if let Some(d) = td.dimensions.first() {
+            return Some(BaseKind::Illegal(match d {
+                UnpackedDimension::Unsized(_) => "a dynamic array",
+                UnpackedDimension::Queue { .. } => "a queue",
+                UnpackedDimension::Associative { .. } => "an associative array",
+                _ => "an unpacked array",
+            }));
+        }
+        Some(match &td.data_type {
+            DataType::IntegerAtom { .. } => BaseKind::Atom,
+            DataType::IntegerVector { .. } => BaseKind::Vector,
+            DataType::Enum(_) => BaseKind::Illegal("an enum"),
+            DataType::Struct(su) if su.kind == StructUnionKind::Union => {
+                BaseKind::Illegal("a union")
+            }
+            DataType::Struct(_) => BaseKind::Illegal("a struct"),
+            DataType::Real { .. } => BaseKind::Illegal("a real type"),
+            DataType::Simple {
+                kind: SimpleType::String,
+                ..
+            } => BaseKind::Illegal("string"),
+            DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } if name.scope.is_none() && type_args.is_empty() => {
+                match self.lookup_base(&name.name.name)? {
+                    BaseKind::Atom if !dimensions.is_empty() => {
+                        BaseKind::Illegal("an integer atom type with a packed dimension")
+                    }
+                    b => b,
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    fn lookup_base(&self, n: &str) -> Option<BaseKind> {
+        for l in self.stack.iter().rev() {
+            let s = l.get();
+            if s.types.contains_key(n) {
+                return s.bases.get(n).copied();
+            }
+            if s.opaque {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// §6.19 `enum_base_type`: an integer atom type, an integer vector type
+    /// with at most one packed dimension, or a typedef of either (an atom
+    /// typedef taking no packed dimension).
+    fn check_enum_base(&mut self, et: &EnumType) {
+        let Some(base) = &et.base_type else {
+            return;
+        };
+        let why = match &**base {
+            DataType::IntegerVector { dimensions, .. } if dimensions.len() > 1 => {
+                Some("a vector with more than one packed dimension")
+            }
+            DataType::Real { .. } => Some("a real type"),
+            DataType::Simple {
+                kind: SimpleType::String,
+                ..
+            } => Some("string"),
+            DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } if name.scope.is_none() && type_args.is_empty() => {
+                match self.lookup_base(&name.name.name) {
+                    Some(BaseKind::Atom) if !dimensions.is_empty() => {
+                        Some("an integer atom type with a packed dimension")
+                    }
+                    Some(BaseKind::Illegal(w)) => Some(w),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(w) = why
+            && self.seen.insert(et.span.start)
+        {
+            self.report(
+                et.span,
+                format!(
+                    "an enum base type must be an integer atom or vector type, not {w} \
+                     (IEEE 1800-2017 §6.19)"
+                ),
+            );
+        }
+    }
+
+    /// §7.2.1: only packed types go in a packed struct or union.
+    fn check_packed_members(&mut self, su: &StructUnionType, members: &[(String, Ty)]) {
+        let kind = match su.kind {
+            StructUnionKind::Struct => "struct",
+            StructUnionKind::Union => "union",
+        };
+        let decls = su.members.iter().flat_map(|m| {
+            let simple = matches!(m.data_type, DataType::Simple { .. });
+            m.declarators.iter().map(move |d| (d, simple))
+        });
+        for ((d, simple), (name, t)) in decls.zip(members) {
+            let why = match t {
+                Ty::Unpacked { dims, .. } => Some(match dims[0] {
+                    Dim::Dynamic => "a dynamic array",
+                    Dim::Queue => "a queue",
+                    Dim::Assoc => "an associative array",
+                    Dim::Fixed(_) => "an unpacked array",
+                }),
+                Ty::Real { .. } => Some("a real"),
+                Ty::Str => Some("a string"),
+                Ty::Class(_) => Some("a class handle"),
+                Ty::Struct(s) if !s.packed => Some("an unpacked struct"),
+                _ if simple => Some("an event or chandle"),
+                _ => None,
+            };
+            if let Some(w) = why
+                && self.seen.insert(d.span.start)
+            {
+                self.report(
+                    d.span,
+                    format!(
+                        "member '{name}' of a packed {kind} must be of a packed type, not {w} \
+                         (IEEE 1800-2017 §7.2.1)"
+                    ),
+                );
+            }
+        }
     }
 
     fn declare_param(&mut self, pd: &ParameterDeclaration) {
@@ -2335,6 +2499,11 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             SourceDefinition::Class(c) => {
                 ck = Ck::new(env(), elab, &c.name.name);
                 ck.walk_class(c);
+            }
+            SourceDefinition::Typedef(td) => {
+                ck = Ck::new(env(), elab, &td.name.name);
+                ck.push();
+                ck.declare_typedef(td);
             }
             _ => continue,
         }
