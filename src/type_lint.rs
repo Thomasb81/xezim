@@ -25,6 +25,10 @@
 //! - A struct member reference names a member of the struct (§7.2), and an
 //!   assignment target is a variable or net, not a parameter or other
 //!   constant (§6.20).
+//! - §11.4.12: a replication count is a non-negative, known constant, and a
+//!   zero-count replication stands only beside a sized operand of a
+//!   concatenation; a concatenation takes no real operand. §6.24.1: a casting
+//!   size is positive; `$signed`/`$unsigned` take an integral argument.
 //!
 //! The same rules apply to declaration initializers, `return` values and
 //! subroutine input arguments, which are assignments too (§13.5).
@@ -90,6 +94,13 @@ struct StructTy {
     key: String,
     packed: bool,
     members: Vec<(String, Ty)>,
+}
+
+/// A folded constant: a known integer, or a value with x/z bits.
+#[derive(Clone, Copy, PartialEq)]
+enum CVal {
+    Int(i64),
+    Xz,
 }
 
 /// What a typedef names, as an enum base type (§6.19).
@@ -281,6 +292,9 @@ struct Scope {
     autos: HashSet<String>,
     /// Typedefs as enum base types.
     bases: HashMap<String, BaseKind>,
+    /// Values of parameters that cannot be overridden here (localparams, and
+    /// parameters of a definition nothing instantiates).
+    consts: HashMap<String, CVal>,
     /// Block-level `static` declarations, which may be `localparam`s (the
     /// parser gives both one shape): neither constant nor variable here.
     unsure: HashSet<String>,
@@ -328,6 +342,12 @@ struct Ck<'a> {
     /// Declarations whose legality was already reported (a type is resolved
     /// once per use).
     seen: HashSet<usize>,
+    /// Parameters of the definition keep their declared values (nothing
+    /// instantiates it, so nothing overrides them).
+    params_fixed: bool,
+    /// Inside a generate block, which may not be elaborated: counts that
+    /// depend on a parameter are not judged there.
+    gen_depth: u32,
     errs: Vec<String>,
 }
 
@@ -347,6 +367,8 @@ impl<'a> Ck<'a> {
             auto_ctx: false,
             default_auto: false,
             seen: HashSet::new(),
+            params_fixed: false,
+            gen_depth: 0,
             errs: Vec::new(),
         }
     }
@@ -698,9 +720,29 @@ impl<'a> Ck<'a> {
 
     fn declare_param(&mut self, pd: &ParameterDeclaration) {
         match &pd.kind {
-            ParameterKind::Data { assignments, .. } => {
+            ParameterKind::Data {
+                data_type,
+                assignments,
+            } => {
+                // A real parameter is typed (a concatenation takes no real
+                // operand); other parameters stay untyped here.
+                let t = match data_type {
+                    DataType::Real { .. } => self.resolve(data_type),
+                    _ => Ty::Unknown,
+                };
+                let fixed = pd.local || self.params_fixed;
                 for a in assignments {
-                    self.top().vars.insert(a.name.name.clone(), Ty::Unknown);
+                    let v = if fixed {
+                        a.init.as_ref().and_then(|e| self.eval_const(e))
+                    } else {
+                        None
+                    };
+                    let top = self.top();
+                    top.vars.insert(a.name.name.clone(), t.clone());
+                    match v {
+                        Some(v) => top.consts.insert(a.name.name.clone(), v),
+                        None => top.consts.remove(&a.name.name),
+                    };
                 }
             }
             ParameterKind::Type { assignments } => {
@@ -1490,6 +1532,7 @@ impl<'a> Ck<'a> {
     fn walk_expr(&mut self, e: &Expression) {
         self.check_const_selects(e);
         self.check_struct_members(e);
+        self.check_operands(e);
         self.walk_value(e, true);
     }
 
@@ -1838,8 +1881,196 @@ impl<'a> Ck<'a> {
                 if let Some(init) = &a.init {
                     let what = format!("the value of parameter '{}'", a.name.name);
                     self.report_nonconst(init, &what, "§6.20");
+                    self.check_operands(init);
                 }
             }
+        }
+    }
+
+    /// Fold a constant expression over literals and fixed parameters.
+    fn eval_const(&self, e: &Expression) -> Option<CVal> {
+        match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer { value, .. })
+                if value
+                    .chars()
+                    .any(|c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?')) =>
+            {
+                Some(CVal::Xz)
+            }
+            ExprKind::Number(_) => lit_i64(e).map(CVal::Int),
+            ExprKind::Paren(x) => self.eval_const(x),
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                operand,
+            } => match self.eval_const(operand)? {
+                CVal::Int(v) => Some(CVal::Int(v.checked_neg()?)),
+                CVal::Xz => Some(CVal::Xz),
+            },
+            ExprKind::Binary { op, left, right } => {
+                let (l, r) = (self.eval_const(left)?, self.eval_const(right)?);
+                let (CVal::Int(l), CVal::Int(r)) = (l, r) else {
+                    return Some(CVal::Xz);
+                };
+                Some(CVal::Int(match op {
+                    BinaryOp::Add => l.checked_add(r)?,
+                    BinaryOp::Sub => l.checked_sub(r)?,
+                    BinaryOp::Mul => l.checked_mul(r)?,
+                    _ => return None,
+                }))
+            }
+            ExprKind::Ident(h)
+                if self.gen_depth == 0
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty() =>
+            {
+                let n = &h.path[0].name.name;
+                for l in self.stack.iter().rev() {
+                    let s = l.get();
+                    if s.vars.contains_key(n) {
+                        return s.consts.get(n).copied();
+                    }
+                    if s.opaque {
+                        return None;
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// §11.4.12 operand rules (replications, real operands) and §6.24.1 size
+    /// casts, everywhere in `e`.
+    fn check_operands(&mut self, e: &Expression) {
+        let mut errs: Vec<(Span, String)> = Vec::new();
+        self.operand_errors(e, false, &mut errs);
+        for (span, msg) in errs {
+            self.report(span, msg);
+        }
+    }
+
+    /// `sized_sibling`: `e` is an operand of a concatenation that also has an
+    /// operand of positive size.
+    fn operand_errors(&self, e: &Expression, sized_sibling: bool, out: &mut Vec<(Span, String)>) {
+        let zero = |x: &Expression| self.zero_width(x);
+        let operands = |xs: &[Expression], out: &mut Vec<(Span, String)>| {
+            let sized = xs.iter().any(|x| !zero(x));
+            for x in xs {
+                if matches!(self.ty_of(x), Ty::Real { .. }) {
+                    out.push((
+                        x.span,
+                        "a real value cannot be an operand of a concatenation \
+                         (IEEE 1800-2017 §11.4.12)"
+                            .into(),
+                    ));
+                }
+                self.operand_errors(x, sized, out);
+            }
+        };
+        match &e.kind {
+            ExprKind::Concatenation(xs) => operands(xs, out),
+            ExprKind::Replication { count, exprs } => {
+                match self.eval_const(count) {
+                    Some(CVal::Xz) => out.push((
+                        count.span,
+                        "a replication count cannot contain x or z bits \
+                         (IEEE 1800-2017 §11.4.12.1)"
+                            .into(),
+                    )),
+                    Some(CVal::Int(n)) if n < 0 => out.push((
+                        count.span,
+                        format!(
+                            "a replication count cannot be negative ({n}) \
+                             (IEEE 1800-2017 §11.4.12.1)"
+                        ),
+                    )),
+                    // §11.4.12.2: a string replication may be zero (the
+                    // empty string).
+                    Some(CVal::Int(0))
+                        if !sized_sibling
+                            && !exprs.iter().any(|x| {
+                                matches!(x.kind, ExprKind::StringLiteral(_))
+                                    || self.ty_of(x) == Ty::Str
+                            }) =>
+                    {
+                        out.push((
+                            e.span,
+                            "a zero replication must be an operand of a concatenation with an \
+                         operand of positive size (IEEE 1800-2017 §11.4.12.1)"
+                                .into(),
+                        ))
+                    }
+                    _ => {}
+                }
+                operands(exprs, out);
+            }
+            ExprKind::SystemCall { name, args } => {
+                let size = match name.as_str() {
+                    "$__xz_size_cast" | "$__xz_named_cast" => args.first(),
+                    _ => None,
+                };
+                if let Some(sz) = size
+                    && matches!(self.eval_const(sz), Some(CVal::Xz) | Some(CVal::Int(..=0)))
+                {
+                    out.push((
+                        sz.span,
+                        "a casting size must be a positive constant (IEEE 1800-2017 §6.24.1)"
+                            .into(),
+                    ));
+                }
+                if matches!(name.as_str(), "$signed" | "$unsigned")
+                    && args
+                        .first()
+                        .is_some_and(|a| matches!(self.ty_of(a), Ty::Real { .. }))
+                {
+                    out.push((
+                        e.span,
+                        format!(
+                            "{name} takes an integral argument, not a real \
+                             (IEEE 1800-2017 §11.7)"
+                        ),
+                    ));
+                }
+                for a in args {
+                    self.operand_errors(a, false, out);
+                }
+            }
+            ExprKind::Unary { operand, .. } => self.operand_errors(operand, false, out),
+            ExprKind::Binary { left, right, .. } => {
+                self.operand_errors(left, false, out);
+                self.operand_errors(right, false, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.operand_errors(condition, false, out);
+                self.operand_errors(then_expr, false, out);
+                self.operand_errors(else_expr, false, out);
+            }
+            ExprKind::Paren(x) => self.operand_errors(x, sized_sibling, out),
+            ExprKind::Call { args, .. } => {
+                for a in args {
+                    self.operand_errors(a, false, out);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                self.operand_errors(expr, false, out);
+                self.operand_errors(index, false, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// A zero-count replication, or a concatenation of only such.
+    fn zero_width(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Replication { count, .. } => self.eval_const(count) == Some(CVal::Int(0)),
+            ExprKind::Concatenation(xs) => !xs.is_empty() && xs.iter().all(|x| self.zero_width(x)),
+            ExprKind::Paren(x) => self.zero_width(x),
+            _ => false,
         }
     }
 
@@ -2184,6 +2415,7 @@ impl<'a> Ck<'a> {
                         self.check_const_dims(&dc.name.name, &n.data_type, &dc.dimensions);
                         if let Some(init) = &dc.init {
                             let vt = with_dims(t.clone(), &dc.dimensions);
+                            self.walk_expr(init);
                             self.check_value(&vt, init, &format!("'{}'", dc.name.name));
                         }
                     }
@@ -2229,6 +2461,7 @@ impl<'a> Ck<'a> {
     }
 
     fn walk_block(&mut self, items: &[ModuleItem], genvar: Option<&str>) {
+        self.gen_depth += 1;
         self.push();
         if let Some(g) = genvar {
             self.top()
@@ -2238,6 +2471,7 @@ impl<'a> Ck<'a> {
         self.declare_items(items);
         self.walk_items(items);
         self.pop();
+        self.gen_depth -= 1;
     }
 }
 
@@ -2519,6 +2753,31 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         }
     }
 
+    // Modules something instantiates (their parameters may be overridden).
+    let mut instantiated: HashSet<String> = HashSet::new();
+    fn instances(items: &[ModuleItem], out: &mut HashSet<String>) {
+        for it in items {
+            match it {
+                ModuleItem::ModuleInstantiation(mi) => {
+                    out.insert(mi.module_name.name.clone());
+                }
+                ModuleItem::GenerateRegion(g) => instances(&g.items, out),
+                ModuleItem::GenerateIf(g) => g.branches.iter().for_each(|(_, i)| instances(i, out)),
+                ModuleItem::GenerateFor(g) => instances(&g.items, out),
+                ModuleItem::GenerateCase(g) => g.arms.iter().for_each(|a| instances(&a.items, out)),
+                _ => {}
+            }
+        }
+    }
+    for d in defs {
+        match d {
+            SourceDefinition::Module(m) => instances(&m.items, &mut instantiated),
+            SourceDefinition::Interface(m) => instances(&m.items, &mut instantiated),
+            SourceDefinition::Program(m) => instances(&m.items, &mut instantiated),
+            _ => {}
+        }
+    }
+
     // Phase 3: walk every body.
     let mut errs = Vec::new();
     let env = || Env {
@@ -2534,6 +2793,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             SourceDefinition::Module(m) => {
                 ck = Ck::new(env(), elab, &m.name.name);
                 ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
+                ck.params_fixed = !instantiated.contains(&m.name.name);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
@@ -2549,6 +2809,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             SourceDefinition::Interface(m) => {
                 ck = Ck::new(env(), elab, &m.name.name);
                 ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
+                ck.params_fixed = !instantiated.contains(&m.name.name);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
@@ -2564,6 +2825,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             SourceDefinition::Program(m) => {
                 ck = Ck::new(env(), elab, &m.name.name);
                 ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
+                ck.params_fixed = !instantiated.contains(&m.name.name);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
