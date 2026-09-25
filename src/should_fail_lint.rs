@@ -153,6 +153,7 @@ fn check_unit(
     check_generate_block_names(u.items, errs);
     check_system_task_values(u.items, errs);
     check_wildcard_import_conflicts(u.ports, u.params, u.items, pkg_decls, errs);
+    check_imported_hier_refs(defs, u.items, pkg_decls, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -3340,6 +3341,82 @@ fn check_wildcard_import_conflicts(
         errs.push(format!(
             "'{n}' is declared by more than one wildcard-imported package, so it is not \
              visible here (LRM 1800-2017 §26.3)"
+        ));
+    }
+}
+
+/// §26.3: a name a module only imports is not one of its members, so a
+/// hierarchical reference cannot reach it through an instance (`m.x` where
+/// module M does `import P::x;`).
+fn check_imported_hier_refs(
+    defs: &[&SourceDefinition],
+    items: &[ModuleItem],
+    pkgs: &HashMap<String, HashSet<String>>,
+    errs: &mut Vec<String>,
+) {
+    let mut inst_of: HashMap<&str, &str> = HashMap::new();
+    for it in items {
+        if let ModuleItem::ModuleInstantiation(mi) = it {
+            for i in &mi.instances {
+                inst_of.insert(i.name.name.as_str(), mi.module_name.name.as_str());
+            }
+        }
+    }
+    if inst_of.is_empty() {
+        return;
+    }
+    let mut hits: Vec<(String, String)> = Vec::new();
+    module_exprs(items, &mut |e| {
+        for_each_expr(e, &mut |x| {
+            let (inst, member) = match &x.kind {
+                ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                        (h.path[0].name.name.as_str(), member.name.as_str())
+                    }
+                    _ => return,
+                },
+                ExprKind::Ident(h) if h.path.len() == 2 && h.path[0].selects.is_empty() => {
+                    (h.path[0].name.name.as_str(), h.path[1].name.name.as_str())
+                }
+                _ => return,
+            };
+            let Some(&module) = inst_of.get(inst) else {
+                return;
+            };
+            let Some(m) = defs.iter().find_map(|d| match d {
+                SourceDefinition::Module(m) if m.name.name == module => Some(m),
+                _ => None,
+            }) else {
+                return;
+            };
+            let own = module_own_names(&m.ports, &m.params, &m.items);
+            if own.contains(member)
+                || m.items.iter().any(|it| {
+                    matches!(
+                        it,
+                        ModuleItem::GenerateRegion(_)
+                            | ModuleItem::GenerateIf(_)
+                            | ModuleItem::GenerateFor(_)
+                            | ModuleItem::GenerateCase(_)
+                    )
+                })
+            {
+                return;
+            }
+            let (wild, explicit) = module_imports(&m.items);
+            let imported = explicit.contains(member)
+                || wild
+                    .iter()
+                    .any(|p| pkgs.get(*p).is_some_and(|ns| ns.contains(member)));
+            if imported {
+                hits.push((inst.to_string(), member.to_string()));
+            }
+        })
+    });
+    for (inst, member) in hits {
+        errs.push(format!(
+            "'{inst}.{member}': '{member}' is only imported into the instantiated module, \
+             not declared there, so it is not visible hierarchically (LRM 1800-2017 §26.3)"
         ));
     }
 }
