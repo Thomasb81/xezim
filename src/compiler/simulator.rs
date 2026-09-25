@@ -6775,6 +6775,10 @@ pub struct Simulator {
     lhs_leaf_width_cache: HashMap<(usize, usize), u32>,
     /// See `blocking_cont_frame`.
     blocking_cont_cache: HashMap<(usize, usize, usize, u8), Arc<[Statement]>>,
+    /// See `class_task_body_frame`.
+    #[allow(clippy::type_complexity)]
+    class_task_frame_cache:
+        HashMap<(usize, usize, usize), (Arc<crate::ast::decl::ClassMethod>, Arc<[Statement]>)>,
     /// §11.8.1: while narrowing relational constraint bounds for a target whose
     /// comparison context is UNSIGNED (the target, or the other operand, is
     /// unsigned), a bound literal must be read by its unsigned value — e.g. the
@@ -10174,6 +10178,7 @@ impl Simulator {
             vif_return_pending: false,
             lhs_leaf_width_cache: HashMap::default(),
             blocking_cont_cache: HashMap::default(),
+            class_task_frame_cache: HashMap::default(),
             forever_sens_cache: HashMap::default(),
             constraint_cmp_unsigned: false,
             stall_iters: 0,
@@ -45588,15 +45593,17 @@ impl Simulator {
                 // child forked from — keep this child's locals out of it.
                 continue;
             }
+            // The unchanged test first: nearly every inherited key is
+            // unchanged, and it then needs no parent lookup.
+            let base_frame = baseline.and_then(|b| b.get(i));
             for (k, v) in &child_frames[i] {
-                if !parent_frames[i].contains_key(k) {
-                    continue;
-                }
-                let inherited_unchanged = baseline
-                    .and_then(|b| b.get(i))
+                let inherited_unchanged = base_frame
                     .and_then(|f| f.get(k))
                     .is_some_and(|old| old == v);
                 if inherited_unchanged {
+                    continue;
+                }
+                if !parent_frames[i].contains_key(k) {
                     continue;
                 }
                 parent_frames[i].insert(k.clone(), v.clone());
@@ -46646,24 +46653,24 @@ impl Simulator {
                                     .map(|inst| inst.class_name.clone())
                             };
                             if let Some(cls) = cls {
-                                if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
+                                if let Some((tm, mclass)) = self.resolve_class_task(&cls, &mn) {
+                                    let crate::ast::decl::ClassMethodKind::Task(td) = &tm.kind
+                                    else {
+                                        unreachable!("resolve_class_task yields tasks only")
+                                    };
                                     if self.stmts_have_blocking(&td.items) {
-                                        let mut cleanup = self.bind_task_frame(&td, args);
+                                        let mut cleanup = self.bind_task_frame(td, args);
                                         // Even a same-object bare call changes
                                         // the defining-class context used by
                                         // `super`; push both stacks uniformly.
                                         self.push_task_method_this(Some(rh), mclass, &mut cleanup);
                                         self.task_cleanup.push(cleanup);
-                                        let mut cont: Vec<Statement> = td.items.clone();
-                                        cont.push(Statement::new(
-                                            StatementKind::ScopePop,
-                                            stmt.span,
-                                        ));
+                                        let frame = self.class_task_body_frame(&tm, stmt.span);
                                         // Chain the caller's tail instead of copying it onto the end of
-                                        // the spliced body (ProcCont::pushed).
+                                        // the spliced body (ProcCont::pushed_frame).
                                         self.run_process_stmts(
                                             pid,
-                                            &pc.pushed(cont, pc.start + i + 1),
+                                            &pc.pushed_frame(frame, pc.start + i + 1),
                                         );
                                         return;
                                     }
@@ -46808,9 +46815,12 @@ impl Simulator {
                                 }
                             }
                         }
-                        if let Some((td, mclass)) = self.resolve_class_task(&cls, &mn) {
+                        if let Some((tm, mclass)) = self.resolve_class_task(&cls, &mn) {
+                            let crate::ast::decl::ClassMethodKind::Task(td) = &tm.kind else {
+                                unreachable!("resolve_class_task yields tasks only")
+                            };
                             if self.stmts_have_blocking(&td.items) {
-                                let mut cleanup = self.bind_task_frame(&td, args);
+                                let mut cleanup = self.bind_task_frame(td, args);
                                 // Static context: push the declaring class for
                                 // member/static resolution, with a null `this`.
                                 self.m_scope_stack.clear();
@@ -46825,11 +46835,13 @@ impl Simulator {
                                     self.current_spec = Some((sb, ss));
                                 }
                                 self.task_cleanup.push(cleanup);
-                                let mut cont: Vec<Statement> = td.items.clone();
-                                cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
+                                let frame = self.class_task_body_frame(&tm, stmt.span);
                                 // Chain the caller's tail instead of copying it onto the end of
-                                // the spliced body (ProcCont::pushed).
-                                self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                                // the spliced body (ProcCont::pushed_frame).
+                                self.run_process_stmts(
+                                    pid,
+                                    &pc.pushed_frame(frame, pc.start + i + 1),
+                                );
                                 self.current_spec = saved_spec;
                                 return;
                             }
@@ -48917,6 +48929,30 @@ impl Simulator {
     /// from the process path (a blocking `begin/end` or a blocking chosen
     /// `if` branch). Keyed per process like `forever_cont_cache`: sibling
     /// instances share spans but never a pid.
+    /// A class task's body followed by its `ScopePop` sentinel (spanned at
+    /// the call), shared per (task, call site) instead of cloned per call.
+    /// The entry keeps the method alive, so its address cannot be recycled.
+    fn class_task_body_frame(
+        &mut self,
+        tm: &Arc<crate::ast::decl::ClassMethod>,
+        call_span: crate::ast::Span,
+    ) -> Arc<[Statement]> {
+        let key = (Arc::as_ptr(tm) as usize, call_span.start, call_span.end);
+        if let Some((_, f)) = self.class_task_frame_cache.get(&key) {
+            return f.clone();
+        }
+        let crate::ast::decl::ClassMethodKind::Task(td) = &tm.kind else {
+            unreachable!("class_task_body_frame takes tasks only")
+        };
+        let mut cont: Vec<Statement> = Vec::with_capacity(td.items.len() + 1);
+        cont.extend_from_slice(&td.items);
+        cont.push(Statement::new(StatementKind::ScopePop, call_span));
+        let f: Arc<[Statement]> = Arc::from(cont);
+        self.class_task_frame_cache
+            .insert(key, (tm.clone(), f.clone()));
+        f
+    }
+
     fn blocking_cont_frame(
         &mut self,
         pid: usize,
@@ -108419,18 +108455,21 @@ impl Simulator {
     /// (`forever @clk`, `#delay`, `wait`, sequence handshakes) suspend the
     /// process instead of spinning. Returns None for functions (they cannot
     /// consume time, so they keep the synchronous path) or unknown methods.
+    /// The task `method` as declared on `start_class` or its nearest
+    /// ancestor, with the declaring class. The method is `Task`-kind.
     fn resolve_class_task(
         &self,
         start_class: &str,
         method: &str,
-    ) -> Option<(crate::ast::decl::TaskDeclaration, String)> {
+    ) -> Option<(Arc<crate::ast::decl::ClassMethod>, String)> {
         use crate::ast::decl::ClassMethodKind;
         let mut cur: Option<&str> = Some(start_class);
         while let Some(cn) = cur {
             let cd = self.module.classes.get(cn)?;
             if let Some(m) = cd.methods.get(method) {
-                if let ClassMethodKind::Task(t) = &m.kind {
-                    return Some((t.clone(), cn.to_string()));
+                if let ClassMethodKind::Task(_) = &m.kind {
+                    let m = self.cached_class_method(cn, method)?;
+                    return Some((m, cn.to_string()));
                 }
                 return None;
             }
