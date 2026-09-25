@@ -146,6 +146,7 @@ fn check_unit(
 ) {
     let is_top = u.name == elab.name;
     check_param_value_refs(u.params, u.items, is_top, pkg_names, elab, errs);
+    check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
 }
 
@@ -2451,6 +2452,56 @@ fn check_param_value_refs(
                     ));
                 }
             }
+        }
+    }
+}
+
+/// §13.3/§13.4: in the top module, an identifier in a function's return range
+/// or in a subroutine port range must be declared (`function [w-1:0] copy;`
+/// with no `w` anywhere).
+fn check_subroutine_range_idents(
+    items: &[ModuleItem],
+    is_top: bool,
+    pkg_names: &HashSet<String>,
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    if !is_top {
+        return;
+    }
+    let check = |sub: &str, dts: Vec<&DataType>, body: &[Statement], errs: &mut Vec<String>| {
+        let mut locals = HashSet::new();
+        for st in body {
+            if let StatementKind::VarDecl { declarators, .. } = &st.kind {
+                locals.extend(declarators.iter().map(|d| d.name.name.as_str()));
+            }
+        }
+        let mut ids = Vec::new();
+        for dt in dts {
+            dim_idents(dt, &mut ids);
+        }
+        for id in ids {
+            if !locals.contains(id.as_str()) && !pkg_names.contains(&id) && !top_declares(&id, elab)
+            {
+                errs.push(format!(
+                    "'{sub}': range refers to undeclared identifier '{id}' (LRM 1800-2017 §13.4)"
+                ));
+            }
+        }
+    };
+    for it in items {
+        match it {
+            ModuleItem::FunctionDeclaration(f) => {
+                let dts = std::iter::once(&f.return_type)
+                    .chain(f.ports.iter().map(|p| &p.data_type))
+                    .collect();
+                check(&f.name.name.name, dts, &f.items, errs);
+            }
+            ModuleItem::TaskDeclaration(t) => {
+                let dts = t.ports.iter().map(|p| &p.data_type).collect();
+                check(&t.name.name.name, dts, &t.items, errs);
+            }
+            _ => {}
         }
     }
 }
