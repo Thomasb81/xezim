@@ -358,13 +358,16 @@ fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<
         for p in ps {
             let omitted =
                 p.direction.is_none() && p.net_type.is_none() && !p.var_kw && p.data_type.is_none();
+            // A port that carries a variable type is a variable: the parser
+            // copies a net kind into a port that inherits `output reg` from
+            // its predecessor (`output reg q, r`), so the net kind alone
+            // does not decide.
             let net = if omitted {
                 prev_net
             } else {
                 p.direction == Some(PortDirection::Output)
                     && !p.var_kw
-                    && (p.net_type.is_some()
-                        || matches!(p.data_type, None | Some(DataType::Implicit { .. })))
+                    && matches!(p.data_type, None | Some(DataType::Implicit { .. }))
             };
             if net {
                 nets.insert(p.name.name.clone());
