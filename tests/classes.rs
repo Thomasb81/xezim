@@ -75,6 +75,9 @@ mod compiled_method_foreach;
 
 #[path = "classes/compiled_method_void.rs"]
 mod compiled_method_void;
+
+#[path = "classes/compiled_method_super.rs"]
+mod compiled_method_super;
 #[path = "classes/compiled_method_cast.rs"]
 mod compiled_method_cast;
 #[path = "classes/class_output_handle_copyback.rs"]

@@ -430,6 +430,20 @@ pub enum Insn {
     /// battle-tested interpreter — correctness pilot, not the end-state.
     CallMethod(RegId, RegId, Box<str>, RegId, u32), // (dest, handle_reg, method, arg_start, n_args)
 
+    /// class-perf Step 9f: STATIC class-method dispatch with the
+    /// resolution-chain START CLASS baked at compile time. Two surfaces:
+    /// `super.m(args)` / `super.new(args)` (§8.15 — start = the parent of
+    /// the DEFINING class, non-virtual) and a BARE call `m(args)` to a
+    /// NON-VIRTUAL method (§8.20 — start = the first class from the
+    /// lexical chain defining `m`, mirroring the AST fallback's
+    /// `nonvirtual_target_class`). The receiver is always `this`
+    /// (`this_reg`); the executor re-enters
+    /// `exec_method_in_class_hierarchy(handle, start_class, m, args)`, so
+    /// ctor chaining, defaults, and everything callee-side stay
+    /// interpreter-owned. (dest, this_reg, start_class, method, arg_start,
+    /// n_args)
+    CallScopedMethod(RegId, RegId, Box<str>, Box<str>, RegId, u32),
+
     /// Compiled class-method builtin-collection call. The receiver is a
     /// class handle in `handle_reg`; `member` names a member collection
     /// (associative array or queue) declared in the receiver's class;
@@ -931,7 +945,8 @@ impl Insn {
             | StmtFallback(..) | EvalExprFallback(..)
             | WaitDelayReg(..) | WaitEdge(..)
             | CallMethod(..) | CallCollMethod(..)
-            | LoadCollElem(..) | StoreCollElem(..) => return false,
+            | LoadCollElem(..) | StoreCollElem(..)
+            | CallScopedMethod(..) => return false,
         }
         true
     }
@@ -996,6 +1011,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::LoadClassMember(..) => "LoadCls",
         Insn::StoreClassMember(..) => "StoreCls",
         Insn::CallMethod(..) => "CallM,",
+        Insn::CallScopedMethod(..) => "CallScp,",
         Insn::CallCollMethod(..) => "CallColl,",
         Insn::LoadCollElem(..) => "CollElemR,",
         Insn::StoreCollElem(..) => "CollElemW,",
@@ -1145,6 +1161,15 @@ pub struct BytecodeCompiler<'a> {
     /// ref write-backs keep their AST semantics (a function body cannot
     /// contain a task call per §13.3, so the callee is always a function).
     class_method_names: HashSet<String>,
+    /// Step 9f: method names visible in the PARENT chain of the enclosing
+    /// class (+ `new`) — the `super.m` admission set.
+    super_method_names: HashSet<String>,
+    /// Step 9f: the parent of the enclosing (defining) class — the baked
+    /// start class for `super.m`.
+    method_class_parent: Option<String>,
+    /// Step 9f: BARE-call static targets — non-virtual method name -> the
+    /// first defining class from the lexical chain (§8.20).
+    static_bare_targets: HashMap<String, String>,
     /// class-perf Step 9e: the static CLASS of the method being compiled —
     /// the `this` root's type for TYPED handle-chain admission.
     method_class: Option<String>,
@@ -1453,6 +1478,9 @@ impl<'a> BytecodeCompiler<'a> {
             member_safe_names: HashSet::default(),
             class_local_names: HashSet::default(),
             class_method_names: HashSet::default(),
+            super_method_names: HashSet::default(),
+            method_class_parent: None,
+            static_bare_targets: HashMap::default(),
             method_class: None,
             handle_member_types: None,
             method_result_reg: None,
@@ -10090,6 +10118,79 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("string_formal_as_callee");
                     return None;
                 }
+                // class-perf Step 9f: `super.m(args)` / `super.new(args)` —
+                // §8.15 static dispatch to the parent-of-the-defining-class
+                // method. Admission mirrors the interpreter's `routed` gate:
+                // the method must exist in the PARENT chain (or be `new`);
+                // `super.m` where only the enclosing class itself defines
+                // `m` does NOT route statically — it falls through to
+                // virtual dispatch on `this`, which only the AST path
+                // reproduces. The receiver is always `this` (a static frame
+                // has none — method_this_reg is None there, so statics with
+                // super calls decline here).
+                if self.method_mode
+                    && let ExprKind::MemberAccess { expr: base, member } = &func.kind
+                    && matches!(&base.kind, ExprKind::Ident(h)
+                        if h.path.len() == 1
+                            && h.path[0].selects.is_empty()
+                            && h.path[0].name.name == "super")
+                    && self.super_method_names.contains(member.name.as_str())
+                {
+                    let Some(this_reg) = self.method_this_reg else {
+                        self.bail("super_no_this");
+                        return None;
+                    };
+                    // Baked start class: the parent of the DEFINING class
+                    // (§8.15 — compile-time-fixed, identical to the
+                    // interpreter's class-context resolution for a
+                    // compiled frame).
+                    let Some(parent) = self.method_class_parent.clone() else {
+                        self.bail("super_no_parent");
+                        return None;
+                    };
+                    let call_start = self.insns.len();
+                    let call_next = self.next_reg;
+                    let mut ok = true;
+                    let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.compile_expr(a, 0) {
+                            Some(r) => arg_values.push(r),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        let dest = self.alloc_reg();
+                        let n = arg_values.len() as u32;
+                        // Contiguous arg slots (same reservation discipline
+                        // as the receiver form above).
+                        let arg_start = self.alloc_reg();
+                        for _ in 1..arg_values.len() {
+                            self.alloc_reg();
+                        }
+                        for (i, &v) in arg_values.iter().enumerate() {
+                            let slot = (arg_start as usize + i) as RegId;
+                            if slot != v {
+                                self.emit(Insn::Move(slot, v));
+                            }
+                        }
+                        self.emit(Insn::CallScopedMethod(
+                            dest,
+                            this_reg,
+                            parent.into_boxed_str(),
+                            member.name.clone().into_boxed_str(),
+                            arg_start,
+                            n,
+                        ));
+                        return Some(dest);
+                    }
+                    self.insns.truncate(call_start);
+                    self.next_reg = call_next;
+                    self.bail("Expr_Call_super");
+                    return None;
+                }
                 // class-perf Step 9b: a builtin-collection call on a member
                 // collection — `m_children.exists(n)`, `q.size()`,
                 // `m_total_count[obj] += count`'s read — lowers to a
@@ -10209,6 +10310,27 @@ impl<'a> BytecodeCompiler<'a> {
                             if slot != v {
                                 self.emit(Insn::Move(slot, v));
                             }
+                        }
+                        // §8.20: a NON-VIRTUAL method binds statically to
+                        // the first defining class of the lexical chain —
+                        // the derived override must not run (the AST
+                        /// fallback's `nonvirtual_target_class`). Virtual
+                        /// (and static) methods keep the virtual
+                        /// CallMethod dispatch.
+                        if let Some(target) = self
+                            .static_bare_targets
+                            .get(h.path[0].name.name.as_str())
+                            .cloned()
+                        {
+                            self.emit(Insn::CallScopedMethod(
+                                dest,
+                                this_reg,
+                                target.into_boxed_str(),
+                                h.path[0].name.name.clone().into_boxed_str(),
+                                arg_start,
+                                n,
+                            ));
+                            return Some(dest);
                         }
                         self.emit(Insn::CallMethod(
                             dest,
@@ -12470,6 +12592,9 @@ impl<'a> BytecodeCompiler<'a> {
         class_formals: &HashSet<String>,
         class_locals: &HashSet<String>,
         class_method_names: &HashSet<String>,
+        super_method_names: &HashSet<String>,
+        method_class_parent: &Option<String>,
+        static_bare_targets: &HashMap<String, String>,
         method_class: &str,
         handle_member_types: &'a HashMap<String, HashMap<String, String>>,
         class_shadow_names: &HashSet<String>,
@@ -12557,6 +12682,9 @@ impl<'a> BytecodeCompiler<'a> {
         // VarDecl arm treats them as handle locals.
         self.class_local_names = class_locals.clone();
         self.class_method_names = class_method_names.clone();
+        self.super_method_names = super_method_names.clone();
+        self.method_class_parent = method_class_parent.clone();
+        self.static_bare_targets = static_bare_targets.clone();
         self.method_class = Some(method_class.to_string());
         self.handle_member_types = Some(handle_member_types);
 
@@ -12584,6 +12712,16 @@ impl<'a> BytecodeCompiler<'a> {
                     self.local_var_regs.insert(rname.to_string(), (r, rw));
                     if is_class {
                         self.method_handle_names.insert(rname.to_string());
+                    }
+                    // class-perf Step 9f fix: a STRING result cell is a
+                    // width-0 string local for infer_lhs_width — without
+                    // this, `f = super.m(...)` / `f = bare_call(...)`
+                    // assigned a byte-vector result at the 32-bit default
+                    // and the store Resize truncated it (the report-message
+                    // regression lost the first character of every composed
+                    // message).
+                    if is_string {
+                        self.local_var_is_string.insert(rname.to_string());
                     }
                 }
                 self.method_result_reg = Some(r);
@@ -12700,6 +12838,9 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::StoreClassMember(h, v, _) => *h == r || *v == r,
             Insn::CallMethod(_, h, _, a, n) => {
                 *h == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+            }
+            Insn::CallScopedMethod(_, t, _, _, a, n) => {
+                *t == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
             }
             Insn::CallCollMethod(_, h, _, _, a, n, _) => {
                 *h == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
@@ -14032,6 +14173,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // Method call: dest width isn't statically known (callee
                 // return width follows its runtime type) — bare dest store.
                 Insn::CallMethod(d, ..) => store(&mut rw, *d, None),
+                Insn::CallScopedMethod(d, ..) => store(&mut rw, *d, None),
                 // Collection builtin: dest width follows the runtime member
                 // (count / exists flag / popped element) — bare dest store.
                 Insn::CallCollMethod(d, ..) => store(&mut rw, *d, None),
@@ -14958,7 +15100,7 @@ mod tests {
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -15022,7 +15164,7 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -15061,7 +15203,7 @@ mod tests {
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );

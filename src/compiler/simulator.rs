@@ -6196,6 +6196,7 @@ enum ImpCons<'a> {
     Expr(&'a Expression),
 }
 
+
 impl Simulator {
     /// Safe accessor for `id_to_name`. Large-array element ids may sit
     /// past the end of `id_to_name` (we skip the per-element push to
@@ -23828,7 +23829,7 @@ impl Simulator {
                     debug_assert!(false, "class-member insn in isolated comb exec");
                     break;
                 }
-                Insn::CallMethod(..) => {
+                Insn::CallMethod(..) | Insn::CallScopedMethod(..) => {
                     debug_assert!(false, "class-member insn in isolated comb exec");
                     break;
                 }
@@ -24512,7 +24513,7 @@ impl Simulator {
                     debug_assert!(false, "class-member insn in isolated comb exec");
                     break;
                 }
-                Insn::CallMethod(..) => {
+                Insn::CallMethod(..) | Insn::CallScopedMethod(..) => {
                     debug_assert!(false, "CallMethod insn in isolated comb exec");
                     break;
                 }
@@ -25702,6 +25703,34 @@ impl Simulator {
                         .map(|v| self.value_method_arg_expr(v))
                         .collect();
                     let result = self.exec_method_call(handle, method, &args);
+                    self.vm_regs[*dest as usize] = result;
+                    local_count += 1;
+                }
+                Insn::CallScopedMethod(dest, this_reg, start_class, method, arg_start, n_args) => {
+                    let handle = self.vm_regs[*this_reg as usize]
+                        .to_u64()
+                        .unwrap_or(0) as usize;
+                    let base = *arg_start as usize;
+                    let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
+                    for i in 0..*n_args as usize {
+                        argvals.push(self.vm_regs.get(base + i).cloned().unwrap_or(Value::zero(32)));
+                    }
+                    // Value-const actuals, exactly like CallMethod. The
+                    // start class was baked at compile time (§8.15 super /
+                    // §8.20 non-virtual bare call): run the body via the
+                    // hierarchy walk from that class — non-virtual, ctor
+                    // chaining included.
+                    let args: Vec<Expression> = argvals
+                        .iter()
+                        .map(|v| self.value_method_arg_expr(v))
+                        .collect();
+                    let result = if handle == 0 {
+                        // Null receiver (unreachable for instance frames;
+                        // a static frame never lowers a scoped call).
+                        Value::zero(32)
+                    } else {
+                        self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
+                    };
                     self.vm_regs[*dest as usize] = result;
                     local_count += 1;
                 }
@@ -38519,6 +38548,7 @@ impl Simulator {
             Insn::LoadClassMember(..) => "LoadClassMember",
             Insn::StoreClassMember(..) => "StoreClassMember",
             Insn::CallMethod(..) => "CallMethod",
+            Insn::CallScopedMethod(..) => "CallScopedMethod",
             Insn::CallCollMethod(..) => "CallCollMethod",
             Insn::LoadCollElem(..) => "LoadCollElem",
             Insn::StoreCollElem(..) => "StoreCollElem",
@@ -117586,6 +117616,38 @@ impl Simulator {
         out
     }
 
+    /// class-perf Step 9f: the `super.m(...)` admission set — method
+    /// names visible in the PARENT chain of `cname` (the class lexically
+    /// containing the call), plus `new` (super.new is ctor chaining, always
+    /// routed). Mirrors the interpreter's `routed` gate: `super.m` where
+    /// only `cname` itself defines `m` does NOT route statically (the AST
+    /// funnel falls through to virtual dispatch on `this`), so it must not
+    /// compile here.
+    fn super_method_name_set(&self, cname: &str) -> HashSet<String> {
+        let mut out = HashSet::default();
+        let Some(mut cur) = self
+            .module
+            .classes
+            .get(cname)
+            .and_then(|cd| cd.extends.clone())
+        else {
+            return out;
+        };
+        let mut seen = HashSet::default();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            out.extend(cd.methods.keys().cloned());
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out.insert("new".to_string());
+        out
+    }
+
     /// class-perf Step 9b-ii: the BARE element-access admission set —
     /// `class_coll_member_names ∪ class_static_coll_member_names` MINUS
     /// every module-scope collection-table name. The AST write funnel
@@ -117887,6 +117949,23 @@ impl Simulator {
                 // Step 9e: method-name admission set for bare this-bounded
                 // calls.
                 let method_name_set = self.class_method_name_set(cname);
+                // Step 9f: parent-chain method names for `super.m` admission.
+                let super_method_set = self.super_method_name_set(cname);
+                // Step 9f: baked dispatch inputs — the defining class's
+                // parent (super.m start class) and the §8.20 non-virtual
+                // bare-call targets (first defining class per method name,
+                // exactly the AST fallback's nonvirtual_target_class;
+                // statics keep the virtual dispatch they have today).
+                let class_parent = self.module.classes.get(cname).and_then(|cd| cd.extends.clone());
+                let mut bare_targets: HashMap<String, String> = HashMap::default();
+                for m in method_name_set.iter() {
+                    if self.is_static_method(cname, m) {
+                        continue;
+                    }
+                    if let Some(t) = self.nonvirtual_target_class(cname, m) {
+                        bare_targets.insert(m.clone(), t);
+                    }
+                }
                 // Step 9e: typed handle-chain admission inputs — the
                 // method's own class and every class's handle-member types.
                 let handle_member_types = self.class_handle_member_types();
@@ -117904,6 +117983,9 @@ impl Simulator {
                         &pre.class_formals,
                         &class_locals,
                         &method_name_set,
+                        &super_method_set,
+                        &class_parent,
+                        &bare_targets,
                         cname,
                         &handle_member_types,
                         &shadow_names,
@@ -117945,6 +118027,7 @@ impl Simulator {
                 let uses_this = |i: &super::bytecode::Insn| {
                     use super::bytecode::Insn as I;
                     match i {
+                        I::CallScopedMethod(_, t, ..) => *t as usize == this_reg as usize,
                         I::CallMethod(_, h, ..)
                         | I::CallCollMethod(_, h, ..)
                         | I::LoadClassMember(_, h, _)
