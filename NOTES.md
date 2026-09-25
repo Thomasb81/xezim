@@ -9,6 +9,46 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* `obj.randomize() with {...}` binds names in the object first and then in
+  the calling scope (§18.7): caller locals, inherited members, array and
+  queue elements, handle members and `local::` names now work, and a
+  caller local no longer hides an object member. A receiver-less
+  `randomize() with {...}` in a class method applies its inline block.
+* Randomization semantics follow the reference simulator: `dist` weights
+  hold in coupled constraint sets (`:=` weighs every declared value, `:/`
+  the whole item), `solve a before b` picks `a` uniformly, `randomize(a,
+  b)` makes exactly the named members random (even non-`rand` ones), and
+  an `inside {[hi:lo]}` range with the bounds reversed is empty.
+* Processes waiting on a net driven by a continuous assignment (`assign
+  CLK2 = PCLK;`) resume after those waiting on its source, and waiters on
+  an interface's clock port after both, as in the reference simulator.
+  Testbenches that race on this order (the uart UVM example's modem tests)
+  now agree with it.
+* `%m` and the "Scope:" line of `$info`/`$warning`/`$error` name the
+  declaring scope (`pk.f`, `pk.C.show`, `tb.u.E.show`); generate blocks,
+  named `always` blocks and labelled assertions are scopes. Auto-detected
+  tops run in source order. A class and an interface may share a name,
+  a blocking `randcase` branch suspends its process, and package-scope
+  initializers may call `$sformatf`.
+* Absolute hierarchical writes (`tb.u.sig = v`) inside tasks, functions
+  and class methods take effect; a callee's local declaration no longer
+  changes a same-named variable's type in the caller (a signed `int` read
+  back through `inout` printed unsigned); arithmetic wider than 128 bits
+  keeps every bit; a forked package task runs as its own process;
+  `s.h = new` on a struct's class-handle member constructs it; `defparam`
+  paths resolve upward; a bare name in a class method must be visible from
+  that class (UVM 1.2's removed global `factory` is rejected, as the
+  reference simulator does).
+* sv-tests: 97.7% pass (from 94.8%). New legality checks reject what the
+  LRM forbids and the reference simulator rejects: enum, unpacked-array
+  and class-handle assignment compatibility, subroutine argument binding,
+  constant expressions in ranges/parameters/part-selects, automatic
+  variables in NBAs and procedural assigns, enum base types, packed struct
+  members, net output ports, replication counts and casting sizes, gate
+  terminal counts, package exports and scoped names, and parameter
+  overrides. Parser: min:typ:max delays, `and #6 (q, a, b)`, net
+  declaration delays after the data type, nameless UDP instances,
+  `this.super.x`, and `begin_keywords "1364-2001-noconfig"`.
 * UVM 1800.2 (2020.3) DPI: `uvm_re_comp`/`uvm_re_exec`/`uvm_re_compexec`/
   `uvm_re_deglobbed` follow UVM's C code, and `uvm_hdl_signal_size` and
   the `uvm_polling_*` value-change API are built in. UVM testbenches
@@ -345,6 +385,13 @@ and the development workflow are in [README.md](README.md).
   line.
 
 **Performance** (instruction counts, output identical)
+
+* UVM class code: name-kind checks answer from per-design name tables and
+  per-class memos, bare names read and write on direct paths, class task
+  bodies are shared instead of cloned per call, and `foreach` over
+  associative arrays uses the element index. UVM stress bench: 20.6 M ->
+  11.5 M host instructions per sequence item (-44%); the six AVIPs run
+  19-27% fewer instructions; c906 CoreMark unchanged.
 
 * A two-state block that reads an x or z bit no longer re-runs on the
   four-state VM: the same lowered stream runs on an x-plane executor that
