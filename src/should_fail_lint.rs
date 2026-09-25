@@ -1348,10 +1348,52 @@ fn check_class(c: &ClassDeclaration, errs: &mut Vec<String>) {
             }
         }
     }
+    check_class_member_names(c, errs);
     // Recurse into nested classes regardless of this class's kind.
     for item in &c.items {
         if let ClassItem::Class(nested) = item {
             check_class(nested, errs);
+        }
+    }
+}
+
+/// §8.3 / §6.19: a class's properties, typedefs and the constants of the
+/// enums it declares share one name space (`enum {A = 10} e; typedef int A;`
+/// declares `A` twice).
+fn check_class_member_names(c: &ClassDeclaration, errs: &mut Vec<String>) {
+    fn enum_names(dt: &DataType) -> Vec<&str> {
+        match dt {
+            // `A[3]` declares A0..A2, not A.
+            DataType::Enum(et) => et
+                .members
+                .iter()
+                .filter(|m| m.range.is_none())
+                .map(|m| m.name.name.as_str())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for item in &c.items {
+        match item {
+            ClassItem::Property(p) => {
+                names.extend(enum_names(&p.data_type));
+                names.extend(p.declarators.iter().map(|d| d.name.name.as_str()));
+            }
+            ClassItem::Typedef(t) if !t.forward && !matches!(t.data_type, DataType::Void(_)) => {
+                names.extend(enum_names(&t.data_type));
+                names.push(&t.name.name);
+            }
+            _ => {}
+        }
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for n in names {
+        if !n.is_empty() && !seen.insert(n) {
+            errs.push(format!(
+                "class '{}': '{n}' is declared more than once (LRM 1800-2017 §8.3)",
+                c.name.name
+            ));
         }
     }
 }
