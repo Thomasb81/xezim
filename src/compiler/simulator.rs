@@ -51470,8 +51470,9 @@ impl Simulator {
         self.prof_waiter_iters += waiters.len() as u64;
         let mut triggered_conts = std::mem::take(&mut self.triggered_conts_buf);
         triggered_conts.clear();
-        let mut ranks = std::mem::take(&mut self.wake_rank_buf);
-        ranks.clear();
+        // Wake rank of each entry of `triggered_conts`, kept only from the
+        // first nonzero rank on: empty means every wakeup is depth 0.
+        let mut ranks: Vec<u8> = Vec::new();
         // In place: a parked waiter that does not fire stays where it is
         // (the old drain moved every waiter through a swap vector each tick).
         waiters.retain_mut(|waiter| {
@@ -51529,8 +51530,15 @@ impl Simulator {
                     self.deferred_clocking_conts.push((waiter.pid, cont));
                 } else {
                     let cont = std::mem::replace(&mut waiter.continuation, ProcCont::empty());
+                    if rank != 0 || !ranks.is_empty() {
+                        if ranks.capacity() == 0 {
+                            ranks = std::mem::take(&mut self.wake_rank_buf);
+                            ranks.clear();
+                        }
+                        ranks.resize(triggered_conts.len(), 0);
+                        ranks.push(rank);
+                    }
                     triggered_conts.push((waiter.pid, cont));
-                    ranks.push(rank);
                 }
                 false
             } else {
@@ -51575,18 +51583,26 @@ impl Simulator {
         // after every waiter of its source has been scheduled. Order the
         // wakeups by scheduling depth (`build_sig_wake_rank`), keeping LIFO
         // within a depth.
+        if !ranks.is_empty() {
+            self.order_wakeups_by_rank(&mut triggered_conts, ranks);
+        }
+        triggered_conts
+    }
+
+    /// Stable sort of one drain's wakeups (already LIFO) by `ranks`, their
+    /// registration-order wake ranks. Out of line: most drains wake depth-0
+    /// waiters only and never get here.
+    #[cold]
+    #[inline(never)]
+    fn order_wakeups_by_rank(&mut self, conts: &mut Vec<(usize, ProcCont)>, mut ranks: Vec<u8>) {
         if ranks.len() > 1 && ranks.iter().any(|&r| r != ranks[0]) {
             ranks.reverse();
-            let mut keyed: Vec<(u8, (usize, ProcCont))> = ranks
-                .iter()
-                .copied()
-                .zip(triggered_conts.drain(..))
-                .collect();
+            let mut keyed: Vec<(u8, (usize, ProcCont))> =
+                ranks.iter().copied().zip(conts.drain(..)).collect();
             keyed.sort_by_key(|k| k.0);
-            triggered_conts.extend(keyed.into_iter().map(|k| k.1));
+            conts.extend(keyed.into_iter().map(|k| k.1));
         }
         self.wake_rank_buf = ranks;
-        triggered_conts
     }
 
     /// Hand a consumed `drain_triggered_event_waiters` vector back for reuse.
