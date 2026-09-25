@@ -64,6 +64,13 @@ Current capabilities include:
 * UVM 1.2 runtime support, also demonstrated by running the `riscv-dv` instruction
   generator end-to-end (random RV32IMC programs that assemble cleanly with
   `riscv64-unknown-elf-as -march=rv32imc_zicsr_zifencei`)
+* **Functional and assertion coverage**, always on — covergroups (explicit,
+  automatic, array, wildcard and transition bins, `ignore_bins`/`illegal_bins`,
+  crosses, `iff` guards, `at_least`/`weight`/`auto_bin_max`/`merge_instances`),
+  the `get_coverage()`/`get_inst_coverage()`/`$get_coverage()` queries, and
+  pass/fail counts for `cover property` and the assertions. A run with any of
+  them writes the results to `xezim_cov.json` (`XEZIM_COV_DB=<path>` to move
+  it). No code coverage. See [docs/coverage-guide.md](docs/coverage-guide.md).
 * Event-driven edge gating (`XEZIM_EVENT_EDGE=1`) — opt-in skip of clocked
   flop fires whose data inputs haven't changed; 1.13-1.30× wall on the C910 /
   C906 hello / memcpy / cmark benchmarks, correct-by-construction
