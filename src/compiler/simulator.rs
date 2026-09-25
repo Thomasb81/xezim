@@ -2707,6 +2707,9 @@ struct ClassMemberNames {
     assoc_props: HashSet<String>,
     /// Every `string` property name.
     string_props: HashSet<String>,
+    /// Names `plain_ident_read` leaves to the full path: static, vif and
+    /// struct-capable properties, and the UVM activity constants.
+    ident_slow: HashSet<String>,
 }
 
 /// `instance_assoc_member`'s class-only verdict for a bare name inside a
@@ -65539,7 +65542,58 @@ impl Simulator {
 
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
+    /// Read fast path for a select-free single-segment identifier: the frame
+    /// local of that name, else the plain property of `this`. Everything the
+    /// full path checks before those two reads is keyed on multi-segment or
+    /// selected shapes, on an active `ref` redirect, on a static local, or
+    /// on the names in `ident_slow` / `shadowed_prop_names`; any of those
+    /// (or a miss) returns `None` and the full path runs.
+    #[inline]
+    fn plain_ident_read(&self, h: &HierarchicalIdentifier) -> Option<Value> {
+        if h.path.len() != 1 || h.root.is_some() || self.ref_redirect_hot || self.name_stats_on {
+            return None;
+        }
+        let seg = &h.path[0];
+        if !seg.selects.is_empty() {
+            return None;
+        }
+        let name = seg.name.name.as_str();
+        if self.class_member_names().ident_slow.contains(name) {
+            return None;
+        }
+        if !self.in_const_param_eval
+            && !self.static_local_names.is_empty()
+            && name
+                .as_bytes()
+                .first()
+                .is_some_and(|&b| self.static_local_first[b as usize])
+            && self.static_local_names.contains(name)
+        {
+            return None;
+        }
+        if let Some(locals) = self.local_stack.last() {
+            if let Some(v) = locals.get(name) {
+                return Some(v.clone());
+            }
+        }
+        if !self.shadowed_prop_names.is_empty() && self.shadowed_prop_names.contains(name) {
+            return None;
+        }
+        let handle = self.this_stack.last().copied().flatten()?;
+        self.heap
+            .get(handle)?
+            .as_ref()?
+            .properties
+            .get(name)
+            .cloned()
+    }
+
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
+        if let ExprKind::Ident(h) = &expr.kind {
+            if let Some(v) = self.plain_ident_read(h) {
+                return v;
+            }
+        }
         if let Some(v) = self.assoc_size_member(expr) {
             return v;
         }
@@ -97537,7 +97591,12 @@ impl Simulator {
     /// run time, so any other name is never a struct property and its
     /// receiver need not be evaluated to find that out.
     fn struct_prop_name_possible(&self, prop: &str) -> bool {
-        let set = self.struct_capable_prop_names.get_or_init(|| {
+        let set = self.struct_capable_names();
+        !set.is_empty() && set.contains(prop)
+    }
+
+    fn struct_capable_names(&self) -> &HashSet<String> {
+        self.struct_capable_prop_names.get_or_init(|| {
             let mut set: HashSet<String> = HashSet::default();
             for cd in self.module.classes.values() {
                 for (name, dt) in &cd.property_types {
@@ -97567,8 +97626,7 @@ impl Simulator {
                 }
             }
             set
-        });
-        !set.is_empty() && set.contains(prop)
+        })
     }
 
     /// The property name `class_prop_receiver` would resolve `e` to.
@@ -127117,7 +127175,14 @@ impl Simulator {
                     }
                 }
             }
+            let mut ident_slow: HashSet<String> = HashSet::default();
+            ident_slow.extend(statics.iter().cloned());
+            ident_slow.extend(vif_props.iter().cloned());
+            ident_slow.extend(self.struct_capable_names().iter().cloned());
+            ident_slow.insert("UVM_ACTIVE".to_string());
+            ident_slow.insert("UVM_PASSIVE".to_string());
             ClassMemberNames {
+                ident_slow,
                 statics,
                 vif_props,
                 methods,
