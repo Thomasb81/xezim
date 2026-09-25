@@ -17,6 +17,8 @@ mod always_timing_lint_forms;
 mod artifact_compression_modes;
 #[path = "misc/assign_z_passthrough.rs"]
 mod assign_z_passthrough;
+#[path = "misc/assignment_compatibility.rs"]
+mod assignment_compatibility;
 #[path = "misc/assoc_class_new_stores_instance.rs"]
 mod assoc_class_new_stores_instance;
 #[path = "misc/audit_round46_finds.rs"]

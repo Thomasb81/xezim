@@ -49,7 +49,6 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                     check_module_item(it, elab, &local_types, true, &mut errs);
                 }
                 check_proc_net_assign(&m.items, &mut errs);
-                check_enum_assign(&m.items, elab, &mut errs);
                 check_dynarray_assign(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
@@ -97,6 +96,9 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
         }
     }
     check_named_block_refs(defs, &mut errs);
+    if xezim_core::sv_parser::strict_checks() {
+        errs.extend(crate::type_lint::check(defs, elab));
+    }
     errs
 }
 
@@ -315,133 +317,6 @@ fn check_proc_net_assign(items: &[ModuleItem], errs: &mut Vec<String>) {
                 }
             }
         });
-    }
-}
-
-/// True if `dt` is an enum type, resolving one typedef reference against the
-/// elaborated typedef table (`typedef enum {...} e; e v;`).
-fn resolves_to_enum(dt: &DataType, elab: &ElaboratedModule) -> bool {
-    match dt {
-        DataType::Enum(_) => true,
-        // An enum typedef is registered in `enum_members` (keyed by the typedef
-        // name), not `typedef_types` — see elaborate::process_typedef.
-        DataType::TypeReference { name, .. } => {
-            elab.enum_members.contains_key(&name.name.name)
-                || elab
-                    .typedef_types
-                    .get(&name.name.name)
-                    .is_some_and(|inner| matches!(inner, DataType::Enum(_)))
-        }
-        _ => false,
-    }
-}
-
-/// §6.19.3: the RHS of an enum assignment must itself be enum-typed or an
-/// explicit cast. A *bare integer literal* (optionally parenthesised / negated)
-/// is the unambiguous illegal case — enum members and same-type enum variables
-/// parse as `Ident`, and a cast parses as a `SystemCall`, so neither is flagged.
-fn is_bare_integer_rhs(e: &Expression) -> bool {
-    match &e.kind {
-        ExprKind::Number(NumberLiteral::Integer { .. }) => true,
-        ExprKind::Paren(inner) => is_bare_integer_rhs(inner),
-        ExprKind::Unary { operand, .. } => is_bare_integer_rhs(operand),
-        _ => false,
-    }
-}
-
-/// §6.19.3: a bare identifier RHS that is a declared variable of a definitely
-/// INTEGRAL, definitely NON-enum type — `int i; e = i;`. Kept as narrow as the
-/// literal case: an enum member, an enum-typed variable, a parameter, a call,
-/// or any name whose declared type is unknown all return false, so only an
-/// unambiguous violation fires.
-fn is_nonenum_integral_var(e: &Expression, elab: &ElaboratedModule) -> bool {
-    let ExprKind::Ident(h) = &e.kind else {
-        return false;
-    };
-    if h.path.len() != 1 || !h.path[0].selects.is_empty() {
-        return false;
-    }
-    let n = h.path[0].name.name.as_str();
-    // An enum MEMBER is a legal RHS, and members are registered as parameters.
-    if elab.parameters.contains_key(n) {
-        return false;
-    }
-    if elab
-        .enum_members
-        .values()
-        .any(|ms| ms.iter().any(|(m, _)| m == n))
-    {
-        return false;
-    }
-    match elab.var_decl_types.get(n) {
-        Some(dt) if resolves_to_enum(dt, elab) => false,
-        Some(DataType::IntegerAtom { .. }) | Some(DataType::IntegerVector { .. }) => true,
-        _ => false,
-    }
-}
-
-/// §6.19.3: reject `enum_var = <integer literal>` (no explicit cast). Covers
-/// both procedural (`e = 1;`) and continuous (`assign e = 1;`) assignments.
-/// Deliberately narrow — only a bare integer-literal RHS to a WHOLE enum
-/// variable fires, so legal enum-member / same-type / cast assignments are
-/// untouched.
-fn check_enum_assign(items: &[ModuleItem], elab: &ElaboratedModule, errs: &mut Vec<String>) {
-    use std::collections::HashSet;
-    let mut enum_vars: HashSet<String> = HashSet::new();
-    for it in items {
-        match it {
-            ModuleItem::DataDeclaration(d) if resolves_to_enum(&d.data_type, elab) => {
-                for decl in &d.declarators {
-                    enum_vars.insert(decl.name.name.clone());
-                }
-            }
-            ModuleItem::NetDeclaration(nd) if resolves_to_enum(&nd.data_type, elab) => {
-                for decl in &nd.declarators {
-                    enum_vars.insert(decl.name.name.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    if enum_vars.is_empty() {
-        return;
-    }
-    fn flag(
-        lv: &Expression,
-        rv: &Expression,
-        enum_vars: &HashSet<String>,
-        elab: &ElaboratedModule,
-        errs: &mut Vec<String>,
-    ) {
-        // Only a whole-variable target (`e = ...`), never `e[i] = ...`.
-        if matches!(lv.kind, ExprKind::Ident(_)) {
-            if let Some(b) = base_ident(lv) {
-                if enum_vars.contains(&b)
-                    && (is_bare_integer_rhs(rv) || is_nonenum_integral_var(rv, elab))
-                {
-                    errs.push(format!(
-                        "assignment to enum variable '{}' requires an explicit cast \
-                         (LRM 1800-2017 §6.19.3)",
-                        b
-                    ));
-                }
-            }
-        }
-    }
-    for it in items {
-        let stmt = match it {
-            ModuleItem::AlwaysConstruct(a) => &a.stmt,
-            ModuleItem::InitialConstruct(i) => &i.stmt,
-            _ => continue,
-        };
-        for_each_assign_pair(stmt, &mut |lv, rv| flag(lv, rv, &enum_vars, elab, errs));
-    }
-    for it in items {
-        if let ModuleItem::ContinuousAssign(ca) = it {
-            for (l, r) in &ca.assignments {
-                flag(l, r, &enum_vars, elab, errs);
-            }
-        }
     }
 }
 

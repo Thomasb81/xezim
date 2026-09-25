@@ -1,0 +1,1866 @@
+//! Assignment-compatibility checks (part of the second-pass should-fail lint,
+//! see `should_fail_lint`).
+//!
+//! The elaborator converts freely between types; these LRM rules reject an
+//! assignment outright:
+//!
+//! - §6.19.3: an enum variable takes only a value of its own enum type — a
+//!   member, a variable or expression of that type, or an explicit cast.
+//! - §8.15: a class handle takes only a handle of its own class or of a class
+//!   derived from it; a base-class handle needs `$cast`.
+//! - §7.6: an unpacked array takes only an unpacked array of the same shape
+//!   whose element type is equivalent (§6.22.2), never a packed value.
+//! - §8.7: `new` without brackets constructs a class (or covergroup) handle.
+//!
+//! The same rules apply to declaration initializers, `return` values and
+//! subroutine input arguments, which are assignments too (§13.5).
+//!
+//! Types are inferred from the AST with lexical scoping. Anything not known
+//! for certain — a parameter-sized width, a hierarchical or package-scoped
+//! name, a cast, a parameterized class, a class whose base is not visible —
+//! is `Unknown` and never produces an error.
+
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use xezim_core::SourceDefinition;
+use xezim_core::ast::Span;
+use xezim_core::ast::decl::{
+    ClassDeclaration, ClassItem, ClassMethodKind, FunctionDeclaration, FunctionPort,
+    ImportDeclaration, ModuleItem, PackageItem, ParameterDeclaration, ParameterKind,
+    TaskDeclaration, TypedefDeclaration,
+};
+use xezim_core::ast::expr::{BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral, UnaryOp};
+use xezim_core::ast::module::PortList;
+use xezim_core::ast::stmt::{ForInit, Statement, StatementKind};
+use xezim_core::ast::types::{
+    DataType, EnumType, IntegerAtomType, IntegerVectorType, PackedDimension, PortDirection,
+    RealType, Signing, SimpleType, UnpackedDimension,
+};
+use xezim_core::elaborate::ElaboratedModule;
+
+#[derive(Clone, Debug, PartialEq)]
+enum Ty {
+    Unknown,
+    /// Packed integral value; `bits` only when every dimension is a literal.
+    Int {
+        bits: Option<u64>,
+        signed: bool,
+        four: bool,
+    },
+    /// One enum declaration: `key` identifies it, `name` is for messages.
+    Enum {
+        key: Rc<str>,
+        name: Rc<str>,
+    },
+    Real {
+        short: bool,
+    },
+    Str,
+    Class(Rc<str>),
+    Null,
+    Void,
+    Struct(Rc<StructTy>),
+    /// Unpacked dimensions, outermost first, around a non-unpacked element.
+    Unpacked {
+        dims: Vec<Dim>,
+        elem: Box<Ty>,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+struct StructTy {
+    key: String,
+    packed: bool,
+    members: Vec<(String, Ty)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Dim {
+    Fixed(Option<u64>),
+    Dynamic,
+    Queue,
+    Assoc,
+}
+
+impl Ty {
+    fn int(bits: Option<u64>, signed: bool, four: bool) -> Ty {
+        Ty::Int { bits, signed, four }
+    }
+
+    /// Integral in the §6.11.1 sense (packed), which an enum or an unpacked
+    /// array can never take implicitly.
+    fn is_packed_value(&self) -> bool {
+        match self {
+            Ty::Int { .. } | Ty::Enum { .. } => true,
+            Ty::Struct(s) => s.packed,
+            _ => false,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Ty::Int { bits, signed, four } => {
+                let base = if *four { "logic" } else { "bit" };
+                let sign = if *signed { " signed" } else { "" };
+                match bits {
+                    Some(1) => format!("{base}{sign}"),
+                    Some(n) => format!("{base}{sign} [{}:0]", n - 1),
+                    None => format!("{base}{sign} vector"),
+                }
+            }
+            Ty::Enum { name, .. } => format!("enum {name}"),
+            Ty::Real { short: true } => "shortreal".into(),
+            Ty::Real { short: false } => "real".into(),
+            Ty::Str => "string".into(),
+            Ty::Class(c) => format!("class {c}"),
+            Ty::Null => "null".into(),
+            Ty::Void => "void".into(),
+            Ty::Struct(s) => {
+                if s.packed {
+                    "packed struct".into()
+                } else {
+                    "unpacked struct".into()
+                }
+            }
+            Ty::Unpacked { dims, elem } => {
+                let mut s = elem.describe();
+                s.push_str(" $");
+                for d in dims {
+                    match d {
+                        Dim::Fixed(Some(n)) => s.push_str(&format!("[{n}]")),
+                        Dim::Fixed(None) => s.push_str("[N]"),
+                        Dim::Dynamic => s.push_str("[]"),
+                        Dim::Queue => s.push_str("[$]"),
+                        Dim::Assoc => s.push_str("[*]"),
+                    }
+                }
+                s
+            }
+            Ty::Unknown => "unknown".into(),
+        }
+    }
+}
+
+/// Wrap `base` in unpacked dimensions (outermost first).
+fn with_dims(base: Ty, dims: &[UnpackedDimension]) -> Ty {
+    if dims.is_empty() || base == Ty::Unknown {
+        return base;
+    }
+    let mut out: Vec<Dim> = dims.iter().map(unpacked_dim).collect();
+    let elem = match base {
+        Ty::Unpacked { dims: inner, elem } => {
+            out.extend(inner);
+            *elem
+        }
+        other => other,
+    };
+    Ty::Unpacked {
+        dims: out,
+        elem: Box::new(elem),
+    }
+}
+
+fn unpacked_dim(d: &UnpackedDimension) -> Dim {
+    match d {
+        UnpackedDimension::Range { left, right, .. } => {
+            Dim::Fixed(match (lit_i64(left), lit_i64(right)) {
+                (Some(l), Some(r)) => Some(l.abs_diff(r) + 1),
+                _ => None,
+            })
+        }
+        UnpackedDimension::Expression { expr, .. } => {
+            Dim::Fixed(lit_i64(expr).and_then(|n| u64::try_from(n).ok()))
+        }
+        UnpackedDimension::Unsized(_) => Dim::Dynamic,
+        UnpackedDimension::Queue { .. } => Dim::Queue,
+        UnpackedDimension::Associative { .. } => Dim::Assoc,
+    }
+}
+
+/// A literal integer expression (no identifiers), folded.
+fn lit_i64(e: &Expression) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
+            let v = value.replace('_', "");
+            let radix = match base {
+                NumberBase::Decimal => 10,
+                NumberBase::Binary => 2,
+                NumberBase::Octal => 8,
+                NumberBase::Hex => 16,
+            };
+            i64::from_str_radix(&v, radix).ok()
+        }
+        ExprKind::Paren(i) => lit_i64(i),
+        ExprKind::Unary {
+            op: UnaryOp::Minus,
+            operand,
+        } => lit_i64(operand).map(|v| -v),
+        ExprKind::Binary { op, left, right } => {
+            let (l, r) = (lit_i64(left)?, lit_i64(right)?);
+            match op {
+                BinaryOp::Add => l.checked_add(r),
+                BinaryOp::Sub => l.checked_sub(r),
+                BinaryOp::Mul => l.checked_mul(r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn packed_bits(dims: &[PackedDimension]) -> Option<u64> {
+    let mut bits: u64 = 1;
+    for d in dims {
+        match d {
+            PackedDimension::Range { left, right, .. } => {
+                bits = bits.checked_mul(lit_i64(left)?.abs_diff(lit_i64(right)?) + 1)?
+            }
+            PackedDimension::Unsized(_) => return None,
+        }
+    }
+    Some(bits)
+}
+
+struct Sig {
+    ret: Ty,
+    ports: Vec<PortSig>,
+}
+
+struct PortSig {
+    name: String,
+    dir: PortDirection,
+    ty: Ty,
+}
+
+struct ClassInfo {
+    base: Option<String>,
+    /// Parameterized, or extends a specialization: identity is not the name.
+    param: bool,
+    interface: bool,
+    props: HashMap<String, Ty>,
+    methods: HashMap<String, Rc<Sig>>,
+}
+
+#[derive(Default)]
+struct Scope {
+    vars: HashMap<String, Ty>,
+    types: HashMap<String, Ty>,
+    subs: HashMap<String, Option<Rc<Sig>>>,
+    /// A class scope whose ancestry is not fully visible: an unqualified name
+    /// may be an inherited member, so a lookup that reaches it gives up.
+    opaque: bool,
+}
+
+enum Layer<'a> {
+    Shared(&'a Scope),
+    Own(Scope),
+}
+
+impl Layer<'_> {
+    fn get(&self) -> &Scope {
+        match self {
+            Layer::Shared(s) => s,
+            Layer::Own(s) => s,
+        }
+    }
+}
+
+/// What the checker knows about the rest of the design.
+struct Env<'e> {
+    class_names: &'e HashMap<String, usize>,
+    packages: &'e HashMap<String, Scope>,
+    unit: Option<&'e Scope>,
+    classes: &'e HashMap<String, Option<Rc<ClassInfo>>>,
+}
+
+struct Ck<'a> {
+    env: Env<'a>,
+    elab: &'a ElaboratedModule,
+    owner: String,
+    stack: Vec<Layer<'a>>,
+    cur_class: Option<String>,
+    ret: Option<Ty>,
+    errs: Vec<String>,
+}
+
+impl<'a> Ck<'a> {
+    fn new(env: Env<'a>, elab: &'a ElaboratedModule, owner: &str) -> Self {
+        let mut stack = Vec::new();
+        if let Some(u) = env.unit {
+            stack.push(Layer::Shared(u));
+        }
+        Ck {
+            env,
+            elab,
+            owner: owner.to_string(),
+            stack,
+            cur_class: None,
+            ret: None,
+            errs: Vec::new(),
+        }
+    }
+
+    fn push(&mut self) {
+        self.stack.push(Layer::Own(Scope::default()));
+    }
+
+    fn pop(&mut self) -> Scope {
+        match self.stack.pop() {
+            Some(Layer::Own(s)) => s,
+            _ => Scope::default(),
+        }
+    }
+
+    fn top(&mut self) -> &mut Scope {
+        if !matches!(self.stack.last(), Some(Layer::Own(_))) {
+            self.push();
+        }
+        match self.stack.last_mut() {
+            Some(Layer::Own(s)) => s,
+            _ => unreachable!(),
+        }
+    }
+
+    fn lookup_var(&self, n: &str) -> Option<Ty> {
+        for l in self.stack.iter().rev() {
+            let s = l.get();
+            if let Some(t) = s.vars.get(n) {
+                return Some(t.clone());
+            }
+            if s.opaque {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn lookup_type(&self, n: &str) -> Option<Ty> {
+        for l in self.stack.iter().rev() {
+            let s = l.get();
+            if let Some(t) = s.types.get(n) {
+                return Some(t.clone());
+            }
+            if s.opaque {
+                return Some(Ty::Unknown);
+            }
+        }
+        None
+    }
+
+    fn lookup_sub(&self, n: &str) -> Option<Rc<Sig>> {
+        for l in self.stack.iter().rev() {
+            let s = l.get();
+            if let Some(t) = s.subs.get(n) {
+                return t.clone();
+            }
+            // Any other name in scope (a variable, a type) hides it too.
+            if s.opaque || s.vars.contains_key(n) || s.types.contains_key(n) {
+                return None;
+            }
+        }
+        None
+    }
+
+    fn is_class_name(&self, n: &str) -> bool {
+        self.env.class_names.get(n) == Some(&1)
+    }
+
+    fn class(&self, n: &str) -> Option<&Rc<ClassInfo>> {
+        self.env.classes.get(n).and_then(|c| c.as_ref())
+    }
+
+    // ---- types -------------------------------------------------------------
+
+    fn resolve(&mut self, dt: &DataType) -> Ty {
+        match dt {
+            DataType::IntegerAtom { kind, signing, .. } => {
+                let (bits, four) = match kind {
+                    IntegerAtomType::Byte => (8, false),
+                    IntegerAtomType::ShortInt => (16, false),
+                    IntegerAtomType::Int => (32, false),
+                    IntegerAtomType::LongInt => (64, false),
+                    IntegerAtomType::Integer => (32, true),
+                    IntegerAtomType::Time => (64, true),
+                };
+                let signed = match signing {
+                    Some(Signing::Signed) => true,
+                    Some(Signing::Unsigned) => false,
+                    None => *kind != IntegerAtomType::Time,
+                };
+                Ty::int(Some(bits), signed, four)
+            }
+            DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                ..
+            } => Ty::int(
+                packed_bits(dimensions),
+                *signing == Some(Signing::Signed),
+                *kind != IntegerVectorType::Bit,
+            ),
+            DataType::Implicit {
+                signing,
+                dimensions,
+                ..
+            } => Ty::int(
+                packed_bits(dimensions),
+                *signing == Some(Signing::Signed),
+                true,
+            ),
+            DataType::Real { kind, .. } => Ty::Real {
+                short: *kind == RealType::ShortReal,
+            },
+            DataType::Simple {
+                kind: SimpleType::String,
+                ..
+            } => Ty::Str,
+            DataType::Simple { .. } => Ty::Unknown,
+            DataType::Void(_) => Ty::Void,
+            DataType::Enum(et) => self.resolve_enum(et, None),
+            DataType::Struct(su) => {
+                if su.tagged || !su.dimensions.is_empty() {
+                    return Ty::Unknown;
+                }
+                let mut members = Vec::new();
+                for m in &su.members {
+                    let t = self.resolve(&m.data_type);
+                    for d in &m.declarators {
+                        members.push((d.name.name.clone(), with_dims(t.clone(), &d.dimensions)));
+                    }
+                }
+                Ty::Struct(Rc::new(StructTy {
+                    key: format!("struct@{}", su.span.start),
+                    packed: su.packed,
+                    members,
+                }))
+            }
+            DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } => {
+                if !dimensions.is_empty() || !type_args.is_empty() {
+                    return Ty::Unknown;
+                }
+                let n = name.name.name.as_str();
+                if let Some(scope) = &name.scope {
+                    return self
+                        .env
+                        .packages
+                        .get(&scope.name)
+                        .and_then(|p| p.types.get(n).cloned())
+                        .unwrap_or(Ty::Unknown);
+                }
+                if let Some(t) = self.lookup_type(n) {
+                    return t;
+                }
+                if self.is_class_name(n) {
+                    return Ty::Class(n.into());
+                }
+                Ty::Unknown
+            }
+            DataType::Interface { .. } => Ty::Unknown,
+        }
+    }
+
+    fn resolve_enum(&mut self, et: &EnumType, name: Option<&str>) -> Ty {
+        if !et.dimensions.is_empty() || et.members.is_empty() {
+            return Ty::Unknown;
+        }
+        let key: Rc<str> = format!("{}@{}", et.members[0].name.name, et.span.start).into();
+        let t = Ty::Enum {
+            key,
+            name: name.unwrap_or("<anonymous>").into(),
+        };
+        // §6.19: the members are constants of the enum type, declared in the
+        // scope that declares the enum.
+        for m in &et.members {
+            if m.range.is_none() {
+                self.top().vars.insert(m.name.name.clone(), t.clone());
+            }
+        }
+        t
+    }
+
+    fn declare_typedef(&mut self, td: &TypedefDeclaration) {
+        if td.forward {
+            return;
+        }
+        let t = match &td.data_type {
+            DataType::Enum(et) => self.resolve_enum(et, Some(&td.name.name)),
+            dt => self.resolve(dt),
+        };
+        let t = with_dims(t, &td.dimensions);
+        self.top().types.insert(td.name.name.clone(), t);
+    }
+
+    fn declare_param(&mut self, pd: &ParameterDeclaration) {
+        match &pd.kind {
+            ParameterKind::Data { assignments, .. } => {
+                for a in assignments {
+                    self.top().vars.insert(a.name.name.clone(), Ty::Unknown);
+                }
+            }
+            ParameterKind::Type { assignments } => {
+                for a in assignments {
+                    self.top().types.insert(a.name.name.clone(), Ty::Unknown);
+                }
+            }
+        }
+    }
+
+    fn declare_import(&mut self, imp: &ImportDeclaration) {
+        let packages = self.env.packages;
+        for it in &imp.items {
+            let Some(p) = packages.get(&it.package.name) else {
+                continue;
+            };
+            match &it.item {
+                // §26.3: a wildcard import is visible only where no local
+                // declaration of the name exists — a layer under this scope.
+                None => {
+                    let own = self.pop();
+                    self.stack.push(Layer::Shared(p));
+                    self.stack.push(Layer::Own(own));
+                }
+                Some(n) => {
+                    let n = &n.name;
+                    if let Some(t) = p.vars.get(n) {
+                        let t = t.clone();
+                        self.top().vars.insert(n.clone(), t);
+                    }
+                    if let Some(t) = p.types.get(n) {
+                        let t = t.clone();
+                        self.top().types.insert(n.clone(), t);
+                        // An imported enum type brings its members along (§26.3
+                        // needs them imported explicitly, but they are the same
+                        // constants, so typing them is safe).
+                    }
+                    if let Some(s) = p.subs.get(n) {
+                        let s = s.clone();
+                        self.top().subs.insert(n.clone(), s);
+                    }
+                }
+            }
+        }
+    }
+
+    fn sig_of_function(&mut self, f: &FunctionDeclaration) -> Rc<Sig> {
+        let ret = self.resolve(&f.return_type);
+        let ports = self.port_sigs(&f.ports, &f.items);
+        Rc::new(Sig { ret, ports })
+    }
+
+    fn sig_of_task(&mut self, t: &TaskDeclaration) -> Rc<Sig> {
+        let ports = self.port_sigs(&t.ports, &t.items);
+        Rc::new(Sig {
+            ret: Ty::Void,
+            ports,
+        })
+    }
+
+    /// A non-ANSI port redeclared in the body (`input [31:0] x; T x;`) has
+    /// the redeclaration's type.
+    fn port_sigs(&mut self, ports: &[FunctionPort], body: &[Statement]) -> Vec<PortSig> {
+        let mut redecl: HashMap<&str, (&DataType, &[UnpackedDimension])> = HashMap::new();
+        for s in body {
+            if let StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } = &s.kind
+            {
+                for d in declarators {
+                    redecl.insert(d.name.name.as_str(), (data_type, &d.dimensions));
+                }
+            }
+        }
+        ports
+            .iter()
+            .map(|p| {
+                let (dt, dims) = redecl
+                    .get(p.name.name.as_str())
+                    .copied()
+                    .unwrap_or((&p.data_type, &p.dimensions));
+                let t = self.resolve(dt);
+                PortSig {
+                    name: p.name.name.clone(),
+                    dir: p.direction,
+                    ty: with_dims(t, dims),
+                }
+            })
+            .collect()
+    }
+
+    /// Record every declaration of a module-like or generate scope in the
+    /// top layer, in source order.
+    fn declare_items(&mut self, items: &[ModuleItem]) {
+        for it in items {
+            match it {
+                ModuleItem::TypedefDeclaration(td) => self.declare_typedef(td),
+                ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                    self.declare_param(pd)
+                }
+                ModuleItem::ImportDeclaration(imp) => self.declare_import(imp),
+                ModuleItem::DataDeclaration(d) => {
+                    let t = self.resolve(&d.data_type);
+                    for dc in &d.declarators {
+                        let vt = with_dims(t.clone(), &dc.dimensions);
+                        self.top().vars.insert(dc.name.name.clone(), vt);
+                    }
+                }
+                ModuleItem::NetDeclaration(n) => {
+                    let t = self.resolve(&n.data_type);
+                    for dc in &n.declarators {
+                        let vt = with_dims(t.clone(), &dc.dimensions);
+                        self.top().vars.insert(dc.name.name.clone(), vt);
+                    }
+                }
+                ModuleItem::PortDeclaration(pd) => {
+                    let t = self.resolve(&pd.data_type);
+                    for dc in &pd.declarators {
+                        let vt = with_dims(t.clone(), &dc.dimensions);
+                        self.top().vars.insert(dc.name.name.clone(), vt);
+                    }
+                }
+                ModuleItem::GenvarDeclaration(g) => {
+                    for n in &g.names {
+                        self.top()
+                            .vars
+                            .insert(n.name.clone(), Ty::int(Some(32), true, false));
+                    }
+                }
+                ModuleItem::FunctionDeclaration(f) if f.name.scope.is_none() => {
+                    let s = self.sig_of_function(f);
+                    self.top().subs.insert(f.name.name.name.clone(), Some(s));
+                }
+                ModuleItem::TaskDeclaration(t) if t.name.scope.is_none() => {
+                    let s = self.sig_of_task(t);
+                    self.top().subs.insert(t.name.name.name.clone(), Some(s));
+                }
+                // A let is called like a function: hide any outer binding.
+                ModuleItem::LetDeclaration(l) => {
+                    self.top().subs.insert(l.name.name.clone(), None);
+                }
+                ModuleItem::ClassDeclaration(c) => {
+                    self.top().types.remove(&c.name.name);
+                }
+                _ => {}
+            }
+        }
+        // DPI imports: their names must not resolve to an outer subroutine.
+        for it in items {
+            if let ModuleItem::DPIImport(d) = it {
+                if let Some(n) = dpi_name(d) {
+                    self.top().subs.insert(n, None);
+                }
+            }
+        }
+    }
+
+    fn declare_ansi_ports(&mut self, ports: &PortList) {
+        if let PortList::Ansi(ps) = ports {
+            for p in ps {
+                let t = match &p.data_type {
+                    Some(dt) => self.resolve(dt),
+                    None => Ty::Unknown,
+                };
+                let t = with_dims(t, &p.dimensions);
+                self.top().vars.insert(p.name.name.clone(), t);
+            }
+        }
+    }
+
+    /// Build the ClassInfo of `c`, declared in the current scope.
+    fn class_info(&mut self, c: &ClassDeclaration) -> ClassInfo {
+        self.push();
+        for p in &c.params {
+            self.declare_param(p);
+        }
+        for it in &c.items {
+            match it {
+                ClassItem::Typedef(td) => self.declare_typedef(td),
+                ClassItem::Parameter(pd) => self.declare_param(pd),
+                ClassItem::Import(imp) => self.declare_import(imp),
+                _ => {}
+            }
+        }
+        let mut props = HashMap::new();
+        let mut methods = HashMap::new();
+        for it in &c.items {
+            match it {
+                ClassItem::Property(p) => {
+                    let t = self.resolve(&p.data_type);
+                    for d in &p.declarators {
+                        props.insert(d.name.name.clone(), with_dims(t.clone(), &d.dimensions));
+                    }
+                }
+                ClassItem::Method(m) => match &m.kind {
+                    ClassMethodKind::Function(f)
+                    | ClassMethodKind::PureVirtual(f)
+                    | ClassMethodKind::Extern(f) => {
+                        let s = self.sig_of_function(f);
+                        methods.insert(f.name.name.name.clone(), s);
+                    }
+                    ClassMethodKind::Task(t) => {
+                        let s = self.sig_of_task(t);
+                        methods.insert(t.name.name.name.clone(), s);
+                    }
+                },
+                _ => {}
+            }
+        }
+        self.pop();
+        let base = c.extends.as_ref().map(|e| e.name.name.clone());
+        ClassInfo {
+            base,
+            param: !c.params.is_empty() || c.extends.as_ref().is_some_and(|e| !e.args.is_empty()),
+            interface: c.is_interface,
+            props,
+            methods,
+        }
+    }
+
+    /// Walk a class's ancestry: Some(chain) when every class on it is known
+    /// and unparameterized.
+    fn chain(&self, name: &str) -> Option<Vec<Rc<ClassInfo>>> {
+        let mut out = Vec::new();
+        let mut cur = name.to_string();
+        loop {
+            let ci = self.class(&cur)?.clone();
+            if ci.param || out.len() > 64 {
+                return None;
+            }
+            let next = ci.base.clone();
+            out.push(ci);
+            match next {
+                Some(b) => cur = b,
+                None => return Some(out),
+            }
+        }
+    }
+
+    /// §8.15: is class `sub` the class `sup` or derived from it?
+    fn derives(&self, sub: &str, sup: &str) -> Option<bool> {
+        let sup_ci = self.class(sup)?;
+        if sup_ci.param || sup_ci.interface {
+            return None;
+        }
+        let chain = self.chain(sub)?;
+        let mut cur = sub.to_string();
+        for ci in &chain {
+            if cur == sup {
+                return Some(true);
+            }
+            if let Some(b) = &ci.base {
+                cur = b.clone();
+            }
+        }
+        Some(cur == sup)
+    }
+
+    fn class_prop(&self, class: &str, member: &str) -> Ty {
+        let Some(chain) = self.chain(class) else {
+            return Ty::Unknown;
+        };
+        for ci in chain {
+            if let Some(t) = ci.props.get(member) {
+                return t.clone();
+            }
+        }
+        Ty::Unknown
+    }
+
+    fn class_method(&self, class: &str, member: &str) -> Option<Rc<Sig>> {
+        for ci in self.chain(class)? {
+            if let Some(s) = ci.methods.get(member) {
+                return Some(s.clone());
+            }
+        }
+        None
+    }
+
+    // ---- expressions -------------------------------------------------------
+
+    fn ty_of(&self, e: &Expression) -> Ty {
+        match &e.kind {
+            ExprKind::Number(NumberLiteral::Integer {
+                size,
+                signed,
+                base,
+                value,
+                ..
+            }) => Ty::int(
+                Some(size.unwrap_or(32) as u64),
+                *signed || (size.is_none() && *base == NumberBase::Decimal),
+                value
+                    .chars()
+                    .any(|c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?')),
+            ),
+            ExprKind::Number(NumberLiteral::Real(_)) => Ty::Real { short: false },
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.is_empty() {
+                    return Ty::Unknown;
+                }
+                let first = &h.path[0];
+                let mut t = if first.name.name == "this" {
+                    match &self.cur_class {
+                        Some(c) => Ty::Class(c.as_str().into()),
+                        None => return Ty::Unknown,
+                    }
+                } else {
+                    match self.lookup_var(&first.name.name) {
+                        Some(t) => t,
+                        None => return Ty::Unknown,
+                    }
+                };
+                for s in &first.selects {
+                    t = self.index_ty(t, s);
+                }
+                for seg in &h.path[1..] {
+                    t = self.member_ty(t, &seg.name.name);
+                    for s in &seg.selects {
+                        t = self.index_ty(t, s);
+                    }
+                }
+                t
+            }
+            ExprKind::Index { expr, index } => {
+                let t = self.ty_of(expr);
+                self.index_ty(t, index)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => match self.ty_of(expr) {
+                Ty::Unpacked { mut dims, elem } => {
+                    let n = match (lit_i64(left), lit_i64(right)) {
+                        (Some(l), Some(r)) => Some(l.abs_diff(r) + 1),
+                        _ => None,
+                    };
+                    dims[0] = Dim::Fixed(n);
+                    Ty::Unpacked { dims, elem }
+                }
+                t if t.is_packed_value() => Ty::int(None, false, four_state(&t)),
+                _ => Ty::Unknown,
+            },
+            ExprKind::MemberAccess { expr, member } => {
+                let t = self.ty_of(expr);
+                self.member_ty(t, &member.name)
+            }
+            ExprKind::Unary { op, operand } => {
+                let t = self.ty_of(operand);
+                match op {
+                    UnaryOp::LogNot
+                    | UnaryOp::BitAnd
+                    | UnaryOp::BitNand
+                    | UnaryOp::BitOr
+                    | UnaryOp::BitNor
+                    | UnaryOp::BitXor
+                    | UnaryOp::BitXnor
+                        if t.is_packed_value() =>
+                    {
+                        Ty::int(Some(1), false, four_state(&t))
+                    }
+                    UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => match t {
+                        Ty::Real { .. } if *op != UnaryOp::BitNot => t,
+                        t if t.is_packed_value() => {
+                            let (bits, signed) = int_shape(&t);
+                            Ty::int(bits, signed, four_state(&t))
+                        }
+                        _ => Ty::Unknown,
+                    },
+                    _ => Ty::Unknown,
+                }
+            }
+            ExprKind::Binary { op, left, right } => {
+                let (l, r) = (self.ty_of(left), self.ty_of(right));
+                let numeric = |t: &Ty| t.is_packed_value() || matches!(t, Ty::Real { .. });
+                match op {
+                    BinaryOp::Eq
+                    | BinaryOp::Neq
+                    | BinaryOp::CaseEq
+                    | BinaryOp::CaseNeq
+                    | BinaryOp::WildcardEq
+                    | BinaryOp::WildcardNeq
+                    | BinaryOp::LogAnd
+                    | BinaryOp::LogOr
+                    | BinaryOp::LogImplies
+                    | BinaryOp::LogEquiv
+                    | BinaryOp::Lt
+                    | BinaryOp::Leq
+                    | BinaryOp::Gt
+                    | BinaryOp::Geq
+                        if l != Ty::Unknown && r != Ty::Unknown =>
+                    {
+                        Ty::int(Some(1), false, false)
+                    }
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod
+                    | BinaryOp::Power
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitXor
+                    | BinaryOp::BitXnor
+                        if numeric(&l) && numeric(&r) =>
+                    {
+                        if matches!(l, Ty::Real { .. }) || matches!(r, Ty::Real { .. }) {
+                            Ty::Real { short: false }
+                        } else {
+                            let (_, ls) = int_shape(&l);
+                            let (_, rs) = int_shape(&r);
+                            Ty::int(None, ls && rs, four_state(&l) || four_state(&r))
+                        }
+                    }
+                    BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight
+                    | BinaryOp::ArithShiftLeft
+                    | BinaryOp::ArithShiftRight
+                        if l.is_packed_value() && numeric(&r) =>
+                    {
+                        let (bits, signed) = int_shape(&l);
+                        Ty::int(bits, signed, four_state(&l))
+                    }
+                    _ => Ty::Unknown,
+                }
+            }
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => {
+                let (a, b) = (self.ty_of(then_expr), self.ty_of(else_expr));
+                if a == b { a } else { Ty::Unknown }
+            }
+            ExprKind::Call { func, .. } => match &func.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none()
+                        && h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name != "new" =>
+                {
+                    match self.lookup_sub(&h.path[0].name.name) {
+                        Some(s) => s.ret.clone(),
+                        None => Ty::Unknown,
+                    }
+                }
+                _ => Ty::Unknown,
+            },
+            ExprKind::Null => Ty::Null,
+            ExprKind::This => match &self.cur_class {
+                Some(c) => Ty::Class(c.as_str().into()),
+                None => Ty::Unknown,
+            },
+            _ => Ty::Unknown,
+        }
+    }
+
+    fn index_ty(&self, t: Ty, index: &Expression) -> Ty {
+        if matches!(index.kind, ExprKind::Range(..)) {
+            return Ty::Unknown;
+        }
+        match t {
+            Ty::Unpacked { mut dims, elem } => {
+                dims.remove(0);
+                if dims.is_empty() {
+                    *elem
+                } else {
+                    Ty::Unpacked { dims, elem }
+                }
+            }
+            t if t.is_packed_value() => Ty::int(None, false, four_state(&t)),
+            _ => Ty::Unknown,
+        }
+    }
+
+    fn member_ty(&self, t: Ty, member: &str) -> Ty {
+        match t {
+            Ty::Struct(s) => s
+                .members
+                .iter()
+                .find(|(n, _)| n == member)
+                .map(|(_, t)| t.clone())
+                .unwrap_or(Ty::Unknown),
+            Ty::Class(c) => self.class_prop(&c, member),
+            _ => Ty::Unknown,
+        }
+    }
+
+    // ---- checks ------------------------------------------------------------
+
+    fn report(&mut self, span: Span, msg: String) {
+        let loc = xezim_core::elaborate::span_location_of(self.elab, span, &self.owner);
+        self.errs.push(match loc {
+            Some(l) => format!("{l}: {msg}"),
+            None => msg,
+        });
+    }
+
+    /// `target = rhs` where `target` has type `lt`; `what` names the target.
+    fn check_value(&mut self, lt: &Ty, rhs: &Expression, what: &str) {
+        if is_new_call(rhs) {
+            // `new(args)` and `new[n](init)` share one AST shape; only the
+            // bare `new` is certainly a class constructor.
+            if matches!(rhs.kind, ExprKind::Ident(_))
+                && matches!(
+                    lt,
+                    Ty::Int { .. }
+                        | Ty::Enum { .. }
+                        | Ty::Real { .. }
+                        | Ty::Str
+                        | Ty::Unpacked { .. }
+                )
+            {
+                self.report(
+                    rhs.span,
+                    format!(
+                        "'new' can only be assigned to a class or covergroup handle, not to \
+                         {what} of type {} (IEEE 1800-2017 §8.7)",
+                        lt.describe()
+                    ),
+                );
+            }
+            return;
+        }
+        let rt = match typed_new_class(rhs) {
+            Some(c) if self.is_class_name(c) => Ty::Class(c.into()),
+            Some(_) => return,
+            None => self.ty_of(rhs),
+        };
+        if let Some(why) = self.incompatible(lt, &rt) {
+            self.report(
+                rhs.span,
+                format!(
+                    "cannot assign {} to {what} of type {}: {why}",
+                    rt.describe(),
+                    lt.describe()
+                ),
+            );
+        }
+    }
+
+    /// Why a value of type `rt` cannot be assigned to type `lt` (None when it
+    /// can, or when that is not certain).
+    fn incompatible(&self, lt: &Ty, rt: &Ty) -> Option<String> {
+        match lt {
+            Ty::Enum { key, .. } => match rt {
+                Ty::Enum { key: k2, .. } if k2 != key => Some(
+                    "an enum takes only its own members, values of its own type, or an explicit \
+                     cast (IEEE 1800-2017 §6.19.3)"
+                        .into(),
+                ),
+                Ty::Int { .. } | Ty::Real { .. } => Some(
+                    "an enum takes only its own members, values of its own type, or an explicit \
+                     cast (IEEE 1800-2017 §6.19.3)"
+                        .into(),
+                ),
+                _ => None,
+            },
+            Ty::Class(a) => match rt {
+                Ty::Class(b) if self.derives(b, a) == Some(false) => Some(format!(
+                    "class {b} is not {a} or a class derived from it; a base-class handle \
+                     needs $cast (IEEE 1800-2017 §8.15)"
+                )),
+                _ => None,
+            },
+            Ty::Unpacked { dims: ld, elem: le } => match rt {
+                t if t.is_packed_value() || matches!(t, Ty::Real { .. } | Ty::Str) => Some(
+                    "an unpacked array takes only an unpacked array (IEEE 1800-2017 §7.6)".into(),
+                ),
+                Ty::Unpacked { dims: rd, elem: re } => {
+                    if ld.contains(&Dim::Assoc) || rd.contains(&Dim::Assoc) {
+                        return None;
+                    }
+                    if ld.len() != rd.len() {
+                        return Some(format!(
+                            "the arrays have {} and {} unpacked dimensions (IEEE 1800-2017 §7.6)",
+                            ld.len(),
+                            rd.len()
+                        ));
+                    }
+                    for (a, b) in ld.iter().zip(rd.iter()) {
+                        if let (Dim::Fixed(Some(x)), Dim::Fixed(Some(y))) = (a, b)
+                            && x != y
+                        {
+                            return Some(format!(
+                                "the arrays have {x} and {y} elements (IEEE 1800-2017 §7.6)"
+                            ));
+                        }
+                    }
+                    if equivalent(le, re) == Some(false) {
+                        return Some(format!(
+                            "element types {} and {} are not equivalent (IEEE 1800-2017 \
+                             §6.22.2, §7.6)",
+                            le.describe(),
+                            re.describe()
+                        ));
+                    }
+                    None
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn check_assign(&mut self, lv: &Expression, rv: &Expression) {
+        let lt = self.ty_of(lv);
+        if lt == Ty::Unknown {
+            return;
+        }
+        let what = format!("'{}'", expr_name(lv));
+        self.check_value(&lt, rv, &what);
+    }
+
+    /// §13.5: argument binding — too many or unbound arguments, and an input
+    /// argument is an assignment to its formal.
+    /// §13.5: an input argument is an assignment to its formal.
+    fn check_call(&mut self, name: &str, sig: &Sig, args: &[Expression]) {
+        let mut pos = 0usize;
+        for a in args {
+            let (i, e) = match &a.kind {
+                ExprKind::NamedArg { name: an, expr } => {
+                    match sig.ports.iter().position(|p| p.name == an.name) {
+                        Some(i) => (i, expr.as_deref()),
+                        None => return,
+                    }
+                }
+                _ => {
+                    pos += 1;
+                    (pos - 1, Some(a))
+                }
+            };
+            let Some(p) = sig.ports.get(i) else {
+                return;
+            };
+            if let Some(e) = e
+                && !matches!(e.kind, ExprKind::Empty)
+                && p.dir == PortDirection::Input
+            {
+                let t = p.ty.clone();
+                let what = format!("argument '{}' of '{name}'", p.name);
+                self.check_value(&t, e, &what);
+            }
+        }
+    }
+
+    fn walk_expr(&mut self, e: &Expression) {
+        match &e.kind {
+            ExprKind::Call { func, args } => {
+                for a in args {
+                    self.walk_expr(a);
+                }
+                match &func.kind {
+                    ExprKind::Ident(h)
+                        if h.root.is_none()
+                            && h.path.len() == 1
+                            && h.path[0].selects.is_empty() =>
+                    {
+                        let n = &h.path[0].name.name;
+                        if n != "new"
+                            && let Some(sig) = self.lookup_sub(n)
+                        {
+                            self.check_call(n, &sig, args);
+                        }
+                    }
+                    ExprKind::MemberAccess { expr, member } => {
+                        self.walk_expr(expr);
+                        if let Ty::Class(c) = self.ty_of(expr)
+                            && let Some(sig) = self.class_method(&c, &member.name)
+                        {
+                            self.check_call(&member.name, &sig, args);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ExprKind::AssignExpr { lvalue, rvalue } => {
+                self.walk_expr(rvalue);
+                self.check_assign(lvalue, rvalue);
+            }
+            ExprKind::Unary { operand, .. } => self.walk_expr(operand),
+            ExprKind::Binary { left, right, .. } => {
+                self.walk_expr(left);
+                self.walk_expr(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.walk_expr(condition);
+                self.walk_expr(then_expr);
+                self.walk_expr(else_expr);
+            }
+            ExprKind::Concatenation(xs) => xs.iter().for_each(|x| self.walk_expr(x)),
+            ExprKind::Paren(x) => self.walk_expr(x),
+            ExprKind::Index { expr, index } => {
+                self.walk_expr(expr);
+                self.walk_expr(index);
+            }
+            ExprKind::MemberAccess { expr, .. } => self.walk_expr(expr),
+            ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| self.walk_expr(x)),
+            _ => {}
+        }
+    }
+
+    fn declare_var(&mut self, dt: &DataType, name: &str, dims: &[UnpackedDimension]) -> Ty {
+        let t = with_dims(self.resolve(dt), dims);
+        self.top().vars.insert(name.to_string(), t.clone());
+        t
+    }
+
+    fn walk_stmt(&mut self, s: &Statement) {
+        match &s.kind {
+            StatementKind::Expr(e) => self.walk_expr(e),
+            StatementKind::BlockingAssign { lvalue, rvalue }
+            | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                self.walk_expr(rvalue);
+                self.check_assign(lvalue, rvalue);
+            }
+            StatementKind::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.walk_expr(condition);
+                self.walk_stmt(then_stmt);
+                if let Some(e) = else_stmt {
+                    self.walk_stmt(e);
+                }
+            }
+            StatementKind::Case { expr, items, .. } => {
+                self.walk_expr(expr);
+                for it in items {
+                    self.walk_stmt(&it.stmt);
+                }
+            }
+            StatementKind::For {
+                init,
+                condition,
+                step,
+                body,
+            } => {
+                self.push();
+                for i in init {
+                    match i {
+                        ForInit::VarDecl {
+                            data_type,
+                            name,
+                            init,
+                        } => {
+                            let t = self.declare_var(data_type, &name.name, &[]);
+                            self.check_value(&t, init, &format!("'{}'", name.name));
+                        }
+                        ForInit::Assign { lvalue, rvalue } => self.check_assign(lvalue, rvalue),
+                    }
+                }
+                if let Some(c) = condition {
+                    self.walk_expr(c);
+                }
+                for e in step {
+                    self.walk_expr(e);
+                }
+                self.walk_stmt(body);
+                self.pop();
+            }
+            StatementKind::Foreach { vars, body, .. } => {
+                self.push();
+                for v in vars.iter().flatten() {
+                    self.top().vars.insert(v.name.clone(), Ty::Unknown);
+                }
+                self.walk_stmt(body);
+                self.pop();
+            }
+            StatementKind::While { condition, body }
+            | StatementKind::DoWhile { body, condition } => {
+                self.walk_expr(condition);
+                self.walk_stmt(body);
+            }
+            StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => self.walk_stmt(body),
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                self.push();
+                for st in stmts {
+                    self.walk_stmt(st);
+                }
+                self.pop();
+            }
+            StatementKind::VarDecl {
+                data_type,
+                declarators,
+                ..
+            } => {
+                let t = self.resolve(data_type);
+                for d in declarators {
+                    let vt = with_dims(t.clone(), &d.dimensions);
+                    if let Some(init) = &d.init {
+                        self.walk_expr(init);
+                        self.check_value(&vt, init, &format!("'{}'", d.name.name));
+                    }
+                    self.top().vars.insert(d.name.name.clone(), vt);
+                }
+            }
+            StatementKind::Typedef(td) => self.declare_typedef(td),
+            StatementKind::Return(Some(e)) => {
+                self.walk_expr(e);
+                if let Some(rt) = self.ret.clone() {
+                    self.check_value(&rt, e, "the return value");
+                }
+            }
+            StatementKind::RandCase { items } => {
+                for (_, st) in items {
+                    self.walk_stmt(st);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_ports(&mut self, ports: &[FunctionPort]) {
+        for p in ports {
+            let t = self.declare_var(&p.data_type, &p.name.name, &p.dimensions);
+            if let Some(d) = &p.default {
+                self.check_value(&t, d, &format!("'{}'", p.name.name));
+            }
+        }
+    }
+
+    fn walk_function(&mut self, f: &FunctionDeclaration) {
+        self.push();
+        let rt = self.resolve(&f.return_type);
+        self.walk_ports(&f.ports);
+        // §13.4.1: the function name is a variable of the return type.
+        if rt != Ty::Void {
+            self.top().vars.insert(f.name.name.name.clone(), rt.clone());
+        }
+        let saved = self
+            .ret
+            .replace(if rt == Ty::Void { Ty::Unknown } else { rt });
+        for s in &f.items {
+            self.walk_stmt(s);
+        }
+        self.ret = saved;
+        self.pop();
+    }
+
+    fn walk_task(&mut self, t: &TaskDeclaration) {
+        self.push();
+        self.walk_ports(&t.ports);
+        let saved = self.ret.take();
+        for s in &t.items {
+            self.walk_stmt(s);
+        }
+        self.ret = saved;
+        self.pop();
+    }
+
+    fn walk_class(&mut self, c: &ClassDeclaration) {
+        if !c.params.is_empty() {
+            return;
+        }
+        let name = c.name.name.as_str();
+        let mut scope = Scope::default();
+        match self.chain(name) {
+            Some(chain) => {
+                for ci in chain.iter().rev() {
+                    for (n, t) in &ci.props {
+                        scope.vars.insert(n.clone(), t.clone());
+                    }
+                    for (n, s) in &ci.methods {
+                        scope.subs.insert(n.clone(), Some(s.clone()));
+                    }
+                }
+            }
+            None => scope.opaque = true,
+        }
+        self.stack.push(Layer::Own(scope));
+        for it in &c.items {
+            match it {
+                ClassItem::Typedef(td) => self.declare_typedef(td),
+                ClassItem::Parameter(pd) => self.declare_param(pd),
+                ClassItem::Import(imp) => self.declare_import(imp),
+                _ => {}
+            }
+        }
+        let saved = self.cur_class.replace(name.to_string());
+        for it in &c.items {
+            match it {
+                ClassItem::Property(p) => {
+                    let t = self.resolve(&p.data_type);
+                    for d in &p.declarators {
+                        if let Some(init) = &d.init {
+                            let vt = with_dims(t.clone(), &d.dimensions);
+                            self.check_value(&vt, init, &format!("'{}'", d.name.name));
+                        }
+                    }
+                }
+                ClassItem::Method(m) => match &m.kind {
+                    ClassMethodKind::Function(f) => self.walk_function(f),
+                    ClassMethodKind::Task(t) => self.walk_task(t),
+                    _ => {}
+                },
+                ClassItem::Class(inner) => self.walk_class(inner),
+                _ => {}
+            }
+        }
+        self.cur_class = saved;
+        self.pop();
+    }
+
+    fn walk_items(&mut self, items: &[ModuleItem]) {
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) => {
+                    let t = self.resolve(&d.data_type);
+                    for dc in &d.declarators {
+                        if let Some(init) = &dc.init {
+                            let vt = with_dims(t.clone(), &dc.dimensions);
+                            self.walk_expr(init);
+                            self.check_value(&vt, init, &format!("'{}'", dc.name.name));
+                        }
+                    }
+                }
+                ModuleItem::NetDeclaration(n) => {
+                    let t = self.resolve(&n.data_type);
+                    for dc in &n.declarators {
+                        if let Some(init) = &dc.init {
+                            let vt = with_dims(t.clone(), &dc.dimensions);
+                            self.check_value(&vt, init, &format!("'{}'", dc.name.name));
+                        }
+                    }
+                }
+                ModuleItem::ContinuousAssign(ca) => {
+                    for (l, r) in &ca.assignments {
+                        self.walk_expr(r);
+                        self.check_assign(l, r);
+                    }
+                }
+                ModuleItem::AlwaysConstruct(a) => self.walk_stmt(&a.stmt),
+                ModuleItem::InitialConstruct(i) => self.walk_stmt(&i.stmt),
+                ModuleItem::FinalConstruct(f) => self.walk_stmt(&f.stmt),
+                ModuleItem::FunctionDeclaration(f) if f.name.scope.is_none() => {
+                    self.walk_function(f)
+                }
+                ModuleItem::TaskDeclaration(t) if t.name.scope.is_none() => self.walk_task(t),
+                ModuleItem::ClassDeclaration(c) => self.walk_class(c),
+                ModuleItem::GenerateRegion(g) => self.walk_block(&g.items, None),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, items) in &g.branches {
+                        self.walk_block(items, None);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => self.walk_block(&g.items, Some(&g.var)),
+                ModuleItem::GenerateCase(g) => {
+                    for arm in &g.arms {
+                        self.walk_block(&arm.items, None);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn walk_block(&mut self, items: &[ModuleItem], genvar: Option<&str>) {
+        self.push();
+        if let Some(g) = genvar {
+            self.top()
+                .vars
+                .insert(g.to_string(), Ty::int(Some(32), true, false));
+        }
+        self.declare_items(items);
+        self.walk_items(items);
+        self.pop();
+    }
+}
+
+fn four_state(t: &Ty) -> bool {
+    match t {
+        Ty::Int { four, .. } => *four,
+        _ => true,
+    }
+}
+
+fn int_shape(t: &Ty) -> (Option<u64>, bool) {
+    match t {
+        Ty::Int { bits, signed, .. } => (*bits, *signed),
+        _ => (None, false),
+    }
+}
+
+/// §6.22.2 type equivalence of array elements: Some(false) only when the two
+/// types are definitely not equivalent.
+fn equivalent(a: &Ty, b: &Ty) -> Option<bool> {
+    match (a, b) {
+        (
+            Ty::Int {
+                bits: ab,
+                signed: asg,
+                four: af,
+            },
+            Ty::Int {
+                bits: bb,
+                signed: bsg,
+                four: bf,
+            },
+        ) => {
+            if asg != bsg || af != bf {
+                return Some(false);
+            }
+            match (ab, bb) {
+                (Some(x), Some(y)) => Some(x == y),
+                _ => None,
+            }
+        }
+        (Ty::Real { short: x }, Ty::Real { short: y }) => Some(x == y),
+        (Ty::Real { .. }, Ty::Int { .. }) | (Ty::Int { .. }, Ty::Real { .. }) => Some(false),
+        (Ty::Str, Ty::Str) => Some(true),
+        (Ty::Str, Ty::Int { .. } | Ty::Real { .. })
+        | (Ty::Int { .. } | Ty::Real { .. }, Ty::Str) => Some(false),
+        (Ty::Enum { key: x, .. }, Ty::Enum { key: y, .. }) => Some(x == y),
+        _ => None,
+    }
+}
+
+fn is_new_call(e: &Expression) -> bool {
+    let id = match &e.kind {
+        ExprKind::Call { func, .. } => func,
+        _ => e,
+    };
+    matches!(&id.kind, ExprKind::Ident(h)
+        if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty()
+            && h.path[0].name.name == "new")
+}
+
+/// `C::new` / `C::new(args)`: the class it constructs.
+fn typed_new_class(e: &Expression) -> Option<&str> {
+    let m = match &e.kind {
+        ExprKind::Call { func, .. } => func,
+        _ => e,
+    };
+    match &m.kind {
+        ExprKind::MemberAccess { expr, member } if member.name == "new" => match &expr.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                Some(h.path[0].name.name.as_str())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn expr_name(e: &Expression) -> String {
+    match &e.kind {
+        ExprKind::Ident(h) => h
+            .path
+            .iter()
+            .map(|s| {
+                if s.selects.is_empty() {
+                    s.name.name.clone()
+                } else {
+                    format!("{}[..]", s.name.name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("."),
+        ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+            format!("{}[..]", expr_name(expr))
+        }
+        ExprKind::MemberAccess { expr, member } => format!("{}.{}", expr_name(expr), member.name),
+        ExprKind::Paren(x) => expr_name(x),
+        _ => "target".into(),
+    }
+}
+
+fn dpi_name(d: &xezim_core::ast::decl::DPIImport) -> Option<String> {
+    use xezim_core::ast::decl::DPIProto;
+    Some(match &d.proto {
+        DPIProto::Function(f) => f.name.name.name.clone(),
+        DPIProto::Task(t) => t.name.name.name.clone(),
+    })
+}
+
+/// Run the checks over every definition; returns the error messages.
+pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String> {
+    // Phase 0: class names (a name declared twice is ambiguous and ignored).
+    let mut class_names: HashMap<String, usize> = HashMap::new();
+    fn count_items(items: &[ModuleItem], out: &mut HashMap<String, usize>) {
+        for it in items {
+            match it {
+                ModuleItem::ClassDeclaration(c) => count_class(c, out),
+                ModuleItem::GenerateRegion(g) => count_items(&g.items, out),
+                ModuleItem::GenerateIf(g) => {
+                    g.branches.iter().for_each(|(_, i)| count_items(i, out))
+                }
+                ModuleItem::GenerateFor(g) => count_items(&g.items, out),
+                ModuleItem::GenerateCase(g) => {
+                    g.arms.iter().for_each(|a| count_items(&a.items, out))
+                }
+                _ => {}
+            }
+        }
+    }
+    fn count_class(c: &ClassDeclaration, out: &mut HashMap<String, usize>) {
+        *out.entry(c.name.name.clone()).or_default() += 1;
+        for it in &c.items {
+            if let ClassItem::Class(inner) = it {
+                count_class(inner, out);
+            }
+        }
+    }
+    for d in defs {
+        match d {
+            SourceDefinition::Module(m) => count_items(&m.items, &mut class_names),
+            SourceDefinition::Interface(m) => count_items(&m.items, &mut class_names),
+            SourceDefinition::Program(m) => count_items(&m.items, &mut class_names),
+            SourceDefinition::Class(c) => count_class(c, &mut class_names),
+            SourceDefinition::Package(p) => {
+                for it in &p.items {
+                    if let PackageItem::Class(c) = it {
+                        count_class(c, &mut class_names);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Phase 1: package scopes (twice, so a package sees the ones it imports).
+    let no_classes: HashMap<String, Option<Rc<ClassInfo>>> = HashMap::new();
+    let empty_pkgs: HashMap<String, Scope> = HashMap::new();
+    let mut unit = Scope::default();
+    {
+        let env = Env {
+            class_names: &class_names,
+            packages: &empty_pkgs,
+            unit: None,
+            classes: &no_classes,
+        };
+        let mut ck = Ck::new(env, elab, "");
+        ck.push();
+        for d in defs {
+            if let SourceDefinition::Typedef(td) = d {
+                ck.declare_typedef(td);
+            }
+        }
+        unit = ck.pop();
+    }
+    let mut packages: HashMap<String, Scope> = HashMap::new();
+    for _pass in 0..2 {
+        let mut next: HashMap<String, Scope> = HashMap::new();
+        for d in defs {
+            if let SourceDefinition::Package(p) = d {
+                let env = Env {
+                    class_names: &class_names,
+                    packages: &packages,
+                    unit: Some(&unit),
+                    classes: &no_classes,
+                };
+                let mut ck = Ck::new(env, elab, &p.name.name);
+                ck.push();
+                declare_package_items(&mut ck, &p.items);
+                next.insert(p.name.name.clone(), ck.pop());
+            }
+        }
+        packages = next;
+    }
+
+    // Phase 2: class declarations, resolved in the scope that declares them.
+    let mut classes: HashMap<String, Option<Rc<ClassInfo>>> = HashMap::new();
+    {
+        let env = || Env {
+            class_names: &class_names,
+            packages: &packages,
+            unit: Some(&unit),
+            classes: &no_classes,
+        };
+        let mut found: Vec<(String, ClassInfo)> = Vec::new();
+        for d in defs {
+            match d {
+                SourceDefinition::Module(m) => {
+                    let mut ck = Ck::new(env(), elab, &m.name.name);
+                    ck.push();
+                    for p in &m.params {
+                        ck.declare_param(p);
+                    }
+                    ck.declare_items(&m.items);
+                    class_infos_items(&mut ck, &m.items, &mut found);
+                }
+                SourceDefinition::Interface(m) => {
+                    let mut ck = Ck::new(env(), elab, &m.name.name);
+                    ck.push();
+                    for p in &m.params {
+                        ck.declare_param(p);
+                    }
+                    ck.declare_items(&m.items);
+                    class_infos_items(&mut ck, &m.items, &mut found);
+                }
+                SourceDefinition::Program(m) => {
+                    let mut ck = Ck::new(env(), elab, &m.name.name);
+                    ck.push();
+                    for p in &m.params {
+                        ck.declare_param(p);
+                    }
+                    ck.declare_items(&m.items);
+                    class_infos_items(&mut ck, &m.items, &mut found);
+                }
+                SourceDefinition::Package(p) => {
+                    let mut ck = Ck::new(env(), elab, &p.name.name);
+                    ck.push();
+                    declare_package_items(&mut ck, &p.items);
+                    for it in &p.items {
+                        if let PackageItem::Class(c) = it {
+                            class_info_rec(&mut ck, c, &mut found);
+                        }
+                    }
+                }
+                SourceDefinition::Class(c) => {
+                    let mut ck = Ck::new(env(), elab, &c.name.name);
+                    class_info_rec(&mut ck, c, &mut found);
+                }
+                _ => {}
+            }
+        }
+        for (n, ci) in found {
+            if class_names.get(&n) == Some(&1) {
+                classes.insert(n, Some(Rc::new(ci)));
+            }
+        }
+    }
+
+    // Phase 3: walk every body.
+    let mut errs = Vec::new();
+    let env = || Env {
+        class_names: &class_names,
+        packages: &packages,
+        unit: Some(&unit),
+        classes: &classes,
+    };
+    for d in defs {
+        let mut ck;
+        match d {
+            SourceDefinition::Module(m) => {
+                ck = Ck::new(env(), elab, &m.name.name);
+                ck.push();
+                for p in &m.params {
+                    ck.declare_param(p);
+                }
+                ck.declare_ansi_ports(&m.ports);
+                ck.declare_items(&m.items);
+                ck.walk_items(&m.items);
+            }
+            SourceDefinition::Interface(m) => {
+                ck = Ck::new(env(), elab, &m.name.name);
+                ck.push();
+                for p in &m.params {
+                    ck.declare_param(p);
+                }
+                ck.declare_ansi_ports(&m.ports);
+                ck.declare_items(&m.items);
+                ck.walk_items(&m.items);
+            }
+            SourceDefinition::Program(m) => {
+                ck = Ck::new(env(), elab, &m.name.name);
+                ck.push();
+                for p in &m.params {
+                    ck.declare_param(p);
+                }
+                ck.declare_ansi_ports(&m.ports);
+                ck.declare_items(&m.items);
+                ck.walk_items(&m.items);
+            }
+            SourceDefinition::Package(p) => {
+                ck = Ck::new(env(), elab, &p.name.name);
+                ck.push();
+                declare_package_items(&mut ck, &p.items);
+                for it in &p.items {
+                    match it {
+                        PackageItem::Function(f) if f.name.scope.is_none() => ck.walk_function(f),
+                        PackageItem::Task(t) if t.name.scope.is_none() => ck.walk_task(t),
+                        PackageItem::Class(c) => ck.walk_class(c),
+                        _ => {}
+                    }
+                }
+            }
+            SourceDefinition::Class(c) => {
+                ck = Ck::new(env(), elab, &c.name.name);
+                ck.walk_class(c);
+            }
+            _ => continue,
+        }
+        errs.append(&mut ck.errs);
+    }
+    errs
+}
+
+fn declare_package_items(ck: &mut Ck<'_>, items: &[PackageItem]) {
+    for it in items {
+        match it {
+            PackageItem::Typedef(td) => ck.declare_typedef(td),
+            PackageItem::Parameter(pd) => ck.declare_param(pd),
+            PackageItem::Import(imp) => ck.declare_import(imp),
+            PackageItem::Data(d) => {
+                let t = ck.resolve(&d.data_type);
+                for dc in &d.declarators {
+                    let vt = with_dims(t.clone(), &dc.dimensions);
+                    ck.top().vars.insert(dc.name.name.clone(), vt);
+                }
+            }
+            PackageItem::Function(f) if f.name.scope.is_none() => {
+                let s = ck.sig_of_function(f);
+                ck.top().subs.insert(f.name.name.name.clone(), Some(s));
+            }
+            PackageItem::Task(t) if t.name.scope.is_none() => {
+                let s = ck.sig_of_task(t);
+                ck.top().subs.insert(t.name.name.name.clone(), Some(s));
+            }
+            PackageItem::DPIImport(d) => {
+                if let Some(n) = dpi_name(d) {
+                    ck.top().subs.insert(n, None);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn class_info_rec(ck: &mut Ck<'_>, c: &ClassDeclaration, out: &mut Vec<(String, ClassInfo)>) {
+    let ci = ck.class_info(c);
+    out.push((c.name.name.clone(), ci));
+    for it in &c.items {
+        if let ClassItem::Class(inner) = it {
+            class_info_rec(ck, inner, out);
+        }
+    }
+}
+
+fn class_infos_items(ck: &mut Ck<'_>, items: &[ModuleItem], out: &mut Vec<(String, ClassInfo)>) {
+    for it in items {
+        match it {
+            ModuleItem::ClassDeclaration(c) => class_info_rec(ck, c, out),
+            ModuleItem::GenerateRegion(g) => class_infos_items(ck, &g.items, out),
+            ModuleItem::GenerateIf(g) => {
+                for (_, items) in &g.branches {
+                    class_infos_items(ck, items, out);
+                }
+            }
+            ModuleItem::GenerateFor(g) => class_infos_items(ck, &g.items, out),
+            ModuleItem::GenerateCase(g) => {
+                for a in &g.arms {
+                    class_infos_items(ck, &a.items, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
