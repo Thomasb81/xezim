@@ -7,7 +7,8 @@
 //!
 //! * a path is enabled when it is unconditional, its condition is true or
 //!   x/z (§30.4.4.1), or — `ifnone` — no conditional path from one of its
-//!   inputs is enabled; with no enabled path the net changes at once;
+//!   inputs is enabled; with no enabled path the net changes in the same
+//!   time step;
 //! * among the enabled paths, the one whose input changed most recently
 //!   wins; inputs that changed together take the smallest delay (§30.4.4);
 //! * each bit uses the delay of its own transition (§30.5.1 Table 30-3),
@@ -24,10 +25,23 @@
 //! also rejects every pulse narrower than the path delay by default.
 use super::*;
 
+/// The design's module paths, resolved to signal ids.
+pub(super) struct ModulePaths {
+    /// Path table index by destination signal id.
+    dst: HashMap<usize, usize>,
+    tables: Vec<Vec<PathRt>>,
+    srcs: Vec<PathSrc>,
+    /// The condition evaluator, called through a pointer. A direct call from
+    /// the delay-scheduling path into the expression evaluator changed how
+    /// the optimizer inlined the hot settle loop — about 1% more
+    /// instructions on a design with no specify paths at all.
+    cond_true: fn(&mut Simulator, &Option<Arc<Expression>>) -> bool,
+}
+
 /// A module path into one net.
-pub(super) struct PathRt {
+struct PathRt {
     delays: [u64; 12],
-    /// Indices into `Simulator::path_srcs`.
+    /// Indices into `ModulePaths::srcs`.
     srcs: Vec<u32>,
     cond: Option<Arc<Expression>>,
     ifnone: bool,
@@ -35,10 +49,51 @@ pub(super) struct PathRt {
 
 /// A path input terminal: its signal, the watch stamping its changes, and
 /// the time of its last change.
-pub(super) struct PathSrc {
+struct PathSrc {
     sig: usize,
     watch: usize,
-    pub(super) last: u64,
+    last: u64,
+}
+
+impl ModulePaths {
+    pub(super) fn table_of(&self, id: usize) -> Option<usize> {
+        self.dst.get(&id).copied()
+    }
+
+    pub(super) fn is_path_net(&self, id: usize) -> bool {
+        self.dst.contains_key(&id)
+    }
+
+    /// Input `slot` changed at `now`.
+    pub(super) fn stamp(&mut self, slot: u32, now: u64) {
+        self.srcs[slot as usize].last = now;
+    }
+}
+
+/// §30.4.4.1: a condition that is x or z enables its path, so the path is
+/// on unless the condition is a known 0 — `(cond) !== 0`, which the
+/// timing-check condition evaluator (enabled only for a known nonzero)
+/// then decides.
+fn path_enable_expr(cond: Expression) -> Arc<Expression> {
+    let span = cond.span;
+    let zero = Expression::new(
+        ExprKind::Number(NumberLiteral::Integer {
+            size: None,
+            signed: true,
+            base: NumberBase::Decimal,
+            value: "0".to_string(),
+            cached_val: Default::default(),
+        }),
+        span,
+    );
+    Arc::new(Expression::new(
+        ExprKind::Binary {
+            op: BinaryOp::CaseNeq,
+            left: Box::new(cond),
+            right: Box::new(zero),
+        },
+        span,
+    ))
 }
 
 impl Simulator {
@@ -53,7 +108,15 @@ impl Simulator {
         let paths = std::mem::take(&mut self.module.module_paths);
         let mut names: Vec<&String> = paths.keys().collect();
         names.sort();
-        let mut src_of: HashMap<usize, u32> = HashMap::default();
+        let mut mp = ModulePaths {
+            dst: HashMap::default(),
+            tables: Vec::new(),
+            srcs: Vec::new(),
+            cond_true: Simulator::timing_cond_true,
+        };
+        // `usize` values: a new `HashMap<usize, u32>::insert` caller changed
+        // how that map's hot users in the NBA path were inlined.
+        let mut src_of: HashMap<usize, usize> = HashMap::default();
         for name in names {
             let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
                 continue;
@@ -69,16 +132,16 @@ impl Simulator {
                         continue;
                     };
                     let slot = match src_of.get(&sig) {
-                        Some(&k) => k,
+                        Some(&k) => k as u32,
                         None => {
-                            let k = self.path_srcs.len() as u32;
+                            let k = mp.srcs.len() as u32;
                             let watch = self.path_source_watch(sig, k);
-                            self.path_srcs.push(PathSrc {
+                            mp.srcs.push(PathSrc {
                                 sig,
                                 watch,
                                 last: 0,
                             });
-                            src_of.insert(sig, k);
+                            src_of.insert(sig, k as usize);
                             k
                         }
                     };
@@ -87,26 +150,31 @@ impl Simulator {
                 rts.push(PathRt {
                     delays: p.delays.map(&map_delay),
                     srcs,
-                    cond: p.cond.clone().map(Arc::new),
+                    cond: p.cond.clone().map(path_enable_expr),
                     ifnone: p.ifnone,
                 });
             }
-            self.path_dst.insert(id, self.module_paths.len());
-            self.module_paths.push(rts);
+            mp.dst.insert(id, mp.tables.len());
+            mp.tables.push(rts);
+        }
+        if !mp.tables.is_empty() {
+            self.module_paths = Some(Box::new(mp));
         }
     }
 
     /// Runtime SDF back-annotation replaces the path delays of the nets it
     /// annotates.
     pub(super) fn drop_module_paths_of(&mut self, id: usize) {
-        self.path_dst.remove(&id);
+        if let Some(mp) = self.module_paths.as_mut() {
+            mp.dst.remove(&id);
+        }
     }
 
     /// When the path's inputs last changed.
-    fn path_input_time(&self, srcs: &[u32]) -> u64 {
+    fn path_input_time(&self, mp: &ModulePaths, srcs: &[u32]) -> u64 {
         srcs.iter()
             .map(|&s| {
-                let src = &self.path_srcs[s as usize];
+                let src = &mp.srcs[s as usize];
                 if self.timing_watch_stale(src.watch, src.sig) {
                     self.time
                 } else {
@@ -117,32 +185,26 @@ impl Simulator {
             .unwrap_or(0)
     }
 
-    fn path_cond_enabled(&mut self, c: &Arc<Expression>) -> bool {
-        // The condition is already in the flat namespace; a scope hint left
-        // behind by the previous evaluation must not re-root its names.
-        let saved = self.name_resolve_hint.borrow_mut().take();
-        let v = self.eval_expr(c);
-        *self.name_resolve_hint.borrow_mut() = saved;
-        v.has_xz() || v.is_true()
-    }
-
     /// The per-transition delays that apply to the next change of the net
     /// with path table `k`; `None` when no path is enabled.
     fn module_path_delays(&mut self, k: usize) -> Option<[u64; 12]> {
-        let n = self.module_paths[k].len();
+        let mp = self.module_paths.as_ref()?;
+        let cond_true = mp.cond_true;
+        let conds: Vec<(Option<Arc<Expression>>, bool)> = mp.tables[k]
+            .iter()
+            .map(|p| (p.cond.clone(), p.ifnone))
+            .collect();
+        let n = conds.len();
         let mut enabled = vec![false; n];
-        for i in 0..n {
-            let (cond, ifnone) = {
-                let p = &self.module_paths[k][i];
-                (p.cond.clone(), p.ifnone)
-            };
+        for (i, (cond, ifnone)) in conds.into_iter().enumerate() {
             enabled[i] = match cond {
                 _ if ifnone => false,
-                Some(c) => self.path_cond_enabled(&c),
+                c @ Some(_) => cond_true(self, &c),
                 None => true,
             };
         }
-        let paths = &self.module_paths[k];
+        let mp = self.module_paths.as_ref()?;
+        let paths = &mp.tables[k];
         for i in 0..n {
             if paths[i].ifnone {
                 enabled[i] = !(0..n).any(|j| {
@@ -155,7 +217,7 @@ impl Simulator {
         let times: Vec<u64> = (0..n)
             .map(|i| {
                 if enabled[i] {
-                    self.path_input_time(&paths[i].srcs)
+                    self.path_input_time(mp, &paths[i].srcs)
                 } else {
                     0
                 }
@@ -174,8 +236,12 @@ impl Simulator {
     /// Schedule `val` onto the path-delayed net `id` (path table `k`): each
     /// bit after the delay of its own transition. Inertial per bit: a bit
     /// already on its way to the same value keeps its pending time, any other
-    /// pending change of the net is replaced, and a bit with no delay
-    /// commits at once.
+    /// pending change of the net is replaced, and a bit with no delay is
+    /// queued for the current time step.
+    ///
+    /// Out of line so `schedule_delayed_with_delay` stays as small as it was
+    /// for designs without module paths.
+    #[inline(never)]
     pub(super) fn schedule_module_path(&mut self, id: usize, k: usize, val: Value) {
         let delays = self.module_path_delays(k);
         let old = self.signal_table[id].clone();
@@ -205,8 +271,9 @@ impl Simulator {
             let at = in_flight.unwrap_or_else(|| self.time + delays.map_or(0, |ds| ds[t]));
             when.push((at, b));
         }
-        when.sort_unstable();
+        when.sort_unstable_by_key(|&(t, b)| (t, b));
         let mut cur = old;
+        let mut steps: Vec<(u64, Value)> = Vec::new();
         let mut i = 0;
         while i < when.len() {
             let at = when[i].0;
@@ -220,22 +287,15 @@ impl Simulator {
             } else {
                 cur.clone()
             };
-            if at <= self.time {
-                self.commit_delayed_now(id, v);
-            } else {
-                self.delayed_updates.push((at, id, v));
-            }
+            steps.push((at, v));
         }
-    }
-
-    /// Commit a delayed update whose delay came out as zero, as
-    /// `apply_delayed_updates` does when one matures.
-    fn commit_delayed_now(&mut self, id: usize, mut val: Value) {
-        val.is_signed = self.signal_signed[id];
-        if self.signal_table[id] != val {
-            write_sig!(self, id, val);
-            self.mark_dirty_id(id);
-            self.table_modified = true;
+        // Latest first: `schedule_delayed_slice` and UDP outputs compose
+        // onto the FIRST queued update of a net, which must be the one that
+        // leaves it at its final value. A bit with no delay (no enabled path)
+        // is queued at the current time; the scheduler applies it in the
+        // next delta of this time step.
+        for (at, v) in steps.into_iter().rev() {
+            self.delayed_updates.push((at, id, v));
         }
     }
 }

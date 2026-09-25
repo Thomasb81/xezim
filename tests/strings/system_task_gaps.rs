@@ -571,10 +571,12 @@ fn sdf_annotation_overrides_specify_and_paths_agree() {
         "SDF must override specify:\n{}",
         with_sdf
     );
-    // Specify-only (no SDF): edge at t=9, so y=0 at t=7.
+    // Specify-only (no SDF): edge at t=9, and the time-0 x->0 change waits
+    // for the path delay as well, so y is still x at t=7 (as the reference
+    // simulator prints).
     let no_sdf = run(&[]);
     assert!(
-        no_sdf.contains("T7 y=0"),
+        no_sdf.contains("T7 y=x"),
         "specify-only timing must be unchanged:\n{}",
         no_sdf
     );

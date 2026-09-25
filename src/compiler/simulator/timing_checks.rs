@@ -634,7 +634,7 @@ impl Simulator {
 
     /// `&&&` condition / timestamp / timecheck condition: enabled only for
     /// a known nonzero value.
-    fn timing_cond_true(&mut self, c: &Option<Arc<Expression>>) -> bool {
+    pub(super) fn timing_cond_true(&mut self, c: &Option<Arc<Expression>>) -> bool {
         let Some(e) = c else { return true };
         // The condition is already in the flat namespace; a scope hint left
         // behind by the previous evaluation must not re-root its names.
@@ -668,8 +668,11 @@ impl Simulator {
             self.timing_watches[w].prev_x = cx;
         }
         for k in 0..self.timing_watches[w].path_srcs.len() {
-            let slot = self.timing_watches[w].path_srcs[k] as usize;
-            self.path_srcs[slot].last = self.time;
+            let slot = self.timing_watches[w].path_srcs[k];
+            let now = self.time;
+            if let Some(mp) = self.module_paths.as_mut() {
+                mp.stamp(slot, now);
+            }
         }
         if self.time == 0 {
             return;

@@ -55,12 +55,14 @@ fn run(tag: &str, args: &[&str]) -> String {
     )
 }
 
-/// Default: the (a => y) = 10 path delay holds y at 0 two ns after the input
-/// edge, and it arrives by the end.
+/// Default: the (a => y) = 10 path delay defers y — two ns after the input
+/// edge it still holds x, because the time-0 x->0 change also waits for the
+/// path delay and the 1 at 5 ns replaced it — and the 1 arrives by the end.
+/// Cross-checked against the reference simulator.
 #[test]
 fn specify_path_delay_applies_by_default() {
     let out = run("default", &[]);
-    assert!(out.contains("MID y=0"), "path delay must defer y:\n{}", out);
+    assert!(out.contains("MID y=x"), "path delay must defer y:\n{}", out);
     assert!(
         out.contains("END y=1"),
         "y must eventually arrive:\n{}",
@@ -95,7 +97,7 @@ fn notimingcheck_keeps_path_delays() {
             out
         );
         assert!(
-            out.contains("MID y=0"),
+            out.contains("MID y=x"),
             "{} must not change timing:\n{}",
             flag,
             out
@@ -204,7 +206,8 @@ endmodule
 
 /// min:typ:max triplets: default typ, +mindelays/+maxdelays select the ends.
 /// A triplet used to derail the specify parser and silently drop the whole
-/// path delay to zero.
+/// path delay to zero. y reads x until its first path delay elapses (the
+/// reference simulator's output for all three selections).
 #[test]
 fn min_typ_max_triplet_selection() {
     let dir = std::env::temp_dir().join("xezim_specify_triplet");
@@ -225,7 +228,7 @@ fn min_typ_max_triplet_selection() {
     };
     let typ = run(&[]);
     assert!(
-        typ.contains("T4 y=0") && typ.contains("T8 y=1"),
+        typ.contains("T4 y=x") && typ.contains("T8 y=1"),
         "typ default (5ns):\n{}",
         typ
     );
@@ -233,7 +236,7 @@ fn min_typ_max_triplet_selection() {
     assert!(min.contains("T4 y=1"), "+mindelays (2ns):\n{}", min);
     let max = run(&["+maxdelays"]);
     assert!(
-        max.contains("T8 y=0") && max.contains("T12 y=1"),
+        max.contains("T8 y=x") && max.contains("T12 y=1"),
         "+maxdelays (9ns):\n{}",
         max
     );
@@ -291,8 +294,9 @@ fn delay_mode_zero_and_unit() {
             String::from_utf8_lossy(&o.stderr)
         )
     };
-    // default: specify 8ns → edge at t9, so y=0 at t3.
-    assert!(run(&[]).contains("T3 y=0"), "default specify delay");
+    // default: specify 8ns → edge at t9, so y is still x at t3 (the time-0
+    // value waits for the path delay too; the reference simulator agrees).
+    assert!(run(&[]).contains("T3 y=x"), "default specify delay");
     // zero: edge at t1 → y=1 at t3.
     assert!(
         run(&["+delay_mode_zero"]).contains("T3 y=1"),

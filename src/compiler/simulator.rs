@@ -4833,11 +4833,9 @@ pub struct Simulator {
     /// Like `has_udp`: timing checks keep per-check state, so their comb
     /// entries force the serial settle.
     has_timing_checks: bool,
-    /// §30.4 module paths: path table index by destination signal id, the
-    /// tables, and the path input terminals (see `module_paths`).
-    path_dst: HashMap<usize, usize>,
-    module_paths: Vec<Vec<module_paths::PathRt>>,
-    path_srcs: Vec<module_paths::PathSrc>,
+    /// §30.4 module paths (see `module_paths`); `None` without any, so a
+    /// design with no specify paths carries one null pointer.
+    module_paths: Option<Box<module_paths::ModulePaths>>,
     /// Timing-check events seen by a settle inside a running process,
     /// evaluated once it suspends: (check, event role).
     timing_pending: Vec<(u32, u8)>,
@@ -9477,9 +9475,7 @@ impl Simulator {
             timing_checks: Vec::new(),
             timing_watches: Vec::new(),
             has_timing_checks: false,
-            path_dst: HashMap::default(),
-            module_paths: Vec::new(),
-            path_srcs: Vec::new(),
+            module_paths: None,
             timing_pending: Vec::new(),
             timing_timers: Vec::new(),
             module,
@@ -32370,6 +32366,16 @@ impl Simulator {
                         if width == self.signal_widths[src_id] {
                             if width <= 64 && delay == 0 {
                                 Some(CombItem::FastDirectCopy { dst_id, src_id })
+                            } else if self
+                                .module_paths
+                                .as_ref()
+                                .is_some_and(|mp| mp.is_path_net(dst_id))
+                            {
+                                // §30.4 path-delayed output: the general
+                                // cont-assign path cancels a pending update
+                                // when the source reverts (§28.16 pulse
+                                // rejection); DirectCopy does not.
+                                None
                             } else {
                                 Some(CombItem::DirectCopy {
                                     dst_id,
@@ -37178,8 +37184,10 @@ impl Simulator {
             // composes into pending-or-current and cancels outright when the
             // revert leaves nothing to change.
             let base_code = self
-                .pending_delayed_value(id)
-                .map(|v| v.get_bit_code(bit))
+                .delayed_updates
+                .iter()
+                .find(|(_, sid, _)| *sid == id)
+                .map(|(_, _, v)| v.get_bit_code(bit))
                 .unwrap_or_else(|| self.signal_table[id].get_bit_code(bit));
             if base_code != new_code {
                 let mut sel = Value::new(1);
@@ -49979,16 +49987,6 @@ impl Simulator {
         self.delayed_nba.iter().any(|(t, _, _)| *t <= self.time)
     }
 
-    /// The value a signal's pending delayed updates leave it at: the latest
-    /// one (a module-path-delayed bus can have several, one per delay).
-    fn pending_delayed_value(&self, id: usize) -> Option<&Value> {
-        self.delayed_updates
-            .iter()
-            .filter(|(_, sid, _)| *sid == id)
-            .max_by_key(|(t, _, _)| *t)
-            .map(|(_, _, v)| v)
-    }
-
     /// Schedule a delayed signal update (inertial delay model).
     fn schedule_delayed(&mut self, id: usize, val: Value) {
         let delay = self.sdf_delays.get(id).copied().unwrap_or(0);
@@ -50006,11 +50004,9 @@ impl Simulator {
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
     fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
         // §30.4 path-delayed net: the module paths pick the delay.
-        if !self.path_dst.is_empty() {
-            if let Some(&k) = self.path_dst.get(&id) {
-                self.schedule_module_path(id, k, val);
-                return;
-            }
+        if let Some(k) = self.module_paths.as_ref().and_then(|mp| mp.table_of(id)) {
+            self.schedule_module_path(id, k, val);
+            return;
         }
         // §28.11: a gate declared `#(rise, fall)` uses the FALL value for a
         // transition to 0. The lowered cont-assign only carries the rise
@@ -50080,8 +50076,10 @@ impl Simulator {
         delay: u64,
     ) {
         let mut merged = self
-            .pending_delayed_value(id)
-            .cloned()
+            .delayed_updates
+            .iter()
+            .find(|(_, sid, _)| *sid == id)
+            .map(|(_, _, v)| v.clone())
             .unwrap_or_else(|| self.signal_table[id].clone());
         for i in 0..sel_w as usize {
             merged.set_bit_code(lo as usize + i, sel_val.get_bit_code(i));
@@ -55826,24 +55824,19 @@ impl Simulator {
                                 // §10.7 fit to the destination net type (2-state X/Z
                                 // drop, real<->int, sign/X-extend, net signedness).
                                 let resized = self.fit_value_to_signal(*dst_id, &src_val);
-                                let delay = self.sdf_delays.get(*dst_id).copied().unwrap_or(0);
-                                if self.signal_table[*dst_id] == resized {
-                                    // §28.16 inertial: the source went back
-                                    // before a pending update matured — the
-                                    // pulse was narrower than the delay.
+                                if self.signal_table[*dst_id] != resized {
+                                    let delay = self.sdf_delays.get(*dst_id).copied().unwrap_or(0);
                                     if delay > 0 && self.time > 0 {
-                                        self.cancel_delayed(*dst_id);
+                                        self.schedule_delayed(*dst_id, resized);
+                                    } else {
+                                        write_sig!(self, *dst_id, resized);
+                                        self.table_modified = true;
+                                        if capture_churn {
+                                            churn.push((*dst_id, eidx));
+                                        }
+                                        note_toggle!(*dst_id);
+                                        trigger_deps!(*dst_id, eidx);
                                     }
-                                } else if delay > 0 && self.time > 0 {
-                                    self.schedule_delayed(*dst_id, resized);
-                                } else {
-                                    write_sig!(self, *dst_id, resized);
-                                    self.table_modified = true;
-                                    if capture_churn {
-                                        churn.push((*dst_id, eidx));
-                                    }
-                                    note_toggle!(*dst_id);
-                                    trigger_deps!(*dst_id, eidx);
                                 }
                             }
                             n_dc += 1;
