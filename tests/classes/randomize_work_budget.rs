@@ -1,0 +1,73 @@
+//! §18.6.2 — an infeasible constraint set over a wide domain must fail
+//! promptly. Here propagation cannot refute the set (`%` is judged by the
+//! evaluator once the variable is fixed), so the joint solver searches
+//! 32-bit values one at a time; every refuted value splits the domain once
+//! more, and without charging that split to the work budget the search ran
+//! its whole node budget at a quadratic cost. The joint solver's debug line
+//! (XEZIM_RAND_DBG) reports the nodes it spent: well under the node budget
+//! (40000) means the work budget stopped it. The reference simulator also
+//! reports no solution.
+
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+const SRC: &str = r#"
+class w_c;
+  rand bit [31:0] x;
+  rand bit [31:0] y;
+  constraint c { x % 7 == 3; y == x + 1; y % 7 == 5; }
+endclass
+module top;
+  initial begin
+    automatic w_c w = new;
+    automatic int r;
+    w.x = 11; w.y = 22;
+    r = w.randomize();
+    $display("R r=%0d x=%0d y=%0d", r, w.x, w.y);
+  end
+endmodule
+"#;
+
+#[test]
+fn infeasible_wide_set_fails_promptly() {
+    let dir = std::env::temp_dir().join(format!("xezim_rand_budget_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temporary directory");
+    let path = dir.join("budget.sv");
+    std::fs::write(&path, SRC).expect("write design");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--simulate", "--no-cache", path.to_str().unwrap()])
+        .env("XEZIM_RAND_DBG", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run xezim");
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        if start.elapsed() > Duration::from_secs(120) {
+            let _ = child.kill();
+            panic!("an infeasible randomize() did not finish in 120 s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut text = String::new();
+    use std::io::Read;
+    child.stdout.take().unwrap().read_to_string(&mut text).ok();
+    child.stderr.take().unwrap().read_to_string(&mut text).ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(status.success(), "run failed:\n{text}");
+    // failed, and left the variables as they were (§18.6.2)
+    assert!(text.contains("R r=0 x=11 y=22"), "{text}");
+    let nodes: Vec<u64> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("[rand-dbg] joint solve gave up: nodes="))
+        .filter_map(|r| r.split_whitespace().next()?.parse().ok())
+        .collect();
+    assert!(!nodes.is_empty(), "no joint-solve report:\n{text}");
+    assert!(
+        nodes.iter().all(|&n| n < 20_000),
+        "the search ran on its node budget: {nodes:?}"
+    );
+}

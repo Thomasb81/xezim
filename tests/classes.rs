@@ -196,6 +196,8 @@ mod randomize_nonrand_members;
 mod randomize_solve_before;
 #[path = "classes/randomize_with_this_and_subset.rs"]
 mod randomize_with_this_and_subset;
+#[path = "classes/randomize_work_budget.rs"]
+mod randomize_work_budget;
 #[path = "classes/scope_randomize_dist_and_foreach.rs"]
 mod scope_randomize_dist_and_foreach;
 #[path = "classes/shadowed_property_storage.rs"]

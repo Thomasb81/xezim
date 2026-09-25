@@ -748,7 +748,16 @@ impl Simulator {
             match r {
                 Some(true) => break,
                 Some(false) => return CspOutcome::Unsat,
-                None if budget == 0 || st.work >= WORK_BUDGET => return CspOutcome::GaveUp,
+                None if budget == 0 || st.work >= WORK_BUDGET => {
+                    if std::env::var_os("XEZIM_RAND_DBG").is_some() {
+                        eprintln!(
+                            "[rand-dbg] joint solve gave up: nodes={} work={}",
+                            NODE_BUDGET - budget,
+                            st.work
+                        );
+                    }
+                    return CspOutcome::GaveUp;
+                }
                 None => run_budget *= 2,
             }
         }
