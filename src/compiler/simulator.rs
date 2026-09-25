@@ -2691,6 +2691,21 @@ impl<'a> IntoIterator for &'a PropMap {
     }
 }
 
+/// `instance_assoc_member`'s class-only verdict for a bare name inside a
+/// method of a given runtime class (class tables are fixed at run time).
+enum MemberCollKind {
+    /// A collection member: per-instance (`None`) or a static fixed array of
+    /// the named owner class.
+    Coll(Option<String>),
+    /// A static collection somewhere in the chain.
+    StaticColl,
+    /// Neither: a per-instance collection only through a declared type that
+    /// carries a collection dimension. `raws` are the raw declared type names
+    /// met on the chain walk (a type-parameter binding for one of them
+    /// changes the answer); `unbound` is the verdict with no binding applied.
+    Plain { raws: Vec<String>, unbound: bool },
+}
+
 #[derive(Debug, Clone)]
 struct ClassInstance {
     class_name: String,
@@ -4418,6 +4433,8 @@ pub struct Simulator {
     /// collection tables per level, on every evaluation; such a name can
     /// never become a collection member, so the verdict is cached.
     class_non_member_cache: std::cell::RefCell<HashMap<String, HashSet<String>>>,
+    /// Runtime class -> bare name -> `instance_assoc_member` verdict.
+    member_coll_cache: std::cell::RefCell<HashMap<String, HashMap<String, MemberCollKind>>>,
     /// Per class: properties that are NOT structs (see `class_prop_struct`).
     class_prop_struct_neg: std::cell::RefCell<HashMap<String, HashSet<String>>>,
     name_stats: [std::cell::Cell<u64>; 5],
@@ -9442,6 +9459,7 @@ impl Simulator {
             force_refresh_done_gen: 0,
             class_coll_index: std::cell::RefCell::new(HashMap::default()),
             class_non_member_cache: std::cell::RefCell::new(HashMap::default()),
+            member_coll_cache: std::cell::RefCell::new(HashMap::default()),
             class_prop_struct_neg: std::cell::RefCell::new(HashMap::default()),
             name_stats: Default::default(),
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
@@ -106990,6 +107008,43 @@ impl Simulator {
             .get(handle)
             .and_then(|x| x.as_ref())
             .map(|i| i.class_name.as_str())?;
+        // Per-(class, name) verdict: every step below except a type-parameter
+        // binding depends on the class tables only.
+        loop {
+            {
+                let cache = self.member_coll_cache.borrow();
+                if let Some(v) = cache.get(ctx).and_then(|m| m.get(name)) {
+                    match v {
+                        MemberCollKind::Coll(None) => return Some(format!("{}#{}", handle, name)),
+                        MemberCollKind::Coll(Some(owner)) => {
+                            return Some(format!("{}::{}", owner, name));
+                        }
+                        MemberCollKind::StaticColl => {
+                            return Some(self.spec_static_coll_key_in_class(name, ctx));
+                        }
+                        MemberCollKind::Plain { raws, unbound } => {
+                            let bound = !raws.is_empty()
+                                && self.heap.get(handle).and_then(|o| o.as_ref()).is_some_and(
+                                    |i| {
+                                        !i.type_bindings.is_empty()
+                                            && raws.iter().any(|r| i.type_bindings.contains_key(r))
+                                    },
+                                );
+                            if !bound {
+                                return unbound.then(|| format!("{}#{}", handle, name));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            let v = self.member_coll_verdict(ctx, name);
+            self.member_coll_cache
+                .borrow_mut()
+                .entry(ctx.to_string())
+                .or_default()
+                .insert(name.to_string(), v);
+        }
         // Flattened index first: it answers the class-only part of the
         // decision (the four property maps and the static-fixed-array list,
         // in ancestry order) in one lookup. A property is declared once, so a
@@ -107100,7 +107155,60 @@ impl Simulator {
     /// Is `member` of the object at `handle` a collection BY TYPE BINDING —
     /// a property declared with a type parameter that this instance binds to
     /// a typedef carrying a dynamic/queue unpacked dimension (§6.20.3)?
+    /// The class-only part of `instance_assoc_member` for `name` inside a
+    /// method of runtime class `ctx` (see `MemberCollKind`).
+    fn member_coll_verdict(&self, ctx: &str, name: &str) -> MemberCollKind {
+        if let Some(kind) = self.class_coll_lookup(ctx, name) {
+            return MemberCollKind::Coll(kind);
+        }
+        if self.collection_is_static_in(ctx, name) {
+            return MemberCollKind::StaticColl;
+        }
+        let mut raws: Vec<String> = Vec::new();
+        let mut unbound = false;
+        let mut cur: Option<&str> = Some(ctx);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            unbound = self.prop_bound_collection_in(None, cn, name);
+            if let Some(raw) = self
+                .prop_raw_ty_cache
+                .borrow()
+                .get(cn)
+                .and_then(|m| m.get(name))
+                .cloned()
+                .flatten()
+            {
+                if !raws.contains(&raw) {
+                    raws.push(raw);
+                }
+            }
+            if unbound {
+                break;
+            }
+            cur = cd.extends.as_deref();
+        }
+        MemberCollKind::Plain { raws, unbound }
+    }
+
     fn prop_bound_collection(&self, handle: usize, class_name: &str, member: &str) -> bool {
+        let bindings = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| &i.type_bindings);
+        self.prop_bound_collection_in(bindings, class_name, member)
+    }
+
+    /// `prop_bound_collection` under the given instance type bindings
+    /// (`None`: no binding applies).
+    fn prop_bound_collection_in(
+        &self,
+        bindings: Option<&HashMap<String, String>>,
+        class_name: &str,
+        member: &str,
+    ) -> bool {
         // Hit path without allocations: the cached raw type and the
         // instance's binding are borrowed, and the dimension verdict is
         // read by `&str`.
@@ -107110,11 +107218,8 @@ impl Simulator {
                 let Some(raw) = hit.as_deref() else {
                     return false;
                 };
-                let concrete: &str = self
-                    .heap
-                    .get(handle)
-                    .and_then(|o| o.as_ref())
-                    .and_then(|i| i.type_bindings.get(raw))
+                let concrete: &str = bindings
+                    .and_then(|b| b.get(raw))
                     .map(String::as_str)
                     .unwrap_or(raw);
                 if let Some(&v) = self.collection_dim_cache.borrow().get(concrete) {
@@ -107157,12 +107262,7 @@ impl Simulator {
         // A type-param binding resolves first; otherwise the raw name may
         // itself be an array/queue typedef (`my_array_t data;` — the class
         // property elaboration is dim-blind for typedef'd types).
-        let concrete = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .and_then(|i| i.type_bindings.get(&raw).cloned())
-            .unwrap_or(raw);
+        let concrete = bindings.and_then(|b| b.get(&raw).cloned()).unwrap_or(raw);
         if let Some(&hit) = self.collection_dim_cache.borrow().get(&concrete) {
             return hit;
         }
