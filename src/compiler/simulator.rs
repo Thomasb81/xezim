@@ -5865,9 +5865,11 @@ pub struct Simulator {
     class_enclosing_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
     /// Interned scope hints and head identifiers for `method_receiver_cache` keys (see there).
     method_receiver_hint_ids: HashMap<String, u32>,
-    /// `resolve_typeref_class_name` memo: name -> (scope, class ctx) -> (class-table size, answer).
-    typeref_class_memo:
-        std::cell::RefCell<HashMap<String, HashMap<(String, String), (usize, Option<String>)>>>,
+    /// `resolve_typeref_class_name` memo: name -> scope -> class ctx -> (class-table size, answer).
+    #[allow(clippy::type_complexity)]
+    typeref_class_memo: std::cell::RefCell<
+        HashMap<String, HashMap<String, HashMap<String, (usize, Option<String>)>>>,
+    >,
     /// Deferred teardown for inlined blocking task/method calls (LIFO). Each
     /// `ScopePop` sentinel pops and replays the top entry. Per-process (carried
     /// in ProcessContext across suspension).
@@ -90105,12 +90107,13 @@ impl Simulator {
         let ncls = self.module.classes.len();
         {
             let memo = self.typeref_class_memo.borrow();
-            if let Some(by_scope) = memo.get(tref.name.name.as_str()) {
-                if let Some((n, hit)) = by_scope.get(&(scope_key.to_string(), ctx_key.to_string()))
-                {
-                    if *n == ncls {
-                        return hit.clone();
-                    }
+            if let Some((n, hit)) = memo
+                .get(tref.name.name.as_str())
+                .and_then(|by_scope| by_scope.get(scope_key))
+                .and_then(|by_ctx| by_ctx.get(ctx_key))
+            {
+                if *n == ncls {
+                    return hit.clone();
                 }
             }
         }
@@ -90119,10 +90122,9 @@ impl Simulator {
             .borrow_mut()
             .entry(tref.name.name.clone())
             .or_default()
-            .insert(
-                (scope_key.to_string(), ctx_key.to_string()),
-                (ncls, out.clone()),
-            );
+            .entry(scope_key.to_string())
+            .or_default()
+            .insert(ctx_key.to_string(), (ncls, out.clone()));
         out
     }
 
@@ -114605,6 +114607,14 @@ impl Simulator {
     fn clear_formal_metadata(&mut self, name: &str) {
         self.module.var_decl_types.remove(name);
         self.module.packed_struct_fields.remove(name);
+        self.clear_formal_elem_widths(name);
+        self.module.packed_full_dims.remove(name);
+        self.var_class_types.remove(name);
+        self.var_typedef_types.remove(name);
+    }
+
+    /// The `packed_signal_elem_widths` part of `clear_formal_metadata`.
+    fn clear_formal_elem_widths(&mut self, name: &str) {
         if self.elem_base_has_dotted(name) {
             self.module.packed_signal_elem_widths.retain(|key, _| {
                 key.as_str() != name
@@ -114621,9 +114631,6 @@ impl Simulator {
         } else {
             self.module.packed_signal_elem_widths.remove(name);
         }
-        self.module.packed_full_dims.remove(name);
-        self.var_class_types.remove(name);
-        self.var_typedef_types.remove(name);
     }
 
     /// Start logging the declarations of the activation whose frame was just
@@ -114818,32 +114825,40 @@ impl Simulator {
     }
 
     fn restore_formal_metadata(&mut self, saved: FormalMetadataSnapshot) {
-        self.clear_formal_metadata(&saved.name);
-        if let Some(data_type) = saved.declared_type {
-            self.module
-                .var_decl_types
-                .insert(saved.name.clone(), data_type);
+        // Each table ends up holding exactly the snapshot's entry for the
+        // name: overwritten in place or removed, without the clear pass.
+        fn put<V>(map: &mut HashMap<String, V>, name: &str, v: Option<V>) {
+            match v {
+                Some(v) => match map.get_mut(name) {
+                    Some(slot) => *slot = v,
+                    None => {
+                        map.insert(name.to_string(), v);
+                    }
+                },
+                None => {
+                    map.remove(name);
+                }
+            }
         }
-        if let Some(fields) = saved.packed_fields {
-            self.module
-                .packed_struct_fields
-                .insert(saved.name.clone(), fields);
-        }
+        let name = saved.name.as_str();
+        put(&mut self.module.var_decl_types, name, saved.declared_type);
+        put(
+            &mut self.module.packed_struct_fields,
+            name,
+            saved.packed_fields,
+        );
+        self.clear_formal_elem_widths(name);
         for (key, width) in saved.packed_element_widths {
             self.note_elem_width_key(&key);
             self.module.packed_signal_elem_widths.insert(key, width);
         }
-        if let Some(dimensions) = saved.packed_dimensions {
-            self.module
-                .packed_full_dims
-                .insert(saved.name.clone(), dimensions);
-        }
-        if let Some(class_type) = saved.class_type {
-            self.var_class_types.insert(saved.name.clone(), class_type);
-        }
-        if let Some(typedef_type) = saved.typedef_type {
-            self.var_typedef_types.insert(saved.name, typedef_type);
-        }
+        put(
+            &mut self.module.packed_full_dims,
+            name,
+            saved.packed_dimensions,
+        );
+        put(&mut self.var_class_types, name, saved.class_type);
+        put(&mut self.var_typedef_types, name, saved.typedef_type);
     }
 
     fn register_formal_type_metadata(&mut self, name: &str, dt: &DataType, no_unpacked_dims: bool) {
