@@ -13,6 +13,9 @@
 //! - §8.7: `new` without brackets constructs a class (or covergroup) handle.
 //! - §26.3: `P::name` names an item declared in package `P`; a task, or a
 //!   void function, is not called in an expression (§13.3, §13.4.1).
+//! - A declaration's range, a parameter's value, a part-select's bounds and
+//!   the selects of a continuous-assignment target are constant expressions
+//!   (§6.20, §7.4, §11.5.1, §10.3): they cannot read a variable or a net.
 //!
 //! The same rules apply to declaration initializers, `return` values and
 //! subroutine input arguments, which are assignments too (§13.5).
@@ -32,12 +35,14 @@ use xezim_core::ast::decl::{
     ImportDeclaration, ModuleItem, PackageItem, ParameterDeclaration, ParameterKind,
     TaskDeclaration, TypedefDeclaration,
 };
-use xezim_core::ast::expr::{BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral, UnaryOp};
+use xezim_core::ast::expr::{
+    BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral, RangeKind, UnaryOp,
+};
 use xezim_core::ast::module::PortList;
 use xezim_core::ast::stmt::{ForInit, Statement, StatementKind};
 use xezim_core::ast::types::{
-    DataType, EnumType, IntegerAtomType, IntegerVectorType, PackedDimension, PortDirection,
-    RealType, Signing, SimpleType, UnpackedDimension,
+    DataType, EnumType, IntegerAtomType, IntegerVectorType, Lifetime, PackedDimension,
+    PortDirection, RealType, Signing, SimpleType, UnpackedDimension,
 };
 use xezim_core::elaborate::ElaboratedModule;
 
@@ -251,6 +256,12 @@ struct Scope {
     vars: HashMap<String, Ty>,
     types: HashMap<String, Ty>,
     subs: HashMap<String, Option<Rc<Sig>>>,
+    /// Variables, nets and ports — unlike parameters, genvars and enum
+    /// members, never part of a constant expression.
+    nonconst: HashSet<String>,
+    /// Block-level `static` declarations, which may be `localparam`s (the
+    /// parser gives both one shape): neither constant nor variable here.
+    unsure: HashSet<String>,
     /// A class scope whose ancestry is not fully visible: an unqualified name
     /// may be an inherited member, so a lookup that reaches it gives up.
     opaque: bool,
@@ -541,6 +552,9 @@ impl<'a> Ck<'a> {
                     if let Some(t) = p.vars.get(n) {
                         let t = t.clone();
                         self.top().vars.insert(n.clone(), t);
+                        if p.nonconst.contains(n) {
+                            self.top().nonconst.insert(n.clone());
+                        }
                     }
                     if let Some(t) = p.types.get(n) {
                         let t = t.clone();
@@ -628,21 +642,21 @@ impl<'a> Ck<'a> {
                     let t = self.resolve(&d.data_type);
                     for dc in &d.declarators {
                         let vt = with_dims(t.clone(), &dc.dimensions);
-                        self.top().vars.insert(dc.name.name.clone(), vt);
+                        self.declare_value(&dc.name.name, vt);
                     }
                 }
                 ModuleItem::NetDeclaration(n) => {
                     let t = self.resolve(&n.data_type);
                     for dc in &n.declarators {
                         let vt = with_dims(t.clone(), &dc.dimensions);
-                        self.top().vars.insert(dc.name.name.clone(), vt);
+                        self.declare_value(&dc.name.name, vt);
                     }
                 }
                 ModuleItem::PortDeclaration(pd) => {
                     let t = self.resolve(&pd.data_type);
                     for dc in &pd.declarators {
                         let vt = with_dims(t.clone(), &dc.dimensions);
-                        self.top().vars.insert(dc.name.name.clone(), vt);
+                        self.declare_value(&dc.name.name, vt);
                     }
                 }
                 ModuleItem::GenvarDeclaration(g) => {
@@ -680,6 +694,16 @@ impl<'a> Ck<'a> {
         }
     }
 
+    fn check_ansi_port_dims(&mut self, ports: &PortList) {
+        if let PortList::Ansi(ps) = ports {
+            for p in ps {
+                if let Some(dt) = &p.data_type {
+                    self.check_const_dims(&p.name.name, dt, &p.dimensions);
+                }
+            }
+        }
+    }
+
     fn declare_ansi_ports(&mut self, ports: &PortList) {
         if let PortList::Ansi(ps) = ports {
             for p in ps {
@@ -688,7 +712,7 @@ impl<'a> Ck<'a> {
                     None => Ty::Unknown,
                 };
                 let t = with_dims(t, &p.dimensions);
-                self.top().vars.insert(p.name.name.clone(), t);
+                self.declare_value(&p.name.name, t);
             }
         }
     }
@@ -1128,6 +1152,7 @@ impl<'a> Ck<'a> {
     }
 
     fn check_assign(&mut self, lv: &Expression, rv: &Expression) {
+        self.check_const_selects(lv);
         let lt = self.ty_of(lv);
         if lt == Ty::Unknown {
             return;
@@ -1196,6 +1221,7 @@ impl<'a> Ck<'a> {
     }
 
     fn walk_expr(&mut self, e: &Expression) {
+        self.check_const_selects(e);
         self.walk_value(e, true);
     }
 
@@ -1204,7 +1230,7 @@ impl<'a> Ck<'a> {
         match &e.kind {
             ExprKind::Call { func, args } => {
                 for a in args {
-                    self.walk_expr(a);
+                    self.walk_value(a, true);
                 }
                 match &func.kind {
                     ExprKind::Ident(h)
@@ -1246,7 +1272,7 @@ impl<'a> Ck<'a> {
                         }
                     }
                     ExprKind::MemberAccess { expr, member } => {
-                        self.walk_expr(expr);
+                        self.walk_value(expr, true);
                         if let Ty::Class(c) = self.ty_of(expr)
                             && let Some(sig) = self.class_method(&c, &member.name)
                         {
@@ -1257,37 +1283,37 @@ impl<'a> Ck<'a> {
                 }
             }
             ExprKind::AssignExpr { lvalue, rvalue } => {
-                self.walk_expr(rvalue);
+                self.walk_value(rvalue, true);
                 self.check_assign(lvalue, rvalue);
             }
-            ExprKind::Unary { operand, .. } => self.walk_expr(operand),
+            ExprKind::Unary { operand, .. } => self.walk_value(operand, true),
             ExprKind::Binary { left, right, .. } => {
-                self.walk_expr(left);
-                self.walk_expr(right);
+                self.walk_value(left, true);
+                self.walk_value(right, true);
             }
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                self.walk_expr(condition);
-                self.walk_expr(then_expr);
-                self.walk_expr(else_expr);
+                self.walk_value(condition, true);
+                self.walk_value(then_expr, true);
+                self.walk_value(else_expr, true);
             }
-            ExprKind::Concatenation(xs) => xs.iter().for_each(|x| self.walk_expr(x)),
+            ExprKind::Concatenation(xs) => xs.iter().for_each(|x| self.walk_value(x, true)),
             // `void'(f())` is still a call made as a statement.
             ExprKind::Paren(x) => self.walk_value(x, value),
             ExprKind::Index { expr, index } => {
-                self.walk_expr(expr);
-                self.walk_expr(index);
+                self.walk_value(expr, true);
+                self.walk_value(index, true);
             }
             ExprKind::MemberAccess { expr, member } => match self.package_of(expr) {
                 Some(pkg) => {
                     self.check_package_member(pkg, &member.name, member.span);
                 }
-                None => self.walk_expr(expr),
+                None => self.walk_value(expr, true),
             },
-            ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| self.walk_expr(x)),
+            ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| self.walk_value(x, true)),
             _ => {}
         }
     }
@@ -1348,13 +1374,201 @@ impl<'a> Ck<'a> {
 
     fn declare_var(&mut self, dt: &DataType, name: &str, dims: &[UnpackedDimension]) -> Ty {
         let t = with_dims(self.resolve(dt), dims);
-        self.top().vars.insert(name.to_string(), t.clone());
+        self.declare_value(name, t.clone());
         t
+    }
+
+    /// A variable, net or port of type `t`.
+    fn declare_value(&mut self, name: &str, t: Ty) {
+        let top = self.top();
+        top.vars.insert(name.to_string(), t);
+        top.nonconst.insert(name.to_string());
+    }
+
+    fn declare_unsure(&mut self, name: &str, t: Ty) {
+        let top = self.top();
+        top.vars.insert(name.to_string(), t);
+        top.unsure.insert(name.to_string());
+    }
+
+    /// Is a simple name a variable, net or port (not a constant)?
+    fn is_nonconst(&self, n: &str) -> bool {
+        for l in self.stack.iter().rev() {
+            let s = l.get();
+            if s.vars.contains_key(n) {
+                return s.nonconst.contains(n);
+            }
+            if s.opaque {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// The first variable, net or port a constant expression reads. System
+    /// function arguments (`$bits(v)`), dotted names (`intf.W`) and called
+    /// function names are skipped.
+    fn first_nonconst(&self, e: &Expression) -> Option<(String, Span)> {
+        let sub = |x: &Expression| self.first_nonconst(x);
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.len() != 1 {
+                    return None;
+                }
+                let n = &h.path[0].name.name;
+                if self.is_nonconst(n) {
+                    return Some((n.clone(), h.path[0].name.span));
+                }
+                h.path[0].selects.iter().find_map(sub)
+            }
+            ExprKind::Unary { operand, .. } => sub(operand),
+            ExprKind::Binary { left, right, .. } => sub(left).or_else(|| sub(right)),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => sub(condition)
+                .or_else(|| sub(then_expr))
+                .or_else(|| sub(else_expr)),
+            ExprKind::Paren(x) => sub(x),
+            ExprKind::Index { expr, index } => sub(expr).or_else(|| sub(index)),
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => sub(expr).or_else(|| sub(left)).or_else(|| sub(right)),
+            ExprKind::Range(a, b) => sub(a).or_else(|| sub(b)),
+            ExprKind::Concatenation(xs) => xs.iter().find_map(sub),
+            ExprKind::Replication { count, exprs } => {
+                sub(count).or_else(|| exprs.iter().find_map(sub))
+            }
+            ExprKind::Call { args, .. } => args.iter().find_map(sub),
+            _ => None,
+        }
+    }
+
+    fn report_nonconst(&mut self, e: &Expression, what: &str, section: &str) {
+        if let Some((n, span)) = self.first_nonconst(e) {
+            self.report(
+                span,
+                format!(
+                    "{what} must be a constant expression, but '{n}' is a variable or net \
+                     (IEEE 1800-2017 {section})"
+                ),
+            );
+        }
+    }
+
+    /// §6.9.1/§7.4: every dimension of a declaration is a constant range.
+    fn check_const_dims(&mut self, name: &str, dt: &DataType, dims: &[UnpackedDimension]) {
+        let packed: &[PackedDimension] = match dt {
+            DataType::IntegerVector { dimensions, .. }
+            | DataType::Implicit { dimensions, .. }
+            | DataType::TypeReference { dimensions, .. } => dimensions,
+            _ => &[],
+        };
+        let what = format!("the range of '{name}'");
+        for d in packed {
+            if let PackedDimension::Range { left, right, .. } = d {
+                self.report_nonconst(left, &what, "§6.9.1");
+                self.report_nonconst(right, &what, "§6.9.1");
+            }
+        }
+        for d in dims {
+            match d {
+                UnpackedDimension::Range { left, right, .. } => {
+                    self.report_nonconst(left, &what, "§7.4");
+                    self.report_nonconst(right, &what, "§7.4");
+                }
+                UnpackedDimension::Expression { expr, .. } => {
+                    self.report_nonconst(expr, &what, "§7.4")
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check_param_values(&mut self, pd: &ParameterDeclaration) {
+        if let ParameterKind::Data { assignments, .. } = &pd.kind {
+            for a in assignments {
+                if let Some(init) = &a.init {
+                    let what = format!("the value of parameter '{}'", a.name.name);
+                    self.report_nonconst(init, &what, "§6.20");
+                }
+            }
+        }
+    }
+
+    /// §11.5.1: a part-select's bounds, and an indexed part-select's width,
+    /// are constant expressions — of a packed value; a queue slice `q[a:b]`
+    /// takes variable bounds (§7.10.1).
+    fn check_const_selects(&mut self, e: &Expression) {
+        let mut found: Vec<(Expression, &'static str)> = Vec::new();
+        visit_expr(e, &mut |x| {
+            let ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } = &x.kind
+            else {
+                return;
+            };
+            if !self.ty_of(expr).is_packed_value() {
+                return;
+            }
+            if *kind == RangeKind::Constant {
+                found.push(((**left).clone(), "a part-select bound"));
+                found.push(((**right).clone(), "a part-select bound"));
+            } else {
+                found.push(((**right).clone(), "an indexed part-select width"));
+            }
+        });
+        for (b, what) in found {
+            self.report_nonconst(&b, what, "§11.5.1");
+        }
+    }
+
+    /// §10.3 (A.8.5): the selects of a continuous-assignment target are
+    /// constant expressions (a variable target is held to this too by the
+    /// reference simulator).
+    fn check_cont_lvalue(&mut self, lv: &Expression) {
+        let mut selects: Vec<Expression> = Vec::new();
+        let mut cur = lv;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    selects.push((**index).clone());
+                    cur = expr;
+                }
+                ExprKind::RangeSelect { expr, left, .. } => {
+                    selects.push((**left).clone());
+                    cur = expr;
+                }
+                ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                    let n = &h.path[0].name.name;
+                    selects.extend(h.path[0].selects.iter().cloned());
+                    for sel in selects {
+                        let what = format!("a select of '{n}' in a continuous assignment target");
+                        self.report_nonconst(&sel, &what, "§10.3");
+                    }
+                    return;
+                }
+                ExprKind::Concatenation(xs) => {
+                    for x in xs {
+                        self.check_cont_lvalue(x);
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
     }
 
     fn walk_stmt(&mut self, s: &Statement) {
         match &s.kind {
-            StatementKind::Expr(e) => self.walk_value(e, false),
+            StatementKind::Expr(e) => {
+                self.check_const_selects(e);
+                self.walk_value(e, false)
+            }
             StatementKind::BlockingAssign { lvalue, rvalue }
             | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
                 self.walk_expr(rvalue);
@@ -1410,7 +1624,7 @@ impl<'a> Ck<'a> {
             StatementKind::Foreach { vars, body, .. } => {
                 self.push();
                 for v in vars.iter().flatten() {
-                    self.top().vars.insert(v.name.clone(), Ty::Unknown);
+                    self.declare_value(&v.name, Ty::Unknown);
                 }
                 self.walk_stmt(body);
                 self.pop();
@@ -1434,16 +1648,23 @@ impl<'a> Ck<'a> {
             StatementKind::VarDecl {
                 data_type,
                 declarators,
-                ..
+                lifetime,
             } => {
                 let t = self.resolve(data_type);
                 for d in declarators {
+                    self.check_const_dims(&d.name.name, data_type, &d.dimensions);
                     let vt = with_dims(t.clone(), &d.dimensions);
                     if let Some(init) = &d.init {
                         self.walk_expr(init);
                         self.check_value(&vt, init, &format!("'{}'", d.name.name));
                     }
-                    self.top().vars.insert(d.name.name.clone(), vt);
+                    // A block-level `localparam` parses as a `static`
+                    // declaration, so such a name may be a constant.
+                    if *lifetime == Some(Lifetime::Static) {
+                        self.declare_unsure(&d.name.name, vt);
+                    } else {
+                        self.declare_value(&d.name.name, vt);
+                    }
                 }
             }
             StatementKind::Typedef(td) => self.declare_typedef(td),
@@ -1464,6 +1685,7 @@ impl<'a> Ck<'a> {
 
     fn walk_ports(&mut self, ports: &[FunctionPort]) {
         for p in ports {
+            self.check_const_dims(&p.name.name, &p.data_type, &p.dimensions);
             let t = self.declare_var(&p.data_type, &p.name.name, &p.dimensions);
             if let Some(d) = &p.default {
                 self.check_value(&t, d, &format!("'{}'", p.name.name));
@@ -1478,11 +1700,12 @@ impl<'a> Ck<'a> {
 
     fn walk_function(&mut self, f: &FunctionDeclaration) {
         self.push();
+        self.check_const_dims(&f.name.name.name, &f.return_type, &[]);
         let rt = self.resolve(&f.return_type);
         self.walk_ports(&f.ports);
         // §13.4.1: the function name is a variable of the return type.
         if rt != Ty::Void {
-            self.top().vars.insert(f.name.name.name.clone(), rt.clone());
+            self.declare_value(&f.name.name.name, rt.clone());
         }
         let saved = self
             .ret
@@ -1564,6 +1787,7 @@ impl<'a> Ck<'a> {
                 ModuleItem::DataDeclaration(d) => {
                     let t = self.resolve(&d.data_type);
                     for dc in &d.declarators {
+                        self.check_const_dims(&dc.name.name, &d.data_type, &dc.dimensions);
                         if let Some(init) = &dc.init {
                             let vt = with_dims(t.clone(), &dc.dimensions);
                             self.walk_expr(init);
@@ -1574,6 +1798,7 @@ impl<'a> Ck<'a> {
                 ModuleItem::NetDeclaration(n) => {
                     let t = self.resolve(&n.data_type);
                     for dc in &n.declarators {
+                        self.check_const_dims(&dc.name.name, &n.data_type, &dc.dimensions);
                         if let Some(init) = &dc.init {
                             let vt = with_dims(t.clone(), &dc.dimensions);
                             self.check_value(&vt, init, &format!("'{}'", dc.name.name));
@@ -1583,8 +1808,17 @@ impl<'a> Ck<'a> {
                 ModuleItem::ContinuousAssign(ca) => {
                     for (l, r) in &ca.assignments {
                         self.walk_expr(r);
+                        self.check_cont_lvalue(l);
                         self.check_assign(l, r);
                     }
+                }
+                ModuleItem::PortDeclaration(pd) => {
+                    for dc in &pd.declarators {
+                        self.check_const_dims(&dc.name.name, &pd.data_type, &dc.dimensions);
+                    }
+                }
+                ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                    self.check_param_values(pd)
                 }
                 ModuleItem::AlwaysConstruct(a) => self.walk_stmt(&a.stmt),
                 ModuleItem::InitialConstruct(i) => self.walk_stmt(&i.stmt),
@@ -1922,6 +2156,10 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 }
                 ck.declare_ansi_ports(&m.ports);
                 ck.declare_items(&m.items);
+                ck.check_ansi_port_dims(&m.ports);
+                for p in &m.params {
+                    ck.check_param_values(p);
+                }
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Interface(m) => {
@@ -1932,6 +2170,10 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 }
                 ck.declare_ansi_ports(&m.ports);
                 ck.declare_items(&m.items);
+                ck.check_ansi_port_dims(&m.ports);
+                for p in &m.params {
+                    ck.check_param_values(p);
+                }
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Program(m) => {
@@ -1942,6 +2184,10 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                 }
                 ck.declare_ansi_ports(&m.ports);
                 ck.declare_items(&m.items);
+                ck.check_ansi_port_dims(&m.ports);
+                for p in &m.params {
+                    ck.check_param_values(p);
+                }
                 ck.walk_items(&m.items);
             }
             SourceDefinition::Package(p) => {
@@ -2096,4 +2342,68 @@ fn package_member_names(items: &[PackageItem]) -> Option<HashSet<String>> {
         }
     }
     (!ranged).then_some(out)
+}
+
+/// Call `f` on `e` and every sub-expression of it.
+fn visit_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
+    f(e);
+    match &e.kind {
+        ExprKind::Unary { operand, .. } => visit_expr(operand, f),
+        ExprKind::Binary { left, right, .. } => {
+            visit_expr(left, f);
+            visit_expr(right, f);
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            visit_expr(condition, f);
+            visit_expr(then_expr, f);
+            visit_expr(else_expr, f);
+        }
+        ExprKind::Concatenation(xs) => xs.iter().for_each(|x| visit_expr(x, f)),
+        ExprKind::Replication { count, exprs } => {
+            visit_expr(count, f);
+            exprs.iter().for_each(|x| visit_expr(x, f));
+        }
+        ExprKind::AssignmentPattern(items) => items.iter().for_each(|i| visit_expr(i.expr(), f)),
+        ExprKind::Call { func, args } => {
+            visit_expr(func, f);
+            args.iter().for_each(|x| visit_expr(x, f));
+        }
+        ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| visit_expr(x, f)),
+        ExprKind::NamedArg { expr: Some(x), .. } => visit_expr(x, f),
+        ExprKind::Inside { expr, ranges } => {
+            visit_expr(expr, f);
+            ranges.iter().for_each(|x| visit_expr(x, f));
+        }
+        ExprKind::MemberAccess { expr, .. } => visit_expr(expr, f),
+        ExprKind::Index { expr, index } => {
+            visit_expr(expr, f);
+            visit_expr(index, f);
+        }
+        ExprKind::RangeSelect {
+            expr, left, right, ..
+        } => {
+            visit_expr(expr, f);
+            visit_expr(left, f);
+            visit_expr(right, f);
+        }
+        ExprKind::Range(a, b) => {
+            visit_expr(a, f);
+            visit_expr(b, f);
+        }
+        ExprKind::Paren(x) => visit_expr(x, f),
+        ExprKind::AssignExpr { lvalue, rvalue } => {
+            visit_expr(lvalue, f);
+            visit_expr(rvalue, f);
+        }
+        ExprKind::Ident(h) => {
+            for seg in &h.path {
+                seg.selects.iter().for_each(|x| visit_expr(x, f));
+            }
+        }
+        _ => {}
+    }
 }

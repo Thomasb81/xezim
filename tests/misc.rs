@@ -57,6 +57,8 @@ mod comb_regvar_loop_fallback;
 mod compliance_tests;
 #[path = "misc/const_chain_fold.rs"]
 mod const_chain_fold;
+#[path = "misc/constant_expression_contexts.rs"]
+mod constant_expression_contexts;
 #[path = "misc/cov_assertion_basic.rs"]
 mod cov_assertion_basic;
 #[path = "misc/delay_precision.rs"]
