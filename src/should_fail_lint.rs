@@ -146,6 +146,7 @@ fn check_unit(
 ) {
     let is_top = u.name == elab.name;
     check_param_value_refs(u.params, u.items, is_top, pkg_names, elab, errs);
+    check_pattern_counts(defs, u.items, elab, is_top, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -2550,6 +2551,99 @@ fn check_nonansi_ports_declared(
                  (LRM 1800-2017 §23.2.2.1)",
                 n.name
             ));
+        }
+    }
+}
+
+/// §10.9: an ordered assignment pattern for a struct has one item per member,
+/// and for a packed array one per element of its outer dimension
+/// (`bit [2:0][3:0] x = '{1, 2};` and `struct packed {int x; shortint y;
+/// byte z;} s = '{1, 2};` are errors). Module-level declarations only; a
+/// pattern with a replication or a non-ordered item is left alone.
+fn check_pattern_counts(
+    defs: &[&SourceDefinition],
+    items: &[ModuleItem],
+    elab: &ElaboratedModule,
+    is_top: bool,
+    errs: &mut Vec<String>,
+) {
+    let typedef = |n: &str| -> Option<DataType> {
+        items
+            .iter()
+            .find_map(|it| match it {
+                ModuleItem::TypedefDeclaration(t) if t.name.name == n => Some(t.data_type.clone()),
+                _ => None,
+            })
+            .or_else(|| {
+                defs.iter().find_map(|d| match d {
+                    SourceDefinition::Typedef(t) if t.name.name == n => Some(t.data_type.clone()),
+                    _ => None,
+                })
+            })
+    };
+    for it in items {
+        let ModuleItem::DataDeclaration(d) = it else {
+            continue;
+        };
+        let dt = match &d.data_type {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } if name.scope.is_none() && dimensions.is_empty() => match typedef(&name.name.name) {
+                Some(t) => t,
+                None => continue,
+            },
+            dt => dt.clone(),
+        };
+        let want: Option<i64> = match &dt {
+            DataType::Struct(su)
+                if matches!(su.kind, xezim_core::ast::types::StructUnionKind::Struct)
+                    && su.dimensions.is_empty() =>
+            {
+                Some(su.members.iter().map(|m| m.declarators.len() as i64).sum())
+            }
+            // The outer packed dimension; its bounds are constant in the top
+            // module, where parameters are known by their own names.
+            DataType::IntegerVector { dimensions, .. } if is_top => match dimensions.first() {
+                Some(PackedDimension::Range { left, right, .. }) => {
+                    let p = Some(&elab.parameters);
+                    match (
+                        xezim_core::elaborate::const_eval_i64_with_params(left, p),
+                        xezim_core::elaborate::const_eval_i64_with_params(right, p),
+                    ) {
+                        (Some(l), Some(r)) => Some((l - r).abs() + 1),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(want) = want else {
+            continue;
+        };
+        for v in &d.declarators {
+            if !v.dimensions.is_empty() {
+                continue;
+            }
+            let Some(Expression {
+                kind: ExprKind::AssignmentPattern(pat),
+                ..
+            }) = &v.init
+            else {
+                continue;
+            };
+            let ordered = pat.iter().all(|p| {
+                matches!(p, AssignmentPatternItem::Ordered(e)
+                    if !matches!(e.kind, ExprKind::Replication { .. }))
+            });
+            if ordered && pat.len() as i64 != want {
+                errs.push(format!(
+                    "assignment pattern for '{}' has {} element(s) but its type has {want} \
+                     (LRM 1800-2017 §10.9)",
+                    v.name.name,
+                    pat.len()
+                ));
+            }
         }
     }
 }
