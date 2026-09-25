@@ -166,3 +166,33 @@ endmodule
     within(&c, "y9", 1420, 1580);
     within(&c, "z5", 1420, 1580);
 }
+
+/// A `:=` range item weighs every one of its values, however many: the
+/// per-variable trials capped an item at 4096 values, so `[0:99999] := 1`
+/// against `100000 := 100` drew the single value 2.4% of the time instead of
+/// 0.1%.
+#[test]
+fn wide_range_item_weighs_every_value() {
+    let c = counts(
+        r#"
+class S1; rand bit [31:0] x; constraint c { x dist {[0:99999] := 1, 100000 := 100}; } endclass
+class S2; rand bit [31:0] x; constraint c { x dist {[0:99999] :/ 1, 100000 := 1}; } endclass
+module top;
+  initial begin
+    automatic S1 s1 = new; automatic S2 s2 = new;
+    automatic int f, c1, c2, bad;
+    for (int i = 0; i < 4000; i++) begin
+      if (!s1.randomize()) f++; c1 += (s1.x == 100000); bad += (s1.x > 100000);
+      if (!s2.randomize()) f++; c2 += (s2.x == 100000); bad += (s2.x > 100000);
+    end
+    $display("fails=%0d bad=%0d c1=%0d c2=%0d", f, bad, c1, c2);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(get(&c, "fails"), 0, "{c:?}");
+    assert_eq!(get(&c, "bad"), 0, "{c:?}");
+    // 100/100100 (4, sd 2); `:/` keeps the range at one item: 1:1
+    within(&c, "c1", 0, 15);
+    within(&c, "c2", 1840, 2160);
+}

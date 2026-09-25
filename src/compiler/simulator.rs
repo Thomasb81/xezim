@@ -95298,7 +95298,8 @@ impl Simulator {
     /// needing thousands to average out sampling noise — which is what
     /// distribution checks in testbenches actually measure. §18.10: the weights
     /// are expressions re-evaluated on every call, so the schedule is rebuilt
-    /// as soon as they change.
+    /// as soon as they change. Weights too fine for a schedule (`[0:99999] :=
+    /// 1, 100000 := 100`) are drawn independently.
     fn pick_dist_value(
         &mut self,
         key: Option<(usize, String)>,
@@ -95307,11 +95308,8 @@ impl Simulator {
     ) -> Option<Value> {
         use crate::ast::decl::DistWeight;
         use rand::Rng;
-        // Cap on the number of values an item is assumed to span, so a
-        // 64-bit-wide `:=` range cannot overflow the mass arithmetic.
-        const MAX_SPAN: i64 = 4096;
         // Fixed-point scaler: keeps `Total(w)` masses exact for small w.
-        const SCALER: u64 = 1024;
+        const SCALER: u128 = 1024;
 
         #[derive(Clone)]
         enum DistItem {
@@ -95319,7 +95317,7 @@ impl Simulator {
             /// lo, hi, width
             Span(i64, i64, u32),
         }
-        let mut items: Vec<(DistItem, u64)> = Vec::new();
+        let mut items: Vec<(DistItem, u128)> = Vec::new();
         for (i, r) in ranges.iter().enumerate() {
             let w_kind = weights.get(i).and_then(|w| w.as_ref());
             let w = match w_kind {
@@ -95331,7 +95329,7 @@ impl Simulator {
             match r {
                 ConstraintRange::Value(e) => {
                     let v = self.eval_expr(e);
-                    items.push((DistItem::One(v), w.saturating_mul(SCALER)));
+                    items.push((DistItem::One(v), w as u128 * SCALER));
                 }
                 ConstraintRange::Range { lo, hi } => {
                     let lov = self.eval_expr(lo);
@@ -95344,13 +95342,13 @@ impl Simulator {
                     if h < l {
                         continue;
                     }
-                    let span = (h - l + 1).min(MAX_SPAN) as u64;
+                    let span = (h as i128 - l as i128 + 1) as u128;
                     let mass = match w_kind {
                         // `:/` — w is the weight of the whole item.
-                        Some(DistWeight::Total(_)) => w.saturating_mul(SCALER),
+                        Some(DistWeight::Total(_)) => w as u128 * SCALER,
                         // `:=` (and the default) — w is the weight of EVERY
                         // value in the item.
-                        _ => w.saturating_mul(SCALER).saturating_mul(span),
+                        _ => (w as u128 * SCALER).saturating_mul(span),
                     };
                     items.push((DistItem::Span(l, h, bw), mass));
                 }
@@ -95359,8 +95357,8 @@ impl Simulator {
         if items.is_empty() {
             return None;
         }
-        let masses: Vec<u64> = items.iter().map(|(_, m)| *m).collect();
-        let total: u64 = masses.iter().sum();
+        let masses: Vec<u128> = items.iter().map(|(_, m)| *m).collect();
+        let total: u128 = masses.iter().fold(0u128, |a, m| a.saturating_add(*m));
         // Every weight is 0 — the constraint admits no value; keep the first
         // item so the caller still makes progress.
         if total == 0 {
@@ -95370,12 +95368,19 @@ impl Simulator {
             });
         }
 
-        let idx = match key {
-            Some(k) => self.deal_dist_item(k, &masses, total),
+        let dealt = match key {
+            Some(k) => self.deal_dist_item(k, &masses),
+            None => None,
+        };
+        let idx = match dealt {
+            Some(i) => i,
             None => {
-                // No stable identity for the target (a foreach element, say):
-                // fall back to an independent weighted draw.
-                let mut draw = self.cur_rng().r#gen::<u64>() % total;
+                // No stable identity for the target (a foreach element, say)
+                // or weights too fine to schedule: an independent draw.
+                let mut draw = match u64::try_from(total) {
+                    Ok(t) => (self.cur_rng().r#gen::<u64>() % t) as u128,
+                    Err(_) => self.cur_rng().gen_range(0..total),
+                };
                 let mut pick = masses.len() - 1;
                 for (i, m) in masses.iter().enumerate() {
                     if draw < *m {
@@ -95411,12 +95416,12 @@ impl Simulator {
     /// every time the other branch deals — a fresh schedule always opens on
     /// its heaviest item. See `pick_dist_value` for why the item choice is
     /// scheduled rather than drawn independently.
-    fn deal_dist_item(&mut self, key: (usize, String), masses: &[u64], total: u64) -> usize {
+    fn deal_dist_item(&mut self, key: (usize, String), masses: &[u128]) -> Option<usize> {
         /// Weight sets remembered per variable.
         const MAX_DECKS: usize = 8;
         let mut sig: u64 = 0xcbf2_9ce4_8422_2325;
         for m in masses {
-            sig ^= *m;
+            sig ^= *m as u64 ^ (*m >> 64) as u64;
             sig = sig.wrapping_mul(0x0000_0100_0000_01b3);
         }
         let live = self
@@ -95425,7 +95430,7 @@ impl Simulator {
             .and_then(|ds| ds.iter().find(|d| d.0 == sig))
             .is_some_and(|(_, deck, pos)| *pos < deck.len());
         if !live {
-            let deck = self.build_dist_deck(masses, total);
+            let deck = self.build_dist_deck(masses)?;
             let decks = self.dist_decks.entry(key.clone()).or_default();
             decks.retain(|d| d.0 != sig);
             if decks.len() >= MAX_DECKS {
@@ -95436,11 +95441,11 @@ impl Simulator {
         let decks = self.dist_decks.get_mut(&key).unwrap();
         let (_, deck, pos) = decks.iter_mut().find(|d| d.0 == sig).unwrap();
         if deck.is_empty() {
-            return 0;
+            return Some(0);
         }
         let idx = deck[*pos];
         *pos += 1;
-        idx
+        Some(idx)
     }
 
     /// §18.5.4 — build a schedule holding each dist item in proportion to its
@@ -95448,38 +95453,26 @@ impl Simulator {
     /// hand the slot to the item with the largest accumulated credit). Adjacent
     /// entries are then randomly transposed so the dealt sequence is not a rigid
     /// repeating pattern while any window of it stays proportional.
-    fn build_dist_deck(&mut self, masses: &[u64], total: u64) -> Vec<usize> {
+    fn build_dist_deck(&mut self, masses: &[u128]) -> Option<Vec<usize>> {
         use rand::Rng;
-        /// Longest schedule dealt before it is rebuilt.
-        const MAX_DECK: u64 = 4096;
-        fn gcd(a: u64, b: u64) -> u64 {
+        /// Longest schedule dealt; finer weights are drawn independently.
+        const MAX_DECK: u128 = 4096;
+        fn gcd(a: u128, b: u128) -> u128 {
             if b == 0 { a } else { gcd(b, a % b) }
         }
         let g = masses
             .iter()
             .copied()
             .filter(|m| *m > 0)
-            .fold(0u64, gcd)
+            .fold(0u128, gcd)
             .max(1);
-        let mut counts: Vec<u64> = masses.iter().map(|m| m / g).collect();
-        let mut len: u64 = counts.iter().sum();
+        let counts: Vec<u128> = masses.iter().map(|m| m / g).collect();
+        let len = counts.iter().fold(0u128, |a, c| a.saturating_add(*c));
         if len > MAX_DECK {
-            // Too fine-grained to enumerate: scale the counts down, keeping
-            // every non-zero item present at least once.
-            counts = masses
-                .iter()
-                .map(|m| {
-                    if *m == 0 {
-                        0
-                    } else {
-                        (((*m as u128) * (MAX_DECK as u128)) / (total as u128)).max(1) as u64
-                    }
-                })
-                .collect();
-            len = counts.iter().sum();
+            return None;
         }
         if len == 0 {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let n = counts.len();
         let mut credit: Vec<i64> = vec![0; n];
@@ -95508,7 +95501,7 @@ impl Simulator {
                 deck.swap(i - 1, i);
             }
         }
-        deck
+        Some(deck)
     }
 
     fn pick_inside_value(&mut self, ranges: &[Expression]) -> Option<Value> {
