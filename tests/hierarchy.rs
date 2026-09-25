@@ -67,6 +67,8 @@ mod implicit_net_gate_port;
 mod implicit_net_name_collision;
 #[path = "hierarchy/implicit_net_submodule.rs"]
 mod implicit_net_submodule;
+#[path = "hierarchy/inout_port_default.rs"]
+mod inout_port_default;
 #[path = "hierarchy/instance_var_init_signedness.rs"]
 mod instance_var_init_signedness;
 #[path = "hierarchy/interface_array_element_ports.rs"]
