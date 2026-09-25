@@ -57,6 +57,8 @@ mod tran_and_implicit_nets;
 mod two_d_array_store_compiles;
 #[path = "gates/udp_primitives.rs"]
 mod udp_primitives;
+#[path = "gates/udp_table_entry_shape.rs"]
+mod udp_table_entry_shape;
 #[path = "gates/vcd_lrm_compliance.rs"]
 mod vcd_lrm_compliance;
 #[path = "gates/wave_flag_gates_dumping.rs"]
