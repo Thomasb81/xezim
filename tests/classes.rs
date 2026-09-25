@@ -136,6 +136,8 @@ mod constraint_logical_or;
 mod constraint_prefixed_inline_with;
 #[path = "classes/constraint_randc_soft_local.rs"]
 mod constraint_randc_soft_local;
+#[path = "classes/constraint_reversed_range.rs"]
+mod constraint_reversed_range;
 #[path = "classes/cov_covergroup_basic.rs"]
 mod cov_covergroup_basic;
 #[path = "classes/coverage_auto_bins.rs"]

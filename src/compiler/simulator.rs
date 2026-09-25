@@ -123512,6 +123512,15 @@ impl Simulator {
                     else {
                         continue;
                     };
+                    // §11.4.13: `[hi:lo]` with the left bound above the
+                    // right one is an empty range. A `$` bound keeps the
+                    // ordered reading.
+                    if l > h
+                        && !matches!(lo.kind, ExprKind::Dollar)
+                        && !matches!(hi.kind, ExprKind::Dollar)
+                    {
+                        continue;
+                    }
                     out.push((l.min(h), l.max(h)));
                 }
             }
