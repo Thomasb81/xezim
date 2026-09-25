@@ -152,6 +152,7 @@ fn check_unit(
     check_port_actuals(defs, u.items, errs);
     check_generate_block_names(u.items, errs);
     check_system_task_values(u.items, errs);
+    check_wildcard_import_conflicts(u.ports, u.params, u.items, pkg_decls, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -3131,6 +3132,215 @@ fn check_system_task_values(items: &[ModuleItem], errs: &mut Vec<String>) {
             ModuleItem::TaskDeclaration(t) => t.items.iter().for_each(&mut check_stmt),
             _ => {}
         }
+    }
+}
+
+/// Packages a module imports: (wildcard imports, explicitly imported names).
+fn module_imports(items: &[ModuleItem]) -> (Vec<&str>, HashSet<&str>) {
+    let mut wild = Vec::new();
+    let mut explicit = HashSet::new();
+    for it in items {
+        if let ModuleItem::ImportDeclaration(d) = it {
+            for i in &d.items {
+                match &i.item {
+                    Some(n) if n.name != "*" => {
+                        explicit.insert(n.name.as_str());
+                    }
+                    _ => wild.push(i.package.name.as_str()),
+                }
+            }
+        }
+    }
+    (wild, explicit)
+}
+
+/// Names a module declares itself, at module level.
+fn module_own_names<'a>(
+    ports: &'a PortList,
+    params: &'a [xezim_core::ast::decl::ParameterDeclaration],
+    items: &'a [ModuleItem],
+) -> HashSet<&'a str> {
+    use xezim_core::ast::decl::ParameterKind;
+    let mut out: HashSet<&str> = HashSet::new();
+    match ports {
+        PortList::Ansi(ps) => out.extend(ps.iter().map(|p| p.name.name.as_str())),
+        PortList::NonAnsi(ns) => out.extend(ns.iter().map(|n| n.name.as_str())),
+        PortList::Empty => {}
+    }
+    let mut add_params = |pd: &'a xezim_core::ast::decl::ParameterDeclaration,
+                          out: &mut HashSet<&'a str>| {
+        match &pd.kind {
+            ParameterKind::Data { assignments, .. } => {
+                out.extend(assignments.iter().map(|a| a.name.name.as_str()))
+            }
+            ParameterKind::Type { assignments } => {
+                out.extend(assignments.iter().map(|a| a.name.name.as_str()))
+            }
+        }
+    };
+    for pd in params {
+        add_params(pd, &mut out);
+    }
+    for it in items {
+        match it {
+            ModuleItem::DataDeclaration(d) => {
+                out.extend(d.declarators.iter().map(|v| v.name.name.as_str()))
+            }
+            ModuleItem::NetDeclaration(d) => {
+                out.extend(d.declarators.iter().map(|v| v.name.name.as_str()))
+            }
+            ModuleItem::PortDeclaration(d) => {
+                out.extend(d.declarators.iter().map(|v| v.name.name.as_str()))
+            }
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                add_params(pd, &mut out)
+            }
+            ModuleItem::TypedefDeclaration(t) => {
+                out.insert(t.name.name.as_str());
+            }
+            ModuleItem::FunctionDeclaration(f) => {
+                out.insert(f.name.name.name.as_str());
+            }
+            ModuleItem::TaskDeclaration(t) => {
+                out.insert(t.name.name.name.as_str());
+            }
+            ModuleItem::ModuleInstantiation(mi) => {
+                out.extend(mi.instances.iter().map(|i| i.name.name.as_str()))
+            }
+            ModuleItem::ClassDeclaration(c) => {
+                out.insert(c.name.name.as_str());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Every expression in a module's processes, continuous assignments and
+/// declaration initializers.
+fn module_exprs<'a>(items: &'a [ModuleItem], f: &mut dyn FnMut(&'a Expression)) {
+    for it in items {
+        match it {
+            ModuleItem::ContinuousAssign(ca) => {
+                for (l, r) in &ca.assignments {
+                    f(l);
+                    f(r);
+                }
+            }
+            ModuleItem::InitialConstruct(i) => collect_stmt_exprs(&i.stmt, f),
+            ModuleItem::AlwaysConstruct(a) => collect_stmt_exprs(&a.stmt, f),
+            _ => {}
+        }
+    }
+}
+
+fn collect_stmt_exprs<'a>(st: &'a Statement, f: &mut dyn FnMut(&'a Expression)) {
+    match &st.kind {
+        StatementKind::Expr(e) => f(e),
+        StatementKind::BlockingAssign { lvalue, rvalue }
+        | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+            f(lvalue);
+            f(rvalue);
+        }
+        StatementKind::If {
+            condition,
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
+            f(condition);
+            collect_stmt_exprs(then_stmt, f);
+            if let Some(e) = else_stmt {
+                collect_stmt_exprs(e, f);
+            }
+        }
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            stmts.iter().for_each(|s| collect_stmt_exprs(s, f))
+        }
+        StatementKind::TimingControl { stmt, .. } => collect_stmt_exprs(stmt, f),
+        StatementKind::While { condition, body } | StatementKind::DoWhile { body, condition } => {
+            f(condition);
+            collect_stmt_exprs(body, f);
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body } => collect_stmt_exprs(body, f),
+        StatementKind::Case { expr, items, .. } => {
+            f(expr);
+            items.iter().for_each(|it| collect_stmt_exprs(&it.stmt, f));
+        }
+        _ => {}
+    }
+}
+
+/// §26.3: a name that two wildcard-imported packages both declare is not
+/// visible through either import; referencing it without a local declaration
+/// or an explicit import is an error.
+fn check_wildcard_import_conflicts(
+    ports: &PortList,
+    params: &[xezim_core::ast::decl::ParameterDeclaration],
+    items: &[ModuleItem],
+    pkgs: &HashMap<String, HashSet<String>>,
+    errs: &mut Vec<String>,
+) {
+    let (wild, explicit) = module_imports(items);
+    if wild.len() < 2 {
+        return;
+    }
+    let own = module_own_names(ports, params, items);
+    let mut count: HashMap<&str, usize> = HashMap::new();
+    let mut uniq: Vec<&str> = wild.clone();
+    uniq.sort();
+    uniq.dedup();
+    for p in uniq {
+        for n in pkgs.get(p).into_iter().flatten() {
+            *count.entry(n.as_str()).or_default() += 1;
+        }
+    }
+    let ambiguous =
+        |n: &str| count.get(n).is_some_and(|&c| c > 1) && !own.contains(n) && !explicit.contains(n);
+    let mut hits: Vec<String> = Vec::new();
+    for it in items {
+        if let ModuleItem::DataDeclaration(d) = it
+            && let DataType::TypeReference { name, .. } = &d.data_type
+            && name.scope.is_none()
+            && ambiguous(&name.name.name)
+        {
+            hits.push(name.name.name.clone());
+        }
+    }
+    let mut locals: HashSet<String> = HashSet::new();
+    for it in items {
+        let st = match it {
+            ModuleItem::InitialConstruct(i) => &i.stmt,
+            ModuleItem::AlwaysConstruct(a) => &a.stmt,
+            _ => continue,
+        };
+        for_each_stmt(st, &mut |s| {
+            if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                locals.extend(declarators.iter().map(|d| d.name.name.clone()));
+            }
+        });
+    }
+    module_exprs(items, &mut |e| {
+        for_each_expr(e, &mut |x| {
+            if let ExprKind::Ident(h) = &x.kind
+                && h.path.len() == 1
+                && ambiguous(&h.path[0].name.name)
+                && !locals.contains(&h.path[0].name.name)
+            {
+                hits.push(h.path[0].name.name.clone());
+            }
+        })
+    });
+    hits.sort();
+    hits.dedup();
+    for n in hits {
+        errs.push(format!(
+            "'{n}' is declared by more than one wildcard-imported package, so it is not \
+             visible here (LRM 1800-2017 §26.3)"
+        ));
     }
 }
 
