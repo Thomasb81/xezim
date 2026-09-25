@@ -173,6 +173,8 @@ mod bind_with_parameters;
 mod formal_shadows_instance_signal;
 #[path = "hierarchy/iface_port_params.rs"]
 mod iface_port_params;
+#[path = "hierarchy/inlined_interface_array_member_refs.rs"]
+mod inlined_interface_array_member_refs;
 #[path = "hierarchy/instance_block_locals_shadow_module_names.rs"]
 mod instance_block_locals_shadow_module_names;
 #[path = "hierarchy/instance_clocking_block_event.rs"]
