@@ -45,6 +45,8 @@ mod explicit_param_static_coll_read;
 mod function_local_struct_return_shadow;
 #[path = "classes/implements_typedef_scope.rs"]
 mod implements_typedef_scope;
+#[path = "classes/inherited_local_member.rs"]
+mod inherited_local_member;
 #[path = "classes/interface_class_inherited_names.rs"]
 mod interface_class_inherited_names;
 #[path = "classes/memory_tasks_fixed_property.rs"]

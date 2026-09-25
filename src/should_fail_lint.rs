@@ -154,6 +154,8 @@ fn check_unit(
     check_system_task_values(u.items, errs);
     check_wildcard_import_conflicts(u.ports, u.params, u.items, pkg_decls, errs);
     check_imported_hier_refs(defs, u.items, pkg_decls, errs);
+    let classes = visible_classes(defs, u.items);
+    check_inherited_local_access(&classes, u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -3418,6 +3420,146 @@ fn check_imported_hier_refs(
             "'{inst}.{member}': '{member}' is only imported into the instantiated module, \
              not declared there, so it is not visible hierarchically (LRM 1800-2017 §26.3)"
         ));
+    }
+}
+
+/// Every class visible to a module: its own, the top-level ones and those in
+/// packages.
+fn visible_classes<'a>(
+    defs: &'a [&'a SourceDefinition],
+    items: &'a [ModuleItem],
+) -> HashMap<&'a str, &'a ClassDeclaration> {
+    let mut map = HashMap::new();
+    for d in defs {
+        match d {
+            SourceDefinition::Class(c) => {
+                map.insert(c.name.name.as_str(), &**c);
+            }
+            SourceDefinition::Package(p) => {
+                for it in &p.items {
+                    if let xezim_core::ast::decl::PackageItem::Class(c) = it {
+                        map.entry(c.name.name.as_str()).or_insert(c);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for it in items {
+        if let ModuleItem::ClassDeclaration(c) = it {
+            map.insert(c.name.name.as_str(), c);
+        }
+    }
+    map
+}
+
+/// §8.18: a `local` member is visible only inside its own class, not in a
+/// class derived from it (`$display(a_loc)` in a subclass method).
+fn check_inherited_local_access(
+    classes: &HashMap<&str, &ClassDeclaration>,
+    items: &[ModuleItem],
+    errs: &mut Vec<String>,
+) {
+    fn members(c: &ClassDeclaration) -> Vec<(&str, bool)> {
+        let mut out = Vec::new();
+        for it in &c.items {
+            match it {
+                ClassItem::Property(p) => {
+                    let local = p.qualifiers.contains(&ClassQualifier::Local);
+                    out.extend(p.declarators.iter().map(|d| (d.name.name.as_str(), local)));
+                }
+                ClassItem::Method(m) => {
+                    let n = match &m.kind {
+                        ClassMethodKind::Function(f)
+                        | ClassMethodKind::PureVirtual(f)
+                        | ClassMethodKind::Extern(f) => &f.name.name.name,
+                        ClassMethodKind::Task(t) => &t.name.name.name,
+                    };
+                    out.push((n.as_str(), m.qualifiers.contains(&ClassQualifier::Local)));
+                }
+                ClassItem::Typedef(t) => out.push((t.name.name.as_str(), false)),
+                ClassItem::Parameter(pd) => {
+                    if let xezim_core::ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind
+                    {
+                        out.extend(assignments.iter().map(|a| (a.name.name.as_str(), false)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+    for it in items {
+        let ModuleItem::ClassDeclaration(c) = it else {
+            continue;
+        };
+        // The first declaration of each name up the chain, and whether it
+        // is an ancestor's local member.
+        let mut hidden: HashSet<&str> = HashSet::new();
+        let mut seen: HashSet<&str> = members(c).into_iter().map(|(n, _)| n).collect();
+        let mut base = c.extends.as_ref().map(|e| e.name.name.as_str());
+        let mut depth = 0;
+        while let Some(b) = base
+            && depth < 32
+        {
+            let Some(bc) = classes.get(b) else {
+                // An unknown ancestor may declare anything.
+                hidden.clear();
+                break;
+            };
+            for (n, local) in members(bc) {
+                if seen.insert(n) && local {
+                    hidden.insert(n);
+                }
+            }
+            base = bc.extends.as_ref().map(|e| e.name.name.as_str());
+            depth += 1;
+        }
+        if hidden.is_empty() {
+            continue;
+        }
+        for ci in &c.items {
+            let ClassItem::Method(m) = ci else { continue };
+            let (ports, body) = match &m.kind {
+                ClassMethodKind::Function(f) => (&f.ports, &f.items),
+                ClassMethodKind::Task(t) => (&t.ports, &t.items),
+                _ => continue,
+            };
+            let mut locals: HashSet<String> = ports.iter().map(|p| p.name.name.clone()).collect();
+            for st in body {
+                for_each_stmt(st, &mut |s| {
+                    if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                        locals.extend(declarators.iter().map(|d| d.name.name.clone()));
+                    }
+                });
+            }
+            let mut hits: Vec<String> = Vec::new();
+            for st in body {
+                for_each_stmt_expr(st, &mut |e| {
+                    let n = match &e.kind {
+                        ExprKind::Ident(h) if h.path.len() == 1 => h.path[0].name.name.as_str(),
+                        ExprKind::MemberAccess { expr, member }
+                            if matches!(expr.kind, ExprKind::This) =>
+                        {
+                            member.name.as_str()
+                        }
+                        _ => return,
+                    };
+                    if hidden.contains(n) && !locals.contains(n) {
+                        hits.push(n.to_string());
+                    }
+                });
+            }
+            hits.sort();
+            hits.dedup();
+            for n in hits {
+                errs.push(format!(
+                    "class '{}': '{n}' is a local member of a base class and is not visible \
+                     in a derived class (LRM 1800-2017 §8.18)",
+                    c.name.name
+                ));
+            }
+        }
     }
 }
 
