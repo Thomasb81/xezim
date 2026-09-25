@@ -48977,6 +48977,22 @@ impl Simulator {
     /// from the process path (a blocking `begin/end` or a blocking chosen
     /// `if` branch). Keyed per process like `forever_cont_cache`: sibling
     /// instances share spans but never a pid.
+    fn blocking_cont_frame(
+        &mut self,
+        pid: usize,
+        span: crate::ast::Span,
+        kind: u8,
+        stmts: &[Statement],
+    ) -> Arc<[Statement]> {
+        let key = (pid, span.start as usize, span.end as usize, kind);
+        if let Some(f) = self.blocking_cont_cache.get(&key) {
+            return f.clone();
+        }
+        let f: Arc<[Statement]> = Arc::from(stmts.to_vec());
+        self.blocking_cont_cache.insert(key, f.clone());
+        f
+    }
+
     /// A class task's body followed by its `ScopePop` sentinel (spanned at
     /// the call), shared per (task, call site) instead of cloned per call.
     /// The entry keeps the method alive, so its address cannot be recycled.
@@ -48998,22 +49014,6 @@ impl Simulator {
         let f: Arc<[Statement]> = Arc::from(cont);
         self.class_task_frame_cache
             .insert(key, (tm.clone(), f.clone()));
-        f
-    }
-
-    fn blocking_cont_frame(
-        &mut self,
-        pid: usize,
-        span: crate::ast::Span,
-        kind: u8,
-        stmts: &[Statement],
-    ) -> Arc<[Statement]> {
-        let key = (pid, span.start as usize, span.end as usize, kind);
-        if let Some(f) = self.blocking_cont_cache.get(&key) {
-            return f.clone();
-        }
-        let f: Arc<[Statement]> = Arc::from(stmts.to_vec());
-        self.blocking_cont_cache.insert(key, f.clone());
         f
     }
 
@@ -65544,8 +65544,6 @@ impl Simulator {
         }
     }
 
-    /// Evaluate expression with a context width hint (for proper shift sizing).
-    /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     /// Read fast path for a select-free single-segment identifier: the frame
     /// local of that name, else the plain property of `this`. Everything the
     /// full path checks before those two reads is keyed on multi-segment or
@@ -65592,6 +65590,8 @@ impl Simulator {
             .cloned()
     }
 
+    /// Evaluate expression with a context width hint (for proper shift sizing).
+    /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
         if let ExprKind::Ident(h) = &expr.kind {
             if let Some(v) = self.plain_ident_read(h) {
@@ -69726,10 +69726,6 @@ impl Simulator {
         }
     }
 
-    /// Outlined from `exec_statement` so the dispatcher's stack frame
-    /// stays small: this arm's locals inflated every call's frame (the
-    /// dispatcher recursed with a 7.8 KB frame per level).
-    #[inline(never)]
     /// The extra conditions for `n = r` (both bare names) to reduce to a
     /// plain evaluate + assign: no `new`, no vif binding to carry, no
     /// struct copy or spread, and no collection / array / associative copy
@@ -69847,6 +69843,10 @@ impl Simulator {
         true
     }
 
+    /// Outlined from `exec_statement` so the dispatcher's stack frame
+    /// stays small: this arm's locals inflated every call's frame (the
+    /// dispatcher recursed with a 7.8 KB frame per level).
+    #[inline(never)]
     fn exec_stmt_blocking_assign(
         &mut self,
         stmt: &Statement,
@@ -107598,11 +107598,6 @@ impl Simulator {
             .insert(class_name.to_string(), map);
     }
 
-    /// Does `class_name` or an ancestor declare `member` as an associative
-    /// array or queue/dynamic-array (both stored per-instance as `<h>#<m>`)?
-    /// Is `member` of the object at `handle` a collection BY TYPE BINDING —
-    /// a property declared with a type parameter that this instance binds to
-    /// a typedef carrying a dynamic/queue unpacked dimension (§6.20.3)?
     /// The class-only part of `instance_assoc_member` for `name` inside a
     /// method of runtime class `ctx` (see `MemberCollKind`).
     fn member_coll_verdict(&self, ctx: &str, name: &str) -> MemberCollKind {
@@ -107640,6 +107635,11 @@ impl Simulator {
         MemberCollKind::Plain { raws, unbound }
     }
 
+    /// Does `class_name` or an ancestor declare `member` as an associative
+    /// array or queue/dynamic-array (both stored per-instance as `<h>#<m>`)?
+    /// Is `member` of the object at `handle` a collection BY TYPE BINDING —
+    /// a property declared with a type parameter that this instance binds to
+    /// a typedef carrying a dynamic/queue unpacked dimension (§6.20.3)?
     fn prop_bound_collection(&self, handle: usize, class_name: &str, member: &str) -> bool {
         let bindings = self
             .heap
