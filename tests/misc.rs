@@ -330,6 +330,8 @@ mod timescale;
 mod unpacked_struct_in_instance;
 #[path = "misc/unsized_literal_keeps_its_digits.rs"]
 mod unsized_literal_keeps_its_digits;
+#[path = "misc/void_cast_operand.rs"]
+mod void_cast_operand;
 #[path = "misc/warm_cache_diag_replay.rs"]
 mod warm_cache_diag_replay;
 #[path = "misc/x_warn_switch.rs"]
