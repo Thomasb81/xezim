@@ -23,6 +23,8 @@ mod always_iff_guard;
 mod always_level_delay;
 #[path = "scheduling/armed_array_element_inputs.rs"]
 mod armed_array_element_inputs;
+#[path = "scheduling/assign_wake_order.rs"]
+mod assign_wake_order;
 #[path = "scheduling/assoc_bracket_keys.rs"]
 mod assoc_bracket_keys;
 #[path = "scheduling/audit_ports_disable_drivers.rs"]

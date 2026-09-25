@@ -1511,6 +1511,9 @@ struct SensitivityId {
     /// `EventWaiter::guard_prev`) — `a=2;b=1` leaving `a+b` at 3 must not
     /// fire. `None` for plain signal/edge terms.
     value_of: Option<Expression>,
+    /// Scheduling depth of the NAME this term was written with (see
+    /// `Simulator::sig_wake_rank`); orders same-pass waiter wakeups.
+    wake_rank: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -5908,6 +5911,17 @@ pub struct Simulator {
     /// roots were fresh Vecs on every tick, and `drain_deferred_comb`
     /// hands its snapshot vectors back here for `note_comb_ran_in_process`.
     triggered_conts_buf: Vec<(usize, ProcCont)>,
+    /// Scheduling depth of the comb-driven signals (see
+    /// `build_sig_wake_rank`): one more per continuous assignment on the way
+    /// from a procedurally written signal, which is depth 0 and not stored.
+    /// Orders the waiters one drain wakes (`drain_triggered_event_waiters`).
+    sig_wake_rank: HashMap<usize, u8>,
+    wake_rank_built: bool,
+    /// Depth of the input-port names collapsed onto their actual's id
+    /// (`collapse_identity_port_nets`), which the id alone cannot carry.
+    name_wake_rank: HashMap<String, u8>,
+    /// Scratch: wake rank of each continuation in `triggered_conts_buf`.
+    wake_rank_buf: Vec<u8>,
     cg_tree_roots_buf: Vec<usize>,
     deferred_comb_pool: Vec<Vec<(usize, Value)>>,
     /// Write set of the process FSM currently executing (see `ProcFsm::writes`).
@@ -9802,6 +9816,10 @@ impl Simulator {
             cg_event_waiters: Vec::new(),
             event_waiters_swap: Vec::new(),
             triggered_conts_buf: Vec::new(),
+            sig_wake_rank: HashMap::default(),
+            wake_rank_built: false,
+            name_wake_rank: HashMap::default(),
+            wake_rank_buf: Vec::new(),
             cg_tree_roots_buf: Vec::new(),
             deferred_comb_pool: Vec::new(),
             cur_fsm_writes: None,
@@ -18287,6 +18305,9 @@ impl Simulator {
             }
             self.dpi_pending_reset_fired = true;
         }
+        if !self.wake_rank_built {
+            self.build_sig_wake_rank();
+        }
         self.event_loop();
         // §16.4: reports of the last time slot (or, after $finish, notes),
         // before the clock moves to a `run <time>` stop point.
@@ -19591,6 +19612,7 @@ impl Simulator {
                                 edge: s.edge,
                                 iff: s.iff.clone(),
                                 value_of: None,
+                                wake_rank: 0,
                             });
                         }
                         if let Some(stripped) = s.signal_name.strip_prefix(&top_prefix) {
@@ -19600,6 +19622,7 @@ impl Simulator {
                                     edge: s.edge,
                                     iff: s.iff.clone(),
                                     value_of: None,
+                                    wake_rank: 0,
                                 });
                             }
                         }
@@ -19614,6 +19637,7 @@ impl Simulator {
                                     edge: s.edge,
                                     iff: s.iff.clone(),
                                     value_of: None,
+                                    wake_rank: 0,
                                 });
                             }
                         }
@@ -39935,9 +39959,26 @@ impl Simulator {
                         edge: s.edge,
                         iff: s.iff.clone(),
                         value_of: s.value_of.clone(),
+                        wake_rank: self.wake_rank_of(s.signal_name.as_str(), id),
                     })
             })
             .collect()
+    }
+
+    /// Scheduling depth of a waiter term: a port name collapsed onto its
+    /// actual keeps its own depth (`name_wake_rank`), anything else takes
+    /// its signal's.
+    #[inline]
+    fn wake_rank_of(&self, name: &str, id: usize) -> u8 {
+        if !self.name_wake_rank.is_empty() {
+            if let Some(&r) = self.name_wake_rank.get(name) {
+                return r;
+            }
+        }
+        if self.sig_wake_rank.is_empty() {
+            return 0;
+        }
+        self.sig_wake_rank.get(&id).copied().unwrap_or(0)
     }
 
     fn make_event_waiter_resolved(
@@ -50884,6 +50925,176 @@ impl Simulator {
         }
     }
 
+    /// Fill `sig_wake_rank` and `name_wake_rank`: the scheduling depth that
+    /// orders the waiters one drain wakes. §4.7 leaves the order open; this
+    /// is the reference simulator's, measured. Waiters on a procedurally
+    /// written signal run first. A continuous assignment's update is its own
+    /// active event (§10.3), so its target's waiters run one step later. An
+    /// input port whose actual is procedurally written adds a step (two for
+    /// an interface port); one whose actual is itself a net, or an output
+    /// port, shares its actual's list and adds none. Only comb-driven
+    /// signals and collapsed port names are stored; the rest are depth 0.
+    fn build_sig_wake_rank(&mut self) {
+        self.wake_rank_built = true;
+        let top_prefix = format!("{}.", self.module.name);
+        let iface_insts: HashSet<&str> = self
+            .module
+            .instances
+            .iter()
+            .filter(|i| self.module.interfaces.contains(&i.def_name))
+            .map(|i| i.path.as_str())
+            .collect();
+        let port_step = |formal: &str| -> u8 {
+            let f = formal.strip_prefix(top_prefix.as_str()).unwrap_or(formal);
+            let inst = f.rsplit_once('.').map_or("", |(p, _)| p);
+            if iface_insts.contains(inst) { 2 } else { 1 }
+        };
+        // Whole-net identity connections not collapsed onto one id, keyed by
+        // the driven side: dst -> (src, step). An input steps from its
+        // actual to the formal, an output from the formal to its actual (no
+        // step). Formals collapsed onto their actual are ranked by name below.
+        const OUT: u8 = u8::MAX;
+        let mut port_dst: HashMap<usize, (usize, u8)> = HashMap::default();
+        let mut collapsed: Vec<(&str, &str)> = Vec::new();
+        for (formal, actual) in &self.module.port_aliases {
+            let (Some(&f), Some(&a)) = (
+                self.signal_name_to_id.get(formal.as_str()),
+                self.signal_name_to_id.get(actual.as_str()),
+            ) else {
+                continue;
+            };
+            if f == a {
+                // Only the input-port pass collapses a FORMAL onto its actual.
+                if self.collapsed_port_children.contains(formal.as_str()) {
+                    collapsed.push((formal.as_str(), actual.as_str()));
+                }
+            } else {
+                port_dst.insert(f, (a, port_step(formal)));
+                port_dst.insert(a, (f, OUT));
+            }
+        }
+        let step_of = |s: usize, rs: u8, w: usize| -> u8 {
+            match port_dst.get(&w) {
+                Some(&(src, OUT)) if src == s => 0,
+                Some(&(src, st)) if src == s => {
+                    if rs == 0 {
+                        st
+                    } else {
+                        0
+                    }
+                }
+                _ => 1,
+            }
+        };
+        // Comb-driven signals start unreached; everything else is depth 0.
+        let entries = &self.comb_entries;
+        let mut rank: HashMap<usize, u8> = HashMap::default();
+        for e in entries.iter() {
+            for &w in &e.cold.write_signal_ids {
+                rank.insert(w, u8::MAX);
+            }
+        }
+        // Shortest weighted distance from the undriven signals, one bucket
+        // per depth. Weights are 0..=2 and never negative, so an entry is
+        // final the first time its shallowest input reaches it.
+        const CAP: usize = 250;
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); CAP + 1];
+        let mut entry_done = vec![false; entries.len()];
+        let relax = |ei: usize,
+                     s: usize,
+                     rs: u8,
+                     rank: &mut HashMap<usize, u8>,
+                     buckets: &mut Vec<Vec<usize>>| {
+            for &w in &entries[ei].cold.write_signal_ids {
+                let nr = (rs as usize + step_of(s, rs, w) as usize).min(CAP);
+                if let Some(cur) = rank.get_mut(&w) {
+                    if nr < *cur as usize {
+                        *cur = nr as u8;
+                        buckets[nr].push(w);
+                    }
+                }
+            }
+        };
+        // Depth 0: entries with an undriven (or no) input.
+        for (ei, e) in entries.iter().enumerate() {
+            let free = if e.cold.read_signal_ids.is_empty() {
+                Some(usize::MAX)
+            } else {
+                e.cold
+                    .read_signal_ids
+                    .iter()
+                    .copied()
+                    .find(|r| !rank.contains_key(r))
+            };
+            if let Some(s) = free {
+                entry_done[ei] = true;
+                relax(ei, s, 0, &mut rank, &mut buckets);
+            }
+        }
+        let offs = &self.comb_dep_offsets;
+        let deps = &self.comb_dep_entries;
+        for r in 0..=CAP {
+            let mut i = 0;
+            while i < buckets[r].len() {
+                let s = buckets[r][i];
+                i += 1;
+                if rank.get(&s).copied() != Some(r as u8) || s + 1 >= offs.len() {
+                    continue;
+                }
+                for &ei in &deps[offs[s] as usize..offs[s + 1] as usize] {
+                    let ei = ei as usize;
+                    if ei < entry_done.len() && !entry_done[ei] {
+                        entry_done[ei] = true;
+                        relax(ei, s, r as u8, &mut rank, &mut buckets);
+                    }
+                }
+            }
+        }
+        // Driven only from a feedback loop with no free input: one step.
+        for r in rank.values_mut() {
+            if *r == u8::MAX {
+                *r = 1;
+            }
+        }
+        rank.retain(|_, r| *r != 0);
+        // Collapsed input ports: the actual's depth, plus the port's step
+        // when that actual is procedurally written. Chains resolve through
+        // the actual's own entry.
+        let mut names: HashMap<String, u8> = HashMap::default();
+        let links: HashMap<&str, &str> = collapsed.iter().copied().collect();
+        for &(formal, _) in &collapsed {
+            // Up the chain to the first name whose depth is known.
+            let mut chain: Vec<&str> = Vec::new();
+            let mut cur = formal;
+            let mut r = loop {
+                if let Some(&r) = names.get(cur) {
+                    break r;
+                }
+                match links.get(cur) {
+                    Some(&a) if !chain.contains(&cur) && chain.len() < 64 => {
+                        chain.push(cur);
+                        cur = a;
+                    }
+                    _ => {
+                        break self
+                            .signal_name_to_id
+                            .get(cur)
+                            .and_then(|id| rank.get(id).copied())
+                            .unwrap_or(0);
+                    }
+                }
+            };
+            for &f in chain.iter().rev() {
+                if r == 0 {
+                    r = port_step(f);
+                }
+                names.insert(f.to_string(), r);
+            }
+        }
+        self.sig_wake_rank = rank;
+        self.name_wake_rank = names;
+    }
+
     /// Detect which parked event waiters' sensitivities fired (against
     /// their own captured_prev baselines) and remove them from the parked
     /// list, refreshing the baseline of everyone left. Returns the (pid,
@@ -50898,10 +51109,13 @@ impl Simulator {
         self.prof_waiter_iters += waiters.len() as u64;
         let mut triggered_conts = std::mem::take(&mut self.triggered_conts_buf);
         triggered_conts.clear();
+        let mut ranks = std::mem::take(&mut self.wake_rank_buf);
+        ranks.clear();
         // In place: a parked waiter that does not fire stays where it is
         // (the old drain moved every waiter through a swap vector each tick).
         waiters.retain_mut(|waiter| {
             let mut triggered = false;
+            let mut rank = 0u8;
             for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
                 let (pv, px) = waiter.captured_prev[i];
                 let pw = waiter.captured_prev_wide[i].as_ref();
@@ -50931,6 +51145,7 @@ impl Simulator {
                 };
                 if guard_ok && value_ok {
                     triggered = true;
+                    rank = sid.wake_rank;
                     break;
                 }
             }
@@ -50954,6 +51169,7 @@ impl Simulator {
                 } else {
                     let cont = std::mem::replace(&mut waiter.continuation, ProcCont::empty());
                     triggered_conts.push((waiter.pid, cont));
+                    ranks.push(rank);
                 }
                 false
             } else {
@@ -50993,6 +51209,22 @@ impl Simulator {
         // ordering so differential runs stay comparable. Registration order
         // is FIFO; reverse to LIFO at the single hand-off point.
         triggered_conts.reverse();
+        // §4.4/§10.3: a continuous assignment's update is its own active
+        // event, so a net it drives changes — and wakes its waiters — only
+        // after every waiter of its source has been scheduled. Order the
+        // wakeups by scheduling depth (`build_sig_wake_rank`), keeping LIFO
+        // within a depth.
+        if ranks.len() > 1 && ranks.iter().any(|&r| r != ranks[0]) {
+            ranks.reverse();
+            let mut keyed: Vec<(u8, (usize, ProcCont))> = ranks
+                .iter()
+                .copied()
+                .zip(triggered_conts.drain(..))
+                .collect();
+            keyed.sort_by_key(|k| k.0);
+            triggered_conts.extend(keyed.into_iter().map(|k| k.1));
+        }
+        self.wake_rank_buf = ranks;
         triggered_conts
     }
 
@@ -114833,6 +115065,7 @@ impl Simulator {
                             edge: s.edge,
                             iff: s.iff.clone(),
                             value_of: None,
+                            wake_rank: 0,
                         })
                 })
                 .collect();
