@@ -146,6 +146,7 @@ fn check_unit(
 ) {
     let is_top = u.name == elab.name;
     check_param_value_refs(u.params, u.items, is_top, pkg_names, elab, errs);
+    check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
 }
 
 /// Classes can appear nested inside module/interface/program bodies.
@@ -2450,6 +2451,154 @@ fn check_param_value_refs(
                     ));
                 }
             }
+        }
+    }
+}
+
+/// §6.10: an undeclared name implies a net only as the target of a
+/// continuous assignment or as a port or terminal connection. Read on the
+/// right-hand side of a module-level continuous assignment it is undeclared.
+/// Top module only, whose implicit nets the elaboration lists.
+fn check_cont_assign_rhs_names(
+    ports: &PortList,
+    items: &[ModuleItem],
+    is_top: bool,
+    pkg_names: &HashSet<String>,
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    fn bare(e: &Expression, out: &mut Vec<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                out.push(h.path[0].name.name.clone())
+            }
+            ExprKind::Concatenation(xs) => xs.iter().for_each(|x| bare(x, out)),
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => bare(expr, out),
+            ExprKind::Paren(x) => bare(x, out),
+            _ => {}
+        }
+    }
+    fn reads(e: &Expression, out: &mut Vec<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                out.push(h.path[0].name.name.clone())
+            }
+            ExprKind::Unary { operand, .. } => reads(operand, out),
+            ExprKind::Binary { left, right, .. } => {
+                reads(left, out);
+                reads(right, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                reads(condition, out);
+                reads(then_expr, out);
+                reads(else_expr, out);
+            }
+            ExprKind::Concatenation(xs) => xs.iter().for_each(|x| reads(x, out)),
+            ExprKind::Replication { count, exprs } => {
+                reads(count, out);
+                exprs.iter().for_each(|x| reads(x, out));
+            }
+            ExprKind::Index { expr, index } => {
+                reads(expr, out);
+                reads(index, out);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                reads(expr, out);
+                reads(left, out);
+                reads(right, out);
+            }
+            ExprKind::Paren(x) => reads(x, out),
+            ExprKind::Call { args, .. } | ExprKind::SystemCall { args, .. } => {
+                args.iter().for_each(|a| reads(a, out))
+            }
+            _ => {}
+        }
+    }
+    // Every name the module declares itself (an unpacked array is listed
+    // with the implicit nets as a placeholder).
+    fn declared(items: &[ModuleItem], out: &mut HashSet<String>) {
+        use xezim_core::ast::decl::ParameterKind;
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) => {
+                    out.extend(d.declarators.iter().map(|v| v.name.name.clone()))
+                }
+                ModuleItem::NetDeclaration(d) => {
+                    out.extend(d.declarators.iter().map(|v| v.name.name.clone()))
+                }
+                ModuleItem::PortDeclaration(d) => {
+                    out.extend(d.declarators.iter().map(|v| v.name.name.clone()))
+                }
+                ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                    if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                        out.extend(assignments.iter().map(|a| a.name.name.clone()));
+                    }
+                }
+                ModuleItem::GenerateRegion(g) => declared(&g.items, out),
+                ModuleItem::GenerateFor(g) => declared(&g.items, out),
+                ModuleItem::GenerateIf(g) => g.branches.iter().for_each(|(_, b)| declared(b, out)),
+                ModuleItem::GenerateCase(g) => g.arms.iter().for_each(|a| declared(&a.items, out)),
+                _ => {}
+            }
+        }
+    }
+    if !is_top {
+        return;
+    }
+    let mut names = HashSet::new();
+    declared(items, &mut names);
+    match ports {
+        PortList::Ansi(ps) => names.extend(ps.iter().map(|p| p.name.name.clone())),
+        PortList::NonAnsi(ns) => names.extend(ns.iter().map(|n| n.name.clone())),
+        PortList::Empty => {}
+    }
+    // Names an implicit net may legally come from.
+    let mut implied = Vec::new();
+    let mut rhs = Vec::new();
+    for it in items {
+        match it {
+            ModuleItem::ContinuousAssign(ca) => {
+                for (l, r) in &ca.assignments {
+                    bare(l, &mut implied);
+                    reads(r, &mut rhs);
+                }
+            }
+            ModuleItem::ModuleInstantiation(mi) => {
+                for c in mi.instances.iter().flat_map(|i| &i.connections) {
+                    match c {
+                        xezim_core::ast::decl::PortConnection::Ordered(Some(e))
+                        | xezim_core::ast::decl::PortConnection::Named { expr: Some(e), .. } => {
+                            bare(e, &mut implied)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ModuleItem::GateInstantiation(g) => {
+                for t in g.instances.iter().flat_map(|i| &i.terminals) {
+                    bare(t, &mut implied);
+                }
+            }
+            _ => {}
+        }
+    }
+    rhs.sort();
+    rhs.dedup();
+    for n in rhs {
+        if elab.implicit_nets.contains(&n)
+            && !names.contains(&n)
+            && !implied.contains(&n)
+            && !pkg_names.contains(&n)
+        {
+            errs.push(format!(
+                "'{n}' is read by a continuous assignment but never declared (LRM 1800-2017 §6.10)"
+            ));
         }
     }
 }

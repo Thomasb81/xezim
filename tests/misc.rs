@@ -63,6 +63,8 @@ mod compliance_tests;
 mod const_chain_fold;
 #[path = "misc/constant_expression_contexts.rs"]
 mod constant_expression_contexts;
+#[path = "misc/cont_assign_rhs_undeclared.rs"]
+mod cont_assign_rhs_undeclared;
 #[path = "misc/cov_assertion_basic.rs"]
 mod cov_assertion_basic;
 #[path = "misc/defparam_local_targets.rs"]
