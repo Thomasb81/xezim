@@ -149,6 +149,7 @@ fn check_unit(
     check_pattern_counts(defs, u.items, elab, is_top, errs);
     check_foreach_dims(u.items, errs);
     check_select_depth(u.items, errs);
+    check_port_actuals(defs, u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -2845,6 +2846,136 @@ fn check_select_depth(items: &[ModuleItem], errs: &mut Vec<String>) {
     }
     for st in stmts {
         for_each_stmt_expr(st, &mut report);
+    }
+}
+
+/// Port directions of a module, by position and by name. `None` where the
+/// direction is not written (an interface port, an ANSI first port without
+/// one).
+fn port_directions(
+    ports: &PortList,
+    items: &[ModuleItem],
+) -> (Vec<Option<PortDirection>>, HashMap<String, PortDirection>) {
+    let mut by_name = HashMap::new();
+    match ports {
+        PortList::Ansi(ps) => {
+            for p in ps {
+                if let Some(d) = p.direction
+                    && !matches!(p.data_type, Some(DataType::Interface { .. }))
+                {
+                    by_name.insert(p.name.name.clone(), d);
+                }
+            }
+        }
+        PortList::NonAnsi(_) => {
+            for it in items {
+                if let ModuleItem::PortDeclaration(d) = it {
+                    for v in &d.declarators {
+                        by_name.insert(v.name.name.clone(), d.direction);
+                    }
+                }
+            }
+        }
+        PortList::Empty => {}
+    }
+    let names: Vec<&str> = match ports {
+        PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.as_str()).collect(),
+        PortList::NonAnsi(ns) => ns.iter().map(|n| n.name.as_str()).collect(),
+        PortList::Empty => Vec::new(),
+    };
+    let by_pos = names.iter().map(|n| by_name.get(*n).copied()).collect();
+    (by_pos, by_name)
+}
+
+/// §23.3.3: an output or inout port is connected to something that can be
+/// driven — a net or variable, a select of one or a concatenation of those,
+/// not a literal or an operator expression — and an inout port to a net,
+/// never a variable.
+fn check_port_actuals(defs: &[&SourceDefinition], items: &[ModuleItem], errs: &mut Vec<String>) {
+    use xezim_core::ast::decl::PortConnection;
+    fn assignable(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => true,
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => assignable(expr),
+            ExprKind::Concatenation(xs) => xs.iter().all(assignable),
+            ExprKind::Paren(x) => assignable(x),
+            _ => false,
+        }
+    }
+    fn root(e: &Expression) -> Option<&str> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => Some(h.path[0].name.name.as_str()),
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => root(expr),
+            _ => None,
+        }
+    }
+    let mut ports: HashSet<&str> = HashSet::new();
+    let mut vars: HashSet<&str> = HashSet::new();
+    for it in items {
+        match it {
+            ModuleItem::PortDeclaration(d) => {
+                ports.extend(d.declarators.iter().map(|v| v.name.name.as_str()))
+            }
+            ModuleItem::DataDeclaration(d)
+                if !matches!(
+                    d.data_type,
+                    DataType::TypeReference { .. } | DataType::Interface { .. }
+                ) =>
+            {
+                vars.extend(d.declarators.iter().map(|v| v.name.name.as_str()))
+            }
+            _ => {}
+        }
+    }
+    for it in items {
+        let ModuleItem::ModuleInstantiation(mi) = it else {
+            continue;
+        };
+        let Some((tp, titems)) = defs.iter().find_map(|d| match d {
+            SourceDefinition::Module(m) if m.name.name == mi.module_name.name => {
+                Some((&m.ports, &m.items))
+            }
+            _ => None,
+        }) else {
+            continue;
+        };
+        let (by_pos, by_name) = port_directions(tp, titems);
+        for inst in &mi.instances {
+            for (i, c) in inst.connections.iter().enumerate() {
+                let (dir, actual, port) = match c {
+                    PortConnection::Ordered(Some(e)) => {
+                        (by_pos.get(i).copied().flatten(), e, format!("#{}", i + 1))
+                    }
+                    PortConnection::Named {
+                        name,
+                        expr: Some(e),
+                        ..
+                    } => (by_name.get(&name.name).copied(), e, name.name.clone()),
+                    _ => continue,
+                };
+                let bad = match dir {
+                    Some(PortDirection::Output) => !assignable(actual),
+                    Some(PortDirection::Inout) => {
+                        !assignable(actual)
+                            || root(actual).is_some_and(|r| vars.contains(r) && !ports.contains(r))
+                    }
+                    _ => false,
+                };
+                if bad {
+                    errs.push(format!(
+                        "port {port} of instance '{}' ({}) is an {} and cannot be connected \
+                         to this expression (LRM 1800-2017 §23.3.3)",
+                        inst.name.name,
+                        mi.module_name.name,
+                        if dir == Some(PortDirection::Output) {
+                            "output"
+                        } else {
+                            "inout, which needs a net"
+                        }
+                    ));
+                }
+            }
+        }
     }
 }
 

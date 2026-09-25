@@ -125,6 +125,8 @@ mod percent_m_module_init_scope;
 mod percent_m_scope;
 #[path = "hierarchy/pkg_subroutines_and_unit_scope.rs"]
 mod pkg_subroutines_and_unit_scope;
+#[path = "hierarchy/port_actual_legality.rs"]
+mod port_actual_legality;
 #[path = "hierarchy/port_default_child_scope.rs"]
 mod port_default_child_scope;
 #[path = "hierarchy/port_net_driven_from_inside.rs"]
