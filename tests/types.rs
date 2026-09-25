@@ -281,6 +281,8 @@ mod valparam_spec_cycle;
 mod value_param_specialization;
 #[path = "types/vcd_param_as_wire.rs"]
 mod vcd_param_as_wire;
+#[path = "types/wide_arithmetic_past_128_bits.rs"]
+mod wide_arithmetic_past_128_bits;
 #[path = "types/wide_enum_values.rs"]
 mod wide_enum_values;
 #[path = "types/wide_signed_arith_and_power.rs"]

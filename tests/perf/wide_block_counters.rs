@@ -164,8 +164,10 @@ module tb;
 endmodule
 "#,
     );
+    // Cross-checked against the reference simulator. The earlier pinned
+    // `0000003c3c03fc3f` came from `b + 300'd11` losing every bit above 128.
     assert!(
-        text.contains("WC 2dd591369b37acca 0000003c3c03fc3f 40"),
+        text.contains("WC 2dd591369b37acca f000cd3f7c037c9f 40"),
         "answer:\n{text}"
     );
     assert!(
