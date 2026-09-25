@@ -12924,6 +12924,27 @@ impl Simulator {
 
     /// Internal typedef-chain resolver for DataType (cloned).
     /// Follows TypeReference chains to get the underlying type.
+    /// `resolve_type_ref` as a borrow (same chain and bound).
+    fn resolve_type_ref_borrowed<'a>(
+        dt: &'a DataType,
+        typedef_types: &'a HashMap<String, DataType>,
+    ) -> &'a DataType {
+        let mut cur = dt;
+        for _ in 0..64 {
+            match cur {
+                DataType::TypeReference { name, .. } => {
+                    if let Some(next) = typedef_types.get(&name.name.name) {
+                        cur = next;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        cur
+    }
+
     fn resolve_type_ref(dt: &DataType, typedef_types: &HashMap<String, DataType>) -> DataType {
         let mut cur = dt.clone();
         for _ in 0..64 {
@@ -113212,6 +113233,14 @@ impl Simulator {
         // so an `output`/`inout`/`ref` formal can be written back member-wise
         // (the whole-value `output_bindings` path can't see per-member locals
         // `o.a`, `o.b`). `None` ⇒ not a member-wise struct formal.
+        // Decide by borrow first: most formals are integral or class
+        // handles, and cloning the declared type to learn that was a
+        // per-formal, per-call copy.
+        match Self::resolve_type_ref_borrowed(dt, &self.module.typedef_types) {
+            DataType::Struct(su) if Self::spreads_member_wise(su) => {}
+            DataType::TypeReference { .. } => {}
+            _ => return None,
+        }
         let dt_resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
         let dt_resolved = match dt_resolved {
             DataType::TypeReference { name, .. } => {
