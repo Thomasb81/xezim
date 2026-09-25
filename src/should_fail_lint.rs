@@ -159,6 +159,7 @@ fn check_unit(
     check_unspecialized_class_scope(&classes, u.items, errs);
     check_udp_instance_delays(defs, u.items, errs);
     check_member_access_roots(u.items, errs);
+    check_event_arguments(u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -3758,6 +3759,80 @@ fn check_member_access_roots(items: &[ModuleItem], errs: &mut Vec<String>) {
                     "'{}' is not declared in subroutine '{root}' (LRM 1800-2017 §23.6)",
                     member.name
                 ));
+            }
+        })
+    });
+    hits.sort();
+    hits.dedup();
+    errs.extend(hits);
+}
+
+/// §13.5: an `event` is not a value, so it cannot be passed to a subroutine
+/// input that is not itself an event (`func(evt)` with `input arg;`).
+fn check_event_arguments(items: &[ModuleItem], errs: &mut Vec<String>) {
+    let mut events: HashSet<&str> = HashSet::new();
+    for it in items {
+        if let ModuleItem::DataDeclaration(d) = it
+            && matches!(
+                d.data_type,
+                DataType::Simple {
+                    kind: xezim_core::ast::types::SimpleType::Event,
+                    ..
+                }
+            )
+        {
+            events.extend(d.declarators.iter().map(|v| v.name.name.as_str()));
+        }
+    }
+    if events.is_empty() {
+        return;
+    }
+    let mut subs: HashMap<&str, &[xezim_core::ast::decl::FunctionPort]> = HashMap::new();
+    for it in items {
+        match it {
+            ModuleItem::FunctionDeclaration(f) => {
+                subs.insert(f.name.name.name.as_str(), &f.ports);
+            }
+            ModuleItem::TaskDeclaration(t) => {
+                subs.insert(t.name.name.name.as_str(), &t.ports);
+            }
+            _ => {}
+        }
+    }
+    let mut hits: Vec<String> = Vec::new();
+    module_exprs(items, &mut |e| {
+        for_each_expr(e, &mut |x| {
+            let ExprKind::Call { func, args } = &x.kind else {
+                return;
+            };
+            let ExprKind::Ident(h) = &func.kind else {
+                return;
+            };
+            if h.path.len() != 1 {
+                return;
+            }
+            let Some(ports) = subs.get(h.path[0].name.name.as_str()) else {
+                return;
+            };
+            for (a, p) in args.iter().zip(ports.iter()) {
+                if let ExprKind::Ident(ah) = &a.kind
+                    && ah.path.len() == 1
+                    && ah.path[0].selects.is_empty()
+                    && events.contains(ah.path[0].name.name.as_str())
+                    && !matches!(
+                        p.data_type,
+                        DataType::Simple {
+                            kind: xezim_core::ast::types::SimpleType::Event,
+                            ..
+                        }
+                    )
+                {
+                    hits.push(format!(
+                        "event '{}' passed to non-event argument '{}' of '{}' \
+                         (LRM 1800-2017 §13.5)",
+                        ah.path[0].name.name, p.name.name, h.path[0].name.name
+                    ));
+                }
             }
         })
     });

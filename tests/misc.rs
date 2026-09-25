@@ -83,6 +83,8 @@ mod duplicate_decl_locations;
 mod elaboration_runaway_guards;
 #[path = "misc/escaped_identifier_matches_nonescaped.rs"]
 mod escaped_identifier_matches_nonescaped;
+#[path = "misc/event_argument.rs"]
+mod event_argument;
 #[path = "misc/for_loop_var_declaration.rs"]
 mod for_loop_var_declaration;
 #[path = "misc/force_assign_override_restore.rs"]
