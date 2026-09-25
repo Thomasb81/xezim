@@ -47656,6 +47656,29 @@ impl Simulator {
                 }
             }
 
+            // Suspend-aware randcase (§18.16), as for `case` above: a chosen
+            // branch that blocks (`1: seq.start(sqr);`) must run on this path,
+            // or its first wait returned at once and the loop around it
+            // started the same sequence again while it was still running.
+            if let StatementKind::RandCase { items } = &stmt.kind {
+                if self.stmt_is_blocking(stmt) {
+                    if let Some(k) = self.randcase_pick(items) {
+                        let arm = &items[k].1;
+                        if self.stmt_is_blocking(arm) {
+                            let cont: Vec<Statement> = match &arm.kind {
+                                StatementKind::SeqBlock { name: None, stmts } => stmts.clone(),
+                                _ => vec![arm.clone()],
+                            };
+                            self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                            return;
+                        }
+                        self.exec_statement(arm);
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+
             // A `for` loop with a blocking body (e.g. `for (i=0; i<n; i++) task_call()`)
             // must iterate via the suspend-aware path — otherwise the synchronous
             // exec runs the body once and the loop never advances. Run the init now,
@@ -75870,31 +75893,7 @@ impl Simulator {
                 }
             },
             StatementKind::RandCase { items } => {
-                // §18.16/§18.17.1: draw one branch with probability
-                // weight_i / sum(weights). Zero-weight branches are never
-                // taken; an all-zero (or empty) list executes nothing.
-                use rand::Rng;
-                let weights: Vec<u64> = items
-                    .iter()
-                    .map(|(w, _)| self.eval_expr(w).to_u64().unwrap_or(0))
-                    .collect();
-                let total: u64 = weights.iter().sum();
-                if total == 0 {
-                    return;
-                }
-                let mut draw = self.cur_rng().gen_range(0..total);
-                let mut chosen = None;
-                for (i, w) in weights.iter().enumerate() {
-                    if *w == 0 {
-                        continue;
-                    }
-                    if draw < *w {
-                        chosen = Some(i);
-                        break;
-                    }
-                    draw -= *w;
-                }
-                if let Some(i) = chosen {
+                if let Some(i) = self.randcase_pick(items) {
                     let stmt = items[i].1.clone();
                     self.exec_statement(&stmt);
                 }
@@ -112879,6 +112878,32 @@ impl Simulator {
             .is_some_and(|o| o == pkg)
         {
             return Some(pkg.clone());
+        }
+        None
+    }
+
+    /// §18.16: draw one `randcase` branch with probability weight_i /
+    /// sum(weights). Zero-weight branches are never taken; an all-zero (or
+    /// empty) list selects nothing.
+    fn randcase_pick(&mut self, items: &[(Expression, Statement)]) -> Option<usize> {
+        use rand::Rng;
+        let weights: Vec<u64> = items
+            .iter()
+            .map(|(w, _)| self.eval_expr(w).to_u64().unwrap_or(0))
+            .collect();
+        let total: u64 = weights.iter().sum();
+        if total == 0 {
+            return None;
+        }
+        let mut draw = self.cur_rng().gen_range(0..total);
+        for (i, w) in weights.iter().enumerate() {
+            if *w == 0 {
+                continue;
+            }
+            if draw < *w {
+                return Some(i);
+            }
+            draw -= *w;
         }
         None
     }

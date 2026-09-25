@@ -155,6 +155,8 @@ mod procedural_loop_stall;
 mod process_block_local_shadowing;
 #[path = "scheduling/pure_inline_loop_body.rs"]
 mod pure_inline_loop_body;
+#[path = "scheduling/randcase_blocking_branch.rs"]
+mod randcase_blocking_branch;
 #[path = "scheduling/ranged_port_connections_and_nba_freeze.rs"]
 mod ranged_port_connections_and_nba_freeze;
 #[path = "scheduling/sampled_value_inferred_clock.rs"]
