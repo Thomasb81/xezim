@@ -581,12 +581,15 @@ impl<'a> Ck<'a> {
         }
         ports
             .iter()
-            .map(|p| {
-                let (dt, dims) = redecl
-                    .get(p.name.name.as_str())
-                    .copied()
-                    .unwrap_or((&p.data_type, &p.dimensions));
-                let t = self.resolve(dt);
+            .enumerate()
+            .map(|(i, p)| {
+                let redeclared = redecl.get(p.name.name.as_str()).copied();
+                let (dt, dims) = redeclared.unwrap_or((&p.data_type, &p.dimensions));
+                let t = if redeclared.is_none() && inherits_port_type(ports, i) {
+                    Ty::Unknown
+                } else {
+                    self.resolve(dt)
+                };
                 PortSig {
                     name: p.name.name.clone(),
                     dir: p.direction,
@@ -1361,6 +1364,11 @@ impl<'a> Ck<'a> {
                 self.check_value(&t, d, &format!("'{}'", p.name.name));
             }
         }
+        for (i, p) in ports.iter().enumerate() {
+            if inherits_port_type(ports, i) {
+                self.top().vars.insert(p.name.name.clone(), Ty::Unknown);
+            }
+        }
     }
 
     fn walk_function(&mut self, f: &FunctionDeclaration) {
@@ -1509,6 +1517,15 @@ impl<'a> Ck<'a> {
         self.walk_items(items);
         self.pop();
     }
+}
+
+/// §13.3: a subroutine port written without a data type takes the previous
+/// port's type (`f(string src, dest[$])`) unless its direction is explicit, and
+/// the AST does not record which; its type is left unknown.
+fn inherits_port_type(ports: &[FunctionPort], i: usize) -> bool {
+    i > 0
+        && matches!(&ports[i].data_type, DataType::Implicit { signing: None, dimensions, .. }
+            if dimensions.is_empty())
 }
 
 fn four_state(t: &Ty) -> bool {
