@@ -31,6 +31,8 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
     // §23.3.2: map every module/interface/program to its declared port names,
     // so a named port connection to a non-existent port can be rejected.
     let port_map = build_port_map(defs);
+    let pkg_decls = package_decls(defs);
+    let pkg_names: HashSet<String> = pkg_decls.values().flatten().cloned().collect();
     for def in defs {
         match def {
             SourceDefinition::Class(c) => check_class(c, &mut errs),
@@ -43,6 +45,13 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_struct_typedef_widths(t, elab, &mut errs);
             }
             SourceDefinition::Module(m) => {
+                let unit = Unit {
+                    name: &m.name.name,
+                    params: &m.params,
+                    ports: &m.ports,
+                    items: &m.items,
+                };
+                check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 for it in &m.items {
@@ -56,6 +65,13 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
             }
             SourceDefinition::Interface(m) => {
+                let unit = Unit {
+                    name: &m.name.name,
+                    params: &m.params,
+                    ports: &m.ports,
+                    items: &m.items,
+                };
+                check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 for it in &m.items {
@@ -67,6 +83,13 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_implicit_ports(&m.ports, &m.items, &port_map, &mut errs);
             }
             SourceDefinition::Program(m) => {
+                let unit = Unit {
+                    name: &m.name.name,
+                    params: &m.params,
+                    ports: &m.ports,
+                    items: &m.items,
+                };
+                check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
                 for it in &m.items {
@@ -100,6 +123,29 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
         errs.extend(crate::type_lint::check(defs, elab));
     }
     errs
+}
+
+/// A module, interface or program, as the scope checks see it.
+struct Unit<'a> {
+    name: &'a str,
+    params: &'a [xezim_core::ast::decl::ParameterDeclaration],
+    ports: &'a PortList,
+    items: &'a [ModuleItem],
+}
+
+/// The declaration and reference checks shared by modules, interfaces and
+/// programs. Checks that resolve names against the elaborated design run on
+/// the top unit only, whose names the elaboration holds.
+fn check_unit(
+    u: &Unit,
+    defs: &[&SourceDefinition],
+    elab: &ElaboratedModule,
+    pkg_decls: &HashMap<String, HashSet<String>>,
+    pkg_names: &HashSet<String>,
+    errs: &mut Vec<String>,
+) {
+    let is_top = u.name == elab.name;
+    check_param_value_refs(u.params, u.items, is_top, pkg_names, elab, errs);
 }
 
 /// Classes can appear nested inside module/interface/program bodies.
@@ -2249,5 +2295,161 @@ yield, so simulated time cannot advance (IEEE 1800-2017 §9.2.1). Add a `#delay`
 `@(...)`, or `wait`, or use `always_comb` (at {})",
             at
         ));
+    }
+}
+
+/// package name -> the names it declares (not the ones it imports). An
+/// imported one may be what a module-level reference means, so the
+/// declaration checks leave those alone.
+fn package_decls(defs: &[&SourceDefinition]) -> HashMap<String, HashSet<String>> {
+    use xezim_core::ast::decl::{PackageItem, ParameterKind};
+    let mut map = HashMap::new();
+    for def in defs {
+        let SourceDefinition::Package(p) = def else {
+            continue;
+        };
+        let out: &mut HashSet<String> = map.entry(p.name.name.clone()).or_default();
+        for it in &p.items {
+            match it {
+                PackageItem::Parameter(pd) => match &pd.kind {
+                    ParameterKind::Data { assignments, .. } => {
+                        out.extend(assignments.iter().map(|a| a.name.name.clone()))
+                    }
+                    ParameterKind::Type { assignments } => {
+                        out.extend(assignments.iter().map(|a| a.name.name.clone()))
+                    }
+                },
+                PackageItem::Data(d) => {
+                    out.extend(d.declarators.iter().map(|v| v.name.name.clone()));
+                    if let DataType::Enum(et) = &d.data_type {
+                        out.extend(et.members.iter().map(|m| m.name.name.clone()));
+                    }
+                }
+                PackageItem::Typedef(td) => {
+                    out.insert(td.name.name.clone());
+                    if let DataType::Enum(et) = &td.data_type {
+                        out.extend(et.members.iter().map(|m| m.name.name.clone()));
+                    }
+                }
+                PackageItem::Function(f) => {
+                    out.insert(f.name.name.name.clone());
+                }
+                PackageItem::Task(t) => {
+                    out.insert(t.name.name.name.clone());
+                }
+                PackageItem::Class(c) => {
+                    out.insert(c.name.name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    map
+}
+
+/// True when `n` names something the elaborated top module declares.
+fn top_declares(n: &str, elab: &ElaboratedModule) -> bool {
+    elab.parameters.contains_key(n)
+        || elab.signals.contains_key(n)
+        || elab.enum_members.contains_key(n)
+        || elab.typedefs.contains_key(n)
+        || elab.classes.contains_key(n)
+        || elab.functions.contains_key(n)
+        || elab.arrays.contains_key(n)
+        || elab.arrays_2d.contains_key(n)
+        || elab.arrays_nd.contains_key(n)
+        || elab.associative_arrays.contains_key(n)
+        || elab.dynamic_arrays.contains(n)
+        || elab.queue_vars.contains(n)
+        || elab.interfaces.contains(n)
+        || elab.packages.contains(n)
+}
+
+/// §6.20.2: a parameter's value cannot depend on itself, directly
+/// (`parameter A = A + 6;`) or through other parameters (`parameter A = B;
+/// parameter B = A;`). In the top module a name declared nowhere
+/// (`parameter x = y ? a : b;` without `b`) is rejected too, even in an
+/// operand the value does not select. An acyclic forward reference is
+/// resolved (the reference simulator rejects that too; xezim keeps it).
+fn check_param_value_refs(
+    params: &[xezim_core::ast::decl::ParameterDeclaration],
+    items: &[ModuleItem],
+    is_top: bool,
+    pkg_names: &HashSet<String>,
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    use xezim_core::ast::decl::ParameterKind;
+    // (name, names its value reads) of every parameter; type parameters
+    // read nothing here.
+    let mut deps: Vec<(&str, Vec<String>)> = Vec::new();
+    let body = items.iter().filter_map(|it| match it {
+        ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => Some(p),
+        _ => None,
+    });
+    for pd in params.iter().chain(body) {
+        match &pd.kind {
+            ParameterKind::Data { assignments, .. } => {
+                for a in assignments {
+                    let mut ids = Vec::new();
+                    if let Some(init) = &a.init {
+                        collect_idents(init, &mut ids);
+                    }
+                    deps.push((a.name.name.as_str(), ids));
+                }
+            }
+            ParameterKind::Type { assignments } => {
+                deps.extend(
+                    assignments
+                        .iter()
+                        .map(|a| (a.name.name.as_str(), Vec::new())),
+                );
+            }
+        }
+    }
+    let index: HashMap<&str, usize> = deps.iter().enumerate().map(|(i, (n, _))| (*n, i)).collect();
+    for (i, (name, ids)) in deps.iter().enumerate() {
+        // Does the value of `name` lead back to `name`?
+        let mut seen = vec![false; deps.len()];
+        let mut stack: Vec<usize> = ids
+            .iter()
+            .filter(|id| !pkg_names.contains(*id))
+            .filter_map(|id| index.get(id.as_str()).copied())
+            .collect();
+        let mut cyclic = false;
+        while let Some(k) = stack.pop() {
+            if k == i {
+                cyclic = true;
+                break;
+            }
+            if std::mem::replace(&mut seen[k], true) {
+                continue;
+            }
+            stack.extend(
+                deps[k]
+                    .1
+                    .iter()
+                    .filter(|id| !pkg_names.contains(*id))
+                    .filter_map(|id| index.get(id.as_str()).copied()),
+            );
+        }
+        if cyclic {
+            errs.push(format!(
+                "parameter '{name}' depends on its own value (LRM 1800-2017 §6.20.2)"
+            ));
+        }
+        if is_top {
+            for id in ids {
+                if !index.contains_key(id.as_str())
+                    && !pkg_names.contains(id)
+                    && !top_declares(id, elab)
+                {
+                    errs.push(format!(
+                        "parameter '{name}' refers to undeclared identifier '{id}' \
+                         (LRM 1800-2017 §6.20.2)"
+                    ));
+                }
+            }
+        }
     }
 }
