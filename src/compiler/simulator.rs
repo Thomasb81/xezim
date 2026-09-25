@@ -69726,6 +69726,40 @@ impl Simulator {
         }
     }
 
+    /// The full path's step after evaluating a call RHS: a collection the
+    /// call just returned (`pending_ret_collection`) is copied whole into a
+    /// collection target. `true` when the assignment is done.
+    fn assign_pending_ret_collection(&mut self, lvalue: &Expression) -> bool {
+        let Some(src) = self.pending_ret_collection.take() else {
+            return false;
+        };
+        let dst: Option<std::borrow::Cow<str>> = {
+            let byname = if let ExprKind::Ident(h) = &lvalue.kind {
+                let bare = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                let n = self
+                    .dyn_name_lookup(bare)
+                    .map(|s| std::borrow::Cow::Owned(s.to_string()))
+                    .unwrap_or_else(|| self.resolve_hier_name(h));
+                self.module.dynamic_arrays.contains(&*n).then_some(n)
+            } else {
+                None
+            };
+            byname.or_else(|| {
+                self.expr_assoc_name(lvalue)
+                    .filter(|an| !self.is_associative_array(an))
+                    .map(std::borrow::Cow::Owned)
+            })
+        };
+        let Some(dst) = dst else {
+            return false;
+        };
+        if dst != src {
+            self.copy_whole_queue(&dst, &src);
+        }
+        self.settle_after_proc_write();
+        true
+    }
+
     /// The extra conditions for `n = r` (both bare names) to reduce to a
     /// plain evaluate + assign: no `new`, no vif binding to carry, no
     /// struct copy or spread, and no collection / array / associative copy
@@ -69801,8 +69835,30 @@ impl Simulator {
     /// `simple_ident_copy_ok`), so the statement is the full path's final
     /// width-sized evaluate + assign.
     fn simple_blocking_assign(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        // A call RHS: the full path's call forms are `new`, a queue pop and
+        // an array locator, each named by the callee's last segment.
+        let rhs_call = match &rvalue.kind {
+            ExprKind::Call { func, .. } => {
+                let callee = match &func.kind {
+                    ExprKind::Ident(fh) => fh.path.last().map(|s| s.name.name.as_str()),
+                    ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                    _ => None,
+                };
+                match callee {
+                    Some(m)
+                        if m != "new"
+                            && m != "pop_front"
+                            && m != "pop_back"
+                            && !Self::is_locator_method(m) => {}
+                    _ => return false,
+                }
+                true
+            }
+            _ => false,
+        };
         let rhs_ident = match &rvalue.kind {
             ExprKind::Number(_) | ExprKind::Binary { .. } | ExprKind::Unary { .. } => None,
+            ExprKind::Call { .. } => None,
             ExprKind::Ident(rh)
                 if rh.path.len() == 1 && rh.root.is_none() && rh.path[0].selects.is_empty() =>
             {
@@ -69833,11 +69889,24 @@ impl Simulator {
                 return false;
             }
         }
+        // A call's value is spread over a member-wise struct target.
+        if rhs_call {
+            let dst = match self.dyn_name_lookup(n) {
+                Some(uq) => uq.to_string(),
+                None => n.to_string(),
+            };
+            if self.struct_copy_target(dst).1.is_some() {
+                return false;
+            }
+        }
         let w = {
             let iw = self.infer_lhs_width(lvalue);
             if iw == 0 { 32 } else { iw }
         };
         let val = self.eval_expr_ctx(rvalue, w);
+        if rhs_call && self.assign_pending_ret_collection(lvalue) {
+            return true;
+        }
         self.assign_value(lvalue, &val);
         self.settle_after_proc_write();
         true
