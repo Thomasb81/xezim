@@ -169,6 +169,15 @@ module tb;
 endmodule
 ";
 
+const LATE_FINISH: &str = "\
+module tb;
+  initial begin
+    #150000000 $display(\"L t=%0t\", $time);
+    $finish;
+  end
+endmodule
+";
+
 #[test]
 fn do_run_time_matches_max_time() {
     let d = scratch("dorun");
@@ -198,14 +207,24 @@ fn do_run_time_matches_max_time() {
 fn do_run_all_lifts_the_default_cap() {
     let d = scratch("doall");
     std::fs::write(d.join("tb.sv"), TIMED).unwrap();
-    // $finish is at 200 us, past the default 100 us cap.
-    let capped = ok_stdout(&d, &["tb.sv"]);
-    assert!(!capped.contains("D t="), "{}", capped);
+    // $finish is at 200 us, inside the default 100 ms cap.
     let native = ok_stdout(&d, &["tb.sv", "--max-time", "1ms"]);
     assert!(native.contains("D t=200000") && native.contains("$finish called"));
+    assert_eq!(ok_stdout(&d, &["tb.sv"]), native);
     assert_eq!(
         ok_stdout(&d, &["tb.sv", "-do", "run -all; quit -f"]),
         native
+    );
+    // $finish at 150 ms, past the default cap: only `run -all` reaches it.
+    let late = scratch("doall_late");
+    std::fs::write(late.join("tb.sv"), LATE_FINISH).unwrap();
+    let capped = ok_stdout(&late, &["tb.sv"]);
+    assert!(!capped.contains("L t="), "{}", capped);
+    let all = ok_stdout(&late, &["tb.sv", "-do", "run -all; quit -f"]);
+    assert!(
+        all.contains("L t=150000000") && all.contains("$finish called"),
+        "{}",
+        all
     );
     // Quitting before any run only elaborates.
     let (code, out, _) = run_in(&d, &["tb.sv", "-do", "quit -f"]);
