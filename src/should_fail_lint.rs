@@ -150,6 +150,7 @@ fn check_unit(
     check_foreach_dims(u.items, errs);
     check_select_depth(u.items, errs);
     check_port_actuals(defs, u.items, errs);
+    check_generate_block_names(u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -2974,6 +2975,82 @@ fn check_port_actuals(defs: &[&SourceDefinition], items: &[ModuleItem], errs: &m
                         }
                     ));
                 }
+            }
+        }
+    }
+}
+
+/// §27.6: a generate block's name lives in the enclosing module's name space.
+/// It cannot repeat another declaration there (`reg named; ... begin : named`),
+/// the name of another generate construct's block, or a named procedural block
+/// (`initial begin : block1`). Alternative branches of one if/case construct
+/// may share a name.
+fn check_generate_block_names(items: &[ModuleItem], errs: &mut Vec<String>) {
+    let mut decls: HashSet<&str> = HashSet::new();
+    let mut blocks: Vec<HashSet<&str>> = Vec::new();
+    fn walk<'a>(
+        items: &'a [ModuleItem],
+        decls: &mut HashSet<&'a str>,
+        blocks: &mut Vec<HashSet<&'a str>>,
+    ) {
+        for it in items {
+            match it {
+                ModuleItem::DataDeclaration(d) => {
+                    decls.extend(d.declarators.iter().map(|v| v.name.name.as_str()))
+                }
+                ModuleItem::NetDeclaration(d) => {
+                    decls.extend(d.declarators.iter().map(|v| v.name.name.as_str()))
+                }
+                ModuleItem::ModuleInstantiation(mi) => {
+                    decls.extend(mi.instances.iter().map(|i| i.name.name.as_str()))
+                }
+                ModuleItem::InitialConstruct(i) => {
+                    if let Some(n) = stmt_block_name(&i.stmt) {
+                        decls.insert(n);
+                    }
+                }
+                ModuleItem::AlwaysConstruct(a) => {
+                    if let Some(n) = stmt_block_name(&a.stmt) {
+                        decls.insert(n);
+                    }
+                }
+                ModuleItem::GenerateFor(gf) => {
+                    if let Some(n) = &gf.name {
+                        blocks.push(HashSet::from([n.as_str()]));
+                    }
+                }
+                ModuleItem::GenerateIf(gi) => blocks.push(
+                    gi.branch_labels
+                        .iter()
+                        .flatten()
+                        .map(|s| s.as_str())
+                        .collect(),
+                ),
+                ModuleItem::GenerateCase(gc) => {
+                    blocks.push(gc.arms.iter().filter_map(|a| a.label.as_deref()).collect())
+                }
+                ModuleItem::GenerateRegion(gr) => walk(&gr.items, decls, blocks),
+                _ => {}
+            }
+        }
+    }
+    fn stmt_block_name(s: &Statement) -> Option<&str> {
+        match &s.kind {
+            StatementKind::SeqBlock { name: Some(n), .. }
+            | StatementKind::ParBlock { name: Some(n), .. } => Some(n.name.as_str()),
+            StatementKind::TimingControl { stmt, .. } => stmt_block_name(stmt),
+            _ => None,
+        }
+    }
+    walk(items, &mut decls, &mut blocks);
+    let mut seen: HashSet<&str> = HashSet::new();
+    for set in &blocks {
+        for n in set {
+            if decls.contains(n) || !seen.insert(n) {
+                errs.push(format!(
+                    "generate block name '{n}' is already declared in this module \
+                     (LRM 1800-2017 §27.6)"
+                ));
             }
         }
     }

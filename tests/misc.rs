@@ -97,6 +97,8 @@ mod forever_break_continue;
 mod function_return_bit_select;
 #[path = "misc/gate_terminal_counts.rs"]
 mod gate_terminal_counts;
+#[path = "misc/generate_block_name_clash.rs"]
+mod generate_block_name_clash;
 #[path = "misc/generate_item_restrictions.rs"]
 mod generate_item_restrictions;
 #[path = "misc/generate_loop_genvar.rs"]
