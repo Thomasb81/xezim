@@ -53,6 +53,8 @@ mod param_type_binding_resolves_enclosing_value_param;
 mod static_fixed_array_storage;
 #[path = "classes/static_param_class_collection_reuse.rs"]
 mod static_param_class_collection_reuse;
+#[path = "classes/struct_member_class_handle_new.rs"]
+mod struct_member_class_handle_new;
 #[path = "classes/this_collection_struct_members.rs"]
 mod this_collection_struct_members;
 #[path = "classes/type_param_formal_stale_local.rs"]

@@ -127576,6 +127576,32 @@ impl Simulator {
             .and_then(Self::container_base)
     }
 
+    /// §7.2/§8.4: the class a CLASS-HANDLE member of an unpacked struct
+    /// variable (`s.h`, `s.inner.h`) names, walked from the variable's
+    /// declared type. The struct's leaves carry no type name of their own,
+    /// so `s.h = new` found no class to construct and left `s.h` null.
+    fn struct_member_class_type(&self, root: &str, members: &[String]) -> Option<String> {
+        let mut dt = self.module.var_decl_types.get(root)?;
+        for m in members {
+            let DataType::Struct(su) = self.resolve_dt_ref(dt) else {
+                return None;
+            };
+            dt = &su
+                .members
+                .iter()
+                .find(|sm| sm.declarators.iter().any(|d| &d.name.name == m))?
+                .data_type;
+        }
+        let DataType::TypeReference { name, .. } = dt else {
+            return None;
+        };
+        let tn = &name.name.name;
+        if self.module.classes.contains_key(tn) {
+            return Some(tn.clone());
+        }
+        self.resolve_simple_typedef_class(tn)
+    }
+
     fn lookup_type_member(&self, type_name: &str, member: &str) -> Option<String> {
         if let Some(t) = self.class_prop_type_named(type_name, member) {
             return Some(t);
@@ -128005,6 +128031,9 @@ impl Simulator {
                             return Some(tn);
                         }
                     }
+                    let members: Vec<String> =
+                        hier.path[1..].iter().map(|s| s.name.name.clone()).collect();
+                    return self.struct_member_class_type(&hier.path[0].name.name, &members);
                 }
                 None
             }
@@ -128163,7 +128192,10 @@ impl Simulator {
                         }
                     }
                 }
-                None
+                let mut segs = Self::flatten_member_path(base)?;
+                segs.push(member.name.clone());
+                let root = segs.remove(0);
+                self.struct_member_class_type(&root, &segs)
             }
             _ => None,
         }
