@@ -129,6 +129,26 @@ fn check_module_item(
         ModuleItem::NetDeclaration(d) => {
             check_enum_type(&d.data_type, elab, errs);
             check_packed_dims(&d.data_type, elab, errs);
+            // §7.4: a net array has fixed-size dimensions only.
+            for decl in &d.declarators {
+                let kind = decl.dimensions.iter().find_map(|dim| match dim {
+                    UnpackedDimension::Unsized(_) => Some("a dynamic array"),
+                    UnpackedDimension::Queue { .. } => Some("a queue"),
+                    // `[N]` with a parameter N parses as an associative
+                    // dimension too; only `[*]` is certainly one.
+                    UnpackedDimension::Associative {
+                        data_type: None, ..
+                    } => Some("an associative array"),
+                    _ => None,
+                });
+                if let Some(kind) = kind {
+                    errs.push(format!(
+                        "net '{}' cannot be {kind}: a net array has fixed-size dimensions \
+                         only (LRM 1800-2017 §7.4)",
+                        decl.name.name
+                    ));
+                }
+            }
         }
         ModuleItem::AlwaysConstruct(a) => {
             if live {
