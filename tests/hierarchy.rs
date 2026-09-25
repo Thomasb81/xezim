@@ -119,6 +119,8 @@ mod packed_port_formal_type;
 mod packed_record_output_chain;
 #[path = "hierarchy/param_typedef_instance_isolation.rs"]
 mod param_typedef_instance_isolation;
+#[path = "hierarchy/parameter_override_identifiers.rs"]
+mod parameter_override_identifiers;
 #[path = "hierarchy/pct_m_block_scope.rs"]
 mod pct_m_block_scope;
 #[path = "hierarchy/percent_m_declaring_scope.rs"]

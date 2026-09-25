@@ -161,6 +161,7 @@ fn check_unit(
     check_member_access_roots(u.items, errs);
     check_event_arguments(u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
+    check_param_override_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
 }
@@ -3138,6 +3139,48 @@ fn check_system_task_values(items: &[ModuleItem], errs: &mut Vec<String>) {
             ModuleItem::FunctionDeclaration(f) => f.items.iter().for_each(&mut check_stmt),
             ModuleItem::TaskDeclaration(t) => t.items.iter().for_each(&mut check_stmt),
             _ => {}
+        }
+    }
+}
+
+/// §23.10: in the top module, a parameter value in an instantiation is a
+/// constant expression over declared names (`foo #(ASDF) bar();` with no
+/// `ASDF` anywhere).
+fn check_param_override_idents(
+    items: &[ModuleItem],
+    is_top: bool,
+    pkg_names: &HashSet<String>,
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    if !is_top {
+        return;
+    }
+    use xezim_core::ast::decl::{ParamConnection, ParamValue};
+    for it in items {
+        let ModuleItem::ModuleInstantiation(mi) = it else {
+            continue;
+        };
+        for c in mi.params.iter().flatten() {
+            let (ParamConnection::Ordered(Some(ParamValue::Expr(e)))
+            | ParamConnection::Named {
+                value: Some(ParamValue::Expr(e)),
+                ..
+            }) = c
+            else {
+                continue;
+            };
+            let mut ids = Vec::new();
+            collect_idents(e, &mut ids);
+            for id in ids {
+                if !is_builtin_type(&id) && !pkg_names.contains(&id) && !top_declares(&id, elab) {
+                    errs.push(format!(
+                        "parameter value for instance of '{}' refers to undeclared identifier \
+                         '{id}' (LRM 1800-2017 §23.10)",
+                        mi.module_name.name
+                    ));
+                }
+            }
         }
     }
 }
