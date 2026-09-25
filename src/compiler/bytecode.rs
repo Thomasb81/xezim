@@ -461,6 +461,14 @@ pub enum Insn {
     /// Allocation + the whole ctor chain stay interpreter-owned
     /// (`instantiate_class`). (dest, class, arg_start, n_args)
     ConstructObject(RegId, Box<str>, RegId, u32),
+    /// class-perf Step 9h: a CLASS-SCOPE static call `Cls.m(args)` /
+    /// `alias.m(args)` — the receiver names a class, a typedef alias, or a
+    /// type parameter (admitted at the compile site). The RAW receiver name
+    /// is baked here; the executor re-enters the interpreter's shared
+    /// `exec_class_scope_static_call`, so specialization derivation and
+    /// per-spec static seeding are runtime-owned and byte-identical to the
+    /// AST path. (dest, recv_name, method, arg_start, n_args)
+    CallStaticScoped(RegId, Box<str>, Box<str>, RegId, u32),
 
     /// Compiled class-method builtin-collection call. The receiver is a
     /// class handle in `handle_reg`; `member` names a member collection
@@ -970,7 +978,8 @@ impl Insn {
             | LoadCollElem(..) | StoreCollElem(..)
             | CallScopedMethod(..)
             | StoreClassStatic(..)
-            | ConstructObject(..) => return false,
+            | ConstructObject(..)
+            | CallStaticScoped(..) => return false,
         }
         true
     }
@@ -1039,6 +1048,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::LoadClassStatic(..) => "LoadSta,",
         Insn::StoreClassStatic(..) => "StorSta,",
         Insn::ConstructObject(..) => "NewObj,",
+        Insn::CallStaticScoped(..) => "CallStatScp,",
         Insn::CallCollMethod(..) => "CallColl,",
         Insn::LoadCollElem(..) => "CollElemR,",
         Insn::StoreCollElem(..) => "CollElemW,",
@@ -1208,6 +1218,7 @@ pub struct BytecodeCompiler<'a> {
     /// the target of a `lhs = new(...)` lowering. Only non-parameterized
     /// targets are admitted (compile-site filtered).
     new_type_map: HashMap<String, String>,
+    scope_static_receivers: HashSet<String>,
     /// class-perf Step 9e: the static CLASS of the method being compiled —
     /// the `this` root's type for TYPED handle-chain admission.
     method_class: Option<String>,
@@ -1522,6 +1533,7 @@ impl<'a> BytecodeCompiler<'a> {
             static_member_names: HashSet::default(),
             class_const_names: HashSet::default(),
             new_type_map: HashMap::default(),
+            scope_static_receivers: HashSet::default(),
             method_class: None,
             handle_member_types: None,
             method_result_reg: None,
@@ -2264,6 +2276,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.bail("Expr_Call");
             return None;
         };
+
         // §6.6.7 resolver dispatch: a DYNAMIC-ARRAY formal (`input real
         // drivers[]`) whose actual is a FIXED assignment pattern is
         // monomorphic at this call site — the nettype resolution machinery
@@ -10515,6 +10528,105 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("Expr_Call_bare_method");
                     return None;
                 }
+                // class-perf Step 9h: a CLASS-SCOPE static call —
+                // `Cls.m(args)` / `alias.m(args)` / `Tparam.m(args)` where
+                // the receiver Ident names a class-scope entity admitted by
+                // the compile site (class name, chain typedef alias, or type
+                // parameter) and is NOT any variable-like name. The receiver
+                // name is baked RAW; resolution (type-param binding, embedded
+                // `base#sig`, plain class, typedef spec, simple typedef) is
+                // executed by the interpreter at runtime via the shared
+                // `exec_class_scope_static_call` — identical to the AST path,
+                // including per-specialization static seeding.
+                // §13.5.2: the shared resolution binds actuals the same way
+                // the AST member-call path does — a ref/output formal writes
+                // back through its ACTUAL EXPRESSION. The compiled call
+                // marshals register VALUES as constant actuals, so a
+                // write-back would be a no-op and the caller's lvalue would
+                // silently keep its pre-call value (uvm_config_db::get's
+                // inout `value` arg zeroed every config read). Formal
+                // directions are runtime state here (the receiver resolves
+                // through typedef/type-param chains at run time), so any
+                // potentially-assignable actual declines the whole method.
+                let arg_could_be_ref_bound = |a: &Expression| -> bool {
+                    match &a.kind {
+                        ExprKind::Ident(h)
+                            if h.root.is_none()
+                                && h.path.len() == 1
+                                && h.path[0].selects.is_empty() =>
+                        {
+                            let n = h.path[0].name.name.as_str();
+                            if n == "this" {
+                                return false;
+                            }
+                            self.local_var_regs.contains_key(n)
+                                || self.local_array_regs.contains_key(n)
+                                || self.bare_member_names.contains(n)
+                                || self.static_member_names.contains(n)
+                                || self.string_member_names.contains(n)
+                                || self.class_shadow_names.contains(n)
+                        }
+                        // A member train or element select is assignable in
+                        // principle (this.m, arr[i]); a nested call result,
+                        // literal, or operator expression is not.
+                        ExprKind::MemberAccess { .. } | ExprKind::Index { .. } => true,
+                        _ => false,
+                    }
+                };
+                if self.method_mode
+                    && let ExprKind::MemberAccess { expr: rx, member } = &func.kind
+                    && let ExprKind::Ident(h) = &rx.kind
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && !self.local_var_regs.contains_key(h.path[0].name.name.as_str())
+                    && !self.local_array_regs.contains_key(h.path[0].name.name.as_str())
+                    && !self.bare_member_names.contains(h.path[0].name.name.as_str())
+                    && self.scope_static_receivers.contains(h.path[0].name.name.as_str())
+                    && !args.iter().any(arg_could_be_ref_bound)
+                {
+                    let call_start = self.insns.len();
+                    let call_next = self.next_reg;
+                    let mut ok = true;
+                    let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.compile_expr(a, 0) {
+                            Some(r) => arg_values.push(r),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        let dest = self.alloc_reg();
+                        let n = arg_values.len() as u32;
+                        // Contiguous arg slots (same reservation discipline
+                        // as the bare-call form above).
+                        let arg_start = self.alloc_reg();
+                        for _ in 1..arg_values.len() {
+                            self.alloc_reg();
+                        }
+                        for (i, &v) in arg_values.iter().enumerate() {
+                            let slot = (arg_start as usize + i) as RegId;
+                            if slot != v {
+                                self.emit(Insn::Move(slot, v));
+                            }
+                        }
+                        self.emit(Insn::CallStaticScoped(
+                            dest,
+                            h.path[0].name.name.clone().into_boxed_str(),
+                            member.name.clone().into_boxed_str(),
+                            arg_start,
+                            n,
+                        ));
+                        return Some(dest);
+                    }
+                    self.insns.truncate(call_start);
+                    self.next_reg = call_next;
+                    self.bail("Expr_Call_static_scope");
+                    return None;
+                }
                 if let Some(r) = self.compile_string_method(func, args, expr.span) {
                     return Some(r);
                 }
@@ -12789,6 +12901,7 @@ impl<'a> BytecodeCompiler<'a> {
         static_member_names: &HashSet<String>,
         class_const_names: &HashSet<String>,
         new_type_map: &HashMap<String, String>,
+        scope_static_receivers: &HashSet<String>,
         method_class: &str,
         handle_member_types: &'a HashMap<String, HashMap<String, String>>,
         class_shadow_names: &HashSet<String>,
@@ -12882,6 +12995,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.static_member_names = static_member_names.clone();
         self.class_const_names = class_const_names.clone();
         self.new_type_map = new_type_map.clone();
+        self.scope_static_receivers = scope_static_receivers.clone();
         self.method_class = Some(method_class.to_string());
         self.handle_member_types = Some(handle_member_types);
 
@@ -13043,6 +13157,10 @@ impl<'a> BytecodeCompiler<'a> {
                 *t == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
             }
             Insn::ConstructObject(_, _, a, n) => {
+                (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+            }
+            // Step 9h: a class-scope static call reads its arg range only.
+            Insn::CallStaticScoped(_, _, _, a, n) => {
                 (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
             }
             // Step 9g: a static-property READ has no register inputs.
@@ -14385,6 +14503,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // object handle has runtime-determined width (bare store).
                 Insn::StoreClassStatic(..) => {}
                 Insn::ConstructObject(d, ..) => store(&mut rw, *d, None),
+                Insn::CallStaticScoped(d, ..) => store(&mut rw, *d, None),
                 // Collection builtin: dest width follows the runtime member
                 // (count / exists flag / popped element) — bare dest store.
                 Insn::CallCollMethod(d, ..) => store(&mut rw, *d, None),
@@ -15311,7 +15430,7 @@ mod tests {
         let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -15375,7 +15494,7 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -15414,7 +15533,7 @@ mod tests {
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );

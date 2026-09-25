@@ -23831,6 +23831,7 @@ impl Simulator {
                 }
                 Insn::CallMethod(..)
                 | Insn::CallScopedMethod(..)
+                | Insn::CallStaticScoped(..)
                 | Insn::LoadClassStatic(..)
                 | Insn::StoreClassStatic(..)
                 | Insn::ConstructObject(..) => {
@@ -24519,6 +24520,7 @@ impl Simulator {
                 }
                 Insn::CallMethod(..)
                 | Insn::CallScopedMethod(..)
+                | Insn::CallStaticScoped(..)
                 | Insn::LoadClassStatic(..)
                 | Insn::StoreClassStatic(..)
                 | Insn::ConstructObject(..) => {
@@ -25740,6 +25742,26 @@ impl Simulator {
                         self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
                     };
                     self.vm_regs[*dest as usize] = result;
+                    local_count += 1;
+                }
+                Insn::CallStaticScoped(dest, recv, method, arg_start, n_args) => {
+                    // Step 9h: class-scope static call — marshal register
+                    // args and re-enter the interpreter's SHARED resolution
+                    // (type-param binding, embedded spec, class name, typedef
+                    // aliases), exactly the AST member-call path.
+                    let base = *arg_start as usize;
+                    let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
+                    for i in 0..*n_args as usize {
+                        argvals.push(self.vm_regs.get(base + i).cloned().unwrap_or(Value::zero(32)));
+                    }
+                    let args: Vec<Expression> = argvals
+                        .iter()
+                        .map(|v| self.value_method_arg_expr(v))
+                        .collect();
+                    let v = self
+                        .exec_class_scope_static_call(recv, method, &args)
+                        .unwrap_or_else(|| Value::zero(32));
+                    self.vm_regs[*dest as usize] = v;
                     local_count += 1;
                 }
                 Insn::LoadClassStatic(dest, class, prop) => {
@@ -38600,6 +38622,7 @@ impl Simulator {
             Insn::LoadClassStatic(..) => "LoadClassStatic",
             Insn::StoreClassStatic(..) => "StoreClassStatic",
             Insn::ConstructObject(..) => "ConstructObject",
+            Insn::CallStaticScoped(..) => "CallStaticScoped",
             Insn::CallCollMethod(..) => "CallCollMethod",
             Insn::LoadCollElem(..) => "LoadCollElem",
             Insn::StoreCollElem(..) => "StoreCollElem",
@@ -99188,6 +99211,111 @@ impl Simulator {
         }
     }
 
+    /// `Name.method(args)` where `Name` names a CLASS-scope entity — the
+    /// shared resolution for the AST member-call path and the compiled
+    /// `Insn::CallStaticScoped` executor (class-perf Step 9h). Resolution
+    /// order (mirrors the original inline block): an active type-parameter
+    /// binding (possibly a `base#sig` specialization), an embedded
+    /// specialization in the name itself, a plain class name, a
+    /// parameterized typedef alias (§8.25.1), then a simple typedef alias
+    /// (§6.18). `Name::new(...)` constructs explicitly. Returns None when
+    /// nothing resolves (callers keep their fallback order).
+    fn exec_class_scope_static_call(
+        &mut self,
+        name: &str,
+        mname: &str,
+        args: &[Expression],
+    ) -> Option<Value> {
+        // Type-parameter used as a class name: `Tregistry::get()`.
+
+        // Resolve the type param to a concrete class/specialization
+        // from the active spec before dispatching.
+        if let Some(resolved) = self.resolve_type_param_binding(name) {
+            if let Some((base, sig)) = self.extract_spec_from_string(&resolved) {
+                self.ensure_spec_statics(&base, &sig);
+                let saved = self.current_spec.take();
+                if let Some(cs) = &saved {
+                    self.spec_scope_stack.push(cs.clone());
+                }
+                self.current_spec = Some((base.clone(), sig));
+                let res = self.exec_static_method(&base, mname, args);
+                let had_saved = saved.is_some();
+                self.current_spec = saved;
+                if had_saved {
+                    self.spec_scope_stack.pop();
+                }
+                if let Some(v) = res {
+                    return Some(v);
+                }
+            } else if self.module.classes.contains_key(&resolved) {
+                if let Some(res) = self.exec_static_method(&resolved, mname, args) {
+                    return Some(res);
+                }
+            }
+        }
+        if let Some((base, sig)) = self.extract_spec_from_string(name) {
+            self.ensure_spec_statics(&base, &sig);
+            let saved = self.current_spec.take();
+            if let Some(cs) = &saved {
+                self.spec_scope_stack.push(cs.clone());
+            }
+            self.current_spec = Some((base.clone(), sig));
+            let res = self.exec_static_method(&base, mname, args);
+            let had_saved = saved.is_some();
+            self.current_spec = saved;
+            if had_saved {
+                self.spec_scope_stack.pop();
+            }
+            if let Some(v) = res {
+                return Some(v);
+            }
+        } else if self.module.classes.contains_key(name) {
+            if let Some(res) = self.exec_static_method(name, mname, args) {
+                return Some(res);
+            }
+            // `ClassName::new(...)` — explicit constructor call.
+            if mname == "new" {
+                if let Some(cd) = self.module.classes.get(name).cloned() {
+                    return Some(self.instantiate_class(&cd, args));
+                }
+            }
+        }
+        // §8.25.1 typedef specialization alias on the dot-access
+        // form (see the flattened-path handler for details).
+        if let Some((base, sig)) = self.resolve_typedef_spec(name) {
+            self.ensure_spec_statics(&base, &sig);
+            let saved = self.current_spec.take();
+            if let Some(cs) = &saved {
+                self.spec_scope_stack.push(cs.clone());
+            }
+            self.current_spec = Some((base.clone(), sig));
+            let res = self.exec_static_method(&base, mname, args);
+            let had_saved = saved.is_some();
+            self.current_spec = saved;
+            if had_saved {
+                self.spec_scope_stack.pop();
+            }
+            if let Some(v) = res {
+                return Some(v);
+            }
+        }
+        // §6.18/§8.25.1: simple class typedef (no specialization
+        // args) — `typedef base alias;` ... `alias::method()`.
+        // `resolve_typedef_spec` skips these; resolve the alias
+        // to its target class and dispatch.
+        if let Some(resolved) = self.resolve_simple_typedef_class(name) {
+            if let Some(res) = self.exec_static_method(&resolved, mname, args) {
+                return Some(res);
+            }
+            if mname == "new" {
+                if let Some(cd) = self.module.classes.get(&resolved).cloned() {
+                    return Some(self.instantiate_class(&cd, args));
+                }
+            }
+        }
+        None
+    }
+
     /// Execute `ClassName::method(args)` — a static method call with no
     /// instance handle. Returns None if the method is not found.
     fn exec_static_method(
@@ -100512,92 +100640,9 @@ impl Simulator {
                     && !self.signal_name_to_id.contains_key(name.as_ref())
                     && !self.signals.contains_key(&*name)
                 {
-                    // Type-parameter used as a class name: `Tregistry::get()`.
-
-                    // Resolve the type param to a concrete class/specialization
-                    // from the active spec before dispatching.
-                    if let Some(resolved) = self.resolve_type_param_binding(&name) {
-                        if let Some((base, sig)) = self.extract_spec_from_string(&resolved) {
-                            self.ensure_spec_statics(&base, &sig);
-                            let saved = self.current_spec.take();
-                            if let Some(cs) = &saved {
-                                self.spec_scope_stack.push(cs.clone());
-                            }
-                            self.current_spec = Some((base.clone(), sig));
-                            let res = self.exec_static_method(&base, mname, args);
-                            let had_saved = saved.is_some();
-                            self.current_spec = saved;
-                            if had_saved {
-                                self.spec_scope_stack.pop();
-                            }
-                            if let Some(v) = res {
-                                return v;
-                            }
-                        } else if self.module.classes.contains_key(&resolved) {
-                            if let Some(res) = self.exec_static_method(&resolved, mname, args) {
-                                return res;
-                            }
-                        }
-                    }
-                    if let Some((base, sig)) = self.extract_spec_from_string(&name) {
-                        self.ensure_spec_statics(&base, &sig);
-                        let saved = self.current_spec.take();
-                        if let Some(cs) = &saved {
-                            self.spec_scope_stack.push(cs.clone());
-                        }
-                        self.current_spec = Some((base.clone(), sig));
-                        let res = self.exec_static_method(&base, mname, args);
-                        let had_saved = saved.is_some();
-                        self.current_spec = saved;
-                        if had_saved {
-                            self.spec_scope_stack.pop();
-                        }
-                        if let Some(v) = res {
-                            return v;
-                        }
-                    } else if self.module.classes.contains_key(&*name) {
-                        if let Some(res) = self.exec_static_method(&name, mname, args) {
-                            return res;
-                        }
-                        // `ClassName::new(...)` — explicit constructor call.
-                        if mname == "new" {
-                            if let Some(cd) = self.module.classes.get(&*name).cloned() {
-                                return self.instantiate_class(&cd, args);
-                            }
-                        }
-                    }
-                    // §8.25.1 typedef specialization alias on the dot-access
-                    // form (see the flattened-path handler for details).
-                    if let Some((base, sig)) = self.resolve_typedef_spec(&name) {
-                        self.ensure_spec_statics(&base, &sig);
-                        let saved = self.current_spec.take();
-                        if let Some(cs) = &saved {
-                            self.spec_scope_stack.push(cs.clone());
-                        }
-                        self.current_spec = Some((base.clone(), sig));
-                        let res = self.exec_static_method(&base, mname, args);
-                        let had_saved = saved.is_some();
-                        self.current_spec = saved;
-                        if had_saved {
-                            self.spec_scope_stack.pop();
-                        }
-                        if let Some(v) = res {
-                            return v;
-                        }
-                    }
-                    // §6.18/§8.25.1: simple class typedef (no specialization
-                    // args) — `typedef base alias;` ... `alias::method()`.
-                    // `resolve_typedef_spec` skips these; resolve the alias
-                    // to its target class and dispatch.
-                    if let Some(resolved) = self.resolve_simple_typedef_class(&name) {
-                        if let Some(res) = self.exec_static_method(&resolved, mname, args) {
-                            return res;
-                        }
-                        if mname == "new" {
-                            if let Some(cd) = self.module.classes.get(&resolved).cloned() {
-                                return self.instantiate_class(&cd, args);
-                            }
-                        }
+                    if let Some(v) = self.exec_class_scope_static_call(name.as_ref(), mname, args)
+                    {
+                        return v;
                     }
                 }
             }
@@ -117139,6 +117184,23 @@ impl Simulator {
     /// class-static storage, so it bails to AST instead of reading the wrong
     /// thing. Instance-independent (depends only on the class name) so it is
     /// safe to reuse across instances of the same class.
+    /// class-perf Step 9h: VALUE-parameter names of `cname` (param_order
+    /// minus type parameters). A compiled body cannot resolve these at compile time
+    /// — the AST reads them from the active specialization — so any bare
+    /// read bails to AST (all-or-nothing OFF-parity).
+    fn class_value_param_names(&self, cname: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let cd = match self.module.classes.get(cname) {
+            Some(cd) => cd,
+            None => return out,
+        };
+        for p in cd.param_order.iter() {
+            if !cd.type_param_names.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        out
+    }
     fn class_scoping_shadow_names(&self, cname: &str) -> HashSet<String> {
         let mut names = HashSet::default();
         let mut seen = HashSet::default();
@@ -118020,6 +118082,7 @@ impl Simulator {
                 let mut static_members: HashSet<String> = HashSet::default();
                 let mut const_names: HashSet<String> = HashSet::default();
                 let mut instance_props: HashSet<String> = HashSet::default();
+                let mut spec_scoped: HashSet<String> = HashSet::default();
                 {
                     let mut cur = Some(cname.to_string());
                     let mut guard = 0;
@@ -118050,6 +118113,15 @@ impl Simulator {
                                     instance_props.insert(pn.clone());
                                 }
                             }
+                            // Step 9h: VALUE parameters of a PARAMETERIZED
+                            // chain class are specialization-scoped at run
+                            // time (ensure_spec_statics seeds them per sig);
+                            // a baked LoadClassStatic(class, name) would
+                            // read the default spec. Collect them here;
+                            // applied below.
+                            if self.class_is_parameterized(&cn) {
+                                spec_scoped.extend(self.class_value_param_names(&cn));
+                            }
                             cur = cd.extends.clone();
                         } else {
                             break;
@@ -118065,6 +118137,11 @@ impl Simulator {
                     for lp in const_names.iter() {
                         static_members.remove(lp);
                     }
+                }
+                for vpn in spec_scoped.iter() {
+                    static_members.remove(vpn);
+                    const_names.remove(vpn);
+                    shadow_names.insert(vpn.clone());
                 }
                 let mut bare_targets: HashMap<String, String> = HashMap::default();
                 for m in method_name_set.iter() {
@@ -118128,6 +118205,47 @@ impl Simulator {
                         }
                     }
                 }
+                // Step 9h: receiver names admitted for CLASS-SCOPE static
+                // calls `X.m(args)` — every elaborated class name, the
+                // declaring chain's typedef aliases and type parameters, and
+                // module typedef aliases whose target is a TypeReference
+                // (class-ish). Anything that could be a VARIABLE of the
+                // frame is excluded (chain members/shadows, signals); the
+                // compiler arm additionally excludes locals. Resolution
+                // itself stays runtime-owned.
+                let mut scope_static_receivers: HashSet<String> =
+                    self.module.classes.keys().cloned().collect();
+                {
+                    let mut cur = Some(cname.to_string());
+                    let mut guard = 0;
+                    while let Some(cn) = cur {
+                        guard += 1;
+                        if guard > 64 {
+                            break;
+                        }
+                        if let Some(cd) = self.module.classes.get(&cn) {
+                            scope_static_receivers.extend(cd.typedef_targets.keys().cloned());
+                            scope_static_receivers
+                                .extend(cd.type_param_names.iter().cloned());
+                            cur = cd.extends.clone();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                for (tn, dt) in self.module.typedef_types.iter() {
+                    if matches!(
+                        dt,
+                        crate::ast::types::DataType::TypeReference { .. }
+                    ) {
+                        scope_static_receivers.insert(tn.clone());
+                    }
+                }
+                for nm in shadow_names.iter().chain(bare_members.iter()) {
+                    scope_static_receivers.remove(nm);
+                }
+                scope_static_receivers
+                    .retain(|n| !self.signal_name_to_id.contains_key(n.as_str()));
                 let compiled = {
                     let mut compiler = BytecodeCompiler::new(
                         &self.signal_name_to_id,
@@ -118150,6 +118268,7 @@ impl Simulator {
                                 &static_members,
                                 &const_names,
                                 &new_type_map,
+                                &scope_static_receivers,
                                 cname,
                                 &handle_member_types,
                                 &shadow_names,
@@ -118171,6 +118290,7 @@ impl Simulator {
                             );
                     compiler_outcome
                 };
+
                 // Step 9e: a STATIC method's frame has NO `this` — its
                 // register 0 is a null seed. Any instruction that lowers
                 // through the receiver (`CallMethod`/`CallCollMethod` on
@@ -118255,7 +118375,12 @@ impl Simulator {
         // return local — the interpreter seeded it before entry and its
         // epilogue reads it back (`return_value.or(implicit)`), so a body
         // that never writes the cell returns the identical value.
-        if pre.is_void_result {
+        // class-perf Step 9h: a CLASS-HANDLE result cell is seeded too —
+        // `$cast(funcname, obj)` fits its write against the destination
+        // cell's CURRENT width, and an unseeded reg (width 1) truncated
+        // the handle to its low bit (uvm_sequence_base::create_item
+        // returned null under the gate).
+        if pre.is_void_result || pre.is_class_result {
             let reg = result_reg as usize;
             if reg < block.num_regs as usize {
                 self.vm_regs[reg] = frame
@@ -118291,6 +118416,23 @@ impl Simulator {
                         );
                     }
                 }
+            }
+        }
+        // class-perf Step 9h: register the implicit fn-return local's
+        // CLASS type, exactly as the interpreter's binding site does
+        // (`record_local_class_type` + `var_class_types` for a
+        // TypeReference return). Without it a `$cast(funcname, obj)`
+        // inside a compiled body (uvm_sequence_base::create_item) fails
+        // its runtime type check and nulls the return — `new_report_message`-
+        // style implicit returns and bare-`new()` returns keep working too.
+        if !pre.fn_ret_name.is_empty()
+            && let crate::ast::types::DataType::TypeReference { name, .. } = &*pre.return_type
+        {
+            let cn = name.name.name.clone();
+            if self.module.classes.contains_key(&cn) {
+                let rn = pre.fn_ret_name.clone();
+                self.record_local_class_type(&rn, &cn);
+                self.var_class_types.insert(rn, cn);
             }
         }
         // Run the block.

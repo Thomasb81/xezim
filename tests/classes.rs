@@ -79,6 +79,9 @@ mod compiled_method_void;
 #[path = "classes/compiled_method_super.rs"]
 mod compiled_method_super;
 #[path = "classes/compiled_method_statics.rs"]
+#[path = "classes/compiled_method_static_scope.rs"]
+mod compiled_method_static_scope;
+#[path = "classes/compiled_method_statics.rs"]
 mod compiled_method_statics;
 #[path = "classes/compiled_method_cast.rs"]
 mod compiled_method_cast;
