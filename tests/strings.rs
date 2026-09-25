@@ -59,6 +59,8 @@ mod p_format_assoc;
 mod p_format_named;
 #[path = "strings/p_format_recursive.rs"]
 mod p_format_recursive;
+#[path = "strings/p_format_string_parameter.rs"]
+mod p_format_string_parameter;
 #[path = "strings/percent_p_string_values.rs"]
 mod percent_p_string_values;
 #[path = "strings/ref_arg_assoc_writeback.rs"]
