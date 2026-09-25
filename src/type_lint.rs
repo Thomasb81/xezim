@@ -29,6 +29,8 @@
 //!   zero-count replication stands only beside a sized operand of a
 //!   concatenation; a concatenation takes no real operand. §6.24.1: a casting
 //!   size is positive; `$signed`/`$unsigned` take an integral argument.
+//! - §26.6: `export P::n` exports a name the package imported from `P` and
+//!   does not declare itself.
 //!
 //! The same rules apply to declaration initializers, `return` values and
 //! subroutine input arguments, which are assignments too (§13.5).
@@ -2840,6 +2842,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             }
             SourceDefinition::Package(p) => {
                 ck = Ck::new(env(), elab, &p.name.name);
+                check_package_exports(&mut ck, &p.items);
                 ck.default_auto = p.lifetime == Some(Lifetime::Automatic);
                 ck.push();
                 declare_package_items(&mut ck, &p.items);
@@ -3071,4 +3074,84 @@ fn has_select(e: &Expression) -> bool {
         ExprKind::Paren(x) => has_select(x),
         _ => false,
     }
+}
+
+/// §26.6: `export P::n` needs `n` imported from `P` (by name, or by a
+/// wildcard import of `P`) and not declared in this package.
+fn check_package_exports(ck: &mut Ck<'_>, items: &[PackageItem]) {
+    let local: HashSet<String> = local_package_names(items);
+    let mut imported: Vec<(&str, Option<&str>)> = Vec::new();
+    for it in items {
+        if let PackageItem::Import(imp) = it {
+            for i in &imp.items {
+                imported.push((
+                    i.package.name.as_str(),
+                    i.item.as_ref().map(|n| n.name.as_str()),
+                ));
+            }
+        }
+    }
+    for it in items {
+        let PackageItem::Export(exp) = it else {
+            continue;
+        };
+        for e in &exp.items {
+            let Some(n) = &e.item else {
+                continue;
+            };
+            let pkg = e.package.name.as_str();
+            if pkg == "*" || n.name == "*" {
+                continue;
+            }
+            let why = if local.contains(&n.name) {
+                "is declared in this package"
+            } else if !imported
+                .iter()
+                .any(|(p, i)| *p == pkg && i.is_none_or(|i| i == n.name))
+            {
+                "was not imported"
+            } else {
+                continue;
+            };
+            ck.report(
+                n.span,
+                format!(
+                    "cannot export {pkg}::{}: the name {why} (IEEE 1800-2017 §26.6)",
+                    n.name
+                ),
+            );
+        }
+    }
+}
+
+/// Names a package declares itself (not the ones it imports).
+fn local_package_names(items: &[PackageItem]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for it in items {
+        match it {
+            PackageItem::Parameter(pd) => match &pd.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    out.extend(assignments.iter().map(|a| a.name.name.clone()))
+                }
+                ParameterKind::Type { assignments } => {
+                    out.extend(assignments.iter().map(|a| a.name.name.clone()))
+                }
+            },
+            PackageItem::Typedef(td) => {
+                out.insert(td.name.name.clone());
+            }
+            PackageItem::Function(f) => {
+                out.insert(f.name.name.name.clone());
+            }
+            PackageItem::Task(t) => {
+                out.insert(t.name.name.name.clone());
+            }
+            PackageItem::Data(d) => out.extend(d.declarators.iter().map(|dc| dc.name.name.clone())),
+            PackageItem::Class(c) => {
+                out.insert(c.name.name.clone());
+            }
+            _ => {}
+        }
+    }
+    out
 }
