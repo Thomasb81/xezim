@@ -16,6 +16,9 @@
 //! - A declaration's range, a parameter's value, a part-select's bounds and
 //!   the selects of a continuous-assignment target are constant expressions
 //!   (§6.20, §7.4, §11.5.1, §10.3): they cannot read a variable or a net.
+//! - §6.21: an automatic variable is not written by a nonblocking assignment
+//!   and not used in a procedural continuous assignment, whose target is a
+//!   whole variable (§10.6.1).
 //!
 //! The same rules apply to declaration initializers, `return` values and
 //! subroutine input arguments, which are assignments too (§13.5).
@@ -39,7 +42,7 @@ use xezim_core::ast::expr::{
     BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral, RangeKind, UnaryOp,
 };
 use xezim_core::ast::module::PortList;
-use xezim_core::ast::stmt::{ForInit, Statement, StatementKind};
+use xezim_core::ast::stmt::{ForInit, ProceduralContinuous, Statement, StatementKind};
 use xezim_core::ast::types::{
     DataType, EnumType, IntegerAtomType, IntegerVectorType, Lifetime, PackedDimension,
     PortDirection, RealType, Signing, SimpleType, UnpackedDimension,
@@ -259,6 +262,8 @@ struct Scope {
     /// Variables, nets and ports — unlike parameters, genvars and enum
     /// members, never part of a constant expression.
     nonconst: HashSet<String>,
+    /// Automatic variables (§6.21).
+    autos: HashSet<String>,
     /// Block-level `static` declarations, which may be `localparam`s (the
     /// parser gives both one shape): neither constant nor variable here.
     unsure: HashSet<String>,
@@ -299,6 +304,10 @@ struct Ck<'a> {
     stack: Vec<Layer<'a>>,
     cur_class: Option<String>,
     ret: Option<Ty>,
+    /// Inside an automatic task or function (§6.21).
+    auto_ctx: bool,
+    /// The definition is declared `automatic`.
+    default_auto: bool,
     errs: Vec<String>,
 }
 
@@ -315,6 +324,8 @@ impl<'a> Ck<'a> {
             stack,
             cur_class: None,
             ret: None,
+            auto_ctx: false,
+            default_auto: false,
             errs: Vec::new(),
         }
     }
@@ -1391,6 +1402,84 @@ impl<'a> Ck<'a> {
         top.unsure.insert(name.to_string());
     }
 
+    fn mark_auto(&mut self, name: &str) {
+        self.top().autos.insert(name.to_string());
+    }
+
+    fn is_auto(&self, n: &str) -> bool {
+        for l in self.stack.iter().rev() {
+            let s = l.get();
+            if s.vars.contains_key(n) {
+                return s.autos.contains(n);
+            }
+            if s.opaque {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// §6.21: an automatic variable is not written by a nonblocking
+    /// assignment.
+    fn check_nba_target(&mut self, lv: &Expression) {
+        if let ExprKind::Ident(h) = &lv.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+            && self.is_auto(&h.path[0].name.name)
+        {
+            self.report(
+                lv.span,
+                format!(
+                    "automatic variable '{}' cannot be written by a nonblocking assignment \
+                     (IEEE 1800-2017 §6.21)",
+                    h.path[0].name.name
+                ),
+            );
+        }
+    }
+
+    /// §10.6: `assign` / `force` inside a procedure. The `assign` target is a
+    /// whole variable (§10.6.1), and neither side reads an automatic variable.
+    fn check_proc_continuous(&mut self, pc: &ProceduralContinuous) {
+        let (lv, rv) = match pc {
+            ProceduralContinuous::Assign { lvalue, rvalue } => {
+                if has_select(lvalue) {
+                    self.report(
+                        lvalue.span,
+                        "a procedural assign target must be a whole variable, not a bit-, \
+                         part- or element-select (IEEE 1800-2017 §10.6.1)"
+                            .into(),
+                    );
+                }
+                (lvalue, rvalue)
+            }
+            ProceduralContinuous::Force { lvalue, rvalue } => (lvalue, rvalue),
+            _ => return,
+        };
+        let mut autos: Vec<(String, Span)> = Vec::new();
+        for e in [lv, rv] {
+            visit_expr(e, &mut |x| {
+                if let ExprKind::Ident(h) = &x.kind
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && self.is_auto(&h.path[0].name.name)
+                {
+                    autos.push((h.path[0].name.name.clone(), x.span));
+                }
+            });
+        }
+        if let Some((n, span)) = autos.into_iter().next() {
+            self.report(
+                span,
+                format!(
+                    "automatic variable '{n}' cannot be used in a procedural continuous \
+                     assignment (IEEE 1800-2017 §10.6)"
+                ),
+            );
+        }
+    }
+
     /// Is a simple name a variable, net or port (not a constant)?
     fn is_nonconst(&self, n: &str) -> bool {
         for l in self.stack.iter().rev() {
@@ -1569,9 +1658,13 @@ impl<'a> Ck<'a> {
                 self.check_const_selects(e);
                 self.walk_value(e, false)
             }
-            StatementKind::BlockingAssign { lvalue, rvalue }
-            | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+            StatementKind::BlockingAssign { lvalue, rvalue } => {
                 self.walk_expr(rvalue);
+                self.check_assign(lvalue, rvalue);
+            }
+            StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                self.walk_expr(rvalue);
+                self.check_nba_target(lvalue);
                 self.check_assign(lvalue, rvalue);
             }
             StatementKind::If {
@@ -1607,6 +1700,7 @@ impl<'a> Ck<'a> {
                             init,
                         } => {
                             let t = self.declare_var(data_type, &name.name, &[]);
+                            self.mark_auto(&name.name);
                             self.check_value(&t, init, &format!("'{}'", name.name));
                         }
                         ForInit::Assign { lvalue, rvalue } => self.check_assign(lvalue, rvalue),
@@ -1625,6 +1719,7 @@ impl<'a> Ck<'a> {
                 self.push();
                 for v in vars.iter().flatten() {
                     self.declare_value(&v.name, Ty::Unknown);
+                    self.mark_auto(&v.name);
                 }
                 self.walk_stmt(body);
                 self.pop();
@@ -1650,6 +1745,11 @@ impl<'a> Ck<'a> {
                 declarators,
                 lifetime,
             } => {
+                let auto = match lifetime {
+                    Some(Lifetime::Automatic) => true,
+                    Some(Lifetime::Static) => false,
+                    None => self.auto_ctx,
+                };
                 let t = self.resolve(data_type);
                 for d in declarators {
                     self.check_const_dims(&d.name.name, data_type, &d.dimensions);
@@ -1665,9 +1765,13 @@ impl<'a> Ck<'a> {
                     } else {
                         self.declare_value(&d.name.name, vt);
                     }
+                    if auto {
+                        self.mark_auto(&d.name.name);
+                    }
                 }
             }
             StatementKind::Typedef(td) => self.declare_typedef(td),
+            StatementKind::ProceduralContinuous(pc) => self.check_proc_continuous(pc),
             StatementKind::Return(Some(e)) => {
                 self.walk_expr(e);
                 if let Some(rt) = self.ret.clone() {
@@ -1687,6 +1791,9 @@ impl<'a> Ck<'a> {
         for p in ports {
             self.check_const_dims(&p.name.name, &p.data_type, &p.dimensions);
             let t = self.declare_var(&p.data_type, &p.name.name, &p.dimensions);
+            if self.auto_ctx {
+                self.mark_auto(&p.name.name);
+            }
             if let Some(d) = &p.default {
                 self.check_value(&t, d, &format!("'{}'", p.name.name));
             }
@@ -1698,7 +1805,18 @@ impl<'a> Ck<'a> {
         }
     }
 
+    /// §6.21: class methods, and subroutines of an `automatic` definition,
+    /// default to automatic.
+    fn subroutine_is_auto(&self, lifetime: Option<Lifetime>) -> bool {
+        match lifetime {
+            Some(l) => l == Lifetime::Automatic,
+            None => self.cur_class.is_some() || self.default_auto,
+        }
+    }
+
     fn walk_function(&mut self, f: &FunctionDeclaration) {
+        let saved_auto = self.auto_ctx;
+        self.auto_ctx = self.subroutine_is_auto(f.lifetime);
         self.push();
         self.check_const_dims(&f.name.name.name, &f.return_type, &[]);
         let rt = self.resolve(&f.return_type);
@@ -1706,6 +1824,9 @@ impl<'a> Ck<'a> {
         // §13.4.1: the function name is a variable of the return type.
         if rt != Ty::Void {
             self.declare_value(&f.name.name.name, rt.clone());
+            if self.auto_ctx {
+                self.mark_auto(&f.name.name.name);
+            }
         }
         let saved = self
             .ret
@@ -1715,9 +1836,12 @@ impl<'a> Ck<'a> {
         }
         self.ret = saved;
         self.pop();
+        self.auto_ctx = saved_auto;
     }
 
     fn walk_task(&mut self, t: &TaskDeclaration) {
+        let saved_auto = self.auto_ctx;
+        self.auto_ctx = self.subroutine_is_auto(t.lifetime);
         self.push();
         self.walk_ports(&t.ports);
         let saved = self.ret.take();
@@ -1726,6 +1850,7 @@ impl<'a> Ck<'a> {
         }
         self.ret = saved;
         self.pop();
+        self.auto_ctx = saved_auto;
     }
 
     fn walk_class(&mut self, c: &ClassDeclaration) {
@@ -2150,6 +2275,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         match d {
             SourceDefinition::Module(m) => {
                 ck = Ck::new(env(), elab, &m.name.name);
+                ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
@@ -2164,6 +2290,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             }
             SourceDefinition::Interface(m) => {
                 ck = Ck::new(env(), elab, &m.name.name);
+                ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
@@ -2178,6 +2305,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             }
             SourceDefinition::Program(m) => {
                 ck = Ck::new(env(), elab, &m.name.name);
+                ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
@@ -2192,6 +2320,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             }
             SourceDefinition::Package(p) => {
                 ck = Ck::new(env(), elab, &p.name.name);
+                ck.default_auto = p.lifetime == Some(Lifetime::Automatic);
                 ck.push();
                 declare_package_items(&mut ck, &p.items);
                 for it in &p.items {
@@ -2405,5 +2534,16 @@ fn visit_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
             }
         }
         _ => {}
+    }
+}
+
+/// A bit-, part- or element-select anywhere in an lvalue.
+fn has_select(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => true,
+        ExprKind::Ident(h) => h.path.iter().any(|s| !s.selects.is_empty()),
+        ExprKind::Concatenation(xs) => xs.iter().any(has_select),
+        ExprKind::Paren(x) => has_select(x),
+        _ => false,
     }
 }

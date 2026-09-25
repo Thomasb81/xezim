@@ -27,6 +27,8 @@ mod assoc_class_new_stores_instance;
 mod audit_round46_finds;
 #[path = "misc/audit_sibling_fixes.rs"]
 mod audit_sibling_fixes;
+#[path = "misc/automatic_and_procedural_assign.rs"]
+mod automatic_and_procedural_assign;
 #[path = "misc/bare_method_call_returns.rs"]
 mod bare_method_call_returns;
 #[path = "misc/bare_randomize_solver.rs"]
