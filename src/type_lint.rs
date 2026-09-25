@@ -40,8 +40,8 @@
 //! name, a cast, a parameterized class, a class whose base is not visible —
 //! is `Unknown` and never produces an error.
 
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use xezim_core::hasher::{HashMap, HashSet};
 
 use xezim_core::SourceDefinition;
 use xezim_core::ast::Span;
@@ -220,14 +220,17 @@ fn unpacked_dim(d: &UnpackedDimension) -> Dim {
 fn lit_i64(e: &Expression) -> Option<i64> {
     match &e.kind {
         ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
-            let v = value.replace('_', "");
             let radix = match base {
                 NumberBase::Decimal => 10,
                 NumberBase::Binary => 2,
                 NumberBase::Octal => 8,
                 NumberBase::Hex => 16,
             };
-            i64::from_str_radix(&v, radix).ok()
+            if value.contains('_') {
+                i64::from_str_radix(&value.replace('_', ""), radix).ok()
+            } else {
+                i64::from_str_radix(value, radix).ok()
+            }
         }
         ExprKind::Paren(i) => lit_i64(i),
         ExprKind::Unary {
@@ -368,7 +371,7 @@ impl<'a> Ck<'a> {
             ret: None,
             auto_ctx: false,
             default_auto: false,
-            seen: HashSet::new(),
+            seen: HashSet::default(),
             params_fixed: false,
             gen_depth: 0,
             errs: Vec::new(),
@@ -819,7 +822,7 @@ impl<'a> Ck<'a> {
     /// A non-ANSI port redeclared in the body (`input [31:0] x; T x;`) has
     /// the redeclaration's type.
     fn port_sigs(&mut self, ports: &[FunctionPort], body: &[Statement]) -> Vec<PortSig> {
-        let mut redecl: HashMap<&str, (&DataType, &[UnpackedDimension])> = HashMap::new();
+        let mut redecl: HashMap<&str, (&DataType, &[UnpackedDimension])> = HashMap::default();
         for s in body {
             if let StatementKind::VarDecl {
                 data_type,
@@ -956,8 +959,8 @@ impl<'a> Ck<'a> {
                 _ => {}
             }
         }
-        let mut props = HashMap::new();
-        let mut methods = HashMap::new();
+        let mut props = HashMap::default();
+        let mut methods = HashMap::default();
         for it in &c.items {
             match it {
                 ClassItem::Property(p) => {
@@ -1356,8 +1359,9 @@ impl<'a> Ck<'a> {
         });
     }
 
-    /// `target = rhs` where `target` has type `lt`; `what` names the target.
-    fn check_value(&mut self, lt: &Ty, rhs: &Expression, what: &str) {
+    /// `target = rhs` where `target` has type `lt`; `what` names the target
+    /// (built only for a report).
+    fn check_value(&mut self, lt: &Ty, rhs: &Expression, what: impl FnOnce() -> String) {
         if is_new_call(rhs) {
             // `new(args)` and `new[n](init)` share one AST shape; only the
             // bare `new` is certainly a class constructor.
@@ -1371,6 +1375,7 @@ impl<'a> Ck<'a> {
                         | Ty::Unpacked { .. }
                 )
             {
+                let what = what();
                 self.report(
                     rhs.span,
                     format!(
@@ -1388,6 +1393,7 @@ impl<'a> Ck<'a> {
             None => self.ty_of(rhs),
         };
         if let Some(why) = self.incompatible(lt, &rt) {
+            let what = what();
             self.report(
                 rhs.span,
                 format!(
@@ -1478,8 +1484,7 @@ impl<'a> Ck<'a> {
         if lt == Ty::Unknown {
             return;
         }
-        let what = format!("'{}'", expr_name(lv));
-        self.check_value(&lt, rv, &what);
+        self.check_value(&lt, rv, || format!("'{}'", expr_name(lv)));
     }
 
     /// §13.5: argument binding — too many or unbound arguments, and an input
@@ -1520,8 +1525,7 @@ impl<'a> Ck<'a> {
             bound[i] = true;
             if p.dir == PortDirection::Input {
                 let t = p.ty.clone();
-                let what = format!("argument '{}' of '{name}'", p.name);
-                self.check_value(&t, e, &what);
+                self.check_value(&t, e, || format!("argument '{}' of '{name}'", p.name));
             }
         }
         if let Some(p) = sig
@@ -1846,8 +1850,9 @@ impl<'a> Ck<'a> {
         }
     }
 
-    fn report_nonconst(&mut self, e: &Expression, what: &str, section: &str) {
+    fn report_nonconst(&mut self, e: &Expression, what: &dyn Fn() -> String, section: &str) {
         if let Some((n, span)) = self.first_nonconst(e) {
+            let what = what();
             self.report(
                 span,
                 format!(
@@ -1866,7 +1871,7 @@ impl<'a> Ck<'a> {
             | DataType::TypeReference { dimensions, .. } => dimensions,
             _ => &[],
         };
-        let what = format!("the range of '{name}'");
+        let what = || format!("the range of '{name}'");
         for d in packed {
             if let PackedDimension::Range { left, right, .. } = d {
                 self.report_nonconst(left, &what, "§6.9.1");
@@ -1891,7 +1896,7 @@ impl<'a> Ck<'a> {
         if let ParameterKind::Data { assignments, .. } = &pd.kind {
             for a in assignments {
                 if let Some(init) = &a.init {
-                    let what = format!("the value of parameter '{}'", a.name.name);
+                    let what = || format!("the value of parameter '{}'", a.name.name);
                     self.report_nonconst(init, &what, "§6.20");
                     self.check_operands(init);
                 }
@@ -2090,7 +2095,7 @@ impl<'a> Ck<'a> {
     /// are constant expressions — of a packed value; a queue slice `q[a:b]`
     /// takes variable bounds (§7.10.1).
     fn check_const_selects(&mut self, e: &Expression) {
-        let mut found: Vec<(Expression, &'static str)> = Vec::new();
+        let mut found: Vec<(&Expression, &'static str)> = Vec::new();
         visit_expr(e, &mut |x| {
             let ExprKind::RangeSelect {
                 expr,
@@ -2105,14 +2110,14 @@ impl<'a> Ck<'a> {
                 return;
             }
             if *kind == RangeKind::Constant {
-                found.push(((**left).clone(), "a part-select bound"));
-                found.push(((**right).clone(), "a part-select bound"));
+                found.push((left, "a part-select bound"));
+                found.push((right, "a part-select bound"));
             } else {
-                found.push(((**right).clone(), "an indexed part-select width"));
+                found.push((right, "an indexed part-select width"));
             }
         });
         for (b, what) in found {
-            self.report_nonconst(&b, what, "§11.5.1");
+            self.report_nonconst(b, &|| what.to_string(), "§11.5.1");
         }
     }
 
@@ -2120,24 +2125,24 @@ impl<'a> Ck<'a> {
     /// constant expressions (a variable target is held to this too by the
     /// reference simulator).
     fn check_cont_lvalue(&mut self, lv: &Expression) {
-        let mut selects: Vec<Expression> = Vec::new();
+        let mut selects: Vec<&Expression> = Vec::new();
         let mut cur = lv;
         loop {
             match &cur.kind {
                 ExprKind::Index { expr, index } => {
-                    selects.push((**index).clone());
+                    selects.push(index);
                     cur = expr;
                 }
                 ExprKind::RangeSelect { expr, left, .. } => {
-                    selects.push((**left).clone());
+                    selects.push(left);
                     cur = expr;
                 }
                 ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
                     let n = &h.path[0].name.name;
-                    selects.extend(h.path[0].selects.iter().cloned());
+                    selects.extend(h.path[0].selects.iter());
+                    let what = || format!("a select of '{n}' in a continuous assignment target");
                     for sel in selects {
-                        let what = format!("a select of '{n}' in a continuous assignment target");
-                        self.report_nonconst(&sel, &what, "§10.3");
+                        self.report_nonconst(sel, &what, "§10.3");
                     }
                     return;
                 }
@@ -2201,7 +2206,7 @@ impl<'a> Ck<'a> {
                         } => {
                             let t = self.declare_var(data_type, &name.name, &[]);
                             self.mark_auto(&name.name);
-                            self.check_value(&t, init, &format!("'{}'", name.name));
+                            self.check_value(&t, init, || format!("'{}'", name.name));
                         }
                         ForInit::Assign { lvalue, rvalue } => self.check_assign(lvalue, rvalue),
                     }
@@ -2256,7 +2261,7 @@ impl<'a> Ck<'a> {
                     let vt = with_dims(t.clone(), &d.dimensions);
                     if let Some(init) = &d.init {
                         self.walk_expr(init);
-                        self.check_value(&vt, init, &format!("'{}'", d.name.name));
+                        self.check_value(&vt, init, || format!("'{}'", d.name.name));
                     }
                     // A block-level `localparam` parses as a `static`
                     // declaration, so such a name may be a constant.
@@ -2275,7 +2280,7 @@ impl<'a> Ck<'a> {
             StatementKind::Return(Some(e)) => {
                 self.walk_expr(e);
                 if let Some(rt) = self.ret.clone() {
-                    self.check_value(&rt, e, "the return value");
+                    self.check_value(&rt, e, || "the return value".to_string());
                 }
             }
             StatementKind::RandCase { items } => {
@@ -2295,7 +2300,7 @@ impl<'a> Ck<'a> {
                 self.mark_auto(&p.name.name);
             }
             if let Some(d) = &p.default {
-                self.check_value(&t, d, &format!("'{}'", p.name.name));
+                self.check_value(&t, d, || format!("'{}'", p.name.name));
             }
         }
         for (i, p) in ports.iter().enumerate() {
@@ -2390,7 +2395,7 @@ impl<'a> Ck<'a> {
                     for d in &p.declarators {
                         if let Some(init) = &d.init {
                             let vt = with_dims(t.clone(), &d.dimensions);
-                            self.check_value(&vt, init, &format!("'{}'", d.name.name));
+                            self.check_value(&vt, init, || format!("'{}'", d.name.name));
                         }
                     }
                 }
@@ -2417,7 +2422,7 @@ impl<'a> Ck<'a> {
                         if let Some(init) = &dc.init {
                             let vt = with_dims(t.clone(), &dc.dimensions);
                             self.walk_expr(init);
-                            self.check_value(&vt, init, &format!("'{}'", dc.name.name));
+                            self.check_value(&vt, init, || format!("'{}'", dc.name.name));
                         }
                     }
                 }
@@ -2428,7 +2433,7 @@ impl<'a> Ck<'a> {
                         if let Some(init) = &dc.init {
                             let vt = with_dims(t.clone(), &dc.dimensions);
                             self.walk_expr(init);
-                            self.check_value(&vt, init, &format!("'{}'", dc.name.name));
+                            self.check_value(&vt, init, || format!("'{}'", dc.name.name));
                         }
                     }
                 }
@@ -2607,7 +2612,7 @@ fn dpi_name(d: &xezim_core::ast::decl::DPIImport) -> Option<String> {
 /// Run the checks over every definition; returns the error messages.
 pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String> {
     // Phase 0: class names (a name declared twice is ambiguous and ignored).
-    let mut class_names: HashMap<String, usize> = HashMap::new();
+    let mut class_names: HashMap<String, usize> = HashMap::default();
     fn count_items(items: &[ModuleItem], out: &mut HashMap<String, usize>) {
         for it in items {
             match it {
@@ -2660,8 +2665,8 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         .collect();
 
     // Phase 1: package scopes (twice, so a package sees the ones it imports).
-    let no_classes: HashMap<String, Option<Rc<ClassInfo>>> = HashMap::new();
-    let empty_pkgs: HashMap<String, Scope> = HashMap::new();
+    let no_classes: HashMap<String, Option<Rc<ClassInfo>>> = HashMap::default();
+    let empty_pkgs: HashMap<String, Scope> = HashMap::default();
     let mut unit = Scope::default();
     {
         let env = Env {
@@ -2680,9 +2685,9 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         }
         unit = ck.pop();
     }
-    let mut packages: HashMap<String, Scope> = HashMap::new();
+    let mut packages: HashMap<String, Scope> = HashMap::default();
     for _pass in 0..2 {
-        let mut next: HashMap<String, Scope> = HashMap::new();
+        let mut next: HashMap<String, Scope> = HashMap::default();
         for d in defs {
             if let SourceDefinition::Package(p) = d {
                 let env = Env {
@@ -2702,7 +2707,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
     }
 
     // Phase 2: class declarations, resolved in the scope that declares them.
-    let mut classes: HashMap<String, Option<Rc<ClassInfo>>> = HashMap::new();
+    let mut classes: HashMap<String, Option<Rc<ClassInfo>>> = HashMap::default();
     {
         let env = || Env {
             class_names: &class_names,
@@ -2766,7 +2771,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
     }
 
     // Modules something instantiates (their parameters may be overridden).
-    let mut instantiated: HashSet<String> = HashSet::new();
+    let mut instantiated: HashSet<String> = HashSet::default();
     fn instances(items: &[ModuleItem], out: &mut HashSet<String>) {
         for it in items {
             match it {
@@ -2946,7 +2951,7 @@ fn class_infos_items(ck: &mut Ck<'_>, items: &[ModuleItem], out: &mut Vec<(Strin
 /// Every name package items declare (None when the package re-exports or
 /// holds an item this pass does not model).
 fn package_member_names(items: &[PackageItem]) -> Option<HashSet<String>> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     let mut ranged = false;
     let mut enum_members = |dt: &DataType, out: &mut HashSet<String>| {
         if let DataType::Enum(et) = dt {
@@ -3015,7 +3020,7 @@ fn package_member_names(items: &[PackageItem]) -> Option<HashSet<String>> {
 }
 
 /// Call `f` on `e` and every sub-expression of it.
-fn visit_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
+fn visit_expr<'e>(e: &'e Expression, f: &mut dyn FnMut(&'e Expression)) {
     f(e);
     match &e.kind {
         ExprKind::Unary { operand, .. } => visit_expr(operand, f),
@@ -3139,7 +3144,7 @@ fn check_package_exports(ck: &mut Ck<'_>, items: &[PackageItem]) {
 
 /// Names a package declares itself (not the ones it imports).
 fn local_package_names(items: &[PackageItem]) -> HashSet<String> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     for it in items {
         match it {
             PackageItem::Parameter(pd) => match &pd.kind {
