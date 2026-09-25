@@ -191,6 +191,8 @@ mod param_class_cast_type_args;
 mod param_pair_this_type_cast;
 #[path = "misc/parameter_override_legality.rs"]
 mod parameter_override_legality;
+#[path = "misc/parameter_port_keyword.rs"]
+mod parameter_port_keyword;
 #[path = "misc/parser_gaps2.rs"]
 mod parser_gaps2;
 #[path = "misc/parser_stmt_gaps.rs"]
