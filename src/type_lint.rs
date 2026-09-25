@@ -231,6 +231,7 @@ struct PortSig {
     name: String,
     dir: PortDirection,
     ty: Ty,
+    has_default: bool,
 }
 
 struct ClassInfo {
@@ -590,6 +591,7 @@ impl<'a> Ck<'a> {
                     name: p.name.name.clone(),
                     dir: p.direction,
                     ty: with_dims(t, dims),
+                    has_default: p.default.is_some(),
                 }
             })
             .collect()
@@ -1119,8 +1121,11 @@ impl<'a> Ck<'a> {
 
     /// §13.5: argument binding — too many or unbound arguments, and an input
     /// argument is an assignment to its formal.
-    /// §13.5: an input argument is an assignment to its formal.
-    fn check_call(&mut self, name: &str, sig: &Sig, args: &[Expression]) {
+    /// §13.5: argument binding — an argument past the last formal, or a
+    /// formal left without an actual and without a default, is an error; an
+    /// input argument is an assignment to its formal.
+    fn check_call(&mut self, name: &str, sig: &Sig, args: &[Expression], span: Span) {
+        let mut bound = vec![false; sig.ports.len()];
         let mut pos = 0usize;
         for a in args {
             let (i, e) = match &a.kind {
@@ -1136,16 +1141,40 @@ impl<'a> Ck<'a> {
                 }
             };
             let Some(p) = sig.ports.get(i) else {
+                self.report(
+                    span,
+                    format!(
+                        "too many arguments to '{name}': it has {} formal argument(s) \
+                         (IEEE 1800-2017 §13.5)",
+                        sig.ports.len()
+                    ),
+                );
                 return;
             };
-            if let Some(e) = e
-                && !matches!(e.kind, ExprKind::Empty)
-                && p.dir == PortDirection::Input
-            {
+            let Some(e) = e.filter(|e| !matches!(e.kind, ExprKind::Empty)) else {
+                continue;
+            };
+            bound[i] = true;
+            if p.dir == PortDirection::Input {
                 let t = p.ty.clone();
                 let what = format!("argument '{}' of '{name}'", p.name);
                 self.check_value(&t, e, &what);
             }
+        }
+        if let Some(p) = sig
+            .ports
+            .iter()
+            .zip(&bound)
+            .find_map(|(p, b)| (!b && !p.has_default).then_some(p))
+        {
+            self.report(
+                span,
+                format!(
+                    "no actual argument for formal '{}' of '{name}', which has no default \
+                     (IEEE 1800-2017 §13.5)",
+                    p.name
+                ),
+            );
         }
     }
 
@@ -1165,7 +1194,7 @@ impl<'a> Ck<'a> {
                         if n != "new"
                             && let Some(sig) = self.lookup_sub(n)
                         {
-                            self.check_call(n, &sig, args);
+                            self.check_call(n, &sig, args, e.span);
                         }
                     }
                     ExprKind::MemberAccess { expr, member } => {
@@ -1173,7 +1202,7 @@ impl<'a> Ck<'a> {
                         if let Ty::Class(c) = self.ty_of(expr)
                             && let Some(sig) = self.class_method(&c, &member.name)
                         {
-                            self.check_call(&member.name, &sig, args);
+                            self.check_call(&member.name, &sig, args, e.span);
                         }
                     }
                     _ => {}

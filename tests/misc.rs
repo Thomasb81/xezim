@@ -13,6 +13,8 @@
 
 #[path = "misc/always_timing_lint_forms.rs"]
 mod always_timing_lint_forms;
+#[path = "misc/argument_binding.rs"]
+mod argument_binding;
 #[path = "misc/artifact_compression_modes.rs"]
 mod artifact_compression_modes;
 #[path = "misc/assign_z_passthrough.rs"]
