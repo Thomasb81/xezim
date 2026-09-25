@@ -13,6 +13,8 @@
 
 #[path = "gates/assign_pattern_aggregate.rs"]
 mod assign_pattern_aggregate;
+#[path = "gates/bare_gate_delay_value.rs"]
+mod bare_gate_delay_value;
 #[path = "gates/const_cont_assign_time0_seed.rs"]
 mod const_cont_assign_time0_seed;
 #[path = "gates/cont_assign_packed2d_unit_inner.rs"]
