@@ -5046,10 +5046,10 @@ pub struct Simulator {
     /// used for a transition to z. Empty unless some assign used the
     /// three-delay form.
     gate_off_delay_by_id: HashMap<usize, u64>,
-    /// `(declaring_class, property)` → does this property's packed range
+    /// Declaring class → property → does this property's packed range
     /// depend on a parameter? `fit_class_prop` runs on every property store,
     /// so the common answer (`false`) is memoized to one hash lookup.
-    spec_prop_is_dyn: std::cell::RefCell<HashMap<(String, String), bool>>,
+    spec_prop_is_dyn: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
     /// Memo for `respec_packed_width`: `(declaring_class, property,
     /// parameter-binding fingerprint)` → re-resolved width, so the packed
     /// range is const-eval'd once per specialization instead of per store.
@@ -5875,6 +5875,9 @@ pub struct Simulator {
     struct_capable_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// See `class_member_names`.
     class_member_names_cell: std::cell::OnceCell<ClassMemberNames>,
+    /// See `nonvirtual_target_class`.
+    #[allow(clippy::type_complexity)]
+    nonvirtual_target_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
     /// See `member_string_keyed_unbound`.
     #[allow(clippy::type_complexity)]
     string_keyed_member_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<bool>>>>,
@@ -9895,6 +9898,7 @@ impl Simulator {
             class_member_names_cell: std::cell::OnceCell::new(),
             method_def_cache: std::cell::RefCell::new(HashMap::default()),
             string_keyed_member_cache: std::cell::RefCell::new(HashMap::default()),
+            nonvirtual_target_cache: std::cell::RefCell::new(HashMap::default()),
             covergroup_leaf_names: std::cell::OnceCell::new(),
             class_string_props: std::cell::RefCell::new(HashMap::default()),
             class_enclosing_cache: std::cell::RefCell::new(HashMap::default()),
@@ -96710,13 +96714,24 @@ impl Simulator {
     /// table, which is not reachable here, so they keep the elaborated width
     /// rather than risk a wrong one.
     fn respec_packed_width(&self, decl_class: &str, handle: usize, prop: &str) -> Option<u32> {
-        let dyn_key = (decl_class.to_string(), prop.to_string());
         // Fast reject for the overwhelmingly common case (no dimensions, or a
-        // literal range that already elaborated correctly): one hash lookup.
-        let known = self.spec_prop_is_dyn.borrow().get(&dyn_key).copied();
+        // literal range that already elaborated correctly): a borrowed lookup.
+        let known = self
+            .spec_prop_is_dyn
+            .borrow()
+            .get(decl_class)
+            .and_then(|m| m.get(prop))
+            .copied();
         if known == Some(false) {
             return None;
         }
+        let note = |v: bool| {
+            self.spec_prop_is_dyn
+                .borrow_mut()
+                .entry(decl_class.to_string())
+                .or_default()
+                .insert(prop.to_string(), v);
+        };
         let cd = self.module.classes.get(decl_class)?;
         let dt = cd.property_types.get(prop);
         let dims = match dt {
@@ -96725,7 +96740,7 @@ impl Simulator {
             }
             Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => dimensions,
             _ => {
-                self.spec_prop_is_dyn.borrow_mut().insert(dyn_key, false);
+                note(false);
                 return None;
             }
         };
@@ -96739,7 +96754,7 @@ impl Simulator {
                         if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
                             || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
                 });
-                self.spec_prop_is_dyn.borrow_mut().insert(dyn_key, v);
+                note(v);
                 v
             }
         };
@@ -96871,8 +96886,7 @@ impl Simulator {
     /// `box#(8)` each report their own width.
     fn heap_prop_width(&self, handle: usize, prop: &str) -> Option<u32> {
         let inst = self.heap.get(handle)?.as_ref()?;
-        let cn = inst.class_name.clone();
-        self.class_prop_width_impl(&cn, Some(handle), prop)
+        self.class_prop_width_impl(&inst.class_name, Some(handle), prop)
     }
 
     /// Clamp `val` to a class property's declared width. Values that already
@@ -100751,6 +100765,14 @@ impl Simulator {
     /// type. The second element holds the element indices when the path still
     /// names an unindexed unpacked array (so `%p` can print an element list).
     fn flat_path_type(&self, flat: &str) -> Option<(DataType, Option<Vec<i64>>)> {
+        // Without a select the first segment is the text before the first
+        // `.`; a base with no declared type answers None before any split.
+        if !flat.as_bytes().contains(&b'[') {
+            let base = flat.split('.').next().unwrap_or(flat);
+            if !self.module.var_decl_types.contains_key(base) {
+                return None;
+            }
+        }
         let segs = Self::split_flat_path(flat);
         let (base, base_idx) = segs.first()?.clone();
         // For an array (or associative array) this is already the ELEMENT type.
@@ -105218,20 +105240,26 @@ impl Simulator {
                     return Some(Some(raw.clone()));
                 }
                 // A DECLARED vif property of `this` with no binding: unbound.
-                if let Some(th) = self.this_stack.last().copied().flatten() {
+                if let Some(th) = self
+                    .this_stack
+                    .last()
+                    .copied()
+                    .flatten()
+                    .filter(|_| self.class_member_names().vif_props.contains(raw.as_str()))
+                {
                     let mut cur = self
                         .heap
                         .get(th)
                         .and_then(|o| o.as_ref())
-                        .map(|i| i.class_name.clone());
+                        .map(|i| i.class_name.as_str());
                     while let Some(cn) = cur {
-                        let Some(cd) = self.module.classes.get(&cn) else {
+                        let Some(cd) = self.module.classes.get(cn) else {
                             break;
                         };
                         if cd.virtual_iface_properties.contains_key(raw) {
                             return Some(None);
                         }
-                        cur = cd.extends.clone();
+                        cur = cd.extends.as_deref();
                     }
                 }
                 None
@@ -126969,10 +126997,29 @@ impl Simulator {
     /// pure — other machinery owns those), is a constructor, or the chain is
     /// not fully resolvable — all of which keep runtime dispatch.
     fn nonvirtual_target_class(&self, decl_cls: &str, m: &str) -> Option<String> {
-        use crate::ast::decl::{ClassMethodKind, ClassQualifier};
         if m == "new" {
             return None;
         }
+        // A function of the class tables alone: memoized per (class, method).
+        if let Some(hit) = self
+            .nonvirtual_target_cache
+            .borrow()
+            .get(decl_cls)
+            .and_then(|by_m| by_m.get(m))
+        {
+            return hit.clone();
+        }
+        let v = self.nonvirtual_target_class_walk(decl_cls, m);
+        self.nonvirtual_target_cache
+            .borrow_mut()
+            .entry(decl_cls.to_string())
+            .or_default()
+            .insert(m.to_string(), v.clone());
+        v
+    }
+
+    fn nonvirtual_target_class_walk(&self, decl_cls: &str, m: &str) -> Option<String> {
+        use crate::ast::decl::{ClassMethodKind, ClassQualifier};
         let mut target: Option<String> = None;
         let mut cur = Some(decl_cls.to_string());
         let mut guard = 0;
