@@ -65,6 +65,8 @@ mod const_chain_fold;
 mod constant_expression_contexts;
 #[path = "misc/cov_assertion_basic.rs"]
 mod cov_assertion_basic;
+#[path = "misc/defparam_local_targets.rs"]
+mod defparam_local_targets;
 #[path = "misc/delay_precision.rs"]
 mod delay_precision;
 #[path = "misc/dep_reg_entry_synth.rs"]
