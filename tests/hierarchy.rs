@@ -103,6 +103,8 @@ mod packed_record_output_chain;
 mod param_typedef_instance_isolation;
 #[path = "hierarchy/pct_m_block_scope.rs"]
 mod pct_m_block_scope;
+#[path = "hierarchy/percent_m_declaring_scope.rs"]
+mod percent_m_declaring_scope;
 #[path = "hierarchy/percent_m_module_init_scope.rs"]
 mod percent_m_module_init_scope;
 #[path = "hierarchy/percent_m_scope.rs"]

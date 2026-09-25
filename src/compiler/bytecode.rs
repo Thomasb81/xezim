@@ -867,6 +867,9 @@ pub struct BytecodeCompiler<'a> {
     /// failing compilation. Safe for edge blocks where the AST interpreter's
     /// statement path is the same one used by the non-compiled fallback.
     pub allow_ast_fallback: bool,
+    /// Named blocks enclosing the statement being compiled, outermost first.
+    /// A fallback that can print its scope runs inside them (`emit_fallback`).
+    m_labels: Vec<crate::ast::Identifier>,
     /// Hierarchical scope for resolving unqualified identifiers. An Ident
     /// with a bare local name (`mem_valid`) is first tried verbatim, then
     /// with this prefix applied (`testbench.mem_valid`).
@@ -1099,6 +1102,7 @@ impl<'a> BytecodeCompiler<'a> {
             widths,
             bail_reason: None,
             allow_ast_fallback: false,
+            m_labels: Vec::new(),
             scope_hint: None,
             allow_waits: false,
             wait_specs: Vec::new(),
@@ -2883,13 +2887,88 @@ impl<'a> BytecodeCompiler<'a> {
                 .bail_reason
                 .unwrap_or_else(|| Self::stmt_kind_label(stmt));
             self.trace_fallback_site(reason, stmt.span, "stmt");
+            // §21.2.1.7: the interpreter pushes a named block onto the `%m`
+            // chain only while it runs the block, so a scope-printing
+            // statement lifted out of one is re-wrapped in its names.
+            let mut body = stmt.clone();
+            if !self.m_labels.is_empty() && Self::stmt_names_scope(stmt) == Some(true) {
+                for n in self.m_labels.iter().rev() {
+                    body = Statement::new(
+                        StatementKind::SeqBlock {
+                            name: Some(n.clone()),
+                            stmts: vec![body],
+                        },
+                        stmt.span,
+                    );
+                }
+            }
             self.emit(Insn::StmtFallback(Box::new((
-                Arc::new(stmt.clone()),
+                Arc::new(body),
                 Arc::from(reason),
             ))));
             true
         } else {
             false
+        }
+    }
+
+    /// Can `stmt` print its own scope — a `%m`, a severity task's scope line
+    /// or an assertion report? `None` when it contains a `disable`, which a
+    /// synthetic named block around it could intercept.
+    fn stmt_names_scope(stmt: &Statement) -> Option<bool> {
+        fn expr(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::StringLiteral(s) => s.contains("%m") || s.contains("%M"),
+                ExprKind::SystemCall { name, args } => {
+                    matches!(name.as_str(), "$info" | "$warning" | "$error" | "$fatal")
+                        || args.iter().any(expr)
+                }
+                ExprKind::Call { args, .. } => args.iter().any(expr),
+                ExprKind::Unary { operand, .. } => expr(operand),
+                ExprKind::Binary { left, right, .. } => expr(left) || expr(right),
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => expr(condition) || expr(then_expr) || expr(else_expr),
+                ExprKind::Concatenation(parts) => parts.iter().any(expr),
+                ExprKind::Paren(inner) => expr(inner),
+                _ => false,
+            }
+        }
+        let any = |stmts: &mut dyn Iterator<Item = &Statement>| -> Option<bool> {
+            let mut found = false;
+            for st in stmts {
+                found |= BytecodeCompiler::stmt_names_scope(st)?;
+            }
+            Some(found)
+        };
+        match &stmt.kind {
+            StatementKind::Disable(_) => None,
+            StatementKind::Expr(e) => Some(expr(e)),
+            StatementKind::BlockingAssign { rvalue, .. }
+            | StatementKind::NonblockingAssign { rvalue, .. } => Some(expr(rvalue)),
+            StatementKind::Assertion(_) => Some(true),
+            StatementKind::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => Some(
+                expr(condition)
+                    | any(&mut std::iter::once(&**then_stmt).chain(else_stmt.as_deref()))?,
+            ),
+            StatementKind::Case { items, .. } => any(&mut items.iter().map(|it| &it.stmt)),
+            StatementKind::SeqBlock { stmts, .. } => any(&mut stmts.iter()),
+            StatementKind::For { body, .. }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => BytecodeCompiler::stmt_names_scope(body),
+            _ => Some(false),
         }
     }
 
@@ -6490,16 +6569,22 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("Stmt_ParBlock");
                 self.emit_fallback(stmt)
             }
-            StatementKind::SeqBlock { stmts, .. } => {
+            StatementKind::SeqBlock { name, stmts } => {
                 let saved_locals = self.local_var_regs.clone();
                 let saved_decl_locals = self.decl_local_regs.clone();
+                let m_depth = self.m_labels.len();
+                if let Some(n) = name {
+                    self.m_labels.push(n.clone());
+                }
                 for s in stmts {
                     if !self.compile_stmt(s) {
+                        self.m_labels.truncate(m_depth);
                         self.local_var_regs = saved_locals;
                         self.decl_local_regs = saved_decl_locals;
                         return false;
                     }
                 }
+                self.m_labels.truncate(m_depth);
                 self.local_var_regs = saved_locals;
                 self.decl_local_regs = saved_decl_locals;
                 true

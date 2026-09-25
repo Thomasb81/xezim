@@ -161,6 +161,13 @@ const RPS_TRAMPOLINE_DEPTH: usize = 300;
 /// `Simulator::intra_saved` (see `make_intra_saved_expr`). Never user-visible.
 const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
 
+/// §21.2.1.7 `%m` bookkeeping: an `m_scope_stack` entry starting with
+/// `M_ROOT_MARK` carries the absolute declaring path of the running
+/// subroutine (`pk`, `tb.u`); one starting with `M_SUBR_MARK` is a subroutine
+/// named from the caller's instance. Plain entries are named blocks.
+pub(crate) const M_ROOT_MARK: char = '\u{1}';
+const M_SUBR_MARK: char = '\u{2}';
+
 pub fn set_sim_debug(enabled: bool) {
     SIM_DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
 }
@@ -2793,6 +2800,10 @@ struct SvaClockedSite {
     /// rather than whichever process ran last.
     scope: String,
     action_pid: usize,
+    /// §21.2.1.7: the lexical chain below `scope` — enclosing named blocks
+    /// and the assertion's own label — that `%m` and severity messages in
+    /// the action blocks name (`tb.ap`).
+    m_chain: Vec<String>,
     /// LRM §16.5.1 — signal ids referenced anywhere in `body`. Their
     /// slot-entry (Preponed) values are cached in `Simulator::sva_preponed`
     /// and swapped in while this site's predicate is evaluated, so the
@@ -5283,6 +5294,10 @@ pub struct Simulator {
     /// Updated in place (`clear` + `push_str`) rather than assigned, so the
     /// settle hot loop reuses one allocation and pays only a short memcmp.
     m_block_scope: String,
+    /// A comb/edge block (not a process) is executing, so `%m` names
+    /// `m_block_scope` — empty for a block of the root — and no process
+    /// block label. Cleared by `run_process`.
+    m_block_active: bool,
     /// Interned scope id per edge block, parallel to `edge_blocks`. Two blocks
     /// in the same instance share an id, so the `%m` bookkeeping in
     /// `exec_bytecode` is a `u32` compare against a contiguous array instead
@@ -9626,6 +9641,7 @@ impl Simulator {
             fn_ret_collection_stack: Vec::new(),
             current_scope: String::new(),
             m_block_scope: String::new(),
+            m_block_active: false,
             edge_block_scope_id: Vec::new(),
             m_block_scope_id: u32::MAX,
             func_call_stack: Vec::new(),
@@ -29712,6 +29728,7 @@ impl Simulator {
     fn set_m_block_scope(&mut self, scope: Option<&str>) {
         // Contents no longer correspond to an interned edge-block scope.
         self.m_block_scope_id = u32::MAX;
+        self.m_block_active = true;
         match scope {
             Some(s) => {
                 if self.m_block_scope != s {
@@ -29778,6 +29795,7 @@ impl Simulator {
             .copied()
             .unwrap_or(false);
         if !light {
+            self.m_block_active = true;
             // Record the firing block's instance scope for `%m`. Short-string
             // compare that usually falls through; only a genuine scope CHANGE
             // touches the buffer, and then `take`/put-back reuses the existing
@@ -44663,6 +44681,7 @@ impl Simulator {
         // last recorded must not leak into this process's `%m`.
         self.m_block_scope.clear();
         self.m_block_scope_id = u32::MAX;
+        self.m_block_active = false;
         // This retained payload is one non-suspending blocking assignment.
         // Isolate it from a caller task's locals by moving that context aside;
         // the generic path clones the entire context because arbitrary
@@ -46657,6 +46676,7 @@ impl Simulator {
                                 let mut cleanup = self.bind_task_frame(&td, args);
                                 // Static context: push the declaring class for
                                 // member/static resolution, with a null `this`.
+                                self.m_scope_stack.clear();
                                 self.this_stack.push(None);
                                 self.class_context_stack.push(Some(mclass));
                                 self.method_local_base
@@ -75724,6 +75744,10 @@ impl Simulator {
                             sampled_ids.dedup();
                             let (disable, node) = self.sva_compile_site(&body_expanded);
                             let scope = self.active_instance_scope();
+                            let mut m_chain = self.m_scope_stack.clone();
+                            if let Some(l) = &a.label {
+                                m_chain.push(l.name.clone());
+                            }
                             let action_pid = self.next_pid;
                             self.next_pid += 1;
                             self.process_scope_hint.insert(action_pid, scope.clone());
@@ -75744,6 +75768,7 @@ impl Simulator {
                                 fail_action: a.else_action.as_deref().cloned(),
                                 scope,
                                 action_pid,
+                                m_chain,
                                 sampled_ids,
                             });
                         }
@@ -77340,7 +77365,7 @@ impl Simulator {
                     name.to_string(),
                     args.to_vec(),
                     self.active_instance_scope(),
-                    self.m_lexical_suffix(),
+                    self.m_path(),
                 ));
             }
             // §21.2.2 file variants: queue exactly like $strobe (postponed
@@ -77351,7 +77376,7 @@ impl Simulator {
                     name.to_string(),
                     args.to_vec(),
                     self.active_instance_scope(),
-                    self.m_lexical_suffix(),
+                    self.m_path(),
                 ));
             }
             // $value$plusargs and $test$plusargs return a bit but the
@@ -77376,7 +77401,7 @@ impl Simulator {
                 // (another initial block's `v = 0`) must be reflected.
                 self.monitor = Some((name.to_string(), args.to_vec()));
                 self.monitor_scope = self.active_instance_scope();
-                self.monitor_m_suffix = self.m_lexical_suffix();
+                self.monitor_m_suffix = self.m_path();
                 self.monitor_arg_prev = None; // fresh arm ⇒ slot-end print
             }
             // §21.2.3 file variant: SHARES the single $monitor slot (xezim
@@ -77387,7 +77412,7 @@ impl Simulator {
             "$fmonitor" | "$fmonitorb" | "$fmonitorh" | "$fmonitoro" => {
                 self.monitor = Some((name.to_string(), args.to_vec()));
                 self.monitor_scope = self.active_instance_scope();
-                self.monitor_m_suffix = self.m_lexical_suffix();
+                self.monitor_m_suffix = self.m_path();
                 self.monitor_arg_prev = None; // fresh arm ⇒ slot-end print
             }
             "$monitoroff" => {
@@ -77911,10 +77936,8 @@ impl Simulator {
     /// context line of §20.10 severity messages and §20.17.2 `$stacktrace`.
     /// Mirrors the resolution used by `$printtimescale`.
     fn severity_scope(&self) -> String {
-        match self.process_scope_hint.get(&self.current_pid) {
-            Some(s) => self.hier_path(s),
-            None => self.module.name.clone(),
-        }
+        // The reference reports the same scope `%m` names.
+        self.m_path()
     }
 
     /// Split `$fatal` arguments into `(message_args, finish_number)` per LRM
@@ -78209,7 +78232,10 @@ impl Simulator {
     /// runtime) in a `Call Stack:`/`A total of N stack frames` envelope. The
     /// task form prints this; the function form returns it as a string.
     fn stacktrace_text(&self) -> String {
-        let scope = self.severity_scope();
+        let scope = match self.process_scope_hint.get(&self.current_pid) {
+            Some(s) => self.hier_path(s),
+            None => self.module.name.clone(),
+        };
         format!(
             "Call Stack:\nModule {}\n\nA total of 1 stack frames are displayed.\n",
             scope
@@ -79429,153 +79455,8 @@ impl Simulator {
                             // %m: hierarchical name of the current scope. It
                             // consumes NO argument, so it must not be gated on
                             // one being available — `$display("%m")` printed
-                            // nothing at all (issue #25). Qualify the top
-                            // module with the running process's instance scope
-                            // so a multiply-instantiated module reports
-                            // `TB.p1` rather than just `TB`.
-                            // A sensitivity-driven block (`always_comb`,
-                            // `always @(edge)`) is evaluated by the settle /
-                            // edge loop rather than `run_process`, so it
-                            // leaves `current_scope` empty and reports its
-                            // instance in `m_block_scope` instead.
-                            // `m_block_scope` WINS when set. `current_scope` is
-                            // installed by `run_process` but not cleared when
-                            // the process ends, so it lingers as the last
-                            // process's scope — after any `fork`, every later
-                            // edge block reported the forked instance instead of
-                            // its own. `m_block_scope` is set at the entry of
-                            // each comb/edge block and cleared by `run_process`,
-                            // so a non-empty value always describes the block
-                            // actually executing.
-                            // Reference behavior for `%m` INSIDE a class
-                            // method: the object's creation scope, then the
-                            // class name, then the method — regardless of
-                            // which process invoked the method. Guarded to
-                            // the method body itself: a free function/task
-                            // called FROM the method repopulates
-                            // `func_call_stack` / `m_scope_stack` and keeps
-                            // its own naming below.
-                            let class_m: Option<String> = if !self.monitor_m_active
-                                && self.func_call_stack.is_empty()
-                                && self.m_scope_stack.is_empty()
-                            {
-                                match self.class_context_stack.last() {
-                                    Some(Some(cname)) => {
-                                        let creation = self
-                                            .this_stack
-                                            .last()
-                                            .copied()
-                                            .flatten()
-                                            .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
-                                            .map(|i| i.creation_scope.clone())
-                                            .unwrap_or_default();
-                                        let method = self
-                                            .static_local_syncs
-                                            .last()
-                                            .map(|(n, _)| n.clone())
-                                            .unwrap_or_default();
-                                        // Built outside every top (a package
-                                        // static): no instance under the
-                                        // multi-top wrapper to name.
-                                        let mut out =
-                                            if creation.is_empty() && self.root_is_multi_top() {
-                                                String::new()
-                                            } else {
-                                                self.hier_path(&creation) + "."
-                                            };
-                                        out.push_str(cname);
-                                        if !method.is_empty() {
-                                            out.push('.');
-                                            out.push_str(&method);
-                                        }
-                                        Some(out)
-                                    }
-                                    _ => None,
-                                }
-                            } else {
-                                None
-                            };
-                            if let Some(cm) = class_m {
-                                result.push_str(&cm);
-                            } else {
-                                let inst_scope = if !self.m_block_scope.is_empty() {
-                                    Some(self.m_block_scope.as_str())
-                                } else if !self.current_scope.is_empty() {
-                                    Some(self.current_scope.as_str())
-                                } else {
-                                    None
-                                };
-                                if let Some(inst_scope) = inst_scope {
-                                    // §21.2.1.7: instance path, then the lexical
-                                    // scope chain (task / function / named block)
-                                    // the `%m` sits in — e.g. `top.u_leaf.t_auto`.
-                                    let mut out = self.hier_path(inst_scope);
-                                    // The process's own flattened block label sits
-                                    // between the instance and any nested scopes.
-                                    // Skipped inside a subroutine, which replaces
-                                    // `m_scope_stack` with its own frame and is
-                                    // named from its DECLARING scope, not the
-                                    // caller's block.
-                                    if self.monitor_m_active {
-                                        // Slot-end $monitor re-render: replay the
-                                        // chain captured at arm time. The live
-                                        // stack belongs to whatever process the
-                                        // postponed-region check ran under.
-                                        out.push_str(&self.monitor_m_suffix);
-                                    } else {
-                                        if self.func_call_stack.is_empty() {
-                                            if let Some(l) =
-                                                self.process_m_label.get(&self.current_pid)
-                                            {
-                                                out.push('.');
-                                                out.push_str(l);
-                                            }
-                                        }
-                                        for sc in &self.m_scope_stack {
-                                            out.push('.');
-                                            out.push_str(sc);
-                                        }
-                                    }
-                                    result.push_str(&out);
-                                } else if !self.m_scope_stack.is_empty() {
-                                    // No instance scope (top module itself): the
-                                    // package/module function/task branch — base at
-                                    // the first subroutine's declaring scope, then
-                                    // the rest of the lexical chain.
-                                    let first = &self.m_scope_stack[0];
-                                    let base = self
-                                        .module
-                                        .func_decl_scope
-                                        .get(first)
-                                        .cloned()
-                                        .unwrap_or_else(|| self.module.name.clone());
-                                    let mut out = format!("{}.{}", base, first);
-                                    for sc in &self.m_scope_stack[1..] {
-                                        out.push('.');
-                                        out.push_str(sc);
-                                    }
-                                    result.push_str(&out);
-                                } else if let Some(fname) = self.func_call_stack.last() {
-                                    // Inside a package/module subroutine called with
-                                    // no instance scope: `%m` must be the
-                                    // subroutine's declaring hierarchy. For a
-                                    // package function this is `<pkg>.<name>`
-                                    // (matches real simulators, e.g. a reference simulator), so
-                                    // scope queries recover `<pkg>` rather than the
-                                    // top-module name. A module-level function
-                                    // (absent from `func_decl_scope`) uses
-                                    // `<top-module>.<name>`.
-                                    let scope = self
-                                        .module
-                                        .func_decl_scope
-                                        .get(fname)
-                                        .cloned()
-                                        .unwrap_or_else(|| self.module.name.clone());
-                                    result.push_str(&format!("{}.{}", scope, fname));
-                                } else {
-                                    result.push_str(&self.module.name);
-                                }
-                            }
+                            // nothing at all (issue #25).
+                            result.push_str(&self.m_path());
                         }
                         _ => {
                             if ai < args.len() {
@@ -80657,23 +80538,27 @@ impl Simulator {
     }
 
     fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
-        let Some((stmt, scope, pid)) = self.sva_sites.get(site_idx).and_then(|s| {
+        let Some((stmt, scope, pid, m_chain)) = self.sva_sites.get(site_idx).and_then(|s| {
             let act = if passed {
                 s.pass_action.clone()
             } else {
                 s.fail_action.clone()
             };
-            act.map(|a| (a, s.scope.clone(), s.action_pid))
+            act.map(|a| (a, s.scope.clone(), s.action_pid, s.m_chain.clone()))
         }) else {
             return;
         };
         let saved_pid = std::mem::replace(&mut self.current_pid, pid);
         let saved_scope = std::mem::replace(&mut self.current_scope, scope);
         let saved_block_scope = std::mem::take(&mut self.m_block_scope);
+        let saved_block_active = std::mem::replace(&mut self.m_block_active, false);
+        let saved_m_scope = std::mem::replace(&mut self.m_scope_stack, m_chain);
         self.exec_statement(&stmt);
         self.current_pid = saved_pid;
         self.current_scope = saved_scope;
         self.m_block_scope = saved_block_scope;
+        self.m_block_active = saved_block_active;
+        self.m_scope_stack = saved_m_scope;
     }
 
     /// LRM §16.5.1 — walk an SVA property body and collect the ids of every
@@ -81540,13 +81425,53 @@ impl Simulator {
         }
     }
 
-    /// The lexical half of `%m`: the process's flattened block label plus the
-    /// task / function / named-block chain that follows the instance path.
-    /// §21.2.1.7 — `%m` names the scope CONTAINING it, so `$monitor` captures
-    /// this at arm time and `check_monitor` replays it verbatim.
-    fn m_lexical_suffix(&self) -> String {
-        let mut out = String::new();
-        if self.func_call_stack.is_empty() {
+    /// §21.2.1.7 `%m`: the hierarchical name of the scope holding the running
+    /// statement — instance path, then the process's block label and the
+    /// named-block chain. A subroutine or class method names its DECLARING
+    /// scope (`pk.f`, `tb.u.mf`, `pk.C.show`), not the caller's.
+    fn m_path(&self) -> String {
+        if self.monitor_m_active {
+            // Slot-end $monitor / $strobe re-render: the path captured when
+            // the task executed.
+            return self.monitor_m_suffix.clone();
+        }
+        let first = self.m_scope_stack.first().map(|s| s.as_str());
+        // A subroutine declared in a package or another instance: its
+        // entry carries the absolute declaring path.
+        if let Some(root) = first.and_then(|f| f.strip_prefix(M_ROOT_MARK)) {
+            let mut out = root.to_string();
+            for sc in &self.m_scope_stack[1..] {
+                out.push('.');
+                out.push_str(sc.trim_start_matches(M_SUBR_MARK));
+            }
+            return out;
+        }
+        let in_subroutine = first.is_some_and(|f| f.starts_with(M_SUBR_MARK));
+        // A class method body (its entry clears the lexical chain, so any
+        // subroutine it calls shows up as a marked entry instead).
+        if !in_subroutine {
+            if let Some(Some(cname)) = self.class_context_stack.last() {
+                let mut out = self.class_m_root(cname);
+                if let Some((method, _)) = self.static_local_syncs.last() {
+                    out.push('.');
+                    out.push_str(method.rsplit("::").next().unwrap_or(method));
+                }
+                for sc in &self.m_scope_stack {
+                    out.push('.');
+                    out.push_str(sc);
+                }
+                return out;
+            }
+        }
+        // A comb/edge block names its own instance (empty = the root); a
+        // process names the scope `run_process` installed.
+        let inst = if self.m_block_active || self.current_scope.is_empty() {
+            self.m_block_scope.as_str()
+        } else {
+            self.current_scope.as_str()
+        };
+        let mut out = self.hier_path(inst);
+        if !self.m_block_active && !in_subroutine && self.func_call_stack.is_empty() {
             if let Some(l) = self.process_m_label.get(&self.current_pid) {
                 out.push('.');
                 out.push_str(l);
@@ -81554,9 +81479,120 @@ impl Simulator {
         }
         for sc in &self.m_scope_stack {
             out.push('.');
-            out.push_str(sc);
+            out.push_str(sc.trim_start_matches(M_SUBR_MARK));
         }
         out
+    }
+
+    /// `%m` prefix of class `cname`: its declaring package, enclosing class
+    /// chain or declaring module instance, then the class name. A class of
+    /// the compilation unit keeps the object's creation scope.
+    fn class_m_root(&self, cname: &str) -> String {
+        let mut path = cname.to_string();
+        let mut outer = cname.to_string();
+        for _ in 0..16 {
+            match self
+                .module
+                .classes
+                .get(&outer)
+                .and_then(|cd| cd.enclosing.clone())
+            {
+                Some(enc) => {
+                    path = format!("{}.{}", enc, path);
+                    outer = enc;
+                }
+                None => break,
+            }
+        }
+        if let Some(pkg) = self.module.class_decl_pkg.get(&outer) {
+            return format!("{}.{}", pkg, path);
+        }
+        let creation = self
+            .this_stack
+            .last()
+            .copied()
+            .flatten()
+            .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+            .map(|i| self.instance_relative_scope(&i.creation_scope))
+            .unwrap_or_default();
+        let decl_module = self
+            .module
+            .classes
+            .get(&outer)
+            .and_then(|cd| cd.declaring_module.clone());
+        let inst = match decl_module {
+            Some(m) if m == self.module.name => String::new(),
+            Some(m) => {
+                let paths: Vec<&str> = self
+                    .module
+                    .instances
+                    .iter()
+                    .filter(|i| i.def_name == m)
+                    .map(|i| i.path.as_str())
+                    .collect();
+                let within = paths.iter().find(|p| {
+                    creation == **p
+                        || creation
+                            .strip_prefix(**p)
+                            .is_some_and(|r| r.starts_with('.'))
+                });
+                match (within, paths.as_slice()) {
+                    (Some(p), _) => p.to_string(),
+                    (None, [only]) => only.to_string(),
+                    _ => creation,
+                }
+            }
+            None => {
+                // Built outside every top (a package static): no instance
+                // under the multi-top wrapper to name.
+                if creation.is_empty() && self.root_is_multi_top() {
+                    return path;
+                }
+                creation
+            }
+        };
+        format!("{}.{}", self.hier_path(&inst), path)
+    }
+
+    /// The `m_scope_stack` a subroutine starts with: its leaf name, marked as
+    /// a subroutine frame. A package subroutine or one declared in another
+    /// instance or generate block (`u.mf`, `g.f`) also carries its absolute
+    /// declaring path; a bare module subroutine is named from the caller's
+    /// instance.
+    fn subroutine_m_entry(
+        &self,
+        full: &str,
+        span: crate::ast::Span,
+        pkg: Option<&str>,
+    ) -> Vec<String> {
+        let (prefix, leaf) = match full.rsplit_once('.') {
+            Some((p, l)) => (Some(p), l),
+            None => (None, full),
+        };
+        let owner = prefix.is_none().then(|| {
+            // The package whose declaration this body IS (spans compare
+            // the hoisted bare copy with the package-qualified one).
+            [
+                pkg,
+                self.module.func_decl_scope.get(leaf).map(|p| p.as_str()),
+                self.module.pkg_subr_owner.get(leaf).map(|p| p.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|p| {
+                let key = format!("{}::{}", p, leaf);
+                self.module.functions.get(&key).map(|f| f.span) == Some(span)
+                    || self.module.tasks.get(&key).map(|t| t.span) == Some(span)
+            })
+        });
+        match (prefix, owner.flatten()) {
+            (Some(p), _) => vec![
+                format!("{}{}", M_ROOT_MARK, self.hier_path(p)),
+                leaf.to_string(),
+            ],
+            (None, Some(pk)) => vec![format!("{}{}", M_ROOT_MARK, pk), leaf.to_string()],
+            (None, None) => vec![format!("{}{}", M_SUBR_MARK, leaf)],
+        }
     }
 
     fn check_monitor(&mut self) {
@@ -113598,15 +113634,12 @@ impl Simulator {
         self.fn_ret_collection_stack
             .push(self.fn_returns_collection(&fd.return_type));
         self.pkg_scope_stack.push(pkg_scope);
-        let m_fn_leaf = fd
-            .name
-            .name
-            .name
-            .rsplit('.')
-            .next()
-            .unwrap_or(&fd.name.name.name)
-            .to_string();
-        let saved_m_scope_fn = std::mem::replace(&mut self.m_scope_stack, vec![m_fn_leaf]);
+        let m_fn_entry = self.subroutine_m_entry(
+            &fd.name.name.name,
+            fd.span,
+            self.pkg_scope_stack.last().and_then(|p| p.as_deref()),
+        );
+        let saved_m_scope_fn = std::mem::replace(&mut self.m_scope_stack, m_fn_entry);
         // §6.21: open a static-local sync frame keyed by this subroutine name.
         self.static_local_syncs
             .push((fd.name.name.name.clone(), Vec::new()));
@@ -114556,8 +114589,8 @@ impl Simulator {
         // §21.2.1.7 `%m`: entering a task RESETS the lexical scope to just
         // this task (leaf name — the decl name may be instance-qualified),
         // saving the caller's scope for restoration on return.
-        let m_leaf = tname.rsplit('.').next().unwrap_or(&tname).to_string();
-        let saved_m_scope = std::mem::replace(&mut self.m_scope_stack, vec![m_leaf]);
+        let m_entry = self.subroutine_m_entry(&tname, td.span, self.pending_pkg_scope.as_deref());
+        let saved_m_scope = std::mem::replace(&mut self.m_scope_stack, m_entry);
         TaskCleanup {
             frame_scope_hint: None,
             prev_hint: None,
@@ -114604,6 +114637,9 @@ impl Simulator {
     ) {
         cleanup.saved_spec = self.current_spec.clone();
         cleanup.pushed_method_this = true;
+        // A method task body starts its own `%m` chain; the caller's comes
+        // back with `saved_m_scope` on return.
+        self.m_scope_stack.clear();
         self.this_stack.push(handle_opt);
         self.class_context_stack.push(Some(mclass.clone()));
         // §23 / §13.4: record the base of THIS method's own locals so
@@ -126696,6 +126732,9 @@ impl Simulator {
                 // made class/spec-aware at the declaration site above.
                 self.static_local_syncs
                     .push((method_name.to_string(), Vec::new()));
+                // §21.2.1.7: the method body starts its own `%m` chain (see
+                // `m_path`); the caller's named blocks are not its scope.
+                let saved_m_scope = std::mem::take(&mut self.m_scope_stack);
                 for stmt in body {
                     self.exec_statement(stmt);
                     if self.break_flag || self.return_flag {
@@ -126738,6 +126777,7 @@ impl Simulator {
                 if method_name == "new" {
                     self.ctor_class_stack.pop();
                 }
+                self.m_scope_stack = saved_m_scope;
                 self.class_context_stack.pop();
                 self.method_local_base.pop();
                 // §13.4.1: a method returning an UNPACKED struct has no single
