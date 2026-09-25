@@ -124,6 +124,8 @@ mod constraint_foreach_and_casts;
 mod constraint_foreach_conditional;
 #[path = "classes/constraint_funcs_aggregates.rs"]
 mod constraint_funcs_aggregates;
+#[path = "classes/constraint_inline_caller_scope.rs"]
+mod constraint_inline_caller_scope;
 #[path = "classes/constraint_inline_enclosing_scope.rs"]
 mod constraint_inline_enclosing_scope;
 #[path = "classes/constraint_logical_or.rs"]

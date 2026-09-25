@@ -2101,6 +2101,7 @@ impl NbaFastIndex {
 
 mod module_paths;
 mod rand_csp;
+mod rand_scope;
 mod timing_checks;
 mod ts_x;
 mod uvm_dpi;
@@ -92769,17 +92770,15 @@ impl Simulator {
                     // check rather than being patched on afterwards.
                     let handle = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
                     if handle != 0 {
-                        // §18.7.1 `local::` — must be bound in the CALLER's
-                        // scope, i.e. before `this` switches to the object.
-                        let mut items_vec: Option<Vec<crate::ast::decl::ConstraintItem>> =
-                            self.bind_local_scope_refs(handle, constraints);
-                        // §18.7 — also freeze references to the ENCLOSING scope's
-                        // members (still on `this_stack` here) so `obj`'s inline
-                        // can compare against a sequence member (`obj.addr ==
-                        // start_addr`) once `this` moves to `obj`.
-                        if let Some(sub) = self.subst_enclosing_scope_refs(handle, constraints) {
-                            items_vec = Some(sub);
-                        }
+                        // §18.7/§18.7.1: caller-scope operands (the caller's
+                        // locals and class members, `local::` names) are
+                        // state variables of the solve — bind them now,
+                        // while `this` is still the caller.
+                        let items_vec = self.freeze_caller_scope_refs(
+                            handle,
+                            Self::plain_ident_name(expr),
+                            constraints,
+                        );
                         let items: &[crate::ast::decl::ConstraintItem] =
                             items_vec.as_deref().unwrap_or(constraints);
                         // §18.11 `obj.randomize(null) with {...}` — in-line
@@ -92864,6 +92863,20 @@ impl Simulator {
         handle: usize,
         inline: &[crate::ast::decl::ConstraintItem],
     ) -> Value {
+        // The object's scope, as for a solve (see `exec_randomize_inner`).
+        self.push_local_frame(HashMap::default());
+        self.method_local_base.push(self.local_stack.len() - 1);
+        let r = self.randomize_check_items(handle, inline);
+        self.method_local_base.pop();
+        self.pop_local_frame();
+        r
+    }
+
+    fn randomize_check_items(
+        &mut self,
+        handle: usize,
+        inline: &[crate::ast::decl::ConstraintItem],
+    ) -> Value {
         let cons = self.active_constraints(handle);
         for con in &cons {
             for item in &con.items {
@@ -92888,174 +92901,6 @@ impl Simulator {
         Value::from_u64(1, 32)
     }
 
-    /// §18.7.1 `local::` — inside an inline `with { ... }` constraint, a bare
-    /// name binds to the OBJECT's member; the CALLER's same-named variable is
-    /// reachable only as `local::name`. The parser folds `local::name` back to
-    /// a plain identifier, which would make `x == local::x` a tautology solved
-    /// by the object's own member (so the caller's value is ignored).
-    ///
-    /// Recover the intended binding: a rand member of the object that also
-    /// appears on the OTHER side of its own constraint can only have been
-    /// written `local::x` — a self-comparison is otherwise meaningless — so
-    /// substitute the value of the caller-scope variable of that name. Called
-    /// with `this` still set to the CALLER's scope, which is exactly the scope
-    /// `local::` resolves in. Returns None when there is nothing to rebind (the
-    /// overwhelmingly common case), so the original AST is used as-is.
-    fn bind_local_scope_refs(
-        &mut self,
-        handle: usize,
-        items: &[crate::ast::decl::ConstraintItem],
-    ) -> Option<Vec<crate::ast::decl::ConstraintItem>> {
-        use crate::ast::decl::ConstraintItem as CI;
-        let rand_set = self.object_rand_set(handle);
-        if rand_set.is_empty() {
-            return None;
-        }
-        let mut out: Vec<CI> = Vec::with_capacity(items.len());
-        let mut any = false;
-        for item in items {
-            let mut new_item = item.clone();
-            if let CI::Expr(e) = &mut new_item {
-                if let ExprKind::Binary { left, right, .. } = &mut e.kind {
-                    // `member <op> <expr containing member>` — the member
-                    // inside <expr> is the `local::` reference.
-                    if let Some(n) = Self::plain_ident_name(left) {
-                        if rand_set.contains(&n) && self.subst_local_ident(right, &n) {
-                            any = true;
-                        }
-                    }
-                    if let Some(n) = Self::plain_ident_name(right) {
-                        if rand_set.contains(&n) && self.subst_local_ident(left, &n) {
-                            any = true;
-                        }
-                    }
-                }
-            }
-            out.push(new_item);
-        }
-        if any { Some(out) } else { None }
-    }
-
-    /// §18.7 — inside `obj.randomize() with {…}` the randomized frame's
-    /// `this` is the OBJECT, so a free identifier that names an ENCLOSING
-    /// scope's member (e.g. a sequence's `start_addr` from a `uvm_do` inline
-    /// block) no longer resolves during the solve and reads 0/garbage. Freeze
-    /// every bare identifier that is a member of the enclosing `this` instance
-    /// (still on `this_stack` at the call site, before `this` switches) but is
-    /// NOT a rand member of the randomized object to its current value as a
-    /// literal. Returns a substituted copy only when something changed.
-    fn subst_enclosing_scope_refs(
-        &mut self,
-        handle: usize,
-        items: &[crate::ast::decl::ConstraintItem],
-    ) -> Option<Vec<crate::ast::decl::ConstraintItem>> {
-        use crate::ast::decl::ConstraintItem as CI;
-        let rand_set = self.object_rand_set(handle);
-        // The enclosing scope's instance handle is this_stack's top. If none
-        // (no class `this`), there is nothing to freeze.
-        let Some(Some(enc_h)) = self.this_stack.last().copied() else {
-            return None;
-        };
-        let Some(enc_cd) = self
-            .heap
-            .get(enc_h)
-            .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.clone())
-            .and_then(|cn| self.module.classes.get(&cn).cloned())
-        else {
-            return None;
-        };
-        if enc_cd.properties.is_empty() {
-            return None;
-        }
-        let mut out: Vec<CI> = Vec::with_capacity(items.len());
-        let mut any = false;
-        for item in items {
-            let mut new_item = item.clone();
-            if let CI::Expr(e) = &mut new_item {
-                if self.subst_enclosing_ident(e, enc_h, &enc_cd, &rand_set) {
-                    any = true;
-                }
-            }
-            out.push(new_item);
-        }
-        if any { Some(out) } else { None }
-    }
-
-    /// Walk `e`, replacing bare identifiers that are members of the enclosing
-    /// instance `enc_h` (but not rand members of the object) with their current
-    /// value as a literal. Returns whether anything changed.
-    fn subst_enclosing_ident(
-        &mut self,
-        e: &mut Expression,
-        enc_h: usize,
-        enc_cd: &crate::compiler::elaborate::ElaboratedClass,
-        rand_set: &HashSet<String>,
-    ) -> bool {
-        use crate::ast::expr::{ExprKind, NumberBase, NumberLiteral};
-        let mut hit = false;
-        match &mut e.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 && h.root.is_none() => {
-                let name = &h.path[0].name.name;
-                if rand_set.contains(name) {
-                    return false; // the object's own rand member — solve it
-                }
-                // Must live on the ENCLOSING instance, not be shadowed by
-                // an enclosing local of the same name nor be the object's
-                // own (non-rand) field the inline qualifies via the receiver.
-                if !enc_cd.properties.contains_key(name) {
-                    return false;
-                }
-                if self
-                    .local_stack
-                    .last()
-                    .is_some_and(|l| l.contains_key(name))
-                {
-                    return false;
-                }
-                let v = self
-                    .heap
-                    .get(enc_h)
-                    .and_then(|o| o.as_ref())
-                    .and_then(|i| i.properties.get(name))
-                    .cloned();
-                if let Some(v) = v.as_ref() {
-                    let lit = NumberLiteral::Integer {
-                        size: Some(v.width.max(1)),
-                        signed: v.is_signed,
-                        base: NumberBase::Decimal,
-                        value: v.to_u64().unwrap_or(0).to_string(),
-                        cached_val: Cell::new(None),
-                    };
-                    e.kind = ExprKind::Number(lit);
-                    hit = true;
-                }
-            }
-            ExprKind::Binary { left, right, .. } => {
-                hit |= self.subst_enclosing_ident(left, enc_h, enc_cd, rand_set);
-                hit |= self.subst_enclosing_ident(right, enc_h, enc_cd, rand_set);
-            }
-            ExprKind::Unary { operand, .. } => {
-                hit |= self.subst_enclosing_ident(operand, enc_h, enc_cd, rand_set)
-            }
-            ExprKind::Paren(inner) => {
-                hit |= self.subst_enclosing_ident(inner, enc_h, enc_cd, rand_set)
-            }
-            ExprKind::Inside { expr, ranges } => {
-                hit |= self.subst_enclosing_ident(expr, enc_h, enc_cd, rand_set);
-                for r in ranges {
-                    hit |= self.subst_enclosing_ident(r, enc_h, enc_cd, rand_set);
-                }
-            }
-            ExprKind::Range(lo, hi) => {
-                hit |= self.subst_enclosing_ident(lo, enc_h, enc_cd, rand_set);
-                hit |= self.subst_enclosing_ident(hi, enc_h, enc_cd, rand_set);
-            }
-            _ => {}
-        }
-        hit
-    }
-
     /// Bare single-segment identifier name of `e`, if that is what it is.
     fn plain_ident_name(e: &Expression) -> Option<String> {
         match &e.kind {
@@ -93064,56 +92909,6 @@ impl Simulator {
             }
             _ => None,
         }
-    }
-
-    /// §18.7.1: replace every bare reference to `name` inside `e` with the
-    /// current value of the caller-scope variable of that name (a literal).
-    /// Returns whether anything was substituted — nothing is if the caller's
-    /// scope has no such variable, leaving the original object-member binding.
-    fn subst_local_ident(&mut self, e: &mut Expression, name: &str) -> bool {
-        let mut hit = false;
-        match &mut e.kind {
-            ExprKind::Ident(h)
-                if h.path.len() == 1 && h.root.is_none() && h.path[0].name.name == name =>
-            {
-                // Resolve on a cache-free copy: the AST node's memoized
-                // name must not be poisoned with the caller-scope
-                // resolution (the same node is re-solved under `this`).
-                let mut probe = h.clone();
-                probe.cached_signal_id = Cell::new(None);
-                probe.cached_resolved_name = std::cell::OnceCell::new();
-                let resolved = self.resolve_hier_name(&probe);
-                if let Some(v) = self.lookup_signal_value(&resolved) {
-                    let lit = NumberLiteral::Integer {
-                        size: Some(v.width.max(1)),
-                        signed: v.is_signed,
-                        base: NumberBase::Decimal,
-                        value: v.to_u64().unwrap_or(0).to_string(),
-                        cached_val: Cell::new(None),
-                    };
-                    e.kind = ExprKind::Number(lit);
-                    hit = true;
-                }
-            }
-            ExprKind::Binary { left, right, .. } => {
-                hit |= self.subst_local_ident(left, name);
-                hit |= self.subst_local_ident(right, name);
-            }
-            ExprKind::Unary { operand, .. } => hit |= self.subst_local_ident(operand, name),
-            ExprKind::Paren(inner) => hit |= self.subst_local_ident(inner, name),
-            ExprKind::Inside { expr, ranges } => {
-                hit |= self.subst_local_ident(expr, name);
-                for r in ranges {
-                    hit |= self.subst_local_ident(r, name);
-                }
-            }
-            ExprKind::Range(lo, hi) => {
-                hit |= self.subst_local_ident(lo, name);
-                hit |= self.subst_local_ident(hi, name);
-            }
-            _ => {}
-        }
-        hit
     }
 
     /// If `expr` names a queue/array (possibly an instance-scoped member),
@@ -121111,7 +120906,21 @@ impl Simulator {
         self.this_stack.pop();
     }
 
+    /// §18.7: the solve binds names in the OBJECT's scope — the calling
+    /// subroutine's locals must not shadow the object's members (a caller
+    /// local `addr` made every `addr` constraint of the object read it). The
+    /// inline constraints' caller-scope operands were bound beforehand
+    /// (`freeze_caller_scope_refs`), so the solve runs in a fresh frame.
     fn exec_randomize_inner(&mut self, handle: usize, inline: &[ConstraintItem]) -> Value {
+        self.push_local_frame(HashMap::default());
+        self.method_local_base.push(self.local_stack.len() - 1);
+        let r = self.exec_randomize_solve(handle, inline);
+        self.method_local_base.pop();
+        self.pop_local_frame();
+        r
+    }
+
+    fn exec_randomize_solve(&mut self, handle: usize, inline: &[ConstraintItem]) -> Value {
         // Reset the dist-pick-once tracker so each randomize call gets a
         // fresh weighted draw per `(handle, prop)`.
         self.dist_picked_once.clear();
