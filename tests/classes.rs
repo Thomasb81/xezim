@@ -59,6 +59,8 @@ mod static_param_class_collection_reuse;
 mod struct_member_class_handle_new;
 #[path = "classes/this_collection_struct_members.rs"]
 mod this_collection_struct_members;
+#[path = "classes/this_super_member.rs"]
+mod this_super_member;
 #[path = "classes/type_param_formal_stale_local.rs"]
 mod type_param_formal_stale_local;
 #[path = "classes/typename_p_subroutine_locals.rs"]
