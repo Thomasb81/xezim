@@ -20,6 +20,7 @@ fn illegal_replications_and_casts() {
         "module top; localparam integer N = 0; initial begin int x, y; y = N'(x); end endmodule",
         "module top; localparam integer N = 32'hx; initial begin int x, y; y = N'(x); end endmodule",
         "module top; reg [7:0] ival = $signed(1.0); endmodule",
+        "module top; real r1, r2; reg in; assign {r1, r2} = in; endmodule",
     ] {
         assert!(simulate(src, 10).is_err(), "accepted:\n{src}");
     }

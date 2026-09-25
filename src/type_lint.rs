@@ -1469,6 +1469,8 @@ impl<'a> Ck<'a> {
         self.check_const_selects(lv);
         self.check_struct_members(lv);
         self.check_target_is_variable(lv);
+        // `{r1, r2} = v` with a real `r1` is a concatenation too.
+        self.check_operands(lv);
         let lt = self.ty_of(lv);
         if lt == Ty::Unknown {
             return;
