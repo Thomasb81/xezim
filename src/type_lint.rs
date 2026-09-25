@@ -732,12 +732,15 @@ impl<'a> Ck<'a> {
                     DataType::Real { .. } => self.resolve(data_type),
                     _ => Ty::Unknown,
                 };
-                let fixed = pd.local || self.params_fixed;
                 for a in assignments {
-                    let v = if fixed {
-                        a.init.as_ref().and_then(|e| self.eval_const(e))
-                    } else {
-                        None
+                    let v = a.init.as_ref().and_then(|e| self.eval_const(e));
+                    // A negative default of a parameter (`width_p = -1`) is a
+                    // placeholder that every instantiation overrides; library
+                    // modules elaborated on their own keep it.
+                    let v = match v {
+                        _ if !pd.local && !self.params_fixed => None,
+                        Some(CVal::Int(n)) if n < 0 && !pd.local => None,
+                        v => v,
                     };
                     let top = self.top();
                     top.vars.insert(a.name.name.clone(), t.clone());

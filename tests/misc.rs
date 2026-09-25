@@ -197,6 +197,8 @@ mod parser_stmt_gaps;
 mod part_select_constant_bounds;
 #[path = "misc/part_select_negative_bound_compiled.rs"]
 mod part_select_negative_bound_compiled;
+#[path = "misc/placeholder_parameter_replication.rs"]
+mod placeholder_parameter_replication;
 #[path = "misc/port_width_mismatch_explains.rs"]
 mod port_width_mismatch_explains;
 #[path = "misc/real_call_bytecode.rs"]
