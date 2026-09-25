@@ -276,3 +276,97 @@ fn legal_subroutine_names_still_elaborate() {
         "wrong output:\n{stdout}{stderr}"
     );
 }
+
+/// §8/§23.9: a class member is visible bare only inside its own class
+/// hierarchy — a member of an UNRELATED class does not declare the name for
+/// another class's method.
+#[test]
+fn member_of_unrelated_class_in_class_method() {
+    rejects(
+        "unrelated_class_member",
+        "class A;\n  int secret;\nendclass\nclass B;\n  function int get();\n    return secret;\n  endfunction\nendclass\nmodule tb;\n  initial begin\n    B b;\n    b = new;\n    $display(\"done %0d\", b.get());\n  end\nendmodule\n",
+        "secret",
+        "6:12",
+    );
+}
+
+/// UVM 1.2 removed the global `factory`; code still naming it compiled
+/// because `uvm_default_coreservice_t` has a (local) `factory` member, and
+/// `factory.set_inst_override_by_name(...)` then silently did nothing. The
+/// reference simulator rejects the name. Reduced shape of that case.
+#[test]
+fn removed_global_used_as_method_receiver() {
+    rejects(
+        "removed_global_receiver",
+        "class fac;\n  function void set_inst_override_by_name(string a, string b, string c);\n  endfunction\nendclass\nclass coreservice;\n  local fac factory;\nendclass\nclass test;\n  function void build();\n    factory.set_inst_override_by_name(\"a\", \"b\", \"c\");\n  endfunction\nendclass\nmodule tb;\n  initial begin\n    test t;\n    t = new;\n    t.build();\n    $display(\"done\");\n  end\nendmodule\n",
+        "factory",
+        "10:5",
+    );
+}
+
+/// Names a class method may use bare: members of its own class and of its
+/// ancestors (a base-class enum member, static, protected member and
+/// localparam), the enclosing class's static and typedef from a nested
+/// class, the enclosing module's variable, and an implemented interface
+/// class. Output cross-checked against the reference simulator.
+#[test]
+fn class_scope_names_still_elaborate() {
+    let src = r#"package cp;
+  class Base;
+    typedef enum {LO, HI} lvl_t;
+    static int count;
+    protected int prot = 3;
+    localparam int DEPTH = 2;
+    function int base_f(); return 1; endfunction
+  endclass
+  class Derived extends Base;
+    function int f();
+      lvl_t l = HI;
+      count++;
+      return prot + DEPTH + int'(l) + base_f() + count;
+    endfunction
+  endclass
+  class Outer;
+    static int shared = 5;
+    typedef int my_int;
+    class Inner;
+      function int g();
+        my_int x = shared;
+        return x;
+      endfunction
+    endclass
+  endclass
+  interface class Shape;
+    pure virtual function int area();
+  endclass
+  class Sq implements Shape;
+    int side = 4;
+    virtual function int area(); return side * side; endfunction
+  endclass
+endpackage
+module tb;
+  import cp::*;
+  int modvar = 11;
+  class InMod;
+    function int h(); return modvar; endfunction
+  endclass
+  initial begin
+    Derived d;
+    Outer::Inner i;
+    InMod m;
+    Sq s;
+    d = new;
+    i = new;
+    m = new;
+    s = new;
+    $display("f=%0d g=%0d h=%0d area=%0d", d.f(), i.g(), m.h(), s.area());
+  end
+endmodule
+"#;
+    let (code, stdout, stderr) = run("class_scope_legal", src);
+    assert_eq!(code, 0, "legal class scopes rejected:\n{stdout}{stderr}");
+    assert!(
+        stdout.contains("f=8 g=5 h=11 area=16\n"),
+        "wrong output:\n{stdout}{stderr}"
+    );
+}
