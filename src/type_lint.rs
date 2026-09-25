@@ -11,6 +11,8 @@
 //! - §7.6: an unpacked array takes only an unpacked array of the same shape
 //!   whose element type is equivalent (§6.22.2), never a packed value.
 //! - §8.7: `new` without brackets constructs a class (or covergroup) handle.
+//! - §26.3: `P::name` names an item declared in package `P`; a task, or a
+//!   void function, is not called in an expression (§13.3, §13.4.1).
 //!
 //! The same rules apply to declaration initializers, `return` values and
 //! subroutine input arguments, which are assignments too (§13.5).
@@ -20,7 +22,7 @@
 //! name, a cast, a parameterized class, a class whose base is not visible —
 //! is `Unknown` and never produces an error.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use xezim_core::SourceDefinition;
@@ -225,6 +227,7 @@ fn packed_bits(dims: &[PackedDimension]) -> Option<u64> {
 struct Sig {
     ret: Ty,
     ports: Vec<PortSig>,
+    is_task: bool,
 }
 
 struct PortSig {
@@ -273,6 +276,9 @@ struct Env<'e> {
     packages: &'e HashMap<String, Scope>,
     unit: Option<&'e Scope>,
     classes: &'e HashMap<String, Option<Rc<ClassInfo>>>,
+    /// Every name each package declares; None when it re-exports or holds
+    /// items this pass does not model.
+    pkg_members: &'e HashMap<String, Option<HashSet<String>>>,
 }
 
 struct Ck<'a> {
@@ -487,7 +493,10 @@ impl<'a> Ck<'a> {
     }
 
     fn declare_typedef(&mut self, td: &TypedefDeclaration) {
-        if td.forward {
+        // `typedef class C;` (parsed as a typedef of `void`) only forward-declares
+        // the class; typing C as void made a call to a method returning C look
+        // like a call to a void function.
+        if td.forward || matches!(td.data_type, DataType::Void(_)) {
             return;
         }
         let t = match &td.data_type {
@@ -552,7 +561,11 @@ impl<'a> Ck<'a> {
     fn sig_of_function(&mut self, f: &FunctionDeclaration) -> Rc<Sig> {
         let ret = self.resolve(&f.return_type);
         let ports = self.port_sigs(&f.ports, &f.items);
-        Rc::new(Sig { ret, ports })
+        Rc::new(Sig {
+            ret,
+            ports,
+            is_task: false,
+        })
     }
 
     fn sig_of_task(&mut self, t: &TaskDeclaration) -> Rc<Sig> {
@@ -560,6 +573,7 @@ impl<'a> Ck<'a> {
         Rc::new(Sig {
             ret: Ty::Void,
             ports,
+            is_task: true,
         })
     }
 
@@ -1182,6 +1196,11 @@ impl<'a> Ck<'a> {
     }
 
     fn walk_expr(&mut self, e: &Expression) {
+        self.walk_value(e, true);
+    }
+
+    /// Walk `e`; `value` is false for a call made as a statement.
+    fn walk_value(&mut self, e: &Expression, value: bool) {
         match &e.kind {
             ExprKind::Call { func, args } => {
                 for a in args {
@@ -1198,6 +1217,32 @@ impl<'a> Ck<'a> {
                             && let Some(sig) = self.lookup_sub(n)
                         {
                             self.check_call(n, &sig, args, e.span);
+                            self.check_call_kind(n, &sig, value, e.span);
+                        }
+                    }
+                    ExprKind::MemberAccess { expr, member } if self.package_of(expr).is_some() => {
+                        let pkg = self.package_of(expr).unwrap_or_default();
+                        let n = format!("{pkg}::{}", member.name);
+                        if !self.check_package_member(pkg, &member.name, member.span) {
+                            return;
+                        }
+                        let scope = self.env.packages.get(pkg);
+                        match scope.and_then(|p| p.subs.get(&member.name)) {
+                            Some(Some(sig)) => {
+                                let sig = sig.clone();
+                                self.check_call(&n, &sig, args, e.span);
+                                self.check_call_kind(&n, &sig, value, e.span);
+                            }
+                            Some(None) => {}
+                            None if scope.is_some_and(|p| p.vars.contains_key(&member.name)) => {
+                                self.report(
+                                    member.span,
+                                    format!(
+                                        "'{n}' is not a function or task (IEEE 1800-2017 §13.4)"
+                                    ),
+                                );
+                            }
+                            None => {}
                         }
                     }
                     ExprKind::MemberAccess { expr, member } => {
@@ -1230,15 +1275,75 @@ impl<'a> Ck<'a> {
                 self.walk_expr(else_expr);
             }
             ExprKind::Concatenation(xs) => xs.iter().for_each(|x| self.walk_expr(x)),
-            ExprKind::Paren(x) => self.walk_expr(x),
+            // `void'(f())` is still a call made as a statement.
+            ExprKind::Paren(x) => self.walk_value(x, value),
             ExprKind::Index { expr, index } => {
                 self.walk_expr(expr);
                 self.walk_expr(index);
             }
-            ExprKind::MemberAccess { expr, .. } => self.walk_expr(expr),
+            ExprKind::MemberAccess { expr, member } => match self.package_of(expr) {
+                Some(pkg) => {
+                    self.check_package_member(pkg, &member.name, member.span);
+                }
+                None => self.walk_expr(expr),
+            },
             ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| self.walk_expr(x)),
             _ => {}
         }
+    }
+
+    /// §13.3/§13.4.1: a task, or a void function, called where a value is
+    /// needed.
+    fn check_call_kind(&mut self, name: &str, sig: &Sig, value: bool, span: Span) {
+        if !value {
+            return;
+        }
+        if sig.is_task {
+            self.report(
+                span,
+                format!("task '{name}' cannot be called in an expression (IEEE 1800-2017 §13.3)"),
+            );
+        } else if sig.ret == Ty::Void {
+            self.report(
+                span,
+                format!(
+                    "void function '{name}' has no value to use in an expression \
+                     (IEEE 1800-2017 §13.4.1)"
+                ),
+            );
+        }
+    }
+
+    /// `P` in `P::name` when it is a package (not a class or a variable).
+    fn package_of<'e>(&self, e: &'e Expression) -> Option<&'e str> {
+        let ExprKind::Ident(h) = &e.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let n = h.path[0].name.name.as_str();
+        (self.env.pkg_members.contains_key(n)
+            && !self.env.class_names.contains_key(n)
+            && self.lookup_var(n).is_none()
+            && self.lookup_type(n).is_none())
+        .then_some(n)
+    }
+
+    /// §26.3: `P::name` must name an item declared in package `P`. False when
+    /// it does not (and the error is reported).
+    fn check_package_member(&mut self, pkg: &str, name: &str, span: Span) -> bool {
+        let Some(Some(members)) = self.env.pkg_members.get(pkg) else {
+            return true;
+        };
+        if members.contains(name) {
+            return true;
+        }
+        self.report(
+            span,
+            format!("'{name}' is not declared in package '{pkg}' (IEEE 1800-2017 §26.3)"),
+        );
+        false
     }
 
     fn declare_var(&mut self, dt: &DataType, name: &str, dims: &[UnpackedDimension]) -> Ty {
@@ -1249,7 +1354,7 @@ impl<'a> Ck<'a> {
 
     fn walk_stmt(&mut self, s: &Statement) {
         match &s.kind {
-            StatementKind::Expr(e) => self.walk_expr(e),
+            StatementKind::Expr(e) => self.walk_value(e, false),
             StatementKind::BlockingAssign { lvalue, rvalue }
             | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
                 self.walk_expr(rvalue);
@@ -1681,6 +1786,16 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         }
     }
 
+    let pkg_members: HashMap<String, Option<HashSet<String>>> = defs
+        .iter()
+        .filter_map(|d| match d {
+            SourceDefinition::Package(p) => {
+                Some((p.name.name.clone(), package_member_names(&p.items)))
+            }
+            _ => None,
+        })
+        .collect();
+
     // Phase 1: package scopes (twice, so a package sees the ones it imports).
     let no_classes: HashMap<String, Option<Rc<ClassInfo>>> = HashMap::new();
     let empty_pkgs: HashMap<String, Scope> = HashMap::new();
@@ -1691,6 +1806,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             packages: &empty_pkgs,
             unit: None,
             classes: &no_classes,
+            pkg_members: &pkg_members,
         };
         let mut ck = Ck::new(env, elab, "");
         ck.push();
@@ -1711,6 +1827,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
                     packages: &packages,
                     unit: Some(&unit),
                     classes: &no_classes,
+                    pkg_members: &pkg_members,
                 };
                 let mut ck = Ck::new(env, elab, &p.name.name);
                 ck.push();
@@ -1729,6 +1846,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             packages: &packages,
             unit: Some(&unit),
             classes: &no_classes,
+            pkg_members: &pkg_members,
         };
         let mut found: Vec<(String, ClassInfo)> = Vec::new();
         for d in defs {
@@ -1791,6 +1909,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         packages: &packages,
         unit: Some(&unit),
         classes: &classes,
+        pkg_members: &pkg_members,
     };
     for d in defs {
         let mut ck;
@@ -1909,4 +2028,72 @@ fn class_infos_items(ck: &mut Ck<'_>, items: &[ModuleItem], out: &mut Vec<(Strin
             _ => {}
         }
     }
+}
+
+/// Every name package items declare (None when the package re-exports or
+/// holds an item this pass does not model).
+fn package_member_names(items: &[PackageItem]) -> Option<HashSet<String>> {
+    let mut out = HashSet::new();
+    let mut ranged = false;
+    let mut enum_members = |dt: &DataType, out: &mut HashSet<String>| {
+        if let DataType::Enum(et) = dt {
+            // `A[3]` declares A0..A2; not modeled here.
+            ranged |= et.members.iter().any(|m| m.range.is_some());
+            out.extend(et.members.iter().map(|m| m.name.name.clone()));
+        }
+    };
+    for it in items {
+        match it {
+            PackageItem::Parameter(pd) => match &pd.kind {
+                ParameterKind::Data {
+                    data_type,
+                    assignments,
+                } => {
+                    enum_members(data_type, &mut out);
+                    out.extend(assignments.iter().map(|a| a.name.name.clone()));
+                }
+                ParameterKind::Type { assignments } => {
+                    out.extend(assignments.iter().map(|a| a.name.name.clone()))
+                }
+            },
+            PackageItem::Typedef(td) => {
+                out.insert(td.name.name.clone());
+                enum_members(&td.data_type, &mut out);
+            }
+            PackageItem::Function(f) => {
+                out.insert(f.name.name.name.clone());
+            }
+            PackageItem::Task(t) => {
+                out.insert(t.name.name.name.clone());
+            }
+            PackageItem::Data(d) => {
+                enum_members(&d.data_type, &mut out);
+                out.extend(d.declarators.iter().map(|dc| dc.name.name.clone()));
+            }
+            PackageItem::Class(c) => {
+                out.insert(c.name.name.clone());
+            }
+            PackageItem::DPIImport(d) => {
+                out.extend(dpi_name(d));
+            }
+            PackageItem::Let(l) => {
+                out.insert(l.name.name.clone());
+            }
+            PackageItem::Checker(c) => {
+                out.insert(c.name.name.clone());
+            }
+            PackageItem::Nettype(n) => {
+                out.insert(n.name.name.clone());
+            }
+            PackageItem::Property(pr) => {
+                out.insert(pr.name.name.clone());
+            }
+            PackageItem::Sequence(sq) => {
+                out.insert(sq.name.name.clone());
+            }
+            PackageItem::Import(_) | PackageItem::DPIExport(_) | PackageItem::TimeunitsDecl(_) => {}
+            PackageItem::Null | PackageItem::Export(_) => return None,
+        }
+    }
+    (!ranged).then_some(out)
 }
