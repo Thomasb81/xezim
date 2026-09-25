@@ -311,6 +311,12 @@ and the development workflow are in [README.md](README.md).
 
 **Usability**
 
+* The default simulation time limit is 100 ms instead of 100 µs, so UVM
+  tests that run for milliseconds (for example 2–25 ms of simulated time)
+  finish instead of stopping early. A design that never calls `$finish`
+  still stops at the limit; `--max-time` sets a different one, and
+  `-do "run -all"` runs until `$finish`.
+
 * Command lines written for other simulators run as-is: bare or `work.`
   top names, `-F`, `-g`/`-G` parameter overrides, `-sv_seed`,
   `-sv_lib`/`-sv_root`, `-svNNcompat`, and a `-do` subset (`run -all`,

@@ -161,7 +161,7 @@ fn print_usage() {
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
     eprintln!(
-        "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)"
+        "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
     );
     eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug);");
     eprintln!("                   implies the --verbose engine lines");
@@ -1638,7 +1638,10 @@ fn run_main() -> i32 {
     // given we synthesize a wrapper module that instantiates them all and
     // elaborate that instead (a single root reaching every requested top).
     let mut top_modules: Vec<String> = Vec::new();
-    let mut max_time: u64 = 100_000;
+    // Default cap: 100 ms of simulated time, in ns. Long enough for UVM tests
+    // that run tens of milliseconds; a design that never calls `$finish`
+    // still stops.
+    let mut max_time: u64 = 100_000_000;
     let mut dump_tokens = false;
     let mut dump_ast = false;
     #[derive(Clone, Copy, PartialEq, Eq)]
