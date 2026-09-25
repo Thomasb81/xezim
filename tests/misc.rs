@@ -221,6 +221,8 @@ mod struct_members_and_constant_targets;
 mod subroutine_port_redeclaration;
 #[path = "misc/svtb_suite.rs"]
 mod svtb_suite;
+#[path = "misc/unnamed_block_end_label.rs"]
+mod unnamed_block_end_label;
 #[path = "misc/unsized_decimal_wrap_warning.rs"]
 mod unsized_decimal_wrap_warning;
 #[path = "misc/uvm_agent_active_config.rs"]
