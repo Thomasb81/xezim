@@ -748,6 +748,13 @@ impl Simulator {
                 }
                 *budget -= 1;
                 st.dirty.clear();
+                // Each refuted value splits the domain once more, and the
+                // split domain is copied again on every later exclusion — a
+                // wide variable refuted value by value costs quadratic time.
+                st.work += st.d[v].len() as u64;
+                if st.work >= WORK_BUDGET {
+                    return None;
+                }
                 let nd = dom_minus(&st.d[v], &vec![(val, val)]);
                 if !st.set(v, nd) {
                     continue;
@@ -1506,6 +1513,53 @@ impl Simulator {
                 self.csp_free(csp, lo, env) && self.csp_free(csp, hi, env)
             }
         });
+        if !ranges_free && !neg {
+            // §11.4.13: a bound that reads a rand variable (`dst inside
+            // {[BASE : TOP - size*4]}`) makes each range the pair of
+            // relations `lo <= expr <= hi` (a value: `expr == v`), and the
+            // set their disjunction — propagated rather than left to the
+            // evaluator, which only judges it once every operand is fixed.
+            let rel = |op: BinaryOp, l: &Expression, r: &Expression| {
+                Expression::new(
+                    ExprKind::Binary {
+                        op,
+                        left: Box::new(l.clone()),
+                        right: Box::new(r.clone()),
+                    },
+                    expr.span,
+                )
+            };
+            let mut alts = Vec::with_capacity(ranges.len());
+            for r in ranges {
+                let n = match r {
+                    ConstraintRange::Value(v) => {
+                        // a rand array operand is set membership, not `==`
+                        if self
+                            .csp_member(csp, v)
+                            .is_some_and(|n| csp.arrays.contains_key(&n))
+                        {
+                            return self.csp_eval_node(csp, whole, env, neg);
+                        }
+                        self.csp_bool(csp, &rel(BinaryOp::Eq, expr, v), env, false)?
+                    }
+                    ConstraintRange::Range { lo, hi } => {
+                        if matches!(lo.kind, ExprKind::Dollar)
+                            || matches!(hi.kind, ExprKind::Dollar)
+                        {
+                            return self.csp_eval_node(csp, whole, env, neg);
+                        }
+                        let a = self.csp_bool(csp, &rel(BinaryOp::Leq, lo, expr), env, false)?;
+                        let b = self.csp_bool(csp, &rel(BinaryOp::Leq, expr, hi), env, false)?;
+                        Node::And(vec![a, b])
+                    }
+                };
+                alts.push(n);
+            }
+            return Some(match alts.len() {
+                1 => alts.pop().unwrap(),
+                _ => Node::Or(alts),
+            });
+        }
         let a = if ranges_free {
             self.csp_ae(csp, expr, env)
         } else {
