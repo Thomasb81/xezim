@@ -13,8 +13,8 @@
 //! and the simulator implements §9.4.5 for the marker call: evaluate the RHS
 //! immediately, suspend the process `d` time units, then assign the saved
 //! value. The rewrite preserves every byte of whitespace (line numbers do not
-//! shift). Intra-assignment EVENT controls (`= @(...)`, `= repeat(n) @(...)`)
-//! keep the parser's existing discard behavior, as do min:typ:max delays.
+//! shift). A min:typ:max delay `#(1:2:3)` is copied as written; the parser
+//! reads the parenthesized triple as its typical value.
 //! Files pulled in via `include are preprocessed inside xezim-core and are
 //! not seen by this pass.
 
@@ -120,7 +120,6 @@ fn extract_delay_and_rhs(b: &[u8], i: usize) -> Option<(usize, usize)> {
     if j < b.len() && b[j] == b'(' {
         let mut k = j + 1;
         let mut depth = 1i32;
-        let mut top_colon = false;
         while k < b.len() && depth > 0 {
             match b[k] {
                 b'"' => {
@@ -129,14 +128,11 @@ fn extract_delay_and_rhs(b: &[u8], i: usize) -> Option<(usize, usize)> {
                 }
                 b'(' | b'[' | b'{' => depth += 1,
                 b')' | b']' | b'}' => depth -= 1,
-                // min:typ:max delay `#(1:2:3)` — not an expression; keep the
-                // parser's discard behavior.
-                b':' if depth == 1 => top_colon = true,
                 _ => {}
             }
             k += 1;
         }
-        if depth != 0 || top_colon {
+        if depth != 0 {
             return None;
         }
         delay_end = k;
@@ -454,6 +450,12 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_min_typ_max_delay() {
+        let r = rewrite_intra_assignment_delays("v = # (2:10:17) 4'h5;\n");
+        assert_eq!(r, "v = $__xz_intra_delay( (2:10:17), 4'h5);\n");
+    }
+
+    #[test]
     fn rewrites_bare_event_identifier() {
         let s = "v = @ ev 4'h5;\nw = repeat (5) @top.ev 1'b1 && 1'b1;\n";
         let r = rewrite_intra_assignment_delays(s);
@@ -469,7 +471,6 @@ mod tests {
             "if (a <= 3) b = 1;\n",
             "#5 v = 1;\n",
             "a = b ## 2;\n",
-            "x = #(1:2:3) y;\n", // min:typ:max — parser keeps discarding
             "s = \"= #2 5;\";\n",
             "// v = #2 5;\n",
         ] {

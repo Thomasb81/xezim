@@ -133,6 +133,8 @@ mod lrm_pattern_matching;
 mod mailbox_method_blocking;
 #[path = "misc/method_call_chaining.rs"]
 mod method_call_chaining;
+#[path = "misc/min_typ_max_delays.rs"]
+mod min_typ_max_delays;
 #[path = "misc/monitor_on_change.rs"]
 mod monitor_on_change;
 #[path = "misc/monitor_percent_m_scope.rs"]
