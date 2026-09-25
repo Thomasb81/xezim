@@ -2701,6 +2701,10 @@ struct ClassMemberNames {
     static_methods: HashSet<String>,
     /// Every function/task key and each of its suffixes after a `.`.
     subroutine_suffixes: HashSet<String>,
+    /// Every class type/value parameter name.
+    params: HashSet<String>,
+    /// Every associative-array property name.
+    assoc_props: HashSet<String>,
 }
 
 /// `instance_assoc_member`'s class-only verdict for a bare name inside a
@@ -5867,10 +5871,11 @@ pub struct Simulator {
     unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// See `struct_prop_name_possible`.
     struct_capable_prop_names: std::cell::OnceCell<HashSet<String>>,
-    /// Every class type/value parameter name (see `resolve_type_param_with`).
-    class_param_names: std::cell::OnceCell<HashSet<String>>,
     /// See `class_member_names`.
     class_member_names_cell: std::cell::OnceCell<ClassMemberNames>,
+    /// See `member_string_keyed_unbound`.
+    #[allow(clippy::type_complexity)]
+    string_keyed_member_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<bool>>>>,
     /// See `method_defining_class`.
     #[allow(clippy::type_complexity)]
     method_def_cache: std::cell::RefCell<
@@ -9885,9 +9890,9 @@ impl Simulator {
             marker_key_scratch: String::new(),
             unpacked_struct_prop_names: std::cell::OnceCell::new(),
             struct_capable_prop_names: std::cell::OnceCell::new(),
-            class_param_names: std::cell::OnceCell::new(),
             class_member_names_cell: std::cell::OnceCell::new(),
             method_def_cache: std::cell::RefCell::new(HashMap::default()),
+            string_keyed_member_cache: std::cell::RefCell::new(HashMap::default()),
             covergroup_leaf_names: std::cell::OnceCell::new(),
             class_string_props: std::cell::RefCell::new(HashMap::default()),
             class_enclosing_cache: std::cell::RefCell::new(HashMap::default()),
@@ -90044,7 +90049,11 @@ impl Simulator {
         if let Some(pos) = name.find('#') {
             if let Ok(handle) = name[..pos].parse::<usize>() {
                 let member = &name[pos + 1..];
-                if let Some(Some(inst)) = self.heap.get(handle) {
+                if let Some(Some(inst)) = self
+                    .heap
+                    .get(handle)
+                    .filter(|_| self.class_member_names().assoc_props.contains(member))
+                {
                     // Borrowed chain walk: no String clone per ancestor.
                     let mut cur: Option<&str> = Some(inst.class_name.as_str());
                     while let Some(cn) = cur {
@@ -91024,6 +91033,9 @@ impl Simulator {
         let Some(Some(inst)) = self.heap.get(handle) else {
             return false;
         };
+        if let Some(v) = self.member_string_keyed_unbound(&inst.class_name, member) {
+            return v;
+        }
         // Type-param name → concrete, carried down the extends chain (each
         // hop rebinds the parent's params from `extends_type_args`).
         let mut carried: HashMap<String, String> = inst.type_bindings.clone();
@@ -91083,6 +91095,64 @@ impl Simulator {
             }
         }
         false
+    }
+
+    /// The per-instance part of `is_string_keyed_array` for `member` of an
+    /// object of class `class_name`, when no type-parameter binding can
+    /// change it: the declared key type is not a parameter name, so the
+    /// bindings carried down the chain never apply. `None` = depends on the
+    /// instance's bindings. Memoized per (class, member).
+    fn member_string_keyed_unbound(&self, class_name: &str, member: &str) -> Option<bool> {
+        if let Some(hit) = self
+            .string_keyed_member_cache
+            .borrow()
+            .get(class_name)
+            .and_then(|m| m.get(member))
+        {
+            return *hit;
+        }
+        let v = (|| {
+            let mut cur: Option<&str> = Some(class_name);
+            let mut level = 0;
+            while let Some(cn) = cur {
+                level += 1;
+                if level > 16 {
+                    return Some(false);
+                }
+                let cd = self.module.classes.get(cn)?;
+                if let Some(&is_str) = cd.assoc_properties.get(member) {
+                    if is_str {
+                        return Some(true);
+                    }
+                    let Some(kt) = cd.assoc_key_types.get(member) else {
+                        return Some(false);
+                    };
+                    if self.class_member_names().params.contains(kt.as_str()) {
+                        return None;
+                    }
+                    if kt == "string" {
+                        return Some(true);
+                    }
+                    return Some(self.module.typedef_types.get(kt).is_some_and(|dt| {
+                        matches!(
+                            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
+                            DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        )
+                    }));
+                }
+                cur = cd.extends.as_deref();
+            }
+            Some(false)
+        })();
+        self.string_keyed_member_cache
+            .borrow_mut()
+            .entry(class_name.to_string())
+            .or_default()
+            .insert(member.to_string(), v);
+        v
     }
 
     /// Warn once per associative array about an invalid (x/z) index.
@@ -117352,15 +117422,7 @@ impl Simulator {
         // parameter list (instance bindings are keyed by type-parameter
         // names too), so a name that no class declares as a parameter
         // resolves to nothing.
-        let params = self.class_param_names.get_or_init(|| {
-            let mut set: HashSet<String> = HashSet::default();
-            for cd in self.module.classes.values() {
-                set.extend(cd.type_param_names.iter().cloned());
-                set.extend(cd.param_order.iter().cloned());
-            }
-            set
-        });
-        if !params.contains(tn) {
+        if !self.class_member_names().params.contains(tn) {
             return None;
         }
         // When the ACTIVE specialization DIRECTLY declares `tn`, its sig
@@ -126965,11 +127027,16 @@ impl Simulator {
             let mut vif_props: HashSet<String> = HashSet::default();
             let mut methods: HashSet<String> = HashSet::default();
             let mut static_methods: HashSet<String> = HashSet::default();
+            let mut params: HashSet<String> = HashSet::default();
+            let mut assoc_props: HashSet<String> = HashSet::default();
             for cd in self.module.classes.values() {
                 statics.extend(cd.static_properties.iter().cloned());
                 vif_props.extend(cd.virtual_iface_properties.keys().cloned());
                 methods.extend(cd.methods.keys().cloned());
                 static_methods.extend(cd.static_methods.iter().cloned());
+                params.extend(cd.type_param_names.iter().cloned());
+                params.extend(cd.param_order.iter().cloned());
+                assoc_props.extend(cd.assoc_properties.keys().cloned());
             }
             let mut subroutine_suffixes: HashSet<String> = HashSet::default();
             for k in self.module.functions.keys().chain(self.module.tasks.keys()) {
@@ -126986,6 +127053,8 @@ impl Simulator {
                 methods,
                 static_methods,
                 subroutine_suffixes,
+                params,
+                assoc_props,
             }
         })
     }
