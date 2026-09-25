@@ -33,6 +33,8 @@ mod fst_roundtrip;
 mod fst_time_table_breakeven;
 #[path = "gates/interrupt_finalizes_dumps.rs"]
 mod interrupt_finalizes_dumps;
+#[path = "gates/nameless_udp_instance.rs"]
+mod nameless_udp_instance;
 #[path = "gates/opt_pass_equivalence.rs"]
 mod opt_pass_equivalence;
 #[path = "gates/packed_member_nba_compiles.rs"]
