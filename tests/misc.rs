@@ -201,6 +201,8 @@ mod select_semantics_11_5_1;
 mod shadow_name_matrix;
 #[path = "misc/spec_static_and_pkg_queue.rs"]
 mod spec_static_and_pkg_queue;
+#[path = "misc/struct_members_and_constant_targets.rs"]
+mod struct_members_and_constant_targets;
 #[path = "misc/svtb_suite.rs"]
 mod svtb_suite;
 #[path = "misc/unsized_decimal_wrap_warning.rs"]

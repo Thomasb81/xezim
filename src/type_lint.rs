@@ -22,6 +22,9 @@
 //! - §6.19: an enum's base type is an integer atom type, or an integer vector
 //!   type with one packed dimension at most; §7.2.1: every member of a packed
 //!   struct or union is packed.
+//! - A struct member reference names a member of the struct (§7.2), and an
+//!   assignment target is a variable or net, not a parameter or other
+//!   constant (§6.20).
 //!
 //! The same rules apply to declaration initializers, `return` values and
 //! subroutine input arguments, which are assignments too (§13.5).
@@ -1211,6 +1214,93 @@ impl<'a> Ck<'a> {
 
     // ---- checks ------------------------------------------------------------
 
+    /// §7.2: `s.m` names a member of struct `s`.
+    fn check_struct_members(&mut self, e: &Expression) {
+        let mut missing: Vec<(String, Span)> = Vec::new();
+        visit_expr(e, &mut |x| {
+            let (base, members): (Ty, Vec<&xezim_core::ast::Identifier>) = match &x.kind {
+                ExprKind::MemberAccess { expr, member } => (self.ty_of(expr), vec![member]),
+                ExprKind::Ident(h)
+                    if h.root.is_none()
+                        && h.path.len() > 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name != "this" =>
+                {
+                    match self.lookup_var(&h.path[0].name.name) {
+                        Some(t) => (t, h.path[1..].iter().map(|s| &s.name).collect()),
+                        None => return,
+                    }
+                }
+                _ => return,
+            };
+            let mut t = base;
+            for m in members {
+                if let Ty::Struct(st) = &t
+                    && !st.members.iter().any(|(n, _)| *n == m.name)
+                {
+                    missing.push((m.name.clone(), m.span));
+                    return;
+                }
+                t = self.member_ty(t, &m.name);
+            }
+        });
+        for (m, span) in missing {
+            self.report(
+                span,
+                format!("'{m}' is not a member of the struct or union (IEEE 1800-2017 §7.2)"),
+            );
+        }
+    }
+
+    /// A parameter, genvar or enum member (not a variable, and not a
+    /// block-level `static` that may be either).
+    fn is_definite_const(&self, n: &str) -> bool {
+        for l in self.stack.iter().rev() {
+            let s = l.get();
+            if s.vars.contains_key(n) {
+                return !s.nonconst.contains(n) && !s.unsure.contains(n);
+            }
+            if s.opaque {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// §6.20: a parameter, localparam, genvar or enum member is a constant and
+    /// cannot be assigned.
+    fn check_target_is_variable(&mut self, lv: &Expression) {
+        let mut cur = lv;
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. }
+                | ExprKind::MemberAccess { expr, .. }
+                | ExprKind::Paren(expr) => cur = expr,
+                ExprKind::Concatenation(xs) => {
+                    for x in xs {
+                        self.check_target_is_variable(x);
+                    }
+                    return;
+                }
+                ExprKind::Ident(h) if h.root.is_none() && !h.path.is_empty() => {
+                    let n = &h.path[0].name.name;
+                    if h.path.len() == 1 && self.is_definite_const(n) {
+                        self.report(
+                            h.path[0].name.span,
+                            format!(
+                                "'{n}' is a parameter or other constant, not a variable, and \
+                                 cannot be assigned (IEEE 1800-2017 §6.20)"
+                            ),
+                        );
+                    }
+                    return;
+                }
+                _ => return,
+            }
+        }
+    }
+
     fn report(&mut self, span: Span, msg: String) {
         let loc = xezim_core::elaborate::span_location_of(self.elab, span, &self.owner);
         self.errs.push(match loc {
@@ -1328,6 +1418,8 @@ impl<'a> Ck<'a> {
 
     fn check_assign(&mut self, lv: &Expression, rv: &Expression) {
         self.check_const_selects(lv);
+        self.check_struct_members(lv);
+        self.check_target_is_variable(lv);
         let lt = self.ty_of(lv);
         if lt == Ty::Unknown {
             return;
@@ -1397,6 +1489,7 @@ impl<'a> Ck<'a> {
 
     fn walk_expr(&mut self, e: &Expression) {
         self.check_const_selects(e);
+        self.check_struct_members(e);
         self.walk_value(e, true);
     }
 
@@ -2028,6 +2121,7 @@ impl<'a> Ck<'a> {
                 for ci in chain.iter().rev() {
                     for (n, t) in &ci.props {
                         scope.vars.insert(n.clone(), t.clone());
+                        scope.nonconst.insert(n.clone());
                     }
                     for (n, s) in &ci.methods {
                         scope.subs.insert(n.clone(), Some(s.clone()));
@@ -2522,7 +2616,7 @@ fn declare_package_items(ck: &mut Ck<'_>, items: &[PackageItem]) {
                 let t = ck.resolve(&d.data_type);
                 for dc in &d.declarators {
                     let vt = with_dims(t.clone(), &dc.dimensions);
-                    ck.top().vars.insert(dc.name.name.clone(), vt);
+                    ck.declare_value(&dc.name.name, vt);
                 }
             }
             PackageItem::Function(f) if f.name.scope.is_none() => {
