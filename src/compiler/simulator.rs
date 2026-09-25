@@ -2691,6 +2691,13 @@ impl<'a> IntoIterator for &'a PropMap {
     }
 }
 
+/// Property names some class declares with a given property kind; a name in
+/// none of them skips the per-class checks for that kind.
+struct ClassMemberNames {
+    statics: HashSet<String>,
+    vif_props: HashSet<String>,
+}
+
 /// `instance_assoc_member`'s class-only verdict for a bare name inside a
 /// method of a given runtime class (class tables are fixed at run time).
 enum MemberCollKind {
@@ -5855,6 +5862,15 @@ pub struct Simulator {
     unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// See `struct_prop_name_possible`.
     struct_capable_prop_names: std::cell::OnceCell<HashSet<String>>,
+    /// Every class type/value parameter name (see `resolve_type_param_with`).
+    class_param_names: std::cell::OnceCell<HashSet<String>>,
+    /// See `class_member_names`.
+    class_member_names_cell: std::cell::OnceCell<ClassMemberNames>,
+    /// See `method_defining_class`.
+    #[allow(clippy::type_complexity)]
+    method_def_cache: std::cell::RefCell<
+        HashMap<String, HashMap<String, Option<(String, Arc<crate::ast::decl::ClassMethod>)>>>,
+    >,
     /// Every covergroup key and its leaf after the last `::` (see
     /// `covergroup_def_for`).
     covergroup_leaf_names: std::cell::OnceCell<HashSet<String>>,
@@ -9864,6 +9880,9 @@ impl Simulator {
             marker_key_scratch: String::new(),
             unpacked_struct_prop_names: std::cell::OnceCell::new(),
             struct_capable_prop_names: std::cell::OnceCell::new(),
+            class_param_names: std::cell::OnceCell::new(),
+            class_member_names_cell: std::cell::OnceCell::new(),
+            method_def_cache: std::cell::RefCell::new(HashMap::default()),
             covergroup_leaf_names: std::cell::OnceCell::new(),
             class_string_props: std::cell::RefCell::new(HashMap::default()),
             class_enclosing_cache: std::cell::RefCell::new(HashMap::default()),
@@ -66060,7 +66079,11 @@ impl Simulator {
                     // bound → non-zero (the bound instance's hashed
                     // sentinel handle), unbound → 0 (null). Drives the
                     // `vif == null` / `vif != null` idiom.
-                    if let Some(Some(handle)) = self.this_stack.last() {
+                    if let Some(Some(handle)) = self
+                        .this_stack
+                        .last()
+                        .filter(|_| self.class_member_names().vif_props.contains(name.as_str()))
+                    {
                         let cls = self
                             .heap
                             .get(*handle)
@@ -66097,6 +66120,11 @@ impl Simulator {
                     // class-context name, one `extends` clone per ancestor
                     // level, and the property key).
                     let is_static_prop = match self.class_context_stack.last() {
+                        Some(Some(_))
+                            if !self.class_member_names().statics.contains(name.as_str()) =>
+                        {
+                            false
+                        }
                         Some(Some(ctx)) => {
                             let mut cur: Option<&str> = Some(ctx.as_str());
                             let mut found = false;
@@ -70124,29 +70152,32 @@ impl Simulator {
             // this type lookup bypassed it, so the whole-struct copy
             // silently declined and every member stayed x — while the
             // identical code at top level worked.
-            let dst = if self.p_elem_type_ref(&dst).is_none() {
-                match self.name_resolve_hint.borrow().clone() {
-                    Some(h) => {
-                        let scoped = format!("{}.{}", h, dst);
-                        if self.p_elem_type_ref(&scoped).is_some() {
-                            scoped
-                        } else {
-                            dst
-                        }
-                    }
-                    None => dst,
-                }
-            } else {
-                dst
-            };
             // Only a member-wise struct target needs its type owned;
             // every other assignment answers the predicate by borrow.
-            let spread_su =
-                self.p_elem_type_ref(&dst)
-                    .and_then(|dt| match self.resolve_dt_ref(&dt) {
+            // `None`: the name has no declared type at all.
+            let spread_of = |sim: &Self, name: &str| {
+                sim.p_elem_type_ref(name)
+                    .map(|dt| match sim.resolve_dt_ref(&dt) {
                         DataType::Struct(su) if Self::spreads_member_wise(su) => Some(su.clone()),
                         _ => None,
-                    });
+                    })
+            };
+            let (dst, spread_su) = match spread_of(self, &dst) {
+                Some(su) => (dst, su),
+                None => {
+                    let hint = self.name_resolve_hint.borrow().clone();
+                    match hint {
+                        Some(h) => {
+                            let scoped = format!("{}.{}", h, dst);
+                            match spread_of(self, &scoped) {
+                                Some(su) => (scoped, su),
+                                None => (dst, None),
+                            }
+                        }
+                        None => (dst, None),
+                    }
+                }
+            };
             if let Some(su) = spread_su {
                 if let Some(src) = self.flat_member_name(rvalue) {
                     if src != dst && self.struct_storage_exists(&src, &su) {
@@ -116919,8 +116950,7 @@ impl Simulator {
     /// inside a `Mk#(Base)` method), else None (so a plain class name passes
     /// through unchanged at the call site).
     fn resolve_type_param_binding(&self, tn: &str) -> Option<String> {
-        let spec = self.current_spec.clone();
-        self.resolve_type_param_with(tn, &spec)
+        self.resolve_type_param_with(tn, &self.current_spec)
     }
 
     /// Resolve a class VALUE parameter `name` from the active specialization
@@ -117299,6 +117329,21 @@ impl Simulator {
     /// type_param_names picks the matching comma element of `sig`). E.g.
     /// `resource#(T)` where `T` is `config_db#(int)`'s own param → `int`.
     fn resolve_type_param_with(&self, tn: &str, spec: &Option<(String, String)>) -> Option<String> {
+        // Every answer below comes from `tn`'s position in some class's
+        // parameter list (instance bindings are keyed by type-parameter
+        // names too), so a name that no class declares as a parameter
+        // resolves to nothing.
+        let params = self.class_param_names.get_or_init(|| {
+            let mut set: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                set.extend(cd.type_param_names.iter().cloned());
+                set.extend(cd.param_order.iter().cloned());
+            }
+            set
+        });
+        if !params.contains(tn) {
+            return None;
+        }
         // When the ACTIVE specialization DIRECTLY declares `tn`, its sig
         // argument is authoritative over an instance's cached binding. The
         // cached `this.type_bindings` can be stale for a parameterized type
@@ -126895,6 +126940,54 @@ impl Simulator {
         method
     }
 
+    fn class_member_names(&self) -> &ClassMemberNames {
+        self.class_member_names_cell.get_or_init(|| {
+            let mut statics: HashSet<String> = HashSet::default();
+            let mut vif_props: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                statics.extend(cd.static_properties.iter().cloned());
+                vif_props.extend(cd.virtual_iface_properties.keys().cloned());
+            }
+            ClassMemberNames { statics, vif_props }
+        })
+    }
+
+    /// The class on `start_class`'s chain that defines function/task
+    /// `method_name`, with the method; memoized per (start class, method).
+    fn method_defining_class(
+        &self,
+        start_class: &str,
+        method_name: &str,
+    ) -> Option<(String, Arc<crate::ast::decl::ClassMethod>)> {
+        if let Some(hit) = self
+            .method_def_cache
+            .borrow()
+            .get(start_class)
+            .and_then(|m| m.get(method_name))
+        {
+            return hit.clone();
+        }
+        let mut found = None;
+        let mut probe: Option<&str> = Some(start_class);
+        while let Some(cn) = probe {
+            if let Some(m) = self.cached_class_method(cn, method_name) {
+                found = Some((cn.to_string(), m));
+                break;
+            }
+            probe = self
+                .module
+                .classes
+                .get(cn)
+                .and_then(|class_def| class_def.extends.as_deref());
+        }
+        self.method_def_cache
+            .borrow_mut()
+            .entry(start_class.to_string())
+            .or_default()
+            .insert(method_name.to_string(), found.clone());
+        found
+    }
+
     /// The string properties of `class_name` and its ancestors.
     fn class_string_props_of(&self, class_name: &str) -> std::rc::Rc<Vec<String>> {
         if let Some(hit) = self.class_string_props.borrow().get(class_name) {
@@ -126951,24 +127044,11 @@ impl Simulator {
         // hottest path in a testbench run (4.5% of the run's memcmp sat under
         // this function). The search is pure lookup, so it can hold a borrow;
         // only the class that actually defines the method is materialized.
-        let mut cur_class: Option<String> = {
-            let mut found: Option<String> = None;
-            let mut probe: Option<&str> = Some(start_class);
-            while let Some(cn) = probe {
-                if self.cached_class_method(cn, method_name).is_some() {
-                    found = Some(cn.to_string());
-                    break;
-                }
-                probe = self
-                    .module
-                    .classes
-                    .get(cn)
-                    .and_then(|class_def| class_def.extends.as_deref());
-            }
-            found
-        };
+        let found = self.method_defining_class(start_class, method_name);
+        let mut found_method = found.as_ref().map(|(_, m)| m.clone());
+        let mut cur_class: Option<String> = found.map(|(cn, _)| cn);
         while let Some(cname) = cur_class {
-            let method_opt = self.cached_class_method(&cname, method_name);
+            let method_opt = found_method.take();
             cur_class = None;
             if let Some(method) = method_opt {
                 let (ports, body) = match &method.kind {
