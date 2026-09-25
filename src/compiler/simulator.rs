@@ -5878,6 +5878,9 @@ pub struct Simulator {
     struct_capable_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// See `class_member_names`.
     class_member_names_cell: std::cell::OnceCell<ClassMemberNames>,
+    /// Every bare name a `__vif_local__` key was ever created for (never
+    /// shrinks): a name outside it has no such key.
+    vif_local_names: HashSet<String>,
     /// See `nonvirtual_target_class`.
     #[allow(clippy::type_complexity)]
     nonvirtual_target_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
@@ -9899,6 +9902,7 @@ impl Simulator {
             unpacked_struct_prop_names: std::cell::OnceCell::new(),
             struct_capable_prop_names: std::cell::OnceCell::new(),
             class_member_names_cell: std::cell::OnceCell::new(),
+            vif_local_names: HashSet::default(),
             method_def_cache: std::cell::RefCell::new(HashMap::default()),
             string_keyed_member_cache: std::cell::RefCell::new(HashMap::default()),
             nonvirtual_target_cache: std::cell::RefCell::new(HashMap::default()),
@@ -105211,6 +105215,7 @@ impl Simulator {
                     self.signals.remove(&key);
                 } else if let Some(nm) = self.resolve_vif_rhs_name_strict(rvalue) {
                     let key = make_key(is_prop_of);
+                    self.vif_local_names.insert(lname.to_string());
                     self.signals.insert(key, Value::from_string(&nm));
                 }
             }
@@ -105260,6 +105265,9 @@ impl Simulator {
         match &e.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let raw = &h.path[0].name.name;
+                if !self.vif_name_possible(raw) {
+                    return None;
+                }
                 if let Some(th) = self.this_stack.last().copied().flatten() {
                     if let Some((b, _)) = self.virtual_iface_bindings.get(&(th, raw.clone())) {
                         return Some(Some(b.clone()));
@@ -105340,6 +105348,9 @@ impl Simulator {
     /// `obj.prop` classification for `vif_operand` — engages only when the
     /// receiver's class DECLARES `prop` as a virtual interface.
     fn vif_operand_obj_prop(&self, obj: &str, prop: &str) -> Option<Option<String>> {
+        if !self.class_member_names().vif_props.contains(prop) {
+            return None;
+        }
         let oh = if obj == "this" {
             self.this_stack.last().copied().flatten().unwrap_or(0)
         } else {
@@ -105409,9 +105420,20 @@ impl Simulator {
             .collect();
         let mut saved = Vec::with_capacity(formals.len());
         for ((name, _), nm) in formals.iter().zip(bound) {
+            // No key was ever made for this name and none is made now: the
+            // removal would find nothing (the store generation still moves,
+            // as it did). An empty key marks the slot for the exit.
+            if nm.is_none() && !self.vif_local_names.contains(*name) {
+                bump_store_gen();
+                saved.push((String::new(), None));
+                continue;
+            }
             let key = format!("__vif_local__{}", name);
             let prev = match nm {
-                Some(nm) => self.signals.insert(key.clone(), Value::from_string(&nm)),
+                Some(nm) => {
+                    self.vif_local_names.insert(name.to_string());
+                    self.signals.insert(key.clone(), Value::from_string(&nm))
+                }
                 None => self.signals.remove(&key),
             };
             saved.push((key, prev));
@@ -105424,15 +105446,29 @@ impl Simulator {
     fn vif_formals_exit(
         &mut self,
         saved: Vec<(String, Option<Value>)>,
+        formals: &[(&str, Option<&Expression>)],
         outputs: &[&str],
     ) -> HashMap<String, String> {
         let mut ended: HashMap<String, String> = HashMap::default();
         for pn in outputs {
+            if !self.vif_local_names.contains(*pn) {
+                continue;
+            }
             if let Some(v) = self.signals.get(&format!("__vif_local__{}", pn)) {
                 ended.insert(pn.to_string(), v.to_sv_string());
             }
         }
-        for (key, prev) in saved {
+        for ((key, prev), (name, _)) in saved.into_iter().zip(formals.iter()) {
+            // Untouched on entry: the key exists only if the body made one.
+            let key = if key.is_empty() {
+                if !self.vif_local_names.contains(*name) {
+                    bump_store_gen();
+                    continue;
+                }
+                format!("__vif_local__{}", name)
+            } else {
+                key
+            };
             match prev {
                 Some(v) => {
                     self.signals.insert(key, v);
@@ -105467,6 +105503,16 @@ impl Simulator {
     }
 
     fn resolve_vif_rhs_name_strict(&self, rvalue: &Expression) -> Option<String> {
+        // A bare name every vif source misses resolves to itself, which is
+        // then no interface instance.
+        if let ExprKind::Ident(h) = &rvalue.kind {
+            if h.path.len() == 1
+                && h.path[0].selects.is_empty()
+                && !self.vif_name_possible(&h.path[0].name.name)
+            {
+                return None;
+            }
+        }
         // `iface.member` where the dotted name is a real SIGNAL is a value
         // read, not a modport view — `dd1 = u.d` must not classify dd1 as a
         // vif (a modport view is never a signal).
@@ -106215,15 +106261,18 @@ impl Simulator {
         if self.virtual_iface_bindings.is_empty() {
             return None;
         }
+        // An ELEMENT key (`va[0]`) checks the BASE property name but binds
+        // per element (§25.10).
+        let prop_base = root.split('[').next().unwrap_or(root);
+        if !self.class_member_names().vif_props.contains(prop_base) {
+            return None;
+        }
         let this_h = self.this_stack.last().copied().flatten()?;
         let cn: &str = self
             .heap
             .get(this_h)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.as_str())?;
-        // An ELEMENT key (`va[0]`) checks the BASE property name but binds
-        // per element (§25.10).
-        let prop_base = root.split('[').next().unwrap_or(root);
         let has = self.module.classes.get(cn).is_some_and(|c| {
             !c.virtual_iface_properties.is_empty()
                 && c.virtual_iface_properties.contains_key(prop_base)
@@ -106394,7 +106443,16 @@ impl Simulator {
                 // element, so the whole `name[idx]` key resolves where the
                 // bare base never will.
                 if let ExprKind::Ident(h) = &expr.kind {
-                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    // `vif_bound_for_root` of an element key can only hit
+                    // through an alias or a vif property base name.
+                    if h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && (self.iface_alias_possible()
+                            || self
+                                .class_member_names()
+                                .vif_props
+                                .contains(h.path[0].name.name.as_str()))
+                    {
                         if let Some(idx) = self.eval_scalar_self(index) {
                             let key = format!("{}[{}]", h.path[0].name.name, idx);
                             if let Some(bound) = self.vif_bound_for_root(&key) {
@@ -106460,6 +106518,27 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// May some interface alias exist for any name (an alias frame entry or
+    /// a module-level vif variable alias)?
+    #[inline]
+    fn iface_alias_possible(&self) -> bool {
+        self.local_iface_aliases
+            .last()
+            .is_some_and(|m| !m.is_empty())
+            || !self.viface_var_aliases.is_empty()
+    }
+
+    /// Could the bare name `raw` resolve through any virtual-interface
+    /// source: an alias, a vif property (binding keys are vif properties),
+    /// a `__vif_local__` key, or an interface instance of that name? When
+    /// false every vif lookup on it misses.
+    fn vif_name_possible(&self, raw: &str) -> bool {
+        self.iface_alias_possible()
+            || self.class_member_names().vif_props.contains(raw)
+            || self.vif_local_names.contains(raw)
+            || self.is_interface_instance(raw)
     }
 
     fn iface_alias_for(&self, name: &str) -> Option<String> {
@@ -114550,7 +114629,7 @@ impl Simulator {
             HashMap::default()
         } else {
             let outs: Vec<&str> = writebacks.iter().map(|(pn, _, _)| pn.as_str()).collect();
-            self.vif_formals_exit(vif_saved, &outs)
+            self.vif_formals_exit(vif_saved, &vif_formals, &outs)
         };
         for (pn, v, caller) in writebacks {
             if let Some(nm) = vif_ended.get(&pn) {
@@ -115205,6 +115284,7 @@ impl Simulator {
                 .and_then(|a| self.resolve_vif_rhs_name_strict(a))
             {
                 Some(nm) => {
+                    self.vif_local_names.insert(port.name.name.clone());
                     self.signals.insert(key, Value::from_string(&nm));
                 }
                 None => {
@@ -128202,7 +128282,7 @@ impl Simulator {
                     self.writeback_array_args(&array_writebacks);
                 }
                 let outs: Vec<&str> = writebacks.iter().map(|(pn, _, _)| pn.as_str()).collect();
-                let vif_ended = self.vif_formals_exit(vif_saved, &outs);
+                let vif_ended = self.vif_formals_exit(vif_saved, &vif_formals, &outs);
                 for (pn, v, caller) in writebacks {
                     if let Some(nm) = vif_ended.get(&pn) {
                         self.vif_bind_actual(&caller, nm);
