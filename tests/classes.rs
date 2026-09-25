@@ -186,6 +186,8 @@ mod pure_sv_phase_objection;
 mod randomize_inside_range;
 #[path = "classes/randomize_member_subset.rs"]
 mod randomize_member_subset;
+#[path = "classes/randomize_with_this_and_subset.rs"]
+mod randomize_with_this_and_subset;
 #[path = "classes/scope_randomize_dist_and_foreach.rs"]
 mod scope_randomize_dist_and_foreach;
 #[path = "classes/shadowed_property_storage.rs"]

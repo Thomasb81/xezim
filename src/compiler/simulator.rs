@@ -92774,41 +92774,73 @@ impl Simulator {
                     // check rather than being patched on afterwards.
                     let handle = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
                     if handle != 0 {
-                        // §18.7/§18.7.1: caller-scope operands (the caller's
-                        // locals and class members, `local::` names) are
-                        // state variables of the solve — bind them now,
-                        // while `this` is still the caller.
-                        let items_vec = self.freeze_caller_scope_refs(
+                        return self.randomize_object_with(
                             handle,
                             Self::plain_ident_name(expr),
+                            args,
                             constraints,
                         );
-                        let items: &[crate::ast::decl::ConstraintItem] =
-                            items_vec.as_deref().unwrap_or(constraints);
-                        // §18.11 `obj.randomize(null) with {...}` — in-line
-                        // constraint CHECKER: nothing is randomized, the
-                        // current values are checked against the constraints.
-                        if Self::is_randomize_check_args(args) {
-                            return self.exec_randomize_check(handle, items);
-                        }
-                        // §18.7: the inline constraints join the class's set
-                        // for this call (sizing, element solving, acceptance).
-                        self.obj_rng_stack.push(handle);
-                        let prev_receiver = self.rand_receiver.take();
-                        if let Some(rn) = Self::plain_ident_name(expr) {
-                            self.rand_receiver = Some(rn);
-                        }
-                        let r = self.exec_randomize_inner(handle, items);
-                        self.rand_receiver = prev_receiver;
-                        self.obj_rng_stack.pop();
-                        return r;
                     }
                     return Value::zero(32);
+                }
+            }
+            // §18.7: a bare `randomize(…) with {…}` in a class method is
+            // `this.randomize(…) with {…}`; evaluating the plain call dropped
+            // the inline constraints.
+            if let ExprKind::Ident(h) = &func.kind {
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && h.path[0].name.name == "randomize"
+                {
+                    if let Some(Some(this_h)) = self.this_stack.last().copied() {
+                        return self.randomize_object_with(this_h, None, args, constraints);
+                    }
                 }
             }
         }
         // Fallback: just evaluate the underlying call.
         self.eval_expr(call)
+    }
+
+    /// §18.7 `obj.randomize(args) with {…}` on the object `handle`;
+    /// `receiver` is the plain name `obj` was written as.
+    fn randomize_object_with(
+        &mut self,
+        handle: usize,
+        receiver: Option<String>,
+        args: &[Expression],
+        constraints: &[crate::ast::decl::ConstraintItem],
+    ) -> Value {
+        // §18.7/§18.7.1: caller-scope operands (the caller's locals and class
+        // members, `local::` names) are state variables of the solve — bind
+        // them now, while `this` is still the caller.
+        let items_vec = self.freeze_caller_scope_refs(handle, receiver.clone(), constraints);
+        let items: &[crate::ast::decl::ConstraintItem] =
+            items_vec.as_deref().unwrap_or(constraints);
+        // §18.11 `obj.randomize(null) with {...}` — in-line constraint
+        // CHECKER: nothing is randomized, the current values are checked
+        // against the constraints.
+        if Self::is_randomize_check_args(args) {
+            return self.exec_randomize_check(handle, items);
+        }
+        // §18.11: `obj.randomize(a, b) with {…}` solves only the named
+        // members; every other one is a state variable of the inline block.
+        let subset: Option<HashSet<String>> = args
+            .iter()
+            .map(Self::plain_ident_name)
+            .collect::<Option<HashSet<String>>>()
+            .filter(|s| !s.is_empty());
+        // §18.7: the inline constraints join the class's set for this call
+        // (sizing, element solving, acceptance).
+        self.obj_rng_stack.push(handle);
+        let prev_receiver = std::mem::replace(&mut self.rand_receiver, receiver);
+        let prev_subset = std::mem::replace(&mut self.randomize_subset, subset);
+        let r = self.exec_randomize_inner(handle, items);
+        self.randomize_subset = prev_subset;
+        self.rand_receiver = prev_receiver;
+        self.obj_rng_stack.pop();
+        r
     }
 
     /// §18.11 — is this a `randomize(null)` call (the in-line constraint
