@@ -25,8 +25,8 @@ enum Bind {
 }
 
 pub(super) struct CallerScope {
-    /// Properties and value parameters of the object's class chain.
-    obj_names: HashSet<String>,
+    /// Class of the randomized object.
+    obj_class: String,
     /// Plain name of the receiver (`req` in `req.randomize()`), which names
     /// the object itself.
     receiver: Option<String>,
@@ -45,18 +45,7 @@ impl Simulator {
         receiver: Option<String>,
         items: &[ConstraintItem],
     ) -> Option<Vec<ConstraintItem>> {
-        let class_name = self.heap.get(handle)?.as_ref()?.class_name.clone();
-        let mut obj_names: HashSet<String> = HashSet::default();
-        let mut cur = Some(class_name);
-        while let Some(cn) = cur {
-            let Some(cd) = self.module.classes.get(&cn) else {
-                break;
-            };
-            obj_names.extend(cd.properties.keys().cloned());
-            obj_names.extend(cd.static_properties.iter().cloned());
-            obj_names.extend(cd.param_defaults.iter().map(|(n, _)| n.clone()));
-            cur = cd.extends.clone();
-        }
+        let obj_class = self.heap.get(handle)?.as_ref()?.class_name.clone();
         let caller_class = match self.this_stack.last().copied().flatten() {
             Some(h) => self
                 .heap
@@ -66,7 +55,7 @@ impl Simulator {
             None => self.class_context_stack.last().cloned().flatten(),
         };
         let cx = CallerScope {
-            obj_names,
+            obj_class,
             receiver,
             caller_class,
         };
@@ -84,21 +73,23 @@ impl Simulator {
         Some(out)
     }
 
-    /// Is `name` a member of the caller's class chain?
-    fn caller_class_has(&self, cx: &CallerScope, name: &str) -> bool {
-        let mut cur = cx.caller_class.clone();
+    /// Does the class chain of `class` declare `name` (a property or a
+    /// value parameter)?
+    fn class_chain_declares(&self, class: Option<&str>, name: &str) -> bool {
+        let mut cur = class;
         while let Some(cn) = cur {
-            let Some(cd) = self.module.classes.get(&cn) else {
+            let Some(cd) = self.module.classes.get(cn) else {
                 return false;
             };
             if cd.properties.contains_key(name)
                 || cd.static_properties.contains(name)
                 || cd.queue_properties.contains_key(name)
                 || cd.assoc_properties.contains_key(name)
+                || cd.param_defaults.iter().any(|(n, _)| n == name)
             {
                 return true;
             }
-            cur = cd.extends.clone();
+            cur = cd.extends.as_deref();
         }
         false
     }
@@ -118,12 +109,12 @@ impl Simulator {
             || n == "super"
             || bound.iter().any(|b| b == n)
             || cx.receiver.as_deref() == Some(n)
-            || cx.obj_names.contains(n)
+            || self.class_chain_declares(Some(&cx.obj_class), n)
         {
             return Bind::Object;
         }
         if self.local_stack.last().is_some_and(|f| f.contains_key(n))
-            || self.caller_class_has(cx, n)
+            || self.class_chain_declares(cx.caller_class.as_deref(), n)
         {
             return Bind::Caller;
         }
