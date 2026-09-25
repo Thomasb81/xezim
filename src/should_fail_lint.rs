@@ -148,6 +148,7 @@ fn check_unit(
     check_param_value_refs(u.params, u.items, is_top, pkg_names, elab, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
+    check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
 }
 
 /// Classes can appear nested inside module/interface/program bodies.
@@ -2502,6 +2503,53 @@ fn check_subroutine_range_idents(
                 check(&t.name.name.name, dts, &t.items, errs);
             }
             _ => {}
+        }
+    }
+}
+
+/// §23.2.2.1: each name in a non-ANSI port list is declared in the module
+/// body with a port direction (or as an interface port). A net or variable
+/// declaration alone does not make it a port.
+fn check_nonansi_ports_declared(
+    module: &str,
+    ports: &PortList,
+    items: &[ModuleItem],
+    errs: &mut Vec<String>,
+) {
+    let PortList::NonAnsi(names) = ports else {
+        return;
+    };
+    // An unparsable UDP falls back to a body-less module stub.
+    if items.is_empty() {
+        return;
+    }
+    let mut declared = HashSet::new();
+    for it in items {
+        match it {
+            ModuleItem::PortDeclaration(d) => {
+                declared.extend(d.declarators.iter().map(|d| d.name.name.as_str()))
+            }
+            // `intf_t bus;` / `intf_t.mp bus;`: a non-ANSI interface port.
+            ModuleItem::DataDeclaration(d)
+                if matches!(
+                    d.data_type,
+                    DataType::TypeReference { .. } | DataType::Interface { .. }
+                ) =>
+            {
+                declared.extend(d.declarators.iter().map(|d| d.name.name.as_str()))
+            }
+            _ => {}
+        }
+    }
+    for n in names {
+        // `__xz_*` names stand in for null ports.
+        if !n.name.is_empty() && !n.name.starts_with("__xz_") && !declared.contains(n.name.as_str())
+        {
+            errs.push(format!(
+                "port '{}' of module '{module}' has no input, output or inout declaration \
+                 (LRM 1800-2017 §23.2.2.1)",
+                n.name
+            ));
         }
     }
 }

@@ -97,6 +97,8 @@ mod nested_interface_struct_ports;
 mod nested_member_in_instance;
 #[path = "hierarchy/nonansi_port_completion.rs"]
 mod nonansi_port_completion;
+#[path = "hierarchy/nonansi_port_declarations.rs"]
+mod nonansi_port_declarations;
 #[path = "hierarchy/nonansi_port_expressions.rs"]
 mod nonansi_port_expressions;
 #[path = "hierarchy/nonansi_port_redeclaration.rs"]
