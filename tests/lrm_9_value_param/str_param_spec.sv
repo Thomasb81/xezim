@@ -27,8 +27,8 @@ module top;
     if (v == 7)            $display("INT_PASS %0d", v);
     else                   $display("INT_FAIL got=%0d", v);
 
-    // Negative-space: default values when NOT specialized.
-    s = Wrapper::type_name();
+    // Negative-space: the default specialization keeps the default values.
+    s = Wrapper#()::type_name();
     if (s == "<unknown>")  $display("DEF_PASS '%s'", s);
     else                   $display("DEF_FAIL got='%s'", s);
   end

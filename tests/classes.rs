@@ -55,6 +55,8 @@ mod memory_tasks_fixed_property;
 mod nested_same_named_ref_assoc_formal;
 #[path = "classes/param_type_binding_resolves_enclosing_value_param.rs"]
 mod param_type_binding_resolves_enclosing_value_param;
+#[path = "classes/parameterized_class_scope.rs"]
+mod parameterized_class_scope;
 #[path = "classes/pure_constraint_implemented.rs"]
 mod pure_constraint_implemented;
 #[path = "classes/randomize_args_name_object_members.rs"]

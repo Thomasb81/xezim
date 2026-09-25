@@ -156,6 +156,7 @@ fn check_unit(
     check_imported_hier_refs(defs, u.items, pkg_decls, errs);
     let classes = visible_classes(defs, u.items);
     check_inherited_local_access(&classes, u.items, errs);
+    check_unspecialized_class_scope(&classes, u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -3560,6 +3561,45 @@ fn check_inherited_local_access(
                 ));
             }
         }
+    }
+}
+
+/// §8.25.1: outside its own declaration, a parameterized class is named with
+/// a parameter value list before `::` (`par_cls#()::b`), never bare.
+fn check_unspecialized_class_scope(
+    classes: &HashMap<&str, &ClassDeclaration>,
+    items: &[ModuleItem],
+    errs: &mut Vec<String>,
+) {
+    // Names the module declares as something other than a class.
+    let mut own = module_own_names(&PortList::Empty, &[], items);
+    for it in items {
+        if let ModuleItem::ClassDeclaration(c) = it {
+            own.remove(c.name.name.as_str());
+        }
+    }
+    let mut hits: Vec<String> = Vec::new();
+    module_exprs(items, &mut |e| {
+        for_each_expr(e, &mut |x| {
+            if let ExprKind::MemberAccess { expr, .. } = &x.kind
+                && let ExprKind::Ident(h) = &expr.kind
+                && h.path.len() == 1
+                && h.path[0].selects.is_empty()
+                && let n = h.path[0].name.name.as_str()
+                && classes.get(n).is_some_and(|c| !c.params.is_empty())
+                && !own.contains(n)
+            {
+                hits.push(n.to_string());
+            }
+        })
+    });
+    hits.sort();
+    hits.dedup();
+    for n in hits {
+        errs.push(format!(
+            "parameterized class '{n}' needs a parameter value list (`{n}#(...)::`) before \
+             `::` (LRM 1800-2017 §8.25.1)"
+        ));
     }
 }
 
