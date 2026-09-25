@@ -118540,11 +118540,45 @@ impl Simulator {
     /// with `rand_mode(0)`), classified by kind. Fixed unpacked arrays are
     /// included so `unique {}` / strict checking can see them, but their
     /// element seeding stays with the legacy enum-pool pass.
+    /// §18.11/§18.13: the members of one class that this `randomize()`
+    /// draws — its `rand`/`randc` members whose rand_mode is on or, for
+    /// `randomize(a, b)`, exactly the members named, declared `rand` or not
+    /// (the argument list overrides rand_mode for the call).
+    fn randomize_members(
+        &self,
+        cd: &crate::compiler::elaborate::ElaboratedClass,
+        rand_disabled: &HashSet<String>,
+    ) -> Vec<String> {
+        match &self.randomize_subset {
+            Some(sub) => {
+                let mut out: Vec<String> = cd
+                    .random_properties
+                    .iter()
+                    .filter(|p| sub.contains(*p))
+                    .cloned()
+                    .collect();
+                out.extend(
+                    cd.property_order
+                        .iter()
+                        .filter(|p| sub.contains(*p) && !cd.random_properties.contains(*p))
+                        .cloned(),
+                );
+                out
+            }
+            None if rand_disabled.contains("*") => Vec::new(),
+            None => cd
+                .random_properties
+                .iter()
+                .filter(|p| !rand_disabled.contains(*p))
+                .cloned()
+                .collect(),
+        }
+    }
+
     fn collect_rand_colls(
         &self,
         handle: usize,
         rand_disabled: &HashSet<String>,
-        rand_all_off: bool,
         constraints: &[ClassConstraint],
     ) -> Vec<RandColl> {
         let mut out: Vec<RandColl> = Vec::new();
@@ -118558,8 +118592,8 @@ impl Simulator {
             let Some(cd) = self.module.classes.get(&cn) else {
                 break;
             };
-            for prop in &cd.random_properties {
-                if rand_all_off || rand_disabled.contains(prop) || !seen.insert(prop.clone()) {
+            for prop in &self.randomize_members(cd, rand_disabled) {
+                if !seen.insert(prop.clone()) {
                     continue;
                 }
                 let scoped = format!("{}#{}", handle, prop);
@@ -120446,6 +120480,17 @@ impl Simulator {
         r
     }
 
+    /// §18.4/§18.5.9: randomize the object behind a rand handle member. A
+    /// `randomize(a, b)` member list names the outer object's members only;
+    /// the inner object draws all of its own.
+    fn randomize_nested(&mut self, sub: usize) {
+        let subset = self.randomize_subset.take();
+        self.randomize_depth += 1;
+        self.exec_randomize(sub);
+        self.randomize_depth -= 1;
+        self.randomize_subset = subset;
+    }
+
     /// Every `cond -> consequent` item of the class constraints, with
     /// `Block`/`Soft` nesting flattened (top level and inside blocks).
     fn class_implications<'a>(
@@ -120994,7 +121039,6 @@ impl Simulator {
             .get(&handle)
             .cloned()
             .unwrap_or_default();
-        let rand_all_off = rand_disabled.contains("*");
         let con_all_off = constraint_disabled.contains("*");
         // rand prop name -> enum type name, for props whose declared type is an
         // enum. Used so randomization picks a *valid* member (e.g. a riscv_reg_t
@@ -121031,11 +121075,7 @@ impl Simulator {
         let mut cur = Some(class_name.clone());
         while let Some(cname) = cur {
             if let Some(class_def) = self.module.classes.get(&cname) {
-                for prop in &class_def.random_properties {
-                    // §18.13: skip rand vars that have rand_mode(0).
-                    if rand_all_off || rand_disabled.contains(prop) {
-                        continue;
-                    }
+                for prop in &self.randomize_members(class_def, &rand_disabled) {
                     let enum_t = class_def
                         .properties
                         .get(prop)
@@ -121192,8 +121232,7 @@ impl Simulator {
         }
 
         // Rand collection members (dynamic arrays, queues, associative arrays).
-        let rand_colls =
-            self.collect_rand_colls(handle, &rand_disabled, rand_all_off, &constraints);
+        let rand_colls = self.collect_rand_colls(handle, &rand_disabled, &constraints);
         // `unique {c}` items naming one of those collections (§18.5.5).
         let unique_colls: Vec<RandColl> = {
             let mut out: Vec<RandColl> = Vec::new();
@@ -121293,12 +121332,6 @@ impl Simulator {
         let unpacked_names: HashSet<String> =
             unpacked_agg_props.iter().map(|(p, _)| p.clone()).collect();
         rand_props.retain(|(n, _)| !rand_obj_props.contains(n) && !unpacked_names.contains(n));
-        // §18.11 member subset: everything not named keeps its current value.
-        if let Some(sub) = self.randomize_subset.clone() {
-            rand_props.retain(|(n, _)| sub.contains(n));
-            rand_obj_props.retain(|n| sub.contains(n));
-            unpacked_agg_props.retain(|(p, _)| sub.contains(p));
-        }
         for (n, w) in rand_props.iter_mut() {
             if let Some(tw) = packed_agg_props.get(n) {
                 *w = *tw;
@@ -121508,9 +121541,7 @@ impl Simulator {
                                     && self.randomize_depth < 8
                                     && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
                                 {
-                                    self.randomize_depth += 1;
-                                    self.exec_randomize(sub);
-                                    self.randomize_depth -= 1;
+                                    self.randomize_nested(sub);
                                 }
                             }
                         }
@@ -121527,9 +121558,7 @@ impl Simulator {
                                     && self.randomize_depth < 8
                                     && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
                                 {
-                                    self.randomize_depth += 1;
-                                    self.exec_randomize(sub);
-                                    self.randomize_depth -= 1;
+                                    self.randomize_nested(sub);
                                 }
                             }
                         }
@@ -121548,9 +121577,7 @@ impl Simulator {
                     && self.randomize_depth < 8
                     && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
                 {
-                    self.randomize_depth += 1;
-                    self.exec_randomize(sub);
-                    self.randomize_depth -= 1;
+                    self.randomize_nested(sub);
                 }
             }
 
