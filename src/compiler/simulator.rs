@@ -2705,6 +2705,8 @@ struct ClassMemberNames {
     params: HashSet<String>,
     /// Every associative-array property name.
     assoc_props: HashSet<String>,
+    /// Every `string` property name.
+    string_props: HashSet<String>,
 }
 
 /// `instance_assoc_member`'s class-only verdict for a bare name inside a
@@ -45634,10 +45636,14 @@ impl Simulator {
                 if inherited_unchanged {
                     continue;
                 }
-                if !parent_frames[i].contains_key(k) {
-                    continue;
+                match parent_frames[i].get_mut(k) {
+                    Some(slot) => {
+                        if slot != v {
+                            *slot = v.clone();
+                        }
+                    }
+                    None => continue,
                 }
-                parent_frames[i].insert(k.clone(), v.clone());
             }
         }
     }
@@ -67217,9 +67223,13 @@ impl Simulator {
                 // INTEGRAL comparison per §11.4 (the literal is treated
                 // as a packed value), and forcing string semantics on it
                 // corrupts code such as hierarchical scope-string walking.
+                // Both string probes below ask the same questions of an
+                // unchanged state; answer each at most once.
+                let mut left_is_str: Option<bool> = None;
+                let mut right_is_str: Option<bool> = None;
                 if matches!(op, BinaryOp::Eq | BinaryOp::Neq)
-                    && self.expr_is_string_valued(left)
-                    && self.expr_is_string_valued(right)
+                    && *left_is_str.get_or_insert_with(|| self.expr_is_string_valued(left))
+                    && *right_is_str.get_or_insert_with(|| self.expr_is_string_valued(right))
                 {
                     let ls = l.to_sv_string();
                     let rs = r.to_sv_string();
@@ -67283,7 +67293,8 @@ impl Simulator {
                         | BinaryOp::Geq
                         | BinaryOp::Eq
                         | BinaryOp::Neq
-                ) && (self.expr_is_string_valued(left) || self.expr_is_string_valued(right))
+                ) && (left_is_str.unwrap_or_else(|| self.expr_is_string_valued(left))
+                    || right_is_str.unwrap_or_else(|| self.expr_is_string_valued(right)))
                 {
                     // §6.16: string comparison is by TEXT. Equality also goes
                     // through here because an out-of-bounds string-collection
@@ -79179,6 +79190,16 @@ impl Simulator {
     /// §6.16 / Table 6-9 semantics rather than treating the underlying
     /// 1024-bit packed storage as a 4-state integral value.
     fn class_member_is_string(&self, expr: &Expression) -> bool {
+        // Only a declared string property can answer true.
+        let prop_name: &str = match &expr.kind {
+            ExprKind::MemberAccess { member, .. } => &member.name,
+            ExprKind::Ident(hier) if hier.path.len() == 1 => &hier.path[0].name.name,
+            ExprKind::Ident(hier) if hier.path.len() == 2 => &hier.path[1].name.name,
+            _ => return false,
+        };
+        if !self.class_member_names().string_props.contains(prop_name) {
+            return false;
+        }
         // Resolve to `(handle, prop_name)`. We prefer to evaluate the
         // receiver to obtain the runtime handle, but `class_member_is_string`
         // takes `&self` (no mutation); instead, use the `this_stack` for
@@ -127029,7 +127050,9 @@ impl Simulator {
             let mut static_methods: HashSet<String> = HashSet::default();
             let mut params: HashSet<String> = HashSet::default();
             let mut assoc_props: HashSet<String> = HashSet::default();
+            let mut string_props: HashSet<String> = HashSet::default();
             for cd in self.module.classes.values() {
+                string_props.extend(cd.string_properties.iter().cloned());
                 statics.extend(cd.static_properties.iter().cloned());
                 vif_props.extend(cd.virtual_iface_properties.keys().cloned());
                 methods.extend(cd.methods.keys().cloned());
@@ -127055,6 +127078,7 @@ impl Simulator {
                 subroutine_suffixes,
                 params,
                 assoc_props,
+                string_props,
             }
         })
     }
@@ -128407,9 +128431,9 @@ impl Simulator {
     }
 
     fn class_prop_type_named(&self, class_name: &str, prop: &str) -> Option<String> {
-        let mut cur = Some(class_name.to_string());
+        let mut cur: Option<&str> = Some(class_name);
         while let Some(cname) = cur {
-            if let Some(cd) = self.module.classes.get(&cname) {
+            if let Some(cd) = self.module.classes.get(cname) {
                 if let Some(sig) = cd.properties.get(prop) {
                     if let Some(t) = &sig.type_name {
                         if self.module.classes.contains_key(t)
@@ -128446,7 +128470,7 @@ impl Simulator {
                     }
                     return None;
                 }
-                cur = cd.extends.clone();
+                cur = cd.extends.as_deref();
             } else {
                 break;
             }
@@ -128775,8 +128799,8 @@ impl Simulator {
                 // A class property referenced bare inside a method —
                 // resolve its type through the current class context.
                 if hier.path.len() == 1 && !in_any_frame {
-                    if let Some(Some(ctx)) = self.class_context_stack.last().cloned() {
-                        if let Some(t) = self.class_prop_type_named(&ctx, &name) {
+                    if let Some(Some(ctx)) = self.class_context_stack.last() {
+                        if let Some(t) = self.class_prop_type_named(ctx, &name) {
                             return Some(t);
                         }
                     }
