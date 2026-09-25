@@ -215,6 +215,8 @@ mod shadow_name_matrix;
 mod spec_static_and_pkg_queue;
 #[path = "misc/struct_members_and_constant_targets.rs"]
 mod struct_members_and_constant_targets;
+#[path = "misc/subroutine_port_redeclaration.rs"]
+mod subroutine_port_redeclaration;
 #[path = "misc/svtb_suite.rs"]
 mod svtb_suite;
 #[path = "misc/unsized_decimal_wrap_warning.rs"]
