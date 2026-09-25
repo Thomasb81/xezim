@@ -59262,11 +59262,90 @@ impl Simulator {
         }
     }
 
+    /// §23.6: an absolute path written inside a subroutine body (`tb.u.sig`,
+    /// `tb.u.sig[3:0]`, `tb.u.mem[i]`) arrives as a MemberAccess chain, and
+    /// the lvalue arms looked it up in a signal table that keys the top
+    /// module's contents without its name — the write was silently dropped.
+    /// Rebuild it as the flat Ident elaboration gives module-scope code,
+    /// keeping the select wrappers, so it resolves the same way.
+    fn top_rooted_member_lvalue(&self, e: &Expression) -> Option<Expression> {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let inner = self.top_rooted_member_lvalue(expr)?;
+                Some(Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(inner),
+                        index: index.clone(),
+                    },
+                    e.span,
+                ))
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let inner = self.top_rooted_member_lvalue(expr)?;
+                Some(Expression::new(
+                    ExprKind::RangeSelect {
+                        expr: Box::new(inner),
+                        kind: kind.clone(),
+                        left: left.clone(),
+                        right: right.clone(),
+                    },
+                    e.span,
+                ))
+            }
+            ExprKind::MemberAccess { .. } => {
+                let mut root = e;
+                while let ExprKind::MemberAccess { expr, .. } = &root.kind {
+                    root = expr;
+                }
+                let ExprKind::Ident(h) = &root.kind else {
+                    return None;
+                };
+                let top = self.module.name.as_str();
+                if h.root.is_some()
+                    || h.path.len() != 1
+                    || !h.path[0].selects.is_empty()
+                    || h.path[0].name.name != top
+                    || self.local_stack.last().is_some_and(|l| l.contains_key(top))
+                    || self.signal_name_to_id.contains_key(top)
+                    || self.signals.contains_key(top)
+                {
+                    return None;
+                }
+                let path = Self::flatten_member_path(e)?
+                    .into_iter()
+                    .map(|name| crate::ast::expr::HierPathSegment {
+                        name: crate::ast::Identifier { name, span: e.span },
+                        selects: Vec::new(),
+                    })
+                    .collect();
+                Some(Expression::new(
+                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path,
+                        span: e.span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    }),
+                    e.span,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn assign_value_inner(&mut self, lhs: &Expression, val: &Value) -> bool {
         if !self.module.packages.is_empty() {
             if let Some(stripped) = self.strip_package_lvalue(lhs) {
                 return self.assign_value_inner(&stripped, val);
             }
+        }
+        if let Some(flat) = self.top_rooted_member_lvalue(lhs) {
+            return self.assign_value_inner(&flat, val);
         }
         // §25.9: a just-returned vif (recorded by the Return arm) binds to
         // the FIRST assignment target after the call — `value = r.read(c)`

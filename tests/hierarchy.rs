@@ -11,6 +11,8 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "hierarchy/absolute_path_writes_in_subroutines.rs"]
+mod absolute_path_writes_in_subroutines;
 #[path = "hierarchy/array_of_module_instances.rs"]
 mod array_of_module_instances;
 #[path = "hierarchy/bind_directive_basic.rs"]
