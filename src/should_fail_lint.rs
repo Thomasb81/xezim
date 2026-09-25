@@ -20,7 +20,7 @@ use xezim_core::ast::expr::{
 };
 use xezim_core::ast::stmt::{Statement, StatementKind, VarDeclarator};
 use xezim_core::ast::types::{
-    DataType, EnumType, IntegerAtomType, PackedDimension, Signing, UnpackedDimension,
+    DataType, EnumType, IntegerAtomType, PackedDimension, PortDirection, Signing, UnpackedDimension,
 };
 use xezim_core::elaborate::ElaboratedModule;
 
@@ -48,7 +48,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 for it in &m.items {
                     check_module_item(it, elab, &local_types, true, &mut errs);
                 }
-                check_proc_net_assign(&m.items, &mut errs);
+                check_proc_net_assign(&m.ports, &m.items, &mut errs);
                 check_dynarray_assign(&m.items, elab, &mut errs);
                 check_stream_widths(&m.items, elab, &mut errs);
                 check_wildcard_cmp(&m.items, elab, &mut errs);
@@ -282,16 +282,46 @@ fn check_array_flat_init(d: &VarDeclarator, elab: &ElaboratedModule, errs: &mut 
 /// §6.5: a net (an explicit `wire`/`tri`/... declaration) may not be the target
 /// of a procedural assignment (`=`/`<=` inside always/initial) — only a
 /// continuous assignment or `force`. Catches `wire w; initial w = ...;`.
-/// Conservative: only explicit NetDeclarations are treated as nets (output
-/// ports, where net-vs-var is ambiguous, are NOT flagged), and only `=`/`<=`
-/// targets are checked (force/release/assign are separate statement kinds).
-fn check_proc_net_assign(items: &[ModuleItem], errs: &mut Vec<String>) {
+/// Nets are the explicit NetDeclarations and the ANSI output ports that
+/// §23.2.2.3 makes nets (`output b`, `output [3:0] c`, `output wire d`, and
+/// the ports inheriting from one); `output logic q` / `output reg q` are
+/// variables. Only `=`/`<=` targets are checked (force/release/assign are
+/// separate statement kinds).
+fn check_proc_net_assign(ports: &PortList, items: &[ModuleItem], errs: &mut Vec<String>) {
     use std::collections::HashSet;
     let mut nets: HashSet<String> = HashSet::new();
     for it in items {
         if let ModuleItem::NetDeclaration(nd) = it {
             for d in &nd.declarators {
                 nets.insert(d.name.name.clone());
+            }
+        }
+    }
+    if let PortList::Ansi(ps) = ports {
+        let mut prev_net = false;
+        for p in ps {
+            let omitted =
+                p.direction.is_none() && p.net_type.is_none() && !p.var_kw && p.data_type.is_none();
+            let net = if omitted {
+                prev_net
+            } else {
+                p.direction == Some(PortDirection::Output)
+                    && !p.var_kw
+                    && (p.net_type.is_some()
+                        || matches!(p.data_type, None | Some(DataType::Implicit { .. })))
+            };
+            if net {
+                nets.insert(p.name.name.clone());
+            }
+            prev_net = net;
+        }
+        // A body declaration of the same name is not a net port (and is
+        // diagnosed elsewhere if illegal).
+        for it in items {
+            if let ModuleItem::DataDeclaration(d) = it {
+                for dc in &d.declarators {
+                    nets.remove(&dc.name.name);
+                }
             }
         }
     }
