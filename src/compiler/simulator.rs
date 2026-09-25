@@ -2696,6 +2696,11 @@ impl<'a> IntoIterator for &'a PropMap {
 struct ClassMemberNames {
     statics: HashSet<String>,
     vif_props: HashSet<String>,
+    /// Every declared method name, of any kind.
+    methods: HashSet<String>,
+    static_methods: HashSet<String>,
+    /// Every function/task key and each of its suffixes after a `.`.
+    subroutine_suffixes: HashSet<String>,
 }
 
 /// `instance_assoc_member`'s class-only verdict for a bare name inside a
@@ -107988,13 +107993,16 @@ impl Simulator {
     }
 
     fn class_has_method(&self, class_name: &str, name: &str) -> bool {
-        let mut cur = Some(class_name.to_string());
+        if !self.class_member_names().methods.contains(name) {
+            return false;
+        }
+        let mut cur: Option<&str> = Some(class_name);
         while let Some(cname) = cur {
-            if let Some(cd) = self.module.classes.get(&cname) {
+            if let Some(cd) = self.module.classes.get(cname) {
                 if cd.methods.contains_key(name) {
                     return true;
                 }
-                cur = cd.extends.clone();
+                cur = cd.extends.as_deref();
             } else {
                 break;
             }
@@ -108513,13 +108521,16 @@ impl Simulator {
 
     /// Is `name` a static method of `class_name` or any ancestor?
     fn is_static_method(&self, class_name: &str, name: &str) -> bool {
-        let mut cur = Some(class_name.to_string());
+        if !self.class_member_names().static_methods.contains(name) {
+            return false;
+        }
+        let mut cur: Option<&str> = Some(class_name);
         while let Some(cname) = cur {
-            if let Some(cd) = self.module.classes.get(&cname) {
+            if let Some(cd) = self.module.classes.get(cname) {
                 if cd.static_methods.contains(name) {
                     return true;
                 }
-                cur = cd.extends.clone();
+                cur = cd.extends.as_deref();
             } else {
                 break;
             }
@@ -108918,21 +108929,29 @@ impl Simulator {
             if let Some(mut segs) = Self::flatten_member_path(recv) {
                 segs.push(member.name.clone());
                 let joined = segs.join(".");
+                // Every subroutine key below is `joined` or ends in
+                // `.joined`.
+                let may_be_subroutine = self
+                    .class_member_names()
+                    .subroutine_suffixes
+                    .contains(joined.as_str());
                 // Interface (or generate-scope) subroutine under its
                 // hierarchical key.
-                if let Some(fd) = self.fn_decl_rc(&joined) {
-                    return self.exec_function_call(&fd, args);
-                }
-                if let Some(td) = self.module.tasks.get(&joined).cloned() {
-                    self.task_clears_this = true;
-                    self.exec_task_call(&td, args);
-                    return Value::zero(32);
+                if may_be_subroutine {
+                    if let Some(fd) = self.fn_decl_rc(&joined) {
+                        return self.exec_function_call(&fd, args);
+                    }
+                    if let Some(td) = self.module.tasks.get(&joined).cloned() {
+                        self.task_clears_this = true;
+                        self.exec_task_call(&td, args);
+                        return Value::zero(32);
+                    }
                 }
                 // The same key under the resolution hint and its parents:
                 // `core.get_seq()` from a class method of an object built in
                 // `u_w` is `u_w.core.get_seq` (issue #155). Class bodies are
                 // not instance-rewritten, so the bare join misses.
-                {
+                if may_be_subroutine {
                     let hint = self.name_resolve_hint.borrow().clone();
                     if let Some(hint) = hint.as_deref() {
                         let mut scope = hint;
@@ -126944,11 +126963,30 @@ impl Simulator {
         self.class_member_names_cell.get_or_init(|| {
             let mut statics: HashSet<String> = HashSet::default();
             let mut vif_props: HashSet<String> = HashSet::default();
+            let mut methods: HashSet<String> = HashSet::default();
+            let mut static_methods: HashSet<String> = HashSet::default();
             for cd in self.module.classes.values() {
                 statics.extend(cd.static_properties.iter().cloned());
                 vif_props.extend(cd.virtual_iface_properties.keys().cloned());
+                methods.extend(cd.methods.keys().cloned());
+                static_methods.extend(cd.static_methods.iter().cloned());
             }
-            ClassMemberNames { statics, vif_props }
+            let mut subroutine_suffixes: HashSet<String> = HashSet::default();
+            for k in self.module.functions.keys().chain(self.module.tasks.keys()) {
+                subroutine_suffixes.insert(k.clone());
+                for (i, b) in k.bytes().enumerate() {
+                    if b == b'.' {
+                        subroutine_suffixes.insert(k[i + 1..].to_string());
+                    }
+                }
+            }
+            ClassMemberNames {
+                statics,
+                vif_props,
+                methods,
+                static_methods,
+                subroutine_suffixes,
+            }
         })
     }
 
