@@ -612,6 +612,61 @@ pub fn defer_static_syscall_inits(
     if let Some(SourceDefinition::Module(top)) = defs.get(&elab.name) {
         walk_module_static_inits(&top.items, defs, elab, "", 0, &mut out);
     }
+    // Package-scope variables too (`string n = $sformatf("%m.notifier")` in
+    // UVM's polling package). The assignment runs inside a block named with
+    // the package as its absolute `%m` root, so `%m` reads `pkg`.
+    let mut pkgs: Vec<&std::rc::Rc<ast::module::PackageDeclaration>> = defs
+        .values()
+        .filter_map(|d| match d {
+            SourceDefinition::Package(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    pkgs.sort_by(|a, b| a.name.name.cmp(&b.name.name));
+    for p in pkgs {
+        for item in &p.items {
+            let ast::decl::PackageItem::Data(dd) = item else {
+                continue;
+            };
+            for d in &dd.declarators {
+                let Some(init) = &d.init else { continue };
+                if !d.dimensions.is_empty()
+                    || !contains_simtime_syscall(init)
+                    || !elab_classifies_const(init, elab, "")
+                {
+                    continue;
+                }
+                use ast::stmt::{Statement, StatementKind};
+                let assign = Statement::new(
+                    StatementKind::BlockingAssign {
+                        lvalue: make_bare_ident(&d.name.name, d.name.span),
+                        rvalue: init.clone(),
+                    },
+                    d.name.span,
+                );
+                let scoped = Statement::new(
+                    StatementKind::SeqBlock {
+                        name: Some(ast::Identifier {
+                            name: format!("{}{}", compiler::simulator::M_ROOT_MARK, p.name.name),
+                            span: d.name.span,
+                        }),
+                        stmts: vec![assign],
+                    },
+                    d.name.span,
+                );
+                out.push(elaborate::InitialBlock {
+                    stmt: Statement::new(
+                        StatementKind::SeqBlock {
+                            name: None,
+                            stmts: vec![scoped],
+                        },
+                        d.name.span,
+                    ),
+                    scope: String::new(),
+                });
+            }
+        }
+    }
     elab.static_init_blocks.extend(out);
 }
 

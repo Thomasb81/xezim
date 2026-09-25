@@ -136,3 +136,35 @@ endmodule
         "$value$plusargs seed static init must be 42"
     );
 }
+
+/// The same for PACKAGE-scope variables: UVM's polling package names its
+/// notifier with `$sformatf("%m.notifier")`, which read blank, and a `%m`
+/// there names the package. A package `string` also reads as text (it
+/// printed right-aligned in a 128-bit field). Cross-checked against the
+/// reference simulator.
+#[test]
+fn package_scope_string_initializers() {
+    let src = r#"
+package pk;
+  string n = $sformatf("%m.notifier");
+  string b = $sformatf("x=%0d", 5);
+  string d = {"ab", "cd"};
+  function automatic string get(); return n; endfunction
+endpackage
+module tb;
+  initial begin
+    $display("n=[%s] b=[%s] d=[%s] len=%0d", pk::n, pk::b, pk::d, pk::d.len());
+    $display("get=[%s]", pk::get());
+  end
+endmodule
+"#;
+    let sim = simulate(src, 1_000).expect("simulate failed");
+    let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert_eq!(
+        out,
+        [
+            "n=[pk.notifier] b=[x=5] d=[abcd] len=4",
+            "get=[pk.notifier]"
+        ]
+    );
+}
