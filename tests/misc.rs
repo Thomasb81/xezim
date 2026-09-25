@@ -147,6 +147,8 @@ mod nba_array_read_x_index;
 mod negative_lsb_range_select;
 #[path = "misc/net_class_data_type.rs"]
 mod net_class_data_type;
+#[path = "misc/net_declaration_delay.rs"]
+mod net_declaration_delay;
 #[path = "misc/nonansi_function_args.rs"]
 mod nonansi_function_args;
 #[path = "misc/nonzero_lsb_indexed_part_select.rs"]
