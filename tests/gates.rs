@@ -55,6 +55,8 @@ mod timing_checks_notifier;
 mod tran_and_implicit_nets;
 #[path = "gates/two_d_array_store_compiles.rs"]
 mod two_d_array_store_compiles;
+#[path = "gates/udp_instance_delays.rs"]
+mod udp_instance_delays;
 #[path = "gates/udp_primitives.rs"]
 mod udp_primitives;
 #[path = "gates/udp_table_entry_shape.rs"]

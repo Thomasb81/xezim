@@ -157,6 +157,7 @@ fn check_unit(
     let classes = visible_classes(defs, u.items);
     check_inherited_local_access(&classes, u.items, errs);
     check_unspecialized_class_scope(&classes, u.items, errs);
+    check_udp_instance_delays(defs, u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -3600,6 +3601,30 @@ fn check_unspecialized_class_scope(
             "parameterized class '{n}' needs a parameter value list (`{n}#(...)::`) before \
              `::` (LRM 1800-2017 §8.25.1)"
         ));
+    }
+}
+
+/// §29.8: a UDP instance takes at most two delays (rise and fall).
+fn check_udp_instance_delays(
+    defs: &[&SourceDefinition],
+    items: &[ModuleItem],
+    errs: &mut Vec<String>,
+) {
+    for it in items {
+        let ModuleItem::ModuleInstantiation(mi) = it else {
+            continue;
+        };
+        let is_udp = defs
+            .iter()
+            .any(|d| matches!(d, SourceDefinition::Udp(u) if u.name.name == mi.module_name.name));
+        let n = mi.params.as_ref().map_or(0, |p| p.len());
+        if is_udp && n > 2 {
+            errs.push(format!(
+                "UDP instance of '{}' has {n} delays; a UDP takes at most two \
+                 (LRM 1800-2017 §29.8)",
+                mi.module_name.name
+            ));
+        }
     }
 }
 
