@@ -37,6 +37,8 @@ mod class_type_param_default_width;
 mod class_unpacked_struct_array_store;
 #[path = "classes/collection_of_handles_new.rs"]
 mod collection_of_handles_new;
+#[path = "classes/constructor_body_ports.rs"]
+mod constructor_body_ports;
 #[path = "classes/explicit_param_static_coll_read.rs"]
 mod explicit_param_static_coll_read;
 #[path = "classes/function_local_struct_return_shadow.rs"]
