@@ -89,6 +89,8 @@ mod for_loop_var_declaration;
 mod force_assign_override_restore;
 #[path = "misc/force_release_semantics.rs"]
 mod force_release_semantics;
+#[path = "misc/foreach_loop_variable_count.rs"]
+mod foreach_loop_variable_count;
 #[path = "misc/forever_break_continue.rs"]
 mod forever_break_continue;
 #[path = "misc/function_return_bit_select.rs"]

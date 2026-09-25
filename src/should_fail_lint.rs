@@ -147,6 +147,7 @@ fn check_unit(
     let is_top = u.name == elab.name;
     check_param_value_refs(u.params, u.items, is_top, pkg_names, elab, errs);
     check_pattern_counts(defs, u.items, elab, is_top, errs);
+    check_foreach_dims(u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -2644,6 +2645,72 @@ fn check_pattern_counts(
                     pat.len()
                 ));
             }
+        }
+    }
+}
+
+/// §12.7.3: a foreach loop names at most one loop variable per dimension of
+/// the array: its unpacked dimensions, then its packed ones (an integer atom
+/// such as `int` counts as one). `logic a[10]; foreach (a[i, j])` is an error.
+/// Arrays declared at module level only, and not where a local may shadow them.
+fn check_foreach_dims(items: &[ModuleItem], errs: &mut Vec<String>) {
+    let mut dims: HashMap<&str, usize> = HashMap::new();
+    for it in items {
+        let ModuleItem::DataDeclaration(d) = it else {
+            continue;
+        };
+        let packed = match &d.data_type {
+            DataType::IntegerVector { dimensions, .. } => dimensions.len(),
+            DataType::IntegerAtom { .. } => 1,
+            _ => continue,
+        };
+        for v in &d.declarators {
+            dims.insert(v.name.name.as_str(), v.dimensions.len() + packed);
+        }
+    }
+    let mut stmts: Vec<&Statement> = Vec::new();
+    let mut locals: HashSet<String> = HashSet::new();
+    for it in items {
+        match it {
+            ModuleItem::InitialConstruct(i) => stmts.push(&i.stmt),
+            ModuleItem::AlwaysConstruct(a) => stmts.push(&a.stmt),
+            ModuleItem::FunctionDeclaration(f) => {
+                stmts.extend(f.items.iter());
+                locals.extend(f.ports.iter().map(|p| p.name.name.clone()));
+            }
+            ModuleItem::TaskDeclaration(t) => {
+                stmts.extend(t.items.iter());
+                locals.extend(t.ports.iter().map(|p| p.name.name.clone()));
+            }
+            _ => {}
+        }
+    }
+    let mut loops: Vec<(String, usize)> = Vec::new();
+    for st in &stmts {
+        for_each_stmt(st, &mut |s| match &s.kind {
+            StatementKind::VarDecl { declarators, .. } => {
+                locals.extend(declarators.iter().map(|d| d.name.name.clone()))
+            }
+            StatementKind::Foreach { array, vars, .. } => {
+                if let ExprKind::Ident(h) = &array.kind
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                {
+                    loops.push((h.path[0].name.name.clone(), vars.len()));
+                }
+            }
+            _ => {}
+        });
+    }
+    for (name, n) in loops {
+        if let Some(&have) = dims.get(name.as_str())
+            && n > have
+            && !locals.contains(&name)
+        {
+            errs.push(format!(
+                "foreach over '{name}' names {n} loop variables, but it has {have} \
+                 dimension(s) (LRM 1800-2017 §12.7.3)"
+            ));
         }
     }
 }
