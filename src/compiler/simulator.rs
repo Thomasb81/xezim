@@ -5836,6 +5836,8 @@ pub struct Simulator {
     marker_key_scratch: String,
     /// See `lvalue_root_is_unpacked_struct_prop`.
     unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
+    /// See `struct_prop_name_possible`.
+    struct_capable_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// Interned scope hints and head identifiers for `method_receiver_cache` keys (see there).
     method_receiver_hint_ids: HashMap<String, u32>,
     /// `resolve_typeref_class_name` memo: name -> (scope, class ctx) -> (class-table size, answer).
@@ -9829,6 +9831,7 @@ impl Simulator {
             vif_key_scratch: std::cell::RefCell::new(String::new()),
             marker_key_scratch: String::new(),
             unpacked_struct_prop_names: std::cell::OnceCell::new(),
+            struct_capable_prop_names: std::cell::OnceCell::new(),
             method_receiver_hint_ids: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
@@ -65534,6 +65537,9 @@ impl Simulator {
             if let ExprKind::Ident(h) = &expr.kind {
                 if (h.path.len() >= 2 || self.this_stack.last().copied().flatten().is_some())
                     && h.path.iter().all(|p| p.selects.is_empty())
+                    && h.path
+                        .last()
+                        .is_some_and(|p| self.struct_prop_name_possible(&p.name.name))
                 {
                     if let Some((handle, prop)) = self.class_prop_receiver(expr) {
                         if let Some(su) = self.class_prop_struct(handle, &prop) {
@@ -97305,6 +97311,75 @@ impl Simulator {
         }
     }
 
+    /// Superset of the property names `class_prop_struct` can answer for: a
+    /// declared (or typedef-resolved) struct type, or a type-parameter type
+    /// whose binding may be a struct. Class and typedef tables are fixed at
+    /// run time, so any other name is never a struct property and its
+    /// receiver need not be evaluated to find that out.
+    fn struct_prop_name_possible(&self, prop: &str) -> bool {
+        let set = self.struct_capable_prop_names.get_or_init(|| {
+            let mut set: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                for (name, dt) in &cd.property_types {
+                    let dt = Self::resolve_type_ref(dt, &self.module.typedef_types);
+                    if matches!(dt, DataType::Struct(_)) {
+                        set.insert(name.clone());
+                    }
+                }
+                for (name, sig) in &cd.properties {
+                    let Some(tn) = sig.type_name.as_ref() else {
+                        continue;
+                    };
+                    let capable = cd.type_param_names.contains(tn)
+                        || self
+                            .module
+                            .typedef_types
+                            .get(tn.as_str())
+                            .is_some_and(|dt| {
+                                matches!(
+                                    Self::resolve_type_ref(dt, &self.module.typedef_types),
+                                    DataType::Struct(_)
+                                )
+                            });
+                    if capable {
+                        set.insert(name.clone());
+                    }
+                }
+            }
+            set
+        });
+        !set.is_empty() && set.contains(prop)
+    }
+
+    /// The property name `class_prop_receiver` would resolve `e` to.
+    fn receiver_prop_name(e: &Expression) -> Option<&str> {
+        match &e.kind {
+            ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                h.path.last().map(|s| s.name.name.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Could any receiver/property split of the member/index chain `e` name
+    /// a struct property? Every candidate property is a member or segment
+    /// name of the chain.
+    fn chain_may_name_struct_prop(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                self.struct_prop_name_possible(&member.name)
+                    || self.chain_may_name_struct_prop(expr)
+            }
+            ExprKind::Index { expr, .. } => self.chain_may_name_struct_prop(expr),
+            ExprKind::Ident(h) => h
+                .path
+                .iter()
+                .any(|s| self.struct_prop_name_possible(&s.name.name)),
+            _ => false,
+        }
+    }
+
     fn class_prop_receiver(&mut self, base: &Expression) -> Option<(usize, String)> {
         if let Some((obj, prop)) = Self::split_trailing_member(base) {
             let h = self.eval_expr(&obj).to_u64()? as usize;
@@ -97337,6 +97412,9 @@ impl Simulator {
         handle: usize,
         prop: &str,
     ) -> Option<crate::ast::types::StructUnionType> {
+        if !self.struct_prop_name_possible(prop) {
+            return None;
+        }
         // An ANONYMOUS inline struct property (`struct packed {..} s;`) has no
         // typedef name to look up, but its declared type is retained verbatim
         // in `property_types` — use it directly; whole-value access worked
@@ -97913,7 +97991,9 @@ impl Simulator {
     /// handle + property name, then assemble the whole unpacked-struct value.
     /// `None` for anything that is not a whole unpacked-struct class property.
     fn try_read_whole_struct_class_prop(&mut self, expr: &Expression) -> Option<Value> {
-        if self.no_class_objects() {
+        if self.no_class_objects()
+            || !Self::receiver_prop_name(expr).is_some_and(|p| self.struct_prop_name_possible(p))
+        {
             return None;
         }
         let (handle, prop_name) = self.class_prop_receiver(expr)?;
@@ -97932,6 +98012,9 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) -> Option<()> {
+        if !Self::receiver_prop_name(lvalue).is_some_and(|p| self.struct_prop_name_possible(p)) {
+            return None;
+        }
         let (handle, prop) = self.class_prop_receiver(lvalue)?;
         let su = self.class_prop_struct(handle, &prop)?;
         if !Self::spreads_member_wise(&su) {
@@ -97990,6 +98073,9 @@ impl Simulator {
             }
             _ => {}
         }
+        if !Self::receiver_prop_name(rvalue).is_some_and(|p| self.struct_prop_name_possible(p)) {
+            return None;
+        }
         let (handle, prop) = self.class_prop_receiver(rvalue)?;
         let su = self.class_prop_struct(handle, &prop)?;
         if !Self::spreads_member_wise(&su) {
@@ -98010,7 +98096,7 @@ impl Simulator {
     /// parse shape — to the storage it aliases. `None` when `e` is not an
     /// aggregate class-property member.
     fn class_agg_member(&mut self, e: &Expression) -> Option<ClassAggRef> {
-        if self.no_class_objects() {
+        if self.no_class_objects() || !self.chain_may_name_struct_prop(e) {
             return None;
         }
         // §7.2: a member of an UNPACKED-struct property at ANY depth, and
@@ -98149,6 +98235,9 @@ impl Simulator {
     /// the suffix names no leaf of it — which is what lets the caller try
     /// successive split points without guessing.
     fn class_unpacked_leaf_at(&mut self, base: &Expression, suffix: &str) -> Option<ClassAggRef> {
+        if !Self::receiver_prop_name(base).is_some_and(|p| self.struct_prop_name_possible(p)) {
+            return None;
+        }
         let (handle, prop) = self.class_prop_receiver(base)?;
         let su = self.class_prop_struct(handle, &prop)?;
         if !Self::spreads_member_wise(&su) {
@@ -98728,7 +98817,9 @@ impl Simulator {
 
     /// `class_agg_member` for an already-split `<base>.<field>`.
     fn class_agg_member_parts(&mut self, base: &Expression, field: &str) -> Option<ClassAggRef> {
-        if self.no_class_objects() {
+        if self.no_class_objects()
+            || !Self::receiver_prop_name(base).is_some_and(|p| self.struct_prop_name_possible(p))
+        {
             return None;
         }
         let (handle, prop) = self.class_prop_receiver(base)?;
@@ -101469,7 +101560,9 @@ impl Simulator {
         &mut self,
         e: &Expression,
     ) -> Option<crate::ast::types::StructUnionType> {
-        if self.no_class_objects() {
+        if self.no_class_objects()
+            || !Self::receiver_prop_name(e).is_some_and(|p| self.struct_prop_name_possible(p))
+        {
             return None;
         }
         let (h, p) = self.class_prop_receiver(e)?;
