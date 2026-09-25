@@ -14269,7 +14269,11 @@ impl Simulator {
             for i in lo..=hi {
                 let elem = format!("{}[{}]", key, i);
                 self.widths.insert(elem.clone(), width);
-                self.signals.entry(elem).or_insert_with(|| default.clone());
+                // `insert` (not the map's `entry`) keeps the element index
+                // of `SignalMap` exact.
+                if !self.signals.contains_key(&elem) {
+                    self.signals.insert(elem, default.clone());
+                }
             }
         }
 
@@ -72423,9 +72427,9 @@ impl Simulator {
                         // sub-elements don't each produce a phantom key.
                         let mut ks: Vec<String> = self
                             .signals
-                            .keys()
+                            .elem_keys_with_prefix(&prefix)
                             .filter_map(|k| {
-                                let rest = k.strip_prefix(&prefix)?;
+                                let rest = k.strip_prefix(prefix.as_str())?;
                                 Self::assoc_first_key_seg(rest).map(|s| s.to_string())
                             })
                             .collect();
@@ -72923,9 +72927,9 @@ impl Simulator {
                     // don't each produce a phantom key.
                     let mut keys: Vec<String> = self
                         .signals
-                        .keys()
+                        .elem_keys_with_prefix(&prefix)
                         .filter_map(|k| {
-                            let rest = k.strip_prefix(&prefix)?;
+                            let rest = k.strip_prefix(prefix.as_str())?;
                             Self::assoc_first_key_seg(rest).map(|s| s.to_string())
                         })
                         .collect();
@@ -92144,9 +92148,9 @@ impl Simulator {
         // up to that `]`; otherwise take the whole key up to the final `]`.
         let mut ks: Vec<String> = self
             .signals
-            .keys()
+            .elem_keys_with_prefix(&prefix)
             .filter_map(|k| {
-                let rest = k.strip_prefix(&prefix)?;
+                let rest = k.strip_prefix(prefix.as_str())?;
                 Self::assoc_first_key_seg(rest).map(|s| s.to_string())
             })
             .collect();
