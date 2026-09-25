@@ -89,6 +89,8 @@ mod function_return_bit_select;
 mod gate_terminal_counts;
 #[path = "misc/generate_item_restrictions.rs"]
 mod generate_item_restrictions;
+#[path = "misc/generate_region_contents.rs"]
+mod generate_region_contents;
 #[path = "misc/iface_functions_and_vif_locals.rs"]
 mod iface_functions_and_vif_locals;
 #[path = "misc/ifu_ibuf_casez_dispatch_c910.rs"]
