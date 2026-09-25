@@ -243,6 +243,8 @@ mod subroutine_port_redeclaration;
 mod subroutine_range_identifiers;
 #[path = "misc/svtb_suite.rs"]
 mod svtb_suite;
+#[path = "misc/system_task_value.rs"]
+mod system_task_value;
 #[path = "misc/unnamed_block_end_label.rs"]
 mod unnamed_block_end_label;
 #[path = "misc/unsized_decimal_wrap_warning.rs"]

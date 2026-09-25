@@ -151,6 +151,7 @@ fn check_unit(
     check_select_depth(u.items, errs);
     check_port_actuals(defs, u.items, errs);
     check_generate_block_names(u.items, errs);
+    check_system_task_values(u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -3052,6 +3053,83 @@ fn check_generate_block_names(items: &[ModuleItem], errs: &mut Vec<String>) {
                      (LRM 1800-2017 §27.6)"
                 ));
             }
+        }
+    }
+}
+
+/// §13.4 / §20: a system task has no value, so it cannot stand in an
+/// expression (`val = $display;`).
+fn check_system_task_values(items: &[ModuleItem], errs: &mut Vec<String>) {
+    fn is_task(n: &str) -> bool {
+        const TASKS: &[&str] = &[
+            "$display",
+            "$displayb",
+            "$displayh",
+            "$displayo",
+            "$write",
+            "$writeb",
+            "$writeh",
+            "$writeo",
+            "$strobe",
+            "$strobeb",
+            "$strobeh",
+            "$strobeo",
+            "$monitor",
+            "$monitorb",
+            "$monitorh",
+            "$monitoro",
+            "$monitoron",
+            "$monitoroff",
+            "$finish",
+            "$stop",
+            "$fdisplay",
+            "$fwrite",
+            "$fstrobe",
+            "$fmonitor",
+            "$dumpfile",
+            "$dumpvars",
+            "$dumpon",
+            "$dumpoff",
+            "$dumpall",
+            "$dumpflush",
+            "$readmemb",
+            "$readmemh",
+            "$writememb",
+            "$writememh",
+            "$printtimescale",
+            "$timeformat",
+        ];
+        TASKS.contains(&n)
+    }
+    let mut report = |e: &Expression| {
+        if let ExprKind::SystemCall { name, .. } = &e.kind
+            && is_task(name)
+        {
+            errs.push(format!(
+                "system task '{name}' used as a function: it returns no value (LRM 1800-2017 §20)"
+            ));
+        }
+    };
+    let mut check_stmt = |st: &Statement| {
+        for_each_stmt(st, &mut |s| match &s.kind {
+            StatementKind::BlockingAssign { lvalue, rvalue }
+            | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                for_each_expr(lvalue, &mut report);
+                for_each_expr(rvalue, &mut report);
+            }
+            StatementKind::If { condition, .. } | StatementKind::While { condition, .. } => {
+                for_each_expr(condition, &mut report)
+            }
+            _ => {}
+        });
+    };
+    for it in items {
+        match it {
+            ModuleItem::InitialConstruct(i) => check_stmt(&i.stmt),
+            ModuleItem::AlwaysConstruct(a) => check_stmt(&a.stmt),
+            ModuleItem::FunctionDeclaration(f) => f.items.iter().for_each(&mut check_stmt),
+            ModuleItem::TaskDeclaration(t) => t.items.iter().for_each(&mut check_stmt),
+            _ => {}
         }
     }
 }
