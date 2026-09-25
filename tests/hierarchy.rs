@@ -81,6 +81,8 @@ mod interface_default_clocking;
 mod ivtest_port_cluster;
 #[path = "hierarchy/local_method_static_binding.rs"]
 mod local_method_static_binding;
+#[path = "hierarchy/member_access_roots.rs"]
+mod member_access_roots;
 #[path = "hierarchy/mixed_port_connections.rs"]
 mod mixed_port_connections;
 #[path = "hierarchy/module_timescale_cli.rs"]

@@ -158,6 +158,7 @@ fn check_unit(
     check_inherited_local_access(&classes, u.items, errs);
     check_unspecialized_class_scope(&classes, u.items, errs);
     check_udp_instance_delays(defs, u.items, errs);
+    check_member_access_roots(u.items, errs);
     check_subroutine_range_idents(u.items, is_top, pkg_names, elab, errs);
     check_cont_assign_rhs_names(u.ports, u.items, is_top, pkg_names, elab, errs);
     check_nonansi_ports_declared(u.name, u.ports, u.items, errs);
@@ -3626,6 +3627,143 @@ fn check_udp_instance_delays(
             ));
         }
     }
+}
+
+/// §23.6 / §13.3: a name followed by `.member` must be a scope, an interface,
+/// a struct or a class handle. A plain net, variable or port is none of these
+/// (`assign y = a.b;` with `input a;`), and a subroutine's scope holds only
+/// its own ports, variables and named blocks (`my_task.missing = 0;`).
+fn check_member_access_roots(items: &[ModuleItem], errs: &mut Vec<String>) {
+    // Names declared with a plain (vector or implicit) type.
+    let mut plain: HashSet<&str> = HashSet::new();
+    let mut other: HashSet<&str> = HashSet::new();
+    let is_plain = |dt: &DataType| {
+        matches!(
+            dt,
+            DataType::IntegerVector { .. }
+                | DataType::Implicit { .. }
+                | DataType::IntegerAtom { .. }
+        )
+    };
+    for it in items {
+        match it {
+            ModuleItem::PortDeclaration(d) => {
+                for v in &d.declarators {
+                    if is_plain(&d.data_type) && v.dimensions.is_empty() {
+                        plain.insert(v.name.name.as_str());
+                    } else {
+                        other.insert(v.name.name.as_str());
+                    }
+                }
+            }
+            // An array has methods (`q.size()`), so only scalars and vectors.
+            ModuleItem::NetDeclaration(d) => {
+                for v in &d.declarators {
+                    if is_plain(&d.data_type) && v.dimensions.is_empty() {
+                        plain.insert(v.name.name.as_str());
+                    } else {
+                        other.insert(v.name.name.as_str());
+                    }
+                }
+            }
+            ModuleItem::DataDeclaration(d) => {
+                for v in &d.declarators {
+                    if is_plain(&d.data_type) && v.dimensions.is_empty() {
+                        plain.insert(v.name.name.as_str());
+                    } else {
+                        other.insert(v.name.name.as_str());
+                    }
+                }
+            }
+            ModuleItem::ModuleInstantiation(mi) => {
+                other.extend(mi.instances.iter().map(|i| i.name.name.as_str()))
+            }
+            ModuleItem::GenerateRegion(_)
+            | ModuleItem::GenerateIf(_)
+            | ModuleItem::GenerateFor(_)
+            | ModuleItem::GenerateCase(_) => return,
+            _ => {}
+        }
+    }
+    // Subroutine scopes: the names reachable inside each one.
+    let mut subs: HashMap<&str, HashSet<String>> = HashMap::new();
+    for it in items {
+        let (name, ports, body) = match it {
+            ModuleItem::FunctionDeclaration(f) => (&f.name.name.name, &f.ports, &f.items),
+            ModuleItem::TaskDeclaration(t) => (&t.name.name.name, &t.ports, &t.items),
+            _ => continue,
+        };
+        let mut names: HashSet<String> = ports.iter().map(|p| p.name.name.clone()).collect();
+        for st in body {
+            for_each_stmt(st, &mut |s| match &s.kind {
+                StatementKind::VarDecl { declarators, .. } => {
+                    names.extend(declarators.iter().map(|d| d.name.name.clone()))
+                }
+                StatementKind::SeqBlock { name: Some(n), .. }
+                | StatementKind::ParBlock { name: Some(n), .. } => {
+                    names.insert(n.name.clone());
+                }
+                _ => {}
+            });
+        }
+        subs.insert(name.as_str(), names);
+    }
+    // Any name a process or subroutine redeclares may mean something else
+    // where it is used.
+    let mut locals: HashSet<String> = HashSet::new();
+    for it in items {
+        let stmts: Vec<&Statement> = match it {
+            ModuleItem::InitialConstruct(i) => vec![&i.stmt],
+            ModuleItem::AlwaysConstruct(a) => vec![&a.stmt],
+            ModuleItem::FunctionDeclaration(f) => f.items.iter().collect(),
+            ModuleItem::TaskDeclaration(t) => t.items.iter().collect(),
+            _ => continue,
+        };
+        for st in stmts {
+            for_each_stmt(st, &mut |s| {
+                if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                    locals.extend(declarators.iter().map(|d| d.name.name.clone()));
+                }
+            });
+        }
+    }
+    let mut hits: Vec<String> = Vec::new();
+    module_exprs(items, &mut |e| {
+        for_each_expr(e, &mut |x| {
+            let ExprKind::MemberAccess { expr, member } = &x.kind else {
+                return;
+            };
+            let ExprKind::Ident(h) = &expr.kind else {
+                return;
+            };
+            if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                return;
+            }
+            let root = h.path[0].name.name.as_str();
+            if locals.contains(root) {
+                return;
+            }
+            if plain.contains(root) && !other.contains(root) && !subs.contains_key(root) {
+                hits.push(format!(
+                    "'{root}' is not a scope, so '{root}.{}' names nothing \
+                     (LRM 1800-2017 §23.6)",
+                    member.name
+                ));
+            } else if let Some(names) = subs.get(root)
+                && !plain.contains(root)
+                && !other.contains(root)
+                && !names.contains(&member.name)
+            {
+                hits.push(format!(
+                    "'{}' is not declared in subroutine '{root}' (LRM 1800-2017 §23.6)",
+                    member.name
+                ));
+            }
+        })
+    });
+    hits.sort();
+    hits.dedup();
+    errs.extend(hits);
 }
 
 /// §6.10: an undeclared name implies a net only as the target of a
