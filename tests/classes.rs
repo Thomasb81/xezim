@@ -264,6 +264,8 @@ mod fixed_member_pattern_write;
 #[path = "classes/nested_and_extends_spec.rs"]
 mod nested_and_extends_spec;
 
+#[path = "classes/instance_class_handles_start_null.rs"]
+mod instance_class_handles_start_null;
 #[path = "classes/null_deref_fatal.rs"]
 mod null_deref_fatal;
 
