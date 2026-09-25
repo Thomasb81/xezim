@@ -85,6 +85,8 @@ mod force_release_semantics;
 mod forever_break_continue;
 #[path = "misc/function_return_bit_select.rs"]
 mod function_return_bit_select;
+#[path = "misc/gate_terminal_counts.rs"]
+mod gate_terminal_counts;
 #[path = "misc/generate_item_restrictions.rs"]
 mod generate_item_restrictions;
 #[path = "misc/iface_functions_and_vif_locals.rs"]

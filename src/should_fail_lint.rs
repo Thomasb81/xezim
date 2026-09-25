@@ -171,6 +171,7 @@ fn check_module_item(
         }
         ModuleItem::FunctionDeclaration(f) => check_output_port_defaults(&f.ports, errs),
         ModuleItem::TaskDeclaration(t) => check_output_port_defaults(&t.ports, errs),
+        ModuleItem::GateInstantiation(g) => check_gate_terminals(g, errs),
         // The per-item checks must SEE inside generate constructs — without
         // this recursion every rule above was bypassed by wrapping the illegal
         // code in `generate begin ... end` (same walker-coverage bug class as
@@ -222,6 +223,41 @@ fn check_module_item(
             }
         }
         _ => {}
+    }
+}
+
+/// §28.3–§28.9: each gate and switch primitive takes a fixed number of
+/// terminals (n-input and n-output gates: two or more).
+fn check_gate_terminals(g: &xezim_core::ast::decl::GateInstantiation, errs: &mut Vec<String>) {
+    use xezim_core::ast::decl::GateType as G;
+    let (min, max, what) = match g.gate_type {
+        G::And | G::Nand | G::Or | G::Nor | G::Xor | G::Xnor => {
+            (2, usize::MAX, "an output and at least one input")
+        }
+        G::Buf | G::Not => (2, usize::MAX, "at least one output and an input"),
+        G::Bufif0 | G::Bufif1 | G::Notif0 | G::Notif1 => {
+            (3, 3, "an output, an input and a control")
+        }
+        G::Nmos | G::Pmos | G::Rnmos | G::Rpmos => (3, 3, "an output, an input and a control"),
+        G::Cmos | G::Rcmos => (4, 4, "an output, an input and two controls"),
+        G::Tran | G::Rtran => (2, 2, "two inout terminals"),
+        G::Tranif0 | G::Tranif1 | G::Rtranif0 | G::Rtranif1 => {
+            (3, 3, "two inout terminals and a control")
+        }
+        G::Pullup | G::Pulldown => (1, usize::MAX, "at least one terminal"),
+    };
+    for inst in &g.instances {
+        let n = inst.terminals.len();
+        if n < min || n > max {
+            errs.push(format!(
+                "{:?} gate{} has {n} terminal(s), but takes {what} (LRM 1800-2017 §28)",
+                g.gate_type,
+                inst.name
+                    .as_ref()
+                    .map(|i| format!(" '{}'", i.name))
+                    .unwrap_or_default()
+            ));
+        }
     }
 }
 
