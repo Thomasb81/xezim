@@ -69730,12 +69730,57 @@ impl Simulator {
     /// stays small: this arm's locals inflated every call's frame (the
     /// dispatcher recursed with a 7.8 KB frame per level).
     #[inline(never)]
+    /// `name = <literal | unary | binary>` on a select-free single-segment
+    /// target. Every special form the full path tests for keys on an
+    /// aggregate, call, pattern, identifier or `new` RHS, on a selected or
+    /// dotted target, or on a target that is an event, a virtual-interface
+    /// variable, a vif property or a possibly-struct property; none can
+    /// match here, so the statement is the full path's final width-sized
+    /// evaluate + assign.
+    fn simple_blocking_assign(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        if !matches!(
+            rvalue.kind,
+            ExprKind::Number(_) | ExprKind::Binary { .. } | ExprKind::Unary { .. }
+        ) {
+            return false;
+        }
+        let ExprKind::Ident(h) = &lvalue.kind else {
+            return false;
+        };
+        if h.path.len() != 1 || h.root.is_some() || !h.path[0].selects.is_empty() {
+            return false;
+        }
+        let n = h.path[0].name.name.as_str();
+        if self.module.events.contains(n)
+            || self.class_member_names().vif_props.contains(n)
+            || self.struct_capable_names().contains(n)
+            || self
+                .module
+                .var_decl_types
+                .get(n)
+                .is_some_and(|dt| self.is_virtual_iface_type(dt))
+        {
+            return false;
+        }
+        let w = {
+            let iw = self.infer_lhs_width(lvalue);
+            if iw == 0 { 32 } else { iw }
+        };
+        let val = self.eval_expr_ctx(rvalue, w);
+        self.assign_value(lvalue, &val);
+        self.settle_after_proc_write();
+        true
+    }
+
     fn exec_stmt_blocking_assign(
         &mut self,
         stmt: &Statement,
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
+        if self.simple_blocking_assign(lvalue, rvalue) {
+            return;
+        }
         // §15.5.5: `event_var = other_event / null / q[i]` re-binds
         // the HANDLE, it does not copy a value.
         if self.try_event_handle_assign(lvalue, rvalue) {
