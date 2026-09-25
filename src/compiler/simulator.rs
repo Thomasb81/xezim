@@ -5113,7 +5113,7 @@ pub struct Simulator {
     randc_pending: HashMap<(usize, String), (u64, Option<HashSet<u64>>)>,
     /// §18.5.4/§18.10 dist schedules, keyed by (instance handle, variable):
     /// (weight signature, item schedule, next slot). See `pick_dist_value`.
-    dist_decks: HashMap<(usize, String), (u64, Vec<usize>, usize)>,
+    dist_decks: HashMap<(usize, String), Vec<(u64, Vec<usize>, usize)>>,
     /// Built-in semaphores (handle -> current count)
     semaphores: HashMap<usize, i64>,
     /// Covergroup instance heap (index 0 is null).
@@ -95404,27 +95404,37 @@ impl Simulator {
     }
 
     /// §18.5.4/§18.10 — deal the next dist ITEM index for `key` from its
-    /// proportional schedule, rebuilding the schedule when it is exhausted or
-    /// when the (dynamically evaluated) weights have changed. See
-    /// `pick_dist_value` for why the item choice is scheduled rather than
-    /// drawn independently.
+    /// proportional schedule, rebuilding the schedule when it is exhausted.
+    /// Each set of resolved weights keeps its own schedule: the weights are
+    /// re-evaluated per call (§18.10 dynamic weights), and a variable whose
+    /// dist differs per `if` branch must not restart one branch's schedule
+    /// every time the other branch deals — a fresh schedule always opens on
+    /// its heaviest item. See `pick_dist_value` for why the item choice is
+    /// scheduled rather than drawn independently.
     fn deal_dist_item(&mut self, key: (usize, String), masses: &[u64], total: u64) -> usize {
-        // Signature of the resolved weights: a change (§18.10 dynamic weights)
-        // invalidates the schedule.
+        /// Weight sets remembered per variable.
+        const MAX_DECKS: usize = 8;
         let mut sig: u64 = 0xcbf2_9ce4_8422_2325;
         for m in masses {
             sig ^= *m;
             sig = sig.wrapping_mul(0x0000_0100_0000_01b3);
         }
-        let stale = self
+        let live = self
             .dist_decks
             .get(&key)
-            .is_none_or(|(s, deck, pos)| *s != sig || *pos >= deck.len());
-        if stale {
+            .and_then(|ds| ds.iter().find(|d| d.0 == sig))
+            .is_some_and(|(_, deck, pos)| *pos < deck.len());
+        if !live {
             let deck = self.build_dist_deck(masses, total);
-            self.dist_decks.insert(key.clone(), (sig, deck, 0));
+            let decks = self.dist_decks.entry(key.clone()).or_default();
+            decks.retain(|d| d.0 != sig);
+            if decks.len() >= MAX_DECKS {
+                decks.remove(0);
+            }
+            decks.push((sig, deck, 0));
         }
-        let (_, deck, pos) = self.dist_decks.get_mut(&key).unwrap();
+        let decks = self.dist_decks.get_mut(&key).unwrap();
+        let (_, deck, pos) = decks.iter_mut().find(|d| d.0 == sig).unwrap();
         if deck.is_empty() {
             return 0;
         }

@@ -184,6 +184,8 @@ mod param_typedef_ctor_resolution;
 mod process_class_9_7;
 #[path = "classes/pure_sv_phase_objection.rs"]
 mod pure_sv_phase_objection;
+#[path = "classes/randomize_dist_weights.rs"]
+mod randomize_dist_weights;
 #[path = "classes/randomize_inside_range.rs"]
 mod randomize_inside_range;
 #[path = "classes/randomize_member_subset.rs"]
