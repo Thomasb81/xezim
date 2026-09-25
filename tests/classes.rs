@@ -61,6 +61,8 @@ mod type_param_formal_stale_local;
 mod typename_p_subroutine_locals;
 #[path = "classes/typename_type_param_resolves_concrete.rs"]
 mod typename_type_param_resolves_concrete;
+#[path = "classes/vif_output_actual_property.rs"]
+mod vif_output_actual_property;
 #[path = "classes/virtual_method_in_binary_is_evaluated_once.rs"]
 mod virtual_method_in_binary_is_evaluated_once;
 #[path = "classes/wait_level_sensitive_inactive_delta.rs"]

@@ -104869,6 +104869,25 @@ impl Simulator {
             .filter(|n| self.is_interface_instance(n))
     }
 
+    /// Object owning a virtual-interface property written as `obj.vif`: a
+    /// local, else (inside a method) a property of `this` — a config_db
+    /// output actual `cfg.vif` names one — else a module variable or a static.
+    fn vif_owner_handle(&self, obj: &str) -> usize {
+        let v = self
+            .local_stack
+            .last()
+            .and_then(|l| l.get(obj).cloned())
+            .or_else(|| {
+                let h = self.this_stack.last().copied().flatten()?;
+                self.heap.get(h)?.as_ref()?.properties.get(obj).cloned()
+            })
+            .or_else(|| self.get_signal_value_by_name(obj));
+        match v.and_then(|x| x.to_u64()) {
+            Some(h) => h as usize,
+            None => self.eval_ident_handle(obj).unwrap_or(0),
+        }
+    }
+
     fn try_bind_virtual_iface_inner(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
         // LRM §25.9: a PLAIN variable declared `virtual <iface>` (a
         // block-local `virtual bus_if vif;` or a module-scope one — not
@@ -105041,17 +105060,13 @@ impl Simulator {
                 let handle = self.this_stack.last().copied().flatten().unwrap_or(0);
                 (handle, h.path[0].name.name.clone())
             }
+            // `c.vif = bus;` — `c` may be a local, a property of `this` (a
+            // method writing `cfg.vif`, e.g. a config_db output actual) or a
+            // module variable.
             ExprKind::Ident(h) if h.path.len() == 2 => {
                 let obj = h.path[0].name.name.as_str();
                 let prop = h.path[1].name.name.clone();
-                let v = if let Some(locals) = self.local_stack.last() {
-                    locals.get(obj).cloned()
-                } else {
-                    None
-                }
-                .or_else(|| self.get_signal_value_by_name(obj));
-                let handle = v.and_then(|x| x.to_u64()).unwrap_or(0) as usize;
-                (handle, prop)
+                (self.vif_owner_handle(obj), prop)
             }
             // `p.cfg.vif = bus;` — the vif property's OWNER is itself reached
             // through a handle chain. Walk the chain to the owning object;
@@ -105067,14 +105082,7 @@ impl Simulator {
             ExprKind::MemberAccess { expr, member } => {
                 let obj_handle = match &expr.kind {
                     ExprKind::Ident(h) if h.path.len() == 1 => {
-                        let obj = &h.path[0].name.name;
-                        let v = if let Some(locals) = self.local_stack.last() {
-                            locals.get(obj).cloned()
-                        } else {
-                            None
-                        }
-                        .or_else(|| self.get_signal_value_by_name(obj));
-                        v.and_then(|x| x.to_u64()).unwrap_or(0) as usize
+                        self.vif_owner_handle(&h.path[0].name.name)
                     }
                     // `this.vif = bus;` — the explicit-`this` spelling of the
                     // bare `vif = bus;` handled above. Resolving only an Ident
@@ -105101,21 +105109,11 @@ impl Simulator {
                         expr: outer,
                         member,
                     } => {
-                        let h = if let ExprKind::Ident(h) = &outer.kind {
-                            if h.path.len() == 1 {
-                                let obj = &h.path[0].name.name;
-                                let v = if let Some(locals) = self.local_stack.last() {
-                                    locals.get(obj).cloned()
-                                } else {
-                                    None
-                                }
-                                .or_else(|| self.get_signal_value_by_name(obj));
-                                v.and_then(|x| x.to_u64()).unwrap_or(0) as usize
-                            } else {
-                                0
+                        let h = match &outer.kind {
+                            ExprKind::Ident(h) if h.path.len() == 1 => {
+                                self.vif_owner_handle(&h.path[0].name.name)
                             }
-                        } else {
-                            0
+                            _ => 0,
                         };
                         (h, member.name.clone())
                     }
@@ -105131,14 +105129,7 @@ impl Simulator {
                     ExprKind::Ident(h) if h.path.len() == 2 => {
                         let obj = h.path[0].name.name.as_str();
                         let prop = h.path[1].name.name.clone();
-                        let v = if let Some(locals) = self.local_stack.last() {
-                            locals.get(obj).cloned()
-                        } else {
-                            None
-                        }
-                        .or_else(|| self.get_signal_value_by_name(obj));
-                        let h_v = v.and_then(|x| x.to_u64()).unwrap_or(0) as usize;
-                        (h_v, prop)
+                        (self.vif_owner_handle(obj), prop)
                     }
                     _ => return false,
                 };
