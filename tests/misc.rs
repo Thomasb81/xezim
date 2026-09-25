@@ -241,6 +241,8 @@ mod spec_static_and_pkg_queue;
 mod struct_members_and_constant_targets;
 #[path = "misc/subroutine_port_redeclaration.rs"]
 mod subroutine_port_redeclaration;
+#[path = "misc/subroutine_port_type.rs"]
+mod subroutine_port_type;
 #[path = "misc/subroutine_range_identifiers.rs"]
 mod subroutine_range_identifiers;
 #[path = "misc/svtb_suite.rs"]

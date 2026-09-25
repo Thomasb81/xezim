@@ -54,6 +54,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
+                check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
                 for it in &m.items {
                     check_module_item(it, elab, &local_types, true, &mut errs);
                 }
@@ -74,6 +75,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
+                check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
                 for it in &m.items {
                     check_module_item(it, elab, &local_types, true, &mut errs);
                 }
@@ -92,6 +94,7 @@ pub fn lint_should_fail(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> 
                 check_unit(&unit, defs, elab, &pkg_decls, &pkg_names, &mut errs);
                 let mut local_types = std::collections::HashSet::new();
                 collect_local_type_names(&m.params, &m.items, &mut local_types);
+                check_subroutine_port_types(&m.items, &local_types, &pkg_names, elab, &mut errs);
                 for it in &m.items {
                     check_module_item(it, elab, &local_types, true, &mut errs);
                 }
@@ -2985,6 +2988,46 @@ fn check_port_actuals(defs: &[&SourceDefinition], items: &[ModuleItem], errs: &m
                         }
                     ));
                 }
+            }
+        }
+    }
+}
+
+/// §13.3/§13.4: a subroutine port's type name must be declared
+/// (`task t1; input make_me_crash i;` names no type at all).
+fn check_subroutine_port_types(
+    items: &[ModuleItem],
+    local_types: &HashSet<String>,
+    pkg_names: &HashSet<String>,
+    elab: &ElaboratedModule,
+    errs: &mut Vec<String>,
+) {
+    for it in items {
+        let (sub, ports) = match it {
+            ModuleItem::FunctionDeclaration(f) => (&f.name.name.name, &f.ports),
+            ModuleItem::TaskDeclaration(t) => (&t.name.name.name, &t.ports),
+            _ => continue,
+        };
+        for p in ports {
+            let DataType::TypeReference { name, .. } = &p.data_type else {
+                continue;
+            };
+            let n = &name.name.name;
+            if name.scope.is_some() || n.is_empty() || is_builtin_type(n) {
+                continue;
+            }
+            let known = local_types.contains(n)
+                || pkg_names.contains(n)
+                || elab.typedefs.contains_key(n)
+                || elab.classes.contains_key(n)
+                || elab.interfaces.contains(n)
+                || elab.packages.contains(n)
+                || elab.parameters.contains_key(n);
+            if !known {
+                errs.push(format!(
+                    "port '{}' of '{sub}' has undeclared type '{n}' (LRM 1800-2017 §13.3)",
+                    p.name.name
+                ));
             }
         }
     }
