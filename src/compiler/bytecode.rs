@@ -444,6 +444,24 @@ pub enum Insn {
     /// n_args)
     CallScopedMethod(RegId, RegId, Box<str>, Box<str>, RegId, u32),
 
+    /// class-perf Step 9g: read a STATIC class property (§8.19) by its
+    /// bare name — the resolution walk (and per-specialization keying)
+    /// happens at runtime in `class_static_get`, exactly like the AST's
+    /// unqualified-static fallback which starts at the LEXICAL class
+    /// (`class_context_stack`). `class` is the defining class of the
+    /// compiled method. (dest, class, prop)
+    LoadClassStatic(RegId, Box<str>, Box<str>),
+    /// class-perf Step 9g: write a STATIC class property by bare name —
+    /// `class_static_set` stores the Value UNRESIZED (the AST path never
+    /// resizes a static store either). (class, prop, src_reg)
+    StoreClassStatic(Box<str>, Box<str>, RegId),
+    /// class-perf Step 9g: `new(args)` / bare `new` as an EXPRESSION
+    /// (§8.8) inside a method — constructs an instance of the DEFINING
+    /// class of the compiled method and writes the fresh handle to `dest`.
+    /// Allocation + the whole ctor chain stay interpreter-owned
+    /// (`instantiate_class`). (dest, class, arg_start, n_args)
+    ConstructObject(RegId, Box<str>, RegId, u32),
+
     /// Compiled class-method builtin-collection call. The receiver is a
     /// class handle in `handle_reg`; `member` names a member collection
     /// (associative array or queue) declared in the receiver's class;
@@ -941,12 +959,18 @@ impl Insn {
             }
             // Signal-to-signal fused array read: no registers at all.
             NbaAssignArrayRead(..) => {}
+            // Step 9g: a static-property READ has exactly one register (its
+            // destination); a static STORE / object construction is
+            // non-offsettable (side effects / interpreter re-entry).
+            LoadClassStatic(a, _, _) => *a += rb,
             LoadProcessLocal(..) | Format(..) | CaseJump(..) | CaseMaskJump(..)
             | StmtFallback(..) | EvalExprFallback(..)
             | WaitDelayReg(..) | WaitEdge(..)
             | CallMethod(..) | CallCollMethod(..)
             | LoadCollElem(..) | StoreCollElem(..)
-            | CallScopedMethod(..) => return false,
+            | CallScopedMethod(..)
+            | StoreClassStatic(..)
+            | ConstructObject(..) => return false,
         }
         true
     }
@@ -1012,6 +1036,9 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::StoreClassMember(..) => "StoreCls",
         Insn::CallMethod(..) => "CallM,",
         Insn::CallScopedMethod(..) => "CallScp,",
+        Insn::LoadClassStatic(..) => "LoadSta,",
+        Insn::StoreClassStatic(..) => "StorSta,",
+        Insn::ConstructObject(..) => "NewObj,",
         Insn::CallCollMethod(..) => "CallColl,",
         Insn::LoadCollElem(..) => "CollElemR,",
         Insn::StoreCollElem(..) => "CollElemW,",
@@ -1170,6 +1197,17 @@ pub struct BytecodeCompiler<'a> {
     /// Step 9f: BARE-call static targets — non-virtual method name -> the
     /// first defining class from the lexical chain (§8.20).
     static_bare_targets: HashMap<String, String>,
+    /// Step 9g: WRITABLE static-property names (bare) of the enclosing
+    /// class chain — reads AND stores lower to Load/StoreClassStatic.
+    static_member_names: HashSet<String>,
+    /// Step 9g: read-only class-CONSTANT names (localparams; live in
+    /// `param_defaults`). Reads lower to LoadClassStatic; stores decline.
+    class_const_names: HashSet<String>,
+    /// Step 9g: bare name -> the DECLARED class type of that lvalue
+    /// (locals, statics, and instance members of the enclosing chain) —
+    /// the target of a `lhs = new(...)` lowering. Only non-parameterized
+    /// targets are admitted (compile-site filtered).
+    new_type_map: HashMap<String, String>,
     /// class-perf Step 9e: the static CLASS of the method being compiled —
     /// the `this` root's type for TYPED handle-chain admission.
     method_class: Option<String>,
@@ -1481,6 +1519,9 @@ impl<'a> BytecodeCompiler<'a> {
             super_method_names: HashSet::default(),
             method_class_parent: None,
             static_bare_targets: HashMap::default(),
+            static_member_names: HashSet::default(),
+            class_const_names: HashSet::default(),
+            new_type_map: HashMap::default(),
             method_class: None,
             handle_member_types: None,
             method_result_reg: None,
@@ -7316,10 +7357,23 @@ impl<'a> BytecodeCompiler<'a> {
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
                 self.pattern_layout = self.lvalue_struct_layout(lvalue);
-                let compiled = self.compile_expr(rvalue, width);
+                // Step 9g: `lhs = new` / `lhs = new(args)` — the
+                // constructed class is the LHS's DECLARED type (§8.8); a
+                // handle needs no Resize regardless of the inferred width.
+                let new_cls = if Self::is_new_shape(rvalue) {
+                    self.new_target_for(lvalue)
+                } else {
+                    None
+                };
+                let via_new = new_cls.is_some();
+                let compiled = if let Some(cls) = new_cls {
+                    self.compile_new_construct(rvalue, &cls)
+                } else {
+                    self.compile_expr(rvalue, width)
+                };
                 self.pattern_layout = None;
                 if let Some(val_reg) = compiled {
-                    if width > 0 {
+                    if width > 0 && !via_new {
                         self.emit(Insn::Resize(val_reg, width));
                     }
                     if self.compile_blocking_target(lvalue, val_reg, width) {
@@ -8322,6 +8376,83 @@ impl<'a> BytecodeCompiler<'a> {
             && self.class_shadow_names.contains(bare)
     }
 
+    /// Step 9g: is `e` a `new` construction shape — bare `new` or a
+    /// call whose func is the unqualified Ident `new`?
+    fn is_new_shape(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                h.root.is_none() && h.path.len() == 1 && h.path[0].name.name == "new"
+            }
+            ExprKind::Call { func, .. } => matches!(
+                &func.kind,
+                ExprKind::Ident(h)
+                    if h.root.is_none()
+                        && h.path.len() == 1
+                        && h.path[0].name.name == "new"
+            ),
+            _ => false,
+        }
+    }
+
+    /// Step 9g: the DECLARED class type of a bare lvalue name (§8.8 —
+    /// `lhs = new` constructs the lhs's class), when admitted.
+    fn new_target_for(&self, lhs: &Expression) -> Option<String> {
+        if !self.method_mode {
+            return None;
+        }
+        if let ExprKind::Ident(h) = &lhs.kind
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+        {
+            return self.new_type_map.get(h.path[0].name.name.as_str()).cloned();
+        }
+        None
+    }
+
+    /// Step 9g: lower `new` / `new(args)` for a KNOWN target class into
+    /// ConstructObject (allocation + ctor chain stay in instantiate_class).
+    fn compile_new_construct(&mut self, expr: &Expression, class: &str) -> Option<RegId> {
+        let args: Vec<&Expression> = match &expr.kind {
+            ExprKind::Ident(..) => Vec::new(),
+            ExprKind::Call { args, .. } => args.iter().collect(),
+            _ => return None,
+        };
+        let call_start = self.insns.len();
+        let call_next = self.next_reg;
+        let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+        for a in &args {
+            match self.compile_expr(a, 0) {
+                Some(r) => arg_values.push(r),
+                None => {
+                    self.insns.truncate(call_start);
+                    self.next_reg = call_next;
+                    self.bail("Expr_New_args");
+                    return None;
+                }
+            }
+        }
+        let dest = self.alloc_reg();
+        let n = arg_values.len() as u32;
+        let arg_start = self.alloc_reg();
+        for _ in 1..arg_values.len() {
+            self.alloc_reg();
+        }
+        for (i, &v) in arg_values.iter().enumerate() {
+            let slot = (arg_start as usize + i) as RegId;
+            if slot != v {
+                self.emit(Insn::Move(slot, v));
+            }
+        }
+        self.emit(Insn::ConstructObject(
+            dest,
+            class.to_string().into_boxed_str(),
+            arg_start,
+            n,
+        ));
+        Some(dest)
+    }
+
     fn compile_expr(&mut self, expr: &Expression, ctx_width: u32) -> Option<RegId> {
         if let Some(id) = self.const_multi_dim_array_elem_signal_id(expr) {
             let dest = self.alloc_reg();
@@ -8458,6 +8589,22 @@ impl<'a> BytecodeCompiler<'a> {
                             ));
                             return Some(dest);
                         }
+                        // Step 9g: a bare STATIC property (or class localparam)
+                        // of the enclosing chain — the AST resolves it
+                        // through class_static_get starting at the lexical
+                        // class; the executor does exactly that with the
+                        // baked defining class.
+                        if self.static_member_names.contains(bare)
+                            || self.class_const_names.contains(bare)
+                        {
+                            let dest = self.alloc_reg();
+                            self.emit(Insn::LoadClassStatic(
+                                dest,
+                                self.method_class.clone().unwrap_or_default().into_boxed_str(),
+                                bare.to_string().into_boxed_str(),
+                            ));
+                            return Some(dest);
+                        }
                         if self.class_shadow_names.contains(bare) {
                             // A class-scope name the compiled path cannot
                             // model: shadowed members, statics/localparams,
@@ -8465,6 +8612,13 @@ impl<'a> BytecodeCompiler<'a> {
                             // those reach HERE, selects non-empty, and used
                             // to fall through to a bogus module-signal read).
                             self.bail("method_class_shadow");
+                        }
+                        // Step 9g: a bare `new` Ident that reached here is
+                        // a §8.8 handle construct outside the assign-site
+                        // lowering (target class = lhs declared type).
+                        if bare == "new" {
+                            self.bail("Expr_New");
+                            return None;
                             return None;
                         }
                     }
@@ -10273,6 +10427,21 @@ impl<'a> BytecodeCompiler<'a> {
                 // enclosing class chain (class scope shadows module
                 // functions per §8.23). Identical to the receiver form but
                 // with `this` as the receiver register.
+                // Step 9g: `new(args)` OUTSIDE an assignment target's
+                // typed lowering — the constructed class is the LHS's
+                // DECLARED type (§8.8), unknowable here. Keep the whole
+                // method on the AST (the assign site below intercepts the
+                // `lhs = new(...)` shape with a known lhs type).
+                if self.method_mode
+                    && let ExprKind::Ident(h) = &func.kind
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && h.path[0].name.name == "new"
+                {
+                    self.bail("Expr_Call_new");
+                    return None;
+                }
                 if self.method_mode
                     && let ExprKind::Ident(h) = &func.kind
                     && h.path.len() == 1
@@ -11179,6 +11348,20 @@ impl<'a> BytecodeCompiler<'a> {
                         ));
                         return true;
                     }
+                    // Step 9g: a bare STATIC-property store —
+                    // class_static_set semantics (Value unresized). Class
+                    // localparams (class_const_names) stay AST — a store
+                    // to a constant is illegal SV.
+                    if !self.local_var_regs.contains_key(bare)
+                        && self.static_member_names.contains(bare)
+                    {
+                        self.emit(Insn::StoreClassStatic(
+                            self.method_class.clone().unwrap_or_default().into_boxed_str(),
+                            bare.to_string().into_boxed_str(),
+                            val_reg,
+                        ));
+                        return true;
+                    }
                 }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     if self.signal_is_string_name(hier) {
@@ -11649,6 +11832,14 @@ impl<'a> BytecodeCompiler<'a> {
                     let bare = hier.path[0].name.name.as_str();
                     if !self.local_var_regs.contains_key(bare)
                         && self.bare_member_names.contains(bare)
+                    {
+                        return 0;
+                    }
+                    // Step 9g: a bare STATIC-property store evaluates its
+                    // RHS self-determined — class_static_set stores the
+                    // Value verbatim.
+                    if !self.local_var_regs.contains_key(bare)
+                        && self.static_member_names.contains(bare)
                     {
                         return 0;
                     }
@@ -12484,7 +12675,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
-    pub fn finish(mut self) -> CompiledBlock {
+    pub fn finish(&mut self) -> CompiledBlock {
         debug_assert!(!self.register_overflow);
         Self::fuse_load_selects(&mut self.insns);
         // After fusion (so the fused `LoadSignalRange`/`LoadSignalBit` count as
@@ -12561,7 +12752,7 @@ impl<'a> BytecodeCompiler<'a> {
             || (array_nbas >= 1 && total_nbas >= 2);
         CompiledBlock {
             num_regs: self.next_reg,
-            instructions: self.insns,
+            instructions: std::mem::take(&mut self.insns),
             has_fallback,
             nba_dup_targets,
             foreach_slots: self.foreach_slot_count,
@@ -12587,7 +12778,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// is `Some` only for functions that can `return e`. The caller seeds
     /// `this`/formal registers before executing and reads the result after.
     pub fn compile_class_method(
-        mut self,
+        &mut self,
         formals: &[(String, u32)],
         class_formals: &HashSet<String>,
         class_locals: &HashSet<String>,
@@ -12595,6 +12786,9 @@ impl<'a> BytecodeCompiler<'a> {
         super_method_names: &HashSet<String>,
         method_class_parent: &Option<String>,
         static_bare_targets: &HashMap<String, String>,
+        static_member_names: &HashSet<String>,
+        class_const_names: &HashSet<String>,
+        new_type_map: &HashMap<String, String>,
         method_class: &str,
         handle_member_types: &'a HashMap<String, HashMap<String, String>>,
         class_shadow_names: &HashSet<String>,
@@ -12685,6 +12879,9 @@ impl<'a> BytecodeCompiler<'a> {
         self.super_method_names = super_method_names.clone();
         self.method_class_parent = method_class_parent.clone();
         self.static_bare_targets = static_bare_targets.clone();
+        self.static_member_names = static_member_names.clone();
+        self.class_const_names = class_const_names.clone();
+        self.new_type_map = new_type_map.clone();
         self.method_class = Some(method_class.to_string());
         self.handle_member_types = Some(handle_member_types);
 
@@ -12806,6 +13003,9 @@ impl<'a> BytecodeCompiler<'a> {
     /// (pub(crate): the FSM native generator in `aot.rs` uses this to prove
     /// a Real tick literal feeds only a delay wait.)
     pub(crate) fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
+        // Step 9g insns: LoadClassStatic writes dest and reads nothing;
+        // StoreClassStatic reads src; ConstructObject reads its arg range
+        // (mirrors the CallMethod arms above).
         match insn {
             Insn::WaitDelayReg(d) => *d == r,
             Insn::WaitEdge(..) => false,
@@ -12842,6 +13042,12 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::CallScopedMethod(_, t, _, _, a, n) => {
                 *t == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
             }
+            Insn::ConstructObject(_, _, a, n) => {
+                (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+            }
+            // Step 9g: a static-property READ has no register inputs.
+            Insn::LoadClassStatic(..) => false,
+            Insn::StoreClassStatic(_, _, src) => *src == r,
             Insn::CallCollMethod(_, h, _, _, a, n, _) => {
                 *h == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
             }
@@ -14174,6 +14380,11 @@ impl<'a> BytecodeCompiler<'a> {
                 // return width follows its runtime type) — bare dest store.
                 Insn::CallMethod(d, ..) => store(&mut rw, *d, None),
                 Insn::CallScopedMethod(d, ..) => store(&mut rw, *d, None),
+                Insn::LoadClassStatic(d, ..) => store(&mut rw, *d, None),
+                // Step 9g: static store defines no SSA value; a fresh
+                // object handle has runtime-determined width (bare store).
+                Insn::StoreClassStatic(..) => {}
+                Insn::ConstructObject(d, ..) => store(&mut rw, *d, None),
                 // Collection builtin: dest width follows the runtime member
                 // (count / exists flag / popped element) — bare dest store.
                 Insn::CallCollMethod(d, ..) => store(&mut rw, *d, None),
@@ -15097,10 +15308,10 @@ mod tests {
         let sig_w: Vec<u32> = Vec::new();
         let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
         let widths: HashMap<String, u32> = Default::default();
-        let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
+        let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -15162,9 +15373,9 @@ mod tests {
         let sig_w: Vec<u32> = Vec::new();
         let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
         let widths: HashMap<String, u32> = Default::default();
-        let compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
+        let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -15199,11 +15410,11 @@ mod tests {
         // Without the shadow set the bare `os` lowers as a module signal; with
         // `os` listed as a class-scope name it must bail all-or-nothing.
         let shadow: HashSet<String> = ["os".to_string()].into_iter().collect();
-        let compiler =
+        let mut compiler =
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );

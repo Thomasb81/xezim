@@ -78,6 +78,8 @@ mod compiled_method_void;
 
 #[path = "classes/compiled_method_super.rs"]
 mod compiled_method_super;
+#[path = "classes/compiled_method_statics.rs"]
+mod compiled_method_statics;
 #[path = "classes/compiled_method_cast.rs"]
 mod compiled_method_cast;
 #[path = "classes/class_output_handle_copyback.rs"]

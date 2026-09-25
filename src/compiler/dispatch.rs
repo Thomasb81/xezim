@@ -90,6 +90,9 @@ pub enum Opcode {
     StoreClassMember,
     CallMethod,
     CallScopedMethod,
+    LoadClassStatic,
+    StoreClassStatic,
+    ConstructObject,
     CallCollMethod,
     LoadCollElem,
     StoreCollElem,
@@ -196,6 +199,9 @@ impl Opcode {
             Insn::StoreClassMember(..) => Self::StoreClassMember,
             Insn::CallMethod(..) => Self::CallMethod,
             Insn::CallScopedMethod(..) => Self::CallScopedMethod,
+            Insn::LoadClassStatic(..) => Self::LoadClassStatic,
+            Insn::StoreClassStatic(..) => Self::StoreClassStatic,
+            Insn::ConstructObject(..) => Self::ConstructObject,
             Insn::CallCollMethod(..) => Self::CallCollMethod,
             Insn::LoadCollElem(..) => Self::LoadCollElem,
             Insn::StoreCollElem(..) => Self::StoreCollElem,
@@ -211,7 +217,7 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 87;
+pub const NUM_OPCODES: usize = 90;
 
 /// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
 /// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to

@@ -23829,7 +23829,11 @@ impl Simulator {
                     debug_assert!(false, "class-member insn in isolated comb exec");
                     break;
                 }
-                Insn::CallMethod(..) | Insn::CallScopedMethod(..) => {
+                Insn::CallMethod(..)
+                | Insn::CallScopedMethod(..)
+                | Insn::LoadClassStatic(..)
+                | Insn::StoreClassStatic(..)
+                | Insn::ConstructObject(..) => {
                     debug_assert!(false, "class-member insn in isolated comb exec");
                     break;
                 }
@@ -24513,7 +24517,11 @@ impl Simulator {
                     debug_assert!(false, "class-member insn in isolated comb exec");
                     break;
                 }
-                Insn::CallMethod(..) | Insn::CallScopedMethod(..) => {
+                Insn::CallMethod(..)
+                | Insn::CallScopedMethod(..)
+                | Insn::LoadClassStatic(..)
+                | Insn::StoreClassStatic(..)
+                | Insn::ConstructObject(..) => {
                     debug_assert!(false, "CallMethod insn in isolated comb exec");
                     break;
                 }
@@ -25732,6 +25740,46 @@ impl Simulator {
                         self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
                     };
                     self.vm_regs[*dest as usize] = result;
+                    local_count += 1;
+                }
+                Insn::LoadClassStatic(dest, class, prop) => {
+                    // Step 9g: static-property read — class_static_get does
+                    // the parent-chain walk AND the per-specialization
+                    // keying from the baked defining class, mirroring the
+                    // AST's unqualified-static fallback (lexical ctx).
+                    let v = self
+                        .class_static_get(class, prop)
+                        .unwrap_or_else(|| Value::zero(32));
+                    self.vm_regs[*dest as usize] = v;
+                    local_count += 1;
+                }
+                Insn::StoreClassStatic(class, prop, src) => {
+                    // Step 9g: static-property store — the Value is stored
+                    // UNRESIZED (class_static_set semantics), immediately
+                    // visible to the interpreter.
+                    let v = self.vm_regs[*src as usize].clone();
+                    self.class_static_set(class, prop, v);
+                }
+                Insn::ConstructObject(dest, class, arg_start, n_args) => {
+                    // Step 9g: `new(args)` / bare `new` — §8.8 constructor
+                    // of the baked DEFINING class. Allocation, property
+                    // inits, and the ctor chain all stay in
+                    // instantiate_class (interpreter-owned).
+                    let base = *arg_start as usize;
+                    let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
+                    for i in 0..*n_args as usize {
+                        argvals.push(self.vm_regs.get(base + i).cloned().unwrap_or(Value::zero(32)));
+                    }
+                    let args: Vec<Expression> = argvals
+                        .iter()
+                        .map(|v| self.value_method_arg_expr(v))
+                        .collect();
+                    let v = if let Some(cd) = self.module.classes.get(class.as_ref()).cloned() {
+                        self.instantiate_class(&cd, &args)
+                    } else {
+                        Value::zero(32)
+                    };
+                    self.vm_regs[*dest as usize] = v;
                     local_count += 1;
                 }
                 Insn::CallCollMethod(dest, handle_reg, member, method, arg_start, n_args, bare) => {
@@ -38549,6 +38597,9 @@ impl Simulator {
             Insn::StoreClassMember(..) => "StoreClassMember",
             Insn::CallMethod(..) => "CallMethod",
             Insn::CallScopedMethod(..) => "CallScopedMethod",
+            Insn::LoadClassStatic(..) => "LoadClassStatic",
+            Insn::StoreClassStatic(..) => "StoreClassStatic",
+            Insn::ConstructObject(..) => "ConstructObject",
             Insn::CallCollMethod(..) => "CallCollMethod",
             Insn::LoadCollElem(..) => "LoadCollElem",
             Insn::StoreCollElem(..) => "StoreCollElem",
@@ -117957,6 +118008,64 @@ impl Simulator {
                 // exactly the AST fallback's nonvirtual_target_class;
                 // statics keep the virtual dispatch they have today).
                 let class_parent = self.module.classes.get(cname).and_then(|cd| cd.extends.clone());
+                // Step 9g: static-member admission. Walk the parent chain
+                // collecting `static_properties` (which ALSO contains class
+                // localparams) and `param_defaults` (localparam names). A
+                // name that exists as an INSTANCE property anywhere in the
+                // chain, or a localparam (constant), is NOT admitted for
+                // writes: the interpreter's own resolution for those
+                // shapes is member-first / read-only, and the compiled
+                // runtime walk starts at the baked defining class (= the
+                // lexical class of every frame that runs this block).
+                let mut static_members: HashSet<String> = HashSet::default();
+                let mut const_names: HashSet<String> = HashSet::default();
+                let mut instance_props: HashSet<String> = HashSet::default();
+                {
+                    let mut cur = Some(cname.to_string());
+                    let mut guard = 0;
+                    while let Some(cn) = cur {
+                        guard += 1;
+                        if guard > 64 {
+                            break;
+                        }
+                        if let Some(cd) = self.module.classes.get(&cn) {
+                            let class_staticish: HashSet<String> = cd
+                                .static_properties
+                                .iter()
+                                .chain(cd.param_defaults.iter().map(|(pn, _)| pn))
+                                .cloned()
+                                .collect();
+                            for sp in cd.static_properties.iter() {
+                                static_members.insert(sp.clone());
+                            }
+                            for (pn, _) in cd.param_defaults.iter() {
+                                const_names.insert(pn.clone());
+                            }
+                            // `property_types` holds EVERY declared
+                            // property (static ones too) — only names that
+                            // are neither static nor localparam are
+                            // instance properties.
+                            for pn in cd.property_types.keys() {
+                                if !class_staticish.contains(pn) {
+                                    instance_props.insert(pn.clone());
+                                }
+                            }
+                            cur = cd.extends.clone();
+                        } else {
+                            break;
+                        }
+                    }
+                    for ip in instance_props.iter() {
+                        static_members.remove(ip);
+                        const_names.remove(ip);
+                    }
+                    // A localparam lives in BOTH sets after the union
+                    // walk; it is READ-ONLY — drop it from the writable
+                    // set (stores to it stay AST).
+                    for lp in const_names.iter() {
+                        static_members.remove(lp);
+                    }
+                }
                 let mut bare_targets: HashMap<String, String> = HashMap::default();
                 for m in method_name_set.iter() {
                     if self.is_static_method(cname, m) {
@@ -117969,8 +118078,58 @@ impl Simulator {
                 // Step 9e: typed handle-chain admission inputs — the
                 // method's own class and every class's handle-member types.
                 let handle_member_types = self.class_handle_member_types();
+                // Step 9g: DECLARED class types of bare lvalues — locals
+                // (from the method body's own VarDecls), static members,
+                // and instance members of the enclosing chain — filtered
+                // to NON-parameterized classes (the ctor's specialization
+                // is runtime state). Drives `lhs = new(...)` lowering.
+                let mut new_type_map: HashMap<String, String> = HashMap::default();
+                for (m, t) in handle_member_types
+                    .get(cname)
+                    .map(|m| m.iter())
+                    .unwrap_or_default()
+                {
+                    if !self.class_is_parameterized(t) {
+                        new_type_map.insert(m.clone(), t.clone());
+                    }
+                }
+                {
+                    let mut cur = Some(cname.to_string());
+                    let mut guard = 0;
+                    while let Some(cn) = cur {
+                        guard += 1;
+                        if guard > 64 {
+                            break;
+                        }
+                        if let Some(cd) = self.module.classes.get(&cn) {
+                            for sp in cd.static_properties.iter() {
+                                if let Some(dt) = cd.property_types.get(sp)
+                                    && let Some(t) = self.typeref_class_name(dt)
+                                    && !self.class_is_parameterized(&t)
+                                {
+                                    new_type_map.insert(sp.clone(), t);
+                                }
+                            }
+                            cur = cd.extends.clone();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                for st in body.iter() {
+                    if let StatementKind::VarDecl { declarators, data_type, .. } = &st.kind {
+                        for d in declarators {
+                            if let Some(t) = self
+                                .typeref_class_name(data_type)
+                                .filter(|t| !self.class_is_parameterized(t))
+                            {
+                                new_type_map.insert(d.name.name.clone(), t);
+                            }
+                        }
+                    }
+                }
                 let compiled = {
-                    let compiler = BytecodeCompiler::new(
+                    let mut compiler = BytecodeCompiler::new(
                         &self.signal_name_to_id,
                         &self.signal_signed,
                         &self.signal_widths,
@@ -117978,33 +118137,39 @@ impl Simulator {
                         &self.widths,
                     );
                     let body_refs: Vec<&crate::ast::stmt::Statement> = body.iter().collect();
-                    compiler.compile_class_method(
-                        &pre.formals,
-                        &pre.class_formals,
-                        &class_locals,
-                        &method_name_set,
-                        &super_method_set,
-                        &class_parent,
-                        &bare_targets,
-                        cname,
-                        &handle_member_types,
-                        &shadow_names,
-                        &member_safe,
-                        &bare_members,
-                        &member_classes,
-                        &string_members,
-                        &pre.coll_members,
-                        &pre.static_coll_members,
-                        &pre.coll_elem_members,
-                        &pre.string_formals,
-                        Some((
-                            &pre.fn_ret_name,
-                            result_width,
-                            pre.is_class_result,
-                            pre.is_string_result,
-                        )),
-                        &body_refs,
-                    )
+                    let compiler_outcome =
+                        compiler
+                            .compile_class_method(
+                                &pre.formals,
+                                &pre.class_formals,
+                                &class_locals,
+                                &method_name_set,
+                                &super_method_set,
+                                &class_parent,
+                                &bare_targets,
+                                &static_members,
+                                &const_names,
+                                &new_type_map,
+                                cname,
+                                &handle_member_types,
+                                &shadow_names,
+                                &member_safe,
+                                &bare_members,
+                                &member_classes,
+                                &string_members,
+                                &pre.coll_members,
+                                &pre.static_coll_members,
+                                &pre.coll_elem_members,
+                                &pre.string_formals,
+                                Some((
+                                    &pre.fn_ret_name,
+                                    result_width,
+                                    pre.is_class_result,
+                                    pre.is_string_result,
+                                )),
+                                &body_refs,
+                            );
+                    compiler_outcome
                 };
                 // Step 9e: a STATIC method's frame has NO `this` — its
                 // register 0 is a null seed. Any instruction that lowers
