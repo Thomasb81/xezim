@@ -103,6 +103,8 @@ mod fork_join_none_await_context;
 mod fork_var_activation_isolation;
 #[path = "scheduling/fork_var_sharing.rs"]
 mod fork_var_sharing;
+#[path = "scheduling/forked_package_task_suspends.rs"]
+mod forked_package_task_suspends;
 #[path = "scheduling/gap_fixes_scoping_and_nba.rs"]
 mod gap_fixes_scoping_and_nba;
 #[path = "scheduling/gate_rise_fall_delay.rs"]

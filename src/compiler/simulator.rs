@@ -46458,6 +46458,27 @@ impl Simulator {
                 }
             }
 
+            // Stage 1-pkg: a blocking PACKAGE task, `pkg::t(args)` — flattened
+            // to Ident([pkg, t]) at module scope, a MemberAccess inside a
+            // subroutine body. Stage 1 matches single-segment names only, so
+            // these ran on the synchronous path, whose nested delay loop
+            // never hands control back: a forked `pkg::t()` with a `forever`
+            // body kept its parent's `#25 $finish` from ever running.
+            if let StatementKind::Expr(expr) = &stmt.kind {
+                if let ExprKind::Call { func, args } = &expr.kind {
+                    if let Some(td) = self.package_task_target(func) {
+                        if self.stmts_have_blocking(&td.items) {
+                            let cleanup = self.bind_task_frame(&td, args);
+                            self.task_cleanup.push(cleanup);
+                            let mut cont: Vec<Statement> = td.items.clone();
+                            cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
+                            self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
+                            return;
+                        }
+                    }
+                }
+            }
+
             // Stage 1-hier: a call to a blocking HIERARCHICAL or interface
             // task — `u_m.sample(args)` / `vif.sample(args)` (LRM §25.5.4,
             // §25.9) — flattens to Call{func: Ident([...])} with 2+ segments.
@@ -106029,6 +106050,37 @@ impl Simulator {
             return None; // fast path: no vif variables bound anywhere
         }
         self.viface_var_aliases.get(name).cloned()
+    }
+
+    /// §26.3: the task a `pkg::t` callee names — the package-qualified key
+    /// elaboration gives a colliding declaration, else the hoisted bare one.
+    /// None unless the head is a registered package that no signal shadows.
+    fn package_task_target(&self, func: &Expression) -> Option<TaskDeclaration> {
+        let (pkg, name) = match &func.kind {
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (&h.path[0].name.name, &h.path[1].name.name)
+            }
+            ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    (&h.path[0].name.name, &member.name)
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if !self.module.packages.contains(pkg)
+            || self.signal_name_to_id.contains_key(pkg.as_str())
+            || self.signals.contains_key(pkg)
+        {
+            return None;
+        }
+        self.module
+            .tasks
+            .get(&format!("{}::{}", pkg, name))
+            .or_else(|| self.module.tasks.get(name))
+            .cloned()
     }
 
     /// Resolve a dotted/interface task ENABLE target to its full key in
