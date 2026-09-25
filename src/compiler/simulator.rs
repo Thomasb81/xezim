@@ -18544,7 +18544,7 @@ impl Simulator {
         let (seed_lhs_name, seed_val) = match &stmts[0].kind {
             StatementKind::BlockingAssign { lvalue, rvalue } => {
                 let n = match &lvalue.kind {
-                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str())?,
+                    ExprKind::Ident(h) => Self::clock_gen_ident(h)?,
                     _ => return None,
                 };
                 // RHS must be a compile-time constant (plain integer,
@@ -18566,7 +18566,7 @@ impl Simulator {
             _ => return None,
         };
         // Stmt 1: Forever containing #d VAR = ~VAR
-        let (half_period, tog_name) = match &stmts[1].kind {
+        let (half_period, tog_hier) = match &stmts[1].kind {
             StatementKind::Forever { body } => {
                 let inner = match &body.kind {
                     StatementKind::SeqBlock { stmts: s, .. } if s.len() == 1 => &s[0],
@@ -18610,10 +18610,11 @@ impl Simulator {
                     _ => return None,
                 };
                 let (lhs, rhs) = ba_target;
-                let ln = match &lhs.kind {
-                    ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str())?,
+                let lh = match &lhs.kind {
+                    ExprKind::Ident(h) => h,
                     _ => return None,
                 };
+                let ln = Self::clock_gen_ident(lh)?;
                 // rhs must be ~LHS or !LHS
                 let rn = match &rhs.kind {
                     ExprKind::Unary {
@@ -18624,7 +18625,7 @@ impl Simulator {
                         op: UnaryOp::LogNot,
                         operand,
                     } => match &operand.kind {
-                        ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str())?,
+                        ExprKind::Ident(h) => Self::clock_gen_ident(h)?,
                         _ => return None,
                     },
                     _ => return None,
@@ -18632,28 +18633,19 @@ impl Simulator {
                 if ln != rn {
                     return None;
                 }
-                (delay, ln)
+                (delay, lh)
             }
             _ => return None,
         };
+        let tog_name = Self::clock_gen_ident(tog_hier)?;
         if seed_lhs_name != tog_name {
             return None;
         }
-        // Resolve signal_id. Use the (hopefully cached) resolve_hier_name
-        // via signal_name_to_id directly on the leaf name — initial
-        // clock blocks almost always use unqualified names in the tb.
-        let sid = if let Some(&id) = self.signal_name_to_id.get(tog_name) {
-            id
-        } else {
-            // Suffix match
-            let suffix = format!(".{}", tog_name);
-            let found = self
-                .signal_name_to_id
-                .iter()
-                .find(|(k, _)| k.ends_with(&suffix))
-                .map(|(_, &v)| v)?;
-            found
-        };
+        // Resolve the whole dotted path under this block's scope (the caller
+        // set the hint). Keying on the leaf alone let `BUS.clk` bind to any
+        // signal ending in `.clk` — another interface's `clk` — so the real
+        // clock never toggled.
+        let sid = self.clock_gen_signal_id(tog_hier)?;
         // Apply seed: sets signal_table[sid] + marks dirty so settle sees it.
         let width = self.signal_widths[sid];
         let seed = seed_val.resize(width);
@@ -18670,6 +18662,29 @@ impl Simulator {
             ahead: None,
             t0_rank: usize::MAX,
         })
+    }
+
+    /// The flat dotted name of a clock-generator operand (`clk`, `BUS.clk`),
+    /// or None when a segment carries a select (a bit of a vector is not a
+    /// whole-signal clock).
+    fn clock_gen_ident(h: &HierarchicalIdentifier) -> Option<String> {
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        Some(
+            h.path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join("."),
+        )
+    }
+
+    /// Signal id of a clock-generator target, resolved like any other
+    /// reference under the current name-resolution hint.
+    fn clock_gen_signal_id(&self, h: &HierarchicalIdentifier) -> Option<usize> {
+        let name = self.resolve_hier_name(h);
+        self.signal_name_to_id.get(name.as_ref()).copied()
     }
 
     /// Try to detect `always #N var = ~var` pattern and extract as a ClockGen.
@@ -18707,11 +18722,12 @@ impl Simulator {
         let (lhs, rhs) = assign;
 
         // LHS must be a simple identifier
-        let lhs_name = match &lhs.kind {
-            ExprKind::Ident(hier) => hier.path.last().map(|s| s.name.name.as_str()),
-            _ => None,
-        }?;
-        let &signal_id = self.signal_name_to_id.get(lhs_name)?;
+        let lhs_hier = match &lhs.kind {
+            ExprKind::Ident(hier) => hier,
+            _ => return None,
+        };
+        let lhs_name = Self::clock_gen_ident(lhs_hier)?;
+        let signal_id = self.clock_gen_signal_id(lhs_hier)?;
 
         // RHS must be ~LHS or !LHS
         match &rhs.kind {
@@ -18724,7 +18740,7 @@ impl Simulator {
                 operand,
             } => {
                 if let ExprKind::Ident(hier) = &operand.kind {
-                    let rhs_name = hier.path.last().map(|s| s.name.name.as_str())?;
+                    let rhs_name = Self::clock_gen_ident(hier)?;
                     if rhs_name == lhs_name {
                         return Some(ClockGen {
                             signal_id,
@@ -19911,7 +19927,13 @@ impl Simulator {
                 // re-evaluate every toggle; never freeze it into a fixed
                 // ClockGen (which would keep the ORIGINAL period forever).
                 if delay_val > 0 && !self.delay_expr_is_dynamic(d) {
-                    if let Some(clock_gen) = self.try_extract_clock_gen(body, delay_val) {
+                    let saved_hint = self.name_resolve_hint.borrow().clone();
+                    if !ab.scope.is_empty() {
+                        *self.name_resolve_hint.borrow_mut() = Some(ab.scope.clone());
+                    }
+                    let extracted = self.try_extract_clock_gen(body, delay_val);
+                    *self.name_resolve_hint.borrow_mut() = saved_hint;
+                    if let Some(clock_gen) = extracted {
                         sim_dbg_eprintln!(
                             "[OPT] clock generator: signal {} period {} (always #{} pattern)",
                             self.name_for_id(clock_gen.signal_id),
