@@ -106033,6 +106033,7 @@ impl Simulator {
                 // vif passed through config_db arrived as nothing
                 // (issue #113: the driver's vif stayed null).
                 if let Some(resolved) = self.resolve_type_param_binding(n) {
+                    let explicit_virtual = resolved.trim_start().starts_with("virtual");
                     let base = resolved
                         .trim_start_matches("virtual")
                         .trim()
@@ -106042,7 +106043,12 @@ impl Simulator {
                         .trim()
                         .to_string();
                     if self.module.interfaces.contains(&base) {
-                        return true;
+                        // §3.13: a bare type argument that also names a class
+                        // (`registry#(mon)` beside `interface mon`) is the
+                        // class; only `virtual mon` denotes the interface.
+                        return explicit_virtual
+                            || !(self.module.classes.contains_key(&base)
+                                || self.module.covergroups.contains_key(&base));
                     }
                 }
                 false
