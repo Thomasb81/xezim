@@ -42,7 +42,7 @@ module tb;
       rc = $cast(l_verbosity, v);
       if (rc == 0) begin
         // out-of-range -> int path (as uvm_report_handler does for a non-member)
-        lv = v; // not reached for 301/501 after the fix
+        lv = verbosity'(v); // not reached for 301/501 after the fix
         return 0;
       end
       return 1;
