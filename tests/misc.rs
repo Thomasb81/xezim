@@ -33,6 +33,8 @@ mod bare_method_call_returns;
 mod bare_randomize_solver;
 #[path = "misc/base1_packed_index.rs"]
 mod base1_packed_index;
+#[path = "misc/begin_keywords_noconfig.rs"]
+mod begin_keywords_noconfig;
 #[path = "misc/bind_upward_refs.rs"]
 mod bind_upward_refs;
 #[path = "misc/blocking_task_call.rs"]
