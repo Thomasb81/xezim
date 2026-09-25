@@ -1444,7 +1444,12 @@ impl<'a> Ck<'a> {
                             ));
                         }
                     }
-                    if equivalent(le, re) == Some(false) {
+                    // An enum array takes no plain integral array (§6.19.3);
+                    // an enum array into an integral one is accepted, as by
+                    // the reference simulator.
+                    let enum_from_int =
+                        matches!(**le, Ty::Enum { .. }) && matches!(**re, Ty::Int { .. });
+                    if enum_from_int || equivalent(le, re) == Some(false) {
                         return Some(format!(
                             "element types {} and {} are not equivalent (IEEE 1800-2017 \
                              §6.22.2, §7.6)",

@@ -60,6 +60,29 @@ fn unpacked_arrays_need_same_shape_and_equivalent_elements() {
     rejected("module top; int q1 [$]; real q2 [$]; initial q1 = q2; endmodule");
 }
 
+/// §6.19.3/§7.6: an enum array takes no plain integral array (xezim has
+/// rejected this since its first enum check, and ivtest expects it; the
+/// reference simulator accepts it). The other direction is accepted by both.
+#[test]
+fn enum_arrays_take_no_integral_arrays() {
+    rejected("module top; wire enum integer {A} x[1:0]; integer y[1:0]; assign x = y; endmodule");
+    rejected(
+        "module top; enum logic [31:0] {A} d1[]; logic [31:0] d2[]; initial d1 = d2; endmodule",
+    );
+    rejected(
+        "module top; enum logic [31:0] {A} q1[$]; logic [31:0] q2[$]; initial q1 = q2; endmodule",
+    );
+    let src = "module top; wire integer x[1:0]; enum integer {A} y[1:0];\n\
+               assign x = y;\n\
+               initial begin y[0] = A; y[1] = A; #1 $display(\"I|%0d\", x[0]); end endmodule";
+    let sim = simulate(src, 10).expect("an enum array into an integer array is legal");
+    assert!(
+        sim.output.iter().any(|o| o.message == "I|0"),
+        "{:?}",
+        sim.output
+    );
+}
+
 #[test]
 fn class_handles_take_only_derived_classes() {
     let e = rejected(
