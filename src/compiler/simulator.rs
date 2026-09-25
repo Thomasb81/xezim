@@ -69730,20 +69730,90 @@ impl Simulator {
     /// stays small: this arm's locals inflated every call's frame (the
     /// dispatcher recursed with a 7.8 KB frame per level).
     #[inline(never)]
-    /// `name = <literal | unary | binary>` on a select-free single-segment
-    /// target. Every special form the full path tests for keys on an
-    /// aggregate, call, pattern, identifier or `new` RHS, on a selected or
-    /// dotted target, or on a target that is an event, a virtual-interface
-    /// variable, a vif property or a possibly-struct property; none can
-    /// match here, so the statement is the full path's final width-sized
-    /// evaluate + assign.
-    fn simple_blocking_assign(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
-        if !matches!(
-            rvalue.kind,
-            ExprKind::Number(_) | ExprKind::Binary { .. } | ExprKind::Unary { .. }
-        ) {
+    /// The extra conditions for `n = r` (both bare names) to reduce to a
+    /// plain evaluate + assign: no `new`, no vif binding to carry, no
+    /// struct copy or spread, and no collection / array / associative copy
+    /// (the full path's whole-aggregate forms all need the target to be one).
+    fn simple_ident_copy_ok(&mut self, lh: &HierarchicalIdentifier, n: &str, r: &str) -> bool {
+        if r == "new"
+            || self.vif_name_possible(r)
+            || self.struct_capable_names().contains(r)
+            || self.module.dynamic_arrays.contains(n)
+            || self.instance_assoc_member(n).is_some()
+        {
             return false;
         }
+        let ln = self.resolve_hier_name(lh);
+        if self.module.arrays.contains_key(ln.as_ref())
+            || self.module.arrays_2d.contains_key(ln.as_ref())
+            || self.module.arrays_nd.contains_key(ln.as_ref())
+            || self.is_associative_array(&ln)
+        {
+            return false;
+        }
+        let dst = match self.dyn_name_lookup(n) {
+            Some(uq) => uq.to_string(),
+            None => n.to_string(),
+        };
+        let struct_decl = self.module.var_decl_types.get(&dst).is_some_and(|dt| {
+            matches!(self.resolve_dt_ref(dt), DataType::Struct(su) if Self::spreads_member_wise(su))
+        });
+        !struct_decl && self.struct_copy_target(dst).1.is_none()
+    }
+
+    /// The member-wise struct type of whole-value copy target `dst`, with the
+    /// name it was found under: `dst` itself or, when `dst` has no declared
+    /// type, `dst` under the resolution hint.
+    fn struct_copy_target(
+        &self,
+        dst: String,
+    ) -> (String, Option<crate::ast::types::StructUnionType>) {
+        // Only a member-wise struct target needs its type owned; every
+        // other assignment answers the predicate by borrow. `None`: the name
+        // has no declared type at all.
+        let spread_of = |sim: &Self, name: &str| {
+            sim.p_elem_type_ref(name)
+                .map(|dt| match sim.resolve_dt_ref(&dt) {
+                    DataType::Struct(su) if Self::spreads_member_wise(su) => Some(su.clone()),
+                    _ => None,
+                })
+        };
+        match spread_of(self, &dst) {
+            Some(su) => (dst, su),
+            None => {
+                let hint = self.name_resolve_hint.borrow().clone();
+                match hint {
+                    Some(h) => {
+                        let scoped = format!("{}.{}", h, dst);
+                        match spread_of(self, &scoped) {
+                            Some(su) => (scoped, su),
+                            None => (dst, None),
+                        }
+                    }
+                    None => (dst, None),
+                }
+            }
+        }
+    }
+
+    /// `name = <literal | unary | binary | name>` on a select-free
+    /// single-segment target. Every special form the full path tests for
+    /// keys on an aggregate, call, pattern or `new` RHS, on a selected or
+    /// dotted target, or on a target that is an event, a virtual-interface
+    /// variable, a vif property or a possibly-struct property; none can
+    /// match here (a bare-name RHS adds the conditions in
+    /// `simple_ident_copy_ok`), so the statement is the full path's final
+    /// width-sized evaluate + assign.
+    fn simple_blocking_assign(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        let rhs_ident = match &rvalue.kind {
+            ExprKind::Number(_) | ExprKind::Binary { .. } | ExprKind::Unary { .. } => None,
+            ExprKind::Ident(rh)
+                if rh.path.len() == 1 && rh.root.is_none() && rh.path[0].selects.is_empty() =>
+            {
+                Some(rh.path[0].name.name.as_str())
+            }
+            _ => return false,
+        };
         let ExprKind::Ident(h) = &lvalue.kind else {
             return false;
         };
@@ -69761,6 +69831,11 @@ impl Simulator {
                 .is_some_and(|dt| self.is_virtual_iface_type(dt))
         {
             return false;
+        }
+        if let Some(r) = rhs_ident {
+            if !self.simple_ident_copy_ok(h, n, r) {
+                return false;
+            }
         }
         let w = {
             let iw = self.infer_lhs_width(lvalue);
@@ -70280,32 +70355,7 @@ impl Simulator {
             // this type lookup bypassed it, so the whole-struct copy
             // silently declined and every member stayed x — while the
             // identical code at top level worked.
-            // Only a member-wise struct target needs its type owned;
-            // every other assignment answers the predicate by borrow.
-            // `None`: the name has no declared type at all.
-            let spread_of = |sim: &Self, name: &str| {
-                sim.p_elem_type_ref(name)
-                    .map(|dt| match sim.resolve_dt_ref(&dt) {
-                        DataType::Struct(su) if Self::spreads_member_wise(su) => Some(su.clone()),
-                        _ => None,
-                    })
-            };
-            let (dst, spread_su) = match spread_of(self, &dst) {
-                Some(su) => (dst, su),
-                None => {
-                    let hint = self.name_resolve_hint.borrow().clone();
-                    match hint {
-                        Some(h) => {
-                            let scoped = format!("{}.{}", h, dst);
-                            match spread_of(self, &scoped) {
-                                Some(su) => (scoped, su),
-                                None => (dst, None),
-                            }
-                        }
-                        None => (dst, None),
-                    }
-                }
-            };
+            let (dst, spread_su) = self.struct_copy_target(dst);
             if let Some(su) = spread_su {
                 if let Some(src) = self.flat_member_name(rvalue) {
                     if src != dst && self.struct_storage_exists(&src, &su) {
