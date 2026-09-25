@@ -179,6 +179,8 @@ mod instance_collections_resolve_by_scope;
 mod instance_loop_local_shadows_module_var;
 #[path = "hierarchy/instance_task_in_forever_loop.rs"]
 mod instance_task_in_forever_loop;
+#[path = "hierarchy/interface_port_inside.rs"]
+mod interface_port_inside;
 #[path = "hierarchy/interface_task_lexical_scope.rs"]
 mod interface_task_lexical_scope;
 #[path = "hierarchy/library_dir_on_demand.rs"]
