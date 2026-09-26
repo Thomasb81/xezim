@@ -1,23 +1,30 @@
-//! Code coverage: statement counts, collected when the run asks for them
-//! (`--code-coverage`, `+cover`) and written to the results file beside the
-//! functional coverage.
+//! Code coverage: statement and branch counts, collected when the run asks
+//! for them (`--code-coverage`, `+cover`) and written to the results file
+//! beside the functional coverage.
 //!
-//! Statements are instrumented at compile time, on the elaborated design,
-//! before any block is lowered: a counted statement gets a `$__xz_cov(<n>)`
-//! call in front of it. The bytecode compiler turns those into
-//! `Insn::CovHit`; the interpreter counts them itself. Every execution path therefore counts the same way, and a run
+//! Statements and branches are instrumented at compile time, on the
+//! elaborated design, before any block is lowered: a counted statement gets a
+//! `$__xz_cov(<n>)` call in front of it, a branch arm one at its start, and a
+//! `?:` condition is wrapped in `$__xz_covc(<n>, cond)`. The bytecode
+//! compiler turns those into `Insn::CovHit`; the interpreter counts them
+//! itself. Every execution path therefore counts the same way, and a run
 //! without code coverage compiles exactly the design it did before.
 //! Continuous assignments count in their comb entry (`ca_counter`).
 use super::*;
 use crate::ast::Span;
 
 pub const KIND_STATEMENT: u8 = 1;
+pub const KIND_BRANCH: u8 = 2;
 /// Result names of the kinds, bit `i` of a kind mask naming entry `i`.
-const KIND_NAMES: [&str; 1] = ["statement"];
+const KIND_NAMES: [&str; 2] = ["statement", "branch"];
 type Tallies = [Tally; KIND_NAMES.len()];
 
-/// `$__xz_cov(<n>)`: counts counter `n` (a statement).
+/// `$__xz_cov(<n>)`: counts counter `n` (a statement or a branch arm).
 pub(crate) const HIT_TASK: &str = "$__xz_cov";
+/// `$__xz_covc(<n>, cond)`: yields `cond`, counting counter `n` when it is
+/// true and `n + 1` when it is false (a `?:` condition).
+pub(crate) const COND_FN: &str = "$__xz_covc";
+
 /// Library packages left out unless `--code-coverage-scope` names them.
 const LIBRARY_PACKAGES: [&str; 2] = ["std", "uvm_pkg"];
 
@@ -44,17 +51,18 @@ pub(crate) fn code_coverage() -> Option<CodeCoverage> {
     CONFIG.lock().ok().and_then(|c| c.clone())
 }
 
-/// The kinds a `--code-coverage` list names: `stmt` (or `statement`, `s`)
-/// or `all`, separated by commas.
+/// The kinds a `--code-coverage` list names: `stmt` (or `statement`, `s`),
+/// `branch` (`b`) or `all`, separated by commas.
 pub fn parse_kinds(spec: &str) -> Result<u8, String> {
     let mut kinds = 0u8;
     for k in spec.split(',').map(str::trim).filter(|k| !k.is_empty()) {
         kinds |= match k {
             "stmt" | "statement" | "s" => KIND_STATEMENT,
-            "all" => KIND_STATEMENT,
+            "branch" | "b" => KIND_BRANCH,
+            "all" => KIND_STATEMENT | KIND_BRANCH,
             _ => {
                 return Err(format!(
-                    "unknown code coverage kind '{}' (want stmt or all)",
+                    "unknown code coverage kind '{}' (want stmt, branch or all)",
                     k
                 ));
             }
@@ -132,12 +140,29 @@ struct StmtSite {
     counter: u32,
 }
 
+struct Arm {
+    span: Span,
+    label: &'static str,
+    /// `None` for the implicit `else` / `default`: the branch's entry count
+    /// minus the other arms.
+    counter: Option<u32>,
+}
+
+struct BranchSite {
+    scope: u32,
+    span: Span,
+    kind: &'static str,
+    entry: Option<u32>,
+    arms: Vec<Arm>,
+}
+
 pub(crate) struct CodeCov {
     kinds: u8,
     limit: Vec<String>,
     scopes: Vec<Scope>,
     scope_index: HashMap<String, u32>,
     stmts: Vec<StmtSite>,
+    branches: Vec<BranchSite>,
     counters: u32,
     /// Continuous assignment (origin span start, end, scope) -> its counter.
     ca_counter: HashMap<(usize, usize, String), u32>,
@@ -175,6 +200,14 @@ impl Instr<'_> {
     fn wrap(&mut self, s: Statement) -> Statement {
         let span = s.span;
         let mut v = Vec::new();
+        self.stmt(s, &mut v);
+        block(v, span)
+    }
+
+    /// A branch arm: its counter, then the arm's own statements.
+    fn arm(&mut self, s: Statement, counter: u32) -> Statement {
+        let span = s.span;
+        let mut v = vec![hit(counter, span)];
         self.stmt(s, &mut v);
         block(v, span)
     }
@@ -237,45 +270,47 @@ impl Instr<'_> {
                     stmts,
                 }));
             }
-            // Not statements themselves; their arms' statements count.
             StatementKind::If {
                 unique_priority,
                 condition,
                 then_stmt,
                 else_stmt,
-            } => {
-                let then_stmt = Box::new(self.wrap(*then_stmt));
-                let else_stmt = else_stmt.map(|e| Box::new(self.wrap(*e)));
-                out.push(rebuilt(StatementKind::If {
-                    unique_priority,
-                    condition,
-                    then_stmt,
-                    else_stmt,
-                }));
-            }
+            } => self.if_stmt(unique_priority, condition, then_stmt, else_stmt, span, out),
             StatementKind::Case {
                 unique_priority,
                 kind,
                 expr,
-                mut items,
-            } => {
-                for it in items.iter_mut() {
-                    let st =
-                        std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
-                    it.stmt = self.wrap(st);
-                }
-                out.push(rebuilt(StatementKind::Case {
-                    unique_priority,
-                    kind,
-                    expr,
-                    items,
-                }));
-            }
+                items,
+            } => self.case_stmt(unique_priority, kind, expr, items, span, out),
             StatementKind::RandCase { items } => {
-                let items = items
-                    .into_iter()
-                    .map(|(w, st)| (w, self.wrap(st)))
-                    .collect();
+                let items = if self.kinds & KIND_BRANCH != 0 {
+                    let mut arms = Vec::new();
+                    let items = items
+                        .into_iter()
+                        .map(|(w, st)| {
+                            let c = self.counter();
+                            arms.push(Arm {
+                                span: st.span,
+                                label: "item",
+                                counter: Some(c),
+                            });
+                            (w, self.arm(st, c))
+                        })
+                        .collect();
+                    self.cov.branches.push(BranchSite {
+                        scope: self.scope,
+                        span,
+                        kind: "randcase",
+                        entry: None,
+                        arms,
+                    });
+                    items
+                } else {
+                    items
+                        .into_iter()
+                        .map(|(w, st)| (w, self.wrap(st)))
+                        .collect()
+                };
                 out.push(rebuilt(StatementKind::RandCase { items }));
             }
             StatementKind::For {
@@ -357,10 +392,318 @@ impl Instr<'_> {
             | StatementKind::ForeverTail { .. }
             | StatementKind::RsAction { .. }
             | StatementKind::RsReturn) => out.push(rebuilt(kind)),
+            StatementKind::BlockingAssign { lvalue, mut rvalue } => {
+                self.count(span, "statement", out);
+                self.expr(&mut rvalue);
+                out.push(rebuilt(StatementKind::BlockingAssign { lvalue, rvalue }));
+            }
+            StatementKind::NonblockingAssign {
+                lvalue,
+                delay,
+                mut rvalue,
+            } => {
+                self.count(span, "statement", out);
+                self.expr(&mut rvalue);
+                out.push(rebuilt(StatementKind::NonblockingAssign {
+                    lvalue,
+                    delay,
+                    rvalue,
+                }));
+            }
+            StatementKind::Expr(mut e) => {
+                self.count(span, "statement", out);
+                match &mut e.kind {
+                    ExprKind::Call { args, .. } => {
+                        for a in args.iter_mut() {
+                            self.expr(a);
+                        }
+                    }
+                    ExprKind::AssignExpr { rvalue, .. } => self.expr(rvalue),
+                    ExprKind::Binary {
+                        op: BinaryOp::Assign,
+                        right,
+                        ..
+                    } => self.expr(right),
+                    _ => {}
+                }
+                out.push(rebuilt(StatementKind::Expr(e)));
+            }
+            StatementKind::Return(Some(mut e)) => {
+                self.count(span, "statement", out);
+                self.expr(&mut e);
+                out.push(rebuilt(StatementKind::Return(Some(e))));
+            }
             kind => {
                 self.count(span, "statement", out);
                 out.push(rebuilt(kind));
             }
+        }
+    }
+
+    /// An `if`, with its `else if` chain as one branch: one arm per
+    /// condition plus the final `else`, written or implicit. A `unique` or
+    /// `priority` chain has no implicit arm (no match is a violation).
+    fn if_stmt(
+        &mut self,
+        unique_priority: Option<UniquePriority>,
+        mut condition: Expression,
+        then_stmt: Box<Statement>,
+        else_stmt: Option<Box<Statement>>,
+        span: Span,
+        out: &mut Vec<Statement>,
+    ) {
+        if self.kinds & KIND_BRANCH == 0 {
+            let then_stmt = Box::new(self.wrap(*then_stmt));
+            let else_stmt = else_stmt.map(|e| Box::new(self.wrap(*e)));
+            out.push(Statement::new(
+                StatementKind::If {
+                    unique_priority,
+                    condition,
+                    then_stmt,
+                    else_stmt,
+                },
+                span,
+            ));
+            return;
+        }
+        let mut has_else = false;
+        let mut tail = else_stmt.as_deref();
+        while let Some(e) = tail {
+            match &e.kind {
+                StatementKind::If { else_stmt, .. } => tail = else_stmt.as_deref(),
+                _ => {
+                    has_else = true;
+                    break;
+                }
+            }
+        }
+        let implicit = !has_else && unique_priority.is_none();
+        let entry = implicit.then(|| self.counter());
+        let site = self.cov.branches.len();
+        self.cov.branches.push(BranchSite {
+            scope: self.scope,
+            span,
+            kind: "if",
+            entry,
+            arms: Vec::new(),
+        });
+        let mut arms = Vec::new();
+        self.expr(&mut condition);
+        let rewritten = self.if_arms(
+            unique_priority,
+            condition,
+            then_stmt,
+            else_stmt,
+            span,
+            true,
+            &mut arms,
+        );
+        if implicit {
+            arms.push(Arm {
+                span,
+                label: "else (implicit)",
+                counter: None,
+            });
+        }
+        self.cov.branches[site].arms = arms;
+        if let Some(e) = entry {
+            out.push(hit(e, span));
+        }
+        out.push(rewritten);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn if_arms(
+        &mut self,
+        unique_priority: Option<UniquePriority>,
+        condition: Expression,
+        then_stmt: Box<Statement>,
+        else_stmt: Option<Box<Statement>>,
+        span: Span,
+        first: bool,
+        arms: &mut Vec<Arm>,
+    ) -> Statement {
+        let c = self.counter();
+        arms.push(Arm {
+            span: then_stmt.span,
+            label: if first { "if" } else { "else if" },
+            counter: Some(c),
+        });
+        let then_stmt = Box::new(self.arm(*then_stmt, c));
+        let else_stmt = else_stmt.map(|e| {
+            let e = *e;
+            let espan = e.span;
+            Box::new(match e.kind {
+                StatementKind::If {
+                    unique_priority: up,
+                    condition: mut cond,
+                    then_stmt: t,
+                    else_stmt: el,
+                } => {
+                    self.expr(&mut cond);
+                    self.if_arms(up, cond, t, el, espan, false, arms)
+                }
+                kind => {
+                    let c = self.counter();
+                    arms.push(Arm {
+                        span: espan,
+                        label: "else",
+                        counter: Some(c),
+                    });
+                    self.arm(Statement::new(kind, espan), c)
+                }
+            })
+        });
+        Statement::new(
+            StatementKind::If {
+                unique_priority,
+                condition,
+                then_stmt,
+                else_stmt,
+            },
+            span,
+        )
+    }
+
+    /// A `case`: one arm per item, plus an implicit `default` when there is
+    /// none (except for `unique` / `priority` cases).
+    fn case_stmt(
+        &mut self,
+        unique_priority: Option<UniquePriority>,
+        kind: CaseKind,
+        expr: Expression,
+        mut items: Vec<CaseItem>,
+        span: Span,
+        out: &mut Vec<Statement>,
+    ) {
+        if self.kinds & KIND_BRANCH == 0 {
+            for it in items.iter_mut() {
+                let st = std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
+                it.stmt = self.wrap(st);
+            }
+        } else {
+            let implicit = !items.iter().any(|it| it.is_default) && unique_priority.is_none();
+            let entry = implicit.then(|| self.counter());
+            let site = self.cov.branches.len();
+            self.cov.branches.push(BranchSite {
+                scope: self.scope,
+                span,
+                kind: match kind {
+                    CaseKind::Case => "case",
+                    CaseKind::Casez => "casez",
+                    CaseKind::Casex => "casex",
+                    CaseKind::CaseInside => "case inside",
+                },
+                entry,
+                arms: Vec::new(),
+            });
+            let mut arms = Vec::new();
+            for it in items.iter_mut() {
+                let c = self.counter();
+                arms.push(Arm {
+                    span: it.span,
+                    label: if it.is_default { "default" } else { "item" },
+                    counter: Some(c),
+                });
+                let st = std::mem::replace(&mut it.stmt, Statement::new(StatementKind::Null, span));
+                it.stmt = self.arm(st, c);
+            }
+            if implicit {
+                arms.push(Arm {
+                    span,
+                    label: "default (implicit)",
+                    counter: None,
+                });
+            }
+            self.cov.branches[site].arms = arms;
+            if let Some(e) = entry {
+                out.push(hit(e, span));
+            }
+        }
+        out.push(Statement::new(
+            StatementKind::Case {
+                unique_priority,
+                kind,
+                expr,
+                items,
+            },
+            span,
+        ));
+    }
+
+    /// Wrap the condition of every `?:` in `e` (see `COND_FN`). Stops at
+    /// system calls, whose arguments some tasks read by shape.
+    fn expr(&mut self, e: &mut Expression) {
+        if self.kinds & KIND_BRANCH == 0 {
+            return;
+        }
+        let espan = e.span;
+        match &mut e.kind {
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr(condition);
+                self.expr(then_expr);
+                self.expr(else_expr);
+                let t = self.counter();
+                let f = self.counter();
+                self.cov.branches.push(BranchSite {
+                    scope: self.scope,
+                    span: espan,
+                    kind: "ternary",
+                    entry: None,
+                    arms: vec![
+                        Arm {
+                            span: then_expr.span,
+                            label: "true",
+                            counter: Some(t),
+                        },
+                        Arm {
+                            span: else_expr.span,
+                            label: "false",
+                            counter: Some(f),
+                        },
+                    ],
+                });
+                let cspan = condition.span;
+                let cond =
+                    std::mem::replace(&mut **condition, Expression::new(ExprKind::Empty, cspan));
+                **condition = Expression::new(
+                    ExprKind::SystemCall {
+                        name: COND_FN.to_string(),
+                        args: vec![number(t, cspan), cond],
+                    },
+                    cspan,
+                );
+            }
+            ExprKind::Unary { operand, .. } => self.expr(operand),
+            ExprKind::Binary { left, right, .. } => {
+                self.expr(left);
+                self.expr(right);
+            }
+            ExprKind::Paren(inner) => self.expr(inner),
+            ExprKind::Concatenation(parts) => {
+                for p in parts.iter_mut() {
+                    self.expr(p);
+                }
+            }
+            ExprKind::Replication { exprs, .. } => {
+                for p in exprs.iter_mut() {
+                    self.expr(p);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                self.expr(expr);
+                self.expr(index);
+            }
+            ExprKind::Call { args, .. } => {
+                for a in args.iter_mut() {
+                    self.expr(a);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -412,7 +755,7 @@ impl Lines<'_> {
     }
 }
 
-/// One reported statement after locating and merging.
+/// One reported statement or arm row after locating and merging.
 #[derive(Clone)]
 struct StmtRow {
     file: String,
@@ -422,9 +765,26 @@ struct StmtRow {
     count: u64,
 }
 
+#[derive(Clone)]
+struct ArmRow {
+    line: u32,
+    label: &'static str,
+    count: u64,
+}
+
+#[derive(Clone)]
+struct BranchRow {
+    file: String,
+    line: u32,
+    start: usize,
+    kind: &'static str,
+    arms: Vec<ArmRow>,
+}
+
 #[derive(Default)]
 struct Report {
     stmts: Vec<StmtRow>,
+    branches: Vec<BranchRow>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -472,6 +832,12 @@ impl Report {
             t[0].total += 1;
             t[0].covered += (s.count > 0) as u64;
         }
+        for b in &self.branches {
+            for a in &b.arms {
+                t[1].total += 1;
+                t[1].covered += (a.count > 0) as u64;
+            }
+        }
         t
     }
 
@@ -491,12 +857,33 @@ impl Report {
             }
         }
         self.stmts = merged;
+        self.branches.sort_by(|a, b| {
+            (&a.file, a.line, a.start, a.kind).cmp(&(&b.file, b.line, b.start, b.kind))
+        });
+        let mut merged: Vec<BranchRow> = Vec::with_capacity(self.branches.len());
+        for b in self.branches.drain(..) {
+            match merged.last_mut() {
+                Some(m)
+                    if m.file == b.file
+                        && m.start == b.start
+                        && m.kind == b.kind
+                        && m.arms.len() == b.arms.len() =>
+                {
+                    for (x, y) in m.arms.iter_mut().zip(&b.arms) {
+                        x.count += y.count;
+                    }
+                }
+                _ => merged.push(b),
+            }
+        }
+        self.branches = merged;
     }
 
     /// Add another instance of the same design unit (rows keyed by source
     /// position).
     fn merge(&mut self, o: &Report) {
         self.stmts.extend(o.stmts.iter().cloned());
+        self.branches.extend(o.branches.iter().cloned());
         self.normalize();
     }
 
@@ -518,6 +905,29 @@ impl Report {
                     s.kind,
                     s.count
                 ));
+            }
+            out.push_str("],\n");
+        }
+        if kinds & KIND_BRANCH != 0 {
+            out.push_str(&format!("{}\"branches\": [", indent));
+            for (i, b) in self.branches.iter().enumerate() {
+                out.push_str(&format!(
+                    "{}{{\"file\": \"{}\", \"line\": {}, \"kind\": \"{}\", \"arms\": [",
+                    if i == 0 { "" } else { ", " },
+                    json_escape(&b.file),
+                    b.line,
+                    b.kind
+                ));
+                for (j, a) in b.arms.iter().enumerate() {
+                    out.push_str(&format!(
+                        "{}{{\"line\": {}, \"arm\": \"{}\", \"count\": {}}}",
+                        if j == 0 { "" } else { ", " },
+                        a.line,
+                        a.label,
+                        a.count
+                    ));
+                }
+                out.push_str("]}");
             }
             out.push_str("],\n");
         }
@@ -546,6 +956,7 @@ impl Simulator {
             scopes: Vec::new(),
             scope_index: HashMap::default(),
             stmts: Vec::new(),
+            branches: Vec::new(),
             counters: 0,
             ca_counter: HashMap::default(),
         };
@@ -555,7 +966,7 @@ impl Simulator {
             .iter()
             .map(|i| i.path.clone())
             .collect();
-        if kinds & KIND_STATEMENT != 0 {
+        if kinds & (KIND_STATEMENT | KIND_BRANCH) != 0 {
             let mut initial = std::mem::take(&mut self.module.initial_blocks);
             for ib in initial.iter_mut() {
                 if Self::cov_synthesized_initial(&ib.stmt) {
@@ -696,6 +1107,7 @@ impl Simulator {
                     kinds,
                     scope: sc,
                 };
+                ins.expr(&mut ca.rhs);
                 if kinds & KIND_STATEMENT != 0 {
                     let key = (span.start, span.end, scope);
                     if !ins.cov.ca_counter.contains_key(&key) {
@@ -975,6 +1387,25 @@ impl Simulator {
         }
     }
 
+    /// `$__xz_covc(<n>, cond)`: count the condition's outcome, yield it.
+    pub(super) fn cov_cond(&mut self, args: &[Expression]) -> Value {
+        let Some(cond) = args.get(1) else {
+            return Value::new(1);
+        };
+        let v = self.eval_expr(cond);
+        if let Some(id) = args.first().and_then(marker_id) {
+            let slot = match v.is_nonzero() {
+                Some(true) => Some(id),
+                Some(false) => Some(id + 1),
+                None => None,
+            };
+            if let Some(c) = slot.and_then(|s| self.code_cov_hits.get_mut(s as usize)) {
+                *c += 1;
+            }
+        }
+        v
+    }
+
     fn cov_report(&self) -> Vec<Report> {
         let Some(cov) = self.code_cov.as_ref() else {
             return Vec::new();
@@ -994,6 +1425,30 @@ impl Simulator {
                 start: s.span.start,
                 kind: s.kind,
                 count: count(s.counter),
+            });
+        }
+        for b in &cov.branches {
+            let src = cov.scopes[b.scope as usize].src;
+            let (file, line) = lines.locate(b.span, src).unwrap_or_default();
+            let taken: u64 = b.arms.iter().filter_map(|a| a.counter).map(count).sum();
+            let arms = b
+                .arms
+                .iter()
+                .map(|a| ArmRow {
+                    line: lines.locate(a.span, src).map(|(_, l)| l).unwrap_or(line),
+                    label: a.label,
+                    count: match a.counter {
+                        Some(c) => count(c),
+                        None => b.entry.map(count).unwrap_or(0).saturating_sub(taken),
+                    },
+                })
+                .collect();
+            reports[b.scope as usize].branches.push(BranchRow {
+                file,
+                line,
+                start: b.span.start,
+                kind: b.kind,
+                arms,
             });
         }
         for r in reports.iter_mut() {

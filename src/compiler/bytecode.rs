@@ -6108,6 +6108,30 @@ impl<'a> BytecodeCompiler<'a> {
         self.emit(Insn::CovHit(c));
     }
 
+    /// `$__xz_covc(<n>, cond)`: the condition's register, with counter `n`
+    /// counted when it is true and `n + 1` when it is false (neither for
+    /// x/z).
+    fn compile_cov_cond(&mut self, args: &[Expression]) -> Option<RegId> {
+        let c = args
+            .first()
+            .and_then(crate::compiler::simulator::cov_marker_id)?;
+        let r = self.compile_expr(args.get(1)?, 0)?;
+        let br = self.insns.len();
+        self.emit(Insn::BranchIfFalse(r, 0));
+        self.emit(Insn::CovHit(c));
+        let jump = self.insns.len();
+        self.emit(Insn::Jump(0));
+        let not_true = self.insns.len() as u32;
+        self.insns[br] = Insn::BranchIfFalse(r, not_true);
+        let bz = self.insns.len();
+        self.emit(Insn::BranchUnlessZero(r, 0));
+        self.emit(Insn::CovHit(c + 1));
+        let end = self.insns.len() as u32;
+        self.insns[jump] = Insn::Jump(end);
+        self.insns[bz] = Insn::BranchUnlessZero(r, end);
+        Some(r)
+    }
+
     pub fn compile_stmt(&mut self, stmt: &Statement) -> bool {
         // §6.21: a block-local declaration that SHADOWS a module signal needs
         // the whole enclosing block interpreted as one unit — the AST path
@@ -8611,6 +8635,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dst)
             }
             ExprKind::SystemCall { name, args } => match name.as_str() {
+                crate::compiler::simulator::COV_COND_FN => self.compile_cov_cond(args),
                 // §21.3.3 `$sformatf` with a LITERAL template and specs the
                 // native filler covers exactly — parsed once here, filled
                 // from register Values at exec. Anything else (non-literal

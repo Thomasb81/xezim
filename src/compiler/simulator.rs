@@ -2113,10 +2113,13 @@ mod rand_scope;
 mod timing_checks;
 mod ts_x;
 mod uvm_dpi;
-pub use code_cov::{
-    CodeCoverage, KIND_STATEMENT, parse_kinds as parse_code_coverage_kinds, set_code_coverage,
+pub(crate) use code_cov::{
+    COND_FN as COV_COND_FN, HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id,
 };
-pub(crate) use code_cov::{HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id};
+pub use code_cov::{
+    CodeCoverage, KIND_BRANCH, KIND_STATEMENT, parse_kinds as parse_code_coverage_kinds,
+    set_code_coverage,
+};
 pub use timing_checks::{set_no_notifier, set_no_tchk_msg, set_no_timing_checks};
 
 #[cfg(test)]
@@ -62998,6 +63001,7 @@ impl Simulator {
         args: &Vec<Expression>,
     ) -> Value {
         let mut sys_result = match name.as_str() {
+            COV_COND_FN => return self.cov_cond(args),
             // §9.4.5: retrieve a pre-evaluated intra-assignment RHS
             // (stashed by the suspend path; see make_intra_saved_expr).
             INTRA_SAVED_MARKER => {

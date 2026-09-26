@@ -32,14 +32,14 @@ pub(crate) struct CompatArgs {
 
 /// The code coverage `+cover[=<letters>]` and `-coverage` ask for, as
 /// `(kinds, letters xezim does not collect)`. The letters are other
-/// simulators': `s` statement maps onto xezim's kind; the others have no
-/// xezim counterpart. The bare forms ask for the default set, `sbceft`:
-/// everything xezim collects.
+/// simulators': `s` statement and `b` branch map onto xezim's kinds; the
+/// others have no xezim counterpart. The bare forms ask for the default set,
+/// `sbceft`: everything xezim collects.
 pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String)> {
-    use xezim::compiler::simulator::KIND_STATEMENT;
+    use xezim::compiler::simulator::{KIND_BRANCH, KIND_STATEMENT};
     let spec = match cx.cover.as_deref() {
         None if !cx.coverage => return None,
-        None | Some("") => return Some((KIND_STATEMENT, String::new())),
+        None | Some("") => return Some((KIND_STATEMENT | KIND_BRANCH, String::new())),
         Some(spec) => spec,
     };
     let mut kinds = 0u8;
@@ -47,6 +47,7 @@ pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String)> {
     for c in spec.chars() {
         match c {
             's' => kinds |= KIND_STATEMENT,
+            'b' => kinds |= KIND_BRANCH,
             _ if !unsupported.contains(c) => unsupported.push(c),
             _ => {}
         }

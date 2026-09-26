@@ -1,5 +1,5 @@
 //! Code coverage (`--code-coverage`, docs/coverage-guide.md): statement
-//! counts in xezim_cov.json, per the guide's counting rules. Where a rule matches the reference simulator's report on the same
+//! and branch counts in xezim_cov.json, per the guide's counting rules. Where a rule matches the reference simulator's report on the same
 //! design, the test says so.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -44,6 +44,26 @@ fn stmt(line: u32, kind: &str, count: u64) -> String {
         "{{\"file\": \"t.sv\", \"line\": {}, \"kind\": \"{}\", \"count\": {}}}",
         line, kind, count
     )
+}
+
+/// The counts of the arms of the branch at `line` of kind `kind`.
+fn arm_counts(json: &str, line: u32, kind: &str) -> Vec<u64> {
+    let key = format!("\"line\": {}, \"kind\": \"{}\", \"arms\": [", line, kind);
+    let start = json
+        .find(&key)
+        .unwrap_or_else(|| panic!("no {kind} at {line}: {json}"));
+    let rest = &json[start + key.len()..];
+    let arms = &rest[..rest.find("]}").unwrap()];
+    arms.split("\"count\": ")
+        .skip(1)
+        .map(|c| {
+            c.chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap()
+        })
+        .collect()
 }
 
 const DESIGN: &str = "\
@@ -151,6 +171,94 @@ fn statement_counts() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Branch arms: `if` with its implicit `else`, `if`/`else`, `?:`, a `case`
+/// without `default` (an implicit arm) and a `unique case` (none). The
+/// counts match the reference simulator's report for the same design.
+#[test]
+fn branch_arms() {
+    let d = scratch("branch");
+    let out = run(&d, DESIGN, &["--code-coverage=branch"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    assert!(
+        json.contains(
+            "{\"file\": \"t.sv\", \"line\": 20, \"kind\": \"if\", \"arms\": [\
+         {\"line\": 21, \"arm\": \"if\", \"count\": 1}, \
+         {\"line\": 20, \"arm\": \"else (implicit)\", \"count\": 0}]}"
+        ),
+        "{json}"
+    );
+    assert_eq!(arm_counts(&json, 30, "if"), [0, 1]);
+    assert_eq!(arm_counts(&json, 32, "ternary"), [1, 0]);
+    assert!(
+        json.contains(
+            "{\"file\": \"t.sv\", \"line\": 33, \"kind\": \"case\", \"arms\": [\
+         {\"line\": 34, \"arm\": \"item\", \"count\": 1}, \
+         {\"line\": 35, \"arm\": \"item\", \"count\": 0}]}"
+        ),
+        "{json}"
+    );
+    assert!(
+        json.contains(
+            "{\"file\": \"t.sv\", \"line\": 5, \"kind\": \"case\", \"arms\": [\
+         {\"line\": 6, \"arm\": \"item\", \"count\": 1}, \
+         {\"line\": 7, \"arm\": \"item\", \"count\": 1}, \
+         {\"line\": 8, \"arm\": \"item\", \"count\": 1}, \
+         {\"line\": 5, \"arm\": \"default (implicit)\", \"count\": 1}]}"
+        ),
+        "{json}"
+    );
+    assert!(
+        json.contains("\"branch\": {\"covered\": 8, \"total\": 12, \"percent\": 66.67}"),
+        "{json}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// An `else if` chain is one branch, and a `?:` in a continuous assignment
+/// is a branch too (combinational counts are evaluations, so only which arms
+/// were taken is checked).
+#[test]
+fn branch_chain_and_assign_ternary() {
+    let d = scratch("chain");
+    let src = "\
+module tb;
+  logic a, b, c;
+  logic [1:0] k;
+  wire w = a ? b : c;
+  always @(a, b)
+    if (a)
+      k = 1;
+    else if (b)
+      k = 2;
+    else
+      k = 3;
+  initial begin
+    a = 0; b = 0; c = 0;
+    #1 b = 1;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=branch"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    let chain = arm_counts(&json, 6, "if");
+    assert_eq!(chain.len(), 3, "{json}");
+    assert!(chain[0] == 0 && chain[1] > 0 && chain[2] > 0, "{json}");
+    let w = arm_counts(&json, 4, "ternary");
+    assert!(w[0] == 0 && w[1] > 0, "{json}");
+    assert!(json.contains("\"arm\": \"else if\""), "{json}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The two-state executors take back a count when they hand a block to the
 /// four-state VM, so both give the same counts (the flop reads x before
 /// `d` is driven).
@@ -226,7 +334,7 @@ fn off_by_default_output_unchanged() {
 
 /// Other simulators' spellings: `+cover=<letters>` picks the kinds and warns
 /// once about the ones xezim lacks; bare `+cover` and `-coverage` collect
-/// statements; XEZIM_CODE_COVERAGE does what the flag does.
+/// both kinds; XEZIM_CODE_COVERAGE does what the flag does.
 #[test]
 fn compatible_spellings() {
     let d = scratch("compat");
@@ -242,32 +350,36 @@ fn compatible_spellings() {
         let k = json[start..start + json[start..].find(']').unwrap()].to_string();
         (k, String::from_utf8_lossy(&out.stderr).into_owned())
     };
-    let all = "\"statement\"";
-    let (k, err) = kinds(&["+cover=scf"]);
-    assert_eq!(k, "\"statement\"");
+    let all = "\"statement\", \"branch\"";
+    let (k, err) = kinds(&["+cover=sbcf"]);
+    assert_eq!(k, "\"statement\", \"branch\"");
     assert_eq!(
         err.matches(
-            "Warning: +cover=scf: xezim has no condition (c), FSM (f) coverage; \
-                     collecting statement coverage"
+            "Warning: +cover=sbcf: xezim has no condition (c), FSM (f) coverage; \
+                     collecting statement, branch coverage"
         )
         .count(),
         1,
         "{err}"
     );
+    assert_eq!(kinds(&["+cover=b"]).0, "\"branch\"");
     assert_eq!(kinds(&["+cover"]).0, all);
     assert_eq!(kinds(&["-coverage"]).0, all);
     assert_eq!(kinds(&["-coverage", "+cover=s"]).0, "\"statement\"");
-    assert_eq!(kinds(&["--code-coverage=stmt"]).0, "\"statement\"");
+    assert_eq!(
+        kinds(&["--code-coverage=branch,stmt"]).0,
+        "\"statement\", \"branch\""
+    );
     std::fs::write(d.join("t.sv"), SMALL).unwrap();
     let env = Command::new(xezim())
         .current_dir(&d)
         .env("XEZIM_COV_DB", d.join("cov.json"))
-        .env("XEZIM_CODE_COVERAGE", "stmt")
+        .env("XEZIM_CODE_COVERAGE", "branch")
         .arg("t.sv")
         .output()
         .expect("run xezim");
     assert!(env.status.success());
-    assert!(results(&d).contains("\"kinds\": [\"statement\"]"));
+    assert!(results(&d).contains("\"kinds\": [\"branch\"]"));
     let bad = run(&d, SMALL, &["--code-coverage=lines"]);
     assert_eq!(bad.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&bad.stderr).contains("unknown code coverage kind 'lines'"));
@@ -294,7 +406,7 @@ fn scope_limit_and_summary() {
     assert!(!json.contains("\"scope\": \"tb\""), "{json}");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("[COV] code coverage: statement 5/5 (100.00%)"),
+        err.contains("[COV] code coverage: statement 5/5 (100.00%), branch 4/4 (100.00%)"),
         "{err}"
     );
     assert!(
