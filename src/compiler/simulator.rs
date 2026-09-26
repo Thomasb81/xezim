@@ -66532,6 +66532,180 @@ impl Simulator {
         Some(self.exec_method_call(handle, m, args))
     }
 
+    /// A comparison operand the binary arm's aggregate probes cannot claim:
+    /// a literal, `null`, `this` or a negated/inverted literal. The virtual
+    /// interface, struct, array, queue, event and string probes all need a
+    /// named (or selected) operand, or a named one on BOTH sides.
+    fn cmp_literal_like(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) | ExprKind::Null | ExprKind::This => true,
+            ExprKind::Unary { op, operand } => {
+                !matches!(
+                    op,
+                    UnaryOp::PreIncr | UnaryOp::PreDecr | UnaryOp::PostIncr | UnaryOp::PostDecr
+                ) && matches!(operand.kind, ExprKind::Number(_))
+            }
+            _ => false,
+        }
+    }
+
+    /// The binary arm's per-operand probes come back empty for the named
+    /// comparison operand `e` (compared with `other`): no virtual-interface
+    /// binding can name it, it is no event compared with `null`, and it is
+    /// not string-valued. A plain name, a call, or `h.p` / `this.p`.
+    fn cmp_named_ok(&mut self, e: &Expression, other: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.path.len() != 1 || h.root.is_some() || !h.path[0].selects.is_empty() {
+                    return false;
+                }
+                let n = h.path[0].name.name.as_str();
+                if self.class_member_names().vif_props.contains(n)
+                    || self.vif_local_names.contains(n)
+                    || self.is_interface_instance(n)
+                    || self.iface_alias_for(n).is_some()
+                {
+                    return false;
+                }
+                // `ev == null` compares event identities.
+                if matches!(other.kind, ExprKind::Null) && self.module.events.contains(n) {
+                    return false;
+                }
+            }
+            // A call result: no probe but the string one names it.
+            ExprKind::Call { .. } => {}
+            // `h.p` / `this.p`: the virtual-interface probe keys on a
+            // declared vif property, the struct one on a struct-capable one.
+            ExprKind::MemberAccess { expr: b, member } => {
+                let plain_base = match &b.kind {
+                    ExprKind::This => true,
+                    ExprKind::Ident(bh) => bh.path.len() == 1 && bh.path[0].selects.is_empty(),
+                    _ => false,
+                };
+                if !plain_base
+                    || self
+                        .class_member_names()
+                        .vif_props
+                        .contains(member.name.as_str())
+                    || self.struct_prop_name_possible(&member.name)
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        !self.expr_is_string_valued(e)
+    }
+
+    /// A select-free one-segment name the binary arm's two-sided probes
+    /// cannot take for an aggregate: no struct-capable or collection member
+    /// name, no queue, event or renamed local, no declared struct type and
+    /// no fixed, 2-D or N-D array under its resolved name.
+    fn cmp_name_scalar(&mut self, h: &HierarchicalIdentifier) -> bool {
+        if h.path.len() != 1 || h.root.is_some() || !h.path[0].selects.is_empty() {
+            return false;
+        }
+        let n = h.path[0].name.name.as_str();
+        if self.struct_prop_name_possible(n)
+            || self.coll_member_possible(n)
+            || self.module.dynamic_arrays.contains(n)
+            || self.module.events.contains(n)
+            || self.dyn_name_lookup(n).is_some()
+            || self
+                .module
+                .var_decl_types
+                .get(n)
+                .is_some_and(|dt| matches!(self.resolve_dt_ref(dt), DataType::Struct(_)))
+        {
+            return false;
+        }
+        let r = self.resolve_hier_name(h);
+        !(self.module.arrays.contains_key(&*r)
+            || self.module.arrays_2d.contains_key(&*r)
+            || self.module.arrays_nd.contains_key(&*r))
+    }
+
+    /// A relational or (in)equality comparison of literal-like operands,
+    /// named operands (`cmp_named_ok`) and at most one named per side. With
+    /// one side literal-like the binary arm's struct, array and queue
+    /// comparisons (which need both sides aggregates) cannot engage; two
+    /// named sides must be plain scalar names (`cmp_name_scalar`). The rest
+    /// is the arm's own sizing, evaluation order, real promotion and
+    /// integral compare.
+    fn plain_compare(
+        &mut self,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+        ctx_width: u32,
+    ) -> Option<Value> {
+        if !matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+        ) {
+            return None;
+        }
+        match (Self::cmp_literal_like(left), Self::cmp_literal_like(right)) {
+            // `null == null` compares event identities.
+            (true, true) => {
+                if matches!(left.kind, ExprKind::Null) && matches!(right.kind, ExprKind::Null) {
+                    return None;
+                }
+            }
+            (true, false) => {
+                if !self.cmp_named_ok(right, left) {
+                    return None;
+                }
+            }
+            (false, true) => {
+                if !self.cmp_named_ok(left, right) {
+                    return None;
+                }
+            }
+            // Two plain names: the aggregate comparisons need both named.
+            (false, false) => {
+                let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&left.kind, &right.kind) else {
+                    return None;
+                };
+                if !self.cmp_name_scalar(lh)
+                    || !self.cmp_name_scalar(rh)
+                    || !self.cmp_named_ok(left, right)
+                    || !self.cmp_named_ok(right, left)
+                {
+                    return None;
+                }
+            }
+        }
+        let sw = match (self.lrm_self_width(left), self.lrm_self_width(right)) {
+            (Some(lw), Some(rw)) => lw.max(rw),
+            _ => ctx_width,
+        };
+        let mut l = self.eval_expr_ctx(left, sw);
+        let mut r = self.eval_expr_ctx(right, sw);
+        if l.is_real != r.is_real {
+            if l.is_real {
+                if let Some(f) = self.eval_subtree_as_real(right) {
+                    r = Value::from_f64(f);
+                }
+            } else if let Some(f) = self.eval_subtree_as_real(left) {
+                l = Value::from_f64(f);
+            }
+        }
+        Some(match op {
+            BinaryOp::Eq => l.is_equal(&r),
+            BinaryOp::Neq => l.is_not_equal(&r),
+            BinaryOp::Lt => l.less_than(&r),
+            BinaryOp::Leq => l.leq(&r),
+            BinaryOp::Gt => l.greater_than(&r),
+            _ => l.geq(&r),
+        })
+    }
+
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
@@ -67813,6 +67987,9 @@ impl Simulator {
                 }
             }
             ExprKind::Binary { op, left, right } => {
+                if let Some(v) = self.plain_compare(*op, left, right, ctx_width) {
+                    return v;
+                }
                 // §25.9: equality where a side is a VIRTUAL-INTERFACE
                 // VARIABLE compares BINDINGS, not (x) values — `val == t` in
                 // uvm_resource::write with t bound and val unbound must be
