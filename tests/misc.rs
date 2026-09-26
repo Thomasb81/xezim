@@ -437,6 +437,8 @@ mod ref_struct_queue_and_local_shadow;
 mod sched_trace_orders_a_time_slot;
 #[path = "misc/severity_exit_status.rs"]
 mod severity_exit_status;
+#[path = "misc/sigterm_ends_stuck_runs.rs"]
+mod sigterm_ends_stuck_runs;
 #[path = "misc/static_local_scope_isolation.rs"]
 mod static_local_scope_isolation;
 #[path = "misc/stdout_flush_at_sim_finish.rs"]

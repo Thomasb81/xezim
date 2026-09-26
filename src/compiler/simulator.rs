@@ -42157,6 +42157,7 @@ impl Simulator {
         ONCE.call_once(|| unsafe {
             libc::signal(libc::SIGINT, handle_interrupt as libc::sighandler_t);
             libc::signal(libc::SIGTERM, handle_interrupt as libc::sighandler_t);
+            libc::signal(libc::SIGALRM, handle_interrupt_alarm as libc::sighandler_t);
         });
     }
 
@@ -42489,6 +42490,7 @@ impl Simulator {
             // Ctrl-C / SIGTERM: leave through the normal exit so the dumps are
             // finalized rather than truncated.
             if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+                acknowledge_interrupt();
                 eprintln!(
                     "[xezim] interrupted at time {} — finalizing waveform dumps",
                     self.time
@@ -44630,6 +44632,7 @@ impl Simulator {
                 break;
             }
             if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+                acknowledge_interrupt();
                 eprintln!(
                     "[xezim] interrupted at time {} — finalizing waveform dumps",
                     self.time
@@ -124643,6 +124646,16 @@ impl Simulator {
         // Per rand sub-object member: the items pushed into its solve.
         let mut pushdown: HashMap<String, Vec<ConstraintItem>> = HashMap::default();
         for _trial in 0..trials {
+            // Ctrl-C / SIGTERM: stop searching and let the run shut down.
+            if interrupt_requested() {
+                acknowledge_interrupt();
+                eprintln!(
+                    "[xezim] interrupted at time {} — finalizing waveform dumps",
+                    self.time
+                );
+                self.finished = true;
+                break;
+            }
             self.rand_tight_mode = fixed_fe_fail_streak >= 4;
             // LRM §18.5.4 dist: clear the pick-once gate at each trial so a
             // failed trial doesn't permanently freeze the dist constraint.
@@ -132576,15 +132589,55 @@ fn vpi_radix_string(v: &Value, bits_per_digit: usize) -> String {
 /// interrupted run still finalizes its waveform dumps.
 static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The signal that set `INTERRUPTED`, for the SIGALRM backstop to re-raise.
+static INTERRUPT_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Seconds an interrupt may go unnoticed before the process is ended anyway.
+const INTERRUPT_GRACE_SECS: libc::c_uint = 5;
+
 /// Signal handler. Does the minimum that is async-signal-safe: set a flag. A
 /// second signal restores the default action and re-raises, so the user can
-/// always force the issue.
+/// always force the issue. The first one also arms an alarm: a run stuck in
+/// a loop that never polls the flag (`timeout` sends a single SIGTERM) still
+/// ends, through `handle_interrupt_alarm`, unless the event loop takes the
+/// interrupt in time and disarms it (`acknowledge_interrupt`).
 extern "C" fn handle_interrupt(sig: libc::c_int) {
     if INTERRUPTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
             libc::raise(sig);
         }
+    } else {
+        INTERRUPT_SIGNAL.store(sig, std::sync::atomic::Ordering::Relaxed);
+        unsafe {
+            libc::alarm(INTERRUPT_GRACE_SECS);
+        }
+    }
+}
+
+/// SIGALRM after an unanswered interrupt: end the process by the original
+/// signal's default action.
+extern "C" fn handle_interrupt_alarm(_sig: libc::c_int) {
+    let sig = INTERRUPT_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
+    if sig != 0 {
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+}
+
+/// Whether Ctrl-C / SIGTERM asked the run to stop. Long loops outside the
+/// event loop (constraint solving) poll this to give up early.
+pub(crate) fn interrupt_requested() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The event loop has taken the interrupt and is shutting down normally:
+/// cancel the backstop so finalizing the dumps is not cut short.
+fn acknowledge_interrupt() {
+    unsafe {
+        libc::alarm(0);
     }
 }
 
