@@ -70,7 +70,11 @@ Current capabilities include:
   the `get_coverage()`/`get_inst_coverage()`/`$get_coverage()` queries, and
   pass/fail counts for `cover property` and the assertions. A run with any of
   them writes the results to `xezim_cov.json` (`XEZIM_COV_DB=<path>` to move
-  it). No code coverage. See [docs/coverage-guide.md](docs/coverage-guide.md).
+  it). See [docs/coverage-guide.md](docs/coverage-guide.md).
+* **Code coverage**, off by default — statement, branch and toggle counts with
+  `--code-coverage` (or `+cover`), per instance and per design unit, in the
+  same `xezim_cov.json`. Instrumented at compile time, so a run without it pays
+  nothing. See [docs/coverage-guide.md](docs/coverage-guide.md#code-coverage).
 * Event-driven edge gating (`XEZIM_EVENT_EDGE=1`) — opt-in skip of clocked
   flop fires whose data inputs haven't changed; 1.13-1.30× wall on the C910 /
   C906 hello / memcpy / cmark benchmarks, correct-by-construction
@@ -352,6 +356,8 @@ Common options:
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for vendor sources you cannot edit |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
+| `--code-coverage[=<kinds>]` | Collect code coverage: `stmt`, `branch`, `toggle` (comma-separated) or `all` (the default). Results go to `xezim_cov.json` next to the functional coverage; `--verbose` adds a per-instance summary. See [docs/coverage-guide.md](docs/coverage-guide.md#code-coverage) |
+| `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees (`tb.dut`) and packages (repeatable) |
 | `--profile` | Print the `[PROF]` end-of-run profile report (edge-block, settle and timing counters) together with the `--verbose` engine lines. Same as `XEZIM_PROFILE_REPORT=1`. Adds overhead |
 
 Selected env knobs (off by default unless noted):
@@ -374,6 +380,7 @@ Selected env knobs (off by default unless noted):
 | `XEZIM_ALLOW_IMPLICIT_STATIC=1` | Same as `--relax-implicit-static` |
 | `XEZIM_PROFILE_REPORT=1` | Same as `--profile` |
 | `XEZIM_VERBOSE=1` | Same as `--verbose` (for scripts that grep `[PHASE]`/`[PROF]` lines without adding a flag) |
+| `XEZIM_CODE_COVERAGE=<kinds>` | Same as `--code-coverage=<kinds>`; the flag wins |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
 | `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
 | `XEZIM_VALUE_TRACE=<substr>[,...]` | Print every committed change of signals whose hierarchical name contains a pattern: time, name, old→new value, dispatch phase, writing process origin (file:line). NBA commits are labeled `nba` |
@@ -417,7 +424,8 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `+notimingchecks` | As before |
 | `-sv12compat`, `-sv17compat` | Same as `--sv2017`. `-sv05compat`/`-sv09compat` do the same with a warning |
 | `-work`, `-L`, `-Lf`, `-lib <lib>` | Ignored, with one warning |
-| `-sv`, `-mfcu`, `-quiet`, `-64`, `-32`, `-batch`, `-nologo`, `+acc[=…]`, `-<step>args=…` (arguments for a separate optimization step), `-suppress <ids>`, `+cover[=…]`, `+fcover`, `-coverage`, `-sva`, `-assertdebug` | Accepted, no effect: SystemVerilog is always on, all files share one compilation unit, every object stays visible, assertions and covergroups are always evaluated |
+| `+cover`, `+cover=<letters>`, `-coverage` | Code coverage (`--code-coverage`): `s`, `b` and `t` select statement, branch and toggle coverage; the bare forms select all three. Other letters (`c`, `e`, `f`, `x`) are ignored with one warning |
+| `-sv`, `-mfcu`, `-quiet`, `-64`, `-32`, `-batch`, `-nologo`, `+acc[=…]`, `-<step>args=…` (arguments for a separate optimization step), `-suppress <ids>`, `+fcover`, `-sva`, `-assertdebug` | Accepted, no effect: SystemVerilog is always on, all files share one compilation unit, every object stays visible, assertions and covergroups are always evaluated |
 | `-sfcu`, `-t <res>`, `-wlf <file>` | Accepted with a warning: xezim always uses one compilation unit and the finest precision declared in the design, and does not write that waveform file (`--fst` / `--wave` dump waveforms) |
 
 Where a spelling means something else in xezim, xezim's meaning is kept:

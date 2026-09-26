@@ -3,11 +3,12 @@
 xezim collects **functional coverage** (covergroups, IEEE 1800 clause 19) and
 **assertion coverage** (`cover` statements, plus pass/fail counts of assertions,
 clause 16) in every simulation, and writes the results to a JSON file when the run
-ends. It does **not** collect code coverage: there is no line, statement, branch,
-condition, expression, toggle or FSM coverage.
+ends. When asked (`--code-coverage`), it also collects **code coverage**:
+statement, branch and toggle counts, in the same file. There is no condition,
+expression or FSM coverage.
 
 This guide covers what is supported, how to write coverage that xezim collects, and
-how to read the results.
+how to read the results. Code coverage has [its own section](#code-coverage).
 
 ---
 
@@ -23,6 +24,7 @@ how to read the results.
 | Options | `option.at_least`, `option.weight`, `option.auto_bin_max`, `type_option.merge_instances`, `type_option.weight` |
 | Queries | `get_inst_coverage()` and `get_coverage()` on a covergroup, a coverpoint or a cross, with or without `(covered, total)`; `cg_type::get_coverage()`; `$get_coverage()`; `start()` and `stop()` |
 | Assertion coverage | Counts for `cover property`, `cover sequence`, `assert property`, `assume property` and the immediate `cover`, `assert` and `assume` |
+| Code coverage | Statement, branch and toggle coverage with `--code-coverage` (or `+cover`). See [Code coverage](#code-coverage) |
 | Results | The `xezim_cov.json` file, and `[COV]` summary lines with `--verbose` |
 
 ---
@@ -39,8 +41,10 @@ xezim alu_cov.sv          # also writes ./xezim_cov.json
 
 - `XEZIM_COV_DB=<path>` writes the file somewhere else. `XEZIM_COV_DB=/dev/null`
   skips it.
-- The coverage switches of other simulators' command lines (`+cover`,
-  `+cover=<spec>`, `+fcover`, `-coverage`) are accepted and do nothing.
+- `+fcover` is accepted and does nothing.
+- Code coverage is off unless asked for: see
+  [Enabling code coverage](#enabling-code-coverage). `+cover`, `+cover=<spec>`
+  and `-coverage` turn it on.
 
 ---
 
@@ -366,8 +370,8 @@ When the run ends, by `$finish`, `$fatal`, `--max-time` or running out of events
 xezim writes `xezim_cov.json` to the current directory, replacing any earlier one.
 
 - It is written only when the design has at least one covergroup instance or one
-  assertion that was evaluated. A run with neither leaves an old `xezim_cov.json`
-  as it was.
+  assertion that was evaluated, or when the run collects code coverage. A run
+  with none of them leaves an old `xezim_cov.json` as it was.
 - `XEZIM_COV_DB=<path>` writes it to `<path>` instead. The directory must exist.
   When the file can't be written, xezim prints
   `[COV] warning: could not write <path>: <reason>` and the run's result is
@@ -401,8 +405,9 @@ The file for the [module example](#a-covergroup-in-a-module-sampled-on-a-clock):
 | `covergroups[].coverpoints` | Per coverpoint, the number of **distinct values** sampled (not bins) |
 | `covergroups[].crosses` | Per cross, the number of distinct value combinations sampled |
 | `covergroups[].bins` | Hit count per explicit bin, keyed `<coverpoint>.<bin>`, `<coverpoint>.<bin>[<value>]` for `name[]` array bins and `<coverpoint>.<bin>[<index>]` for `name[N]`, and per bin of a cross body, keyed `<cross>.<bin>`. Includes `default` and `illegal_bins` bins |
+| `code_coverage` | Only in a run that collects code coverage; see [The code coverage results](#the-code-coverage-results) |
 
-Things the file does not hold:
+Things the file does not hold for functional coverage:
 
 - **Percentages.** Print them from the testbench with the
   [query functions](#query-functions), for example in a `final` block.
@@ -531,13 +536,325 @@ hit, so a combined percentage can't be worked out from them alone.
 
 ---
 
+## Code coverage
+
+With `--code-coverage`, xezim also counts which statements ran, which way each
+branch went and which bits of each signal toggled, and writes the counts to
+`xezim_cov.json` next to the functional coverage.
+
+### Enabling code coverage
+
+| Spelling | Collects |
+|---|---|
+| `--code-coverage` | Statement, branch and toggle coverage |
+| `--code-coverage=<kinds>` | The kinds listed, separated by commas: `stmt` (or `statement`), `branch`, `toggle`, `all` |
+| `XEZIM_CODE_COVERAGE=<kinds>` | The same, for scripts that cannot add a flag. `--code-coverage` wins |
+| `+cover` | All three |
+| `+cover=<letters>` | `s` statement, `b` branch, `t` toggle. Other simulators' other letters (`c` condition, `e` expression, `f` FSM, `x` extended toggle) are ignored with one warning, for example `Warning: +cover=sbcf: xezim has no condition (c), FSM (f) coverage; collecting statement, branch coverage` |
+| `-coverage` | All three, unless a `+cover=<letters>` names fewer |
+
+`--code-coverage-scope=<path>[,<path>...]` (repeatable) limits every kind to the
+instances at or below the given paths (`tb.dut`, or `dut` for the instance of that
+name below the top) and to the packages named. Without it the whole design is
+covered, except the UVM library package `uvm_pkg` and the built-in `std` package;
+name one of them in the scope to include it.
+
+Code coverage is off by default, and then costs nothing: the design compiles and
+runs exactly as it does without the feature. When it is on, statements and
+branches are instrumented as the design is compiled, before xezim lowers it to
+bytecode, so every execution path (compiled blocks, the two-state executors and
+the interpreter) counts the same way, and the simulation's results do not
+change. The instrumented run is slower, most of all for RTL:
+
+| Run | Without | `--code-coverage` | `=stmt,branch` | `=toggle` |
+|---|---|---|---|---|
+| C906 RISC-V CPU running one CoreMark iteration (RTL) | 112 s | 298 s; 2.36x the instructions | 2.17x the instructions | 1.23x the instructions |
+| AXI4 UVM testbench (`axi4_base_test`) | 7.0 s | 7.2 s; +0.1% instructions | - | - |
+
+The C906 run's results file is 23 MB: 47,632 statements, 23,603 branch arms and
+979,190 toggle bins in 1,773 scopes.
+
+### An example
+
+```systemverilog
+module counter (input logic clk, rst, en, output logic [2:0] q);
+  always_ff @(posedge clk)
+    if (rst)
+      q <= 0;
+    else if (en)
+      q <= q + 1;
+endmodule
+
+module tb;
+  logic clk = 0, rst = 1, en = 0;
+  logic [2:0] q;
+  counter u_cnt (.clk, .rst, .en, .q);
+  always #5 clk = ~clk;
+  initial begin
+    @(negedge clk) rst = 0;
+    en = 1;
+    repeat (3) @(negedge clk);
+    $display("q = %0d", q);
+    $finish;
+  end
+endmodule
+```
+
+```text
+$ xezim --code-coverage cnt_cov.sv
+q = 3
+Simulation finished at time 40 ($finish called)
+$ xezim --code-coverage --verbose cnt_cov.sv 2>&1 | grep '^\[COV\] code\|^\[COV\]  '
+[COV] code coverage: statement 12/12 (100.00%), branch 2/3 (66.67%), toggle 10/18 (55.56%)
+[COV]   tb (tb): statement 9/9 (100.00%), branch 0/0, toggle 7/12 (58.33%)
+[COV]   tb.u_cnt (counter): statement 3/3 (100.00%), branch 2/3 (66.67%), toggle 3/6 (50.00%)
+```
+
+The first line is the design's totals, then one line per scope with its design
+unit in parentheses (at most 50 scopes; the file has them all).
+
+The counter's entry in `xezim_cov.json`:
+
+```json
+      {
+        "scope": "tb.u_cnt",
+        "design_unit": "counter",
+        "kind": "instance",
+        "statement": {"covered": 3, "total": 3, "percent": 100.00},
+        "branch": {"covered": 2, "total": 3, "percent": 66.67},
+        "toggle": {"covered": 3, "total": 6, "percent": 50.00},
+        "statements": [{"file": "cnt_cov.sv", "line": 2, "kind": "always_ff", "count": 4}, {"file": "cnt_cov.sv", "line": 4, "kind": "statement", "count": 1}, {"file": "cnt_cov.sv", "line": 6, "kind": "statement", "count": 3}],
+        "branches": [{"file": "cnt_cov.sv", "line": 3, "kind": "if", "arms": [{"line": 4, "arm": "if", "count": 1}, {"line": 6, "arm": "else if", "count": 3}, {"line": 3, "arm": "else (implicit)", "count": 0}]}],
+        "toggles": [{"signal": "q", "width": 3, "rise": [2, 1, 0], "fall": [1, 0, 0]}]
+      }
+```
+
+The flop ran on four clock edges: once in reset, three times counting. No edge
+came with both `rst` and `en` low, so the implicit `else` of the `if` chain was
+never taken. `q` went 0, 1, 2, 3: bit 2 never toggled and bit 1 never fell, so
+3 of the counter's 6 toggle bins are covered. Its inputs `clk`, `rst` and `en`
+are not listed: their toggles are the testbench's.
+
+### What counts
+
+#### Statements
+
+- Every procedural statement of `initial`, `always`, `always_comb`, `always_ff`,
+  `always_latch` and `final` blocks, tasks, functions and class methods counts
+  each time it starts: assignments, calls, system task calls, `return`,
+  `break`, `continue`, `disable`, `->`, `wait fork`, immediate assertions, and
+  procedural `assign`, `deassign`, `force` and `release`.
+- The `always` construct is a statement of its own, of kind `always`,
+  `always_comb`, `always_ff` or `always_latch`: it counts each time its body
+  starts, once per event for `always @(...)` and once per evaluation for
+  `always_comb`. An `always` that starts with a delay (`always #5 clk = ~clk;`)
+  counts when the delay has passed.
+- A timing control and the statement it guards are two statements:
+  `#1 a = 1;` counts the delay (kind `delay`) when it starts waiting and the
+  assignment when it runs. `@(...)` is kind `event`, `wait (...)` kind `wait`.
+- A loop (`for`, `foreach`, `while`, `do`, `repeat`, `forever`) counts once each
+  time it starts; the statements of its body count once per iteration.
+- `if` and `case` are not statements (they are [branches](#branches)), and
+  neither are `begin`/`end`, `fork`/`join` and declarations. The statements
+  inside them count.
+- Each continuous assignment is a statement of kind `assign`: an `assign`
+  (one per target when it lists several) and a net declaration assignment
+  (`wire w = a & b;`). It counts each time xezim evaluates it.
+- Not counted: the initializers of variables declared outside procedural code,
+  port connections and gate primitives.
+
+#### Branches
+
+- `if`: one arm per condition of an `if` / `else if` chain, and one for the
+  final `else`. A chain without a final `else` gets an `else (implicit)` arm
+  that counts the times no condition held. A `unique`, `unique0` or `priority`
+  `if` has no implicit arm, since no condition holding is a violation.
+- `case`, `casez`, `casex` and `case inside`: one arm per case item, the
+  `default` item included. An item listing several expressions (`0, 1: ...`) is
+  one arm. A `case` without a `default` gets a `default (implicit)` arm, except a
+  `unique`, `unique0` or `priority` one.
+- `randcase`: one arm per item.
+- `?:`: a `true` and a `false` arm, counted each time the expression is
+  evaluated, in the value of an assignment (procedural or continuous) or a
+  `return`, in the arguments of a task or function call, and in an `if`
+  condition. A condition with x or z bits counts for neither.
+- An arm is covered once its count is at least 1; branch coverage is the
+  covered arms over all arms.
+
+#### Toggles
+
+- Each bit has two bins: a rise (0 to 1) and a fall (1 to 0). Transitions to or
+  from x or z do not count.
+- A bit is compared with its value at the end of the previous time slot, the way
+  a waveform dump sees it: a signal that goes 0, 1, 0 within one time slot, even
+  across delta cycles, does not toggle. The first comparison is with the value
+  the signal starts with.
+- Tracked: every net and variable of an integral type declared in a module or
+  interface instance: `logic`, `bit` and `reg` vectors, nets, `int`, `integer`,
+  `byte`, `shortint`, `longint`, enums and packed structs (both as plain bit
+  vectors), and the members of unpacked structs. Output ports are tracked; when
+  one is connected straight to a parent's signal, both names show the same
+  counts.
+- Not tracked: input and inout ports (the signal that drives one carries its
+  toggles), unpacked arrays, queues, dynamic and associative arrays, `real`,
+  `time`, `string`, `event` and class-handle variables, parameters, variables
+  declared in tasks, functions and procedural blocks, and class properties.
+- Counts are exact: they do not stop at 1.
+
+#### Scopes
+
+Code in a module body (generate blocks included) belongs to its instance. The
+methods of a class and the tasks and functions of a package belong to a scope
+named after the package (kind `package`); a class declared outside any package
+or module belongs to `$unit` (kind `unit`), and one declared inside a module to a
+scope named after the module (kind `module`), shared by all of its instances.
+
+#### Compared with other simulators
+
+The rules above follow what other simulators report for the same constructs. The
+differences:
+
+- Counts of combinational code (`always_comb`, an `always` whose event
+  control lists only level changes such as `@*` or `@(a or b)`, continuous
+  assignments and the `?:` in them) are the number of times xezim evaluated
+  it, which can be more than another simulator's count. Whether a statement
+  or an arm was hit agrees.
+- A loop counts once per start. Other simulators may count its iterations or
+  its condition tests, and a `for` loop's step as a statement of its own.
+- A `case` item listing several expressions is one arm. Other simulators can
+  give each expression its own arm.
+- An `always` that starts with a delay counts when the delay has passed, not
+  when it starts, which can make its count one lower.
+- A continuous assignment that another simulator optimizes into a gate
+  (`assign y = r;`, `wire w = a ? b : c;`) is still a statement here, and its
+  `?:` still a branch. So is the code of an instance whose inputs are
+  constant, which another simulator may fold away.
+- Enum variables toggle as bit vectors, not by value, and unused variables stay
+  in the toggle list.
+- Toggle counts are not capped at 1.
+
+### The code coverage results
+
+The results file gains a `code_coverage` member:
+
+| Field | Meaning |
+|---|---|
+| `code_coverage.kinds` | The kinds collected: `statement`, `branch`, `toggle` |
+| `code_coverage.statement`, `.branch`, `.toggle` | Totals over the design: `covered`, `total` and `percent` (two decimals; `null` when `total` is 0). Toggle totals count bins, two per bit |
+| `code_coverage.scopes[]` | One entry per scope that has code: the instances by path, then the packages, `$unit` and the modules that declare classes |
+| `scopes[].scope` | The instance path from the top (`tb.u_cnt`), or the package, `$unit` or module name |
+| `scopes[].design_unit` | The module or interface of the instance; the scope's own name otherwise |
+| `scopes[].kind` | `instance`, `package`, `unit` or `module` (see [Scopes](#scopes)) |
+| `scopes[].statement`, `.branch`, `.toggle` | The scope's totals, like the design totals |
+| `scopes[].statements[]` | Every counted statement, count 0 included, in source order: `file`, `line`, `kind` and `count`. `kind` is `statement`, `assign`, `always`, `always_comb`, `always_ff`, `always_latch`, `for`, `foreach`, `while`, `do`, `repeat`, `forever`, `delay`, `event` or `wait` |
+| `scopes[].branches[]` | Every branch: `file`, `line`, `kind` (`if`, `case`, `casez`, `casex`, `case inside`, `randcase` or `ternary`) and `arms[]`, each with `line`, `arm` (`if`, `else if`, `else`, `else (implicit)`, `item`, `default`, `default (implicit)`, `true` or `false`) and `count` |
+| `scopes[].toggles[]` | Every tracked signal: `signal` (its name within the scope), `width`, and `rise[]` and `fall[]` with one count per bit, bit 0 (the rightmost) first |
+| `code_coverage.design_units[]` | One entry per module, interface or package: `design_unit`, `instances`, the totals, and `statements`, `branches` and `toggles` with the counts of all its instances added up. A statement, arm or bin is covered when any instance covered it |
+
+Only the kinds collected appear. Several statements on one line are separate
+entries with the same `line`.
+
+With `--verbose`, the end of the run prints the `[COV]` lines of the
+[example](#an-example) as well.
+
+### Adding code coverage runs together
+
+Each run's file lists every statement, arm and bit, hit or not, in the same order
+for the same design, so the files of several runs add up. For example, one
+random `case` selector per run:
+
+```systemverilog
+module tb;
+  bit [1:0] op;
+  int acc;
+  initial begin
+    op = $urandom_range(0, 3);
+    case (op)
+      0: acc = 1;
+      1: acc = 2;
+      2: acc = 3;
+      default: acc = 4;
+    endcase
+    $display("op = %0d", op);
+  end
+endmodule
+```
+
+```text
+$ mkdir -p cov
+$ for s in 5 6 7; do XEZIM_COV_DB=cov/seed$s.json xezim --code-coverage=stmt,branch +seed=$s op_cov.sv; done
+op = 2
+Simulation finished at time 0
+op = 3
+Simulation finished at time 0
+op = 0
+Simulation finished at time 0
+```
+
+Each run covers 3 of the 6 statements and 1 of the 4 arms. Keyed by scope and
+position, the statements of all three runs add up with `jq`:
+
+```text
+$ jq -s '[.[] | .code_coverage.scopes[] | .scope as $s | .statements | to_entries[]
+          | {key: "\($s)#\(.key)", count: .value.count}]
+         | group_by(.key) | map(map(.count) | add)
+         | {covered: map(select(. > 0)) | length, total: length}' cov/seed*.json
+{
+  "covered": 5,
+  "total": 6
+}
+```
+
+and the branch arms the same way:
+
+```text
+$ jq -s '[.[] | .code_coverage.scopes[] | .scope as $s | .branches | to_entries[]
+          | .key as $b | .value.arms | to_entries[]
+          | {key: "\($s)#\($b)#\(.key)", count: .value.count}]
+         | group_by(.key) | map(map(.count) | add)
+         | {covered: map(select(. > 0)) | length, total: length}' cov/seed*.json
+{
+  "covered": 3,
+  "total": 4
+}
+```
+
+Only `1: acc = 2;` never ran. Toggles add up per bit in the same way, from
+`.toggles[] | .rise` and `.fall`.
+
+### Code coverage limits
+
+- No condition, expression or FSM coverage, and no exclusions: every statement,
+  arm and tracked bit counts.
+- Instrumented code leaves some of xezim's fast paths: the optional native code
+  generators, gate fusion for instrumented continuous assignments, table
+  lookups for `case` statements, skipping a flop's clock edge when its inputs
+  are unchanged, clock generators such as `always #5 clk = ~clk;`, and parallel
+  evaluation. The results do not change; the run is slower.
+- A function evaluated during elaboration (for a parameter value) counts only its
+  calls during the run.
+- Assertion action blocks, `randsequence` productions and covergroups are not
+  instrumented, and a `?:` elsewhere than listed under [Branches](#branches)
+  (in a system task's arguments, a loop condition or a `case` selector) is not
+  a branch.
+- A run from a precompiled artifact (`-o`) has no source text, so its entries
+  have an empty `file` and line 0.
+- The file lists every statement and tracked bit of the covered scopes. For a
+  large design, cover the design under test only (`--code-coverage-scope`), or
+  leave toggles out (`--code-coverage=stmt,branch`).
+
+---
+
 ## Limits and unsupported features
 
 **Not supported at all:**
 
-- Code coverage: line, statement, branch, condition, expression, toggle and FSM.
+- Condition, expression and FSM coverage. Code coverage is statement, branch
+  and toggle only; see [Code coverage limits](#code-coverage-limits).
 - Coverage databases in other formats (such as UCIS), text or HTML coverage
-  reports, and merging results across runs.
+  reports, and merging results across runs (the files can be added up with
+  `jq`: see [Several runs](#several-runs) and
+  [Adding runs together](#adding-code-coverage-runs-together)).
 - The coverage system functions `$coverage_control`, `$coverage_get`,
   `$coverage_get_max`, `$coverage_merge`, `$coverage_save`, `$set_coverage_db_name`
   and `$load_coverage_db`. They print `Warning: unknown system task '<name>' ignored`
@@ -580,5 +897,8 @@ it.
 | `--verbose`, `XEZIM_VERBOSE=1` | Print the `[COV]` summary lines on stderr, along with the other engine lines |
 | `+seed=<n>` | Seed the random generator, for reproducible random stimulus and coverage |
 | `--error-exit` | Exit nonzero after any `$error`, including one from an assertion's action block, and after an `illegal_bins` hit |
-| `+cover`, `+cover=<spec>`, `+fcover`, `-coverage` | Accepted for compatibility with other simulators; no effect |
+| `--code-coverage[=<kinds>]`, `XEZIM_CODE_COVERAGE=<kinds>` | Collect code coverage: `stmt`, `branch`, `toggle` or `all` (the default). See [Code coverage](#code-coverage) |
+| `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees and packages |
+| `+cover`, `+cover=<letters>`, `-coverage` | Other simulators' spellings of `--code-coverage`: `s`, `b` and `t` select the kinds; other letters are ignored with a warning |
+| `+fcover` | Accepted for compatibility with other simulators; no effect |
 | `-do "coverage save ..."`, `-do "coverage report ..."` | Ignored with a warning |
