@@ -76382,10 +76382,18 @@ impl Simulator {
             }
             StatementKind::Return(expr) => {
                 if let Some(e) = expr {
+                    // A bare name no virtual-interface source can name: both
+                    // vif lookups below come back empty for it.
+                    let vif_free = matches!(&e.kind,
+                        ExprKind::Ident(h) if h.path.len() == 1
+                            && !self.vif_name_possible(&h.path[0].name.name));
                     // §25.9: `return val` where val carries a vif binding —
                     // record it so the caller's `x = f()` re-binds x
                     // (uvm_resource#(virtual if)::read; issue #113).
-                    if let Some(nm) = self.resolve_vif_rhs_name_strict(e) {
+                    if let Some(nm) = (!vif_free)
+                        .then(|| self.resolve_vif_rhs_name_strict(e))
+                        .flatten()
+                    {
                         self.signals
                             .insert("__vif_return__".to_string(), Value::from_string(&nm));
                         self.vif_return_pending = true;
@@ -76394,6 +76402,9 @@ impl Simulator {
                     // storage name so the caller's assign can copy elements
                     // (a packed Value cannot carry them).
                     self.pending_ret_collection = None;
+                    // `instance_assoc_member` of a one-segment name, when
+                    // computed below: it is also `expr_assoc_name`'s answer.
+                    let mut bare_member: Option<Option<String>> = None;
                     if let ExprKind::Ident(h) = &e.kind {
                         let bare = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                         // A queue / dynamic-array member lives at `<handle>#member`,
@@ -76411,8 +76422,11 @@ impl Simulator {
                             .dyn_name_lookup(bare)
                             .map(|s| std::borrow::Cow::Owned(s.to_string()))
                             .or_else(|| {
-                                self.instance_assoc_member(bare)
-                                    .map(std::borrow::Cow::Owned)
+                                let m = self.instance_assoc_member(bare);
+                                if h.path.len() == 1 {
+                                    bare_member = Some(m.clone());
+                                }
+                                m.map(std::borrow::Cow::Owned)
                             })
                             .unwrap_or_else(|| self.resolve_hier_name(h));
                         if self.module.dynamic_arrays.contains(&*n) {
@@ -76434,7 +76448,11 @@ impl Simulator {
                         }
                     }
                     if self.pending_ret_collection.is_none() {
-                        if let Some(an) = self.expr_assoc_name(e) {
+                        let an = match bare_member {
+                            Some(m) => m,
+                            None => self.expr_assoc_name(e),
+                        };
+                        if let Some(an) = an {
                             if !self.is_associative_array(&an) {
                                 self.pending_ret_collection = Some(an);
                             }
@@ -76486,7 +76504,11 @@ impl Simulator {
                     // the caller's `vd = getter();` can re-establish the
                     // alias. Guarded on the name resolving to a REAL
                     // interface instance, so ordinary returns never match.
-                    if let Some(bound) = self.resolve_vif_rhs_name(e) {
+                    let vif_free = matches!(&e.kind,
+                        ExprKind::Ident(h) if h.path.len() == 1
+                            && !self.vif_name_possible(&h.path[0].name.name));
+                    if let Some(bound) = (!vif_free).then(|| self.resolve_vif_rhs_name(e)).flatten()
+                    {
                         if self.is_interface_instance(&bound) {
                             self.last_vif_return = Some(bound);
                         }
@@ -79405,7 +79427,7 @@ impl Simulator {
             ExprKind::Ident(h) => {
                 self.string_signals.contains(&*self.resolve_hier_name(h))
                     || self.class_member_is_string(expr)
-                    || self.get_expr_type_name(expr).is_some_and(|t| t == "string")
+                    || self.ident_type_is_string(h, expr)
                     || self.local_struct_member_is_string(h)
                     || self.member_chain_is_string(expr)
             }
@@ -116059,6 +116081,16 @@ impl Simulator {
         if !no_unpacked_dims {
             return;
         }
+        // A built-in scalar or a plain class has no element width, struct
+        // layout or typedef-carried shape: only a vector's own
+        // non-normalized range can apply.
+        if Self::type_is_plain_scalar(dt) || self.type_is_plain_class(dt) {
+            if let Some(fdims) = super::elaborate::packed_full_dims_of(dt, &self.module.parameters)
+            {
+                self.module.packed_full_dims.insert(name.to_string(), fdims);
+            }
+            return;
+        }
         let dt1 = self.typedef_one_step(dt);
         if let Some(ew) = super::elaborate::packed_inner_elem_width(
             dt,
@@ -116149,17 +116181,27 @@ impl Simulator {
             if !Self::formal_may_carry_vif(&port.data_type) {
                 continue;
             }
-            let key = format!("__vif_local__{}", port.name.name);
-            match args
-                .get(i)
-                .and_then(|a| self.resolve_vif_rhs_name_strict(a))
-            {
+            // A plain class formal cannot be bound to an interface.
+            let nm = if self.port_is_plain_class(port) {
+                None
+            } else {
+                args.get(i)
+                    .and_then(|a| self.resolve_vif_rhs_name_strict(a))
+            };
+            match nm {
                 Some(nm) => {
                     self.vif_local_names.insert(port.name.name.clone());
-                    self.signals.insert(key, Value::from_string(&nm));
+                    self.signals.insert(
+                        format!("__vif_local__{}", port.name.name),
+                        Value::from_string(&nm),
+                    );
                 }
+                // No key was ever made under this name, so the removal
+                // would find nothing (the store generation still moves).
+                None if !self.vif_local_names.contains(&port.name.name) => bump_store_gen(),
                 None => {
-                    self.signals.remove(&key);
+                    self.signals
+                        .remove(&format!("__vif_local__{}", port.name.name));
                 }
             }
         }
@@ -116202,8 +116244,8 @@ impl Simulator {
             if i < args.len() {
                 let eff_dims: Vec<crate::ast::types::UnpackedDimension> =
                     if port.dimensions.is_empty() {
-                        if let crate::ast::types::DataType::TypeReference { name, .. } =
-                            &port.data_type
+                        if let (false, crate::ast::types::DataType::TypeReference { name, .. }) =
+                            (self.port_is_plain_class(port), &port.data_type)
                         {
                             let tn = &name.name.name;
                             let concrete = self
@@ -130529,6 +130571,63 @@ impl Simulator {
             }
         }
         keys
+    }
+
+    /// `get_expr_type_name(expr) == Some("string")` for the identifier
+    /// `expr`. A bare name stops before the class-property fallback, which
+    /// only ever yields a class, enum, covergroup or type-parameter name;
+    /// every other shape asks `get_expr_type_name`.
+    fn ident_type_is_string(&self, hier: &HierarchicalIdentifier, expr: &Expression) -> bool {
+        if hier.path.len() != 1 {
+            return self.get_expr_type_name(expr).is_some_and(|t| t == "string");
+        }
+        let name = self.resolve_hier_name(hier);
+        let is_string = |t: Option<&String>| t.is_some_and(|t| t == "string");
+        if self.fe_trusted_types.contains(&*name) {
+            if let Some(t) = self.var_typedef_types.get(&*name) {
+                return t == "string";
+            }
+        }
+        // The first source that answers decides, in `get_expr_type_name`'s
+        // order.
+        let in_any_frame = self
+            .method_local_base
+            .last()
+            .map(|&base| {
+                self.local_stack
+                    .get(base..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .rev()
+                    .any(|m| m.contains_key(&*name))
+            })
+            .unwrap_or_else(|| {
+                self.local_stack
+                    .iter()
+                    .rev()
+                    .any(|m| m.contains_key(&*name))
+            });
+        if in_any_frame {
+            if let Some(t) = self.var_class_types.get(&*name) {
+                return t == "string";
+            }
+            if let Some(t) = self.var_typedef_types.get(&*name) {
+                return t == "string";
+            }
+        }
+        if let Some(t) = self
+            .signal_name_to_id
+            .get(name.as_ref())
+            .and_then(|id| self.signal_type_names.get(id))
+        {
+            return t == "string";
+        }
+        if self.class_context_stack.last().is_none() {
+            return is_string(self.var_class_types.get(&*name))
+                || (!self.var_class_types.contains_key(&*name)
+                    && is_string(self.var_typedef_types.get(&*name)));
+        }
+        false
     }
 
     fn get_expr_type_name(&self, expr: &Expression) -> Option<String> {
