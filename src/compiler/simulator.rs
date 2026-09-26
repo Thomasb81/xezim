@@ -160,6 +160,9 @@ const RPS_TRAMPOLINE_DEPTH: usize = 300;
 /// Internal marker retrieving a §9.4.5 intra-assignment RHS value captured in
 /// `Simulator::intra_saved` (see `make_intra_saved_expr`). Never user-visible.
 const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
+/// A signal of a concurrent assertion resolved at registration: `(<id>)`
+/// reads `signal_table[id]` (see `sva_resolve_signals`).
+const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
 
 /// §21.2.1.7 `%m` bookkeeping: an `m_scope_stack` entry starting with
 /// `M_ROOT_MARK` carries the absolute declaring path of the running
@@ -2873,6 +2876,9 @@ struct SvaClockedSite {
     /// Property body as written (after named-sequence expansion); kept for
     /// the `$past` argument walk.
     body: Expression,
+    /// The bare signal names `$past` reads in `body` (sorted, unique), found
+    /// once at registration: the walk ran on every clock fire.
+    past_names: Vec<String>,
     /// The body compiled to an evaluable property tree (see `SvaNode`).
     node: std::sync::Arc<SvaNode>,
     /// §16.12 `disable iff (guard)`: while the guard holds, every attempt in
@@ -66069,10 +66075,16 @@ impl Simulator {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
-        if let ExprKind::Ident(h) = &expr.kind {
-            if let Some(v) = self.plain_ident_read(h) {
-                return v;
+        match &expr.kind {
+            ExprKind::Ident(h) => {
+                if let Some(v) = self.plain_ident_read(h) {
+                    return v;
+                }
             }
+            ExprKind::SystemCall { name, args } if name == SVA_SIG_MARKER => {
+                return self.sva_sig_read(args);
+            }
+            _ => {}
         }
         if let Some(v) = self.assoc_size_member(expr) {
             return v;
@@ -77081,11 +77093,18 @@ impl Simulator {
                             };
                             // Named sequence / property instances INSIDE the
                             // body (`a |=> s`) expand here, once.
-                            let body_expanded = self.sva_expand_named(&body, 0);
+                            let mut body_expanded = self.sva_expand_named(&body, 0);
                             let mut sampled_ids = Vec::new();
                             self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
                             sampled_ids.sort_unstable();
                             sampled_ids.dedup();
+                            let mut past_names = Vec::new();
+                            self.collect_past_arg_names(&body_expanded, &mut past_names);
+                            // A signal is sampled once per property clock,
+                            // however many sampled-value calls reference it.
+                            past_names.sort_unstable();
+                            past_names.dedup();
+                            self.sva_resolve_signals(&mut body_expanded);
                             let (disable, node) = self.sva_compile_site(&body_expanded);
                             let scope = self.active_instance_scope();
                             let mut m_chain = self.m_scope_stack.clone();
@@ -77107,6 +77126,7 @@ impl Simulator {
                                 edge,
                                 iff,
                                 body: body_expanded,
+                                past_names,
                                 node: std::sync::Arc::new(node),
                                 disable,
                                 prev_clock: 2, // sentinel
@@ -82103,15 +82123,27 @@ impl Simulator {
         if self.sva_sites.is_empty() {
             return;
         }
+        // Concurrent assertions live in modules and interfaces (§16.14),
+        // never in a class: evaluate them without the class context the last
+        // process left behind, whose `this` made every signal read in a
+        // property probe the object's members first.
+        let saved_this = std::mem::take(&mut self.this_stack);
+        let saved_cls = std::mem::take(&mut self.class_context_stack);
+        self.tick_sva_sites_inner();
+        self.this_stack = saved_this;
+        self.class_context_stack = saved_cls;
+    }
+
+    fn tick_sva_sites_inner(&mut self) {
         // Use indices so we can call &mut self methods inside the loop
         // without holding a borrow on self.sva_sites.
         for i in 0..self.sva_sites.len() {
-            let clk_name = self.sva_sites[i].clock_signal.clone();
+            let clk_name = &self.sva_sites[i].clock_signal;
             if clk_name.is_empty() {
                 continue;
             }
             let cur_clk_bit = self
-                .get_signal_value_by_name(&clk_name)
+                .get_signal_value_by_name(clk_name)
                 .and_then(|v| v.to_u64())
                 .map(|u| (u & 1) as u8)
                 .unwrap_or(2);
@@ -82137,24 +82169,28 @@ impl Simulator {
             let site_loc = self.sva_sites[i].stat_loc;
             let site_kind = self.sva_sites[i].kind;
             let node = self.sva_sites[i].node.clone();
-            let disable = self.sva_sites[i].disable.clone();
-            let body = self.sva_sites[i].body.clone();
+            // The guard and the sampled ids are moved out for the fire (the
+            // evaluator needs `&mut self`) and put back below, not cloned.
+            let disable = self.sva_sites[i].disable.take();
             // LRM §16.5.1: the referenced-signal ids whose Preponed samples
             // this fire's predicates must read (see eval_sva_sampled).
-            let sampled_ids = self.sva_sites[i].sampled_ids.clone();
+            let sampled_ids = std::mem::take(&mut self.sva_sites[i].sampled_ids);
             let prev_active = self.active_sva_site.replace(i);
             // LRM §16.9.3: refresh the past-value snapshots BEFORE anything
             // evaluates, so `$past(<sig>)` in a consequent that comes due
             // this tick reads the previous cycle's sample too.
-            self.refresh_sva_past_snapshots(i, &body, &sampled_ids);
+            self.refresh_sva_past_snapshots(i, &sampled_ids);
             // §16.12 `disable iff`: an asserted guard cancels every attempt
             // in flight, including the one that would start now.
-            if let Some(g) = &disable {
-                if self.eval_expr(g).is_true() {
-                    self.sva_sites[i].attempts.clear();
-                    self.active_sva_site = prev_active;
-                    continue;
-                }
+            let disabled = disable
+                .as_ref()
+                .is_some_and(|g| self.eval_expr(g).is_true());
+            self.sva_sites[i].disable = disable;
+            if disabled {
+                self.sva_sites[i].attempts.clear();
+                self.sva_sites[i].sampled_ids = sampled_ids;
+                self.active_sva_site = prev_active;
+                continue;
             }
             let saved = self.install_preponed(&sampled_ids);
             let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
@@ -82193,6 +82229,7 @@ impl Simulator {
             }
             self.sva_sites[i].attempts = live;
             self.restore_preponed(saved);
+            self.sva_sites[i].sampled_ids = sampled_ids;
             for r in results {
                 match r {
                     SvaOutcome::Pass => self.sva_tally(i, span_key, true),
@@ -82223,21 +82260,15 @@ impl Simulator {
     /// snapshot ring, pushing this cycle's sampled value and trimming to a
     /// max depth. Each unique signal gets its own ring; index 0 = this
     /// cycle, index N = N cycles ago.
-    fn refresh_sva_past_snapshots(
-        &mut self,
-        site_idx: usize,
-        body: &Expression,
-        sampled_ids: &[usize],
-    ) {
+    fn refresh_sva_past_snapshots(&mut self, site_idx: usize, sampled_ids: &[usize]) {
         const PAST_MAX_DEPTH: usize = 16;
-        let mut names: Vec<String> = Vec::new();
-        self.collect_past_arg_names(body, &mut names);
-        // A signal is sampled once per property clock, regardless of how many
-        // sampled-value calls reference it.  Pushing duplicate names made
-        // ring[1] another copy of the current cycle instead of the prior one.
-        names.sort_unstable();
-        names.dedup();
-        for name in names {
+        // Deduplicated at registration: a duplicate name would make ring[1]
+        // another copy of the current cycle instead of the prior one.
+        if self.sva_sites[site_idx].past_names.is_empty() {
+            return;
+        }
+        let names = std::mem::take(&mut self.sva_sites[site_idx].past_names);
+        for name in &names {
             // The sampled (Preponed) value when the site tracks the signal.
             let pre = self
                 .signal_name_to_id
@@ -82246,17 +82277,121 @@ impl Simulator {
                 .filter(|id| sampled_ids.contains(id))
                 .and_then(|id| self.sva_preponed.get(&id).cloned());
             let v = pre
-                .or_else(|| self.get_signal_value_by_name(&name))
+                .or_else(|| self.get_signal_value_by_name(name))
                 .unwrap_or_else(|| Value::zero(32));
-            let ring = self.sva_sites[site_idx]
-                .past_snapshots
-                .entry(name)
-                .or_default();
+            let snaps = &mut self.sva_sites[site_idx].past_snapshots;
+            let ring = match snaps.get_mut(name.as_str()) {
+                Some(r) => r,
+                None => snaps.entry(name.clone()).or_default(),
+            };
             ring.push_front(v);
             while ring.len() > PAST_MAX_DEPTH {
                 ring.pop_back();
             }
         }
+        self.sva_sites[site_idx].past_names = names;
+    }
+
+    /// Replace each plain signal read in a concurrent assertion's body with
+    /// an `SVA_SIG_MARKER` read of its signal id, resolved once in the
+    /// registering scope: the generic identifier path re-ran its class,
+    /// local and interface probes on every clock of every assertion. The
+    /// argument of a sampled-value function stays a name (its history is
+    /// keyed by name), as does the base of a select.
+    fn sva_resolve_signals(&self, e: &mut Expression) {
+        match &mut e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+                    return;
+                }
+                let name = self.resolve_hier_name(h).into_owned();
+                let Some(&id) = self.signal_name_to_id.get(name.as_str()) else {
+                    return;
+                };
+                if self.module.arrays.contains_key(&name)
+                    || self.module.arrays_2d.contains_key(&name)
+                    || self.module.arrays_nd.contains_key(&name)
+                    || self.module.dynamic_arrays.contains(&name)
+                    || self.module.associative_arrays.contains_key(&name)
+                    || self.string_signals.contains(&name)
+                {
+                    return;
+                }
+                let span = e.span;
+                *e = Expression::new(
+                    ExprKind::SystemCall {
+                        name: SVA_SIG_MARKER.to_string(),
+                        args: vec![Expression::new(
+                            ExprKind::Number(NumberLiteral::Integer {
+                                size: None,
+                                signed: false,
+                                base: NumberBase::Decimal,
+                                value: id.to_string(),
+                                cached_val: Cell::new(None),
+                            }),
+                            span,
+                        )],
+                    },
+                    span,
+                );
+            }
+            ExprKind::SystemCall { name, args } => {
+                if matches!(
+                    name.as_str(),
+                    "$past" | "$rose" | "$fell" | "$stable" | "$changed" | "$sampled"
+                ) {
+                    return;
+                }
+                for a in args {
+                    self.sva_resolve_signals(a);
+                }
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.sva_resolve_signals(operand)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.sva_resolve_signals(left);
+                self.sva_resolve_signals(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.sva_resolve_signals(condition);
+                self.sva_resolve_signals(then_expr);
+                self.sva_resolve_signals(else_expr);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    self.sva_resolve_signals(p);
+                }
+            }
+            ExprKind::Index { index, .. } => self.sva_resolve_signals(index),
+            ExprKind::SvaClocked { .. } => {}
+            _ => {}
+        }
+    }
+
+    /// The value behind an `SVA_SIG_MARKER` read.
+    fn sva_sig_read(&self, args: &[Expression]) -> Value {
+        let id = match args.first().map(|a| &a.kind) {
+            Some(ExprKind::Number(NumberLiteral::Integer { value, .. })) => {
+                value.parse::<usize>().unwrap_or(usize::MAX)
+            }
+            _ => usize::MAX,
+        };
+        let Some(v) = self.signal_table.get(id) else {
+            return Value::new(1);
+        };
+        let mut v = v.clone();
+        if self.signal_signed[id] {
+            v.is_signed = true;
+        }
+        if self.signal_real[id] {
+            v.is_real = true;
+        }
+        v
     }
 
     /// Walk `expr` and append every bare signal name referenced by a
