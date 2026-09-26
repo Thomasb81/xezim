@@ -77638,8 +77638,10 @@ impl Simulator {
         // name-keyed path uses, under a synthetic per-instance key.
         let stamp = Self::instance_event_stamp_key(&key);
         self.event_triggered_time.insert(stamp, now);
-        if let Some(w) = self.cg_instance_event_waiters.get(&key).cloned() {
-            self.sample_event_covergroups(w);
+        if !self.cg_instance_event_waiters.is_empty() {
+            if let Some(w) = self.cg_instance_event_waiters.get(&key).cloned() {
+                self.sample_event_covergroups(w);
+            }
         }
         let mut woken = Vec::new();
         self.instance_event_waiters.retain(|w| {
