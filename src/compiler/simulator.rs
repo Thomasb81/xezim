@@ -46177,6 +46177,31 @@ impl Simulator {
             // The unchanged test first: nearly every inherited key is
             // unchanged, and it then needs no parent lookup.
             let base_frame = baseline.and_then(|b| b.get(i));
+            // A frame whose keys were never inserted or removed since the
+            // fork still has its baseline clone's layout, so the two iterate
+            // in the same key order and pair up without a lookup. Any key
+            // mismatch falls back to the keyed loop, which re-derives the
+            // same writes (a repeated write is a no-op).
+            if let Some(bf) = base_frame.filter(|f| f.len() == child_frames[i].len()) {
+                let mut paired = true;
+                for ((k, v), (bk, bv)) in child_frames[i].iter().zip(bf.iter()) {
+                    if k != bk {
+                        paired = false;
+                        break;
+                    }
+                    if v == bv {
+                        continue;
+                    }
+                    if let Some(slot) = parent_frames[i].get_mut(k) {
+                        if slot != v {
+                            *slot = v.clone();
+                        }
+                    }
+                }
+                if paired {
+                    continue;
+                }
+            }
             for (k, v) in &child_frames[i] {
                 let inherited_unchanged = base_frame
                     .and_then(|f| f.get(k))
