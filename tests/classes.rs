@@ -310,6 +310,8 @@ mod instance_class_handles_start_null;
 mod interface_array_handle_new;
 #[path = "classes/nested_rand_inline_constraints.rs"]
 mod nested_rand_inline_constraints;
+#[path = "classes/nested_rand_joint_solve.rs"]
+mod nested_rand_joint_solve;
 #[path = "classes/null_deref_fatal.rs"]
 mod null_deref_fatal;
 #[path = "classes/shadowed_property_initializers.rs"]

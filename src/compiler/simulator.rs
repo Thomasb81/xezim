@@ -124988,11 +124988,32 @@ impl Simulator {
         // The joint solver (`rand_csp`) models integral scalars and 1-D
         // arrays; randc cycles, real values, object handles and unpacked
         // aggregates stay with the trial loop.
+        // §18.5.9: rand sub-objects held in plain handle members join the
+        // fallback joint solve (`csp_add_sub`); a collection of objects, a
+        // null handle or a member-subset call keeps them out.
+        let sub_objs: Option<Vec<(String, usize)>> = if self.randomize_subset.is_some() {
+            None
+        } else {
+            let cd = self.module.classes.get(&class_name).cloned();
+            rand_obj_props
+                .iter()
+                .map(|p| {
+                    let coll = cd.as_ref().is_some_and(|cd| {
+                        cd.queue_properties.contains_key(p)
+                            || cd.array_properties.contains_key(p)
+                            || cd.assoc_properties.contains_key(p)
+                    }) || self.is_associative_array(&format!("{}#{}", handle, p));
+                    let sub = self.member_handle(handle, p).unwrap_or(0);
+                    (!coll && sub != 0 && sub != handle).then(|| (p.clone(), sub))
+                })
+                .collect()
+        };
         let mut csp_ok = randc_set.is_empty()
             && real_rand_props.is_empty()
-            && rand_obj_props.is_empty()
+            && (rand_obj_props.is_empty() || sub_objs.is_some())
             && unpacked_agg_props.is_empty()
             && rand_nd_arrays.is_empty();
+        let sub_objs = sub_objs.unwrap_or_default();
         let mut csp_runs = 0u32;
         let array_enums: HashMap<String, String> = rand_arrays
             .iter()
@@ -125003,6 +125024,7 @@ impl Simulator {
         // solver first; the trials stay the fallback.
         let mut trials = 1000;
         if csp_ok
+            && rand_obj_props.is_empty()
             && !rand_colls.iter().any(|c| c.kind == CollKind::Dyn)
             && self.rand_order_sensitive(&constraints)
         {
@@ -125021,6 +125043,7 @@ impl Simulator {
                 &rand_colls,
                 &array_enums,
                 true,
+                &[],
             ) {
                 rand_csp::CspOutcome::Sat => {
                     if has_post {
@@ -126283,8 +126306,22 @@ impl Simulator {
                     &rand_colls,
                     &array_enums,
                     false,
+                    &sub_objs,
                 ) {
                     rand_csp::CspOutcome::Sat => {
+                        // The joint solve rewrote the sub-objects after
+                        // their own post_randomize ran: run it on the final
+                        // values.
+                        for (_, sub) in &sub_objs {
+                            let cls = self
+                                .heap
+                                .get(*sub)
+                                .and_then(|o| o.as_ref())
+                                .map(|i| i.class_name.clone());
+                            if cls.is_some_and(|c| self.class_has_method(&c, "post_randomize")) {
+                                self.exec_method_call(*sub, "post_randomize", &[]);
+                            }
+                        }
                         if has_post {
                             self.exec_method_call(handle, "post_randomize", &[]);
                         }

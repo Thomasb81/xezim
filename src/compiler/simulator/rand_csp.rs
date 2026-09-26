@@ -301,6 +301,8 @@ struct Aux {
 enum VarKey {
     Prop(String),
     Elem(String),
+    /// A rand scalar of a rand sub-object: (its handle, property).
+    Sub(usize, String),
 }
 
 #[derive(Clone, Debug)]
@@ -351,6 +353,8 @@ struct Csp {
     /// or `unique` the translation could not model), so a solution is not
     /// fully verified.
     opaque: bool,
+    /// Rand sub-object scalars are variables too (`csp_add_sub`).
+    has_subs: bool,
 }
 
 /// Translation scope: bound `foreach` indices and the `with` iterator.
@@ -565,6 +569,7 @@ impl Simulator {
         colls: &[RandColl],
         array_enums: &HashMap<String, String>,
         strict: bool,
+        subs: &[(String, usize)],
     ) -> CspOutcome {
         let Some(mut csp) = self.csp_vars(
             handle,
@@ -575,6 +580,32 @@ impl Simulator {
             array_enums,
         ) else {
             return CspOutcome::NotApplicable;
+        };
+        // §18.5.9: the rand sub-objects' scalars and their own constraints
+        // join the problem, so an item tying two of them together (`a.x <
+        // b.y`) or one to an enclosing member is solved jointly.
+        let mut joint: Vec<ClassConstraint>;
+        let constraints: &[ClassConstraint] = if subs.is_empty() {
+            constraints
+        } else {
+            joint = constraints.to_vec();
+            for (prop, sub) in subs {
+                let Some(items) = self.csp_add_sub(&mut csp, prop, *sub) else {
+                    return CspOutcome::NotApplicable;
+                };
+                joint.push(ClassConstraint {
+                    is_static: false,
+                    is_extern: false,
+                    has_body: true,
+                    name: crate::ast::Identifier {
+                        name: format!("{}.*", prop),
+                        span: crate::ast::Span::dummy(),
+                    },
+                    items,
+                    span: crate::ast::Span::dummy(),
+                });
+            }
+            &joint
         };
         csp.with_soft = true;
         if self.csp_translate(&mut csp, constraints).is_none() {
@@ -623,6 +654,7 @@ impl Simulator {
             dists: Vec::new(),
             order: Vec::new(),
             opaque: false,
+            has_subs: false,
         };
         let enum_dom = |me: &Self, tn: &str| -> Option<Dom> {
             let members = me.module.enum_members.get(tn)?;
@@ -1425,6 +1457,230 @@ impl Simulator {
                 }
             }
             VarKey::Elem(k) => self.write_coll_elem(k, val),
+            VarKey::Sub(h, n) => {
+                if let Some(Some(inst)) = self.heap.get_mut(*h) {
+                    inst.properties.insert(n.clone(), val);
+                }
+            }
+        }
+    }
+
+    /// Add the rand scalars of the rand sub-object `sub` (member `prop` of
+    /// the object being randomized) as `prop.<name>` variables, and return
+    /// its class constraints rewritten to name them through `prop`. None
+    /// when the sub-object holds anything this solver does not model: a
+    /// nested object, a collection, a real, a randc, or a constraint that
+    /// calls a method.
+    fn csp_add_sub(
+        &mut self,
+        csp: &mut Csp,
+        prop: &str,
+        sub: usize,
+    ) -> Option<Vec<ConstraintItem>> {
+        let class_name = self.heap.get(sub)?.as_ref()?.class_name.clone();
+        let rand_disabled = self
+            .rand_mode_disabled
+            .get(&sub)
+            .cloned()
+            .unwrap_or_default();
+        let con_disabled = self
+            .constraint_mode_disabled
+            .get(&sub)
+            .cloned()
+            .unwrap_or_default();
+        csp.has_subs = true;
+        let mut members: HashSet<String> = HashSet::default();
+        let mut items: Vec<ConstraintItem> = Vec::new();
+        let mut seen_con: HashSet<String> = HashSet::default();
+        let mut seen_var: HashSet<String> = HashSet::default();
+        let mut cur = Some(class_name);
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?.clone();
+            if !cd.randc_properties.is_empty() {
+                return None;
+            }
+            members.extend(cd.properties.keys().cloned());
+            for name in self.randomize_members(&cd, &rand_disabled) {
+                if !seen_var.insert(name.clone()) {
+                    continue;
+                }
+                let sig = cd.properties.get(&name)?;
+                let is_obj = sig
+                    .type_name
+                    .as_ref()
+                    .is_some_and(|tn| self.module.classes.contains_key(tn));
+                if is_obj
+                    || sig.is_real
+                    || sig.width == 0
+                    || sig.width > 64
+                    || cd.array_properties.contains_key(&name)
+                    || cd.array_nd_properties.contains_key(&name)
+                    || cd.queue_properties.contains_key(&name)
+                    || cd.assoc_properties.contains_key(&name)
+                {
+                    return None;
+                }
+                let dom = sig
+                    .type_name
+                    .as_ref()
+                    .and_then(|tn| self.module.enum_members.get(tn))
+                    .filter(|m| !m.is_empty())
+                    .map(|m| dom_norm(m.iter().map(|e| (e.1 as i128, e.1 as i128)).collect()))
+                    .unwrap_or_else(|| {
+                        let (lo, hi) = ws_range(sig.width, sig.is_signed);
+                        vec![(lo, hi)]
+                    });
+                csp.scalars
+                    .insert(format!("{}.{}", prop, name), csp.vars.len());
+                csp.vars.push(CspVar {
+                    key: VarKey::Sub(sub, name.clone()),
+                    width: sig.width,
+                    signed: sig.is_signed,
+                });
+                csp.dom0.push(dom);
+            }
+            if !con_disabled.contains("*") {
+                for (cname, con) in cd.constraints.iter() {
+                    if !seen_con.insert(cname.clone()) || con_disabled.contains(cname) {
+                        continue;
+                    }
+                    items.extend(con.items.iter().cloned());
+                }
+            }
+            cur = cd.extends.clone();
+        }
+        if csp.vars.len() > MAX_VARS {
+            return None;
+        }
+        let mut out = Vec::with_capacity(items.len());
+        for mut it in items {
+            if !Self::csp_prefix_item(&mut it, prop, &members) {
+                return None;
+            }
+            out.push(it);
+        }
+        Some(out)
+    }
+
+    /// Rewrite a sub-object's constraint item so its member references go
+    /// through the enclosing object's member `prop` (`x` becomes `prop.x`).
+    /// False when the item holds something that cannot be rewritten so.
+    fn csp_prefix_item(it: &mut ConstraintItem, prop: &str, members: &HashSet<String>) -> bool {
+        use crate::ast::decl::ConstraintRange;
+        match it {
+            ConstraintItem::Expr(e) => Self::csp_prefix_expr(e, prop, members),
+            ConstraintItem::Inside { expr, range, .. } => {
+                Self::csp_prefix_expr(expr, prop, members)
+                    && range.iter_mut().all(|r| match r {
+                        ConstraintRange::Value(v) => Self::csp_prefix_expr(v, prop, members),
+                        ConstraintRange::Range { lo, hi } => {
+                            Self::csp_prefix_expr(lo, prop, members)
+                                && Self::csp_prefix_expr(hi, prop, members)
+                        }
+                    })
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                Self::csp_prefix_expr(condition, prop, members)
+                    && Self::csp_prefix_item(constraint, prop, members)
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                Self::csp_prefix_expr(condition, prop, members)
+                    && Self::csp_prefix_item(then_item, prop, members)
+                    && else_item
+                        .as_mut()
+                        .is_none_or(|e| Self::csp_prefix_item(e, prop, members))
+            }
+            ConstraintItem::Soft(inner) => Self::csp_prefix_item(inner, prop, members),
+            ConstraintItem::Block(items) => items
+                .iter_mut()
+                .all(|i| Self::csp_prefix_item(i, prop, members)),
+            _ => false,
+        }
+    }
+
+    fn csp_prefix_expr(e: &mut Expression, prop: &str, members: &HashSet<String>) -> bool {
+        let through = |name: &str, span: crate::ast::Span| {
+            Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(Expression::new(
+                        ExprKind::Ident(HierarchicalIdentifier {
+                            root: None,
+                            path: vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: prop.to_string(),
+                                    span,
+                                },
+                                selects: Vec::new(),
+                            }],
+                            span,
+                            cached_signal_id: Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        span,
+                    )),
+                    member: crate::ast::Identifier {
+                        name: name.to_string(),
+                        span,
+                    },
+                },
+                span,
+            )
+        };
+        match &mut e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    return false;
+                }
+                let n = h.path[0].name.name.clone();
+                if members.contains(&n) {
+                    *e = through(&n, e.span);
+                }
+                true
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                if matches!(expr.kind, ExprKind::This) && members.contains(&member.name) {
+                    let n = member.name.clone();
+                    *e = through(&n, e.span);
+                    return true;
+                }
+                false
+            }
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                Self::csp_prefix_expr(operand, prop, members)
+            }
+            ExprKind::Binary { left, right, .. } | ExprKind::Range(left, right) => {
+                Self::csp_prefix_expr(left, prop, members)
+                    && Self::csp_prefix_expr(right, prop, members)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::csp_prefix_expr(condition, prop, members)
+                    && Self::csp_prefix_expr(then_expr, prop, members)
+                    && Self::csp_prefix_expr(else_expr, prop, members)
+            }
+            ExprKind::Inside { expr, ranges } => {
+                Self::csp_prefix_expr(expr, prop, members)
+                    && ranges
+                        .iter_mut()
+                        .all(|r| Self::csp_prefix_expr(r, prop, members))
+            }
+            ExprKind::Concatenation(parts) => parts
+                .iter_mut()
+                .all(|p| Self::csp_prefix_expr(p, prop, members)),
+            _ => false,
         }
     }
 
@@ -2004,6 +2260,21 @@ impl Simulator {
     fn csp_member(&self, csp: &Csp, e: &Expression) -> Option<String> {
         let known = |n: &str| csp.scalars.contains_key(n) || csp.arrays.contains_key(n);
         let recv_ok = |me: &Self, r: &str| r == "this" || me.rand_receiver.as_deref() == Some(r);
+        // A rand sub-object's member (`a.x`, `this.a.x`, `t.a.x`): a
+        // `prop.name` variable when the sub-object joined the solve.
+        if csp.has_subs {
+            if let Some(mut path) = Self::csp_member_path(e) {
+                if path.len() >= 3 && (path[0] == "this" || recv_ok(self, &path[0])) {
+                    path.remove(0);
+                }
+                if path.len() == 2 {
+                    let n = format!("{}.{}", path[0], path[1]);
+                    if csp.scalars.contains_key(&n) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
         let name = match &e.kind {
             ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => match h.path.len()
             {
@@ -2021,6 +2292,25 @@ impl Simulator {
             _ => return None,
         };
         known(&name).then_some(name)
+    }
+
+    /// The names of a plain member path (`a.b`, `this.a.b`), `this` kept.
+    fn csp_member_path(e: &Expression) -> Option<Vec<String>> {
+        match &e.kind {
+            ExprKind::This => Some(vec!["this".to_string()]),
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+                    return None;
+                }
+                Some(h.path.iter().map(|s| s.name.name.clone()).collect())
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let mut v = Self::csp_member_path(expr)?;
+                v.push(member.name.clone());
+                Some(v)
+            }
+            _ => None,
+        }
     }
 
     /// Variables `e` reads. False when it calls something whose reads are
