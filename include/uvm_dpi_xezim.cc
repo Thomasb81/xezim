@@ -2,7 +2,7 @@
 // xezim UVM DPI driver.
 //
 // Mirrors `uvm_dpi.cc` from the Accellera UVM reference but skips
-// `uvm_hdl.c` entirely (its VCS / Questa / Xcelium branches all
+// `uvm_hdl.c` entirely (its per-simulator branches all
 // require proprietary vendor headers). The `uvm_hdl_*` surface is
 // implemented directly here against standard IEEE 1800 VPI — no
 // separate C file, no mangling concerns.
@@ -53,7 +53,7 @@ unsigned char uvm_re_compexecfree(const char* re, const char* str,
 //   uvm_hdl_release_and_read returns 1 on success, 0 on failure
 //   uvm_hdl_read             returns 1 on success, 0 on failure
 //
-// Questa-specific helpers (`uvm_is_vhdl_path`,
+// Simulator-specific helpers (`uvm_is_vhdl_path`,
 // `uvm_register_get_vhdl`, `uvm_register_set_vhdl`) are NOT part
 // of IEEE 1800.2 and are intentionally not provided.
 //----------------------------------------------------------------------

@@ -168,8 +168,8 @@ g++ -shared -fPIC \
 > **Practical note:** `uvm_dpi.cc` already `#include`s every `.c` and `.cc` source
 > from `uvm-core/src/dpi/` inside its own `extern "C" { … }` block. The catch is
 > that `uvm_dpi.cc` unconditionally `#include "uvm_hdl.c"`, and that file has a
-> `#ifdef VCS / #elif QUESTA / #elif XCELIUM / #else #error "hdl vendor backend
-> is missing"` chain that requires a proprietary vendor header. xezim doesn't
+> per-simulator `#ifdef` chain (ending in `#else #error "hdl vendor backend
+> is missing"`) that requires a proprietary vendor header. xezim doesn't
 > ship those vendor headers because none of them are open source.
 >
 > Use `include/uvm_dpi_xezim.cc` instead — a single driver that mirrors
@@ -177,7 +177,7 @@ g++ -shared -fPIC \
 > `uvm_hdl_*` surface itself per IEEE 1800.2-2017 Annex C (return 1 on
 > success, 0 on failure). It uses only standard `vpi_handle_by_name` +
 > `vpi_get_value` + `vpi_put_value` — no vendor extensions, no VHPI, no
-> M-HPI. Questa's `uvm_is_vhdl_path` and `uvm_register_*_vhdl` helpers are
+> M-HPI. The simulator-specific `uvm_is_vhdl_path` and `uvm_register_*_vhdl` helpers are
 > NOT part of IEEE 1800.2 and are intentionally not provided.
 >
 > ```bash
