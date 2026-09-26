@@ -21,7 +21,7 @@ how to read the results.
 | Guards | `coverpoint x iff (cond)`, `cross a, b iff (cond)` |
 | Crosses | Automatic cross bins (every combination of the coverpoints' bins), `bins name = binsof(cp) intersect {...}` |
 | Options | `option.at_least`, `option.weight`, `option.auto_bin_max`, `type_option.merge_instances`, `type_option.weight` |
-| Queries | `get_inst_coverage()` and `get_coverage()` on a covergroup, a coverpoint or a cross; `$get_coverage()` |
+| Queries | `get_inst_coverage()` and `get_coverage()` on a covergroup, a coverpoint or a cross, with or without `(covered, total)`; `cg_type::get_coverage()`; `$get_coverage()`; `start()` and `stop()` |
 | Assertion coverage | Counts for `cover property`, `assert property`, `assume property` and the immediate `cover`, `assert` and `assume` |
 | Results | The `xezim_cov.json` file, and `[COV]` summary lines with `--verbose` |
 
@@ -461,11 +461,17 @@ All return a `real` percentage from 0.0 to 100.0; print it with `%f`, for exampl
 | `cg.get_inst_coverage()` | Coverage of the instance `cg` |
 | `cg.get_coverage()` | Coverage of the covergroup type: the average over its instances, or a union of their hits with `type_option.merge_instances = 1` |
 | `cg.<cp>.get_inst_coverage()`, `cg.<cp>.get_coverage()` | The same for one coverpoint or cross `<cp>` |
+| `cg_type::get_coverage()`, `cg_type::<cp>::get_coverage()` | The same as `get_coverage()` on an instance of type `cg_type` |
 | `$get_coverage()` | The average over every covergroup type, weighted by `type_option.weight` |
 | `cg.sample()`, `cg.sample(args)` | Samples the instance now |
+| `cg.stop()`, `cg.start()`, `cg.<cp>.stop()`, `cg.<cp>.start()` | Stop sampling the instance (or one coverpoint or cross of it), and start it again |
 
-Call `get_coverage()` on an instance handle. The type-scoped forms
-`cg_type::get_coverage()` and `cg_type::cp::get_coverage()` return 0.
+Each coverage query also takes two `int` output arguments,
+`get_inst_coverage(covered, total)`: they receive the number of covered bins and the
+total number of bins, summed over the coverpoints and crosses for a covergroup.
+`get_coverage` sums them over the instances, or counts the union of their hits with
+`type_option.merge_instances = 1`. With `merge_instances`, `get_inst_coverage()`
+returns the type's coverage too.
 
 ### Several runs
 
@@ -549,14 +555,11 @@ it.
 
 | Feature | What happens |
 |---|---|
-| `start()`, `stop()` | No effect: sampling continues after `stop()` |
 | `option.per_instance`, `option.goal`, `option.name`, `option.comment` | Accepted, no effect. The results file always has one entry per instance, named after the type |
 | `bins name[N] = {...}` | Treated as `name[]`: one bin per value, not N bins |
 | Transition sets and repetition: `(1, 5 => 3)`, `(3 [*2])`, `[->n]`, `[=n]` | Never hit |
 | In a cross body: `ignore_bins`, `illegal_bins`, `binsof(cp.bin)`, `binsof(...) with (...)` | Ignored. Only `bins name = binsof(cp) intersect {...}` is used. To leave values out of a cross, put `ignore_bins` on the coverpoint, as in [the cross example](#crosses-and-ignore_bins) |
 | `binsof(...) intersect {...} && binsof(...) ...` (or `\|\|`) | Only the first `binsof` term is used |
-| `get_coverage(covered, total)`, `get_inst_coverage(covered, total)` | The percentage is returned, but `covered` and `total` are not set |
-| `cg_type::get_coverage()` | Returns 0. Call it on an instance: `cg.get_coverage()` |
 
 ---
 

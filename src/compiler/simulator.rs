@@ -3246,6 +3246,10 @@ struct CovergroupInstance {
     point_history: HashMap<String, std::collections::VecDeque<Value>>,
     /// Total `sample()` invocations on this instance.
     sample_count: u64,
+    /// §19.8 `stop()`: sampling is off until `start()`.
+    stopped: bool,
+    /// Coverpoints and crosses stopped with `cg.item.stop()`.
+    stopped_items: HashSet<String>,
 }
 
 /// One bin of a coverpoint as coverage counts it (§19.5).
@@ -111036,9 +111040,25 @@ impl Simulator {
                     }
                 }
             }
+            // §19.8: `cg_type::get_coverage()` and `cg_type::cp::get_coverage()`
+            // query a covergroup TYPE.
+            if member.name == "get_coverage" {
+                if let Some((cg, item)) = self.cg_type_receiver(expr) {
+                    let (pct, c, t) = match item {
+                        None => self.cg_type_counts(&cg),
+                        Some(it) => self.cg_type_item_counts(&cg, &it).unwrap_or((0.0, 0, 0)),
+                    };
+                    self.cg_assign_counts(args, c, t);
+                    return Value::from_f64(pct);
+                }
+            }
             // §19.8: `cg.cp.get_coverage()` / `cg.cp.get_inst_coverage()`
-            // query ONE coverpoint or cross of a covergroup instance.
-            if matches!(member.name.as_str(), "get_coverage" | "get_inst_coverage") {
+            // query ONE coverpoint or cross of a covergroup instance;
+            // `cg.cp.stop()` / `start()` switch its sampling.
+            if matches!(
+                member.name.as_str(),
+                "get_coverage" | "get_inst_coverage" | "start" | "stop"
+            ) {
                 if let ExprKind::MemberAccess {
                     expr: inner,
                     member: item,
@@ -111046,8 +111066,20 @@ impl Simulator {
                 {
                     let h = self.eval_expr(inner).to_u64().unwrap_or(0) as usize;
                     if let Some(idx) = self.cg_index(h) {
-                        if let Some(v) = self.cg_item_query(idx, &item.name, &member.name) {
-                            return v;
+                        if matches!(member.name.as_str(), "start" | "stop") {
+                            if let Some(Some(inst)) = self.cg_heap.get_mut(idx) {
+                                if member.name == "stop" {
+                                    inst.stopped_items.insert(item.name.clone());
+                                } else {
+                                    inst.stopped_items.remove(&item.name);
+                                }
+                            }
+                            return Value::zero(32);
+                        }
+                        if let Some((pct, c, t)) = self.cg_item_query(idx, &item.name, &member.name)
+                        {
+                            self.cg_assign_counts(args, c, t);
+                            return Value::from_f64(pct);
                         }
                     }
                 }
@@ -112035,6 +112067,34 @@ impl Simulator {
                         }
                     }
                 }
+                // §19.8 `cg_type::get_coverage()` / `cg_type::cp::get_coverage()`
+                // flatten to Ident([cg_type, (cp,) get_coverage]).
+                if matches!(hier.path.len(), 2 | 3)
+                    && hier
+                        .path
+                        .last()
+                        .is_some_and(|s| s.name.name == "get_coverage")
+                    && hier.path.iter().all(|s| s.selects.is_empty())
+                {
+                    let recv = Expression::new(
+                        ExprKind::Ident(HierarchicalIdentifier {
+                            root: None,
+                            path: hier.path[..hier.path.len() - 1].to_vec(),
+                            span: hier.span,
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        func.span,
+                    );
+                    if let Some((cg, item)) = self.cg_type_receiver(&recv) {
+                        let (pct, c, t) = match item {
+                            None => self.cg_type_counts(&cg),
+                            Some(it) => self.cg_type_item_counts(&cg, &it).unwrap_or((0.0, 0, 0)),
+                        };
+                        self.cg_assign_counts(args, c, t);
+                        return Value::from_f64(pct);
+                    }
+                }
                 // IEEE 1800-2023 §8.15/§13.5.5: a method reached through a
                 // flattened multi-segment path — `o.in.getval()` parses as
                 // Ident([o, in, getval]). The receiver is the FULL prefix
@@ -112085,10 +112145,11 @@ impl Simulator {
                             && matches!(method_name.as_str(), "get_coverage" | "get_inst_coverage")
                         {
                             if let Some(idx) = self.cg_index(handle) {
-                                if let Some(v) =
+                                if let Some((pct, c, t)) =
                                     self.cg_item_query(idx, &seg.name.name, method_name)
                                 {
-                                    return v;
+                                    self.cg_assign_counts(args, c, t);
+                                    return Value::from_f64(pct);
                                 }
                             }
                         }
@@ -116183,6 +116244,8 @@ impl Simulator {
             cross_hits: HashMap::default(),
             cross_bin_hits: HashMap::default(),
             sample_count: 0,
+            stopped: false,
+            stopped_items: HashSet::default(),
         };
         self.cg_heap.push(Some(instance));
 
@@ -116258,33 +116321,147 @@ impl Simulator {
     /// instance at `idx`: `get_inst_coverage` over this instance,
     /// `get_coverage` over every instance of the type. `None` when the
     /// covergroup has no item by that name.
-    fn cg_item_query(&self, idx: usize, item: &str, method: &str) -> Option<Value> {
+    fn cg_item_query(&self, idx: usize, item: &str, method: &str) -> Option<(f64, u64, u64)> {
         let inst = self.cg_heap.get(idx)?.as_ref()?;
         let cg_name = inst.cg_name.clone();
-        if method == "get_inst_coverage" {
+        // With `merge_instances` an instance reports its type's coverage.
+        if method == "get_inst_coverage" && !self.cg_merge_instances(&cg_name) {
             return self
-                .cg_named_item_coverage(&cg_name, item, &[inst])
-                .map(Value::from_f64);
+                .cg_named_item_counts(&cg_name, item, &[inst])
+                .map(|(c, t)| (Self::cg_fraction(c, t) * 100.0, c, t));
         }
-        let insts: Vec<&CovergroupInstance> = self
-            .cg_heap
+        self.cg_type_item_counts(&cg_name, item)
+    }
+
+    /// The live instances of a covergroup type.
+    fn cg_type_instances(&self, cg_name: &str) -> Vec<&CovergroupInstance> {
+        self.cg_heap
             .iter()
             .flatten()
             .filter(|i| i.cg_name == cg_name)
-            .collect();
-        if self.cg_merge_instances(&cg_name) {
-            return self
-                .cg_named_item_coverage(&cg_name, item, &insts)
-                .map(Value::from_f64);
+            .collect()
+    }
+
+    /// §19.8/§19.11 TYPE coverage of one coverpoint or cross: over the
+    /// union of the instances' hits with `merge_instances`, else the
+    /// average of the instances, with their bin counts summed.
+    fn cg_type_item_counts(&self, cg_name: &str, item: &str) -> Option<(f64, u64, u64)> {
+        let insts = self.cg_type_instances(cg_name);
+        if self.cg_merge_instances(cg_name) || insts.is_empty() {
+            let (c, t) = self.cg_named_item_counts(cg_name, item, &insts)?;
+            return Some((Self::cg_fraction(c, t) * 100.0, c, t));
         }
-        let per: Vec<f64> = insts
-            .iter()
-            .filter_map(|i| self.cg_named_item_coverage(&cg_name, item, std::slice::from_ref(i)))
-            .collect();
-        if per.is_empty() {
+        let (mut pct, mut c, mut t) = (0.0, 0, 0);
+        for i in &insts {
+            let (ic, it) = self.cg_named_item_counts(cg_name, item, std::slice::from_ref(i))?;
+            pct += Self::cg_fraction(ic, it) * 100.0;
+            c += ic;
+            t += it;
+        }
+        Some((pct / insts.len() as f64, c, t))
+    }
+
+    /// Coverage (percent) and covered / total bin counts of instance
+    /// `handle`, summed over its coverpoints and crosses; with
+    /// `merge_instances`, those of its type.
+    fn cg_instance_counts(&self, handle: usize) -> (f64, u64, u64) {
+        let Some(inst) = self.cg_heap.get(handle).and_then(|x| x.as_ref()) else {
+            return (0.0, 0, 0);
+        };
+        if self.cg_merge_instances(&inst.cg_name) {
+            return self.cg_type_counts(&inst.cg_name);
+        }
+        let (c, t) = self.cg_bin_totals(&inst.cg_name, &[inst]);
+        (self.calculate_coverage(handle), c, t)
+    }
+
+    /// Type coverage (percent) and bin counts: of the union of the
+    /// instances' hits with `merge_instances`, else summed over them.
+    fn cg_type_counts(&self, cg_name: &str) -> (f64, u64, u64) {
+        let insts = self.cg_type_instances(cg_name);
+        let (c, t) = if self.cg_merge_instances(cg_name) {
+            self.cg_bin_totals(cg_name, &insts)
+        } else {
+            insts.iter().fold((0, 0), |(c, t), i| {
+                let (ic, it) = self.cg_bin_totals(cg_name, std::slice::from_ref(i));
+                (c + ic, t + it)
+            })
+        };
+        (self.calculate_type_coverage(cg_name), c, t)
+    }
+
+    /// Covered and total bins over every coverpoint and cross of a
+    /// covergroup (implicit coverpoints included).
+    fn cg_bin_totals(&self, cg_name: &str, insts: &[&CovergroupInstance]) -> (u64, u64) {
+        let Some(def) = self.module.covergroups.get(cg_name) else {
+            return (0, 0);
+        };
+        let (mut covered, mut total) = (0u64, 0u64);
+        for item in &def.items {
+            if let Some((c, t, _)) = self.cg_item_counts(def, item, insts) {
+                covered += c;
+                total += t;
+            }
+        }
+        let at_least = self.cg_at_least(def, &[], insts);
+        for name in Self::cg_implicit_points(def) {
+            let (c, t) = Self::cg_implicit_point_counts(&name, insts, at_least);
+            covered += c;
+            total += t;
+        }
+        (covered, total)
+    }
+
+    /// Write a coverage query's `covered` / `total` output arguments.
+    fn cg_assign_counts(&mut self, args: &[Expression], covered: u64, total: u64) {
+        if let [c, t, ..] = args {
+            self.assign_value(c, &Value::from_u64(covered, 32));
+            self.assign_value(t, &Value::from_u64(total, 32));
+        }
+    }
+
+    /// `cg_type::get_coverage()` / `cg_type::cp::get_coverage()`: the
+    /// covergroup type (key) and item a receiver names, when it names a
+    /// covergroup type rather than a variable.
+    fn cg_type_receiver(&self, recv: &Expression) -> Option<(String, Option<String>)> {
+        let (name, item) = match &recv.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                (h.path[0].name.name.as_str(), None)
+            }
+            ExprKind::Ident(h)
+                if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                (
+                    h.path[0].name.name.as_str(),
+                    Some(h.path[1].name.name.clone()),
+                )
+            }
+            ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    (h.path[0].name.name.as_str(), Some(member.name.clone()))
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // A variable (or a class's own covergroup variable) is an instance.
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|l| l.contains_key(name))
+            || self.signal_name_to_id.contains_key(name)
+            || self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                .is_some_and(|o| o.properties.contains_key(name))
+        {
             return None;
         }
-        Some(Value::from_f64(per.iter().sum::<f64>() / per.len() as f64))
+        let def = self.covergroup_def_for(name)?;
+        Some((def.name.name, item))
     }
 
     fn exec_cg_method_call(
@@ -116299,23 +116476,32 @@ impl Simulator {
             // Value (from_u64), so `%f`-family display reinterpreted the
             // integer's bits as an f64 and printed 0.0 even when the
             // computed coverage was 100.
-            "get_inst_coverage" => {
-                // §19.8 get_inst_coverage(): coverage of THIS instance.
-                Value::from_f64(self.calculate_coverage(handle))
-            }
-            "get_coverage" => {
-                // §19.8/§19.11 get_coverage(): TYPE coverage — the merge
-                // of every instance of this covergroup type (a bin is
-                // covered if any instance hit it).
-                let cg_name = self
+            "get_inst_coverage" | "get_coverage" => {
+                // §19.8: get_inst_coverage() covers THIS instance,
+                // get_coverage() the covergroup TYPE. The optional
+                // `(covered, total)` arguments receive the bin counts.
+                let Some(cg_name) = self
                     .cg_heap
                     .get(handle)
                     .and_then(|x| x.as_ref())
-                    .map(|i| i.cg_name.clone());
-                match cg_name {
-                    Some(n) => Value::from_f64(self.calculate_type_coverage(&n)),
-                    None => Value::from_f64(0.0),
+                    .map(|i| i.cg_name.clone())
+                else {
+                    return Value::from_f64(0.0);
+                };
+                let (pct, covered, total) = if method_name == "get_inst_coverage" {
+                    self.cg_instance_counts(handle)
+                } else {
+                    self.cg_type_counts(&cg_name)
+                };
+                self.cg_assign_counts(_args, covered, total);
+                Value::from_f64(pct)
+            }
+            "start" | "stop" => {
+                // §19.8: a stopped instance ignores its samples.
+                if let Some(Some(inst)) = self.cg_heap.get_mut(handle) {
+                    inst.stopped = method_name == "stop";
                 }
+                Value::zero(32)
             }
             "sample" => {
                 // §19.8.1 `with function sample(formals)`: bind the call's
@@ -117047,8 +117233,8 @@ impl Simulator {
     ) {
         let (owner, mut ctor_args, ctor_refs) =
             match self.cg_heap.get(handle).and_then(|x| x.as_ref()) {
-                Some(i) => (i.owner, i.ctor_args.clone(), i.ctor_refs.clone()),
-                None => return,
+                Some(i) if !i.stopped => (i.owner, i.ctor_args.clone(), i.ctor_refs.clone()),
+                _ => return,
             };
         // §19.3: a `ref` formal reads its actual's CURRENT value.
         for (n, e) in &ctor_refs {
@@ -117097,7 +117283,23 @@ impl Simulator {
             return;
         };
 
+        let stopped_items = self
+            .cg_heap
+            .get(handle)
+            .and_then(|x| x.as_ref())
+            .map(|i| i.stopped_items.clone())
+            .unwrap_or_default();
         for item in &def.items {
+            if !stopped_items.is_empty() {
+                let item_name = match item {
+                    CovergroupItem::Coverpoint(cp) => Some(Self::cg_point_name(cp)),
+                    CovergroupItem::Cross(cr) => Some(Self::cg_cross_name(cr)),
+                    _ => None,
+                };
+                if item_name.is_some_and(|n| stopped_items.contains(&n)) {
+                    continue;
+                }
+            }
             match item {
                 CovergroupItem::Coverpoint(cp) => {
                     // LRM §19.5 `iff (guard)` — skip the sample when the
