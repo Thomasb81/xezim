@@ -57566,6 +57566,21 @@ impl Simulator {
         if id < 0 { None } else { Some(id as usize) }
     }
 
+    /// `format!("{}#{}::{}", class, sig, member)` (with a sig) or
+    /// `format!("{}::{}", class, member)` without the formatting machinery.
+    fn spec_member_key(class: &str, sig: Option<&str>, member: &str) -> String {
+        let mut out =
+            String::with_capacity(class.len() + sig.map_or(0, |s| s.len() + 1) + member.len() + 2);
+        out.push_str(class);
+        if let Some(sig) = sig {
+            out.push('#');
+            out.push_str(sig);
+        }
+        out.push_str("::");
+        out.push_str(member);
+        out
+    }
+
     /// `format!("{}{}", base, suffix)` without the formatting machinery.
     fn name_with_suffix(base: &str, suffix: &str) -> String {
         let mut out = String::with_capacity(base.len() + suffix.len());
@@ -106888,31 +106903,33 @@ impl Simulator {
                             // extend `typed_callbacks#(T)` — share the
                             // same `m_tw_cb_q` static cell.
                             if base == cname {
-                                format!(
-                                    "{}#{}::{}",
-                                    cname,
-                                    self.canonicalize_spec_sig(&cname, sig.as_str()),
-                                    prop
+                                Self::spec_member_key(
+                                    &cname,
+                                    Some(self.canonicalize_spec_sig(&cname, sig.as_str()).as_str()),
+                                    prop,
                                 )
                             } else if let Some(ancestor_sig) =
                                 self.ancestor_spec(base.as_str(), sig.as_str(), &cname)
                             {
-                                format!(
-                                    "{}#{}::{}",
-                                    cname,
-                                    self.canonicalize_spec_sig(&cname, &ancestor_sig),
-                                    prop
+                                Self::spec_member_key(
+                                    &cname,
+                                    Some(
+                                        self.canonicalize_spec_sig(&cname, &ancestor_sig).as_str(),
+                                    ),
+                                    prop,
                                 )
                             } else {
-                                format!(
-                                    "{}#{}::{}",
-                                    base,
-                                    self.canonicalize_spec_sig(base.as_str(), sig.as_str()),
-                                    prop
+                                Self::spec_member_key(
+                                    &base,
+                                    Some(
+                                        self.canonicalize_spec_sig(base.as_str(), sig.as_str())
+                                            .as_str(),
+                                    ),
+                                    prop,
                                 )
                             }
                         }
-                        _ => format!("{}::{}", cname, prop),
+                        _ => Self::spec_member_key(&cname, None, prop),
                     };
 
                     return Some(key);
@@ -107330,10 +107347,14 @@ impl Simulator {
                     return false;
                 }
                 let make_key = |is_prop_of: Option<usize>| -> String {
-                    match is_prop_of {
-                        Some(th) => format!("__vif_local__{}#{}", th, lname),
-                        None => format!("__vif_local__{}", lname),
+                    let mut key = String::with_capacity(lname.len() + 24);
+                    key.push_str("__vif_local__");
+                    if let Some(th) = is_prop_of {
+                        Self::push_i64(&mut key, th as i64);
+                        key.push('#');
                     }
+                    key.push_str(lname);
+                    key
                 };
                 if matches!(&rvalue.kind, ExprKind::Null) {
                     let key = make_key(is_prop_of);
