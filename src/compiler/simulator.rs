@@ -106685,25 +106685,14 @@ impl Simulator {
     }
 
     fn canonicalize_spec_sig(&self, class_name: &str, sig: &str) -> String {
-        // Clone the small vecs we need so the `&self` borrow in
-        // `expr_to_spec_fragment` below doesn't conflict.
-        let class_key = if self.module.classes.contains_key(class_name) {
-            class_name.to_string()
-        } else {
+        // The class's parameter lists are read in place: every call below
+        // takes `&self`.
+        let Some(cd) = self.module.classes.get(class_name) else {
             return sig.to_string();
         };
-        let (order, tp_defaults, v_defaults): (
-            Vec<String>,
-            Vec<(String, String)>,
-            Vec<(String, Option<crate::ast::expr::Expression>)>,
-        ) = match self.module.classes.get(&class_key) {
-            Some(cd) => (
-                cd.param_order.clone(),
-                cd.type_param_defaults.clone(),
-                cd.param_defaults.clone(),
-            ),
-            None => return sig.to_string(),
-        };
+        let order = &cd.param_order;
+        let tp_defaults = &cd.type_param_defaults;
+        let v_defaults = &cd.param_defaults;
         if order.is_empty() {
             return sig.to_string();
         }
