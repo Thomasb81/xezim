@@ -281,3 +281,48 @@ endmodule
     assert!(!text.contains("gated out"), "monitor gated out:\n{}", text);
     assert!(text.contains("n=3 t=66"), "monitor result:\n{}", text);
 }
+
+/// A run that stops at --max-time with a compiled process parked still says
+/// where that process is: its waiter has no AST continuation to point at.
+#[test]
+fn hang_report_names_parked_fsm_process() {
+    let src = r#"
+module tb;
+  reg clk = 0;
+  always #5 clk = ~clk;
+  integer n = 0;
+  always @(posedge clk) begin
+    n <= n + 1;
+    if (n == 1000) begin
+      #1;
+      $display("never");
+    end
+  end
+endmodule
+"#;
+    let dir = std::env::temp_dir().join(format!("xezim_proc_fsm_hang_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let f = dir.join("t.sv");
+    std::fs::write(&f, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--no-cache", "-s", "tb", "--max-time", "40"])
+        .arg(&f)
+        .env("XEZIM_PROC_LOOP_STATS", "1")
+        .output()
+        .expect("run xezim");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("[PROC-FSM] registered"),
+        "process not compiled:\n{}",
+        text
+    );
+    assert!(
+        text.contains("resumes at a wait inside the process at ") && text.contains("t.sv:6"),
+        "hang report location:\n{}",
+        text
+    );
+}

@@ -40308,10 +40308,17 @@ impl Simulator {
                     moved
                 ));
             }
+            // A compiled process FSM parks with an empty continuation; name
+            // the body it belongs to instead.
             let loc = w
                 .continuation
                 .first()
                 .and_then(|st| self.span_file_line_in(st.span, None))
+                .or_else(|| {
+                    let (span, _) = self.process_origin.get(&w.pid)?;
+                    let at = self.span_file_line_in(*span, None)?;
+                    Some(format!("a wait inside the process at {}", at))
+                })
                 .unwrap_or_else(|| "<unknown location>".to_string());
             let origin = self
                 .process_origin
