@@ -5469,6 +5469,9 @@ pub struct Simulator {
     /// Paths of instances whose definition is an interface (see
     /// `is_interface_instance`); filled on first use.
     iface_instance_paths: std::cell::OnceCell<std::collections::HashSet<String>>,
+    /// See `iface_path_parts`.
+    #[allow(clippy::type_complexity)]
+    iface_path_parts: std::cell::OnceCell<(HashSet<String>, HashSet<String>)>,
     /// Quiet signals: neither an armed edge-block input nor edge-sensitive,
     /// so a write to one has no side-table work at all. One bit per signal;
     /// rebuilt when either table changes. A quiet store skips the write
@@ -9865,6 +9868,7 @@ impl Simulator {
             gate_queued: Vec::new(),
             gate_lane_valid: false,
             iface_instance_paths: std::cell::OnceCell::new(),
+            iface_path_parts: std::cell::OnceCell::new(),
             quiet_bits: Vec::new(),
             quiet_valid: false,
             prof_quiet_stores: 0,
@@ -77525,11 +77529,9 @@ impl Simulator {
             }
             StatementKind::Return(expr) => {
                 if let Some(e) = expr {
-                    // A bare name no virtual-interface source can name: both
+                    // An operand no virtual-interface source can name: both
                     // vif lookups below come back empty for it.
-                    let vif_free = matches!(&e.kind,
-                        ExprKind::Ident(h) if h.path.len() == 1
-                            && !self.vif_name_possible(&h.path[0].name.name));
+                    let vif_free = !self.vif_rhs_possible(e);
                     // §25.9: `return val` where val carries a vif binding —
                     // record it so the caller's `x = f()` re-binds x
                     // (uvm_resource#(virtual if)::read; issue #113).
@@ -77647,9 +77649,7 @@ impl Simulator {
                     // the caller's `vd = getter();` can re-establish the
                     // alias. Guarded on the name resolving to a REAL
                     // interface instance, so ordinary returns never match.
-                    let vif_free = matches!(&e.kind,
-                        ExprKind::Ident(h) if h.path.len() == 1
-                            && !self.vif_name_possible(&h.path[0].name.name));
+                    let vif_free = !self.vif_rhs_possible(e);
                     if let Some(bound) = (!vif_free).then(|| self.resolve_vif_rhs_name(e)).flatten()
                     {
                         if self.is_interface_instance(&bound) {
@@ -107262,6 +107262,20 @@ impl Simulator {
                     return false;
                 }
                 let lname: &str = h.path[0].name.name.as_str();
+                // `null` acts only on a vif property of `this` or a name that
+                // holds a `__vif_local__` key (the key removal otherwise finds
+                // nothing; the store generation still moves). Any other RHS
+                // must be able to name an interface instance.
+                if matches!(&rvalue.kind, ExprKind::Null) {
+                    if !self.class_member_names().vif_props.contains(lname)
+                        && !self.vif_local_names.contains(lname)
+                    {
+                        bump_store_gen();
+                        return false;
+                    }
+                } else if !self.vif_rhs_possible(rvalue) {
+                    return false;
+                }
                 // A bare name that is a PROPERTY of `this` stores per-instance
                 // (each uvm_resource's `val` must keep its own interface);
                 // otherwise the flat local/static key.
@@ -107614,15 +107628,8 @@ impl Simulator {
     }
 
     fn resolve_vif_rhs_name_strict(&self, rvalue: &Expression) -> Option<String> {
-        // A bare name every vif source misses resolves to itself, which is
-        // then no interface instance.
-        if let ExprKind::Ident(h) = &rvalue.kind {
-            if h.path.len() == 1
-                && h.path[0].selects.is_empty()
-                && !self.vif_name_possible(&h.path[0].name.name)
-            {
-                return None;
-            }
+        if !self.vif_rhs_possible(rvalue) {
+            return None;
         }
         // `iface.member` where the dotted name is a real SIGNAL is a value
         // read, not a modport view — `dd1 = u.d` must not classify dd1 as a
@@ -107690,15 +107697,15 @@ impl Simulator {
                     .is_some_and(|dt| self.is_virtual_iface_type(dt));
                 // A same-named class vif PROPERTY written bare inside a
                 // method takes the binding path below, not the var alias.
-                let shadows_class_prop = self
-                    .this_stack
-                    .last()
-                    .copied()
-                    .flatten()
-                    .and_then(|hd| self.heap.get(hd).and_then(|o| o.as_ref()))
-                    .map(|i| i.class_name.clone())
-                    .and_then(|cn| self.module.classes.get(&cn))
-                    .is_some_and(|cd| cd.virtual_iface_properties.contains_key(name));
+                let shadows_class_prop = is_viface_var
+                    && self
+                        .this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .and_then(|hd| self.heap.get(hd).and_then(|o| o.as_ref()))
+                        .and_then(|i| self.module.classes.get(&i.class_name))
+                        .is_some_and(|cd| cd.virtual_iface_properties.contains_key(name));
                 if is_viface_var && !shadows_class_prop {
                     // §25.10: whole-array binding (`vifs = interfaces`). Each
                     // virtual-interface element is an independent alias to the
@@ -107833,6 +107840,16 @@ impl Simulator {
                     }
                 }
             }
+        }
+        // Only a declared vif property takes a (handle, prop) binding; the
+        // owner lookups of a name or member target are reads.
+        let target_prop: Option<&str> = match &lvalue.kind {
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+            ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+            _ => None,
+        };
+        if target_prop.is_some_and(|p| !self.class_member_names().vif_props.contains(p)) {
+            return false;
         }
         // (handle, prop) for the target. `prop` for arrays encodes the
         // index as `"vif_arr[<idx>]"` so existing single-key storage
@@ -108751,6 +108768,76 @@ impl Simulator {
             || self.class_member_names().vif_props.contains(raw)
             || self.vif_local_names.contains(raw)
             || self.is_interface_instance(raw)
+    }
+
+    /// Could `resolve_vif_rhs_name(e)` come back with an interface-instance
+    /// name? Its sources: a vif binding (keyed by a vif property name), a
+    /// `__vif_local__` key, an alias, the name itself, an interface instance
+    /// reached by path (whose last segment is a tail of an instance path),
+    /// or an element `a[i]` of an interface-instance array. When false the
+    /// strict resolver returns None and callers filtering on
+    /// `is_interface_instance` find nothing; the resolver only reads state.
+    fn vif_rhs_possible(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => self.vif_name_possible(&h.path[0].name.name),
+            ExprKind::Ident(h) => {
+                if h.path.iter().any(|s| !s.selects.is_empty()) {
+                    return true;
+                }
+                let last = h.path[h.path.len() - 1].name.name.as_str();
+                (h.path.len() == 2
+                    && (self.is_interface_instance(&h.path[0].name.name)
+                        || self.class_member_names().vif_props.contains(last)))
+                    || self.iface_path_parts().0.contains(last)
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                matches!(&expr.kind, ExprKind::Ident(bh)
+                    if bh.path.len() == 1 && self.is_interface_instance(&bh.path[0].name.name))
+                    || self
+                        .class_member_names()
+                        .vif_props
+                        .contains(member.name.as_str())
+                    || self.iface_path_parts().0.contains(member.name.as_str())
+            }
+            ExprKind::Index { expr: base, .. } => match &base.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => self
+                    .iface_path_parts()
+                    .1
+                    .contains(h.path[0].name.name.as_str()),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Every `.`-separated tail of an interface-instance path (the path
+    /// included), and every prefix of one that ends before a `[`.
+    fn iface_path_parts(&self) -> &(HashSet<String>, HashSet<String>) {
+        self.iface_path_parts.get_or_init(|| {
+            let mut tails: HashSet<String> = HashSet::default();
+            let mut heads: HashSet<String> = HashSet::default();
+            for inst in self
+                .module
+                .instances
+                .iter()
+                .filter(|i| self.module.interfaces.contains(&i.def_name))
+            {
+                let p = inst.path.as_str();
+                tails.insert(p.to_string());
+                for (k, c) in p.char_indices() {
+                    match c {
+                        '.' => {
+                            tails.insert(p[k + 1..].to_string());
+                        }
+                        '[' => {
+                            heads.insert(p[..k].to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (tails, heads)
+        })
     }
 
     fn iface_alias_for(&self, name: &str) -> Option<String> {
