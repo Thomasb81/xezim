@@ -93024,64 +93024,72 @@ impl Simulator {
             return v;
         }
         // Type-param name → concrete, carried down the extends chain (each
-        // hop rebinds the parent's params from `extends_type_args`).
-        let mut carried: HashMap<String, String> = inst.type_bindings.clone();
-        let mut cur = Some(inst.class_name.clone());
-        let mut level = 0;
+        // hop rebinds the parent's params from `extends_type_args`). The
+        // chain is walked to the declaring class first; a name is then
+        // carried back to the instance's own bindings on demand.
+        let mut chain: Vec<&super::elaborate::ElaboratedClass> = Vec::new();
+        let mut cur: Option<&str> = Some(inst.class_name.as_str());
         while let Some(cn) = cur {
-            level += 1;
-            if level > 16 {
-                break;
+            if chain.len() == 16 {
+                return false;
             }
-            let Some(cd) = self.module.classes.get(&cn) else {
-                break;
+            let Some(cd) = self.module.classes.get(cn) else {
+                return false;
             };
+            chain.push(cd.as_ref());
             if let Some(&is_str) = cd.assoc_properties.get(member) {
                 if is_str {
                     return true;
                 }
-                if let Some(kt) = cd.assoc_key_types.get(member) {
-                    let mut concrete = carried.get(kt).cloned().unwrap_or_else(|| kt.clone());
-                    if let Some(c2) = carried.get(&concrete) {
-                        concrete = c2.clone();
-                    }
-                    if concrete == "string" {
-                        return true;
-                    }
-                    if let Some(dt) = self.module.typedef_types.get(&concrete) {
-                        if matches!(
-                            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
-                            DataType::Simple {
-                                kind: crate::ast::types::SimpleType::String,
-                                ..
-                            }
-                        ) {
-                            return true;
+                let Some(kt) = cd.assoc_key_types.get(member) else {
+                    return false;
+                };
+                let k = chain.len() - 1;
+                let carried =
+                    |name: &str| Self::carried_type_binding(&inst.type_bindings, &chain, k, name);
+                let mut concrete = carried(kt).unwrap_or_else(|| kt.clone());
+                if let Some(c2) = carried(&concrete) {
+                    concrete = c2;
+                }
+                if concrete == "string" {
+                    return true;
+                }
+                if let Some(dt) = self.module.typedef_types.get(&concrete) {
+                    if matches!(
+                        super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types),
+                        DataType::Simple {
+                            kind: crate::ast::types::SimpleType::String,
+                            ..
                         }
+                    ) {
+                        return true;
                     }
                 }
                 return false;
             }
-            match cd.extends.clone() {
-                Some(parent) => {
-                    if let Some(pcd) = self.module.classes.get(&parent) {
-                        let mut next: HashMap<String, String> = HashMap::default();
-                        for (i, pname) in pcd.param_order.iter().enumerate() {
-                            if let Some(arg) = cd.extends_type_args.get(i) {
-                                let a = arg.trim();
-                                let resolved =
-                                    carried.get(a).cloned().unwrap_or_else(|| a.to_string());
-                                next.insert(pname.clone(), resolved);
-                            }
-                        }
-                        carried = next;
-                    }
-                    cur = Some(parent);
-                }
-                None => cur = None,
-            }
+            cur = cd.extends.as_deref();
         }
         false
+    }
+
+    /// The binding of type parameter `name` of `chain[k]` for an object whose
+    /// class is `chain[0]` with `bindings`: level 0 reads the bindings;
+    /// each level above takes the child's `extends_type_args` entry at the
+    /// parameter's position, itself carried from below (else taken as
+    /// written). None when `name` is not bound at that level.
+    fn carried_type_binding(
+        bindings: &HashMap<String, String>,
+        chain: &[&super::elaborate::ElaboratedClass],
+        k: usize,
+        name: &str,
+    ) -> Option<String> {
+        if k == 0 {
+            return bindings.get(name).cloned();
+        }
+        let child = chain[k - 1];
+        let i = chain[k].param_order.iter().position(|p| p == name)?;
+        let a = child.extends_type_args.get(i)?.trim();
+        Some(Self::carried_type_binding(bindings, chain, k - 1, a).unwrap_or_else(|| a.to_string()))
     }
 
     /// The per-instance part of `is_string_keyed_array` for `member` of an
