@@ -3252,6 +3252,8 @@ struct CovergroupInstance {
     stopped: bool,
     /// Coverpoints and crosses stopped with `cg.item.stop()`.
     stopped_items: HashSet<String>,
+    /// §19.7 `cg.option.<name> = v` written at run time.
+    options: HashMap<String, Value>,
 }
 
 /// One bin of a coverpoint as coverage counts it (§19.5).
@@ -59692,6 +59694,18 @@ impl Simulator {
     }
 
     fn assign_value_inner(&mut self, lhs: &Expression, val: &Value) -> bool {
+        // §19.7 `cg.option.<name> = v` on a covergroup instance.
+        if let ExprKind::Ident(h) = &lhs.kind {
+            if h.path.len() == 3 && h.path[1].name.name == "option" {
+                if let Some(idx) = self.cg_option_target(h) {
+                    if let Some(Some(inst)) = self.cg_heap.get_mut(idx) {
+                        inst.options
+                            .insert(h.path[2].name.name.clone(), val.clone());
+                    }
+                    return true;
+                }
+            }
+        }
         if !self.module.packages.is_empty() {
             if let Some(stripped) = self.strip_package_lvalue(lhs) {
                 return self.assign_value_inner(&stripped, val);
@@ -65990,6 +66004,13 @@ impl Simulator {
                 if hier.path.len() == 3 && hier.path[1].name.name == "type_option" {
                     if let Some((cg, field)) = self.cg_type_option_path(hier) {
                         if let Some(v) = self.cg_type_option_get(&cg, &field) {
+                            return v;
+                        }
+                    }
+                }
+                if hier.path.len() == 3 && hier.path[1].name.name == "option" {
+                    if let Some(idx) = self.cg_option_target(hier) {
+                        if let Some(v) = self.cg_option_read(idx, &hier.path[2].name.name) {
                             return v;
                         }
                     }
@@ -82756,6 +82777,54 @@ impl Simulator {
             .get(cg)
             .and_then(|t| t.get(field))
             .cloned()
+    }
+
+    /// The covergroup instance of a `cg.option.<name>` access.
+    fn cg_option_target(&mut self, hier: &HierarchicalIdentifier) -> Option<usize> {
+        if hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let head = Expression::new(
+            ExprKind::Ident(HierarchicalIdentifier {
+                root: hier.root.clone(),
+                path: vec![hier.path[0].clone()],
+                span: hier.span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            hier.span,
+        );
+        let h = self.eval_expr(&head).to_u64()? as usize;
+        self.cg_index(h)
+    }
+
+    /// §19.7 `cg.option.<name>`: the value set at run time, else by the
+    /// covergroup body, else the option's default.
+    fn cg_option_read(&mut self, idx: usize, field: &str) -> Option<Value> {
+        let inst = self.cg_heap.get(idx)?.as_ref()?;
+        if let Some(v) = inst.options.get(field) {
+            return Some(v.clone());
+        }
+        let body = self.module.covergroups.get(&inst.cg_name).and_then(|d| {
+            d.items.iter().find_map(|it| match it {
+                CovergroupItem::Option { name, val } if name == field => Some(val.clone()),
+                _ => None,
+            })
+        });
+        if let Some(e) = body {
+            return Some(self.eval_expr(&e));
+        }
+        let n = match field {
+            "weight" | "at_least" => 1,
+            "goal" => 100,
+            "auto_bin_max" => 64,
+            "per_instance" | "detect_overlap" | "cross_num_print_missing" | "get_inst_coverage" => {
+                0
+            }
+            "name" | "comment" => return Some(Value::from_string("")),
+            _ => return None,
+        };
+        Some(Value::from_u64(n, 32))
     }
 
     /// The `[cg, type_option, field]` shape of a scoped type-option access.
@@ -116395,6 +116464,7 @@ impl Simulator {
             sample_count: 0,
             stopped: false,
             stopped_items: HashSet::default(),
+            options: HashMap::default(),
         };
         self.cg_heap.push(Some(instance));
 

@@ -561,7 +561,13 @@ it.
 
 | Feature | What happens |
 |---|---|
-| `option.per_instance`, `option.goal`, `option.name`, `option.comment` | Accepted, no effect. The results file always has one entry per instance, named after the type |
+| `bins name[] = {...} with (expr)` on a coverpoint | The `with` filter is ignored: the bin holds every listed value |
+| `bins name = default sequence` | Counted like `default`: every sampled value no other value bin holds |
+| An `ignore_bins` or `illegal_bins` transition | An `illegal_bins` transition is reported; neither removes the transition from other bins |
+| Automatic bins of a signed coverpoint | They cover 0 to 2^width-1: a negative value falls in no automatic bin |
+| `matches` in a cross bin select | Ignored |
+| A file-scope covergroup created in a module instance | A separate type per module instance, like a covergroup declared in the module |
+| `option.per_instance`, `option.goal`, `option.name`, `option.comment` | Readable as `cg.option.goal` (the covergroup's setting, a value written at run time, or the default), but they change nothing else. An option written at run time (`cg.option.at_least = 2`) does not change the coverage either, as in the reference simulator. The results file always has one entry per instance, named after the type |
 
 ---
 
