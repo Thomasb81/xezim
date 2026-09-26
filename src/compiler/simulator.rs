@@ -5969,6 +5969,8 @@ pub struct Simulator {
     class_enclosing_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
     /// See `plain_class_ref`.
     plain_class_types: std::cell::RefCell<Option<HashMap<String, bool>>>,
+    /// See `coll_member_possible`.
+    coll_member_names: std::cell::RefCell<Option<HashSet<String>>>,
     /// Reused `<name>.size` key buffer of the queue-frame save/restore.
     queue_key_scratch: String,
     /// See `prop_owners`.
@@ -9997,6 +9999,7 @@ impl Simulator {
             class_string_props: std::cell::RefCell::new(HashMap::default()),
             class_enclosing_cache: std::cell::RefCell::new(HashMap::default()),
             plain_class_types: std::cell::RefCell::new(None),
+            coll_member_names: std::cell::RefCell::new(None),
             queue_key_scratch: String::new(),
             prop_owner_index: std::cell::RefCell::new(HashMap::default()),
             formal_parts_pool: Vec::new(),
@@ -65031,33 +65034,42 @@ impl Simulator {
             // `a.b` parses as a MemberAccess, so the identifier
             // resolver's hint walk never saw it and the flat name
             // missed. Try it under the hint and each parent scope.
-            let flat = if self.get_signal_value_by_name(&flat).is_some() {
-                flat
-            } else {
-                let hint = self.name_resolve_hint.borrow().clone();
-                let mut found: Option<String> = None;
-                if let Some(hint) = hint.as_deref() {
-                    let mut scope = hint;
-                    loop {
-                        let scoped = format!("{}.{}", scope, flat);
-                        if self.signal_name_to_id.contains_key(scoped.as_str())
-                            || self.signals.contains_key(&scoped)
-                        {
-                            found = Some(scoped);
-                            break;
-                        }
-                        match scope.rsplit_once('.') {
-                            Some((p, _)) => scope = p,
-                            None => break,
+            // The plain spelling is read once; after a miss only a hit under
+            // the hint (or a parent scope) is read again.
+            let hit = match self.get_signal_value_by_name(&flat) {
+                Some(v) => Some(v),
+                None => {
+                    let mut found: Option<String> = None;
+                    {
+                        let hint = self.name_resolve_hint.borrow();
+                        if let Some(hint) = hint.as_deref() {
+                            let mut scope = hint;
+                            let mut scoped = String::new();
+                            loop {
+                                scoped.clear();
+                                scoped.push_str(scope);
+                                scoped.push('.');
+                                scoped.push_str(&flat);
+                                if self.signal_name_to_id.contains_key(scoped.as_str())
+                                    || self.signals.contains_key(&scoped)
+                                {
+                                    found = Some(scoped);
+                                    break;
+                                }
+                                match scope.rsplit_once('.') {
+                                    Some((p, _)) => scope = p,
+                                    None => break,
+                                }
+                            }
                         }
                     }
+                    found.and_then(|scoped| self.get_signal_value_by_name(&scoped))
                 }
-                found.unwrap_or(flat)
             };
             // A leaf may live in the compact table OR the runtime map (a
             // LOCAL unpacked-struct array element is only in the latter),
             // so consult both — `sa[1].a` read 0 while `%p` showed 2.
-            if let Some(mut v) = self.get_signal_value_by_name(&flat) {
+            if let Some(mut v) = hit {
                 // §6.11.1: a collection element's member leaf carries no
                 // declared metadata — stamp the member's declared
                 // signedness so `q[0].latency <= 0` on an `integer`
@@ -76990,6 +77002,7 @@ impl Simulator {
                 if let Some(set) = self.plain_class_types.borrow_mut().as_mut() {
                     set.remove(&td.name.name);
                 }
+                *self.coll_member_names.borrow_mut() = None;
                 if !td.dimensions.is_empty() {
                     self.module
                         .typedef_unpacked_dims
@@ -108403,6 +108416,46 @@ impl Simulator {
         verdict
     }
 
+    /// Can `member` of some object be a per-instance collection or a static
+    /// fixed array (`class_assoc_member`, `prop_bound_collection`,
+    /// `static_fixed_key_in`)? Only if some class declares it as an
+    /// associative/queue/array property or a static fixed array, or types it
+    /// with a class parameter or a typedef carrying unpacked dimensions.
+    /// Rebuilt after a procedural `typedef`.
+    fn coll_member_possible(&self, member: &str) -> bool {
+        let mut cell = self.coll_member_names.borrow_mut();
+        let set = cell.get_or_insert_with(|| {
+            let params = &self.class_member_names().params;
+            let mut dimmed: HashSet<&str> = self
+                .module
+                .typedef_unpacked_dims
+                .keys()
+                .map(String::as_str)
+                .collect();
+            for cd in self.module.classes.values() {
+                dimmed.extend(cd.typedef_unpacked_dims.keys().map(String::as_str));
+            }
+            let mut names: HashSet<String> = HashSet::default();
+            for cd in self.module.classes.values() {
+                names.extend(cd.assoc_properties.keys().cloned());
+                names.extend(cd.queue_properties.keys().cloned());
+                names.extend(cd.array_properties.keys().cloned());
+                names.extend(cd.static_fixed_arrays.iter().map(|(n, ..)| n.clone()));
+                for (p, sig) in &cd.properties {
+                    if sig
+                        .type_name
+                        .as_deref()
+                        .is_some_and(|t| params.contains(t) || dimmed.contains(t))
+                    {
+                        names.insert(p.clone());
+                    }
+                }
+            }
+            names
+        });
+        set.contains(member)
+    }
+
     fn class_assoc_member(&self, class_name: &str, member: &str) -> bool {
         // Walk the ancestry by BORROW. The owned form allocated a String for
         // the start class and another per level (`extends.clone()`); this
@@ -108458,6 +108511,27 @@ impl Simulator {
     /// base expression is either a bare member (`m` — uses `this`) or a
     /// member of another object (`obj.m`). Returns `<handle>#<member>`.
     fn expr_assoc_name(&mut self, expr: &Expression) -> Option<String> {
+        // `this.m` / `obj.m` (either parse shape) on an object resolves to a
+        // store only for a member some class can hold as a collection.
+        let obj_member_name = match &expr.kind {
+            ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                ExprKind::This => Some(member.name.as_str()),
+                ExprKind::Ident(bh)
+                    if bh.path.len() == 1
+                        && !self.module.classes.contains_key(&bh.path[0].name.name) =>
+                {
+                    Some(member.name.as_str())
+                }
+                _ => None,
+            },
+            ExprKind::Ident(h) if h.path.len() == 2 && h.path[0].selects.is_empty() => {
+                Some(h.path[1].name.name.as_str())
+            }
+            _ => None,
+        };
+        if obj_member_name.is_some_and(|m| !self.coll_member_possible(m)) {
+            return None;
+        }
         // `obj`/`member` pair → instance-scoped name if `member` is an
         // associative property of the object the handle points at.
         let obj_member = |sim: &Self, obj: &str, member: &str| -> Option<String> {
