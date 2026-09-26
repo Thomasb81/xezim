@@ -5960,8 +5960,10 @@ pub struct Simulator {
     class_string_props: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<String>>>>,
     /// Class -> `class_enclosing_module` answer.
     class_enclosing_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
-    /// See `port_is_plain_class`.
+    /// See `type_is_plain_class`.
     plain_class_types: std::cell::RefCell<Option<HashSet<String>>>,
+    /// Reused `<name>.size` key buffer of the queue-frame save/restore.
+    queue_key_scratch: String,
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
@@ -9985,6 +9987,7 @@ impl Simulator {
             class_string_props: std::cell::RefCell::new(HashMap::default()),
             class_enclosing_cache: std::cell::RefCell::new(HashMap::default()),
             plain_class_types: std::cell::RefCell::new(None),
+            queue_key_scratch: String::new(),
             formal_parts_pool: Vec::new(),
             method_receiver_hint_ids: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
@@ -73864,13 +73867,19 @@ impl Simulator {
         // may report as 0 for a class with only methods/statics).
         // A 0 width is never valid for a variable.
         let w = if w0 == 0 { 32 } else { w0 };
+        // A built-in scalar or a plain class type: the packed-layout,
+        // struct, enum, typedef and type-parameter probes below all come
+        // back empty for it (a plain class resolves to itself).
+        let plain_class = self.type_is_plain_class(data_type);
+        let plain = plain_class || Self::type_is_plain_scalar(data_type);
         // §6.8/§6.18: resolve typedef aliases before deciding 2- vs
         // 4-state — `uvm_reg_data_t value_adjust;` (typedef of `bit
         // [63:0]`) must initialize to 0, not x (UVM's field
         // read-modify-write ORs into it, so an x seed poisoned the
-        // whole register write).
-        let two_state =
-            super::elaborate::is_type_two_state_resolved(data_type, &self.module.typedef_types);
+        // whole register write). A class handle defaults to null either
+        // way.
+        let two_state = !plain_class
+            && super::elaborate::is_type_two_state_resolved(data_type, &self.module.typedef_types);
         // LRM §8.4: an uninitialized class handle defaults to
         // `null`. Treat class-handle types and `chandle` as
         // two-state-zero so `if (h == null)` works without an
@@ -73878,7 +73887,7 @@ impl Simulator {
         // resolving the type name against `module.classes`.
         let is_class_handle = match data_type {
             crate::ast::types::DataType::TypeReference { .. } => {
-                self.type_ref_is_class_handle(data_type)
+                plain_class || self.type_ref_is_class_handle(data_type)
             }
             crate::ast::types::DataType::Simple {
                 kind: crate::ast::types::SimpleType::Chandle,
@@ -73936,23 +73945,29 @@ impl Simulator {
             // str` after a previous `string str[$]` isn't still treated
             // as a queue.
             {
-                let nm = d.name.name.clone();
+                let nm = d.name.name.as_str();
                 if !self.decl_shadow_log.is_empty() {
-                    self.note_decl_shadow(&nm, data_type);
+                    self.note_decl_shadow(nm, data_type);
                 }
                 // If this local shares its bare name with a caller-frame
                 // queue, preserve the caller's queue storage so it is
                 // restored when this subroutine returns (queue locals are
                 // global-by-bare-name; see `queue_frame_saves`).
-                self.snapshot_queue_local(&nm);
-                let nm = nm.as_str();
-                self.module.dynamic_arrays.remove(nm);
-                self.module.arrays.remove(nm);
-                self.module.descending_arrays.remove(nm);
+                let saved = self.save_queue_local(nm, true);
+                if !saved {
+                    self.module.dynamic_arrays.remove(nm);
+                    self.module.arrays.remove(nm);
+                    self.module.descending_arrays.remove(nm);
+                    self.module.queue_max_sizes.remove(nm);
+                }
                 self.module.associative_arrays.remove(nm);
-                self.module.queue_max_sizes.remove(nm);
                 self.module.packed_signal_elem_widths.remove(nm);
-                self.signals.remove(&format!("{}.size", nm));
+                let mut size_key = std::mem::take(&mut self.queue_key_scratch);
+                size_key.clear();
+                size_key.push_str(nm);
+                size_key.push_str(".size");
+                self.signals.remove(&size_key);
+                self.queue_key_scratch = size_key;
             }
             // Register a *packed*-struct local's field layout so member
             // access (`p.field`) aliases into the whole variable, as
@@ -73992,7 +74007,7 @@ impl Simulator {
             // long-standing AST bug behind self-checking TBs whose
             // reference functions silently agreed with equally-broken
             // DUT paths (pixel-conversion battery).
-            if d.dimensions.is_empty() {
+            if d.dimensions.is_empty() && !plain {
                 if let Some(ew) = self.ast_decl_elem_width(data_type) {
                     if ew > 0 && w > ew && w % ew == 0 {
                         self.module
@@ -74001,7 +74016,20 @@ impl Simulator {
                     }
                 }
             }
-            if d.dimensions.is_empty() {
+            if d.dimensions.is_empty() && plain {
+                // No element width (removed above) and no struct or enum
+                // layout; only a vector's own non-normalized range is kept.
+                match super::elaborate::packed_full_dims_of(data_type, &self.module.parameters) {
+                    Some(fdims) => {
+                        self.module
+                            .packed_full_dims
+                            .insert(d.name.name.clone(), fdims);
+                    }
+                    None => {
+                        self.module.packed_full_dims.remove(&d.name.name);
+                    }
+                }
+            } else if d.dimensions.is_empty() {
                 // Packed multi-D local (`logic [1:0][3:0] m;`): record
                 // the per-element width so `m[i]` is an element slice,
                 // not a bit-select — module-scope decls already do.
@@ -74111,46 +74139,46 @@ impl Simulator {
             // §6.18/§6.20.3: a typedef'd (or type-param-bound) local
             // carries its unpacked dims on the TYPE — `my_array_t a;`
             // declared inside a task elaborated as a scalar.
-            let typedef_dims: Vec<crate::ast::types::UnpackedDimension> = if d.dimensions.is_empty()
-            {
-                if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
-                    let tn = &name.name.name;
-                    let concrete = self
-                        .resolve_type_param_binding(tn)
-                        .unwrap_or_else(|| tn.clone());
-                    self.module
-                        .typedef_unpacked_dims
-                        .get(&concrete)
-                        .cloned()
-                        .or_else(|| {
-                            // CLASS-LOCAL typedef: an explicit
-                            // `C::t_t v;` scope, else the class
-                            // whose method is executing — a
-                            // `Ph::d_t dd;` local bound as a
-                            // scalar, so a later `ref` call saw
-                            // no collection to write back to.
-                            let start = name
-                                .scope
-                                .as_ref()
-                                .map(|s| s.name.clone())
-                                .or_else(|| self.class_context_stack.last().cloned().flatten())
-                                .or_else(|| {
-                                    self.this_stack.last().copied().flatten().and_then(|h| {
-                                        self.heap
-                                            .get(h)
-                                            .and_then(|x| x.as_ref())
-                                            .map(|i| i.class_name.clone())
-                                    })
-                                })?;
-                            Self::typedef_dims_via_tables(&self.module, &start, &concrete)
-                        })
-                        .unwrap_or_default()
+            let typedef_dims: Vec<crate::ast::types::UnpackedDimension> =
+                if d.dimensions.is_empty() && !plain_class {
+                    if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+                        let tn = &name.name.name;
+                        let concrete = self
+                            .resolve_type_param_binding(tn)
+                            .unwrap_or_else(|| tn.clone());
+                        self.module
+                            .typedef_unpacked_dims
+                            .get(&concrete)
+                            .cloned()
+                            .or_else(|| {
+                                // CLASS-LOCAL typedef: an explicit
+                                // `C::t_t v;` scope, else the class
+                                // whose method is executing — a
+                                // `Ph::d_t dd;` local bound as a
+                                // scalar, so a later `ref` call saw
+                                // no collection to write back to.
+                                let start = name
+                                    .scope
+                                    .as_ref()
+                                    .map(|s| s.name.clone())
+                                    .or_else(|| self.class_context_stack.last().cloned().flatten())
+                                    .or_else(|| {
+                                        self.this_stack.last().copied().flatten().and_then(|h| {
+                                            self.heap
+                                                .get(h)
+                                                .and_then(|x| x.as_ref())
+                                                .map(|i| i.class_name.clone())
+                                        })
+                                    })?;
+                                Self::typedef_dims_via_tables(&self.module, &start, &concrete)
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
                 } else {
                     Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
+                };
             let dims: &Vec<crate::ast::types::UnpackedDimension> = if typedef_dims.is_empty() {
                 &d.dimensions
             } else {
@@ -74647,7 +74675,13 @@ impl Simulator {
                     }
                 }
                 let class_name =
-                    if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+                    if let (true, crate::ast::types::DataType::TypeReference { name, .. }) =
+                        (plain_class, data_type)
+                    {
+                        Some(name.name.name.clone())
+                    } else if let crate::ast::types::DataType::TypeReference { name, .. } =
+                        data_type
+                    {
                         // §8.25: the declared type may be a TYPE
                         // PARAMETER of the enclosing parameterized class
                         // (e.g. `T obj = new(...)` inside
@@ -74869,7 +74903,7 @@ impl Simulator {
                 // back and its own writes vanished. Seeding also makes
                 // each call's local FRESH, as `automatic` requires.
                 let mut unpacked_struct_local = false;
-                if !self.local_stack.is_empty() && d.dimensions.is_empty() {
+                if !self.local_stack.is_empty() && d.dimensions.is_empty() && !plain {
                     if let crate::ast::types::DataType::Struct(su) = self.resolve_dt(data_type) {
                         if Self::spreads_member_wise(&su) {
                             unpacked_struct_local = true;
@@ -74925,7 +74959,7 @@ impl Simulator {
                     // signals, as module-scope structs do; a member write
                     // through a selected member (`t.rows[0].level = 2`) found
                     // no leaf to land on and vanished.
-                    if d.dimensions.is_empty() {
+                    if d.dimensions.is_empty() && !plain {
                         if let crate::ast::types::DataType::Struct(su) = self.resolve_dt(data_type)
                         {
                             if Self::spreads_member_wise(&su) {
@@ -74963,7 +74997,7 @@ impl Simulator {
                 // (needed for signed division/modulo, comparison, and
                 // `%0d` display). A fresh decl also clears a stale
                 // same-named signed flag from another frame.
-                if self.type_is_signed_concrete(data_type) {
+                if !plain_class && self.type_is_signed_concrete(data_type) {
                     self.signed_signals.insert(d.name.name.clone());
                 } else {
                     self.signed_signals.remove(&d.name.name);
@@ -75027,7 +75061,9 @@ impl Simulator {
                         // specialization with type_bindings populated
                         // (§8.25 — otherwise `T` stays unbound).
                         if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
-                            if let Some((_, Some(ta))) =
+                            if plain_class {
+                                // A plain class has no typedef to carry arguments.
+                            } else if let Some((_, Some(ta))) =
                                 self.resolve_typeref_class_with_type_args(name)
                             {
                                 self.var_type_args.insert(d.name.name.clone(), ta);
@@ -75063,13 +75099,12 @@ impl Simulator {
                 // the args are hidden in the typedef chain — resolve
                 // them so the new() populates type_bindings (§8.25).
                 // Clear a stale same-named entry when this decl has none.
-                let resolved_ta =
-                    if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
-                        self.resolve_typeref_class_with_type_args(name)
-                            .and_then(|(_, ta)| ta)
-                    } else {
-                        None
-                    };
+                let resolved_ta = match data_type {
+                    crate::ast::types::DataType::TypeReference { name, .. } if !plain_class => self
+                        .resolve_typeref_class_with_type_args(name)
+                        .and_then(|(_, ta)| ta),
+                    _ => None,
+                };
                 if let crate::ast::types::DataType::TypeReference { type_args, .. } = data_type {
                     if !type_args.is_empty() {
                         self.var_type_args
@@ -75099,8 +75134,11 @@ impl Simulator {
                 // LRM §6.19.6: track typedef-typed locals so
                 // `local.next()`/`.first()`/etc. find their
                 // enum-member list. We extract the bare type
-                // name from a TypeReference data_type.
-                if let crate::ast::types::DataType::TypeReference { name, .. } = data_type {
+                // name from a TypeReference data_type. (A plain class
+                // is neither, nor a type parameter.)
+                if let (false, crate::ast::types::DataType::TypeReference { name, .. }) =
+                    (plain_class, data_type)
+                {
                     let tn = name.name.name.clone();
                     // A local declared with a class TYPE PARAMETER
                     // (`T e;` in a parameterized class) isn't in the
@@ -93346,8 +93384,15 @@ impl Simulator {
     /// current subroutine returns. No-op outside a frame, or if this name was
     /// already snapshotted in this frame.
     fn snapshot_queue_local(&mut self, name: &str) {
+        self.save_queue_local(name, false);
+    }
+
+    /// `snapshot_queue_local`; with `take`, the `module.*` collection
+    /// registrations are moved out rather than copied (a declaration clears
+    /// them next). `true` when the save was made.
+    fn save_queue_local(&mut self, name: &str, take: bool) -> bool {
         if self.queue_frame_saves.is_empty() {
-            return;
+            return false;
         }
         if self
             .queue_frame_saves
@@ -93355,9 +93400,12 @@ impl Simulator {
             .map(|f| f.contains_key(name))
             .unwrap_or(true)
         {
-            return;
+            return false;
         }
-        let size_key = format!("{}.size", name);
+        let mut size_key = std::mem::take(&mut self.queue_key_scratch);
+        size_key.clear();
+        size_key.push_str(name);
+        size_key.push_str(".size");
         // Element keys come from the SignalMap index — no full-map scan.
         let mut signals: Vec<(String, Value)> = self
             .signals
@@ -93368,18 +93416,31 @@ impl Simulator {
         if let Some(v) = self.signals.get(&size_key) {
             signals.push((size_key.clone(), v.clone()));
         }
-        let save = QueueLocalSave {
-            signals,
-            arrays_entry: self.module.arrays.get(name).copied(),
-            was_dynamic: self.module.dynamic_arrays.contains(name),
-            was_descending: self.module.descending_arrays.contains(name),
-            queue_max: self.module.queue_max_sizes.get(name).copied(),
-            width: self.widths.get(name).copied(),
+        self.queue_key_scratch = size_key;
+        let save = if take {
+            QueueLocalSave {
+                signals,
+                arrays_entry: self.module.arrays.remove(name),
+                was_dynamic: self.module.dynamic_arrays.remove(name),
+                was_descending: self.module.descending_arrays.remove(name),
+                queue_max: self.module.queue_max_sizes.remove(name),
+                width: self.widths.get(name).copied(),
+            }
+        } else {
+            QueueLocalSave {
+                signals,
+                arrays_entry: self.module.arrays.get(name).copied(),
+                was_dynamic: self.module.dynamic_arrays.contains(name),
+                was_descending: self.module.descending_arrays.contains(name),
+                queue_max: self.module.queue_max_sizes.get(name).copied(),
+                width: self.widths.get(name).copied(),
+            }
         };
         self.queue_frame_saves
             .last_mut()
             .unwrap()
             .insert(name.to_string(), save);
+        true
     }
 
     /// Pop the top queue-local save frame and restore every snapshotted name:
@@ -93393,12 +93454,13 @@ impl Simulator {
             // there was no save frame there is no dyn frame either.
             return;
         };
-        // Drain into a Vec first so the borrows in the restore loop are the
-        // only outstanding `&mut self` access (no aliasing with the HashMap
-        // we are popping).
-        let entries: Vec<(String, QueueLocalSave)> = frame.into_iter().collect();
-        for (name, save) in entries {
-            let size_key = format!("{}.size", name);
+        // The popped frame is owned, so iterating it holds no borrow of
+        // `self`.
+        let mut size_key = std::mem::take(&mut self.queue_key_scratch);
+        for (name, save) in frame {
+            size_key.clear();
+            size_key.push_str(&name);
+            size_key.push_str(".size");
             for k in self.signals.elem_keys(&name) {
                 self.signals.remove(&k);
             }
@@ -93454,6 +93516,7 @@ impl Simulator {
                 }
             }
         }
+        self.queue_key_scratch = size_key;
         // Drop this invocation's process-unique local dyn-array storage so
         // it doesn't leak across the whole simulation (each invocation got
         // its own `@name#id` keys).
@@ -113162,21 +113225,42 @@ impl Simulator {
             )
     }
 
-    /// A formal of a plain CLASS type: a class name that no typedef (module
-    /// or class-local), enum or class parameter shares, without packed or
+    /// A declared type with no packed-array, struct, enum or typedef layout
+    /// to register: an integral atom, a vector with at most one packed
+    /// dimension, `real`/`shortreal`/`realtime` or `string`.
+    fn type_is_plain_scalar(dt: &DataType) -> bool {
+        match dt {
+            DataType::IntegerAtom { .. } | DataType::Real { .. } => true,
+            DataType::IntegerVector { dimensions, .. } => dimensions.len() <= 1,
+            DataType::Simple { kind, .. } => {
+                matches!(kind, crate::ast::types::SimpleType::String)
+            }
+            _ => false,
+        }
+    }
+
+    /// A formal of a plain class type (see `type_is_plain_class`) with no
     /// unpacked dimensions. The collection, struct and array binders, the
     /// integral width fitting and the vif probes all come back empty for
-    /// it, so it binds exactly like a scalar. The name set is built from the
-    /// class and typedef tables and dropped when a procedural `typedef` or an
-    /// inline-enum local adds to them.
+    /// it, so it binds exactly like a scalar.
     fn port_is_plain_class(&self, port: &crate::ast::decl::FunctionPort) -> bool {
+        port.dimensions.is_empty() && self.type_is_plain_class(&port.data_type)
+    }
+
+    /// An unscoped, dimension-free reference to a plain CLASS: a class name
+    /// that no typedef (module or class-local), enum or class parameter
+    /// shares, so every typedef, type-parameter and layout lookup on it
+    /// misses and it resolves to the class itself. The name set is built
+    /// from the class and typedef tables and loses a name when a procedural
+    /// `typedef` or an inline-enum local adds it to them.
+    fn type_is_plain_class(&self, dt: &DataType) -> bool {
         let DataType::TypeReference {
             name, dimensions, ..
-        } = &port.data_type
+        } = dt
         else {
             return false;
         };
-        if !port.dimensions.is_empty() || !dimensions.is_empty() {
+        if !dimensions.is_empty() || name.scope.is_some() {
             return false;
         }
         let mut cell = self.plain_class_types.borrow_mut();
@@ -113198,6 +113282,7 @@ impl Simulator {
                         && !self.module.typedef_types.contains_key(n)
                         && !self.module.typedefs.contains_key(n)
                         && !self.module.typedef_unpacked_dims.contains_key(n)
+                        && !self.module.typedef_elem_widths.contains_key(n)
                         && !self.module.enum_members.contains_key(n)
                 })
                 .cloned()
