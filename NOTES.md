@@ -9,6 +9,38 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* Functional coverage: covergroups work in instantiated modules,
+  interfaces, packages, file scope, multi-top designs and classes declared
+  in modules (each module instance gets its own covergroup, named `u0.cg`
+  in `xezim_cov.json`). Cross bodies support `binsof`, `intersect`, `!`,
+  `&&`, `||`, `with` and cross `ignore_bins`/`illegal_bins`; `bins x[N]`,
+  transition sets, lists and repetitions work; `option.at_least` applies to
+  automatic and cross bins; `@(clk iff en)` and named-event sampling work;
+  `cg_type::get_coverage()`, `(covered, total)`, `start()`/`stop()` and
+  `cg.option.<name>` reads are supported; `illegal_bins` hits are errors
+  (counted by `--error-exit`); unlabeled coverpoints are named after their
+  variable; `cover sequence` counts every match; and assertion entries in
+  `xezim_cov.json` carry `file` and `line`. Coverage numbers match the
+  reference simulator. See docs/coverage-guide.md.
+* UVM examples that hung now finish: a clock generator on an interface
+  member (`BUS.clk`) toggles its own signal; a non-root module drives
+  members of its own interface array (`assign INT[0].irq = ...`); class
+  handles in child instances start as null; `semaphore s = new(N)` as a
+  class member gets N keys; `new` through a typedef of a parameterized
+  class builds that specialization (UVM transaction event pools);
+  a redeclared base-class property keeps its own initializer; fixed-size
+  arrays declared in class methods are separate per call; a class
+  property takes precedence over a same-named module signal; and
+  `randomize() with {}` constraints on members of nested rand objects
+  (register-model fields) are solved.
+* sv-tests: 98.9% pass (from 97.6%). Strict checks reject malformed UDP
+  table rows, duplicate non-ANSI subroutine port declarations, constructor
+  body port declarations, end labels on unnamed blocks, `#([7:0] A)` without
+  `parameter`, `for (var [7:0] i ...)`, `void'` of a non-call, mixed
+  positional and named connections, inout port defaults, generate loops
+  without a genvar, self and generate-local `defparam` targets, and more;
+  non-ANSI port expressions (`.b(a[2:1])`, `{a, b}`) are supported, and a
+  ranged non-ANSI subroutine port redeclared as a `reg` is one port.
 * `obj.randomize() with {...}` binds names in the object first and then in
   the calling scope (§18.7): caller locals, inherited members, array and
   queue elements, handle members and `local::` names now work, and a
@@ -385,6 +417,16 @@ and the development workflow are in [README.md](README.md).
   line.
 
 **Performance** (instruction counts, output identical)
+
+* UVM class code, round two: formal snapshots by position, plain-type
+  fast paths for locals and formals, per-class property-owner indexes,
+  forward-declared classes (`typedef class X;`, 110 in UVM) on the plain
+  paths, and name-set gates in member and call lookup. UVM stress bench:
+  11.5 M -> 10.1 M host instructions per item (-12%); axi4 AVIP -6.2%.
+* c906 CoreMark -0.4% (elaboration -2.4 G): loop-feedback analysis only
+  walks reads when a write reaches a combinational block, waiter wake
+  ranks are tracked only once a nonzero rank fires, and the legality
+  checker hashes scopes faster and builds messages lazily.
 
 * UVM class code: name-kind checks answer from per-design name tables and
   per-class memos, bare names read and write on direct paths, class task
