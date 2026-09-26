@@ -283,9 +283,9 @@ only once), `cp_y` 100.00, and `opt_cg` (50 + 3 x 100) / 4 = 87.50.
 | Option | Where | Effect |
 |---|---|---|
 | `option.at_least = N` | covergroup, coverpoint or cross | A bin (explicit, automatic or cross) counts as covered once it has N hits (default 1). A coverpoint's or cross's setting overrides the group's |
-| `option.weight = N` | coverpoint | Weight of the coverpoint in its covergroup's average (default 1) |
+| `option.weight = N` | coverpoint or cross | Weight of the coverpoint or cross in its covergroup's average (default 1) |
 | `option.auto_bin_max = N` | covergroup or coverpoint | Maximum number of automatic bins (default 64) |
-| `type_option.merge_instances = 1` | covergroup, or `cg_type::type_option.merge_instances = 1;` at run time | `get_coverage()` counts a bin as covered when any instance hit it. Default 0: the average of the instances' coverages |
+| `type_option.merge_instances = 1` | covergroup, or `cg_type::type_option.merge_instances = 1;` at run time | `get_coverage()` adds up the instances' hits: a bin is covered once their total reaches `at_least`, and `get_inst_coverage()` returns the same number. Default 0: the average of the instances' coverages |
 | `type_option.weight = N` | covergroup, or `cg_type::type_option.weight = N;` | Weight of the covergroup type in `$get_coverage()` (default 1) |
 
 Every `new()` creates a separate instance with its own hits. `get_inst_coverage()`
@@ -465,7 +465,7 @@ All return a `real` percentage from 0.0 to 100.0; print it with `%f`, for exampl
 | Call | Returns |
 |---|---|
 | `cg.get_inst_coverage()` | Coverage of the instance `cg` |
-| `cg.get_coverage()` | Coverage of the covergroup type: the average over its instances, or a union of their hits with `type_option.merge_instances = 1` |
+| `cg.get_coverage()` | Coverage of the covergroup type: the average over its instances, or of their hits added up with `type_option.merge_instances = 1` |
 | `cg.<cp>.get_inst_coverage()`, `cg.<cp>.get_coverage()` | The same for one coverpoint or cross `<cp>` |
 | `cg_type::get_coverage()`, `cg_type::<cp>::get_coverage()` | The same as `get_coverage()` on an instance of type `cg_type` |
 | `$get_coverage()` | The average over every covergroup type, weighted by `type_option.weight` |
@@ -475,9 +475,9 @@ All return a `real` percentage from 0.0 to 100.0; print it with `%f`, for exampl
 Each coverage query also takes two `int` output arguments,
 `get_inst_coverage(covered, total)`: they receive the number of covered bins and the
 total number of bins, summed over the coverpoints and crosses for a covergroup.
-`get_coverage` sums them over the instances, or counts the union of their hits with
-`type_option.merge_instances = 1`. With `merge_instances`, `get_inst_coverage()`
-returns the type's coverage too.
+`get_coverage` sums them over the instances, or counts the bins of their added-up
+hits with `type_option.merge_instances = 1`. With `merge_instances`,
+`get_inst_coverage()` returns the type's numbers too.
 
 ### Several runs
 
