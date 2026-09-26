@@ -1471,8 +1471,9 @@ impl Simulator {
             .copied()
     }
 
-    /// Count counter `c` (`Insn::CovHit` / `TsInsn::CovHit`).
-    #[inline]
+    /// Count counter `c` (`Insn::CovHit`). Out of line, so the executors'
+    /// hot loops compile as they do without code coverage.
+    #[inline(never)]
     pub(super) fn cov_count(&mut self, c: u32) {
         if let Some(h) = self.code_cov_hits.get_mut(c as usize) {
             *h += 1;
@@ -1481,7 +1482,7 @@ impl Simulator {
 
     /// `TsInsn::CovHit`: count, and note the count on the save list so a
     /// bail takes it back (`ts_restore_saved`) before the block runs again.
-    #[inline]
+    #[inline(never)]
     pub(super) fn ts_cov_hit(&mut self, c: u32) {
         self.cov_count(c);
         self.ts_save_list.push((c | TS_SAVE_COV, 0, 0));
