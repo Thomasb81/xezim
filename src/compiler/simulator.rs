@@ -2765,6 +2765,9 @@ struct ClassMemberNames {
     tasks: HashSet<String>,
     /// Every property declared as a packed vector (`bit [3:0][7:0] p`).
     packed_vec_props: HashSet<String>,
+    /// Every method name some class declares as a function returning
+    /// `string`.
+    string_methods: HashSet<String>,
     static_methods: HashSet<String>,
     /// Every function/task key and each of its suffixes after a `.`.
     subroutine_suffixes: HashSet<String>,
@@ -81036,14 +81039,14 @@ impl Simulator {
                 }
             }
         }
-        // Only a name some class declares as a method can be found by the
-        // class walk below.
+        // The class walk below answers true only for a name some class
+        // declares as a string-returning function.
         let callee = match &func.kind {
             ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
             ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
             _ => None,
         };
-        if !callee.is_some_and(|m| self.class_member_names().methods.contains(m)) {
+        if !callee.is_some_and(|m| self.class_member_names().string_methods.contains(m)) {
             return false;
         }
         // Extract (class_name, method_name).
@@ -130675,7 +130678,18 @@ impl Simulator {
             let mut assoc_props: HashSet<String> = HashSet::default();
             let mut string_props: HashSet<String> = HashSet::default();
             let mut static_or_param: HashSet<String> = HashSet::default();
+            let mut string_methods: HashSet<String> = HashSet::default();
             for cd in self.module.classes.values() {
+                for (name, cm) in &cd.methods {
+                    if let crate::ast::decl::ClassMethodKind::Function(fd)
+                    | crate::ast::decl::ClassMethodKind::Extern(fd)
+                    | crate::ast::decl::ClassMethodKind::PureVirtual(fd) = &cm.kind
+                    {
+                        if Self::is_string_data_type(&fd.return_type) {
+                            string_methods.insert(name.clone());
+                        }
+                    }
+                }
                 string_props.extend(cd.string_properties.iter().cloned());
                 statics.extend(cd.static_properties.iter().cloned());
                 vif_props.extend(cd.virtual_iface_properties.keys().cloned());
@@ -130726,6 +130740,7 @@ impl Simulator {
                 methods,
                 tasks,
                 packed_vec_props,
+                string_methods,
                 static_methods,
                 subroutine_suffixes,
                 params,
