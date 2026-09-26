@@ -64549,15 +64549,15 @@ impl Simulator {
                     } = &arg.kind
                     {
                         let bn = self.expr_type_leaf_name(base);
-                        return Value::from_string(&format!(
-                            "class {} #({})",
-                            bn,
-                            self.format_typename_args_text(type_args_text)
-                        ));
+                        let parts = self.typename_args_text_parts(type_args_text);
+                        return Value::from_string(&self.class_typename_with_args(&bn, parts));
                     }
                     // A class-typed variable: "class <name> #(<args>)".
                     if let Some((base, ta)) = self.class_declared_type_of(arg) {
                         return Value::from_string(&self.format_class_typename(&base, &ta));
+                    }
+                    if let Some(t) = self.class_operand_typename(arg) {
+                        return Value::from_string(&t);
                     }
                     // §8.25: a bare TYPE PARAMETER of the active
                     // specialization (`$typename(T)` inside
@@ -64587,6 +64587,17 @@ impl Simulator {
                     if let ExprKind::Ident(hier_td) = &arg.kind {
                         if hier_td.path.len() == 1 && hier_td.path[0].selects.is_empty() {
                             let tdn = &hier_td.path[0].name.name;
+                            // A typedef naming a class (or a specialization).
+                            if let Some((b, sig)) = self.resolve_typedef_spec(tdn) {
+                                return Value::from_string(
+                                    &self.class_spec_typename(&b, Some(&sig)),
+                                );
+                            }
+                            if let Some(c) =
+                                self.resolve_simple_typedef_class(tdn).filter(|c| c != tdn)
+                            {
+                                return Value::from_string(&self.class_spec_typename(&c, None));
+                            }
                             if self.module.typedef_types.contains_key(tdn)
                                 || self.lookup_typedef_target(tdn).is_some()
                             {
@@ -131339,14 +131350,100 @@ impl Simulator {
     /// argument renders as `class <name>` (recursive) and a value argument
     /// as its literal.
     fn format_class_typename(&mut self, base: &str, type_args: &[Expression]) -> String {
-        if type_args.is_empty() {
-            return format!("class {}", base);
-        }
         let parts: Vec<String> = type_args
             .iter()
             .map(|a| self.format_typename_arg(a))
             .collect();
-        format!("class {} #({})", base, parts.join(", "))
+        self.class_typename_with_args(base, parts)
+    }
+
+    /// `class <name> #(<args>)` from the rendered leading arguments: the
+    /// reference simulator lists every parameter, so the ones left out take
+    /// their declared defaults.
+    fn class_typename_with_args(&self, base: &str, mut parts: Vec<String>) -> String {
+        let head = self.class_typename_head(base);
+        if let Some(cd) = self.module.classes.get(base) {
+            for name in cd.param_order.iter().skip(parts.len()) {
+                if let Some((_, t)) = cd.type_param_defaults.iter().find(|(n, _)| n == name) {
+                    let t: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+                    parts.push(self.format_typename_text_one(&t));
+                } else if cd.type_param_names.contains(name) {
+                    parts.push("int".to_string());
+                } else if let Some(v) = cd
+                    .param_defaults
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .and_then(|(_, e)| e.as_ref())
+                    .and_then(|e| super::elaborate::const_eval_i64_with_params(e, None))
+                {
+                    parts.push(v.to_string());
+                } else {
+                    break;
+                }
+            }
+        }
+        if parts.is_empty() {
+            return head;
+        }
+        format!("{} #({})", head, parts.join(", "))
+    }
+
+    /// `class <name>` for `$typename`, qualified by the declaring package
+    /// (`class p::C`) as the reference simulator prints it.
+    fn class_typename_head(&self, base: &str) -> String {
+        match self.module.class_decl_pkg.get(base) {
+            Some(pkg) => format!("class {}::{}", pkg, base),
+            None => format!("class {}", base),
+        }
+    }
+
+    /// `class_typename_with_args` from a specialization's raw `#(...)` text.
+    fn class_spec_typename(&self, base: &str, sig: Option<&str>) -> String {
+        let parts = sig
+            .map(|s| self.typename_args_text_parts(s))
+            .unwrap_or_default();
+        self.class_typename_with_args(base, parts)
+    }
+
+    /// §20.6.1 `$typename` of a class-typed operand: `this` names the class
+    /// declaring the running method (with the object's specialization), any
+    /// other operand its declared class type. None when the operand is not
+    /// class-typed.
+    fn class_operand_typename(&mut self, arg: &Expression) -> Option<String> {
+        if matches!(arg.kind, ExprKind::This) {
+            let cls = self.class_context_stack.last().cloned().flatten()?;
+            let sig = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h))
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.spec.clone())
+                .filter(|(b, _)| *b == cls)
+                .map(|(_, s)| s);
+            return Some(self.class_spec_typename(&cls, sig.as_deref()));
+        }
+        let tn = self.get_expr_type_name(arg)?;
+        let tn = self.resolve_type_param_binding(&tn).unwrap_or(tn);
+        if let Some((b, sig)) = self
+            .extract_spec_from_string(&tn)
+            .or_else(|| self.resolve_typedef_spec(&tn))
+        {
+            return Some(self.class_spec_typename(&b, Some(&sig)));
+        }
+        let cls = if self.module.classes.contains_key(&tn) {
+            tn
+        } else {
+            self.resolve_simple_typedef_class(&tn)?
+        };
+        if let ExprKind::Ident(h) = &arg.kind {
+            let n = self.resolve_hier_name(h).into_owned();
+            if let Some(ta) = self.module.class_type_args.get(&n).cloned() {
+                return Some(self.format_class_typename(&cls, &ta));
+            }
+        }
+        Some(self.class_spec_typename(&cls, None))
     }
 
     /// Format a single specialization argument (a type or a value).
@@ -131357,23 +131454,36 @@ impl Simulator {
                 type_args_text,
             } => {
                 let bn = self.expr_type_leaf_name(base);
-                format!(
-                    "class {} #({})",
-                    bn,
-                    self.format_typename_args_text(type_args_text)
-                )
+                let parts = self.typename_args_text_parts(type_args_text);
+                self.class_typename_with_args(&bn, parts)
             }
             ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
                 let n = &hier.path[0].name.name;
-                if self.module.classes.contains_key(n)
-                    || self.module.covergroups.contains_key(n.as_str())
-                {
+                if self.module.classes.contains_key(n) {
+                    self.class_typename_head(n)
+                } else if self.module.covergroups.contains_key(n.as_str()) {
                     format!("class {}", n)
                 } else {
                     n.clone()
                 }
             }
             ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.clone(),
+            // A package-qualified class (`p::C`).
+            ExprKind::Ident(hier)
+                if hier.path.len() >= 2
+                    && hier.path.iter().all(|s| s.selects.is_empty())
+                    && self
+                        .module
+                        .classes
+                        .contains_key(&hier.path.last().unwrap().name.name) =>
+            {
+                self.class_typename_head(&hier.path.last().unwrap().name.name)
+            }
+            ExprKind::MemberAccess { member, .. }
+                if self.module.classes.contains_key(&member.name) =>
+            {
+                self.class_typename_head(&member.name)
+            }
             _ => {
                 let v = self.eval_expr(arg);
                 match v.to_u64() {
@@ -131386,10 +131496,10 @@ impl Simulator {
 
     /// Recursively format the raw `#(...)` text of a `Specialization` node
     /// (space-joined source tokens) into typename arguments.
-    fn format_typename_args_text(&self, text: &str) -> String {
+    fn typename_args_text_parts(&self, text: &str) -> Vec<String> {
         let norm: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         if norm.is_empty() {
-            return String::new();
+            return Vec::new();
         }
         // Split on top-level commas (respecting ()/[] nesting).
         let mut parts = Vec::new();
@@ -131415,8 +131525,7 @@ impl Simulator {
         parts
             .iter()
             .map(|p| self.format_typename_text_one(p))
-            .collect::<Vec<_>>()
-            .join(", ")
+            .collect()
     }
 
     /// Format one raw-text type argument (after whitespace removal).
@@ -131425,14 +131534,14 @@ impl Simulator {
             let base = &s[..pos];
             if s.ends_with(')') {
                 let inner = &s[pos + 2..s.len() - 1];
-                return format!(
-                    "class {} #({})",
-                    base,
-                    self.format_typename_args_text(inner)
-                );
+                let base = base.rsplit("::").next().unwrap_or(base);
+                return self.class_typename_with_args(base, self.typename_args_text_parts(inner));
             }
         }
-        if self.module.classes.contains_key(s) || self.module.covergroups.contains_key(s) {
+        let leaf = s.rsplit("::").next().unwrap_or(s);
+        if self.module.classes.contains_key(leaf) {
+            self.class_typename_head(leaf)
+        } else if self.module.covergroups.contains_key(s) {
             format!("class {}", s)
         } else {
             s.to_string()

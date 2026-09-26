@@ -314,6 +314,8 @@ mod null_deref_fatal;
 mod shadowed_property_initializers;
 #[path = "classes/typedef_param_class_construction.rs"]
 mod typedef_param_class_construction;
+#[path = "classes/typename_class_operands.rs"]
+mod typename_class_operands;
 
 #[path = "classes/ctor_dispatch_and_p_format.rs"]
 mod ctor_dispatch_and_p_format;
