@@ -70933,6 +70933,27 @@ impl Simulator {
         !struct_decl && self.struct_copy_target(dst).1.is_none()
     }
 
+    /// Does `flat_member_name(e)` evaluate nothing but plain reads? Its only
+    /// evaluations are the indices of an `Index` chain (a selected
+    /// identifier yields no name); a literal or a name the plain read path
+    /// answers is one.
+    fn flat_name_pure(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::MemberAccess { expr, .. } => {
+                matches!(expr.kind, ExprKind::This) || self.flat_name_pure(expr)
+            }
+            ExprKind::Index { expr, index } => {
+                self.flat_name_pure(expr)
+                    && match &index.kind {
+                        ExprKind::Number(_) => true,
+                        ExprKind::Ident(ih) => self.plain_ident_read(ih).is_some(),
+                        _ => false,
+                    }
+            }
+            _ => true,
+        }
+    }
+
     /// The member-wise struct type of whole-value copy target `dst`, with the
     /// name it was found under: `dst` itself or, when `dst` has no declared
     /// type, `dst` under the resolution hint.
@@ -71576,19 +71597,21 @@ impl Simulator {
         // value path cannot carry variable-size members, so `b.d[]`
         // arrived empty. Copy member-wise (the copier now clones
         // dynamic members element-by-element).
-        if let (Some(dst), Some(src)) =
-            (self.flat_member_name(lvalue), self.flat_member_name(rvalue))
-        {
+        // A flattened name whose computation evaluates nothing impure is
+        // the same at every probe below: compute it once.
+        let l_pure = self.flat_name_pure(lvalue);
+        let r_pure = self.flat_name_pure(rvalue);
+        let mut lflat = self.flat_member_name(lvalue);
+        let rflat = self.flat_member_name(rvalue);
+        if let (Some(dst), Some(src)) = (&lflat, &rflat) {
             if dst != src {
                 let su_opt =
-                    self.module
-                        .var_decl_types
-                        .get(&dst)
-                        .cloned()
-                        .and_then(|dt| match self.resolve_dt(&dt) {
+                    self.module.var_decl_types.get(dst).cloned().and_then(|dt| {
+                        match self.resolve_dt(&dt) {
                             DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
                             _ => None,
-                        });
+                        }
+                    });
                 if let Some(su) = su_opt {
                     let has_dyn = su.members.iter().any(|m| {
                         m.declarators.iter().any(|d| {
@@ -71602,25 +71625,28 @@ impl Simulator {
                             })
                         })
                     });
-                    if has_dyn && self.struct_storage_exists(&src, &su) {
-                        self.copy_unpacked_struct(&dst, &src, &su);
+                    if has_dyn && self.struct_storage_exists(src, &su) {
+                        self.copy_unpacked_struct(dst, src, &su);
                         self.settle_after_proc_write();
                         return;
                     }
                 }
             }
         }
+        if !l_pure {
+            lflat = self.flat_member_name(lvalue);
+        }
         // `s = q.pop_front()` on a queue of unpacked structs: the popped
         // element's members must reach `s` before the queue shifts — a
         // packed return value cannot carry them.
-        if let Some(dst) = self.flat_member_name(lvalue) {
+        if let Some(dst) = &lflat {
             if let Some((obj, pop)) = self.queue_pop_call(rvalue) {
                 if let Some(su) = self.queue_elem_struct(&obj) {
                     let sz = self.get_queue_size(&obj);
                     if sz > 0 {
                         let idx = if pop == "pop_front" { 0 } else { sz - 1 };
                         let src = format!("{}[{}]", obj, idx);
-                        self.copy_unpacked_struct(&dst, &src, &su);
+                        self.copy_unpacked_struct(dst, &src, &su);
                     }
                     self.eval_builtin_method(&obj, &pop, &[]);
                     self.settle_after_proc_write();
@@ -71681,7 +71707,10 @@ impl Simulator {
             }
         }
         if self.queue_pop_call(rvalue).is_none() {
-            if let Some(dst) = self.flat_member_name(lvalue) {
+            if !l_pure {
+                lflat = self.flat_member_name(lvalue);
+            }
+            if let Some(dst) = &lflat {
                 // Only a BARE element lvalue (`slices[i] = ...`) — a
                 // member path (`arr[0].meta.f = v`) must fall through
                 // to the leaf/aggregate arms, else a scalar write was
@@ -71692,7 +71721,12 @@ impl Simulator {
                         let cont_s = self.resolve_locator_storage(&cont);
                         if let Some(su) = self.queue_elem_struct(&cont_s) {
                             let dst_s = format!("{}{}", cont_s, &dst[cut..]);
-                            if let Some(src) = self.flat_member_name(rvalue) {
+                            let src = if r_pure {
+                                rflat.clone()
+                            } else {
+                                self.flat_member_name(rvalue)
+                            };
+                            if let Some(src) = src {
                                 if self.struct_storage_exists(&src, &su) {
                                     self.copy_unpacked_struct(&dst_s, &src, &su);
                                     self.settle_after_proc_write();
@@ -71720,7 +71754,10 @@ impl Simulator {
         // container nobody ever reads — `y = x` left every member of `y`
         // at X. Covers struct variables, array/queue elements and
         // struct members, in any combination.
-        if let Some(dst) = self.flat_member_name(lvalue) {
+        if !l_pure {
+            lflat = self.flat_member_name(lvalue);
+        }
+        if let Some(dst) = lflat {
             // §7.2/§23.10: inside an INLINED child's process the lvalue
             // may still carry the child's own spelling — a reference
             // through a nested instance (`li.us2` in a non-top holder)
@@ -71731,7 +71768,12 @@ impl Simulator {
             // identical code at top level worked.
             let (dst, spread_su) = self.struct_copy_target(dst);
             if let Some(su) = spread_su {
-                if let Some(src) = self.flat_member_name(rvalue) {
+                let src = if r_pure {
+                    rflat
+                } else {
+                    self.flat_member_name(rvalue)
+                };
+                if let Some(src) = src {
                     if src != dst && self.struct_storage_exists(&src, &su) {
                         self.copy_unpacked_struct(&dst, &src, &su.clone());
                         self.settle_after_proc_write();
