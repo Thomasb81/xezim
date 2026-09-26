@@ -2635,44 +2635,87 @@ impl TimingWheel {
     }
 }
 
-/// Bumped by every mutation of the STRING-KEYED stores a parked `wait(cond)`
-/// can depend on: class properties (`PropMap`), the runtime signal map
-/// (`SignalMap`), and every procedural / name-based NBA assignment. The
-/// id-based RTL signal table is deliberately NOT counted: a clock toggle must
-/// not re-arm the UVM housekeeping waits (see `drain_condition_waiters`).
-static STORE_WRITE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Names written since the condition-waiter drain last looked, as a 64-bit
+/// filter over `name_bit`. Set by every mutation of the STRING-KEYED stores a
+/// parked `wait(cond)` can depend on: class properties (`PropMap`), class
+/// statics (`StaticMap`), the runtime signal map (`SignalMap`), and every
+/// procedural / name-based NBA assignment. A write that does not name its
+/// target sets every bit. The id-based RTL signal table is deliberately NOT
+/// counted: a clock toggle must not re-arm the UVM housekeeping waits (see
+/// `drain_condition_waiters`).
+static STORE_WRITE_MASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The `STORE_WRITE_MASK` bits of a property / variable name: two bits of
+/// an FNV-1a hash, so two short names rarely share both.
 #[inline]
-fn bump_store_gen() {
-    STORE_WRITE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+fn name_bit(n: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in n.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63))
 }
 
 #[inline]
-fn store_gen() -> u64 {
-    STORE_WRITE_GEN.load(std::sync::atomic::Ordering::Relaxed)
+fn note_store_write(bits: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if STORE_WRITE_MASK.load(Relaxed) & bits != bits {
+        STORE_WRITE_MASK.fetch_or(bits, Relaxed);
+    }
+}
+
+/// A write to the string-keyed stores that does not name its target.
+#[inline]
+fn bump_store_gen() {
+    note_store_write(u64::MAX);
+}
+
+/// The names written since the last call.
+fn take_store_writes() -> u64 {
+    STORE_WRITE_MASK.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A class object's property map. Reads deref to the plain map; every
-/// mutating entry point bumps `STORE_WRITE_GEN`, so no write site can be
-/// missed by the condition-waiter gate.
+/// mutating entry point notes the property name in `STORE_WRITE_MASK`, so no
+/// write site can be missed by the condition-waiter gate.
 #[derive(Debug, Clone, Default)]
 struct PropMap(HashMap<String, Value>);
 
 impl PropMap {
     #[inline]
     fn insert(&mut self, k: String, v: Value) -> Option<Value> {
-        bump_store_gen();
+        note_store_write(name_bit(&k));
         self.0.insert(k, v)
     }
     #[inline]
     fn get_mut(&mut self, k: &str) -> Option<&mut Value> {
-        bump_store_gen();
+        note_store_write(name_bit(k));
         self.0.get_mut(k)
     }
     #[inline]
     fn remove(&mut self, k: &str) -> Option<Value> {
-        bump_store_gen();
+        note_store_write(name_bit(k));
         self.0.remove(k)
+    }
+}
+
+/// Class static properties (`Class::prop` keys), noted like `PropMap`.
+#[derive(Debug, Clone, Default)]
+struct StaticMap(HashMap<String, Value>);
+
+impl StaticMap {
+    #[inline]
+    fn insert(&mut self, k: String, v: Value) -> Option<Value> {
+        note_store_write(name_bit(k.rsplit("::").next().unwrap_or(&k)));
+        self.0.insert(k, v)
+    }
+}
+
+impl std::ops::Deref for StaticMap {
+    type Target = HashMap<String, Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -5082,7 +5125,7 @@ pub struct Simulator {
     /// Static class properties — one shared cell per `Class::prop`,
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
-    class_statics: HashMap<String, Value>,
+    class_statics: StaticMap,
     /// Per-frame overlay for class/typedef types of frame-locals. The
     /// global var_class_types/var_typedef_types are keyed by BARE name and
     /// shared across every process, so a class-typed local declared in one
@@ -6010,13 +6053,14 @@ pub struct Simulator {
     cond_waiter_reads: HashMap<usize, HashSet<String>>,
     /// Wait condition expression for each parked waiter.
     cond_waiter_conditions: HashMap<usize, Expression>,
-    /// Per parked condition waiter: `Some(gen)` when every name its
-    /// condition reads is a property or static of its own object (or a
-    /// collection builtin), with the store generation at park time. Such a
-    /// waiter is skipped by the bulk re-schedule while the generation is
-    /// unchanged — nothing it can observe has been written. `None` keeps the
-    /// unconditional re-schedule (RTL signals, locals, calls, no `this`).
-    cond_waiter_gate: HashMap<usize, Option<u64>>,
+    /// Per parked condition waiter: `Some(bits)` when everything its
+    /// condition reads lives in the string-keyed stores (see
+    /// `cond_gate_for`), with the `name_bit`s of each name it reads. Such a
+    /// waiter is skipped by the bulk re-schedule until a write notes all the
+    /// bits of one of those names — nothing it can observe has changed; a
+    /// constant condition (`wait(0)`) reads no name and is never re-checked.
+    /// `None` keeps the unconditional re-schedule (RTL signals, calls).
+    cond_waiter_gate: HashMap<usize, Option<Box<[u64]>>>,
     /// IEEE 1800-2017 §4.4.2.3 Inactive region: continuations of `#0`
     /// delays park here instead of in the event_queue. The event_queue's
     /// batch drain in `run_one_tick` re-fetches same-time entries into the
@@ -9744,7 +9788,7 @@ impl Simulator {
             locator_iter: "item".to_string(),
             dist_picked_once: HashSet::default(),
             rand_ranges: HashMap::default(),
-            class_statics: HashMap::default(),
+            class_statics: StaticMap::default(),
             local_type_stack: Vec::new(),
             current_spec: None,
             spec_scope_stack: Vec::new(),
@@ -40466,7 +40510,7 @@ impl Simulator {
     fn park_condition_waiter(&mut self, pid: usize, cont: ProcCont, cond: &Expression) {
         let mut reads = HashSet::default();
         Self::collect_condition_read_names(cond, &mut reads);
-        let gate = self.cond_gate_for(&reads);
+        let gate = self.cond_gate_for(cond, &reads);
         self.cond_waiter_gate.insert(pid, gate);
         self.cond_waiter_reads.insert(pid, reads);
         self.cond_read_union_dirty = true;
@@ -40474,43 +40518,150 @@ impl Simulator {
         self.condition_waiters.push((pid, cont));
     }
 
-    /// Can the bulk re-schedule skip this waiter while nothing in the
-    /// string-keyed stores changed? Only when every read name is a property
-    /// (or static) of the parking process's `this` object or a collection
-    /// builtin: those live in `PropMap` / `SignalMap`, whose every mutation
-    /// bumps `STORE_WRITE_GEN`. Anything else (an RTL signal, a local, a
-    /// free function) keeps the unconditional re-schedule.
-    fn cond_gate_for(&self, reads: &HashSet<String>) -> Option<u64> {
-        let Some(handle) = self
+    /// Can the bulk re-schedule skip this waiter until a write notes one of
+    /// the names its condition reads? Only when every operand lives in the
+    /// string-keyed stores, whose every mutation notes its name in
+    /// `STORE_WRITE_MASK`: a property or static of the parking process's
+    /// `this` object, a local of the running method (fork children note
+    /// their writes into it on merge), a property reached through such a
+    /// handle, or a collection builtin on one of them. Anything else (an RTL
+    /// signal, a `ref` formal, a call, a system function) keeps the
+    /// unconditional re-schedule. Returns the `name_bit`s of each of `reads`.
+    fn cond_gate_for(&self, cond: &Expression, reads: &HashSet<String>) -> Option<Box<[u64]>> {
+        // The running method's object, or (in a static method) none: then
+        // only the class's statics count as its members.
+        let handle = self
             .this_stack
             .last()
             .copied()
             .flatten()
-            .filter(|&h| h != 0)
-        else {
-            return None;
+            .filter(|&h| h != 0);
+        let cls = match handle {
+            Some(h) => self
+                .heap
+                .get(h)
+                .and_then(|o| o.as_ref())?
+                .class_name
+                .clone(),
+            None => self.class_context_stack.last().cloned().flatten()?,
         };
-        let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
-        let cn = inst.class_name.clone();
-        for n in reads {
-            if matches!(
-                n.as_str(),
-                "this" | "super" | "size" | "num" | "exists" | "first" | "last" | "next" | "prev"
-            ) {
-                continue;
-            }
-            if inst.properties.contains_key(n) {
-                continue;
-            }
-            if self.class_prop_type_name(handle, n).is_some() {
-                continue;
-            }
-            if self.static_prop_key(&cn, n).is_some() {
-                continue;
-            }
+        if !self.cond_operand_gated(cond, handle.unwrap_or(0), &cls) {
             return None;
         }
-        Some(store_gen())
+        Some(reads.iter().map(|n| name_bit(n)).collect())
+    }
+
+    /// `cond_gate_for`'s operand check.
+    fn cond_operand_gated(&self, e: &Expression, this_h: usize, this_cls: &str) -> bool {
+        let this_member = |n: &str| {
+            if this_h == 0 {
+                return self.static_prop_key(this_cls, n).is_some()
+                    || self.member_is_static_coll(this_cls, n);
+            }
+            self.heap
+                .get(this_h)
+                .and_then(|o| o.as_ref())
+                .is_some_and(|i| i.properties.contains_key(n))
+                || self.class_prop_type_name(this_h, n).is_some()
+                || self.static_prop_key(this_cls, n).is_some()
+        };
+        let method_local = |n: &str| {
+            let base = self.method_local_base.last().copied().unwrap_or(0);
+            !self
+                .ref_alias_stack
+                .last()
+                .is_some_and(|m| m.contains_key(n))
+                && self
+                    .local_stack
+                    .get(base..)
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|m| m.contains_key(n))
+        };
+        // A property of the class object `h` (0 when not one).
+        let obj_prop = |h: usize, n: &str| {
+            h != 0
+                && self
+                    .heap
+                    .get(h)
+                    .and_then(|o| o.as_ref())
+                    .is_some_and(|i| i.properties.contains_key(n))
+        };
+        match &e.kind {
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) | ExprKind::This => true,
+            ExprKind::Ident(h) => {
+                if h.root.is_some() {
+                    return false;
+                }
+                let head = h.path[0].name.name.as_str();
+                let head_ok = if method_local(head) {
+                    !self.vif_local_names.contains(head)
+                } else {
+                    this_member(head) && !self.class_member_names().vif_props.contains(head)
+                };
+                if !head_ok
+                    || !h.path.iter().all(|s| {
+                        s.selects
+                            .iter()
+                            .all(|x| self.cond_operand_gated(x, this_h, this_cls))
+                    })
+                {
+                    return false;
+                }
+                // `a.b.c`: every later segment a property of the object the
+                // path reaches so far.
+                let mut cur = if h.path.len() > 1 {
+                    self.eval_ident_handle(head).unwrap_or(0)
+                } else {
+                    0
+                };
+                for seg in &h.path[1..] {
+                    if !obj_prop(cur, &seg.name.name) {
+                        return false;
+                    }
+                    cur = self.member_handle(cur, &seg.name.name).unwrap_or(0);
+                }
+                true
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                self.cond_operand_gated(expr, this_h, this_cls)
+                    && obj_prop(self.eval_handle_expr(expr).unwrap_or(0), &member.name)
+            }
+            // A collection builtin on a gated operand (`m_q.size()`).
+            ExprKind::Call { func, args } => {
+                let ExprKind::MemberAccess { expr, member } = &func.kind else {
+                    return false;
+                };
+                matches!(
+                    member.name.as_str(),
+                    "size" | "num" | "exists" | "first" | "last" | "next" | "prev"
+                ) && self.cond_operand_gated(expr, this_h, this_cls)
+                    && args
+                        .iter()
+                        .all(|a| self.cond_operand_gated(a, this_h, this_cls))
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.cond_operand_gated(left, this_h, this_cls)
+                    && self.cond_operand_gated(right, this_h, this_cls)
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.cond_operand_gated(operand, this_h, this_cls)
+            }
+            ExprKind::Index { expr, index } => {
+                self.cond_operand_gated(expr, this_h, this_cls)
+                    && self.cond_operand_gated(index, this_h, this_cls)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.cond_operand_gated(condition, this_h, this_cls)
+                    && self.cond_operand_gated(then_expr, this_h, this_cls)
+                    && self.cond_operand_gated(else_expr, this_h, this_cls)
+            }
+            _ => false,
+        }
     }
 
     fn eval_waiter_condition(&mut self, waiter_pid: usize, cond: &Expression) -> bool {
@@ -41672,15 +41823,15 @@ impl Simulator {
             // eight UVM housekeeping waits (`wait(m_premature_end)`, the
             // phase hopper's `.size() != 0`, `wait(0)`) each restored a
             // process, re-evaluated, merged fork frames and parked again —
-            // ~40 µs per tick, most of a 5 GHz-clock UVM run. A waiter
-            // whose condition reads only its own object's properties is
-            // skipped while the store generation is unchanged.
+            // ~40 µs per tick, most of a 5 GHz-clock UVM run. A gated
+            // waiter (`cond_gate_for`) is skipped until one of the names it
+            // reads is written.
             let parked = std::mem::take(&mut self.condition_waiters);
-            let now_gen = store_gen();
+            let written = take_store_writes();
             let mut still_parked: Vec<(usize, ProcCont)> = Vec::new();
             for (cpid, cont) in parked {
-                if let Some(Some(g)) = self.cond_waiter_gate.get(&cpid) {
-                    if *g == now_gen {
+                if let Some(Some(bits)) = self.cond_waiter_gate.get(&cpid) {
+                    if !bits.iter().any(|&b| written & b == b) {
                         still_parked.push((cpid, cont));
                         continue;
                     }
@@ -45867,6 +46018,8 @@ impl Simulator {
                     Some(slot) => {
                         if slot != v {
                             *slot = v.clone();
+                            // A parked `wait` of the parent may read it.
+                            note_store_write(name_bit(k));
                         }
                     }
                     None => continue,
