@@ -73,3 +73,6 @@ Cargo.lock
 
 # Local PGO/experiment build dirs (cargo-local variants)
 target-*/
+
+# Local-only working notes (perf resume docs etc.) — never published.
+*_RESUME.md
