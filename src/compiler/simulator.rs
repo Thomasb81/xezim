@@ -2747,6 +2747,8 @@ struct ClassMemberNames {
     methods: HashSet<String>,
     /// Every declared task name.
     tasks: HashSet<String>,
+    /// Every property declared as a packed vector (`bit [3:0][7:0] p`).
+    packed_vec_props: HashSet<String>,
     static_methods: HashSet<String>,
     /// Every function/task key and each of its suffixes after a `.`.
     subroutine_suffixes: HashSet<String>,
@@ -99569,6 +99571,17 @@ impl Simulator {
         if self.no_class_objects() {
             return None;
         }
+        // Only a packed-vector property can be this select; any other name
+        // (an interface or module signal read in an assertion, say) skips
+        // the receiver evaluation below.
+        let prop = match &base.kind {
+            ExprKind::MemberAccess { member, .. } => member.name.as_str(),
+            ExprKind::Ident(h) => h.path.last()?.name.name.as_str(),
+            _ => return None,
+        };
+        if !self.class_member_names().packed_vec_props.contains(prop) {
+            return None;
+        }
         let (handle, prop) = self.class_prop_receiver(base)?;
         let (elem_w, total, left, right) = self.class_prop_packed_shape(handle, &prop)?;
         let idx = self.eval_expr(index).to_i64()?;
@@ -129581,6 +129594,7 @@ impl Simulator {
             let mut vif_props: HashSet<String> = HashSet::default();
             let mut methods: HashSet<String> = HashSet::default();
             let mut tasks: HashSet<String> = HashSet::default();
+            let mut packed_vec_props: HashSet<String> = HashSet::default();
             let mut static_methods: HashSet<String> = HashSet::default();
             let mut params: HashSet<String> = HashSet::default();
             let mut assoc_props: HashSet<String> = HashSet::default();
@@ -129599,6 +129613,15 @@ impl Simulator {
                         })
                         .map(|(n, _)| n.clone()),
                 );
+                for (n, dt) in &cd.property_types {
+                    if let DataType::IntegerVector { dimensions, .. }
+                    | DataType::Implicit { dimensions, .. } = dt
+                    {
+                        if !dimensions.is_empty() {
+                            packed_vec_props.insert(n.clone());
+                        }
+                    }
+                }
                 static_methods.extend(cd.static_methods.iter().cloned());
                 params.extend(cd.type_param_names.iter().cloned());
                 params.extend(cd.param_order.iter().cloned());
@@ -129627,6 +129650,7 @@ impl Simulator {
                 vif_props,
                 methods,
                 tasks,
+                packed_vec_props,
                 static_methods,
                 subroutine_suffixes,
                 params,
