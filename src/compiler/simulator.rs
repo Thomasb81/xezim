@@ -79477,8 +79477,9 @@ impl Simulator {
                     // NESTED struct member (`o.in.s`, either parse shape)
                     // otherwise missed and `%s` padded the string to its
                     // container width.
-                    || Self::flatten_member_path(base)
-                        .is_some_and(|segs| {
+                    || Self::member_path_head(base)
+                        .is_some_and(|head| self.module.var_decl_types.contains_key(head))
+                        && Self::flatten_member_path(base).is_some_and(|segs| {
                             self.dotted_member_is_string(&segs.join("."), &member.name)
                         })
                     || self.member_chain_is_string(expr)
@@ -79916,6 +79917,16 @@ impl Simulator {
                     }
                 }
             }
+        }
+        // Only a name some class declares as a method can be found by the
+        // class walk below.
+        let callee = match &func.kind {
+            ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+            _ => None,
+        };
+        if !callee.is_some_and(|m| self.class_member_names().methods.contains(m)) {
+            return false;
         }
         // Extract (class_name, method_name).
         let (class_name, method_name): (Option<String>, Option<String>) = match &func.kind {
@@ -106897,6 +106908,17 @@ impl Simulator {
         }
     }
 
+    /// First segment of a `flatten_member_path` chain, without building it.
+    fn member_path_head(expr: &Expression) -> Option<&str> {
+        match &expr.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                h.path.first().map(|s| s.name.name.as_str())
+            }
+            ExprKind::MemberAccess { expr: base, .. } => Self::member_path_head(base),
+            _ => None,
+        }
+    }
+
     /// `flatten_member_path` joined with `.` into `out`, without the per-
     /// segment copies: the number of segments written, or `None` for a shape
     /// it does not flatten.
@@ -108090,6 +108112,11 @@ impl Simulator {
             let fd = first_dot?;
             return self.chained_member_scoped(name, fd);
         }
+        // Every store below is a collection some class declares under this
+        // name (or types with a parameter or a dimensioned typedef).
+        if !self.coll_member_possible(name) {
+            return None;
+        }
         // §8.9: inside a STATIC method there is no `this`; the lexical class
         // context still resolves a bare static-array member to its store.
         let Some(handle) = self
@@ -108416,12 +108443,12 @@ impl Simulator {
         verdict
     }
 
-    /// Can `member` of some object be a per-instance collection or a static
-    /// fixed array (`class_assoc_member`, `prop_bound_collection`,
-    /// `static_fixed_key_in`)? Only if some class declares it as an
-    /// associative/queue/array property or a static fixed array, or types it
-    /// with a class parameter or a typedef carrying unpacked dimensions.
-    /// Rebuilt after a procedural `typedef`.
+    /// Can `member` be a collection store of an object or class
+    /// (`class_assoc_member`, `prop_bound_collection`, `static_fixed_key_in`,
+    /// `instance_assoc_member`)? Only if some class declares it as an
+    /// associative/queue/array property, a static collection or a static
+    /// fixed array, or types it with a class parameter or a typedef carrying
+    /// unpacked dimensions. Rebuilt after a procedural `typedef`.
     fn coll_member_possible(&self, member: &str) -> bool {
         let mut cell = self.coll_member_names.borrow_mut();
         let set = cell.get_or_insert_with(|| {
@@ -108440,6 +108467,8 @@ impl Simulator {
                 names.extend(cd.assoc_properties.keys().cloned());
                 names.extend(cd.queue_properties.keys().cloned());
                 names.extend(cd.array_properties.keys().cloned());
+                names.extend(cd.array_nd_properties.keys().cloned());
+                names.extend(cd.static_collections.iter().map(|(n, ..)| n.clone()));
                 names.extend(cd.static_fixed_arrays.iter().map(|(n, ..)| n.clone()));
                 for (p, sig) in &cd.properties {
                     if sig
@@ -110870,7 +110899,20 @@ impl Simulator {
             // §6.16.4 putc / §6.16.10 itoa-family / §6.16.9 atoreal. A
             // user-defined class method of the same name (e.g. inherited
             // `compare`) must NOT be shadowed by these string builtins.
-            if !self.class_expr_has_method(expr, mname) {
+            // `string_method` answers only these names.
+            if matches!(
+                mname,
+                "putc"
+                    | "compare"
+                    | "icompare"
+                    | "itoa"
+                    | "hextoa"
+                    | "octtoa"
+                    | "bintoa"
+                    | "realtoa"
+                    | "atoreal"
+            ) && !self.class_expr_has_method(expr, mname)
+            {
                 if let Some(v) = self.string_method(expr, mname, args) {
                     return v;
                 }
@@ -111622,9 +111664,8 @@ impl Simulator {
                 .receiver_static_class(expr, handle)
                 .map(|c| c.split('#').next().unwrap_or(&c).to_string())
             {
-                let m = member.name.clone();
-                if self.is_static_method(&base_cls, &m) {
-                    if let Some(res) = self.exec_static_method(&base_cls, &m, args) {
+                if self.is_static_method(&base_cls, &member.name) {
+                    if let Some(res) = self.exec_static_method(&base_cls, &member.name, args) {
                         return res;
                     }
                 }
@@ -111670,9 +111711,9 @@ impl Simulator {
                                 // otherwise the static-type info is bogus and
                                 // the runtime (virtual) dispatch through the
                                 // live handle's class is correct.
-                                let target_on_chain = runtime.as_deref().is_some_and(|rt| {
-                                    target == rt.to_string() || self.class_is_a(rt, &target)
-                                });
+                                let target_on_chain = runtime
+                                    .as_deref()
+                                    .is_some_and(|rt| target == rt || self.class_is_a(rt, &target));
                                 if target_on_chain && runtime.as_deref() != Some(target.as_str()) {
                                     return self.exec_method_in_class_hierarchy(
                                         handle,
@@ -129970,7 +130011,6 @@ impl Simulator {
                 // the current method's locals — not a caller's same-named
                 // local that leaked into the flat `var_class_types` map.
                 self.method_local_base.push(self.local_stack.len() - 1);
-                self.class_context_stack.push(Some(cname.clone()));
                 // §8.7 ctor-time binding (reference behavior): while class
                 // C's `new` body runs, an unqualified method call on `this`
                 // binds within C's own chain — a derived override must not
@@ -129978,6 +130018,7 @@ impl Simulator {
                 if method_name == "new" {
                     self.ctor_class_stack.push((handle, cname.clone()));
                 }
+                self.class_context_stack.push(Some(cname));
                 self.local_iface_aliases.push(iface_alias_frame);
                 // §13.4: a FUNCTION method may return a collection (queue /
                 // unsized dynamic array) via a LITERAL (`return '{}` /
