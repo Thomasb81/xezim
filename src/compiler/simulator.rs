@@ -57562,6 +57562,24 @@ impl Simulator {
         if id < 0 { None } else { Some(id as usize) }
     }
 
+    /// `format!("{}{}", base, suffix)` without the formatting machinery.
+    fn name_with_suffix(base: &str, suffix: &str) -> String {
+        let mut out = String::with_capacity(base.len() + suffix.len());
+        out.push_str(base);
+        out.push_str(suffix);
+        out
+    }
+
+    /// `format!("{}[{}]", base, key)` for an already-rendered key.
+    fn name_with_key(base: &str, key: &str) -> String {
+        let mut out = String::with_capacity(base.len() + key.len() + 2);
+        out.push_str(base);
+        out.push('[');
+        out.push_str(key);
+        out.push(']');
+        out
+    }
+
     /// Flatten an `Ident` / `Index` / `MemberAccess` chain into the dotted-and-
     /// indexed signal name the elaborator pre-registers for unpacked aggregates
     /// (`c.nodes[1].status`, `arr[0].tag`). `None` for shapes it can't flatten
@@ -93931,13 +93949,13 @@ impl Simulator {
     }
 
     fn get_queue_size(&self, obj_name: &str) -> u64 {
-        let raw = if let Some(v) = self.signals.get(&format!("{}.size", obj_name)) {
+        let raw = if let Some(v) = self.signals.get(&Self::name_with_suffix(obj_name, ".size")) {
             v.to_u64().unwrap_or(0)
         } else if self.module.dynamic_arrays.contains(obj_name) {
             // `.size` may have been materialised in the compact signal table
             // (e.g. a package-scope `arr[] = {...}` global) rather than the
             // runtime `signals` map.
-            self.get_signal_value_by_name(&format!("{}.size", obj_name))
+            self.get_signal_value_by_name(&Self::name_with_suffix(obj_name, ".size"))
                 .and_then(|v| v.to_u64())
                 .unwrap_or(0)
         } else if let Some((lo, hi, _)) = self.module.arrays.get(obj_name) {
@@ -93958,7 +93976,7 @@ impl Simulator {
     }
 
     fn set_queue_size(&mut self, obj_name: &str, size: u64) {
-        let key = format!("{}.size", obj_name);
+        let key = Self::name_with_suffix(obj_name, ".size");
         // The `.size` signal is the queue's comb-dependency proxy (see
         // Simulator::new): route through the table write so a size change
         // marks it dirty and re-fires comb readers of `q.size()` / `q[i]`.
@@ -93977,7 +93995,7 @@ impl Simulator {
     /// element-level mutations (`q[i] = v`, `q[i].member = v`) so comb readers
     /// of the queue re-evaluate.
     fn touch_queue(&mut self, obj_name: &str) {
-        let key = format!("{}.size", obj_name);
+        let key = Self::name_with_suffix(obj_name, ".size");
         if let Some(&id) = self.signal_name_to_id.get(key.as_str()) {
             self.mark_dirty_id(id);
             self.dirty_any = true;
@@ -105562,12 +105580,12 @@ impl Simulator {
             // (Without this it falls through to the queue/.size-shadow/string
             // paths and reads 0 for a true assoc array — sv_22.)
             if self.is_associative_array(obj_name) {
-                let prefix = format!("{}[", obj_name);
+                let prefix = Self::name_with_suffix(obj_name, "[");
                 let c1 = self.signals.keys_with_elem_prefix(&prefix).len();
                 let c2 = self.assoc_static_keys(&prefix).len();
                 return Some(Value::from_u64((c1 + c2) as u64, 32));
             }
-            if let Some(v) = self.signals.get(&format!("{}.size", obj_name)) {
+            if let Some(v) = self.signals.get(&Self::name_with_suffix(obj_name, ".size")) {
                 return Some(v.clone());
             }
             // Dynamic-array/queue size may live in the compact signal table
@@ -105578,7 +105596,9 @@ impl Simulator {
             // registration placeholder, not a length (a fresh module-scope
             // queue read size()==64).
             if self.module.dynamic_arrays.contains(obj_name) {
-                if let Some(v) = self.get_signal_value_by_name(&format!("{}.size", obj_name)) {
+                if let Some(v) =
+                    self.get_signal_value_by_name(&Self::name_with_suffix(obj_name, ".size"))
+                {
                     return Some(v);
                 }
                 return Some(Value::from_u64(0, 32));
@@ -105699,7 +105719,7 @@ impl Simulator {
                         return Some(Value::zero(32));
                     }
                 }
-                let elem = format!("{}[{}]", obj_name, cur_size);
+                let elem = Self::name_with_index(obj_name, cur_size as i64);
                 self.queue_store_elem(obj_name, &elem, arg);
                 self.set_queue_size(obj_name, cur_size + 1);
             }
@@ -105716,7 +105736,7 @@ impl Simulator {
                 for i in (0..cur_size).rev() {
                     self.queue_move_elem(obj_name, i, i + 1);
                 }
-                let head = format!("{}[0]", obj_name);
+                let head = Self::name_with_index(obj_name, 0);
                 self.queue_store_elem(obj_name, &head, arg);
                 self.set_queue_size(obj_name, cur_size + 1);
             }
@@ -105726,7 +105746,7 @@ impl Simulator {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self
-                    .get_signal_value_by_name(&format!("{}[0]", obj_name))
+                    .get_signal_value_by_name(&Self::name_with_index(obj_name, 0))
                     .unwrap_or_else(|| Value::zero(32));
                 for i in 1..cur_size {
                     self.queue_move_elem(obj_name, i, i - 1);
@@ -105740,7 +105760,7 @@ impl Simulator {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
                 let val = self
-                    .get_signal_value_by_name(&format!("{}[{}]", obj_name, cur_size - 1))
+                    .get_signal_value_by_name(&Self::name_with_index(obj_name, cur_size as i64 - 1))
                     .unwrap_or_else(|| Value::zero(32));
                 self.set_queue_size(obj_name, cur_size - 1);
                 return Some(val);
@@ -106028,20 +106048,20 @@ impl Simulator {
             if let Some(arg) = args.first() {
                 let kv = self.eval_expr(arg);
                 let key = self.assoc_key_str(obj_name, &kv);
-                let elem_name = format!("{}[{}]", obj_name, key);
+                let elem_name = Self::name_with_key(obj_name, &key);
                 // A multidimensional associative array (`m[K1][K2]`, IEEE 1800-2023 §7.8.1)
                 // stores elements under the compound key `m[K1][K2]`; the bare `m[K1]`
                 // is never a direct entry. So a hit is EITHER the flat 1D key OR any
                 // compound `m[K1][...]` element (prefix scan).
-                let nested_prefix = format!("{}[", elem_name);
+                let nested_prefix = Self::name_with_suffix(&elem_name, "[");
                 // A STRUCT element stores member-wise leaves
                 // (`sa[k].id`) — no `sa[k]` entry ever exists.
-                let member_prefix = format!("{}.", elem_name);
+                let member_prefix = Self::name_with_suffix(&elem_name, ".");
                 let found = self.signals.contains_key(&elem_name)
                     || self.signal_name_to_id.contains_key(elem_name.as_str())
                     // An assoc element that is itself a collection is stored
                     // under `<assoc>[<key>].size` / `<assoc>[<key>][i]`.
-                    || self.signals.contains_key(&format!("{}.size", elem_name))
+                    || self.signals.contains_key(&Self::name_with_suffix(&elem_name, ".size"))
                     || self.module.dynamic_arrays.contains(&elem_name)
                     || self.signals.any_key_with_prefix(&nested_prefix)
                     || self.signals.any_key_with_prefix(&member_prefix);
