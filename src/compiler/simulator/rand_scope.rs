@@ -575,3 +575,208 @@ impl Simulator {
         )
     }
 }
+
+impl Simulator {
+    /// §18.5.9 — the constraint items of an enclosing solve that constrain
+    /// ONLY the rand sub-object behind member `prop`, rewritten relative to
+    /// that object (`ctrl.fld.value inside {…}` becomes `fld.value inside
+    /// {…}` for `ctrl`) so the sub-object's own solve honours them. The
+    /// enclosing solve can only re-pin a nested member by `==`; a relational,
+    /// `inside` or deeper-nested item was left to chance and the acceptance
+    /// check, so it failed every trial. An item reading anything but `prop.…`
+    /// paths and literals stays with the enclosing solve only.
+    pub(super) fn pushdown_items(
+        &self,
+        prop: &str,
+        constraints: &[ClassConstraint],
+    ) -> Vec<ConstraintItem> {
+        let recv = self.rand_receiver.as_deref();
+        let mut out = Vec::new();
+        for con in constraints {
+            for it in &con.items {
+                Self::pushdown_item(it, prop, recv, &mut out);
+            }
+        }
+        out
+    }
+
+    fn pushdown_item(
+        it: &ConstraintItem,
+        prop: &str,
+        recv: Option<&str>,
+        out: &mut Vec<ConstraintItem>,
+    ) {
+        if let ConstraintItem::Block(items) = it {
+            for i in items {
+                Self::pushdown_item(i, prop, recv, out);
+            }
+            return;
+        }
+        let mut c = it.clone();
+        let mut hit = false;
+        if Self::rebase_item(&mut c, prop, recv, &mut hit) && hit {
+            out.push(c);
+        }
+    }
+
+    fn rebase_item(
+        it: &mut ConstraintItem,
+        prop: &str,
+        recv: Option<&str>,
+        hit: &mut bool,
+    ) -> bool {
+        match it {
+            ConstraintItem::Expr(e) => Self::rebase_expr(e, prop, recv, hit),
+            ConstraintItem::Inside { expr, range, .. } => {
+                Self::rebase_expr(expr, prop, recv, hit)
+                    && range.iter_mut().all(|r| match r {
+                        ConstraintRange::Value(v) => Self::rebase_expr(v, prop, recv, hit),
+                        ConstraintRange::Range { lo, hi } => {
+                            Self::rebase_expr(lo, prop, recv, hit)
+                                && Self::rebase_expr(hi, prop, recv, hit)
+                        }
+                    })
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                Self::rebase_expr(condition, prop, recv, hit)
+                    && Self::rebase_item(constraint, prop, recv, hit)
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                Self::rebase_expr(condition, prop, recv, hit)
+                    && Self::rebase_item(then_item, prop, recv, hit)
+                    && else_item
+                        .as_mut()
+                        .is_none_or(|e| Self::rebase_item(e, prop, recv, hit))
+            }
+            ConstraintItem::Soft(inner) => Self::rebase_item(inner, prop, recv, hit),
+            ConstraintItem::Block(items) => items
+                .iter_mut()
+                .all(|i| Self::rebase_item(i, prop, recv, hit)),
+            _ => false,
+        }
+    }
+
+    /// Strip `prop.` (or `<receiver>.prop.`) from every operand path of `e`
+    /// (`prop.x.y` parses as a member-access chain over `prop`); false when
+    /// an operand is anything else a sub-object solve could not read the
+    /// same way (an enclosing member, a call, `this`).
+    fn rebase_expr(e: &mut Expression, prop: &str, recv: Option<&str>, hit: &mut bool) -> bool {
+        if matches!(e.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. }) {
+            let Some(names) = Self::member_chain(e) else {
+                return false;
+            };
+            let skip = usize::from(
+                recv.is_some_and(|r| names.len() >= 3 && names[0] == r && names[1] == prop),
+            );
+            if names.len() < skip + 2 || names[skip] != prop {
+                return false;
+            }
+            *e = Self::chain_expr(&names[skip + 1..], e.span);
+            *hit = true;
+            return true;
+        }
+        match &mut e.kind {
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                Self::rebase_expr(operand, prop, recv, hit)
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::Range(left, right)
+            | ExprKind::Index {
+                expr: left,
+                index: right,
+            } => {
+                Self::rebase_expr(left, prop, recv, hit)
+                    && Self::rebase_expr(right, prop, recv, hit)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::rebase_expr(condition, prop, recv, hit)
+                    && Self::rebase_expr(then_expr, prop, recv, hit)
+                    && Self::rebase_expr(else_expr, prop, recv, hit)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::rebase_expr(expr, prop, recv, hit)
+                    && Self::rebase_expr(left, prop, recv, hit)
+                    && Self::rebase_expr(right, prop, recv, hit)
+            }
+            ExprKind::Concatenation(parts) => parts
+                .iter_mut()
+                .all(|p| Self::rebase_expr(p, prop, recv, hit)),
+            ExprKind::Inside { expr, ranges } => {
+                Self::rebase_expr(expr, prop, recv, hit)
+                    && ranges
+                        .iter_mut()
+                        .all(|r| Self::rebase_expr(r, prop, recv, hit))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Simulator {
+    /// The names of a plain operand path: an identifier (no selects, no
+    /// root) or a member-access chain over one. None for anything else.
+    fn member_chain(e: &Expression) -> Option<Vec<String>> {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+                    return None;
+                }
+                Some(h.path.iter().map(|s| s.name.name.clone()).collect())
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                let mut v = Self::member_chain(expr)?;
+                v.push(member.name.clone());
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    /// Rebuild `a.b.c` as the parser shapes it: an identifier `a` under a
+    /// member-access chain.
+    fn chain_expr(names: &[String], span: crate::ast::Span) -> Expression {
+        let ident = |n: &str| crate::ast::Identifier {
+            name: n.to_string(),
+            span,
+        };
+        let mut e = Expression::new(
+            ExprKind::Ident(HierarchicalIdentifier {
+                root: None,
+                path: vec![crate::ast::expr::HierPathSegment {
+                    name: ident(&names[0]),
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        );
+        for n in &names[1..] {
+            e = Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(e),
+                    member: ident(n),
+                },
+                span,
+            );
+        }
+        e
+    }
+}

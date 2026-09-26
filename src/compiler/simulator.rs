@@ -121830,9 +121830,17 @@ impl Simulator {
     /// `randomize(a, b)` member list names the outer object's members only;
     /// the inner object draws all of its own.
     fn randomize_nested(&mut self, sub: usize) {
+        self.randomize_nested_with(sub, &[]);
+    }
+
+    /// The same, with the enclosing solve's items that constrain only this
+    /// sub-object (see `pushdown_items`) joining its own set.
+    fn randomize_nested_with(&mut self, sub: usize, pushed: &[ConstraintItem]) {
         let subset = self.randomize_subset.take();
         self.randomize_depth += 1;
-        self.exec_randomize(sub);
+        self.obj_rng_stack.push(sub);
+        self.exec_randomize_inner(sub, pushed);
+        self.obj_rng_stack.pop();
         self.randomize_depth -= 1;
         self.randomize_subset = subset;
     }
@@ -122876,6 +122884,8 @@ impl Simulator {
             }
         }
         self.rand_tight_mode = false;
+        // Per rand sub-object member: the items pushed into its solve.
+        let mut pushdown: HashMap<String, Vec<ConstraintItem>> = HashMap::default();
         for _trial in 0..trials {
             self.rand_tight_mode = fixed_fe_fail_streak >= 4;
             // LRM §18.5.4 dist: clear the pick-once gate at each trial so a
@@ -122971,7 +122981,11 @@ impl Simulator {
                     && self.randomize_depth < 8
                     && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
                 {
-                    self.randomize_nested(sub);
+                    let pushed = pushdown
+                        .entry(p.clone())
+                        .or_insert_with(|| self.pushdown_items(p, &constraints))
+                        .clone();
+                    self.randomize_nested_with(sub, &pushed);
                 }
             }
 
