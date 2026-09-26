@@ -33,6 +33,8 @@ mod fixed_string_array_dims;
 mod format_lrm_compliance;
 #[path = "strings/format_sibling_fixes.rs"]
 mod format_sibling_fixes;
+#[path = "strings/fwrite_buffered_flush_points.rs"]
+mod fwrite_buffered_flush_points;
 #[path = "strings/fwrite_mcd_fd.rs"]
 mod fwrite_mcd_fd;
 #[path = "strings/hierarchical_string_method.rs"]

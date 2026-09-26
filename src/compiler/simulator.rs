@@ -2110,6 +2110,7 @@ mod code_cov;
 mod module_paths;
 mod rand_csp;
 mod rand_scope;
+mod sv_file;
 mod timing_checks;
 mod ts_x;
 mod uvm_dpi;
@@ -7157,7 +7158,9 @@ pub struct Simulator {
     /// MCD channels use their bit number (1..=30), FD channels use the raw FD
     /// value (0x8000_0000+). FD STDOUT/STDERR/STDIN and MCD bit 0 are never
     /// inserted — they are handled inline at write time.
-    file_handles: HashMap<i32, std::fs::File>,
+    file_handles: HashMap<i32, sv_file::SvFile>,
+    /// Some handle holds buffered `$fwrite` output (see `flush_file_writes`).
+    file_writes_pending: bool,
     /// §21.3.5 (measured): `$feof` is a STICKY flag set when a read
     /// operation actually hits end-of-file — not a position probe. A read
     /// that consumes exactly up to the final newline leaves it clear.
@@ -10483,6 +10486,7 @@ impl Simulator {
             dpi_pending_start_sim_fired: false,
             dpi_pending_end_sim_fired: false,
             file_handles: HashMap::default(),
+            file_writes_pending: false,
             file_eof: HashSet::default(),
             ungetc_buf: HashMap::default(),
             queues: HashMap::default(),
@@ -12320,6 +12324,9 @@ impl Simulator {
         if path.is_empty() {
             return Value::zero(32);
         }
+        // Buffered output reaches its file before this open can truncate or
+        // read it.
+        self.flush_file_writes();
         // IEEE 1800 §21.3.1: the presence of the `type` argument selects the
         // addressing mode. No type → multichannel descriptor (MCD, bit 31
         // clear, opened for write). With type → file descriptor (FD, bit 31
@@ -12347,10 +12354,20 @@ impl Simulator {
         if !mode.contains('r') && !mode.contains('w') && !mode.contains('a') {
             opts.read(true);
         }
-        let file = match opts.open(&path) {
-            Ok(f) => f,
+        let mut file = match opts.open(&path) {
+            Ok(f) => sv_file::SvFile::new(f, &path),
             Err(_) => return Value::zero(32),
         };
+        // A second handle on an open file: both write through, so their
+        // writes land in program order.
+        if let Some(ident) = file.ident() {
+            for other in self.file_handles.values_mut() {
+                if other.ident() == Some(ident) {
+                    other.set_write_through();
+                    file.set_write_through();
+                }
+            }
+        }
         if mcd_mode {
             // Allocate the lowest free bit in 1..=30 (bit 31 reserved/clear,
             // bit 0 is stdout). Return an MCD with that single bit set.
@@ -12433,11 +12450,23 @@ impl Simulator {
                 let _ = e.flush();
             } else if let Some(f) = self.file_handles.get_mut(&k) {
                 let _ = f.write_all(payload.as_bytes());
-                let _ = f.flush();
+                self.file_writes_pending |= f.has_pending();
             }
             // else: closed/unknown fd (e.g. STDIN) → silently drop.
         }
         Value::from_u64(nbytes, 32)
+    }
+
+    /// Write out every handle's buffered output. Called wherever the files may
+    /// be looked at from outside their own handle (see `sv_file`).
+    fn flush_file_writes(&mut self) {
+        if !self.file_writes_pending {
+            return;
+        }
+        for f in self.file_handles.values_mut() {
+            let _ = f.write_out();
+        }
+        self.file_writes_pending = false;
     }
 
     /// Read up to `buf.len()` bytes from file descriptor `fd`, looping until
@@ -12612,6 +12641,7 @@ impl Simulator {
     }
 
     fn read_memory_file(&mut self, args: &[Expression], default_radix: u32) -> Value {
+        self.flush_file_writes();
         if args.len() < 2 {
             sim_dbg_eprintln!("[DEBUG] $readmem*: missing arguments");
             return Value::zero(32);
@@ -12723,6 +12753,7 @@ impl Simulator {
     /// radix. Each line is `@<addr_hex> <value_in_radix>`, matching the
     /// `$readmem*` format so the file is round-trippable.
     fn write_memory_file(&mut self, args: &[Expression], tn: &str) -> Value {
+        self.flush_file_writes();
         if args.len() < 2 {
             return Value::zero(32);
         }
@@ -13713,6 +13744,8 @@ impl Simulator {
             ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
             return Some(Value::zero(32));
         }
+        // Foreign code may read what the design wrote to a file.
+        self.flush_file_writes();
         let Some(binding) = self.dpi_bindings.get(sv_name) else {
             if self.dpi_unresolved.insert(sv_name.to_string()) {
                 eprintln!(
@@ -18706,6 +18739,7 @@ impl Simulator {
         // the tail of the simulation's own output can be overtaken by the
         // summary that is supposed to follow it.
         self.flush_stdout();
+        self.flush_file_writes();
         if std::env::var("XEZIM_RS_STATS").is_ok() {
             xezim_core::value::Value::dump_range_select_stats();
         }
@@ -78940,6 +78974,7 @@ impl Simulator {
                         name, self.time, bt
                     );
                 }
+                self.flush_file_writes();
                 self.finished = true;
             }
             "$fclose" => {
@@ -78979,6 +79014,7 @@ impl Simulator {
                     for f in self.file_handles.values_mut() {
                         let _ = f.flush();
                     }
+                    self.file_writes_pending = false;
                     self.flush_stdout();
                 } else {
                     for k in self.resolve_output_keys(raw) {
@@ -79679,6 +79715,7 @@ impl Simulator {
     /// `system(NULL)` (returns nonzero when a shell is available). Returns the
     /// command's exit status as an `int`.
     fn system_impl(&mut self, args: &[Expression]) -> i32 {
+        self.flush_file_writes();
         match args.first() {
             None => 1, // system(NULL): a shell is available
             Some(a) => {
@@ -134340,6 +134377,8 @@ fn vpi_call_systf(sim: *mut Simulator, name: &str, args: &[Expression]) -> Optio
     });
 
     ACTIVE_SIMULATOR.with(|cell| cell.set(sim));
+    // Foreign code may read what the design wrote to a file.
+    unsafe { (*sim).flush_file_writes() };
     type TfFn = extern "C" fn(*mut libc::c_char) -> libc::c_int;
     if entry.compiletf != 0 {
         let f: TfFn = unsafe { std::mem::transmute(entry.compiletf as *const ()) };
@@ -134839,6 +134878,10 @@ fn dispatch_vpi_cb(
         user_data: cb.user_data as *mut libc::c_void,
     };
 
+    if !sim_ptr.is_null() {
+        // Foreign code may read what the design wrote to a file.
+        unsafe { (*sim_ptr).flush_file_writes() };
+    }
     type CbFn = extern "C" fn(*mut s_cb_data);
     let cb_fn: CbFn = unsafe { std::mem::transmute(cb.cb_routine as *const ()) };
     cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
