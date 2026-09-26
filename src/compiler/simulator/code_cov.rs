@@ -1,6 +1,6 @@
-//! Code coverage: statement and branch counts, collected when the run asks
-//! for them (`--code-coverage`, `+cover`) and written to the results file
-//! beside the functional coverage.
+//! Code coverage: statement, branch and toggle counts, collected when the run
+//! asks for them (`--code-coverage`, `+cover`) and written to the results
+//! file beside the functional coverage.
 //!
 //! Statements and branches are instrumented at compile time, on the
 //! elaborated design, before any block is lowered: a counted statement gets a
@@ -9,14 +9,17 @@
 //! compiler turns those into `Insn::CovHit`; the interpreter counts them
 //! itself. Every execution path therefore counts the same way, and a run
 //! without code coverage compiles exactly the design it did before.
-//! Continuous assignments count in their comb entry (`ca_counter`).
+//! Continuous assignments count in their comb entry (`ca_counter`). Toggles
+//! compare each tracked signal with its value at the end of the previous
+//! time slot, off the dirty set the waveform writers share.
 use super::*;
 use crate::ast::Span;
 
 pub const KIND_STATEMENT: u8 = 1;
 pub const KIND_BRANCH: u8 = 2;
+pub const KIND_TOGGLE: u8 = 4;
 /// Result names of the kinds, bit `i` of a kind mask naming entry `i`.
-const KIND_NAMES: [&str; 2] = ["statement", "branch"];
+const KIND_NAMES: [&str; 3] = ["statement", "branch", "toggle"];
 type Tallies = [Tally; KIND_NAMES.len()];
 
 /// `$__xz_cov(<n>)`: counts counter `n` (a statement or a branch arm).
@@ -52,17 +55,18 @@ pub(crate) fn code_coverage() -> Option<CodeCoverage> {
 }
 
 /// The kinds a `--code-coverage` list names: `stmt` (or `statement`, `s`),
-/// `branch` (`b`) or `all`, separated by commas.
+/// `branch` (`b`), `toggle` (`t`) or `all`, separated by commas.
 pub fn parse_kinds(spec: &str) -> Result<u8, String> {
     let mut kinds = 0u8;
     for k in spec.split(',').map(str::trim).filter(|k| !k.is_empty()) {
         kinds |= match k {
             "stmt" | "statement" | "s" => KIND_STATEMENT,
             "branch" | "b" => KIND_BRANCH,
-            "all" => KIND_STATEMENT | KIND_BRANCH,
+            "toggle" | "t" => KIND_TOGGLE,
+            "all" => KIND_STATEMENT | KIND_BRANCH | KIND_TOGGLE,
             _ => {
                 return Err(format!(
-                    "unknown code coverage kind '{}' (want stmt, branch or all)",
+                    "unknown code coverage kind '{}' (want stmt, branch, toggle or all)",
                     k
                 ));
             }
@@ -156,6 +160,48 @@ struct BranchSite {
     arms: Vec<Arm>,
 }
 
+/// Per-bit rise/fall counts of the tracked signals.
+pub(crate) struct Toggle {
+    /// Signal id -> tracked index, `u32::MAX` when not tracked.
+    slot: Vec<u32>,
+    ids: Vec<u32>,
+    width: Vec<u32>,
+    /// First word of each tracked signal in `prev_v` / `prev_x`.
+    word0: Vec<u32>,
+    /// First bit of each tracked signal in `rise` / `fall`.
+    bit0: Vec<u32>,
+    prev_v: Vec<u64>,
+    prev_x: Vec<u64>,
+    rise: Vec<u32>,
+    fall: Vec<u32>,
+    /// (scope, name within the scope, tracked index); aliases of one signal
+    /// share the tracked index.
+    names: Vec<(u32, String, u32)>,
+}
+
+impl Toggle {
+    fn sample(&mut self, k: usize, v: u64, x: u64, word: usize) {
+        let w = self.word0[k] as usize + word;
+        let (pv, px) = (self.prev_v[w], self.prev_x[w]);
+        self.prev_v[w] = v;
+        self.prev_x[w] = x;
+        let known = !(x | px);
+        let mut rise = v & !pv & known;
+        let mut fall = pv & !v & known;
+        let base = self.bit0[k] as usize + word * 64;
+        while rise != 0 {
+            let b = rise.trailing_zeros() as usize;
+            self.rise[base + b] = self.rise[base + b].saturating_add(1);
+            rise &= rise - 1;
+        }
+        while fall != 0 {
+            let b = fall.trailing_zeros() as usize;
+            self.fall[base + b] = self.fall[base + b].saturating_add(1);
+            fall &= fall - 1;
+        }
+    }
+}
+
 pub(crate) struct CodeCov {
     kinds: u8,
     limit: Vec<String>,
@@ -166,6 +212,7 @@ pub(crate) struct CodeCov {
     counters: u32,
     /// Continuous assignment (origin span start, end, scope) -> its counter.
     ca_counter: HashMap<(usize, usize, String), u32>,
+    pub(crate) toggle: Option<Toggle>,
 }
 
 /// Rewrites one scope's statements; see the module docs.
@@ -755,7 +802,7 @@ impl Lines<'_> {
     }
 }
 
-/// One reported statement or arm row after locating and merging.
+/// One reported statement, arm or toggle row after locating and merging.
 #[derive(Clone)]
 struct StmtRow {
     file: String,
@@ -781,10 +828,18 @@ struct BranchRow {
     arms: Vec<ArmRow>,
 }
 
+#[derive(Clone)]
+struct ToggleRow {
+    name: String,
+    rise: Vec<u32>,
+    fall: Vec<u32>,
+}
+
 #[derive(Default)]
 struct Report {
     stmts: Vec<StmtRow>,
     branches: Vec<BranchRow>,
+    toggles: Vec<ToggleRow>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -838,6 +893,11 @@ impl Report {
                 t[1].covered += (a.count > 0) as u64;
             }
         }
+        for r in &self.toggles {
+            t[2].total += 2 * r.rise.len() as u64;
+            t[2].covered += r.rise.iter().filter(|&&c| c > 0).count() as u64
+                + r.fall.iter().filter(|&&c| c > 0).count() as u64;
+        }
         t
     }
 
@@ -877,13 +937,37 @@ impl Report {
             }
         }
         self.branches = merged;
+        self.toggles.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
     /// Add another instance of the same design unit (rows keyed by source
-    /// position).
+    /// position and signal name).
     fn merge(&mut self, o: &Report) {
         self.stmts.extend(o.stmts.iter().cloned());
         self.branches.extend(o.branches.iter().cloned());
+        let mut by_name: HashMap<String, usize> = self
+            .toggles
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.name.clone(), i))
+            .collect();
+        for r in &o.toggles {
+            match by_name.get(&r.name) {
+                Some(&i) if self.toggles[i].rise.len() == r.rise.len() => {
+                    let t = &mut self.toggles[i];
+                    for (a, b) in t.rise.iter_mut().zip(&r.rise) {
+                        *a = a.saturating_add(*b);
+                    }
+                    for (a, b) in t.fall.iter_mut().zip(&r.fall) {
+                        *a = a.saturating_add(*b);
+                    }
+                }
+                _ => {
+                    by_name.insert(r.name.clone(), self.toggles.len());
+                    self.toggles.push(r.clone());
+                }
+            }
+        }
         self.normalize();
     }
 
@@ -931,6 +1015,26 @@ impl Report {
             }
             out.push_str("],\n");
         }
+        if kinds & KIND_TOGGLE != 0 {
+            out.push_str(&format!("{}\"toggles\": [", indent));
+            let list = |v: &[u32]| {
+                v.iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            for (i, r) in self.toggles.iter().enumerate() {
+                out.push_str(&format!(
+                    "{}{{\"signal\": \"{}\", \"width\": {}, \"rise\": [{}], \"fall\": [{}]}}",
+                    if i == 0 { "" } else { ", " },
+                    json_escape(&r.name),
+                    r.rise.len(),
+                    list(&r.rise),
+                    list(&r.fall)
+                ));
+            }
+            out.push_str("],\n");
+        }
         // Drop the trailing comma of the last member.
         if out.ends_with(",\n") {
             out.truncate(out.len() - 2);
@@ -959,6 +1063,7 @@ impl Simulator {
             branches: Vec::new(),
             counters: 0,
             ca_counter: HashMap::default(),
+            toggle: None,
         };
         let inst_paths: HashSet<String> = self
             .module
@@ -1123,6 +1228,11 @@ impl Simulator {
                 }
             }
             self.module.continuous_assigns = cas;
+        }
+        if kinds & KIND_TOGGLE != 0 {
+            let names = std::mem::take(&mut self.code_cov_toggle_names);
+            cov.toggle = Some(self.cov_build_toggle(&mut cov, &inst_paths, names));
+            self.enable_dump_dirty_tracking();
         }
         self.code_cov_hits = vec![0; cov.counters as usize];
         self.code_cov = Some(Box::new(cov));
@@ -1406,6 +1516,204 @@ impl Simulator {
         v
     }
 
+    /// Nets and variables toggle coverage tracks, by name, taken while the
+    /// elaboration signal table still holds their declarations: the integral
+    /// ones of instances, without input and inout ports (the parent's signal
+    /// carries those toggles), unpacked arrays, `time` variables, subroutine
+    /// variables and class properties.
+    pub(super) fn cov_toggle_candidates(module: &ElaboratedModule) -> Vec<String> {
+        let wants = code_coverage().is_some_and(|c| c.kinds & KIND_TOGGLE != 0);
+        if !wants {
+            return Vec::new();
+        }
+        let inst_paths: HashSet<&str> = module.instances.iter().map(|i| i.path.as_str()).collect();
+        let subr_prefixes: Vec<String> = module
+            .functions
+            .keys()
+            .chain(module.tasks.keys())
+            .map(|k| format!("{}.", k))
+            .collect();
+        let mut out: Vec<String> = module
+            .signals
+            .iter()
+            .filter(|(name, sig)| {
+                if sig.is_const
+                    || sig.is_real
+                    || sig.width == 0
+                    || matches!(
+                        sig.direction,
+                        Some(PortDirection::Input) | Some(PortDirection::Inout)
+                    )
+                {
+                    return false;
+                }
+                if name.contains("__xz") || name.starts_with("__") || name.contains("::") {
+                    return false;
+                }
+                if let Some((base, _)) = name.split_once('[') {
+                    if module.arrays.contains_key(base)
+                        || module.arrays_nd.contains_key(base)
+                        || module.dynamic_arrays.contains(base)
+                        || module.associative_arrays.contains_key(base)
+                    {
+                        return false;
+                    }
+                }
+                let n = name.as_str();
+                // Enum constants and parameters, and the placeholders named
+                // after instances.
+                if module.parameters.contains_key(n) || inst_paths.contains(n) {
+                    return false;
+                }
+                if module.arrays.contains_key(n)
+                    || module.arrays_nd.contains_key(n)
+                    || module.dynamic_arrays.contains(n)
+                    || module.associative_arrays.contains_key(n)
+                    || module.queue_vars.contains(n)
+                    || module.string_signals.contains(n)
+                    || module.events.contains(n)
+                {
+                    return false;
+                }
+                if let Some(t) = &sig.type_name {
+                    if module.classes.contains_key(t) || module.interfaces.contains(t) {
+                        return false;
+                    }
+                }
+                match module.var_decl_types.get(n) {
+                    Some(DataType::IntegerAtom {
+                        kind: IntegerAtomType::Time,
+                        ..
+                    })
+                    | Some(DataType::Real { .. })
+                    | Some(DataType::Simple { .. })
+                    | Some(DataType::Interface { .. }) => return false,
+                    _ => {}
+                }
+                !subr_prefixes.iter().any(|p| n.starts_with(p.as_str()))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn cov_build_toggle(
+        &mut self,
+        cov: &mut CodeCov,
+        inst_paths: &HashSet<String>,
+        names: Vec<String>,
+    ) -> Toggle {
+        let mut t = Toggle {
+            slot: vec![u32::MAX; self.signal_table.len()],
+            ids: Vec::new(),
+            width: Vec::new(),
+            word0: Vec::new(),
+            bit0: Vec::new(),
+            prev_v: Vec::new(),
+            prev_x: Vec::new(),
+            rise: Vec::new(),
+            fall: Vec::new(),
+            names: Vec::new(),
+        };
+        let top_prefix = format!("{}.", self.module.name);
+        for name in names {
+            let Some(&id) = self.signal_name_to_id.get(name.as_str()).or_else(|| {
+                self.signal_name_to_id
+                    .get(format!("{}{}", top_prefix, name).as_str())
+            }) else {
+                continue;
+            };
+            let width = self.signal_widths.get(id).copied().unwrap_or(0);
+            if width == 0 || self.signal_real.get(id).copied().unwrap_or(false) {
+                continue;
+            }
+            // The owning instance: the longest instance path the name
+            // starts with; the rest is the signal's name within it.
+            let mut inst = "";
+            let mut rest = name.as_str();
+            let mut cut = name.len();
+            while let Some(p) = name[..cut].rfind('.') {
+                if inst_paths.contains(&name[..p]) {
+                    inst = &name[..p];
+                    rest = &name[p + 1..];
+                    break;
+                }
+                cut = p;
+            }
+            let Some(sc) = self.cov_instance_scope(cov, inst_paths, inst) else {
+                continue;
+            };
+            let k = if t.slot[id] != u32::MAX {
+                t.slot[id]
+            } else {
+                let k = t.ids.len() as u32;
+                t.slot[id] = k;
+                t.ids.push(id as u32);
+                t.width.push(width);
+                t.word0.push(t.prev_v.len() as u32);
+                t.bit0.push(t.rise.len() as u32);
+                let words = width.div_ceil(64) as usize;
+                let v = &self.signal_table[id];
+                for w in 0..words {
+                    let n = (width as usize - w * 64).min(64);
+                    let (pv, px) = v.slice_bits_swar(w * 64, n);
+                    t.prev_v.push(pv);
+                    t.prev_x.push(px);
+                }
+                t.rise.resize(t.rise.len() + width as usize, 0);
+                t.fall.resize(t.fall.len() + width as usize, 0);
+                k
+            };
+            t.names.push((sc, rest.to_string(), k));
+        }
+        t
+    }
+
+    /// End of a time slot: compare every tracked signal written since the
+    /// last one with its previous value.
+    pub(super) fn cov_toggle_sample(&mut self) {
+        let Some(t) = self.code_cov.as_mut().and_then(|c| c.toggle.as_mut()) else {
+            return;
+        };
+        let full = !self.dump_dirty_active;
+        let n = if full {
+            t.ids.len()
+        } else {
+            self.dump_dirty.len()
+        };
+        for i in 0..n {
+            let k = if full {
+                i
+            } else {
+                match t.slot.get(self.dump_dirty[i] as usize) {
+                    Some(&k) if k != u32::MAX => k as usize,
+                    _ => continue,
+                }
+            };
+            let id = t.ids[k] as usize;
+            let width = t.width[k] as usize;
+            if width <= 64 {
+                let (v, x) = match self.signal_inline_bits.get(id) {
+                    Some(sl) => (sl[0], sl[1]),
+                    None => self.signal_table[id].raw_bits(),
+                };
+                let mask = if width == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << width) - 1
+                };
+                t.sample(k, v & mask, x & mask, 0);
+            } else {
+                for w in 0..width.div_ceil(64) {
+                    let n = (width - w * 64).min(64);
+                    let (v, x) = self.signal_table[id].slice_bits_swar(w * 64, n);
+                    t.sample(k, v, x, w);
+                }
+            }
+        }
+    }
+
     fn cov_report(&self) -> Vec<Report> {
         let Some(cov) = self.code_cov.as_ref() else {
             return Vec::new();
@@ -1450,6 +1758,17 @@ impl Simulator {
                 kind: b.kind,
                 arms,
             });
+        }
+        if let Some(t) = &cov.toggle {
+            for (sc, name, k) in &t.names {
+                let k = *k as usize;
+                let (b, w) = (t.bit0[k] as usize, t.width[k] as usize);
+                reports[*sc as usize].toggles.push(ToggleRow {
+                    name: name.clone(),
+                    rise: t.rise[b..b + w].to_vec(),
+                    fall: t.fall[b..b + w].to_vec(),
+                });
+            }
         }
         for r in reports.iter_mut() {
             r.normalize();

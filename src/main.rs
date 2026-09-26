@@ -179,7 +179,7 @@ fn print_usage() {
                    XEZIM_ALLOW_IMPLICIT_STATIC=1."
     );
     eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
-    eprintln!("                   stmt, branch (or all, the default). Counts go to");
+    eprintln!("                   stmt, branch, toggle (or all, the default). Counts go to");
     eprintln!("                   xezim_cov.json (XEZIM_COV_DB) with the functional coverage;");
     eprintln!("                   --verbose prints a summary. XEZIM_CODE_COVERAGE=<kinds> too.");
     eprintln!("  --code-coverage-scope <path>[,<path>...]  Only instrument these instance");
@@ -340,8 +340,8 @@ fn print_usage() {
         "  -work/-L/-Lf/-lib <lib>  Ignored with one warning: every run compiles from source"
     );
     eprintln!("  -sv12compat, -sv17compat  Same as --sv2017 (-sv05compat/-sv09compat warn)");
-    eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b");
-    eprintln!("                   = stmt, branch; bare = both. Other letters are");
+    eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b, t");
+    eprintln!("                   = stmt, branch, toggle; bare = all three. Other letters are");
     eprintln!("                   ignored with a warning");
     eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -<step>args=..,");
     eprintln!("  -suppress <ids>, +fcover, -sva,");
@@ -2232,7 +2232,8 @@ fn run_main() -> i32 {
             "--code-coverage" => {
                 code_cov_kinds = Some(
                     xezim::compiler::simulator::KIND_STATEMENT
-                        | xezim::compiler::simulator::KIND_BRANCH,
+                        | xezim::compiler::simulator::KIND_BRANCH
+                        | xezim::compiler::simulator::KIND_TOGGLE,
                 );
             }
             _ if arg.starts_with("--code-coverage=") => {
@@ -2630,7 +2631,6 @@ fn run_main() -> i32 {
             let names: Vec<String> = unsupported
                 .chars()
                 .map(|c| match c {
-                    't' => "toggle (t)".to_string(),
                     'c' => "condition (c)".to_string(),
                     'e' => "expression (e)".to_string(),
                     'f' => "FSM (f)".to_string(),
@@ -2641,6 +2641,7 @@ fn run_main() -> i32 {
             let kept: Vec<&str> = [
                 (xezim::compiler::simulator::KIND_STATEMENT, "statement"),
                 (xezim::compiler::simulator::KIND_BRANCH, "branch"),
+                (xezim::compiler::simulator::KIND_TOGGLE, "toggle"),
             ]
             .iter()
             .filter(|(k, _)| kinds & k != 0)

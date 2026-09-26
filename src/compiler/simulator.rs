@@ -2117,8 +2117,8 @@ pub(crate) use code_cov::{
     COND_FN as COV_COND_FN, HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id,
 };
 pub use code_cov::{
-    CodeCoverage, KIND_BRANCH, KIND_STATEMENT, parse_kinds as parse_code_coverage_kinds,
-    set_code_coverage,
+    CodeCoverage, KIND_BRANCH, KIND_STATEMENT, KIND_TOGGLE,
+    parse_kinds as parse_code_coverage_kinds, set_code_coverage,
 };
 pub use timing_checks::{set_no_notifier, set_no_tchk_msg, set_no_timing_checks};
 
@@ -5325,6 +5325,9 @@ pub struct Simulator {
     /// Code coverage counters, indexed by the id a `$__xz_cov` marker or an
     /// `Insn::CovHit` carries. Empty when the run collects none.
     code_cov_hits: Vec<u64>,
+    /// Toggle coverage candidates, named while `new` still has the
+    /// elaboration signal table; resolved to ids in `compile`.
+    code_cov_toggle_names: Vec<String>,
     /// Call stack for tracking 'this' and local variables.
     this_stack: Vec<Option<usize>>,
     /// One-shot: the next `exec_task_call` runs an INSTANCE (module or
@@ -8962,6 +8965,9 @@ impl Simulator {
         // instead. Clearing it here (rather than at end of construction) keeps
         // its ~one-long-name-string-plus-Signal-per-entry footprint out of the
         // peak-RSS window during the big array reserve.
+        // Toggle coverage needs the declarations too (see
+        // `cov_toggle_candidates`); empty unless the run asked for it.
+        let code_cov_toggle_names = Self::cov_toggle_candidates(&module);
         // Snapshot array-element values before the map is dropped: the array
         // builder below re-registers these names onto freshly zeroed slots.
         let array_elem_inits: Vec<(String, Value)> = module
@@ -9894,6 +9900,7 @@ impl Simulator {
             assertion_stats: HashMap::default(),
             code_cov: None,
             code_cov_hits: Vec::new(),
+            code_cov_toggle_names,
             this_stack: vec![],
             task_clears_this: false,
             local_stack: vec![],
@@ -88979,6 +88986,9 @@ impl Simulator {
         }
         if self.fst_writer.is_some() {
             self.fst_write_changes();
+        }
+        if self.code_cov.is_some() {
+            self.cov_toggle_sample();
         }
         if self.dump_dirty_active {
             self.dump_dirty.clear();

@@ -1,5 +1,6 @@
-//! Code coverage (`--code-coverage`, docs/coverage-guide.md): statement
-//! and branch counts in xezim_cov.json, per the guide's counting rules. Where a rule matches the reference simulator's report on the same
+//! Code coverage (`--code-coverage`, docs/coverage-guide.md): statement,
+//! branch and toggle counts in xezim_cov.json, per the guide's counting
+//! rules. Where a rule matches the reference simulator's report on the same
 //! design, the test says so.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -259,6 +260,68 @@ endmodule
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Toggles: per bit, 0->1 and 1->0 between the ends of time slots, never to
+/// or from x; input ports, memories and reals untracked. As in the reference
+/// simulator's report, a 0-1-0 within one time slot is no toggle and the
+/// leaf's input port is not listed.
+#[test]
+fn toggle_counts() {
+    let d = scratch("toggle");
+    let src = "\
+module leaf(input logic a, output logic o);
+  assign o = ~a;
+endmodule
+module tb;
+  logic x, g;
+  logic [1:0] v;
+  logic [7:0] mem [4];
+  int unsigned n;
+  real r;
+  leaf u(.a(x), .o());
+  initial begin
+    x = 0; g = 0; v = 0; n = 0; r = 0.5;
+    #1 x = 1;
+    #1 g = 1; g = 0;
+    #1 v = 2'b10; v = 2'b01;
+    #1 v = 2'bx1;
+    #1 x = 0;
+    mem[0] = 8'hff;
+    n = 3;
+  end
+endmodule
+";
+    let out = run(&d, src, &["--code-coverage=toggle"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = results(&d);
+    for row in [
+        "{\"signal\": \"x\", \"width\": 1, \"rise\": [1], \"fall\": [1]}",
+        "{\"signal\": \"g\", \"width\": 1, \"rise\": [0], \"fall\": [0]}",
+        "{\"signal\": \"v\", \"width\": 2, \"rise\": [1, 0], \"fall\": [0, 0]}",
+        "{\"signal\": \"o\", \"width\": 1, \"rise\": [1], \"fall\": [1]}",
+    ] {
+        assert!(json.contains(row), "{row}: {json}");
+    }
+    assert!(
+        json.contains("{\"signal\": \"n\", \"width\": 32, \"rise\": [1, 1, 0,"),
+        "{json}"
+    );
+    for name in ["mem", "r", "a", "u"] {
+        assert!(
+            !json.contains(&format!("\"signal\": \"{name}\"")),
+            "{name}: {json}"
+        );
+    }
+    assert!(
+        json.contains("\"toggle\": {\"covered\": 7, \"total\": 74, \"percent\": 9.46}"),
+        "{json}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// The two-state executors take back a count when they hand a block to the
 /// four-state VM, so both give the same counts (the flop reads x before
 /// `d` is driven).
@@ -333,8 +396,8 @@ fn off_by_default_output_unchanged() {
 }
 
 /// Other simulators' spellings: `+cover=<letters>` picks the kinds and warns
-/// once about the ones xezim lacks; bare `+cover` and `-coverage` collect
-/// both kinds; XEZIM_CODE_COVERAGE does what the flag does.
+/// once about the ones xezim lacks; bare `+cover` and `-coverage` collect all
+/// three; XEZIM_CODE_COVERAGE does what the flag does.
 #[test]
 fn compatible_spellings() {
     let d = scratch("compat");
@@ -350,7 +413,7 @@ fn compatible_spellings() {
         let k = json[start..start + json[start..].find(']').unwrap()].to_string();
         (k, String::from_utf8_lossy(&out.stderr).into_owned())
     };
-    let all = "\"statement\", \"branch\"";
+    let all = "\"statement\", \"branch\", \"toggle\"";
     let (k, err) = kinds(&["+cover=sbcf"]);
     assert_eq!(k, "\"statement\", \"branch\"");
     assert_eq!(
@@ -362,7 +425,7 @@ fn compatible_spellings() {
         1,
         "{err}"
     );
-    assert_eq!(kinds(&["+cover=b"]).0, "\"branch\"");
+    assert_eq!(kinds(&["+cover=t"]).0, "\"toggle\"");
     assert_eq!(kinds(&["+cover"]).0, all);
     assert_eq!(kinds(&["-coverage"]).0, all);
     assert_eq!(kinds(&["-coverage", "+cover=s"]).0, "\"statement\"");
@@ -374,12 +437,12 @@ fn compatible_spellings() {
     let env = Command::new(xezim())
         .current_dir(&d)
         .env("XEZIM_COV_DB", d.join("cov.json"))
-        .env("XEZIM_CODE_COVERAGE", "branch")
+        .env("XEZIM_CODE_COVERAGE", "toggle")
         .arg("t.sv")
         .output()
         .expect("run xezim");
     assert!(env.status.success());
-    assert!(results(&d).contains("\"kinds\": [\"branch\"]"));
+    assert!(results(&d).contains("\"kinds\": [\"toggle\"]"));
     let bad = run(&d, SMALL, &["--code-coverage=lines"]);
     assert_eq!(bad.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&bad.stderr).contains("unknown code coverage kind 'lines'"));
@@ -406,7 +469,7 @@ fn scope_limit_and_summary() {
     assert!(!json.contains("\"scope\": \"tb\""), "{json}");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
-        err.contains("[COV] code coverage: statement 5/5 (100.00%), branch 4/4 (100.00%)"),
+        err.contains("[COV] code coverage: statement 5/5 (100.00%), branch 4/4 (100.00%), toggle"),
         "{err}"
     );
     assert!(
