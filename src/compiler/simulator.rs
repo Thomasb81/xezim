@@ -131257,6 +131257,32 @@ impl Simulator {
                         }
                     }
                 }
+                // A member of one element of an interface instance array
+                // (`B[0].proxy`): the element's members are signals under
+                // `B[0].`, carrying their declared type. Without this, the
+                // lookup below found no type and `B[0].proxy = new;` stored
+                // nothing.
+                if let ExprKind::Index { expr: ib, index } = &base.kind {
+                    if let ExprKind::Ident(bh) = &ib.kind {
+                        if bh.path.iter().all(|s| s.selects.is_empty()) {
+                            if let Some(k) = self.eval_scalar_self(index) {
+                                let name = format!(
+                                    "{}[{}].{}",
+                                    self.resolve_hier_name(bh),
+                                    k,
+                                    member.name
+                                );
+                                if let Some(t) = self
+                                    .signal_name_to_id
+                                    .get(name.as_str())
+                                    .and_then(|id| self.signal_type_names.get(id))
+                                {
+                                    return Some(t.clone());
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(base_type) = self.get_expr_type_name(base) {
                     let dt_opt = self.module.typedef_types.get(&base_type).cloned();
                     if let Some(dt) = dt_opt {

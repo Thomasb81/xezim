@@ -304,6 +304,8 @@ mod class_property_over_module_signal;
 mod concurrent_method_local_arrays;
 #[path = "classes/instance_class_handles_start_null.rs"]
 mod instance_class_handles_start_null;
+#[path = "classes/interface_array_handle_new.rs"]
+mod interface_array_handle_new;
 #[path = "classes/nested_rand_inline_constraints.rs"]
 mod nested_rand_inline_constraints;
 #[path = "classes/null_deref_fatal.rs"]
