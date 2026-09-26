@@ -302,6 +302,8 @@ mod blocking_task_on_call_result;
 mod class_property_over_module_signal;
 #[path = "classes/concurrent_method_local_arrays.rs"]
 mod concurrent_method_local_arrays;
+#[path = "classes/concurrent_method_local_queues.rs"]
+mod concurrent_method_local_queues;
 #[path = "classes/instance_class_handles_start_null.rs"]
 mod instance_class_handles_start_null;
 #[path = "classes/interface_array_handle_new.rs"]

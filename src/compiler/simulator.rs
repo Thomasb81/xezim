@@ -72541,6 +72541,17 @@ impl Simulator {
         }
         let resolve_coll = |sim: &mut Self, e: &Expression| -> Option<(String, bool)> {
             if let ExprKind::Ident(h) = &e.kind {
+                // A method-local queue / dynamic array lives under its
+                // per-call storage key (`declare_local_dyn`), which shadows
+                // any same-named property.
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    let bare = h.path[0].name.name.as_str();
+                    if let Some(uq) = sim.dyn_name_lookup(bare).filter(|uq| *uq != bare) {
+                        if sim.module.dynamic_arrays.contains(uq) {
+                            return Some((uq.to_string(), false));
+                        }
+                    }
+                }
                 let n = Self::resolve_hier_name_static(h, &sim.module);
                 // A bare identifier naming a COLLECTION MEMBER of
                 // `this` must resolve to its `<handle>#member` storage
@@ -74405,29 +74416,40 @@ impl Simulator {
                     }
                     UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. } => {
                         // Register as dynamic array / queue (initially empty).
-                        //
-                        // NOTE: queue/dynamic-array LOCALS do NOT yet get
-                        // the per-process unique storage key. Associative-
-                        // array locals do (see the Associative arm below),
-                        // which fixes time-0 stalls for local array edges.
-                        // Queue-local isolation is correct in principle (see
-                        // /tmp/svrun/queue_leak_forkjoin.sv and
-                        // tests/concurrent_local_dyn_arrays.rs) but is
-                        // deferred: it regresses register map access
-                        // (`do_bus_access` doing `addrs = map_info.addr`,
-                        // a whole-queue copy from a struct field, which the rename
-                        // mishandles). Re-enable by replacing `true`
-                        // with `false` below once that path is fixed.
+                        // §6.21: in a class method it is automatic — each
+                        // invocation owns its storage, under the per-frame
+                        // key the associative and fixed-size locals use.
+                        // Keyed by its bare name, two concurrent calls
+                        // shared one queue and each declaration emptied the
+                        // other's.
                         let bare = d.name.name.clone();
-                        let name = if matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
-                            || true
+                        let in_method = matches!(self.class_context_stack.last(), Some(Some(_)));
+                        let name = if in_method
+                            && self.current_static_task.is_none()
+                            && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
                         {
-                            bare.clone()
-                        } else {
                             self.declare_local_dyn(&bare)
+                        } else {
+                            bare.clone()
                         };
                         self.module.arrays.insert(name.clone(), (0, -1, w));
                         self.module.dynamic_arrays.insert(name.clone());
+                        if name != bare {
+                            // The element type, under the per-call key too
+                            // (a queue of structs spreads its members by it).
+                            self.module
+                                .var_decl_types
+                                .insert(name.clone(), data_type.clone());
+                            if let crate::ast::types::DataType::TypeReference { name: tn, .. } =
+                                data_type
+                            {
+                                if self.module.classes.contains_key(&tn.name.name) {
+                                    self.module
+                                        .array_elem_class
+                                        .insert(name.clone(), tn.name.name.clone());
+                                }
+                            }
+                        }
                         // A QUEUE-typed local (`int a[$];`, possibly with
                         // a bound `[$:N]`) keeps the queue semantics -
                         // index-at-size appends, size tracking on
@@ -93477,6 +93499,8 @@ impl Simulator {
         self.module.associative_arrays.remove(key);
         self.module.queue_max_sizes.remove(key);
         self.module.descending_arrays.remove(key);
+        self.module.var_decl_types.remove(key);
+        self.module.array_elem_class.remove(key);
         self.signals.remove(&format!("{}.size", key));
         self.widths.remove(key);
         self.string_signals.remove(key);
@@ -102709,6 +102733,17 @@ impl Simulator {
     /// collection properties (via [`Self::expr_assoc_name`]).
     fn dyn_cmp_operand_name(&mut self, e: &Expression) -> Option<String> {
         if let ExprKind::Ident(h) = &e.kind {
+            // A method-local queue under its per-call storage key.
+            if let [seg] = h.path.as_slice() {
+                let bare = seg.name.name.as_str();
+                if seg.selects.is_empty() {
+                    if let Some(uq) = self.dyn_name_lookup(bare).filter(|uq| *uq != bare) {
+                        if self.module.dynamic_arrays.contains(uq) {
+                            return Some(uq.to_string());
+                        }
+                    }
+                }
+            }
             // A bare-identifier dyn array / queue formal or local registered
             // in `dynamic_arrays`. Consult `this`-scoped members first so a
             // member name hidden by an unrelated outer bare registration
@@ -103820,12 +103855,21 @@ impl Simulator {
         }
         let size = self.get_queue_size(&cname);
         let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
-        let vals: Vec<Value> = (0..size)
-            .map(|j| {
-                self.get_signal_value_by_name(&format!("{}[{}]", cname, j))
-                    .unwrap_or_else(|| Value::zero(w))
-            })
-            .collect();
+        // A queue of unpacked structs keeps its members as separate leaves
+        // (`q[0].addr`); those are copied element-wise below.
+        let elem_struct = (*cname != *pname)
+            .then(|| self.queue_elem_struct(&cname))
+            .flatten();
+        let vals: Vec<Value> = if elem_struct.is_some() {
+            Vec::new()
+        } else {
+            (0..size)
+                .map(|j| {
+                    self.get_signal_value_by_name(&format!("{}[{}]", cname, j))
+                        .unwrap_or_else(|| Value::zero(w))
+                })
+                .collect()
+        };
         // §13.5.2: a queue FORMAL lives under its BARE name, so a nested
         // call whose formal has the SAME name overwrites this frame's
         // storage — and the outer frame then keeps appending to whatever the
@@ -103844,6 +103888,12 @@ impl Simulator {
         }
         self.module.arrays.insert(pname.to_string(), (0, -1, w));
         self.module.dynamic_arrays.insert(pname.to_string());
+        if let Some(su) = &elem_struct {
+            for j in 0..size {
+                let (src, dst) = (format!("{}[{}]", cname, j), format!("{}[{}]", pname, j));
+                self.copy_unpacked_struct(&dst, &src, su);
+            }
+        }
         for (j, v) in vals.into_iter().enumerate() {
             self.set_signal_value_by_name(&format!("{}[{}]", pname, j), v);
         }
@@ -104141,16 +104191,22 @@ impl Simulator {
             {
                 return None;
             }
-            if self.dyn_name_lookup(obj_name).is_none() {
-                match self.instance_assoc_member(obj_name) {
+            match self.dyn_name_lookup(obj_name) {
+                None => match self.instance_assoc_member(obj_name) {
                     Some(scoped) => {
                         _inst_scoped = scoped;
                         _inst_scoped.as_str()
                     }
                     None => obj_name,
+                },
+                // A local under its per-call storage key: a same-named
+                // registration elsewhere (another subroutine's bare local)
+                // must not capture the call.
+                Some(uq) if uq != obj_name => {
+                    _inst_scoped = uq.to_string();
+                    _inst_scoped.as_str()
                 }
-            } else {
-                obj_name
+                Some(_) => obj_name,
             }
         } else {
             obj_name

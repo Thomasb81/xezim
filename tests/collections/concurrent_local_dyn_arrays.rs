@@ -1,11 +1,9 @@
 //! IEEE 1800-2023 §9.3.2 / §6.21: automatic (default) task/method locals are
 //! per-invocation. Two concurrent task invocations (fork/join siblings) each
-//! declaring `int edges[$]` must NOT share storage. xezim now isolates
-//! ASSOCIATIVE-ARRAY locals per-invocation (this is what fixes the UVM
-//! time-0 stall — `sync_phase`'s `edges_t edges`). QUEUE/dynamic-array local
-//! isolation is correct in principle but currently DEFERRED (it regresses the
-//! register model); the queue tests below are `#[ignore]` until that path is
-//! fixed. Verified byte-for-byte against reference simulators.
+//! declaring `int edges[$]` must NOT share storage. Associative-array locals
+//! were isolated first (the UVM time-0 stall — `sync_phase`'s `edges_t
+//! edges`); queue and dynamic-array locals of class methods now are too.
+//! Verified byte-for-byte against reference simulators.
 
 use xezim::simulate;
 
@@ -19,7 +17,6 @@ fn out(src: &str) -> String {
 }
 
 #[test]
-#[ignore = "queue-local isolation deferred: regresses uvm_reg_map::do_bus_access `addrs=map_info.addr`"]
 fn concurrent_fork_queues_do_not_clobber() {
     // Each fork child fills its own local queue, suspends (#0), then re-reads.
     // Without per-invocation storage the sibling's VarDecl zeroes the queue.
