@@ -112,9 +112,9 @@ Current capabilities include:
 
 ### Non-standard extensions
 
-These are **not** part of IEEE 1800 — they are de-facto vendor (Verilog-XL / VCS /
-Questa / Xcelium) extensions supported for compatibility with existing gate-level
-and testbench flows. Portable code should not rely on them.
+These are **not** part of IEEE 1800 — they are de-facto extensions of commercial
+simulators, supported for compatibility with existing gate-level and testbench
+flows. Portable code should not rely on them.
 
 * **`$deposit(target, value)`** — sets `target` to `value` immediately *without*
   installing a persistent driver: the value holds until the next driver
