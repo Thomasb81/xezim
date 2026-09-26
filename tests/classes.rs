@@ -312,6 +312,8 @@ mod nested_rand_inline_constraints;
 mod null_deref_fatal;
 #[path = "classes/shadowed_property_initializers.rs"]
 mod shadowed_property_initializers;
+#[path = "classes/std_randomize_object_member.rs"]
+mod std_randomize_object_member;
 #[path = "classes/typedef_param_class_construction.rs"]
 mod typedef_param_class_construction;
 #[path = "classes/typename_class_operands.rs"]

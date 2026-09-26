@@ -93739,6 +93739,10 @@ impl Simulator {
                                 } else if let ExprKind::Ident(hh) = &a.kind {
                                     targets
                                         .push((self.resolve_hier_name(hh).into_owned(), a.clone()));
+                                } else if let Some(n) = self.constraint_operand_name(a) {
+                                    // A class property named through its
+                                    // handle (`obj.member`, `o.sub.member`).
+                                    targets.push((n, a.clone()));
                                 }
                             }
                             let mut satisfied = false;
@@ -95918,6 +95922,7 @@ impl Simulator {
         e: &Expression,
         names: &HashMap<String, usize>,
         ncols: usize,
+        members: bool,
     ) -> Option<(Vec<i128>, i128)> {
         // A bare target leaf (matched by last path segment, as the constraint
         // solver matches rand props / scope-randomize targets everywhere).
@@ -95930,9 +95935,21 @@ impl Simulator {
                 }
             }
         }
+        // A scope target named through a handle (`std::randomize(obj.m)`,
+        // `members`), keyed by `constraint_operand_name` like the targets.
+        if members && matches!(e.kind, ExprKind::MemberAccess { .. }) {
+            if let Some(&idx) = self.constraint_operand_name(e).and_then(|n| names.get(&n)) {
+                let mut c = vec![0i128; ncols];
+                c[idx] = 1;
+                return Some((c, 0));
+            }
+        }
         // A subexpression naming no target is a plain constant.
         let mut ids = HashSet::default();
         self.collect_expr_idents(e, &mut ids);
+        if members {
+            self.collect_member_operand_names(e, &mut ids);
+        }
         if !names.keys().any(|n| ids.contains(n)) {
             let v = self.eval_expr(e);
             let k: i128 = if self.constraint_cmp_unsigned {
@@ -95943,19 +95960,21 @@ impl Simulator {
             return Some((vec![0i128; ncols], k));
         }
         match &e.kind {
-            ExprKind::Paren(inner) => self.affine_cols(inner, names, ncols),
+            ExprKind::Paren(inner) => self.affine_cols(inner, names, ncols, members),
             ExprKind::SystemCall { name, args } => match name.as_str() {
-                "$__xz_size_cast" if args.len() == 2 => self.affine_cols(&args[1], names, ncols),
+                "$__xz_size_cast" if args.len() == 2 => {
+                    self.affine_cols(&args[1], names, ncols, members)
+                }
                 "$signed" | "$unsigned" if args.len() == 1 => {
-                    self.affine_cols(&args[0], names, ncols)
+                    self.affine_cols(&args[0], names, ncols, members)
                 }
                 _ => None,
             },
             ExprKind::Binary { op, left, right }
                 if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) =>
             {
-                let (lc, lk) = self.affine_cols(left, names, ncols)?;
-                let (rc, rk) = self.affine_cols(right, names, ncols)?;
+                let (lc, lk) = self.affine_cols(left, names, ncols, members)?;
+                let (rc, rk) = self.affine_cols(right, names, ncols, members)?;
                 let mut c = vec![0i128; ncols];
                 match op {
                     BinaryOp::Add => {
@@ -96033,8 +96052,10 @@ impl Simulator {
                 return None;
             }
         }
-        let (lc, lk) = self.affine_cols(left, names, ncols)?;
-        let (rc, rk) = self.affine_cols(right, names, ncols)?;
+        // Scope randomization (no object) may name targets through handles.
+        let members = obj_handle.is_none();
+        let (lc, lk) = self.affine_cols(left, names, ncols, members)?;
+        let (rc, rk) = self.affine_cols(right, names, ncols, members)?;
         let mut coeffs = vec![0i128; ncols];
         let mut any = false;
         for i in 0..ncols {
@@ -96381,6 +96402,28 @@ impl Simulator {
                         fh.cached_resolved_name = std::cell::OnceCell::new();
                         return Some(self.resolve_hier_name(&fh).into_owned());
                     }
+                }
+                // A deeper select chain (`o.f.value`): the name of the same
+                // path written as one dotted identifier.
+                if matches!(expr.kind, ExprKind::MemberAccess { .. }) {
+                    let segs = Self::flatten_member_path(e)?;
+                    let fh = crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: segs
+                            .into_iter()
+                            .map(|n| crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: n,
+                                    span: member.span,
+                                },
+                                selects: Vec::new(),
+                            })
+                            .collect(),
+                        span: e.span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    };
+                    return Some(self.resolve_hier_name(&fh).into_owned());
                 }
                 None
             }
@@ -128810,6 +128853,49 @@ impl Simulator {
                     || Self::expr_unmodeled(else_expr)
             }
             _ => false,
+        }
+    }
+
+    /// The `constraint_operand_name` of every member-select operand in
+    /// `expr` (`collect_expr_idents` names only the base of `obj.m`).
+    fn collect_member_operand_names(&self, expr: &Expression, out: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::MemberAccess { .. } => {
+                if let Some(n) = self.constraint_operand_name(expr) {
+                    out.insert(n);
+                }
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.collect_member_operand_names(operand, out)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.collect_member_operand_names(left, out);
+                self.collect_member_operand_names(right, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_member_operand_names(condition, out);
+                self.collect_member_operand_names(then_expr, out);
+                self.collect_member_operand_names(else_expr, out);
+            }
+            ExprKind::Concatenation(exprs) => {
+                for e in exprs {
+                    self.collect_member_operand_names(e, out);
+                }
+            }
+            ExprKind::Call { args, .. } | ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    self.collect_member_operand_names(a, out);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                self.collect_member_operand_names(expr, out);
+                self.collect_member_operand_names(index, out);
+            }
+            _ => {}
         }
     }
 
