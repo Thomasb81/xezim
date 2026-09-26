@@ -162,6 +162,8 @@ mod cov_covergroup_basic;
 mod coverage_auto_bins;
 #[path = "classes/covergroup_coverage_query.rs"]
 mod covergroup_coverage_query;
+#[path = "classes/covergroup_placement.rs"]
+mod covergroup_placement;
 #[path = "classes/factory_run_test.rs"]
 mod factory_run_test;
 #[path = "classes/foreach_member_multidim.rs"]

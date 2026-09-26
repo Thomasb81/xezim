@@ -5892,7 +5892,7 @@ pub struct Simulator {
     method_def_cache: std::cell::RefCell<
         HashMap<String, HashMap<String, Option<(String, Arc<crate::ast::decl::ClassMethod>)>>>,
     >,
-    /// Every covergroup key and its leaf after the last `::` (see
+    /// Every covergroup key and its leaf after the last `::` or `.` (see
     /// `covergroup_def_for`).
     covergroup_leaf_names: std::cell::OnceCell<HashSet<String>>,
     /// Class -> the `string_properties` of it and its ancestors, in chain
@@ -74624,7 +74624,7 @@ impl Simulator {
                                     ));
                                 }
                             }
-                        } else if let Some(cg_def) = self.module.covergroups.get(cn).cloned() {
+                        } else if let Some(cg_def) = self.covergroup_def_for(cn) {
                             // IEEE 1800-2017 §19.8: a covergroup-typed
                             // LOCAL `cg c = new();` (declared inside a
                             // procedural block) must allocate a real
@@ -112310,6 +112310,11 @@ impl Simulator {
                         let mname = hier.path.last().unwrap().name.name.clone();
                         return self.exec_method_call(h, &mname, args);
                     }
+                    // A covergroup of another instance (`u0.cg.sample()`).
+                    if let Some(idx) = self.cg_index(h) {
+                        let mname = hier.path.last().unwrap().name.name.clone();
+                        return self.exec_cg_method_call(idx, &mname, args);
+                    }
                 }
             }
             // Handle static/constructor call: class_name::f() or new()
@@ -116012,6 +116017,10 @@ impl Simulator {
                     if let Some((_, leaf)) = k.rsplit_once("::") {
                         set.insert(leaf.to_string());
                     }
+                    // An instance's covergroup, `<inst>.cg`.
+                    if let Some((_, leaf)) = k.rsplit_once('.') {
+                        set.insert(leaf.to_string());
+                    }
                 }
                 set
             });
@@ -116048,6 +116057,20 @@ impl Simulator {
                 .classes
                 .get(&base)
                 .and_then(|cd| cd.extends.clone());
+        }
+        // §19.3: a covergroup declared in a module instance is registered as
+        // `<inst>.cg`; the running process's instance scope (a declaration
+        // initializer carries its instance) picks that instance's type.
+        if !tname.contains(':') {
+            let scope = self.active_instance_scope();
+            let mut p: &str = &scope;
+            while !p.is_empty() {
+                let key = format!("{}.{}", p, tname);
+                if let Some(d) = self.module.covergroups.get(&key) {
+                    return Some(d.clone());
+                }
+                p = p.rsplit_once('.').map(|(a, _)| a).unwrap_or("");
+            }
         }
         self.module.covergroups.get(tname).cloned()
     }

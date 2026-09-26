@@ -15,7 +15,7 @@ how to read the results.
 
 | Area | Supported |
 |---|---|
-| Where covergroups live | The top-level module, and classes declared in a package or at file scope. See [Where a covergroup can be declared](#where-a-covergroup-can-be-declared) |
+| Where covergroups live | Any module (the top or an instantiated one), an interface, a package, file scope, and classes. See [Where a covergroup can be declared](#where-a-covergroup-can-be-declared) |
 | Sampling | A sampling event (`covergroup cg @(posedge clk)`), explicit `sample()`, `with function sample(...)` arguments, constructor arguments (`covergroup cg (int lo, int hi)`) |
 | Bins | Values and ranges (`{0, [2:5], [8:$]}`), automatic bins, array bins `name[]`, `wildcard` bins, transition bins `(1 => 2 => 3)` and `([0:1] => [2:3])`, `default`, `ignore_bins`, `illegal_bins` |
 | Guards | `coverpoint x iff (cond)`, `cross a, b iff (cond)` |
@@ -382,7 +382,7 @@ The file for the [module example](#a-covergroup-in-a-module-sampled-on-a-clock):
 | `assertion_pass_total`, `assertion_fail_total` | The sums of the `pass` and `fail` fields of `assertions` |
 | `assertions` | One entry per assertion or cover statement; see below |
 | `covergroups` | One entry per covergroup instance, in creation order |
-| `covergroups[].name` | The covergroup type: `alu_cg`, or `packet::pkt_cg` for one declared in class `packet`. Instances of one type share the name |
+| `covergroups[].name` | The covergroup type: `alu_cg`, `packet::pkt_cg` for one declared in class `packet`, or `u0.v_cg` for one declared in the module instantiated as `u0` (the instance path below the top module). Instances of one type share the name |
 | `covergroups[].samples` | How many times the instance was sampled (sampling events plus `sample()` calls) |
 | `covergroups[].coverpoints` | Per coverpoint, the number of **distinct values** sampled (not bins) |
 | `covergroups[].crosses` | Per cross, the number of distinct value combinations sampled |
@@ -533,20 +533,15 @@ hit, so a combined percentage can't be worked out from them alone.
 
 #### Where a covergroup can be declared
 
-A covergroup instance is created only when the covergroup is declared in:
+A covergroup can be declared in any module (the top or one instantiated below it,
+and every top of a design with several), an interface, a package, at file scope,
+and in a class wherever the class is declared.
 
-- the top-level module of a design with one top, or
-- a class declared in a package or at file scope.
-
-A covergroup declared anywhere else is never created. This covers a module
-instantiated below the top, an interface, a class declared inside a module, a
-covergroup declared directly at file scope or in a package, and every module of a
-design with several tops (`-s a -s b`). Its `new()` gives a handle whose queries
-return 0, and it doesn't appear in the results file. In those places, move the
-covergroup into a class in a package, and create that class from the testbench.
-
-Assertion coverage has no such restriction: `cover property` and the assertions are
-counted in every module instance.
+A covergroup declared in a module or interface is a separate type in each instance
+of that module: `get_coverage()` averages the covergroup's instances within that
+module instance only, and `$get_coverage()` counts each module instance's type
+once. A covergroup declared in a package is one type however many modules create
+it.
 
 **Covergroup features that are accepted but have no effect, or only a partial one:**
 

@@ -2986,6 +2986,9 @@ fn package_member_names(items: &[PackageItem]) -> Option<HashSet<String>> {
             PackageItem::Class(c) => {
                 out.insert(c.name.name.clone());
             }
+            PackageItem::Covergroup(cg) => {
+                out.insert(cg.name.name.clone());
+            }
             PackageItem::DPIImport(d) => {
                 out.extend(dpi_name(d));
             }
