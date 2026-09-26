@@ -533,6 +533,9 @@ pub enum Insn {
     /// Suspend the process until the wait spec (index into the owning
     /// FSM's `wait_specs` table) fires. Process bodies only.
     WaitEdge(u32),
+    /// Code coverage: count counter `n` (see `simulator::code_cov`). Reads
+    /// and writes no register; only instrumented designs contain it.
+    CovHit(u32),
 }
 
 /// Pre-resolved unpacked-array addressing embedded in bytecode. The name is
@@ -595,7 +598,7 @@ impl Insn {
     pub fn offset_regs_and_targets(&mut self, rb: RegId, ib: u32) -> bool {
         use Insn::*;
         match self {
-            Nop => {}
+            Nop | CovHit(_) => {}
             BinOpConstAdd2(a) => {
                 a.d1 += rb;
                 a.s1 += rb;
@@ -827,6 +830,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::BinOpConstAdd2(..) => "AddC2",
         Insn::WaitDelayReg(..) => "WaitDly",
         Insn::WaitEdge(..) => "WaitEdge",
+        Insn::CovHit(..) => "CovHit",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Eq) => "EqC",
         Insn::BinOpConst(_, _, _, BinOpConstKind::CaseEq) => "CaseEqC",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Xor) => "XorC",
@@ -6098,6 +6102,12 @@ impl<'a> BytecodeCompiler<'a> {
     /// Compile a statement. Returns true on success.
     /// When `allow_ast_fallback` is set, any nested failure rolls back and
     /// emits a single `StmtFallback` for the whole statement.
+    /// Count code coverage counter `c` first (an instrumented continuous
+    /// assignment's entry).
+    pub fn emit_cov_hit(&mut self, c: u32) {
+        self.emit(Insn::CovHit(c));
+    }
+
     pub fn compile_stmt(&mut self, stmt: &Statement) -> bool {
         // §6.21: a block-local declaration that SHADOWS a module signal needs
         // the whole enclosing block interpreted as one unit — the AST path
@@ -6590,6 +6600,24 @@ impl<'a> BytecodeCompiler<'a> {
                 true
             }
             // Bail out on anything else (timing controls, loops, system tasks, etc.)
+            StatementKind::Expr(e)
+                if matches!(&e.kind, ExprKind::SystemCall { name, .. }
+                    if name == crate::compiler::simulator::COV_HIT_TASK) =>
+            {
+                let ExprKind::SystemCall { args, .. } = &e.kind else {
+                    return false;
+                };
+                match args
+                    .first()
+                    .and_then(crate::compiler::simulator::cov_marker_id)
+                {
+                    Some(c) => {
+                        self.emit(Insn::CovHit(c));
+                        true
+                    }
+                    None => false,
+                }
+            }
             StatementKind::Expr(e) => {
                 // §6.24.1: `void'(expr)` lowers to `Paren(expr)` (the cast is
                 // a pure discard). The old `Paren(_) => no-op` arm below then
@@ -11517,7 +11545,7 @@ impl<'a> BytecodeCompiler<'a> {
     pub(crate) fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
         match insn {
             Insn::WaitDelayReg(d) => *d == r,
-            Insn::WaitEdge(..) => false,
+            Insn::WaitEdge(..) | Insn::CovHit(..) => false,
             Insn::CmpBranch(_, l, rr, _, _) => *l == r || *rr == r,
             Insn::MoveResize(_, s, _) => *s == r,
             Insn::CaseLut(_, src, _) => *src == r,
@@ -13489,6 +13517,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // No register destination.
                 Insn::WaitDelayReg(..)
                 | Insn::WaitEdge(..)
+                | Insn::CovHit(..)
                 | Insn::BranchIfFalse(..)
                 | Insn::BranchUnlessZero(..)
                 | Insn::BranchIfSignalFalse(..)
@@ -15030,6 +15059,8 @@ pub enum TsInsn {
         raw: u64,
         resume: u32,
     },
+    /// `Insn::CovHit`; undone on a bail like a hazard save.
+    CovHit(u32),
 }
 
 pub struct TwoStateBlock {
@@ -18084,6 +18115,9 @@ pub fn lower_two_state(
                 side_effects = true;
                 out.push(TsInsn::Fallback(payload.0.clone()));
             }
+            // The executors note each count on the save list, so a bail takes
+            // it back before the four-state re-run counts again.
+            Insn::CovHit(c) => out.push(TsInsn::CovHit(*c)),
             _ => return None,
         }
     }

@@ -173,6 +173,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Phase 2: minimum same-slot ratio for a fusion edge (default 0.9)",
     ),
     (
+        "XEZIM_CODE_COVERAGE",
+        "Coverage: collect code coverage, like --code-coverage=<kinds> (stmt,all); the flag wins",
+    ),
+    (
         "XEZIM_COMB_GRAPH",
         "Profiling: write the comb operand graph (entry read/write ids, edge-block write ids) to the given path",
     ),

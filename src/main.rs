@@ -178,6 +178,12 @@ fn print_usage() {
                    (§6.21) with a warning instead of an error. Also enabled by
                    XEZIM_ALLOW_IMPLICIT_STATIC=1."
     );
+    eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
+    eprintln!("                   stmt (or all, the default). Counts go to");
+    eprintln!("                   xezim_cov.json (XEZIM_COV_DB) with the functional coverage;");
+    eprintln!("                   --verbose prints a summary. XEZIM_CODE_COVERAGE=<kinds> too.");
+    eprintln!("  --code-coverage-scope <path>[,<path>...]  Only instrument these instance");
+    eprintln!("                   subtrees (tb.dut) and packages. Repeatable.");
     eprintln!("  --verbose        Internal engine lines, off by default: the version banner,");
     eprintln!("                   [PHASE] timings, end-of-run engine counters ([PROF]/[FUSE]/");
     eprintln!("                   [EVENT-EDGE]/[COV]), compile-time optimisation notes and");
@@ -334,8 +340,10 @@ fn print_usage() {
         "  -work/-L/-Lf/-lib <lib>  Ignored with one warning: every run compiles from source"
     );
     eprintln!("  -sv12compat, -sv17compat  Same as --sv2017 (-sv05compat/-sv09compat warn)");
+    eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s = stmt;");
+    eprintln!("                   bare = all. Other letters are ignored with a warning");
     eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -<step>args=..,");
-    eprintln!("  -suppress <ids>, +cover[=..], +fcover, -coverage, -sva,");
+    eprintln!("  -suppress <ids>, +fcover, -sva,");
     eprintln!("  -assertdebug     Accepted, no effect");
     eprintln!("  -sfcu, -t <res>, -wlf <file>  Accepted with a warning (one compilation unit;");
     eprintln!("                   finest precision; waveforms come from --fst/--wave)");
@@ -1704,6 +1712,9 @@ fn run_main() -> i32 {
     let mut xtrace_profile: Option<String> = None;
     let mut xtrace_compress: Option<String> = None;
     let mut wave = false;
+    // `--code-coverage[=<kinds>]` / `--code-coverage-scope`.
+    let mut code_cov_kinds: Option<u8> = None;
+    let mut code_cov_scopes: Vec<String> = Vec::new();
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
@@ -2217,6 +2228,44 @@ fn run_main() -> i32 {
             "--wave" => {
                 wave = true;
             }
+            "--code-coverage" => {
+                code_cov_kinds = Some(xezim::compiler::simulator::KIND_STATEMENT);
+            }
+            _ if arg.starts_with("--code-coverage=") => {
+                match xezim::compiler::simulator::parse_code_coverage_kinds(
+                    &arg["--code-coverage=".len()..],
+                ) {
+                    Ok(k) => code_cov_kinds = Some(k),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "--code-coverage-scope" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => code_cov_scopes.extend(
+                        v.split(',')
+                            .map(str::trim)
+                            .filter(|p| !p.is_empty())
+                            .map(String::from),
+                    ),
+                    None => {
+                        eprintln!("Error: --code-coverage-scope requires an instance path");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ if arg.starts_with("--code-coverage-scope=") => {
+                code_cov_scopes.extend(
+                    arg["--code-coverage-scope=".len()..]
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(String::from),
+                );
+            }
             "--fst" => {
                 i += 1;
                 if i < args.len() {
@@ -2567,6 +2616,67 @@ fn run_main() -> i32 {
                 std::process::exit(1);
             }
         }
+    }
+
+    // Code coverage: `--code-coverage` wins over XEZIM_CODE_COVERAGE, which
+    // wins over other simulators' `+cover` / `-coverage`.
+    let cover_request = cli_compat::cover_request(&compat);
+    if let (Some(spec), Some((kinds, unsupported))) = (&compat.cover, &cover_request) {
+        if !unsupported.is_empty() {
+            let names: Vec<String> = unsupported
+                .chars()
+                .map(|c| match c {
+                    'b' => "branch (b)".to_string(),
+                    't' => "toggle (t)".to_string(),
+                    'c' => "condition (c)".to_string(),
+                    'e' => "expression (e)".to_string(),
+                    'f' => "FSM (f)".to_string(),
+                    'x' => "extended toggle (x)".to_string(),
+                    _ => format!("'{}'", c),
+                })
+                .collect();
+            let kept: Vec<&str> = [(xezim::compiler::simulator::KIND_STATEMENT, "statement")]
+                .iter()
+                .filter(|(k, _)| kinds & k != 0)
+                .map(|(_, n)| *n)
+                .collect();
+            eprintln!(
+                "Warning: +cover={}: xezim has no {} coverage; collecting {}",
+                spec,
+                names.join(", "),
+                if kept.is_empty() {
+                    "no code coverage".to_string()
+                } else {
+                    format!("{} coverage", kept.join(", "))
+                }
+            );
+        }
+    }
+    let env_cov = match env::var("XEZIM_CODE_COVERAGE") {
+        Ok(v) if !v.is_empty() && v != "0" => {
+            match xezim::compiler::simulator::parse_code_coverage_kinds(&v) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    eprintln!("Error: XEZIM_CODE_COVERAGE: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => None,
+    };
+    let code_cov = code_cov_kinds
+        .or(env_cov)
+        .or(cover_request.map(|(k, _)| k))
+        .unwrap_or(0);
+    if code_cov != 0 {
+        xezim::compiler::simulator::set_code_coverage(Some(
+            xezim::compiler::simulator::CodeCoverage {
+                kinds: code_cov,
+                scopes: code_cov_scopes,
+            },
+        ));
+    } else if !code_cov_scopes.is_empty() {
+        eprintln!("Warning: --code-coverage-scope has no effect without --code-coverage");
     }
 
     // Opt-in statistics footer: the CLI flag wins over XEZIM_REPORT_STATS.

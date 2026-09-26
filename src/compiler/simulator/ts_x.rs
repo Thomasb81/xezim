@@ -885,6 +885,7 @@ impl Simulator {
                     // Hazard saves exist for the abort path; this executor
                     // never aborts.
                     TsInsn::SaveSig { .. } | TsInsn::SaveSigW { .. } => {}
+                    TsInsn::CovHit(c) => self.ts_cov_hit(*c),
                     TsInsn::Fallback(..)
                     | TsInsn::WaitEdge { .. }
                     | TsInsn::WaitDelayRaw { .. }

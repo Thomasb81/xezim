@@ -1025,6 +1025,10 @@ struct CombEntryCold {
     /// can name file:line for a non-converging driver. `Span::dummy()` when
     /// the origin has no source (synthesized entries).
     span: crate::ast::Span,
+    /// Code coverage counter of an interpreted continuous assignment (the
+    /// compiled form counts with an `Insn::CovHit`). Never cached.
+    #[serde(skip)]
+    cov: Option<u32>,
 }
 
 const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB009";
@@ -2102,12 +2106,17 @@ impl NbaFastIndex {
     }
 }
 
+mod code_cov;
 mod module_paths;
 mod rand_csp;
 mod rand_scope;
 mod timing_checks;
 mod ts_x;
 mod uvm_dpi;
+pub use code_cov::{
+    CodeCoverage, KIND_STATEMENT, parse_kinds as parse_code_coverage_kinds, set_code_coverage,
+};
+pub(crate) use code_cov::{HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id};
 pub use timing_checks::{set_no_notifier, set_no_tchk_msg, set_no_timing_checks};
 
 #[cfg(test)]
@@ -4485,6 +4494,9 @@ const TS_ABORT_DEMOTE: u16 = 8;
 /// Flag bit in a `ts_save_list` id marking a wide save entry (signal ids
 /// stay below it).
 const TS_SAVE_WIDE: u32 = 1 << 31;
+/// Flag bit in a `ts_save_list` id marking a code coverage count to take back
+/// when the block bails (the four-state re-run counts it again).
+const TS_SAVE_COV: u32 = 1 << 30;
 /// Consecutive x-read bails before a block is put to sleep.
 const TS_XBAIL_STREAK: u8 = 8;
 /// First sleep, in successful two-state evaluations design-wide (about half
@@ -5304,6 +5316,12 @@ pub struct Simulator {
     /// Emitted at end-of-sim under `[COV] assertion summary` + (when
     /// `XEZIM_COV_DB` is set) the JSON coverage database file.
     assertion_stats: HashMap<usize, AssertionStat>,
+    /// Code coverage sites and toggle state (`--code-coverage`); `None` when
+    /// the run collects none. See `code_cov`.
+    code_cov: Option<Box<code_cov::CodeCov>>,
+    /// Code coverage counters, indexed by the id a `$__xz_cov` marker or an
+    /// `Insn::CovHit` carries. Empty when the run collects none.
+    code_cov_hits: Vec<u64>,
     /// Call stack for tracking 'this' and local variables.
     this_stack: Vec<Option<usize>>,
     /// One-shot: the next `exec_task_call` runs an INSTANCE (module or
@@ -8132,6 +8150,7 @@ impl Simulator {
                     let alias = format!("__xz_edgesel{}", new_signals.len());
                     new_signals.push(alias.clone());
                     new_assigns.push(super::elaborate::ContinuousAssignment {
+                        origin: None,
                         lhs: mk_ident(&alias, span),
                         rhs,
                         delay: 0,
@@ -8471,6 +8490,7 @@ impl Simulator {
                 module
                     .continuous_assigns
                     .push(super::elaborate::ContinuousAssignment {
+                        origin: None,
                         lhs: mk_ident(&nm, rhs.span),
                         rhs,
                         delay: 0,
@@ -9869,6 +9889,8 @@ impl Simulator {
             semaphores: HashMap::default(),
             cg_heap: vec![None],
             assertion_stats: HashMap::default(),
+            code_cov: None,
+            code_cov_hits: Vec::new(),
             this_stack: vec![],
             task_clears_this: false,
             local_stack: vec![],
@@ -11327,6 +11349,7 @@ impl Simulator {
             for insn in &cb.instructions {
                 match insn {
                     Insn::StmtFallback(..)
+                    | Insn::CovHit(..)
                     | Insn::EvalExprFallback(..)
                     | Insn::BlockingAssign(..)
                     | Insn::BlockingAssignRange(..)
@@ -14157,6 +14180,7 @@ impl Simulator {
         if self.compiled {
             return;
         }
+        self.instrument_code_coverage();
         let trace_compile_phases = std::env::var_os("XEZIM_COMPILE_PHASES").is_some();
         let mut compile_phase_start = std::time::Instant::now();
         let mark_compile_phase = |label: &str, start: &mut std::time::Instant| {
@@ -15723,6 +15747,7 @@ impl Simulator {
                             // catch-all in exec_comb_block_isolated): array /
                             // dynamic-range blocking writes and AST fallback.
                             Insn::StmtFallback(..)
+                            | Insn::CovHit(..)
                             | Insn::EvalExprFallback(..)
                             | Insn::BlockingAssignArray(..)
                             | Insn::BlockingAssignArrayRange(..)
@@ -17639,11 +17664,12 @@ impl Simulator {
                 },
                 CombItem::CompiledContAssign { compiled, .. }
                 | CombItem::CompiledAlwaysBlock { compiled, .. } => {
-                    if compiled
-                        .instructions
-                        .iter()
-                        .any(|i| matches!(i, Insn::StmtFallback(..) | Insn::EvalExprFallback(..)))
-                    {
+                    if compiled.instructions.iter().any(|i| {
+                        matches!(
+                            i,
+                            Insn::StmtFallback(..) | Insn::EvalExprFallback(..) | Insn::CovHit(..)
+                        )
+                    }) {
                         SendCombItem::AstFallback
                     } else {
                         SendCombItem::Compiled(compiled.clone())
@@ -18652,6 +18678,9 @@ impl Simulator {
                 self.finished = false;
             }
             self.finished = was_finished;
+        }
+        if self.code_cov.is_some() {
+            self.emit_coverage_summary();
         }
         // Flush any `--warn-x` reports captured during the final region.
         self.drain_warn_x();
@@ -24209,6 +24238,7 @@ impl Simulator {
                 TsInsn::RedAnd { d, s, mask } => {
                     regs[*d as usize] = (regs[*s as usize] == *mask) as u64;
                 }
+                TsInsn::CovHit(c) => self.ts_cov_hit(*c),
                 TsInsn::WaitEdge { .. } | TsInsn::WaitDelayRaw { .. } => {
                     // FSM streams run on the control executor only.
                     bail!();
@@ -25189,6 +25219,7 @@ impl Simulator {
                     TsInsn::RedAnd { d, s, mask } => {
                         r!(*d) = (r!(*s) == *mask) as u64;
                     }
+                    TsInsn::CovHit(c) => self.ts_cov_hit(*c),
                     TsInsn::WaitEdge { .. } | TsInsn::WaitDelayRaw { .. } => {
                         // FSM streams run on the control executor only.
                         return false;
@@ -25638,6 +25669,12 @@ impl Simulator {
             let Some((sig, v, x)) = self.ts_save_list.pop() else {
                 break;
             };
+            if sig & (TS_SAVE_WIDE | TS_SAVE_COV) == TS_SAVE_COV {
+                if let Some(h) = self.code_cov_hits.get_mut((sig & !TS_SAVE_COV) as usize) {
+                    *h = h.saturating_sub(1);
+                }
+                continue;
+            }
             if sig & TS_SAVE_WIDE != 0 {
                 // A wide save: `v` words follow, highest first.
                 let id = (sig & !TS_SAVE_WIDE) as usize;
@@ -26589,6 +26626,7 @@ impl Simulator {
                     TsInsn::RedAnd { d, s, mask } => {
                         (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) == *mask) as u64;
                     }
+                    TsInsn::CovHit(c) => self.ts_cov_hit(*c),
                     TsInsn::WaitEdge { ix, resume } => {
                         self.fsm_suspend = Some((*resume, FsmWait::Edge(*ix)));
                         return true;
@@ -28143,6 +28181,7 @@ impl Simulator {
                     matches!(
                         insn,
                         super::bytecode::Insn::StmtFallback(..)
+                            | super::bytecode::Insn::CovHit(..)
                             | super::bytecode::Insn::EvalExprFallback(..)
                     )
                 })
@@ -28172,6 +28211,7 @@ impl Simulator {
                 for insn in &cb.instructions {
                     match insn {
                         BcInsn::StmtFallback(..)
+                        | BcInsn::CovHit(..)
                         | BcInsn::EvalExprFallback(..)
                         | BcInsn::BlockingAssign(..)
                         | BcInsn::BlockingAssignRange(..)
@@ -28367,6 +28407,7 @@ impl Simulator {
                     matches!(
                         i,
                         Insn::StmtFallback(..)
+                            | Insn::CovHit(..)
                             | Insn::EvalExprFallback(..)
                             | Insn::BlockingAssign(..)
                             | Insn::BlockingAssignRange(..)
@@ -29120,7 +29161,9 @@ impl Simulator {
                         "parallel block should not contain fallback/blocking/NbaRangeDyn instructions"
                     );
                 }
-                Insn::Nop => {}
+                // Parallel eligibility keeps instrumented blocks sequential;
+                // an isolated run has no counters to add to.
+                Insn::Nop | Insn::CovHit(_) => {}
             }
             pc += 1;
         }
@@ -29959,11 +30002,13 @@ impl Simulator {
                 | Insn::NbaAssignArrayRange(..)
                 | Insn::BlockingAssignArrayRange(..)
                 | Insn::StmtFallback(..)
-                | Insn::EvalExprFallback(..)) => {
+                | Insn::EvalExprFallback(..)
+                | Insn::CovHit(..)) => {
                     unsupported = true;
                     if std::env::var("XEZIM_PDES_CHK_KINDS").ok().as_deref() == Some("1") {
                         let kind = match insn {
                             Insn::StmtFallback(..) => "StmtFallback",
+                            Insn::CovHit(..) => "CovHit",
                             Insn::EvalExprFallback(..) => "EvalExprFallback",
                             Insn::BlockingAssignArrayRange(..) => "BlockingAssignArrayRange",
                             Insn::NbaAssignRangeDyn(..) => "NbaAssignRangeDyn",
@@ -32351,6 +32396,7 @@ impl Simulator {
                     self.vm_regs[*d as usize] =
                         self.vm_regs[*l as usize].power(&self.vm_regs[*r as usize]);
                 }
+                Insn::CovHit(c) => self.cov_count(*c),
                 Insn::Nop => {}
             }
             pc += 1;
@@ -32360,6 +32406,8 @@ impl Simulator {
 
     fn prepared_comb_cache_eligible(&self) -> bool {
         self.prepared_comb_cache_path.is_some()
+            // Instrumented entries hold per-run counters.
+            && self.code_cov.is_none()
             && self.module.udp_instances.is_empty()
             && self.module.timing_checks.is_empty()
             && self.sdf_delays.is_empty()
@@ -32677,6 +32725,13 @@ impl Simulator {
             let explicit_delay = ca.delay;
             // Captured before `ca.lhs` may be moved into the CombItem below.
             let ca_span = ca.lhs.span;
+            // Statement coverage counts this assignment's evaluations: keep it
+            // on a form that runs a counter (compiled, or interpreted).
+            let cov_counter = if self.code_cov.is_some() {
+                self.cov_ca_counter(&ca)
+            } else {
+                None
+            };
             // §21.7.2.1 `var_type`: an object whose only driver is continuous is
             // a `wire` in a dump (see `cont_driven`). Recorded here — this is the
             // last point at which the continuous assigns still exist as ASTs.
@@ -32750,7 +32805,7 @@ impl Simulator {
                     .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads))
             };
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
-            let direct_copy = if explicit_delay == 0 {
+            let direct_copy = if explicit_delay == 0 && cov_counter.is_none() {
                 if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) =
                     (&ca.lhs.kind, &ca.rhs.kind)
                 {
@@ -32904,7 +32959,7 @@ impl Simulator {
             // Try fused-gate fast path first: recognizes yosys patterns like
             // `assign d[0] = a & b` or `assign d[0] = ~(a & b)` — executes
             // without VM dispatch, just bit reads + 4-state combinator + set_bit.
-            let fused = if explicit_delay == 0 {
+            let fused = if explicit_delay == 0 && cov_counter.is_none() {
                 self.try_build_fused_gate(&ca.lhs, &ca.rhs, scope_hint.as_deref())
             } else {
                 None
@@ -32980,6 +33035,9 @@ impl Simulator {
                 // instantiation passes it; this one simply never did.
                 compiler.set_functions(&self.module.functions);
                 compiler.top_module_name = Some(self.module.name.clone());
+                if let Some(c) = cov_counter {
+                    compiler.emit_cov_hit(c);
+                }
                 if compiler.compile_cont_assign(&ca.rhs, dst_id, width) {
                     CombItem::CompiledContAssign {
                         compiled: compiler.finish(),
@@ -33054,6 +33112,9 @@ impl Simulator {
                 // inline its calls and stayed on the AST interpreter.
                 compiler.set_functions(&self.module.functions);
                 compiler.top_module_name = Some(self.module.name.clone());
+                if let Some(c) = cov_counter {
+                    compiler.emit_cov_hit(c);
+                }
                 let lhs_w = compiler.infer_lhs_width_pub(&ca.lhs);
                 if lhs_w > 0 && compiler.compile_cont_assign_lhs(&ca.lhs, &ca.rhs, lhs_w) {
                     CombItem::CompiledContAssign {
@@ -33436,6 +33497,7 @@ impl Simulator {
             if matches!(&item, CombItem::Noop) {
                 continue;
             }
+            let cov = cov_counter.filter(|_| matches!(&item, CombItem::ContAssign { .. }));
             entries.push(CombEntry {
                 item,
                 cold: Box::new(CombEntryCold {
@@ -33443,6 +33505,7 @@ impl Simulator {
                     read_signal_ids: rids,
                     write_signal_ids: wids,
                     span: ca_span,
+                    cov,
                 }),
                 has_unresolved_reads,
                 defer_at_time0: false,
@@ -33781,6 +33844,7 @@ impl Simulator {
                         read_signal_ids: rids,
                         write_signal_ids: wids,
                         span: ab.stmt.span,
+                        cov: None,
                     }),
                     has_unresolved_reads,
                     // §9.2.2.1: a level-only `always @(sensitivity)` block
@@ -36019,6 +36083,7 @@ impl Simulator {
                     !matches!(
                         ins,
                         RIns::StmtFallback(..)
+                            | RIns::CovHit(..)
                             | RIns::EvalExprFallback(..)
                             | RIns::LoadProcessLocal(..)
                             | RIns::Format(..)
@@ -37125,6 +37190,7 @@ impl Simulator {
                             read_signal_ids: read_ids,
                             write_signal_ids: write_ids,
                             span: inst.span,
+                            cov: None,
                         }),
                         has_unresolved_reads: false,
                         defer_at_time0: false,
@@ -37179,6 +37245,7 @@ impl Simulator {
                     read_signal_ids: read_ids,
                     write_signal_ids: write_ids,
                     span: inst.span,
+                    cov: None,
                 }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,
@@ -37202,6 +37269,7 @@ impl Simulator {
                     read_signal_ids: vec![event_ref.sig_id as usize],
                     write_signal_ids,
                     span: crate::ast::Span::dummy(),
+                    cov: None,
                 }),
                 has_unresolved_reads: false,
                 defer_at_time0: false,
@@ -43776,8 +43844,11 @@ impl Simulator {
         self.sva_end_of_sim();
         // Assertion + coverage summary (always when any data was recorded;
         // dump the JSON database iff XEZIM_COV_DB=<path> is set, else default
-        // path xezim_cov.json when at least one stat exists).
-        self.emit_coverage_summary();
+        // path xezim_cov.json when at least one stat exists). A run with code
+        // coverage writes it after the `final` blocks, which count too.
+        if self.code_cov.is_none() {
+            self.emit_coverage_summary();
+        }
         if self.edge_block_stats_enabled {
             self.print_edge_block_stats();
         }
@@ -43831,7 +43902,7 @@ impl Simulator {
             }
         }
 
-        if n_assert_sites == 0 && n_cg_instances == 0 {
+        if n_assert_sites == 0 && n_cg_instances == 0 && self.code_cov.is_none() {
             return;
         }
         chatter!(
@@ -43945,7 +44016,12 @@ impl Simulator {
             }
             json.push('\n');
         }
-        json.push_str("  ]\n}\n");
+        json.push_str("  ]");
+        if let Some(code) = self.code_coverage_json() {
+            json.push_str(",\n");
+            json.push_str(&code);
+        }
+        json.push_str("\n}\n");
         match std::fs::write(&db_path, &json) {
             Ok(()) => chatter!("[COV] wrote coverage DB to {}", db_path),
             Err(e) => eprintln!("[COV] warning: could not write {}: {}", db_path, e),
@@ -44039,6 +44115,7 @@ impl Simulator {
             Insn::LoadSignalRangeDyn(..) => "LoadRngDyn",
             Insn::WaitDelayReg(..) => "WaitDly",
             Insn::WaitEdge(..) => "WaitEdge",
+            Insn::CovHit(..) => "CovHit",
             Insn::CaseLut(..) => "CaseLut",
             Insn::CaseJump(..) => "CaseJump",
             Insn::CaseMaskJump(..) => "CaseMaskJump",
@@ -55279,6 +55356,9 @@ impl Simulator {
                 rhs,
                 delay: explicit_delay,
             } => {
+                if let Some(c) = entry.cold.cov {
+                    self.cov_count(c);
+                }
                 let scope_hint = entry.cold.scope_hint.clone();
                 let t_entry = std::time::Instant::now();
                 let saved_hint = self.name_resolve_hint.borrow().clone();
@@ -78554,6 +78634,7 @@ impl Simulator {
             return;
         }
         match name {
+            COV_HIT_TASK => self.cov_hit(args.first()),
             // §21.3.5 $timeformat(units, precision, suffix, min_width). All
             // arguments are optional in xezim's callers; missing ones keep the
             // prior/default value.
@@ -85702,7 +85783,10 @@ impl Simulator {
             let mut opaque = false;
             for insn in &cb.instructions {
                 match insn {
-                    Insn::StmtFallback(..) | Insn::EvalExprFallback(..) => opaque = true,
+                    // A counted block must run on every edge.
+                    Insn::StmtFallback(..) | Insn::EvalExprFallback(..) | Insn::CovHit(..) => {
+                        opaque = true
+                    }
                     // Constant bit/part selects record only the SLICE they
                     // read (see `edge_block_reads_meta`); everything else is
                     // a full-signal read.

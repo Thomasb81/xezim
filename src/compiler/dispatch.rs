@@ -168,7 +168,7 @@ impl Opcode {
             Insn::SetSigned(_) => Self::SetSigned,
             Insn::ClearSigned(_) => Self::ClearSigned,
             Insn::Pow(_, _, _) => Self::Pow,
-            Insn::Nop => Self::Nop,
+            Insn::Nop | Insn::CovHit(_) => Self::Nop,
             Insn::LoadSignalRange(_, _, _, _) => Self::LoadSignalRange,
             Insn::LoadSignalRangeDyn(_, _, _, _) => Self::LoadSignalRangeDyn,
             Insn::LoadSignalBit(_, _, _) => Self::LoadSignalBit,

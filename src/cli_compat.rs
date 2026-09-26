@@ -24,6 +24,34 @@ pub(crate) struct CompatArgs {
     /// `-sv_root <dir>` / `-sv_lib <name>`: DPI shared libraries.
     pub sv_root: Option<String>,
     pub sv_libs: Vec<String>,
+    /// `+cover[=<letters>]`, the last one given (`""` for the bare form).
+    pub cover: Option<String>,
+    /// `-coverage`.
+    pub coverage: bool,
+}
+
+/// The code coverage `+cover[=<letters>]` and `-coverage` ask for, as
+/// `(kinds, letters xezim does not collect)`. The letters are other
+/// simulators': `s` statement maps onto xezim's kind; the others have no
+/// xezim counterpart. The bare forms ask for the default set, `sbceft`:
+/// everything xezim collects.
+pub(crate) fn cover_request(cx: &CompatArgs) -> Option<(u8, String)> {
+    use xezim::compiler::simulator::KIND_STATEMENT;
+    let spec = match cx.cover.as_deref() {
+        None if !cx.coverage => return None,
+        None | Some("") => return Some((KIND_STATEMENT, String::new())),
+        Some(spec) => spec,
+    };
+    let mut kinds = 0u8;
+    let mut unsupported = String::new();
+    for c in spec.chars() {
+        match c {
+            's' => kinds |= KIND_STATEMENT,
+            _ if !unsupported.contains(c) => unsupported.push(c),
+            _ => {}
+        }
+    }
+    Some((kinds, unsupported))
 }
 
 /// `-sv_lib <name>` loads `<sv_root>/<name>.so`; a name that already carries
@@ -70,8 +98,21 @@ pub(crate) fn handle_flag(
         _ if t.starts_with("-mfcu=") || is_pass_through_args(t) => Ok(1),
         // Design visibility for debug: xezim keeps every object visible.
         // Assertions and covergroups are always compiled and evaluated.
-        "+acc" | "+cover" | "+fcover" | "-sva" | "-assertdebug" | "-coverage" => Ok(1),
-        _ if t.starts_with("+acc=") || t.starts_with("+cover=") => Ok(1),
+        "+acc" | "+fcover" | "-sva" | "-assertdebug" => Ok(1),
+        _ if t.starts_with("+acc=") => Ok(1),
+        // Code coverage; see `cover_request`.
+        "+cover" => {
+            cx.cover = Some(String::new());
+            Ok(1)
+        }
+        _ if t.starts_with("+cover=") => {
+            cx.cover = Some(t["+cover=".len()..].to_string());
+            Ok(1)
+        }
+        "-coverage" => {
+            cx.coverage = true;
+            Ok(1)
+        }
         "-wlf" => {
             let f = value()?;
             eprintln!(

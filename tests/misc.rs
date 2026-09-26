@@ -57,6 +57,8 @@ mod chained_member_access;
 mod child_decl_init_and_wide_rand;
 #[path = "misc/clocked_loop_case_nest_compiled.rs"]
 mod clocked_loop_case_nest_compiled;
+#[path = "misc/code_coverage.rs"]
+mod code_coverage;
 #[path = "misc/comb_regvar_loop_fallback.rs"]
 mod comb_regvar_loop_fallback;
 #[path = "misc/compliance_tests.rs"]
