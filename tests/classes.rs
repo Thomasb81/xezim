@@ -160,6 +160,8 @@ mod constraint_reversed_range;
 mod cov_covergroup_basic;
 #[path = "classes/coverage_auto_bins.rs"]
 mod coverage_auto_bins;
+#[path = "classes/covergroup_at_least.rs"]
+mod covergroup_at_least;
 #[path = "classes/covergroup_coverage_query.rs"]
 mod covergroup_coverage_query;
 #[path = "classes/covergroup_implicit_names.rs"]

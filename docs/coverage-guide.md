@@ -269,7 +269,7 @@ only once), `cp_y` 100.00, and `opt_cg` (50 + 3 x 100) / 4 = 87.50.
 
 | Option | Where | Effect |
 |---|---|---|
-| `option.at_least = N` | covergroup or coverpoint | An explicit bin counts as covered once it has N hits (default 1). A coverpoint's setting overrides the group's |
+| `option.at_least = N` | covergroup, coverpoint or cross | A bin (explicit, automatic or cross) counts as covered once it has N hits (default 1). A coverpoint's or cross's setting overrides the group's |
 | `option.weight = N` | coverpoint | Weight of the coverpoint in its covergroup's average (default 1) |
 | `option.auto_bin_max = N` | covergroup or coverpoint | Maximum number of automatic bins (default 64) |
 | `type_option.merge_instances = 1` | covergroup, or `cg_type::type_option.merge_instances = 1;` at run time | `get_coverage()` counts a bin as covered when any instance hit it. Default 0: the average of the instances' coverages |
@@ -551,7 +551,6 @@ it.
 | `start()`, `stop()` | No effect: sampling continues after `stop()` |
 | `option.per_instance`, `option.goal`, `option.name`, `option.comment` | Accepted, no effect. The results file always has one entry per instance, named after the type |
 | `@(posedge clk iff cond)` as the sampling event | The `iff` is ignored and every edge samples. Put the condition on the coverpoints: `coverpoint x iff (cond)` |
-| `option.at_least` | Applies to explicit bins only. Automatic bins and cross bins count as covered on their first hit |
 | `bins name[N] = {...}` | Treated as `name[]`: one bin per value, not N bins |
 | Transition sets and repetition: `(1, 5 => 3)`, `(3 [*2])`, `[->n]`, `[=n]` | Never hit |
 | In a cross body: `ignore_bins`, `illegal_bins`, `binsof(cp.bin)`, `binsof(...) with (...)` | Ignored. Only `bins name = binsof(cp) intersect {...}` is used. To leave values out of a cross, put `ignore_bins` on the coverpoint, as in [the cross example](#crosses-and-ignore_bins) |

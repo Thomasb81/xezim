@@ -3223,10 +3223,10 @@ struct CovergroupInstance {
     /// §19.3 `ref` constructor formals and their actual expressions: read
     /// again at every sample rather than captured at `new`.
     ctor_refs: Vec<(String, Expression)>,
-    /// Hits: coverpoint_name -> Set of observed values
-    point_hits: HashMap<String, HashSet<Value>>,
-    /// Cross hits: cross_name -> Set of observed tuples
-    cross_hits: HashMap<String, HashSet<Vec<Value>>>,
+    /// Hits: coverpoint_name -> observed value -> times sampled
+    point_hits: HashMap<String, HashMap<Value, u64>>,
+    /// Cross hits: cross_name -> observed value tuple -> times sampled
+    cross_hits: HashMap<String, HashMap<Vec<Value>, u64>>,
     /// LRM §19.6 cross-bin filter hit counts. Key: `cross_name.bin_name`.
     /// Sampling increments the counter when the referenced coverpoint's
     /// component of the cross-tuple falls in any of the bin's ranges.
@@ -3246,6 +3246,28 @@ struct CovergroupInstance {
     point_history: HashMap<String, std::collections::VecDeque<Value>>,
     /// Total `sample()` invocations on this instance.
     sample_count: u64,
+}
+
+/// One bin of a coverpoint as coverage counts it (§19.5).
+struct CgBin {
+    /// Key of its hit counter in `bin_hits`; None for an automatic bin,
+    /// whose hits come from the sampled values.
+    key: Option<String>,
+    /// The declared bin name (`auto[k]` for an automatic bin).
+    #[allow(dead_code)]
+    name: String,
+    /// Constant value ranges; empty for a transition bin or non-constant
+    /// values.
+    ranges: Vec<(i64, i64)>,
+}
+
+/// The bins of a coverpoint, or of a crossed variable.
+struct CpShape {
+    bins: Vec<CgBin>,
+    /// Automatic bins: (value space, values per bin, bin count).
+    auto: Option<(u64, u64, u64)>,
+    /// Values removed by `ignore_bins` / `illegal_bins`.
+    excl: Vec<(i64, i64)>,
 }
 
 /// Per-source-location running tally for `assert` / `assume` / `cover` (the
@@ -116336,25 +116358,15 @@ impl Simulator {
         })
     }
 
-    /// IEEE 1800-2017 §19.8/§19.11 coverage computation, shared by
-    /// get_inst_coverage (one instance) and get_coverage (all instances
-    /// of the type).
+    /// IEEE 1800-2017 §19.8/§19.11 coverage of a covergroup over `insts`:
+    /// one instance for get_inst_coverage, every instance of the type for a
+    /// merged get_coverage.
     ///
-    /// Per §19.8, a coverpoint's coverage is the fraction of its bins
-    /// that were hit: with explicit bins, `100 * (#bins hit / #bins)`,
-    /// counting only `bins` proper — `ignore_bins`, `illegal_bins`, and
-    /// `default` bins are EXCLUDED from the calculation (§19.5/§19.5.6).
-    /// This replaces the old any-value-sampled → 100% shortcut, which
-    /// reported full coverage when only one of several bins was hit.
-    /// A coverpoint with no explicit bins uses auto-bins; we approximate
-    /// that as covered once any value has been sampled (preserving prior
-    /// behavior for auto-binned points). A cross with body bins uses the
-    /// same hit-fraction rule over its bins; a bare cross is covered
-    /// once any tuple was sampled.
-    ///
-    /// Per §19.11, the covergroup number is the weighted average of its
-    /// items' coverages; with the default `option.weight = 1` for every
-    /// item that is the unweighted mean, which is what we compute.
+    /// Each coverpoint and cross contributes the fraction of its bins that
+    /// were hit at least `option.at_least` times (hits summed over `insts`),
+    /// weighted by its `option.weight`; a crossed variable with no
+    /// coverpoint of its own is an implicit coverpoint of weight 1 (§19.6).
+    /// A covergroup with no items has 100% coverage.
     fn coverage_over_instances(&self, cg_name: &str, insts: &[&CovergroupInstance]) -> f64 {
         let def = if let Some(d) = self.module.covergroups.get(cg_name) {
             d
@@ -116364,22 +116376,29 @@ impl Simulator {
         let mut total_weight = 0.0f64;
         let mut coverage_sum = 0.0f64;
         for item in &def.items {
-            if let Some((cov, weight)) = self.cg_item_coverage(def, item, insts) {
+            if let Some((covered, total, weight)) = self.cg_item_counts(def, item, insts) {
                 total_weight += weight;
-                coverage_sum += cov * weight;
+                coverage_sum += Self::cg_fraction(covered, total) * weight;
             }
         }
-        // §19.6: each crossed variable without a coverpoint of its own is
-        // an implicit coverpoint (automatic bins, weight 1).
+        let at_least = self.cg_at_least(def, &[], insts);
         for name in Self::cg_implicit_points(def) {
+            let (covered, total) = Self::cg_implicit_point_counts(&name, insts, at_least);
             total_weight += 1.0;
-            coverage_sum += Self::cg_implicit_point_coverage(&name, insts);
+            coverage_sum += Self::cg_fraction(covered, total);
         }
         if total_weight == 0.0 {
-            // §19.11: a covergroup with no items has 100% coverage.
             100.0
         } else {
             (coverage_sum / total_weight) * 100.0
+        }
+    }
+
+    fn cg_fraction(covered: u64, total: u64) -> f64 {
+        if total == 0 {
+            0.0
+        } else {
+            (covered as f64 / total as f64).min(1.0)
         }
     }
 
@@ -116407,37 +116426,56 @@ impl Simulator {
         out
     }
 
-    /// Coverage fraction of an implicit coverpoint: automatic bins over the
-    /// sampled width (§19.5.1, at most 64).
-    fn cg_implicit_point_coverage(name: &str, insts: &[&CovergroupInstance]) -> f64 {
-        const AUTO_BIN_MAX: u64 = 64;
-        let width = insts
+    /// Automatic-bin shape over a sampled width (§19.5.1): (value space,
+    /// values per bin, bin count).
+    fn cg_auto_shape(width: u32, auto_bin_max: u64) -> (u64, u64, u64) {
+        let space = if width >= 63 { u64::MAX } else { 1u64 << width };
+        if space <= auto_bin_max {
+            (space, 1, space)
+        } else {
+            (space, (space / auto_bin_max).max(1), auto_bin_max)
+        }
+    }
+
+    /// The automatic bin of value `v`, or None outside the value space.
+    fn cg_auto_bin_of(v: i64, (space, group, nbins): (u64, u64, u64)) -> Option<u64> {
+        if v < 0 || (space != u64::MAX && v as u64 >= space) {
+            return None;
+        }
+        Some((v as u64 / group).min(nbins.saturating_sub(1)))
+    }
+
+    /// Width of the values sampled for `name` (1 when none was).
+    fn cg_sampled_width(name: &str, insts: &[&CovergroupInstance]) -> u32 {
+        insts
             .iter()
             .filter_map(|i| i.point_hits.get(name))
-            .flat_map(|h| h.iter())
+            .flat_map(|h| h.keys())
             .next()
             .map(|v| v.width)
-            .unwrap_or(1);
-        let vs = if width >= 63 { u64::MAX } else { 1u64 << width };
-        let total = vs.min(AUTO_BIN_MAX);
-        let group = if vs <= AUTO_BIN_MAX {
-            1
-        } else {
-            (vs / AUTO_BIN_MAX).max(1)
-        };
-        let mut hit: HashSet<u64> = HashSet::default();
+            .unwrap_or(1)
+    }
+
+    /// Covered and total automatic bins of an implicit coverpoint (§19.6).
+    fn cg_implicit_point_counts(
+        name: &str,
+        insts: &[&CovergroupInstance],
+        at_least: u64,
+    ) -> (u64, u64) {
+        let shape = Self::cg_auto_shape(Self::cg_sampled_width(name, insts), 64);
+        let mut hits: HashMap<u64, u64> = HashMap::default();
         for i in insts {
-            if let Some(h) = i.point_hits.get(name) {
-                for v in h.iter().filter(|v| !v.has_xz()) {
-                    hit.insert(v.to_u64().unwrap_or(0) / group);
+            for (v, &c) in i.point_hits.get(name).into_iter().flatten() {
+                if v.has_xz() {
+                    continue;
+                }
+                if let Some(b) = Self::cg_auto_bin_of(v.to_u64().unwrap_or(0) as i64, shape) {
+                    *hits.entry(b).or_insert(0) += c;
                 }
             }
         }
-        if total == 0 {
-            0.0
-        } else {
-            (hit.len() as f64 / total as f64).min(1.0)
-        }
+        let covered = hits.values().filter(|&&c| c >= at_least).count() as u64;
+        (covered, shape.2)
     }
 
     /// §19.8 `cg.item.get_coverage()` / `cg.item.get_inst_coverage()`: the
@@ -116448,6 +116486,17 @@ impl Simulator {
         item_name: &str,
         insts: &[&CovergroupInstance],
     ) -> Option<f64> {
+        self.cg_named_item_counts(cg_name, item_name, insts)
+            .map(|(c, t)| Self::cg_fraction(c, t) * 100.0)
+    }
+
+    /// Covered and total bins of ONE coverpoint or cross.
+    fn cg_named_item_counts(
+        &self,
+        cg_name: &str,
+        item_name: &str,
+        insts: &[&CovergroupInstance],
+    ) -> Option<(u64, u64)> {
         let def = self.module.covergroups.get(cg_name)?;
         let item = def.items.iter().find(|it| match it {
             CovergroupItem::Coverpoint(cp) => cp.name.as_ref().is_some_and(|n| n.name == item_name),
@@ -116456,32 +116505,74 @@ impl Simulator {
         });
         match item {
             Some(item) => self
-                .cg_item_coverage(def, item, insts)
-                .map(|(c, _)| c * 100.0),
+                .cg_item_counts(def, item, insts)
+                .map(|(c, t, _)| (c, t)),
             None if Self::cg_implicit_points(def).iter().any(|n| n == item_name) => {
-                Some(Self::cg_implicit_point_coverage(item_name, insts) * 100.0)
+                let at_least = self.cg_at_least(def, &[], insts);
+                Some(Self::cg_implicit_point_counts(item_name, insts, at_least))
             }
             None => None,
         }
     }
 
     /// Constant bounds of one bin range (`v` or `[lo:hi]`), with §19.3
-    /// constructor formals visible.
-    fn cg_range_bounds(
-        r: &crate::ast::decl::ConstraintRange,
-        ctor: &[(String, Value)],
-    ) -> Option<(i64, i64)> {
-        let params: HashMap<String, Value> = ctor.iter().cloned().collect();
-        let ev = |e: &crate::ast::expr::Expression| -> Option<i64> {
-            super::elaborate::const_eval_i64_with_params(e, Some(&params))
-        };
+    /// constructor formals and parameters visible.
+    fn cg_range_bounds(&self, r: &ConstraintRange, ctor: &[(String, Value)]) -> Option<(i64, i64)> {
+        let ev = |e: &Expression| self.cg_const_i64(e, ctor);
         match r {
-            crate::ast::decl::ConstraintRange::Value(e) => ev(e).map(|v| (v, v)),
-            crate::ast::decl::ConstraintRange::Range { lo, hi } => {
+            ConstraintRange::Value(e) => ev(e).map(|v| (v, v)),
+            ConstraintRange::Range { lo, hi } => {
                 let (l, h) = (ev(lo)?, ev(hi)?);
                 Some((l.min(h), l.max(h)))
             }
         }
+    }
+
+    /// Constant value of a bin bound or option: constructor formals first,
+    /// then the design's parameters.
+    fn cg_const_i64(&self, e: &Expression, ctor: &[(String, Value)]) -> Option<i64> {
+        if !ctor.is_empty() {
+            let params: HashMap<String, Value> = ctor.iter().cloned().collect();
+            if let Some(v) = super::elaborate::const_eval_i64_with_params(e, Some(&params)) {
+                return Some(v);
+            }
+        }
+        super::elaborate::const_eval_i64_with_params(e, Some(&self.module.parameters))
+    }
+
+    /// §19.7 option `name` of a coverpoint or cross (`item_opts`), else
+    /// the covergroup's own `option.name`.
+    fn cg_option_i64(
+        &self,
+        def: &crate::ast::decl::CovergroupDeclaration,
+        item_opts: &[(String, Expression)],
+        name: &str,
+        ctor: &[(String, Value)],
+    ) -> Option<i64> {
+        item_opts
+            .iter()
+            .find_map(|(n, v)| (n == name).then(|| self.cg_const_i64(v, ctor)).flatten())
+            .or_else(|| {
+                def.items.iter().find_map(|it| match it {
+                    CovergroupItem::Option { name: n, val } if n == name => {
+                        self.cg_const_i64(val, ctor)
+                    }
+                    _ => None,
+                })
+            })
+    }
+
+    /// §19.7 `option.at_least` (default 1) of an item.
+    fn cg_at_least(
+        &self,
+        def: &crate::ast::decl::CovergroupDeclaration,
+        item_opts: &[(String, Expression)],
+        insts: &[&CovergroupInstance],
+    ) -> u64 {
+        let ctor: &[(String, Value)] = insts.first().map(|i| i.ctor_args.as_slice()).unwrap_or(&[]);
+        self.cg_option_i64(def, item_opts, "at_least", ctor)
+            .unwrap_or(1)
+            .max(1) as u64
     }
 
     /// §19.5.6 / §19.5.7: values of `ignore_bins` and `illegal_bins` are
@@ -116489,10 +116580,11 @@ impl Simulator {
     /// and automatic), so they count neither toward the bins nor toward
     /// the coverage denominator. Merged, sorted, inclusive ranges.
     fn cg_excluded_ranges(
+        &self,
         cp: &crate::ast::decl::Coverpoint,
         ctor: &[(String, Value)],
     ) -> Vec<(i64, i64)> {
-        let mut v: Vec<(i64, i64)> = cp
+        let v: Vec<(i64, i64)> = cp
             .bins
             .iter()
             .filter(|b| {
@@ -116506,9 +116598,13 @@ impl Simulator {
             .flat_map(|b| {
                 b.values
                     .iter()
-                    .filter_map(|r| Self::cg_range_bounds(r, ctor))
+                    .filter_map(|r| self.cg_range_bounds(r, ctor))
             })
             .collect();
+        Self::cg_merge_ranges(v)
+    }
+
+    fn cg_merge_ranges(mut v: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
         v.sort_unstable();
         let mut merged: Vec<(i64, i64)> = Vec::new();
         for (l, h) in v {
@@ -116518,6 +116614,10 @@ impl Simulator {
             }
         }
         merged
+    }
+
+    fn cg_in_ranges(v: i64, ranges: &[(i64, i64)]) -> bool {
+        ranges.iter().any(|&(l, h)| v >= l && v <= h)
     }
 
     /// Number of values in `[lo, hi]` not covered by `excl` (merged ranges).
@@ -116535,53 +116635,89 @@ impl Simulator {
         n
     }
 
-    /// The bins of a coverpoint as seen by coverage: every bin's id and a
-    /// value -> bin-ids mapper. Explicit scalar bins keep their name,
-    /// `name[]` array bins expand to `name[v]`, automatic bins are one per
-    /// value (or per group above `auto_bin_max`); excluded values map to
-    /// nothing. Returns (bin count, mapper) where the mapper yields the ids
-    /// of the bins a sampled value falls into.
-    fn cg_point_bins<'a>(
+    /// The bins of a coverpoint that count toward coverage (§19.5): its
+    /// explicit `bins`, or automatic bins when it declares none.
+    fn cg_point_shape(
         &self,
-        def: &'a crate::ast::decl::CovergroupDeclaration,
-        cp: &'a crate::ast::decl::Coverpoint,
+        def: &crate::ast::decl::CovergroupDeclaration,
+        cp: &crate::ast::decl::Coverpoint,
         insts: &[&CovergroupInstance],
-        ctor: &'a [(String, Value)],
-    ) -> (u64, Box<dyn Fn(i64) -> Vec<String> + 'a>) {
-        let excl = Self::cg_excluded_ranges(cp, ctor);
-        let is_excl = |v: i64, ex: &[(i64, i64)]| ex.iter().any(|&(l, h)| v >= l && v <= h);
+    ) -> CpShape {
+        let ctor: &[(String, Value)] = insts.first().map(|i| i.ctor_args.as_slice()).unwrap_or(&[]);
+        let excl = self.cg_excluded_ranges(cp, ctor);
+        let cp_name = Self::cg_point_name(cp);
         let explicit: Vec<&crate::ast::decl::CoverBin> = cp
             .bins
             .iter()
             .filter(|b| matches!(b.kind, crate::ast::decl::CoverBinKind::Bins))
             .collect();
         if explicit.is_empty() {
-            let (value_space, group, total) = self.cg_auto_bin_shape(def, cp, insts, &excl);
-            let excl2 = excl.clone();
-            let mapper = Box::new(move |v: i64| -> Vec<String> {
-                if v < 0
-                    || (value_space != u64::MAX && v as u64 >= value_space)
-                    || is_excl(v, &excl2)
-                {
-                    return Vec::new();
+            let auto_bin_max = self
+                .cg_option_i64(def, &cp.options, "auto_bin_max", ctor)
+                .filter(|&n| n > 0)
+                .unwrap_or(64) as u64;
+            let (space, group, nbins) =
+                Self::cg_auto_shape(Self::cg_sampled_width(&cp_name, insts), auto_bin_max);
+            // One-value bins wholly excluded by ignore/illegal values are
+            // not bins; wider automatic bins always are.
+            let mut bins = Vec::new();
+            if group == 1 && space <= 1 << 20 {
+                for v in 0..space as i64 {
+                    if !Self::cg_in_ranges(v, &excl) {
+                        bins.push(CgBin {
+                            key: None,
+                            name: format!("auto[{}]", v),
+                            ranges: vec![(v, v)],
+                        });
+                    }
                 }
-                vec![format!("{}", v as u64 / group)]
-            });
-            return (total, mapper);
+            } else {
+                for k in 0..nbins {
+                    let lo = (k * group) as i64;
+                    let hi = if k + 1 == nbins {
+                        space.saturating_sub(1).min(i64::MAX as u64) as i64
+                    } else {
+                        ((k + 1) * group - 1) as i64
+                    };
+                    bins.push(CgBin {
+                        key: None,
+                        name: format!("auto[{}]", k),
+                        ranges: vec![(lo, hi)],
+                    });
+                }
+            }
+            return CpShape {
+                bins,
+                auto: Some((space, group, nbins)),
+                excl,
+            };
         }
-        let mut total = 0u64;
-        let mut bins: Vec<(String, bool, Vec<(i64, i64)>)> = Vec::new();
+        let mut bins = Vec::new();
         for b in &explicit {
+            let key = format!("{}.{}", cp_name, b.name.name);
             let ranges: Vec<(i64, i64)> = b
                 .values
                 .iter()
-                .filter_map(|r| Self::cg_range_bounds(r, ctor))
+                .filter_map(|r| self.cg_range_bounds(r, ctor))
                 .collect();
-            if b.array_form {
-                total += ranges
-                    .iter()
-                    .map(|&(l, h)| Self::cg_count_outside(l, h, &excl))
-                    .sum::<u64>();
+            if b.array_form && b.transitions.is_empty() && !b.is_wildcard {
+                // §19.5.1 `name[]`: one bin per value, `cp.name[<value>]`.
+                let mut n = 0u64;
+                for (l, h) in Self::cg_merge_ranges(ranges) {
+                    for v in l..=h {
+                        if n >= 1 << 20 {
+                            break;
+                        }
+                        if !Self::cg_in_ranges(v, &excl) {
+                            bins.push(CgBin {
+                                key: Some(format!("{}[{}]", key, v)),
+                                name: b.name.name.clone(),
+                                ranges: vec![(v, v)],
+                            });
+                            n += 1;
+                        }
+                    }
+                }
             } else if b.values.is_empty()
                 || ranges.len() < b.values.len()
                 || ranges
@@ -116591,313 +116727,186 @@ impl Simulator {
                 // A scalar bin exists unless every one of its values is
                 // excluded (bins whose ranges are not constants, and
                 // transition/wildcard bins, always count).
-                total += 1;
+                bins.push(CgBin {
+                    key: Some(key),
+                    name: b.name.name.clone(),
+                    ranges,
+                });
             }
-            bins.push((b.name.name.clone(), b.array_form, ranges));
         }
-        let mapper = Box::new(move |v: i64| -> Vec<String> {
-            if is_excl(v, &excl) {
-                return Vec::new();
-            }
-            bins.iter()
-                .filter(|(_, _, rs)| rs.iter().any(|&(l, h)| v >= l && v <= h))
-                .map(|(n, arr, _)| {
-                    if *arr {
-                        format!("{}[{}]", n, v)
-                    } else {
-                        n.clone()
-                    }
-                })
-                .collect()
-        });
-        (total, mapper)
+        CpShape {
+            bins,
+            auto: None,
+            excl,
+        }
     }
 
-    /// §19.5.1 automatic bins of a coverpoint: (value space, values per
-    /// bin, bin count after excluding ignore/illegal values).
-    fn cg_auto_bin_shape(
-        &self,
-        def: &crate::ast::decl::CovergroupDeclaration,
-        cp: &crate::ast::decl::Coverpoint,
-        insts: &[&CovergroupInstance],
-        excl: &[(i64, i64)],
-    ) -> (u64, u64, u64) {
-        let opt = |e: &crate::ast::expr::Expression| {
-            super::elaborate::const_eval_i64_with_params(e, None)
-        };
-        let auto_bin_max: u64 = cp
-            .options
-            .iter()
-            .find_map(|(n, v)| (n == "auto_bin_max").then(|| opt(v)).flatten())
-            .or_else(|| {
-                def.items.iter().find_map(|it| match it {
-                    CovergroupItem::Option { name, val } if name == "auto_bin_max" => opt(val),
-                    _ => None,
-                })
-            })
-            .filter(|&n| n > 0)
-            .unwrap_or(64) as u64;
-        let cp_name = cp
-            .name
+    /// Hits of each bin of `shape` for the coverpoint `cp_name`, summed
+    /// over `insts`.
+    fn cg_shape_hits(cp_name: &str, shape: &CpShape, insts: &[&CovergroupInstance]) -> Vec<u64> {
+        let mut hits = vec![0u64; shape.bins.len()];
+        match shape.auto {
+            Some(auto) => {
+                let index: HashMap<i64, usize> = shape
+                    .bins
+                    .iter()
+                    .enumerate()
+                    .map(|(k, b)| (b.ranges[0].0, k))
+                    .collect();
+                for i in insts {
+                    for (v, &c) in i.point_hits.get(cp_name).into_iter().flatten() {
+                        if v.has_xz() {
+                            continue;
+                        }
+                        let v = v.to_u64().unwrap_or(0) as i64;
+                        if Self::cg_in_ranges(v, &shape.excl) {
+                            continue;
+                        }
+                        if let Some(b) = Self::cg_auto_bin_of(v, auto) {
+                            let lo = (b * auto.1) as i64;
+                            if let Some(&k) = index.get(&lo) {
+                                hits[k] += c;
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                for (k, b) in shape.bins.iter().enumerate() {
+                    if let Some(key) = &b.key {
+                        hits[k] = insts
+                            .iter()
+                            .filter_map(|i| i.bin_hits.get(key))
+                            .sum::<u64>();
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    /// The name a coverpoint is recorded under.
+    fn cg_point_name(cp: &crate::ast::decl::Coverpoint) -> String {
+        cp.name
             .as_ref()
             .map(|n| n.name.clone())
-            .unwrap_or_else(|| format!("{:?}", cp.expr));
-        let width = insts
-            .iter()
-            .filter_map(|i| i.point_hits.get(&cp_name))
-            .flat_map(|h| h.iter())
-            .next()
-            .map(|v| v.width)
-            .unwrap_or(1);
-        let value_space = if width >= 63 { u64::MAX } else { 1u64 << width };
-        if value_space <= auto_bin_max {
-            let total = Self::cg_count_outside(0, value_space as i64 - 1, excl);
-            (value_space, 1, total)
-        } else {
-            (
-                value_space,
-                (value_space / auto_bin_max).max(1),
-                auto_bin_max,
-            )
+            .unwrap_or_else(|| format!("{:?}", cp.expr))
+    }
+
+    /// The name a cross is recorded under.
+    fn cg_cross_name(cr: &crate::ast::decl::Cross) -> String {
+        cr.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| {
+            cr.items
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<Vec<_>>()
+                .join("_")
+        })
+    }
+
+    /// The bins a crossed item contributes (§19.6): its coverpoint's bins,
+    /// or automatic bins of the sampled width for a crossed variable.
+    fn cg_cross_axis(
+        &self,
+        def: &crate::ast::decl::CovergroupDeclaration,
+        name: &str,
+        insts: &[&CovergroupInstance],
+    ) -> CpShape {
+        let cp = def.items.iter().find_map(|d| match d {
+            CovergroupItem::Coverpoint(cp) if cp.name.as_ref().is_some_and(|n| n.name == name) => {
+                Some(cp)
+            }
+            _ => None,
+        });
+        match cp {
+            Some(cp) => self.cg_point_shape(def, cp, insts),
+            None => {
+                let (space, group, nbins) =
+                    Self::cg_auto_shape(Self::cg_sampled_width(name, insts), 64);
+                let bins = (0..nbins)
+                    .map(|k| {
+                        let lo = (k * group) as i64;
+                        let hi = if k + 1 == nbins {
+                            space.saturating_sub(1).min(i64::MAX as u64) as i64
+                        } else {
+                            ((k + 1) * group - 1) as i64
+                        };
+                        CgBin {
+                            key: None,
+                            name: format!("auto[{}]", k),
+                            ranges: vec![(lo, hi)],
+                        }
+                    })
+                    .collect();
+                CpShape {
+                    bins,
+                    auto: Some((space, group, nbins)),
+                    excl: Vec::new(),
+                }
+            }
         }
     }
 
-    /// Coverage fraction (0..=1) and weight of one covergroup item over
-    /// `insts`. `None` for option items.
-    fn cg_item_coverage(
+    /// Indices of the bins of `shape` that value `v` falls into.
+    fn cg_axis_bins_of(shape: &CpShape, v: i64) -> Vec<usize> {
+        if Self::cg_in_ranges(v, &shape.excl) {
+            return Vec::new();
+        }
+        if let Some(auto) = shape.auto {
+            let Some(b) = Self::cg_auto_bin_of(v, auto) else {
+                return Vec::new();
+            };
+            let lo = (b * auto.1) as i64;
+            return shape
+                .bins
+                .iter()
+                .position(|x| x.ranges[0].0 == lo)
+                .into_iter()
+                .collect();
+        }
+        shape
+            .bins
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| Self::cg_in_ranges(v, &b.ranges))
+            .map(|(k, _)| k)
+            .collect()
+    }
+
+    /// Covered and total bin counts, and the weight, of one covergroup item
+    /// over `insts` (§19.8/§19.11). `None` for option items.
+    fn cg_item_counts(
         &self,
         def: &crate::ast::decl::CovergroupDeclaration,
         item: &CovergroupItem,
         insts: &[&CovergroupInstance],
-    ) -> Option<(f64, f64)> {
-        // §19.7 option.at_least: a bin counts as covered only when hit at least
-        // this many times (per-coverpoint override falls back to the covergroup
-        // option, then the LRM default of 1). §19.7 option.weight: each item's
-        // weight in the covergroup's (weighted) mean.
-        // Bin bounds are literals or (§19.3) the instance's constructor
-        // formals: `bins r = {[lo:hi]}` with `new(2, 5)`.
+    ) -> Option<(u64, u64, f64)> {
         let ctor: &[(String, Value)] = insts.first().map(|i| i.ctor_args.as_slice()).unwrap_or(&[]);
-        let opt_u64 = |e: &crate::ast::expr::Expression| -> Option<u64> {
-            fn lit(e: &crate::ast::expr::Expression, ctor: &[(String, Value)]) -> Option<u64> {
-                match &e.kind {
-                    ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
-                        let radix = match base {
-                            crate::ast::expr::NumberBase::Decimal => 10,
-                            crate::ast::expr::NumberBase::Hex => 16,
-                            crate::ast::expr::NumberBase::Octal => 8,
-                            crate::ast::expr::NumberBase::Binary => 2,
-                        };
-                        u64::from_str_radix(&value.replace('_', ""), radix).ok()
-                    }
-                    ExprKind::Paren(i) => lit(i, ctor),
-                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => ctor
-                        .iter()
-                        .find(|(n, _)| *n == h.path[0].name.name)
-                        .and_then(|(_, v)| v.to_u64()),
-                    _ => None,
-                }
-            }
-            lit(e, ctor)
-        };
-        let cg_at_least = def
-            .items
-            .iter()
-            .find_map(|it| match it {
-                CovergroupItem::Option { name, val } if name == "at_least" => opt_u64(val),
-                _ => None,
-            })
-            .unwrap_or(1)
-            .max(1);
-
-        // Is the (non-array) bin `key` hit `>= at_least` times in any instance?
-        // For the `bins name[]` array form, hits are recorded per sub-bin as
-        // `cp.name[<val>]`, so match on the `cp.name[` prefix.
-        let bin_hit = |key: &str, array_form: bool, at_least: u64| -> bool {
-            insts.iter().any(|inst| {
-                if array_form {
-                    let pre = format!("{}[", key);
-                    inst.bin_hits
-                        .iter()
-                        .any(|(k, &c)| c >= at_least && k.starts_with(&pre))
-                } else {
-                    inst.bin_hits.get(key).is_some_and(|&c| c >= at_least)
-                }
-            })
-        };
-
         match item {
             CovergroupItem::Coverpoint(cp) => {
-                let cp_name = cp
-                    .name
-                    .as_ref()
-                    .map(|n| n.name.clone())
-                    .unwrap_or_else(|| format!("{:?}", cp.expr));
-                let has_explicit = cp
-                    .bins
-                    .iter()
-                    .any(|b| matches!(b.kind, crate::ast::decl::CoverBinKind::Bins));
-                let (total, mapper) = self.cg_point_bins(def, cp, insts, ctor);
-                let cov = if !has_explicit {
-                    // Automatic bins: distinct bins among the sampled values.
-                    let mut hit: HashSet<String> = HashSet::default();
-                    for i in insts {
-                        if let Some(h) = i.point_hits.get(&cp_name) {
-                            for v in h {
-                                if v.has_xz() {
-                                    continue;
-                                }
-                                for b in mapper(v.to_u64().unwrap_or(0) as i64) {
-                                    hit.insert(b);
-                                }
-                            }
-                        }
-                    }
-                    if total == 0 {
-                        0.0
-                    } else {
-                        (hit.len() as f64 / total as f64).min(1.0)
-                    }
-                } else {
-                    // Per-coverpoint at_least overrides the covergroup one.
-                    let at_least = cp
-                        .options
-                        .iter()
-                        .find_map(|(n, v)| (n == "at_least").then(|| opt_u64(v)).flatten())
-                        .unwrap_or(cg_at_least)
-                        .max(1);
-                    let excl = Self::cg_excluded_ranges(cp, ctor);
-                    let mut hit_bins = 0u64;
-                    for b in cp
-                        .bins
-                        .iter()
-                        .filter(|b| matches!(b.kind, crate::ast::decl::CoverBinKind::Bins))
-                    {
-                        let key = format!("{}.{}", cp_name, b.name.name);
-                        if b.array_form {
-                            // §19.5.2: one sub-bin per value, recorded as
-                            // `cp.bin[<value>]`; excluded values are not bins.
-                            let pre = format!("{}[", key);
-                            let mut sub_hit: HashSet<&str> = HashSet::default();
-                            for inst in insts {
-                                for (k, &c) in inst.bin_hits.iter() {
-                                    if c < at_least || !k.starts_with(&pre) {
-                                        continue;
-                                    }
-                                    let excluded = k[pre.len()..]
-                                        .trim_end_matches(']')
-                                        .parse::<i64>()
-                                        .is_ok_and(|v| excl.iter().any(|&(l, h)| v >= l && v <= h));
-                                    if !excluded {
-                                        sub_hit.insert(k.as_str());
-                                    }
-                                }
-                            }
-                            hit_bins += sub_hit.len() as u64;
-                        } else if bin_hit(&key, false, at_least) {
-                            hit_bins += 1;
-                        }
-                    }
-                    if total == 0 {
-                        0.0
-                    } else {
-                        (hit_bins as f64 / total as f64).min(1.0)
-                    }
-                };
+                let at_least = self.cg_at_least(def, &cp.options, insts);
+                let cp_name = Self::cg_point_name(cp);
+                let shape = self.cg_point_shape(def, cp, insts);
+                let hits = Self::cg_shape_hits(&cp_name, &shape, insts);
+                let covered = hits.iter().filter(|&&c| c >= at_least).count() as u64;
                 // §19.7 option.weight (default 1) weights this coverpoint in
                 // the covergroup's mean.
                 let weight = cp
                     .options
                     .iter()
-                    .find_map(|(n, v)| (n == "weight").then(|| opt_u64(v)).flatten())
-                    .unwrap_or(1) as f64;
-                Some((cov, weight))
+                    .find_map(|(n, v)| {
+                        (n == "weight")
+                            .then(|| self.cg_const_i64(v, ctor))
+                            .flatten()
+                    })
+                    .unwrap_or(1)
+                    .max(0) as f64;
+                Some((covered, shape.bins.len() as u64, weight))
             }
             CovergroupItem::Cross(cr) => {
-                let cr_name = cr.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| {
-                    cr.items
-                        .iter()
-                        .map(|i| i.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join("_")
-                });
-                let cov = if cr.bins.is_empty() {
-                    // §19.6 automatic cross bins: the Cartesian product of
-                    // the crossed coverpoints' bins (after their ignore /
-                    // illegal exclusions); a sampled tuple hits the product
-                    // of the bins each of its values falls into. A crossed
-                    // variable with no coverpoint gets automatic bins of its
-                    // sampled width.
-                    let sample_tuple = insts
-                        .iter()
-                        .filter_map(|i| i.cross_hits.get(&cr_name))
-                        .flat_map(|h| h.iter())
-                        .next();
-                    let mut total: u64 = 1;
-                    let mut mappers: Vec<Box<dyn Fn(i64) -> Vec<String> + '_>> = Vec::new();
-                    for (k, it) in cr.items.iter().enumerate() {
-                        let cp = def.items.iter().find_map(|d| match d {
-                            CovergroupItem::Coverpoint(cp)
-                                if cp.name.as_ref().is_some_and(|n| n.name == it.name) =>
-                            {
-                                Some(cp)
-                            }
-                            _ => None,
-                        });
-                        match cp {
-                            Some(cp) => {
-                                let (n, m) = self.cg_point_bins(def, cp, insts, ctor);
-                                total = total.saturating_mul(n);
-                                mappers.push(m);
-                            }
-                            None => {
-                                const AUTO_BIN_MAX: u64 = 64;
-                                let w = sample_tuple
-                                    .and_then(|t| t.get(k))
-                                    .map(|v| v.width)
-                                    .unwrap_or(1);
-                                let vs = if w >= 63 { u64::MAX } else { 1u64 << w };
-                                let group = if vs <= AUTO_BIN_MAX {
-                                    1
-                                } else {
-                                    (vs / AUTO_BIN_MAX).max(1)
-                                };
-                                total = total.saturating_mul(vs.min(AUTO_BIN_MAX));
-                                mappers.push(Box::new(move |v: i64| {
-                                    vec![format!("{}", v as u64 / group)]
-                                }));
-                            }
-                        }
-                    }
-                    let mut hit: HashSet<Vec<String>> = HashSet::default();
-                    for i in insts {
-                        if let Some(h) = i.cross_hits.get(&cr_name) {
-                            for t in h {
-                                if t.len() != mappers.len() || t.iter().any(|v| v.has_xz()) {
-                                    continue;
-                                }
-                                let mut combos: Vec<Vec<String>> = vec![Vec::new()];
-                                for (k, v) in t.iter().enumerate() {
-                                    let ids = mappers[k](v.to_u64().unwrap_or(0) as i64);
-                                    let mut next = Vec::new();
-                                    for c in &combos {
-                                        for id in &ids {
-                                            let mut c2 = c.clone();
-                                            c2.push(id.clone());
-                                            next.push(c2);
-                                        }
-                                    }
-                                    combos = next;
-                                }
-                                hit.extend(combos);
-                            }
-                        }
-                    }
-                    if total == 0 {
-                        0.0
-                    } else {
-                        (hit.len() as f64 / total as f64).min(1.0)
-                    }
-                } else {
+                let cr_name = Self::cg_cross_name(cr);
+                let at_least = self.cg_at_least(def, &[], insts);
+                if !cr.bins.is_empty() {
                     let hit = cr
                         .bins
                         .iter()
@@ -116905,16 +116914,58 @@ impl Simulator {
                             let key = format!("{}.{}", cr_name, b.name.name);
                             insts
                                 .iter()
-                                .any(|i| i.cross_bin_hits.get(&key).is_some_and(|&c| c > 0))
+                                .filter_map(|i| i.cross_bin_hits.get(&key))
+                                .sum::<u64>()
+                                >= at_least
                         })
                         .count();
-                    hit as f64 / cr.bins.len() as f64
-                };
-                // A cross carries the default weight 1 (no option storage).
-                Some((cov, 1.0))
+                    return Some((hit as u64, cr.bins.len() as u64, 1.0));
+                }
+                // §19.6 automatic cross bins: the Cartesian product of the
+                // crossed items' bins; a sampled tuple hits the product of
+                // the bins each of its values falls into.
+                let axes: Vec<CpShape> = cr
+                    .items
+                    .iter()
+                    .map(|it| self.cg_cross_axis(def, &it.name, insts))
+                    .collect();
+                let total = axes
+                    .iter()
+                    .fold(1u64, |t, a| t.saturating_mul(a.bins.len() as u64));
+                let mut hits: HashMap<Vec<usize>, u64> = HashMap::default();
+                for i in insts {
+                    for (t, &c) in i.cross_hits.get(&cr_name).into_iter().flatten() {
+                        for prod in Self::cg_tuple_products(&axes, t) {
+                            *hits.entry(prod).or_insert(0) += c;
+                        }
+                    }
+                }
+                let covered = hits.values().filter(|&&c| c >= at_least).count() as u64;
+                Some((covered, total, 1.0))
             }
             _ => None,
         }
+    }
+
+    /// The product bins (one bin index per axis) a sampled value tuple hits.
+    fn cg_tuple_products(axes: &[CpShape], t: &[Value]) -> Vec<Vec<usize>> {
+        if t.len() != axes.len() || t.iter().any(|v| v.has_xz()) {
+            return Vec::new();
+        }
+        let mut combos: Vec<Vec<usize>> = vec![Vec::new()];
+        for (k, v) in t.iter().enumerate() {
+            let ids = Self::cg_axis_bins_of(&axes[k], v.to_u64().unwrap_or(0) as i64);
+            let mut next = Vec::with_capacity(combos.len() * ids.len());
+            for c in &combos {
+                for &id in &ids {
+                    let mut c2 = c.clone();
+                    c2.push(id);
+                    next.push(c2);
+                }
+            }
+            combos = next;
+        }
+        combos
     }
 
     fn sample_covergroup(&mut self, handle: usize) {
@@ -116981,11 +117032,7 @@ impl Simulator {
                         }
                     }
                     let val = self.eval_expr(&cp.expr);
-                    let cp_name = cp
-                        .name
-                        .as_ref()
-                        .map(|n| n.name.clone())
-                        .unwrap_or_else(|| format!("{:?}", cp.expr));
+                    let cp_name = Self::cg_point_name(cp);
                     // Per-explicit-bin tallies (LRM §19.5). Done before the
                     // existing per-value-set bookkeeping so an illegal_bins
                     // hit can fire before the value is recorded. `default`
@@ -117130,10 +117177,12 @@ impl Simulator {
                         }
                     }
                     if let Some(Some(inst)) = self.cg_heap.get_mut(handle) {
-                        inst.point_hits
+                        *inst
+                            .point_hits
                             .entry(cp_name.clone())
                             .or_default()
-                            .insert(val.clone());
+                            .entry(val.clone())
+                            .or_insert(0) += 1;
                         for (k, _illegal) in bin_increments {
                             *inst.bin_hits.entry(k).or_insert(0) += 1;
                         }
@@ -117199,13 +117248,7 @@ impl Simulator {
                         };
                         tuple.push(val);
                     }
-                    let cr_name = cr.name.as_ref().map(|n| n.name.clone()).unwrap_or_else(|| {
-                        cr.items
-                            .iter()
-                            .map(|i| i.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join("_")
-                    });
+                    let cr_name = Self::cg_cross_name(cr);
                     // LRM §19.6 cross body bin filters. For each
                     // `bins NAME = binsof(<cp>) intersect { ranges };`,
                     // look up cp's index in the cross items list and
@@ -117236,15 +117279,22 @@ impl Simulator {
                         }
                     }
                     if let Some(Some(inst)) = self.cg_heap.get_mut(handle) {
-                        inst.cross_hits
+                        *inst
+                            .cross_hits
                             .entry(cr_name.clone())
                             .or_default()
-                            .insert(tuple);
+                            .entry(tuple)
+                            .or_insert(0) += 1;
                         for k in bin_increments {
                             *inst.cross_bin_hits.entry(k).or_insert(0) += 1;
                         }
                         for (name, v) in implicit_points {
-                            inst.point_hits.entry(name).or_default().insert(v);
+                            *inst
+                                .point_hits
+                                .entry(name)
+                                .or_default()
+                                .entry(v)
+                                .or_insert(0) += 1;
                         }
                     }
                 }
