@@ -120871,9 +120871,6 @@ impl Simulator {
         self.eval_spec_arg_fragment(frag)
     }
 
-    /// Split a specialization argument-list text on top-level commas,
-    /// respecting string literals, parentheses, brackets and braces so that
-    /// `#("a,b", f(1,2))` yields two fragments, not four.
     /// Fragment `idx` of `split_spec_args(sig)`, borrowed: the same
     /// top-level split, without building the list.
     fn spec_arg_at(sig: &str, idx: usize) -> Option<&str> {
@@ -120905,6 +120902,9 @@ impl Simulator {
         (k == idx && !last.trim().is_empty()).then_some(last)
     }
 
+    /// Split a specialization argument-list text on top-level commas,
+    /// respecting string literals, parentheses, brackets and braces so that
+    /// `#("a,b", f(1,2))` yields two fragments, not four.
     fn split_spec_args(sig: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut cur = String::new();
