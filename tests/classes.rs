@@ -268,6 +268,8 @@ mod nested_and_extends_spec;
 mod instance_class_handles_start_null;
 #[path = "classes/null_deref_fatal.rs"]
 mod null_deref_fatal;
+#[path = "classes/typedef_param_class_construction.rs"]
+mod typedef_param_class_construction;
 
 #[path = "classes/ctor_dispatch_and_p_format.rs"]
 mod ctor_dispatch_and_p_format;

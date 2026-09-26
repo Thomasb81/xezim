@@ -71781,6 +71781,9 @@ impl Simulator {
                                     self.extract_spec_from_string(&tn)
                                         .map(|(base, _)| self.module.classes.contains_key(&base))
                                         .unwrap_or(false)
+                                        // A typedef alias to a parameterized
+                                        // class (`typedef C#(int) c_t;`).
+                                        || self.resolve_typedef_spec(&tn).is_some()
                                 })
                         })
                         .unwrap_or(false);
@@ -71844,7 +71847,14 @@ impl Simulator {
                 // and the pool would be built with `T` = its default
                 // (`uvm_object`). Recover the spec from the member's
                 // alias and construct the correct specialization.
-                if let Some((base, sig)) = self.this_member_typedef_spec(lvalue) {
+                // The same alias on a module-scope or procedural variable
+                // (`typedef C#(int) c_t; c_t h; h = new;`): the lookup below
+                // only follows NON-parameterized aliases, so `h` stayed null
+                // and every call through it was silently dropped.
+                if let Some((base, sig)) = self
+                    .this_member_typedef_spec(lvalue)
+                    .or_else(|| self.resolve_typedef_spec(&tname))
+                {
                     if let Some(class_def) = self.module.classes.get(&base).cloned() {
                         self.ensure_spec_statics(&base, &sig);
                         let saved_spec = self.current_spec.clone();
@@ -118926,6 +118936,25 @@ impl Simulator {
                         .get(&pname)
                         .and_then(|s| s.type_name.clone());
                     if let Some(tn) = prop_tn {
+                        // A typedef alias to a parameterized class (UVM's
+                        // `uvm_event_pool events = new("events");` in every
+                        // transaction): build THAT specialization. The base
+                        // lookup below dropped the type arguments, so the
+                        // pool made plain `uvm_object`s and every
+                        // `wait_trigger` on one returned at once.
+                        if let Some((base, sig)) = self.resolve_typedef_spec(&tn) {
+                            if let Some(cd2) = self.module.classes.get(&base).cloned() {
+                                self.ensure_spec_statics(&base, &sig);
+                                let saved_spec = self.current_spec.clone();
+                                self.current_spec = Some((base, sig));
+                                let v = self.instantiate_class(&cd2, ctor_args);
+                                self.current_spec = saved_spec;
+                                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                                    inst.properties.insert(pname, v);
+                                }
+                                continue;
+                            }
+                        }
                         let concrete_tn =
                             if let Some(crate::ast::types::DataType::TypeReference {
                                 name, ..
