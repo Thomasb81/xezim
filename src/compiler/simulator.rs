@@ -129229,6 +129229,18 @@ impl Simulator {
                         return Some(t.clone());
                     }
                 }
+                // §8.1: inside a class method a bare name its class declares
+                // is that PROPERTY, even when a module signal shares the name.
+                // The signal won here, so a constructor's `b = new(7)` built
+                // the module variable's class instead — whose constructor
+                // built this one again, without end.
+                if hier.path.len() == 1 && !in_any_frame {
+                    if let Some(Some(ctx)) = self.class_context_stack.last() {
+                        if let Some(t) = self.class_prop_type_named(ctx, &name) {
+                            return Some(t);
+                        }
+                    }
+                }
                 if let Some(t) = self
                     .signal_name_to_id
                     .get(name.as_ref())
