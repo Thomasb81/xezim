@@ -5692,6 +5692,10 @@ pub struct Simulator {
     /// walking fired edge signals so we do not scan the whole bitmap to
     /// discover triggered blocks.
     edge_triggered_list: Vec<usize>,
+    /// Reusable `check_edges` buffers for the fired positions' detect-time
+    /// values (narrow planes / wide values); a fresh pair grew on every pass.
+    edge_fired_snap: Vec<(usize, u64, u64)>,
+    edge_fired_wide: Vec<(usize, Value)>,
     /// Generation marker for gateable blocks rejected by ARMED filtering
     /// during fanout dispatch. This deduplicates multi-sensitivity blocks
     /// without appending skipped work to `edge_triggered_list`.
@@ -9977,6 +9981,8 @@ impl Simulator {
             bitsel_sid_bits: Vec::new(),
             edge_triggered_bitmap: Vec::new(),
             edge_triggered_list: Vec::new(),
+            edge_fired_snap: Vec::new(),
+            edge_fired_wide: Vec::new(),
             edge_prefilter_seen: Vec::new(),
             edge_prefilter_generation: 0,
             edge_parallel_work: Vec::new(),
@@ -52624,8 +52630,10 @@ impl Simulator {
         // in a later same-time detect, and (b) a blocking write made DURING
         // exec reads as a NEW edge relative to the refreshed prev — which
         // drain_edge_exec_rescan then delivers (§9.2).
-        let mut fired_snap: Vec<(usize, u64, u64)> = Vec::new();
-        let mut fired_wide: Vec<(usize, Value)> = Vec::new();
+        let mut fired_snap = std::mem::take(&mut self.edge_fired_snap);
+        let mut fired_wide = std::mem::take(&mut self.edge_fired_wide);
+        fired_snap.clear();
+        fired_wide.clear();
         // One generation per detect pass: a memo slot stamped with an older
         // generation is stale, so the table never has to be cleared.
         self.edge_group_generation = self.edge_group_generation.wrapping_add(1);
@@ -54100,11 +54108,13 @@ impl Simulator {
             self.prev_val[sid] = v;
             self.prev_xz[sid] = x;
         }
-        for (sid, val) in fired_wide {
+        for (sid, val) in fired_wide.drain(..) {
             if let Some(p) = self.prev_wide.get_mut(&sid) {
                 *p = val;
             }
         }
+        self.edge_fired_snap = fired_snap;
+        self.edge_fired_wide = fired_wide;
         drop(blocks);
         self.edge_pass_depth -= 1;
         // A nested pass must not clear the flag out from under its caller.
