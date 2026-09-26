@@ -78782,6 +78782,11 @@ impl Simulator {
         } else {
             self.format_args(args, "$display")
         };
+        self.emit_severity_text(severity, &body);
+    }
+
+    /// `emit_severity` with the message already formatted.
+    fn emit_severity_text(&mut self, severity: &str, body: &str) {
         let scope = self.severity_scope();
         let time_s = self.format_time_parts(self.time_in_current_unit()).0;
         let line = if body.is_empty() {
@@ -117158,10 +117163,10 @@ impl Simulator {
                                         }
                                         crate::ast::decl::CoverBinKind::Ignore => { /* drop */ }
                                         crate::ast::decl::CoverBinKind::Illegal => {
-                                            eprintln!(
-                                                "[cov] illegal_bins hit: {} (val={:?}) (LRM §19.5)",
-                                                key,
-                                                val.to_u64()
+                                            self.cg_illegal_hit(
+                                                &cg_name,
+                                                &key,
+                                                &Self::cg_value_text(&val),
                                             );
                                             bin_increments.push((key, true));
                                         }
@@ -117300,6 +117305,28 @@ impl Simulator {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// §19.5.7: sampling a value (or transition) of an `illegal_bins` is a
+    /// run-time error; it counts toward `--error-exit`, and the run goes on.
+    fn cg_illegal_hit(&mut self, cg_name: &str, bin_key: &str, value: &str) {
+        let body = format!(
+            "Illegal bin hit at value {}: {}.{}",
+            value, cg_name, bin_key
+        );
+        self.emit_severity_text("Error", &body);
+    }
+
+    /// A sampled value as an illegal-bin message shows it: decimal, or
+    /// binary when it has x or z bits.
+    fn cg_value_text(val: &Value) -> String {
+        if val.has_xz() {
+            format!("{}'b{}", val.width, val.to_bin_string())
+        } else if val.is_signed {
+            val.to_i64().unwrap_or(0).to_string()
+        } else {
+            val.to_u64().unwrap_or(0).to_string()
         }
     }
 

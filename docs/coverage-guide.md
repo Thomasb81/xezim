@@ -247,8 +247,9 @@ axb : cross cp_a, cp_b {
 - **Covergroup:** the average of its coverpoints and crosses, weighted by each
   coverpoint's `option.weight` (default 1; a cross always weighs 1).
 
-A hit on an `illegal_bins` value prints a `[cov] illegal_bins hit: <coverpoint>.<bin>`
-line on stderr. The run carries on, and the hit is not counted by `--error-exit`.
+A hit on an `illegal_bins` value or transition is a run-time error: xezim prints
+`** Error: Illegal bin hit at value 7: cg.cp_s.bad` with the time and scope, like
+`$error`, and `--error-exit` counts it. The run carries on.
 
 ### Options and multiple instances
 
@@ -558,7 +559,6 @@ it.
 | Constructor arguments together with `with function sample` arguments | No bin is ever hit. Use one or the other |
 | `get_coverage(covered, total)`, `get_inst_coverage(covered, total)` | The percentage is returned, but `covered` and `total` are not set |
 | `cg_type::get_coverage()` | Returns 0. Call it on an instance: `cg.get_coverage()` |
-| `illegal_bins` hit | Reported on stderr. Not an error and doesn't stop the run |
 
 ---
 
@@ -571,6 +571,6 @@ it.
 | `--verbose`, `XEZIM_VERBOSE=1` | Print the `[COV]` summary lines on stderr, along with the other engine lines |
 | `--preprocess <files>` | Print the preprocessed source, to map an assertion's `span_start` to a line |
 | `+seed=<n>` | Seed the random generator, for reproducible random stimulus and coverage |
-| `--error-exit` | Exit nonzero after any `$error`, including one from an assertion's action block. `illegal_bins` hits are not counted |
+| `--error-exit` | Exit nonzero after any `$error`, including one from an assertion's action block, and after an `illegal_bins` hit |
 | `+cover`, `+cover=<spec>`, `+fcover`, `-coverage` | Accepted for compatibility with other simulators; no effect |
 | `-do "coverage save ..."`, `-do "coverage report ..."` | Ignored with a warning |
