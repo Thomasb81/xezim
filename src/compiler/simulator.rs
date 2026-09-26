@@ -5967,8 +5967,8 @@ pub struct Simulator {
     class_string_props: std::cell::RefCell<HashMap<String, std::rc::Rc<Vec<String>>>>,
     /// Class -> `class_enclosing_module` answer.
     class_enclosing_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
-    /// See `type_is_plain_class`.
-    plain_class_types: std::cell::RefCell<Option<HashSet<String>>>,
+    /// See `plain_class_ref`.
+    plain_class_types: std::cell::RefCell<Option<HashMap<String, bool>>>,
     /// Reused `<name>.size` key buffer of the queue-frame save/restore.
     queue_key_scratch: String,
     /// See `prop_owners`.
@@ -73883,7 +73883,8 @@ impl Simulator {
         // A built-in scalar or a plain class type: the packed-layout,
         // struct, enum, typedef and type-parameter probes below all come
         // back empty for it (a plain class resolves to itself).
-        let plain_class = self.type_is_plain_class(data_type);
+        let class_ref = self.plain_class_ref(data_type);
+        let plain_class = class_ref.is_some();
         let plain = plain_class || Self::type_is_plain_scalar(data_type);
         // §6.8/§6.18: resolve typedef aliases before deciding 2- vs
         // 4-state — `uvm_reg_data_t value_adjust;` (typedef of `bit
@@ -75148,9 +75149,10 @@ impl Simulator {
                 // `local.next()`/`.first()`/etc. find their
                 // enum-member list. We extract the bare type
                 // name from a TypeReference data_type. (A plain class
-                // is neither, nor a type parameter.)
+                // is neither, nor a type parameter; a forward-declared one
+                // is registered as its typedef here.)
                 if let (false, crate::ast::types::DataType::TypeReference { name, .. }) =
-                    (plain_class, data_type)
+                    (class_ref == Some(false), data_type)
                 {
                     let tn = name.name.name.clone();
                     // A local declared with a class TYPE PARAMETER
@@ -113365,32 +113367,38 @@ impl Simulator {
         }
     }
 
-    /// A formal of a plain class type (see `type_is_plain_class`) with no
-    /// unpacked dimensions. The collection, struct and array binders, the
-    /// integral width fitting and the vif probes all come back empty for
-    /// it, so it binds exactly like a scalar.
-    fn port_is_plain_class(&self, port: &crate::ast::decl::FunctionPort) -> bool {
-        port.dimensions.is_empty() && self.type_is_plain_class(&port.data_type)
+    /// `plain_class_ref` of a formal with no unpacked dimensions. The
+    /// collection, struct and array binders, the integral width fitting and
+    /// the vif probes all come back empty for such a formal, so it binds
+    /// exactly like a scalar.
+    fn port_class_ref(&self, port: &crate::ast::decl::FunctionPort) -> Option<bool> {
+        if !port.dimensions.is_empty() {
+            return None;
+        }
+        self.plain_class_ref(&port.data_type)
     }
 
-    /// An unscoped, dimension-free reference to a plain CLASS: a class name
+    /// An unscoped, dimension-free reference to a plain CLASS -- a class name
     /// that no typedef (module or class-local), enum or class parameter
     /// shares, so every typedef, type-parameter and layout lookup on it
-    /// misses and it resolves to the class itself. The name set is built
-    /// from the class and typedef tables and loses a name when a procedural
-    /// `typedef` or an inline-enum local adds it to them.
-    fn type_is_plain_class(&self, dt: &DataType) -> bool {
+    /// misses and it resolves to the class itself: `Some(false)`.
+    /// `Some(true)` when the name is also a forward `typedef class`
+    /// placeholder (a `Void` typedef), which answers every layout probe the
+    /// same way but registers formals and locals as typedef-typed too. The
+    /// name table is built from the class and typedef tables and loses a
+    /// name when a procedural `typedef` or an inline-enum local adds it.
+    fn plain_class_ref(&self, dt: &DataType) -> Option<bool> {
         let DataType::TypeReference {
             name, dimensions, ..
         } = dt
         else {
-            return false;
+            return None;
         };
         if !dimensions.is_empty() || name.scope.is_some() {
-            return false;
+            return None;
         }
         let mut cell = self.plain_class_types.borrow_mut();
-        let set = cell.get_or_insert_with(|| {
+        let kinds = cell.get_or_insert_with(|| {
             let params = &self.class_member_names().params;
             let mut local_typedefs: HashSet<&str> = HashSet::default();
             for cd in self.module.classes.values() {
@@ -113401,20 +113409,29 @@ impl Simulator {
             self.module
                 .classes
                 .keys()
-                .filter(|n| {
+                .filter_map(|n| {
                     let n = n.as_str();
-                    !params.contains(n)
-                        && !local_typedefs.contains(n)
-                        && !self.module.typedef_types.contains_key(n)
-                        && !self.module.typedefs.contains_key(n)
-                        && !self.module.typedef_unpacked_dims.contains_key(n)
-                        && !self.module.typedef_elem_widths.contains_key(n)
-                        && !self.module.enum_members.contains_key(n)
+                    if params.contains(n)
+                        || local_typedefs.contains(n)
+                        || self.module.typedef_unpacked_dims.contains_key(n)
+                        || self.module.typedef_elem_widths.contains_key(n)
+                        || self.module.enum_members.contains_key(n)
+                    {
+                        return None;
+                    }
+                    let forward = match (
+                        self.module.typedef_types.get(n),
+                        self.module.typedefs.contains_key(n),
+                    ) {
+                        (None, false) => false,
+                        (Some(DataType::Void(_)), true) => true,
+                        _ => return None,
+                    };
+                    Some((n.to_string(), forward))
                 })
-                .cloned()
                 .collect()
         });
-        set.contains(name.name.name.as_str())
+        kinds.get(name.name.name.as_str()).copied()
     }
 
     /// The `k`-th name whose metadata a class-method call saves (ports in
@@ -116153,7 +116170,7 @@ impl Simulator {
         // A built-in scalar or a plain class has no element width, struct
         // layout or typedef-carried shape: only a vector's own
         // non-normalized range can apply.
-        if Self::type_is_plain_scalar(dt) || self.type_is_plain_class(dt) {
+        if Self::type_is_plain_scalar(dt) || self.plain_class_ref(dt).is_some() {
             if let Some(fdims) = super::elaborate::packed_full_dims_of(dt, &self.module.parameters)
             {
                 self.module.packed_full_dims.insert(name.to_string(), fdims);
@@ -116251,7 +116268,7 @@ impl Simulator {
                 continue;
             }
             // A plain class formal cannot be bound to an interface.
-            let nm = if self.port_is_plain_class(port) {
+            let nm = if self.port_class_ref(port).is_some() {
                 None
             } else {
                 args.get(i)
@@ -116314,7 +116331,7 @@ impl Simulator {
                 let eff_dims: Vec<crate::ast::types::UnpackedDimension> =
                     if port.dimensions.is_empty() {
                         if let (false, crate::ast::types::DataType::TypeReference { name, .. }) =
-                            (self.port_is_plain_class(port), &port.data_type)
+                            (self.port_class_ref(port).is_some(), &port.data_type)
                         {
                             let tn = &name.name.name;
                             let concrete = self
@@ -129217,7 +129234,7 @@ impl Simulator {
                     .enumerate()
                     .map(|(i, port)| {
                         let plain =
-                            Self::port_is_plain_scalar(port) || self.port_is_plain_class(port);
+                            Self::port_is_plain_scalar(port) || self.port_class_ref(port).is_some();
                         (port.name.name.as_str(), args.get(i).filter(|_| !plain))
                     })
                     .collect();
@@ -129243,7 +129260,8 @@ impl Simulator {
                 for (i, port) in ports.iter().enumerate() {
                     // A plain scalar or class formal: none of the struct,
                     // collection, array or width probes below can claim it.
-                    let plain_class = self.port_is_plain_class(port);
+                    let class_ref = self.port_class_ref(port);
+                    let plain_class = class_ref.is_some();
                     let plain = plain_class || Self::port_is_plain_scalar(port);
                     if !plain && matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
                     {
@@ -129506,14 +129524,17 @@ impl Simulator {
                     }
                     if let DataType::TypeReference { name: tn, .. } = &port.data_type {
                         let type_name = tn.name.name.clone();
-                        if !plain_class
+                        // A plain class is a class here; a forward-declared
+                        // one is registered as its typedef.
+                        let plain_only = class_ref == Some(false);
+                        if !plain_only
                             && (self.module.enum_members.contains_key(&type_name)
                                 || self.module.typedefs.contains_key(&type_name))
                         {
                             self.record_local_typedef_type(&port.name.name, &type_name);
                             self.var_typedef_types
                                 .insert(port.name.name.clone(), type_name);
-                        } else if plain_class || self.module.classes.contains_key(&type_name) {
+                        } else if plain_only || self.module.classes.contains_key(&type_name) {
                             self.record_local_class_type(&port.name.name, &type_name);
                             self.var_class_types
                                 .insert(port.name.name.clone(), type_name.clone());
