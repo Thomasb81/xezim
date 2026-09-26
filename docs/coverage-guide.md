@@ -419,9 +419,9 @@ For the [assertion example](#assertion-coverage):
 
 ```json
   "assertions": [
-    {"span_start": 95, "kind": "cover", "pass": 2, "fail": 0},
-    {"span_start": 222, "kind": "assert", "pass": 6, "fail": 0},
-    {"span_start": 372, "kind": "cover", "pass": 2, "fail": 5}
+    {"file": "handshake.sv", "line": 6, "span_start": 95, "kind": "cover", "pass": 2, "fail": 0},
+    {"file": "handshake.sv", "line": 10, "span_start": 222, "kind": "assert", "pass": 6, "fail": 0},
+    {"file": "handshake.sv", "line": 14, "span_start": 372, "kind": "cover", "pass": 2, "fail": 5}
   ],
 ```
 
@@ -435,15 +435,9 @@ An immediate `cover`'s false evaluations therefore count in `assertion_fail_tota
 too. In the example, all 5 fails are clock edges where `req && !gnt` was false; no
 assertion failed.
 
-An entry has no name, file or line. `span_start` is the position of the `cover` /
-`assert` / `assume` keyword in its file after preprocessing, and the entries are
-sorted by it. Preprocessing keeps line breaks, so for a single-file design the line
-number is:
-
-```bash
-$ echo $(( $(xezim --preprocess handshake.sv | tail -n +2 | head -c 95 | wc -l) + 1 ))
-6
-```
+`file` and `line` locate the `cover` / `assert` / `assume` statement; `span_start`
+is its position in that file after preprocessing. The entries are sorted by file
+and position. An entry has no name.
 
 All instances of a module share one entry: its counts are the sum over the
 instances.
@@ -577,7 +571,6 @@ it.
 | (none) | Covergroups and assertions are always collected. A run with any of them writes `./xezim_cov.json` |
 | `XEZIM_COV_DB=<path>` | Write the results file to `<path>`; `/dev/null` to skip it |
 | `--verbose`, `XEZIM_VERBOSE=1` | Print the `[COV]` summary lines on stderr, along with the other engine lines |
-| `--preprocess <files>` | Print the preprocessed source, to map an assertion's `span_start` to a line |
 | `+seed=<n>` | Seed the random generator, for reproducible random stimulus and coverage |
 | `--error-exit` | Exit nonzero after any `$error`, including one from an assertion's action block, and after an `illegal_bins` hit |
 | `+cover`, `+cover=<spec>`, `+fcover`, `-coverage` | Accepted for compatibility with other simulators; no effect |

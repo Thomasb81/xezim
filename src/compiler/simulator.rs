@@ -2797,6 +2797,9 @@ struct SvaClockedSite {
     /// Unique identifier (hash of span position) so dedup across
     /// re-executions is cheap.
     span_key: usize,
+    /// Key of the site's `assertion_stats` tally, and its location.
+    stat_key: usize,
+    stat_loc: (Option<u32>, usize),
     /// Instance scope of the registering process: every instance of a
     /// module or interface shares the assertion's span.
     dedup_scope: String,
@@ -3293,13 +3296,16 @@ struct CpShape {
     excl: Vec<(i64, i64)>,
 }
 
-/// Per-source-location running tally for `assert` / `assume` / `cover` (the
-/// immediate-assertion forms). Keyed by `Statement.span.start` so each
-/// distinct source position is tracked once across all executions.
+/// Per-source-location running tally for `assert` / `assume` / `cover`,
+/// keyed by `Simulator::assert_stat_key` (source file and span start) so
+/// each distinct source position is tracked once across all executions.
 #[derive(Debug, Clone, Copy, Default)]
 struct AssertionStat {
     /// "assert" / "assume" / "cover" — one of three kinds
     kind: u8,
+    /// Where the statement is: its source file index (when known) and the
+    /// span start in that file's preprocessed text.
+    loc: Option<(Option<u32>, usize)>,
     /// Times the predicate evaluated true (`cover` calls these "hits").
     pass_count: u64,
     /// Times the predicate evaluated false (`cover` ignores).
@@ -6049,6 +6055,8 @@ pub struct Simulator {
     /// method on `this`). Woken directly by `fire_instance_event` when the
     /// matching `->m_event` runs; see `InstanceEventWaiter`.
     instance_event_waiters: Vec<InstanceEventWaiter>,
+    /// Source file of each process's module, for assertion tallies.
+    pid_src_file: HashMap<usize, Option<u32>>,
     /// Covergroups waiting for sampling events
     cg_event_waiters: Vec<(usize, Vec<SensitivityId>)>,
     /// Covergroups sampled on a named event (`@(ev)`), by the event's
@@ -9984,6 +9992,7 @@ impl Simulator {
             event_waiters: Vec::new(),
             instance_event_waiters: Vec::new(),
             fe_trusted_types: HashSet::default(),
+            pid_src_file: HashMap::default(),
             cg_event_waiters: Vec::new(),
             cg_named_event_waiters: HashMap::default(),
             cg_instance_event_waiters: HashMap::default(),
@@ -41187,6 +41196,70 @@ impl Simulator {
             .and_then(|m| self.module.src_file_of_module.get(&m).copied())
     }
 
+    /// `assertion_stats` key of an assertion statement: its span start,
+    /// tagged with its source file so statements of different files at the
+    /// same offset stay apart.
+    fn assert_stat_key(span_start: usize, src_file: Option<u32>) -> usize {
+        span_start | (src_file.map_or(0, |f| f as usize + 1) << 40)
+    }
+
+    /// Source file of the running process's module (memoized per process).
+    fn current_src_file(&mut self) -> Option<u32> {
+        let pid = self.current_pid;
+        if let Some(&f) = self.pid_src_file.get(&pid) {
+            return f;
+        }
+        let f = self.stall_pid_src_file(pid);
+        self.pid_src_file.insert(pid, f);
+        f
+    }
+
+    /// File and line of a span, resolved like `span_file_line_in`.
+    fn span_file_and_line(
+        &self,
+        span: crate::ast::Span,
+        src_file: Option<u32>,
+    ) -> Option<(String, usize)> {
+        let texts = &self.module.source_texts;
+        let i = match src_file
+            .map(|s| s as usize)
+            .filter(|&s| texts.get(s).is_some_and(|t| span.start < t.len()))
+        {
+            Some(i) => i,
+            None => {
+                let mut fits = texts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| span.start < t.len());
+                let (i, _) = fits.next()?;
+                if fits.next().is_some() {
+                    return None;
+                }
+                i
+            }
+        };
+        if let Some(loc) = self
+            .module
+            .source_line_maps
+            .get(i)
+            .and_then(|m| m.as_ref())
+            .and_then(|m| m.locate(&texts[i], span))
+        {
+            return Some((loc.file, loc.line as usize));
+        }
+        let line = 1 + texts[i].as_bytes()[..span.start]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        let file = self
+            .module
+            .source_files
+            .get(i)
+            .filter(|f| !f.is_empty())?
+            .clone();
+        Some((file, line))
+    }
+
     /// Best-effort `file:line` for a statement span. A span is a byte offset
     /// into its OWN file's preprocessed text; `src_file` says which file
     /// that is when the offender's originating module is known (see
@@ -43597,14 +43670,26 @@ impl Simulator {
         json.push_str("  \"assertions\": [\n");
         let mut sites: Vec<_> = self.assertion_stats.iter().collect();
         sites.sort_by_key(|(k, _)| **k);
-        for (i, (off, st)) in sites.iter().enumerate() {
+        for (i, (_, st)) in sites.iter().enumerate() {
             let kind = match st.kind {
                 0 => "assert",
                 1 => "assume",
                 _ => "cover",
             };
+            let (off, place) = match st.loc {
+                Some((src, off)) => (
+                    off,
+                    self.span_file_and_line(crate::ast::Span::new(off, off + 1), src)
+                        .map(|(f, l)| {
+                            format!("\"file\": \"{}\", \"line\": {}, ", json_escape(&f), l)
+                        })
+                        .unwrap_or_default(),
+                ),
+                None => (0, String::new()),
+            };
             json.push_str(&format!(
-                "    {{\"span_start\": {}, \"kind\": \"{}\", \"pass\": {}, \"fail\": {}}}{}\n",
+                "    {{{}\"span_start\": {}, \"kind\": \"{}\", \"pass\": {}, \"fail\": {}}}{}\n",
+                place,
                 off,
                 kind,
                 st.pass_count,
@@ -76622,8 +76707,11 @@ impl Simulator {
                             let action_pid = self.next_pid;
                             self.next_pid += 1;
                             self.process_scope_hint.insert(action_pid, scope.clone());
+                            let src = self.scope_src_file(Some(scope.as_str()));
                             self.sva_sites.push(SvaClockedSite {
                                 span_key,
+                                stat_key: Self::assert_stat_key(span_key, src),
+                                stat_loc: (src, span_key),
                                 dedup_scope: self.current_scope.clone(),
                                 kind,
                                 all_matches: a.is_sequence,
@@ -76666,11 +76754,13 @@ impl Simulator {
                     AssertionKind::Assume => 1,
                     AssertionKind::Cover => 2,
                 };
+                let src = self.current_src_file();
                 let entry = self
                     .assertion_stats
-                    .entry(a.span.start)
+                    .entry(Self::assert_stat_key(a.span.start, src))
                     .or_insert(AssertionStat {
                         kind: kind_tag,
+                        loc: Some((src, a.span.start)),
                         pass_count: 0,
                         fail_count: 0,
                     });
@@ -81048,7 +81138,7 @@ impl Simulator {
     fn sva_end_of_sim(&mut self) {
         for i in 0..self.sva_sites.len() {
             let node = self.sva_sites[i].node.clone();
-            let span_key = self.sva_sites[i].span_key;
+            let span_key = self.sva_sites[i].stat_key;
             let attempts = std::mem::take(&mut self.sva_sites[i].attempts);
             let n_fail = attempts
                 .iter()
@@ -81395,11 +81485,13 @@ impl Simulator {
     /// Tally one finished attempt on a site: cover sites count matches only.
     fn sva_tally(&mut self, site_idx: usize, span_key: usize, outcome: bool) {
         let kind = self.sva_sites[site_idx].kind;
+        let loc = self.sva_sites[site_idx].stat_loc;
         let stat = self
             .assertion_stats
             .entry(span_key)
             .or_insert_with(|| AssertionStat {
                 kind,
+                loc: Some(loc),
                 pass_count: 0,
                 fail_count: 0,
             });
@@ -81645,7 +81737,8 @@ impl Simulator {
                     continue;
                 }
             }
-            let span_key = self.sva_sites[i].span_key;
+            let span_key = self.sva_sites[i].stat_key;
+            let site_loc = self.sva_sites[i].stat_loc;
             let site_kind = self.sva_sites[i].kind;
             let node = self.sva_sites[i].node.clone();
             let disable = self.sva_sites[i].disable.clone();
@@ -81714,6 +81807,7 @@ impl Simulator {
                                 .entry(span_key)
                                 .or_insert_with(|| AssertionStat {
                                     kind: site_kind,
+                                    loc: Some(site_loc),
                                     pass_count: 0,
                                     fail_count: 0,
                                 });
@@ -82094,11 +82188,13 @@ impl Simulator {
             crate::ast::stmt::AssertionKind::Assume => 1,
             crate::ast::stmt::AssertionKind::Cover => 2,
         };
+        let src = self.current_src_file();
         let entry = self
             .assertion_stats
-            .entry(a.span.start)
+            .entry(Self::assert_stat_key(a.span.start, src))
             .or_insert(AssertionStat {
                 kind: kind_tag,
+                loc: Some((src, a.span.start)),
                 pass_count: 0,
                 fail_count: 0,
             });
@@ -82232,7 +82328,8 @@ impl Simulator {
                 .or_insert_with(|| {
                     AssertionStat {
                         kind: 2,
-                        /* cover */ pass_count: 0,
+                        /* cover */ loc: None,
+                        pass_count: 0,
                         fail_count: 0,
                     }
                 });
