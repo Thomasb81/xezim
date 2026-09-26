@@ -316,6 +316,8 @@ mod null_deref_fatal;
 mod shadowed_property_initializers;
 #[path = "classes/std_randomize_object_member.rs"]
 mod std_randomize_object_member;
+#[path = "classes/two_state_property_writes.rs"]
+mod two_state_property_writes;
 #[path = "classes/typedef_param_class_construction.rs"]
 mod typedef_param_class_construction;
 #[path = "classes/typename_class_operands.rs"]

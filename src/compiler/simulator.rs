@@ -97829,14 +97829,51 @@ impl Simulator {
         if val.is_real {
             return val.clone();
         }
-        match self.heap_prop_width(handle, prop) {
+        let fitted = match self.heap_prop_width(handle, prop) {
             Some(w) if w != val.width => {
                 let mut fitted = val.resize_for_assign(w);
                 fitted.is_signed = self.class_prop_signed_of(handle, prop);
                 fitted
             }
             _ => val.clone(),
+        };
+        // §6.11.1/§10.7: a 2-state property drops X/Z on every write.
+        if fitted.has_xz() && self.class_prop_two_state(handle, prop) {
+            return fitted.to_two_state();
         }
+        fitted
+    }
+
+    /// Whether property `prop` of the object `handle` is declared with a
+    /// 2-state type (`bit`, `int`, a typedef of one, ...).
+    fn class_prop_two_state(&self, handle: usize, prop: &str) -> bool {
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return false;
+        };
+        let mut cur = Some(inst.class_name.as_str());
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                return false;
+            };
+            if let Some(dt) = cd.property_types.get(prop) {
+                // A class-local typedef first, then the design's.
+                let dt = match dt {
+                    DataType::TypeReference { name, .. } => {
+                        cd.typedef_targets.get(&name.name.name).unwrap_or(dt)
+                    }
+                    _ => dt,
+                };
+                return super::elaborate::is_type_two_state_resolved(
+                    dt,
+                    &self.module.typedef_types,
+                );
+            }
+            if cd.properties.contains_key(prop) {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
     }
 
     /// §8.4: `var.prop` where `var` is a DECLARED class handle currently
@@ -100571,6 +100608,12 @@ impl Simulator {
                         kind: IAT::Byte | IAT::ShortInt | IAT::Int | IAT::LongInt,
                         ..
                     } => {
+                        // The leaf is 2-state: later writes drop X/Z too.
+                        if let Some(&id) = self.signal_name_to_id.get(leaf.as_str()) {
+                            if let Some(t) = self.signal_two_state.get_mut(id) {
+                                *t = true;
+                            }
+                        }
                         // Overwrite an ALL-X current value too: the member
                         // signal may be pre-registered x-filled. A restored
                         // declared initializer is never fully x, so it wins.
