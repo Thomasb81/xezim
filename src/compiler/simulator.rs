@@ -57581,6 +57581,18 @@ impl Simulator {
         out
     }
 
+    /// `format!("{}.{}", hint, name)` under the current scope hint, if any,
+    /// built without cloning the hint.
+    fn hint_scoped(&self, name: &str) -> Option<String> {
+        let hint = self.name_resolve_hint.borrow();
+        let h = hint.as_deref()?;
+        let mut out = String::with_capacity(h.len() + 1 + name.len());
+        out.push_str(h);
+        out.push('.');
+        out.push_str(name);
+        Some(out)
+    }
+
     /// `format!("{}{}", base, suffix)` without the formatting machinery.
     fn name_with_suffix(base: &str, suffix: &str) -> String {
         let mut out = String::with_capacity(base.len() + suffix.len());
@@ -59039,7 +59051,7 @@ impl Simulator {
                     && !self.signals.contains_key(&*base)
                 {
                     let i = self.eval_expr(index).to_i64().unwrap_or(0);
-                    let elem = format!("{}[{}]", base, i);
+                    let elem = Self::name_with_index(&base, i);
                     // A module-level struct has its element signals
                     // pre-registered. A PROCEDURAL-LOCAL one does not —
                     // nothing is registered for it at all — so create the
@@ -59156,7 +59168,7 @@ impl Simulator {
             }
             let idx_val = self.eval_expr(index);
             let idx_str = self.assoc_key_str(&an, &idx_val);
-            let elem_name = format!("{}[{}]", an, idx_str);
+            let elem_name = Self::name_with_key(&an, &idx_str);
             // §7.10.2.3 / §7.4: for a QUEUE / dynamic array (NOT a
             // true assoc array) `q[i] = v` with `i >= size` APPENDS —
             // the size becomes `i+1`. UVM's `uvm_unpack_queueN` fills
@@ -59684,9 +59696,7 @@ impl Simulator {
             // the process's instance scope (name_resolve_hint), like
             // scalar reads/writes already do.
             if !self.module.arrays.contains_key(&*name) && !self.is_associative_array(&name) {
-                let hint = self.name_resolve_hint.borrow().clone();
-                if let Some(h) = hint {
-                    let scoped = format!("{}.{}", h, name);
+                if let Some(scoped) = self.hint_scoped(&name) {
                     if self.module.arrays.contains_key(&scoped)
                         || self.is_associative_array(&scoped)
                     {
@@ -69236,7 +69246,7 @@ impl Simulator {
                         return Value::new(ew.max(1));
                     }
                     let idx_str = self.assoc_key_str(&an, &idx_val);
-                    let elem_name = format!("{}[{}]", an, idx_str);
+                    let elem_name = Self::name_with_key(&an, &idx_str);
                     if let Some(ev) = self.signals.get(&elem_name) {
                         return ev.clone();
                     }
@@ -69422,9 +69432,7 @@ impl Simulator {
                     // scalar reads/writes already do.
                     if !self.module.arrays.contains_key(&*name) && !self.is_associative_array(&name)
                     {
-                        let hint = self.name_resolve_hint.borrow().clone();
-                        if let Some(h) = hint {
-                            let scoped = format!("{}.{}", h, name);
+                        if let Some(scoped) = self.hint_scoped(&name) {
                             if self.module.arrays.contains_key(&scoped)
                                 || self.is_associative_array(&scoped)
                             {
@@ -69525,7 +69533,7 @@ impl Simulator {
                             // spelling — `nmem[-2]`, not `nmem[4294967294]`.
                             idx_val.to_i64().unwrap_or(0).to_string()
                         };
-                        let elem_name = format!("{}[{}]", store_name, idx_str);
+                        let elem_name = Self::name_with_key(&store_name, &idx_str);
                         if let Some(&eid) = self.signal_name_to_id.get(elem_name.as_str()) {
                             let mut v = self.signal_table[eid].clone();
                             if self.signal_signed[eid] {
@@ -69831,7 +69839,7 @@ impl Simulator {
                                     .unwrap_or(ctx_width.max(1));
                                 return Value::new(ew.max(1));
                             };
-                            let elem = format!("{}[{}]", base, i);
+                            let elem = Self::name_with_index(&base, i);
                             if let Some(v) = self.get_signal_value_by_name(&elem) {
                                 return v;
                             }
@@ -71013,19 +71021,13 @@ impl Simulator {
         };
         match spread_of(self, &dst) {
             Some(su) => (dst, su),
-            None => {
-                let hint = self.name_resolve_hint.borrow().clone();
-                match hint {
-                    Some(h) => {
-                        let scoped = format!("{}.{}", h, dst);
-                        match spread_of(self, &scoped) {
-                            Some(su) => (scoped, su),
-                            None => (dst, None),
-                        }
-                    }
+            None => match self.hint_scoped(&dst) {
+                Some(scoped) => match spread_of(self, &scoped) {
+                    Some(su) => (scoped, su),
                     None => (dst, None),
-                }
-            }
+                },
+                None => (dst, None),
+            },
         }
     }
 
@@ -74508,9 +74510,7 @@ impl Simulator {
                 && !self.module.dynamic_arrays.contains(&*name)
                 && !self.is_associative_array(&name)
             {
-                let hint = self.name_resolve_hint.borrow().clone();
-                if let Some(h) = hint {
-                    let scoped = format!("{}.{}", h, name);
+                if let Some(scoped) = self.hint_scoped(&name) {
                     if self.module.arrays.contains_key(&scoped)
                         || self.module.arrays_2d.contains_key(&scoped)
                         || self.module.arrays_nd.contains_key(&scoped)
@@ -94548,9 +94548,7 @@ impl Simulator {
                 && !self.module.dynamic_arrays.contains(&*name)
                 && !self.is_associative_array(&name)
             {
-                let hint = self.name_resolve_hint.borrow().clone();
-                if let Some(h) = hint {
-                    let scoped = format!("{}.{}", h, name);
+                if let Some(scoped) = self.hint_scoped(&name) {
                     if self.module.arrays.contains_key(&scoped)
                         || self.module.arrays_2d.contains_key(&scoped)
                         || self.module.arrays_nd.contains_key(&scoped)
@@ -107952,6 +107950,15 @@ impl Simulator {
                     }
                     _ => return false,
                 };
+                // The index is evaluated (as it always was); only a declared
+                // vif property can take the element binding.
+                if !self
+                    .class_member_names()
+                    .vif_props
+                    .contains(prop_base.as_str())
+                {
+                    return false;
+                }
                 (obj_handle, format!("{}[{}]", prop_base, idx))
             }
             _ => return false,
