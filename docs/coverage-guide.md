@@ -47,9 +47,10 @@ xezim alu_cov.sv          # also writes ./xezim_cov.json
 ## Writing coverage
 
 Give every coverpoint and cross a label (`cp_op : coverpoint op`). Queries and the
-results file use the label as the name. An unlabeled coverpoint cannot be queried
-by name, and the results file lists it under an internal name. An unlabeled
-coverpoint on an expression (`coverpoint a + b`) can also read 0% after it was hit.
+results file use the label as the name. An unlabeled coverpoint on a variable is
+named after the variable (`coverpoint data` is `cg.data`); one on any other
+expression gets the name `coverpoint#<n>`, `<n>` counting the covergroup's
+coverpoints from 1, which a query cannot spell.
 
 ### A covergroup in a module, sampled on a clock
 
