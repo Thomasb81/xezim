@@ -120689,6 +120689,37 @@ impl Simulator {
     /// Split a specialization argument-list text on top-level commas,
     /// respecting string literals, parentheses, brackets and braces so that
     /// `#("a,b", f(1,2))` yields two fragments, not four.
+    /// Fragment `idx` of `split_spec_args(sig)`, borrowed: the same
+    /// top-level split, without building the list.
+    fn spec_arg_at(sig: &str, idx: usize) -> Option<&str> {
+        let mut depth: i32 = 0;
+        let mut in_str = false;
+        let mut prev = '\0';
+        let mut start = 0usize;
+        let mut k = 0usize;
+        for (i, ch) in sig.char_indices() {
+            match (in_str, ch) {
+                (false, '"') => in_str = true,
+                (true, '"') if prev != '\\' => in_str = false,
+                (true, _) => {}
+                (false, '(' | '[' | '{') => depth += 1,
+                (false, ')' | ']' | '}') => depth -= 1,
+                (false, ',') if depth == 0 => {
+                    if k == idx {
+                        return Some(&sig[start..i]);
+                    }
+                    k += 1;
+                    start = i + 1;
+                }
+                (false, _) => {}
+            }
+            prev = ch;
+        }
+        // The last fragment is listed only when it is not blank.
+        let last = &sig[start..];
+        (k == idx && !last.trim().is_empty()).then_some(last)
+    }
+
     fn split_spec_args(sig: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut cur = String::new();
@@ -120864,8 +120895,7 @@ impl Simulator {
                     &cd.param_order
                 };
                 if let Some(idx) = order.iter().position(|p| p == tn) {
-                    let frags = Self::split_spec_args(sig);
-                    if let Some(v) = frags.get(idx) {
+                    if let Some(v) = Self::spec_arg_at(sig, idx) {
                         let v = v.trim();
                         if !v.is_empty() {
                             return Some(v.to_string());
@@ -120887,8 +120917,7 @@ impl Simulator {
         if let Some((base, sig)) = spec {
             if let Some(cd) = self.get_class_def(base) {
                 if let Some(idx) = cd.type_param_names.iter().position(|p| p == tn) {
-                    let frags = Self::split_spec_args(sig);
-                    if let Some(v) = frags.get(idx) {
+                    if let Some(v) = Self::spec_arg_at(sig, idx) {
                         let v = v.trim();
                         if !v.is_empty() {
                             return Some(v.to_string());
