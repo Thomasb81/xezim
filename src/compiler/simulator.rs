@@ -116277,30 +116277,24 @@ impl Simulator {
                     .and_then(|i| self.module.covergroups.get(&i.cg_name))
                     .map(|d| d.sample_ports.clone())
                     .unwrap_or_default();
-                if formals.is_empty() {
-                    self.sample_covergroup(handle);
-                } else {
-                    let mut frame: HashMap<String, Value> = HashMap::default();
-                    for (i, port) in formals.iter().enumerate() {
-                        let mut v = match _args.get(i) {
-                            Some(a) => self.eval_expr(a),
-                            None => match &port.default {
-                                Some(d) => self.eval_expr(d),
-                                None => Value::zero(32),
-                            },
-                        };
-                        if let Some((w, signed)) = self.scalar_formal_integral(&port.data_type) {
-                            if w > 0 && w != v.width {
-                                v = v.resize(w);
-                            }
-                            v.is_signed = signed;
+                let mut frame: HashMap<String, Value> = HashMap::default();
+                for (i, port) in formals.iter().enumerate() {
+                    let mut v = match _args.get(i) {
+                        Some(a) => self.eval_expr(a),
+                        None => match &port.default {
+                            Some(d) => self.eval_expr(d),
+                            None => Value::zero(32),
+                        },
+                    };
+                    if let Some((w, signed)) = self.scalar_formal_integral(&port.data_type) {
+                        if w > 0 && w != v.width {
+                            v = v.resize(w);
                         }
-                        frame.insert(port.name.name.clone(), v);
+                        v.is_signed = signed;
                     }
-                    self.push_local_frame(frame);
-                    self.sample_covergroup(handle);
-                    self.pop_local_frame();
+                    frame.insert(port.name.name.clone(), v);
                 }
+                self.sample_covergroup_with(handle, frame);
                 Value::zero(32)
             }
             _ => Value::zero(32),
@@ -116974,6 +116968,14 @@ impl Simulator {
     }
 
     fn sample_covergroup(&mut self, handle: usize) {
+        self.sample_covergroup_with(handle, HashMap::default());
+    }
+
+    /// Sample instance `handle` with the §19.8.1 `with function sample`
+    /// formals bound to `sample_args`. They share one frame with the §19.3
+    /// constructor formals: a second frame on top hid the first, so a
+    /// covergroup with both never saw its sample arguments.
+    fn sample_covergroup_with(&mut self, handle: usize, sample_args: HashMap<String, Value>) {
         let (owner, mut ctor_args, ctor_refs) =
             match self.cg_heap.get(handle).and_then(|x| x.as_ref()) {
                 Some(i) => (i.owner, i.ctor_args.clone(), i.ctor_refs.clone()),
@@ -116986,12 +116988,12 @@ impl Simulator {
                 slot.1 = v;
             }
         }
-        let has_args = !ctor_args.is_empty();
+        let mut frame = sample_args;
+        for (n, v) in ctor_args {
+            frame.entry(n).or_insert(v);
+        }
+        let has_args = !frame.is_empty();
         if has_args {
-            let mut frame: HashMap<String, Value> = HashMap::default();
-            for (n, v) in ctor_args {
-                frame.insert(n, v);
-            }
             self.push_local_frame(frame);
         }
         if let Some(h) = owner {

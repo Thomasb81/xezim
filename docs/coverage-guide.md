@@ -556,7 +556,6 @@ it.
 | Transition sets and repetition: `(1, 5 => 3)`, `(3 [*2])`, `[->n]`, `[=n]` | Never hit |
 | In a cross body: `ignore_bins`, `illegal_bins`, `binsof(cp.bin)`, `binsof(...) with (...)` | Ignored. Only `bins name = binsof(cp) intersect {...}` is used. To leave values out of a cross, put `ignore_bins` on the coverpoint, as in [the cross example](#crosses-and-ignore_bins) |
 | `binsof(...) intersect {...} && binsof(...) ...` (or `\|\|`) | Only the first `binsof` term is used |
-| Constructor arguments together with `with function sample` arguments | No bin is ever hit. Use one or the other |
 | `get_coverage(covered, total)`, `get_inst_coverage(covered, total)` | The percentage is returned, but `covered` and `total` are not set |
 | `cg_type::get_coverage()` | Returns 0. Call it on an instance: `cg.get_coverage()` |
 

@@ -170,6 +170,8 @@ mod covergroup_illegal_bins;
 mod covergroup_implicit_names;
 #[path = "classes/covergroup_placement.rs"]
 mod covergroup_placement;
+#[path = "classes/covergroup_sample_args.rs"]
+mod covergroup_sample_args;
 #[path = "classes/factory_run_test.rs"]
 mod factory_run_test;
 #[path = "classes/foreach_member_multidim.rs"]
