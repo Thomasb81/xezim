@@ -74345,7 +74345,22 @@ impl Simulator {
                 }
             }
             if let Some((lo, hi)) = range {
-                let name = d.name.name.clone();
+                // §6.21: a fixed array local to a class method is automatic —
+                // each invocation owns its storage. Keyed by its bare name it
+                // was one array shared by every concurrent call (two
+                // sequences' `item req_c[10]` overwrote each other) and
+                // re-seeded under the other's feet. Give it the per-frame
+                // key the associative locals already use.
+                let bare = d.name.name.clone();
+                let in_method = matches!(self.class_context_stack.last(), Some(Some(_)));
+                let name = if in_method
+                    && self.current_static_task.is_none()
+                    && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                {
+                    self.declare_local_dyn(&bare)
+                } else {
+                    bare.clone()
+                };
                 self.module.arrays.insert(name.clone(), (lo, hi, w));
                 if descending {
                     self.module.descending_arrays.insert(name.clone());
@@ -74399,7 +74414,7 @@ impl Simulator {
                                 root: None,
                                 path: vec![crate::ast::expr::HierPathSegment {
                                     name: crate::ast::Identifier {
-                                        name: name.clone(),
+                                        name: bare.clone(),
                                         span: d.name.span,
                                     },
                                     selects: Vec::new(),
