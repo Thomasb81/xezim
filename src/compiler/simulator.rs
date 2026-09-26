@@ -2702,6 +2702,8 @@ struct ClassMemberNames {
     vif_props: HashSet<String>,
     /// Every declared method name, of any kind.
     methods: HashSet<String>,
+    /// Every declared task name.
+    tasks: HashSet<String>,
     static_methods: HashSet<String>,
     /// Every function/task key and each of its suffixes after a `.`.
     subroutine_suffixes: HashSet<String>,
@@ -46871,6 +46873,8 @@ impl Simulator {
             // tasks with no top-level wait) keep the synchronous path.
             if let StatementKind::Expr(expr) = &stmt.kind {
                 if let ExprKind::Call { func, args } = &expr.kind {
+                    // The receiver handle when it came from a call result.
+                    let mut call_recv: Option<usize> = None;
                     let resolved: Option<(usize, String)> = match &func.kind {
                         // (receiver_handle, method_name)
                         ExprKind::Ident(h) if h.path.len() == 1 => self
@@ -46894,9 +46898,37 @@ impl Simulator {
                             let recv = Expression::new(ExprKind::Ident(head), expr.span);
                             self.eval_handle_expr(&recv).map(|hh| (hh, last.name.name))
                         }
-                        ExprKind::MemberAccess { expr: recv, member } => self
-                            .eval_handle_expr(recv)
-                            .map(|hh| (hh, member.name.clone())),
+                        ExprKind::MemberAccess { expr: recv, member } => {
+                            match self.eval_handle_expr(recv) {
+                                Some(hh) => Some((hh, member.name.clone())),
+                                // A receiver reached through a call result
+                                // (`h.pool.get("done").wait_trigger()`) has no
+                                // side-effect-free handle form, so the call
+                                // ran synchronously and a blocking task
+                                // returned at once. For a name some class
+                                // declares as a task, run the receiver call
+                                // here and keep its result.
+                                None if self
+                                    .class_member_names()
+                                    .tasks
+                                    .contains(member.name.as_str()) =>
+                                {
+                                    match Self::recv_call_node(recv) {
+                                        Some(call) => {
+                                            let v = self.eval_expr(call);
+                                            let hh = self.recv_chain_handle(
+                                                v.to_u64().unwrap_or(0) as usize,
+                                                recv,
+                                            );
+                                            call_recv = Some(hh);
+                                            Some((hh, member.name.clone()))
+                                        }
+                                        None => None,
+                                    }
+                                }
+                                None => None,
+                            }
+                        }
                         _ => None,
                     };
                     if let Some((rh, mn)) = resolved {
@@ -46941,6 +46973,25 @@ impl Simulator {
                                 }
                             }
                         }
+                    }
+                    // Not inlined: run the call with the receiver value
+                    // already computed above rather than evaluating it again.
+                    if let (Some(rh), ExprKind::MemberAccess { member, .. }) =
+                        (call_recv, &func.kind)
+                    {
+                        let is_obj = rh != 0
+                            && self.heap.get(rh).is_some_and(|o| o.is_some())
+                            && !self.mailboxes.contains_key(&rh)
+                            && !self.semaphores.contains_key(&rh);
+                        if is_obj && self.cg_index(rh).is_none() {
+                            self.exec_method_call(rh, &member.name, args);
+                            i += 1;
+                            continue;
+                        }
+                        // Not a class object (a mailbox, semaphore, process
+                        // or null handle, or a collection property): leave
+                        // the call to the later stages and the synchronous
+                        // path, which evaluate the receiver themselves.
                     }
                 }
             }
@@ -103489,6 +103540,36 @@ impl Simulator {
         Value::from_u64(out, w.max(32))
     }
 
+    /// The subroutine call a method-call receiver is reached through
+    /// (`f()` in `f().m()` or `f().a.b.m()`), if the receiver is a call
+    /// followed only by member selects.
+    fn recv_call_node(expr: &Expression) -> Option<&Expression> {
+        match &expr.kind {
+            ExprKind::Call { .. } => Some(expr),
+            ExprKind::MemberAccess { expr, .. } => Self::recv_call_node(expr),
+            ExprKind::Paren(inner) => Self::recv_call_node(inner),
+            _ => None,
+        }
+    }
+
+    /// The handle a `recv_call_node`-shaped receiver names, given the call's
+    /// result: walk the member selects after the call as handle properties
+    /// (0 when one is not a handle).
+    fn recv_chain_handle(&self, call_handle: usize, expr: &Expression) -> usize {
+        match &expr.kind {
+            ExprKind::Call { .. } => call_handle,
+            ExprKind::MemberAccess { expr, member } => {
+                let h = self.recv_chain_handle(call_handle, expr);
+                if h == 0 {
+                    return 0;
+                }
+                self.member_handle(h, &member.name).unwrap_or(0)
+            }
+            ExprKind::Paren(inner) => self.recv_chain_handle(call_handle, inner),
+            _ => 0,
+        }
+    }
+
     /// True if `expr` contains a function/method/system/`new` call anywhere —
     /// such initializers may recurse or have side effects, so they are not
     /// re-evaluated at instantiation.
@@ -129137,6 +129218,7 @@ impl Simulator {
             let mut statics: HashSet<String> = HashSet::default();
             let mut vif_props: HashSet<String> = HashSet::default();
             let mut methods: HashSet<String> = HashSet::default();
+            let mut tasks: HashSet<String> = HashSet::default();
             let mut static_methods: HashSet<String> = HashSet::default();
             let mut params: HashSet<String> = HashSet::default();
             let mut assoc_props: HashSet<String> = HashSet::default();
@@ -129147,6 +129229,14 @@ impl Simulator {
                 statics.extend(cd.static_properties.iter().cloned());
                 vif_props.extend(cd.virtual_iface_properties.keys().cloned());
                 methods.extend(cd.methods.keys().cloned());
+                tasks.extend(
+                    cd.methods
+                        .iter()
+                        .filter(|(_, m)| {
+                            matches!(m.kind, crate::ast::decl::ClassMethodKind::Task(_))
+                        })
+                        .map(|(n, _)| n.clone()),
+                );
                 static_methods.extend(cd.static_methods.iter().cloned());
                 params.extend(cd.type_param_names.iter().cloned());
                 params.extend(cd.param_order.iter().cloned());
@@ -129174,6 +129264,7 @@ impl Simulator {
                 statics,
                 vif_props,
                 methods,
+                tasks,
                 static_methods,
                 subroutine_suffixes,
                 params,

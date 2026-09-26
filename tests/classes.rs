@@ -296,6 +296,8 @@ mod fixed_member_pattern_write;
 #[path = "classes/nested_and_extends_spec.rs"]
 mod nested_and_extends_spec;
 
+#[path = "classes/blocking_task_on_call_result.rs"]
+mod blocking_task_on_call_result;
 #[path = "classes/class_property_over_module_signal.rs"]
 mod class_property_over_module_signal;
 #[path = "classes/concurrent_method_local_arrays.rs"]
