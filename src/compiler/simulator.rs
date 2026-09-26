@@ -109485,6 +109485,16 @@ impl Simulator {
         None
     }
 
+    /// `format!("{}#{}", handle, member)`: the instance-scoped store name of
+    /// a collection member, built without the formatting machinery.
+    fn handle_member_key(handle: usize, member: &str) -> String {
+        let mut out = String::with_capacity(member.len() + 21);
+        Self::push_i64(&mut out, handle as i64);
+        out.push('#');
+        out.push_str(member);
+        out
+    }
+
     fn instance_assoc_member(&self, name: &str) -> Option<String> {
         // §8.9: `Cls::member` / flattened `Cls.member` spellings of a static
         // fixed array resolve to the declaring class's store BEFORE the
@@ -109562,7 +109572,9 @@ impl Simulator {
                 let cache = self.member_coll_cache.borrow();
                 if let Some(v) = cache.get(ctx).and_then(|m| m.get(name)) {
                     match v {
-                        MemberCollKind::Coll(None) => return Some(format!("{}#{}", handle, name)),
+                        MemberCollKind::Coll(None) => {
+                            return Some(Self::handle_member_key(handle, name));
+                        }
                         MemberCollKind::Coll(Some(owner)) => {
                             return Some(format!("{}::{}", owner, name));
                         }
@@ -109578,7 +109590,7 @@ impl Simulator {
                                     },
                                 );
                             if !bound {
-                                return unbound.then(|| format!("{}#{}", handle, name));
+                                return unbound.then(|| Self::handle_member_key(handle, name));
                             }
                             break;
                         }
@@ -109601,7 +109613,7 @@ impl Simulator {
         // path below instead of running at every level.
         if let Some(kind) = self.class_coll_lookup(ctx, name) {
             return Some(match kind {
-                None => format!("{}#{}", handle, name),
+                None => Self::handle_member_key(handle, name),
                 Some(owner) => format!("{}::{}", owner, name),
             });
         }
@@ -109632,7 +109644,7 @@ impl Simulator {
             let cd = self.module.classes.get(cn)?;
             declared |= cd.properties.contains_key(name);
             if self.prop_bound_collection(handle, cn, name) {
-                return Some(format!("{}#{}", handle, name));
+                return Some(Self::handle_member_key(handle, name));
             }
             cur = cd.extends.as_deref();
         }
@@ -109983,11 +109995,11 @@ impl Simulator {
                 .and_then(|x| x.as_ref())
                 .map(|i| i.class_name.clone())?;
             if sim.class_assoc_member(&cn, member) {
-                Some(format!("{}#{}", handle, member))
+                Some(Self::handle_member_key(handle, member))
             } else if sim.prop_bound_collection(handle, &cn, member) {
                 // §6.20.3: `T data;` where THIS instance binds T to an
                 // array/queue typedef — a per-spec collection property.
-                Some(format!("{}#{}", handle, member))
+                Some(Self::handle_member_key(handle, member))
             } else {
                 // §8.9: a fixed-size static array member names the
                 // class-qualified shared store.
