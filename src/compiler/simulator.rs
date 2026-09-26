@@ -70852,6 +70852,168 @@ impl Simulator {
         true
     }
 
+    /// A member chain of select-free names ending in `this` or a one-segment
+    /// identifier (`a.b.c`, `this.a`): evaluating or naming it evaluates no
+    /// index and calls nothing.
+    fn member_chain_is_plain(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::MemberAccess { expr, .. } => Self::member_chain_is_plain(expr),
+            ExprKind::This => true,
+            ExprKind::Ident(h) => h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()),
+            _ => false,
+        }
+    }
+
+    /// Does a member chain below its last member name a method anywhere (a
+    /// parenless call when evaluated)?
+    fn chain_names_method(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::MemberAccess { expr, member } => {
+                self.class_member_names()
+                    .methods
+                    .contains(member.name.as_str())
+                    || self.chain_names_method(expr)
+            }
+            _ => false,
+        }
+    }
+
+    /// `h.p = rhs` / `this.p = rhs`, `h` a select-free one-segment name and
+    /// `p` a property no class can hold as a vif, a struct or a collection.
+    /// The full path's special forms key on a pattern, `new`, pop, locator,
+    /// stream, tagged, concatenation, conditional or struct-property RHS, on
+    /// a vif, struct or collection target (the class name sets), or on a
+    /// declared struct type for `h` or `h.p` (probed); none can match here,
+    /// so the statement is the full path's width-sized evaluate + assign.
+    fn member_target_assign(&mut self, lvalue: &Expression, rvalue: &Expression) -> bool {
+        let ExprKind::MemberAccess { expr: base, member } = &lvalue.kind else {
+            return false;
+        };
+        let recv: Option<&str> = match &base.kind {
+            ExprKind::This => None,
+            ExprKind::Ident(h)
+                if h.path.len() == 1 && h.root.is_none() && h.path[0].selects.is_empty() =>
+            {
+                let n = h.path[0].name.name.as_str();
+                if matches!(n, "super" | "this") {
+                    return false;
+                }
+                Some(n)
+            }
+            _ => return false,
+        };
+        // The full path's call forms are `new`, a queue pop and an array
+        // locator, each named by the callee's last segment; a member or
+        // dotted RHS naming a locator is a locator call too.
+        let rhs_call = match &rvalue.kind {
+            ExprKind::Number(_)
+            | ExprKind::Null
+            | ExprKind::This
+            | ExprKind::Unary { .. }
+            | ExprKind::Binary { .. } => false,
+            ExprKind::Ident(rh) => {
+                if rh.root.is_some()
+                    || rh.path.len() > 2
+                    || rh.path.iter().any(|s| !s.selects.is_empty())
+                    || rh.path.last().is_some_and(|s| {
+                        s.name.name == "new" || Self::is_locator_method(&s.name.name)
+                    })
+                {
+                    return false;
+                }
+                false
+            }
+            ExprKind::MemberAccess {
+                expr: rb,
+                member: rm,
+            } => {
+                // A deeper chain's receiver is evaluated by the collection
+                // probes too; it must be a plain read (no parenless call).
+                if Self::is_locator_method(&rm.name)
+                    || !Self::member_chain_is_plain(rvalue)
+                    || self.chain_names_method(rb)
+                {
+                    return false;
+                }
+                false
+            }
+            ExprKind::Call { func, .. } => {
+                let callee = match &func.kind {
+                    ExprKind::Ident(fh) => fh.path.last().map(|s| s.name.name.as_str()),
+                    ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                    _ => None,
+                };
+                match callee {
+                    Some(m)
+                        if m != "new"
+                            && m != "pop_front"
+                            && m != "pop_back"
+                            && !Self::is_locator_method(m) => {}
+                    _ => return false,
+                }
+                // The pop probe names a member callee's receiver; an index in
+                // it would be evaluated there as well.
+                if let ExprKind::MemberAccess { expr: fr, .. } = &func.kind {
+                    if !Self::member_chain_is_plain(fr) {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => return false,
+        };
+        let p = member.name.as_str();
+        if self.class_member_names().vif_props.contains(p)
+            || self.struct_prop_name_possible(p)
+            || self.coll_member_possible(p)
+            || Self::receiver_prop_name(rvalue).is_some_and(|q| self.struct_prop_name_possible(q))
+        {
+            return false;
+        }
+        if let Some(n) = recv {
+            if self.struct_prop_name_possible(n)
+                || self.dyn_name_lookup(n).is_some()
+                || self.module.classes.contains_key(n)
+                || self.module.packages.contains(n)
+            {
+                return false;
+            }
+            // The whole-struct copy targets: `h.p` declared, or `h` a struct
+            // with a member `p` (the flat-path type), or either under the
+            // scope hint.
+            let mut dst = String::with_capacity(n.len() + p.len() + 1);
+            dst.push_str(n);
+            dst.push('.');
+            dst.push_str(p);
+            if self.module.var_decl_types.contains_key(dst.as_str())
+                || self
+                    .module
+                    .var_decl_types
+                    .get(n)
+                    .is_some_and(|dt| matches!(self.resolve_dt_ref(dt), DataType::Struct(_)))
+            {
+                return false;
+            }
+            if self.name_resolve_hint.borrow().is_some() && self.struct_copy_target(dst).1.is_some()
+            {
+                return false;
+            }
+        }
+        let w = {
+            let iw = self.infer_lhs_width(lvalue);
+            if iw == 0 { 32 } else { iw }
+        };
+        let val = self.eval_expr_ctx(rvalue, w);
+        if rhs_call {
+            // The full path takes a returned collection here; a member
+            // target is never its destination.
+            self.pending_ret_collection = None;
+        }
+        self.assign_value(lvalue, &val);
+        self.settle_after_proc_write();
+        true
+    }
+
     /// Outlined from `exec_statement` so the dispatcher's stack frame
     /// stays small: this arm's locals inflated every call's frame (the
     /// dispatcher recursed with a 7.8 KB frame per level).
@@ -70862,7 +71024,8 @@ impl Simulator {
         lvalue: &Expression,
         rvalue: &Expression,
     ) {
-        if self.simple_blocking_assign(lvalue, rvalue) {
+        if self.simple_blocking_assign(lvalue, rvalue) || self.member_target_assign(lvalue, rvalue)
+        {
             return;
         }
         // §15.5.5: `event_var = other_event / null / q[i]` re-binds
