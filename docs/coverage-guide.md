@@ -17,7 +17,7 @@ how to read the results.
 |---|---|
 | Where covergroups live | Any module (the top or an instantiated one), an interface, a package, file scope, and classes. See [Where a covergroup can be declared](#where-a-covergroup-can-be-declared) |
 | Sampling | A sampling event (`covergroup cg @(posedge clk)`, `@(posedge clk iff en)`, a named event `@(ev)`), explicit `sample()`, `with function sample(...)` arguments, constructor arguments (`covergroup cg (int lo, int hi)`) |
-| Bins | Values and ranges (`{0, [2:5], [8:$]}`), automatic bins, array bins `name[]`, `wildcard` bins, transition bins `(1 => 2 => 3)` and `([0:1] => [2:3])`, `default`, `ignore_bins`, `illegal_bins` |
+| Bins | Values and ranges (`{0, [2:5], [8:$]}`), automatic bins, array bins `name[]` and `name[N]`, `wildcard` bins, transition bins (`(1 => 2 => 3)`, `([0:1] => [2:3])`, sets `(1, 5 => 3)`, lists `(1 => 2), (5 => 6)`, repetition `[*n]`, `[->n]`, `[=n]`), `default`, `ignore_bins`, `illegal_bins` |
 | Guards | `coverpoint x iff (cond)`, `cross a, b iff (cond)` |
 | Crosses | Automatic cross bins (every combination of the coverpoints' bins); `bins`, `ignore_bins` and `illegal_bins` selected with `binsof(cp)`, `binsof(cp.bin)`, `intersect {...}`, `!`, `&&`, `\|\|` and `with (...)` |
 | Options | `option.at_least`, `option.weight`, `option.auto_bin_max`, `type_option.merge_instances`, `type_option.weight` |
@@ -234,14 +234,21 @@ axb : cross cp_a, cp_b {
 
 - **Explicit bins:** a coverpoint's coverage is the number of its `bins` that were hit
   divided by the number of `bins`. `ignore_bins` and `illegal_bins` values are removed
-  from the other bins, and a bin left with no values is dropped. A `default` bin is
-  not counted.
+  from the other bins (a sampled ignored value hits no bin), and a bin left with no
+  values is dropped. A `default` bin is not counted.
 - **Automatic bins** (a coverpoint with no `bins`): one bin per value of the sampled
   expression's width, or `option.auto_bin_max` (default 64) equal ranges when there
   are more values than that. A 4-bit coverpoint has 16 bins; an `int` has 64.
-- **Array bins** `name[]`: one bin per value, named `name[<value>]`.
+- **Array bins** `name[]`: one bin per value, named `name[<value>]`. `name[N]`: N bins
+  `name[0]` to `name[N-1]`; the listed values, in order, are split evenly among them
+  and the last one also takes the remainder.
 - **Transition bins** `(1 => 2 => 3)`: hit when consecutive samples of the coverpoint
-  match the sequence. Each step can be a value or a range.
+  match the sequence. Each step is a value set (values and ranges, `1, [3:4]`) with
+  an optional repetition: `v [*n]` (n consecutive samples), `v [->n]` (n samples,
+  not necessarily consecutive, ending on the last), `v [=n]` (the same, followed by
+  any samples of other values), each also as `n:m`. A bin with a list
+  `(1 => 2), (5 => 6)` is hit by any of them; an array bin `name[] = (...)` has one
+  bin per value sequence.
 - **Crosses:** every combination of the crossed coverpoints' bins. A crossed variable
   that has no coverpoint of its own gets automatic bins. A `bins` of the cross body
   is one bin holding the combinations its select expression picks; an `ignore_bins`
@@ -561,8 +568,6 @@ it.
 | Feature | What happens |
 |---|---|
 | `option.per_instance`, `option.goal`, `option.name`, `option.comment` | Accepted, no effect. The results file always has one entry per instance, named after the type |
-| `bins name[N] = {...}` | Treated as `name[]`: one bin per value, not N bins |
-| Transition sets and repetition: `(1, 5 => 3)`, `(3 [*2])`, `[->n]`, `[=n]` | Never hit |
 
 ---
 

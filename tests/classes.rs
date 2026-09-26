@@ -162,6 +162,8 @@ mod cov_covergroup_basic;
 mod coverage_auto_bins;
 #[path = "classes/covergroup_at_least.rs"]
 mod covergroup_at_least;
+#[path = "classes/covergroup_bins.rs"]
+mod covergroup_bins;
 #[path = "classes/covergroup_coverage_query.rs"]
 mod covergroup_coverage_query;
 #[path = "classes/covergroup_cross_bins.rs"]

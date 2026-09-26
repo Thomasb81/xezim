@@ -3237,13 +3237,9 @@ struct CovergroupInstance {
     /// `illegal_bins` hit also fires an immediate error.
     #[allow(dead_code)]
     bin_hits: HashMap<String, u64>,
-    /// LRM §19.5 transition-bin sample-history tracker. For each
-    /// coverpoint that has any transition spec, holds the trailing N-1
-    /// sampled values (where N is the longest declared chain across all
-    /// of the coverpoint's bins). Sampler appends the current sample
-    /// then checks whether any bin's chain matches the trailing window.
-    #[allow(dead_code)]
-    point_history: HashMap<String, std::collections::VecDeque<Value>>,
+    /// §19.5.2 in-flight attempts of each transition sequence, by bin key
+    /// (`cp.bin#<n>` for the n-th sequence of a scalar bin): (step, count).
+    trans_pos: HashMap<String, HashSet<(u32, u32)>>,
     /// Total `sample()` invocations on this instance.
     sample_count: u64,
     /// §19.8 `stop()`: sampling is off until `start()`.
@@ -3273,6 +3269,16 @@ enum CrossOwner {
     Auto,
     /// Held by these user bins (indices among the body's `bins`).
     User(Vec<usize>),
+}
+
+/// One resolved step of a §19.5.2 transition: its values and repetition
+/// count range (`max` None = unbounded).
+#[derive(Clone)]
+struct TransAtom {
+    ranges: Vec<(i64, i64)>,
+    kind: crate::ast::decl::TransRepeatKind,
+    min: u32,
+    max: Option<u32>,
 }
 
 /// The bins of a coverpoint, or of a crossed variable.
@@ -87408,6 +87414,16 @@ impl Simulator {
         }
         0
     }
+    /// Hit count of the coverpoint bin `key` (`cp.bin`, `cp.bin[v]`) on the
+    /// first instance of covergroup `cg_name` that recorded it.
+    pub fn coverpoint_bin_hits(&self, cg_name: &str, key: &str) -> u64 {
+        self.cg_heap
+            .iter()
+            .flatten()
+            .filter(|i| i.cg_name == cg_name)
+            .find_map(|i| i.bin_hits.get(key).copied())
+            .unwrap_or(0)
+    }
     pub fn set_signal(&mut self, name: &str, val: Value) {
         if let Some(&id) = self.signal_name_to_id.get(name) {
             let w = self.signal_widths[id];
@@ -116254,7 +116270,7 @@ impl Simulator {
                 .collect(),
             point_hits: HashMap::default(),
             bin_hits: HashMap::default(),
-            point_history: HashMap::default(),
+            trans_pos: HashMap::default(),
             cross_hits: HashMap::default(),
             cross_bin_hits: HashMap::default(),
             sample_count: 0,
@@ -116955,7 +116971,34 @@ impl Simulator {
                 .iter()
                 .filter_map(|r| self.cg_range_bounds(r, ctor))
                 .collect();
-            if b.array_form && b.transitions.is_empty() && !b.is_wildcard {
+            if b.array_form && !b.transitions.is_empty() {
+                // §19.5.2 `name[] = (...)`: one bin per value sequence.
+                for (label, _) in self.cg_trans_sequences(b, ctor) {
+                    bins.push(CgBin {
+                        key: Some(format!("{}[{}]", key, label.unwrap_or_default())),
+                        name: b.name.name.clone(),
+                        ranges: Vec::new(),
+                    });
+                }
+            } else if b.array_form && b.array_size.is_some() && !b.is_wildcard {
+                // §19.5.1 `name[N]`: bins `cp.name[0]` .. `cp.name[N-1]`; one
+                // whose values are all excluded, or that got none, is not a
+                // bin.
+                if let Some(fa) = self.cg_fixed_array(b, ctor) {
+                    for j in 0..fa.0 {
+                        let r = Self::cg_fixed_bin_ranges(j, &fa);
+                        if r.iter()
+                            .any(|&(l, h)| Self::cg_count_outside(l, h, &excl) > 0)
+                        {
+                            bins.push(CgBin {
+                                key: Some(format!("{}[{}]", key, j)),
+                                name: b.name.name.clone(),
+                                ranges: r,
+                            });
+                        }
+                    }
+                }
+            } else if b.array_form && !b.is_wildcard {
                 // §19.5.1 `name[]`: one bin per value, `cp.name[<value>]`.
                 let mut n = 0u64;
                 for (l, h) in Self::cg_merge_ranges(ranges) {
@@ -117408,6 +117451,293 @@ impl Simulator {
         false
     }
 
+    /// The transition sequences of a bin (§19.5.2), each with its label: a
+    /// scalar bin keeps its sequences as they are written (label None); an
+    /// array bin `name[]` gets one bin per value sequence its sets and
+    /// ranges expand to, labelled like `1=>2`.
+    fn cg_trans_sequences(
+        &self,
+        bin: &crate::ast::decl::CoverBin,
+        ctor: &[(String, Value)],
+    ) -> Vec<(Option<String>, Vec<TransAtom>)> {
+        use crate::ast::decl::TransRepeatKind;
+        const MAX_SEQS: usize = 4096;
+        let mut out = Vec::new();
+        for set in &bin.transitions {
+            let mut atoms: Vec<TransAtom> = Vec::new();
+            for step in set {
+                let ranges: Vec<(i64, i64)> = step
+                    .values
+                    .iter()
+                    .filter_map(|r| self.cg_range_bounds(r, ctor))
+                    .collect();
+                let (kind, min, max) = match &step.repeat {
+                    None => (TransRepeatKind::Consecutive, 1, Some(1)),
+                    Some(rep) => {
+                        let lo = self.cg_const_i64(&rep.lo, ctor).unwrap_or(1).max(0) as u32;
+                        let hi = match &rep.hi {
+                            None => Some(lo),
+                            Some(h) if matches!(h.kind, ExprKind::Dollar) => None,
+                            Some(h) => {
+                                Some(self.cg_const_i64(h, ctor).unwrap_or(lo as i64).max(0) as u32)
+                            }
+                        };
+                        (rep.kind, lo, hi)
+                    }
+                };
+                atoms.push(TransAtom {
+                    ranges,
+                    kind,
+                    min,
+                    max,
+                });
+            }
+            if !bin.array_form {
+                out.push((None, atoms));
+                continue;
+            }
+            // Expand every step's values into single-value steps.
+            let mut seqs: Vec<(Vec<String>, Vec<TransAtom>)> = vec![(Vec::new(), Vec::new())];
+            for a in &atoms {
+                let mut vals: Vec<i64> = Vec::new();
+                for &(l, h) in &a.ranges {
+                    let mut v = l;
+                    while v <= h && vals.len() < 64 {
+                        vals.push(v);
+                        v += 1;
+                    }
+                }
+                let rep = match (a.kind, a.min, a.max) {
+                    (TransRepeatKind::Consecutive, 1, Some(1)) => String::new(),
+                    (k, lo, hi) => {
+                        let op = match k {
+                            TransRepeatKind::Consecutive => "*",
+                            TransRepeatKind::Goto => "->",
+                            TransRepeatKind::NonConsecutive => "=",
+                        };
+                        match hi {
+                            Some(h) if h == lo => format!("[{}{}]", op, lo),
+                            Some(h) => format!("[{}{}:{}]", op, lo, h),
+                            None => format!("[{}{}:$]", op, lo),
+                        }
+                    }
+                };
+                let mut next = Vec::new();
+                for (label, seq) in &seqs {
+                    for &v in &vals {
+                        if next.len() >= MAX_SEQS {
+                            break;
+                        }
+                        let mut l2 = label.clone();
+                        l2.push(format!("{}{}", v, rep));
+                        let mut s2 = seq.clone();
+                        s2.push(TransAtom {
+                            ranges: vec![(v, v)],
+                            ..a.clone()
+                        });
+                        next.push((l2, s2));
+                    }
+                }
+                seqs = next;
+            }
+            out.extend(seqs.into_iter().map(|(l, s)| (Some(l.join("=>")), s)));
+        }
+        out
+    }
+
+    /// Start of atom `i` of a transition (with any zero-count atoms after
+    /// it); true when that completes the sequence.
+    fn cg_trans_enter(atoms: &[TransAtom], i: usize, next: &mut HashSet<(u32, u32)>) -> bool {
+        if i >= atoms.len() {
+            return true;
+        }
+        next.insert((i as u32, 0));
+        atoms[i].min == 0 && Self::cg_trans_enter(atoms, i + 1, next)
+    }
+
+    /// Advance the in-flight attempts `pos` of one transition sequence by a
+    /// sample (None: x or z, which matches no value); every sample also
+    /// starts a new attempt. True when an attempt completes at this sample.
+    fn cg_trans_step(atoms: &[TransAtom], pos: &mut HashSet<(u32, u32)>, v: Option<i64>) -> bool {
+        use crate::ast::decl::TransRepeatKind;
+        if atoms.is_empty() {
+            return false;
+        }
+        let mut cur = std::mem::take(pos);
+        let _ = Self::cg_trans_enter(atoms, 0, &mut cur);
+        let mut matched = false;
+        for (i, c) in cur {
+            let a = &atoms[i as usize];
+            let inset = v.is_some_and(|v| Self::cg_in_ranges(v, &a.ranges));
+            // Above an unbounded minimum every count behaves alike.
+            let cap = |n: u32| if a.max.is_none() { n.min(a.min) } else { n };
+            let below_max = |n: u32| a.max.is_none_or(|m| n < m);
+            let in_range = |n: u32| n >= a.min && a.max.is_none_or(|m| n <= m);
+            let complete = match a.kind {
+                TransRepeatKind::Consecutive => {
+                    if !inset {
+                        continue;
+                    }
+                    if below_max(c + 1) {
+                        pos.insert((i, cap(c + 1)));
+                    }
+                    in_range(c + 1)
+                }
+                TransRepeatKind::Goto => {
+                    if !inset {
+                        pos.insert((i, c));
+                        continue;
+                    }
+                    if below_max(c + 1) {
+                        pos.insert((i, cap(c + 1)));
+                    }
+                    in_range(c + 1)
+                }
+                TransRepeatKind::NonConsecutive => {
+                    let c1 = if inset { c + 1 } else { c };
+                    if a.max.is_some_and(|m| c1 > m) {
+                        continue;
+                    }
+                    pos.insert((i, cap(c1)));
+                    in_range(c1) && (c1 > 0 || !inset)
+                }
+            };
+            if complete && Self::cg_trans_enter(atoms, i as usize + 1, pos) {
+                matched = true;
+            }
+        }
+        matched
+    }
+
+    /// §19.5.1 `name[N]`: the bin's values, in the order written, spread
+    /// over N bins, each taking `len / N` of them and the last one also the
+    /// remainder (one value per bin when there are fewer values than bins).
+    /// Returns (N, values per bin, the value list as ordered ranges).
+    fn cg_fixed_array(
+        &self,
+        bin: &crate::ast::decl::CoverBin,
+        ctor: &[(String, Value)],
+    ) -> Option<(u64, u64, Vec<(i64, i64)>)> {
+        let n = self.cg_const_i64(bin.array_size.as_ref()?, ctor)?.max(0) as u64;
+        let segs: Vec<(i64, i64)> = bin
+            .values
+            .iter()
+            .filter_map(|r| self.cg_range_bounds(r, ctor))
+            .collect();
+        let m: u64 = segs.iter().map(|&(l, h)| (h - l) as u64 + 1).sum();
+        Some((n, m / n.max(1), segs))
+    }
+
+    /// The sub-bins of a fixed-size array bin that value `v` falls in.
+    fn cg_fixed_bins_of(v: i64, (n, per, segs): &(u64, u64, Vec<(i64, i64)>)) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut off = 0u64;
+        for &(l, h) in segs {
+            if v >= l && v <= h {
+                let p = off + (v - l) as u64;
+                let j = if *per == 0 { p } else { (p / per).min(n - 1) };
+                if j < *n && !out.contains(&j) {
+                    out.push(j);
+                }
+            }
+            off += (h - l) as u64 + 1;
+        }
+        out
+    }
+
+    /// The value ranges of sub-bin `j` of a fixed-size array bin.
+    fn cg_fixed_bin_ranges(
+        j: u64,
+        (n, per, segs): &(u64, u64, Vec<(i64, i64)>),
+    ) -> Vec<(i64, i64)> {
+        let m: u64 = segs.iter().map(|&(l, h)| (h - l) as u64 + 1).sum();
+        let (start, end) = if *per == 0 {
+            (j, j + 1)
+        } else if j + 1 == *n {
+            (j * per, m)
+        } else {
+            (j * per, (j + 1) * per)
+        };
+        let end = end.min(m);
+        let mut out = Vec::new();
+        let mut off = 0u64;
+        for &(l, h) in segs {
+            let len = (h - l) as u64 + 1;
+            let (a, b) = (start.max(off), end.min(off + len));
+            if a < b {
+                out.push((l + (a - off) as i64, l + (b - off) as i64 - 1));
+            }
+            off += len;
+        }
+        out
+    }
+
+    /// The `bin_hits` keys a matching value adds for bin `bin`: the bin
+    /// itself, or its array element (`name[value]` for `name[]`, the
+    /// sub-bin index for `name[N]`).
+    fn cg_value_bin_keys(
+        &self,
+        bin: &crate::ast::decl::CoverBin,
+        base_key: &str,
+        vi: Option<i64>,
+        ctor: &[(String, Value)],
+    ) -> Vec<String> {
+        if !bin.array_form {
+            return vec![base_key.to_string()];
+        }
+        let Some(v) = vi else {
+            return Vec::new();
+        };
+        if bin.array_size.is_none() {
+            return vec![format!("{}[{}]", base_key, v)];
+        }
+        match self.cg_fixed_array(bin, ctor) {
+            Some(fa) => Self::cg_fixed_bins_of(v, &fa)
+                .into_iter()
+                .map(|j| format!("{}[{}]", base_key, j))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Advance the transition bins of coverpoint `cp` by the sample `vi`;
+    /// returns the keys (and kinds) of the transition bins it completes.
+    fn cg_step_transitions(
+        &mut self,
+        handle: usize,
+        cp: &crate::ast::decl::Coverpoint,
+        cp_name: &str,
+        vi: Option<i64>,
+        ctor: &[(String, Value)],
+    ) -> Vec<(String, crate::ast::decl::CoverBinKind)> {
+        let mut out = Vec::new();
+        for bin in cp.bins.iter().filter(|b| !b.transitions.is_empty()) {
+            let base = format!("{}.{}", cp_name, bin.name.name);
+            let seqs = self.cg_trans_sequences(bin, ctor);
+            let Some(Some(inst)) = self.cg_heap.get_mut(handle) else {
+                break;
+            };
+            let mut hit = false;
+            for (si, (label, atoms)) in seqs.iter().enumerate() {
+                let state = match label {
+                    Some(l) => format!("{}[{}]", base, l),
+                    None => format!("{}#{}", base, si),
+                };
+                let pos = inst.trans_pos.entry(state.clone()).or_default();
+                if Self::cg_trans_step(atoms, pos, vi) {
+                    match label {
+                        Some(_) => out.push((state, bin.kind)),
+                        None => hit = true,
+                    }
+                }
+            }
+            if hit {
+                out.push((base, bin.kind));
+            }
+        }
+        out
+    }
+
     /// The product bins (one bin index per axis) a sampled value tuple hits.
     fn cg_tuple_products(axes: &[CpShape], t: &[Value]) -> Vec<Vec<usize>> {
         if t.len() != axes.len() || t.iter().any(|v| v.has_xz()) {
@@ -117527,10 +117857,8 @@ impl Simulator {
             match item {
                 CovergroupItem::Coverpoint(cp) => {
                     // LRM §19.5 `iff (guard)` — skip the sample when the
-                    // guard expression is false (or X/Z). Done before any
-                    // value-eval / bin checking so a guarded sample is a
-                    // pure no-op (no point_hits, no bin_increments, no
-                    // history update).
+                    // guard expression is false (or X/Z): no hit, no bin
+                    // and no transition step.
                     if let Some(guard) = &cp.iff_guard {
                         if !self.eval_expr(guard).is_true() {
                             continue;
@@ -117538,168 +117866,96 @@ impl Simulator {
                     }
                     let val = self.eval_expr(&cp.expr);
                     let cp_name = Self::cg_point_name(cp);
-                    // Per-explicit-bin tallies (LRM §19.5). Done before the
-                    // existing per-value-set bookkeeping so an illegal_bins
-                    // hit can fire before the value is recorded. `default`
-                    // bins are deferred: counted only if no explicit
-                    // (Bins / Ignore / Illegal) bin in this coverpoint
-                    // matched.
-                    let mut bin_increments: Vec<(String, bool)> = Vec::new();
-                    let mut any_explicit_match = false;
-                    let mut default_bin_keys: Vec<String> = Vec::new();
-                    // LRM §19.5 transition bins — needs the trailing
-                    // sample history. We snapshot it before bin matching
-                    // and append the current sample after all bins fire.
-                    let history_for_trans: Vec<Value> = self
+                    let vi: Option<i64> = if val.has_xz() { None } else { val.to_i64() };
+                    let ctor: Vec<(String, Value)> = self
                         .cg_heap
                         .get(handle)
                         .and_then(|x| x.as_ref())
-                        .and_then(|inst| inst.point_history.get(&cp_name))
-                        .map(|hq| hq.iter().cloned().collect())
+                        .map(|i| i.ctor_args.clone())
                         .unwrap_or_default();
-                    // Longest declared chain for this coverpoint — caps the
-                    // history we keep.
-                    let max_chain_len = cp
-                        .bins
-                        .iter()
-                        .flat_map(|b| b.transitions.iter().map(|c| c.len()))
-                        .max()
-                        .unwrap_or(0);
+                    // §19.5.6/§19.5.7: an ignored or illegal value is in no
+                    // other bin.
+                    let has_excl = cp.bins.iter().any(|b| {
+                        matches!(
+                            b.kind,
+                            crate::ast::decl::CoverBinKind::Ignore
+                                | crate::ast::decl::CoverBinKind::Illegal
+                        )
+                    });
+                    let excluded = has_excl
+                        && vi.is_some_and(|v| {
+                            Self::cg_in_ranges(v, &self.cg_excluded_ranges(cp, &ctor))
+                        });
+                    // `default` bins count only the values no other value
+                    // bin (bins, ignore_bins or illegal_bins) holds.
+                    let mut bin_increments: Vec<String> = Vec::new();
+                    let mut illegal_hits: Vec<String> = Vec::new();
+                    let mut any_value_match = false;
+                    let mut default_bin_keys: Vec<String> = Vec::new();
                     for bin in &cp.bins {
-                        // For `bins name[]` array form, the recorded key
-                        // is `cp.name[<val>]` so each distinct matched
-                        // value gets its own sub-bin counter (LRM §19.5).
                         let base_key = format!("{}.{}", cp_name, bin.name.name);
-                        let key_for_val = || -> String {
-                            if bin.array_form {
-                                match val.to_u64() {
-                                    Some(u) => format!("{}[{}]", base_key, u),
-                                    None => format!("{}[?]", base_key),
+                        if bin.kind == crate::ast::decl::CoverBinKind::Default {
+                            default_bin_keys.push(base_key);
+                            continue;
+                        }
+                        if !bin.transitions.is_empty() {
+                            continue;
+                        }
+                        let matched = if bin.is_wildcard {
+                            // LRM §19.5 wildcard match: bit-wise compare with
+                            // the bin pattern; pattern bits that are X/Z/?
+                            // are don't-cares.
+                            bin.values.iter().any(|r| match r {
+                                ConstraintRange::Value(e) => {
+                                    let pat = self.eval_expr(e);
+                                    val.wildcard_eq(&pat).is_true()
                                 }
-                            } else {
-                                base_key.clone()
-                            }
+                                // Wildcard with [lo:hi] isn't standard;
+                                // treat as plain range.
+                                ConstraintRange::Range { lo, hi } => {
+                                    let l = self.eval_expr(lo);
+                                    let h = self.eval_expr(hi);
+                                    val.greater_equal(&l).is_true() && val.less_equal(&h).is_true()
+                                }
+                            })
+                        } else {
+                            self.value_in_ranges(&val, &bin.values)
                         };
+                        if !matched {
+                            continue;
+                        }
+                        any_value_match = true;
                         match bin.kind {
-                            crate::ast::decl::CoverBinKind::Default => {
-                                default_bin_keys.push(key_for_val());
+                            crate::ast::decl::CoverBinKind::Bins if !excluded => {
+                                bin_increments
+                                    .extend(self.cg_value_bin_keys(bin, &base_key, vi, &ctor));
                             }
-                            _ => {
-                                // LRM §19.5 transition bin: `(prev => cur)`.
-                                // Fires when (prev_sampled, val) matches any
-                                // listed pair. Falls back to the value-set
-                                // path when the bin has no transitions.
-                                let trans_match = !bin.transitions.is_empty()
-                                    && bin.transitions.iter().any(|chain| {
-                                        use crate::ast::decl::ConstraintRange;
-                                        let cl = chain.len();
-                                        if cl < 2 {
-                                            return false;
-                                        }
-                                        if history_for_trans.len() + 1 < cl {
-                                            return false;
-                                        }
-                                        let start = history_for_trans.len() + 1 - cl;
-                                        let mut window: Vec<&Value> =
-                                            history_for_trans[start..].iter().collect();
-                                        window.push(&val);
-                                        // Element-wise membership: each
-                                        // step's ConstraintRange must
-                                        // contain the corresponding window
-                                        // value.
-                                        chain.iter().zip(window.iter()).all(|(step, v)| {
-                                            let v_u = v.to_u64();
-                                            match step {
-                                                ConstraintRange::Value(e) => {
-                                                    let e_u = self.eval_expr(e).to_u64();
-                                                    e_u.is_some() && e_u == v_u
-                                                }
-                                                ConstraintRange::Range { lo, hi } => {
-                                                    let l = self.eval_expr(lo).to_u64();
-                                                    let h = self.eval_expr(hi).to_u64();
-                                                    match (l, h, v_u) {
-                                                        (Some(lo_v), Some(hi_v), Some(vv)) => {
-                                                            vv >= lo_v && vv <= hi_v
-                                                        }
-                                                        _ => false,
-                                                    }
-                                                }
-                                            }
-                                        })
-                                    });
-                                let value_match = if !bin.transitions.is_empty() {
-                                    false // transition bins are not value-list bins
-                                } else if bin.is_wildcard {
-                                    // LRM §19.5 wildcard match: bit-wise
-                                    // compare with the bin pattern; pattern
-                                    // bits that are X/Z/? are don't-cares.
-                                    bin.values.iter().any(|r| {
-                                        use crate::ast::decl::ConstraintRange;
-                                        match r {
-                                            ConstraintRange::Value(e) => {
-                                                let pat = self.eval_expr(e);
-                                                val.wildcard_eq(&pat).is_true()
-                                            }
-                                            // Wildcard with [lo:hi] isn't
-                                            // standard; treat as plain range.
-                                            ConstraintRange::Range { lo, hi } => {
-                                                let l = self.eval_expr(lo);
-                                                let h = self.eval_expr(hi);
-                                                val.greater_equal(&l).is_true()
-                                                    && val.less_equal(&h).is_true()
-                                            }
-                                        }
-                                    })
-                                } else {
-                                    self.value_in_ranges(&val, &bin.values)
-                                };
-                                let matched = trans_match || value_match;
-                                if matched {
-                                    any_explicit_match = true;
-                                    let key = key_for_val();
-                                    match bin.kind {
-                                        crate::ast::decl::CoverBinKind::Bins => {
-                                            bin_increments.push((key, false))
-                                        }
-                                        crate::ast::decl::CoverBinKind::Ignore => { /* drop */ }
-                                        crate::ast::decl::CoverBinKind::Illegal => {
-                                            self.cg_illegal_hit(
-                                                &cg_name,
-                                                &key,
-                                                &Self::cg_value_text(&val),
-                                            );
-                                            bin_increments.push((key, true));
-                                        }
-                                        crate::ast::decl::CoverBinKind::Default => unreachable!(),
-                                    }
-                                }
-                            }
+                            crate::ast::decl::CoverBinKind::Illegal => illegal_hits.push(base_key),
+                            _ => {}
                         }
                     }
-                    if !any_explicit_match {
-                        for k in default_bin_keys {
-                            bin_increments.push((k, false));
+                    if !any_value_match {
+                        bin_increments.extend(default_bin_keys);
+                    }
+                    for (key, kind) in self.cg_step_transitions(handle, cp, &cp_name, vi, &ctor) {
+                        match kind {
+                            crate::ast::decl::CoverBinKind::Bins => bin_increments.push(key),
+                            crate::ast::decl::CoverBinKind::Illegal => illegal_hits.push(key),
+                            _ => {}
                         }
+                    }
+                    for key in &illegal_hits {
+                        self.cg_illegal_hit(&cg_name, key, &Self::cg_value_text(&val));
                     }
                     if let Some(Some(inst)) = self.cg_heap.get_mut(handle) {
                         *inst
                             .point_hits
-                            .entry(cp_name.clone())
+                            .entry(cp_name)
                             .or_default()
-                            .entry(val.clone())
+                            .entry(val)
                             .or_insert(0) += 1;
-                        for (k, _illegal) in bin_increments {
+                        for k in bin_increments.into_iter().chain(illegal_hits) {
                             *inst.bin_hits.entry(k).or_insert(0) += 1;
-                        }
-                        // Update the transition-tracker history. Keep at
-                        // most (max_chain_len) entries — the longest chain
-                        // needs that many for its trailing window.
-                        if max_chain_len >= 2 {
-                            let hq = inst.point_history.entry(cp_name).or_default();
-                            hq.push_back(val);
-                            while hq.len() > max_chain_len {
-                                hq.pop_front();
-                            }
                         }
                     }
                 }
