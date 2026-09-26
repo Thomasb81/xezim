@@ -164,6 +164,8 @@ mod coverage_auto_bins;
 mod covergroup_at_least;
 #[path = "classes/covergroup_coverage_query.rs"]
 mod covergroup_coverage_query;
+#[path = "classes/covergroup_cross_bins.rs"]
+mod covergroup_cross_bins;
 #[path = "classes/covergroup_illegal_bins.rs"]
 mod covergroup_illegal_bins;
 #[path = "classes/covergroup_implicit_names.rs"]

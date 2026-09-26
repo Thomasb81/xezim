@@ -19,7 +19,7 @@ how to read the results.
 | Sampling | A sampling event (`covergroup cg @(posedge clk)`, `@(posedge clk iff en)`, a named event `@(ev)`), explicit `sample()`, `with function sample(...)` arguments, constructor arguments (`covergroup cg (int lo, int hi)`) |
 | Bins | Values and ranges (`{0, [2:5], [8:$]}`), automatic bins, array bins `name[]`, `wildcard` bins, transition bins `(1 => 2 => 3)` and `([0:1] => [2:3])`, `default`, `ignore_bins`, `illegal_bins` |
 | Guards | `coverpoint x iff (cond)`, `cross a, b iff (cond)` |
-| Crosses | Automatic cross bins (every combination of the coverpoints' bins), `bins name = binsof(cp) intersect {...}` |
+| Crosses | Automatic cross bins (every combination of the coverpoints' bins); `bins`, `ignore_bins` and `illegal_bins` selected with `binsof(cp)`, `binsof(cp.bin)`, `intersect {...}`, `!`, `&&`, `\|\|` and `with (...)` |
 | Options | `option.at_least`, `option.weight`, `option.auto_bin_max`, `type_option.merge_instances`, `type_option.weight` |
 | Queries | `get_inst_coverage()` and `get_coverage()` on a covergroup, a coverpoint or a cross, with or without `(covered, total)`; `cg_type::get_coverage()`; `$get_coverage()`; `start()` and `stop()` |
 | Assertion coverage | Counts for `cover property`, `assert property`, `assume property` and the immediate `cover`, `assert` and `assume` |
@@ -243,9 +243,14 @@ axb : cross cp_a, cp_b {
 - **Transition bins** `(1 => 2 => 3)`: hit when consecutive samples of the coverpoint
   match the sequence. Each step can be a value or a range.
 - **Crosses:** every combination of the crossed coverpoints' bins. A crossed variable
-  that has no coverpoint of its own gets automatic bins.
+  that has no coverpoint of its own gets automatic bins. A `bins` of the cross body
+  is one bin holding the combinations its select expression picks; an `ignore_bins`
+  or `illegal_bins` removes the combinations it picks; every other combination
+  stays an automatic bin of its own. `binsof(cp) intersect {v}` picks the
+  combinations whose `cp` bin holds a value in `{v}`, and `with (expr)` those with a
+  value tuple for which `expr` holds.
 - **Covergroup:** the average of its coverpoints and crosses, weighted by each
-  coverpoint's `option.weight` (default 1; a cross always weighs 1).
+  one's `option.weight` (default 1).
 
 A hit on an `illegal_bins` value or transition is a run-time error: xezim prints
 `** Error: Illegal bin hit at value 7: cg.cp_s.bad` with the time and scope, like
@@ -388,7 +393,7 @@ The file for the [module example](#a-covergroup-in-a-module-sampled-on-a-clock):
 | `covergroups[].samples` | How many times the instance was sampled (sampling events plus `sample()` calls) |
 | `covergroups[].coverpoints` | Per coverpoint, the number of **distinct values** sampled (not bins) |
 | `covergroups[].crosses` | Per cross, the number of distinct value combinations sampled |
-| `covergroups[].bins` | Hit count per explicit bin, keyed `<coverpoint>.<bin>`, or `<coverpoint>.<bin>[<value>]` for array bins. Includes `default` bins |
+| `covergroups[].bins` | Hit count per explicit bin, keyed `<coverpoint>.<bin>`, `<coverpoint>.<bin>[<value>]` for `name[]` array bins and `<coverpoint>.<bin>[<index>]` for `name[N]`, and per bin of a cross body, keyed `<cross>.<bin>`. Includes `default` and `illegal_bins` bins |
 
 Things the file does not hold:
 
@@ -396,7 +401,7 @@ Things the file does not hold:
   [query functions](#query-functions), for example in a `final` block.
 - **Bins that were never hit.** `alu_cg` above has no `cp_op.logic_ops` entry.
   Compare against the covergroup's source to find the holes.
-- Automatic bins and the bins declared in a cross's body.
+- Automatic bins, of a coverpoint or a cross.
 
 Key order in the objects can change from run to run. Compare files with
 `jq -S . xezim_cov.json`, not with a plain `diff`.
@@ -558,8 +563,6 @@ it.
 | `option.per_instance`, `option.goal`, `option.name`, `option.comment` | Accepted, no effect. The results file always has one entry per instance, named after the type |
 | `bins name[N] = {...}` | Treated as `name[]`: one bin per value, not N bins |
 | Transition sets and repetition: `(1, 5 => 3)`, `(3 [*2])`, `[->n]`, `[=n]` | Never hit |
-| In a cross body: `ignore_bins`, `illegal_bins`, `binsof(cp.bin)`, `binsof(...) with (...)` | Ignored. Only `bins name = binsof(cp) intersect {...}` is used. To leave values out of a cross, put `ignore_bins` on the coverpoint, as in [the cross example](#crosses-and-ignore_bins) |
-| `binsof(...) intersect {...} && binsof(...) ...` (or `\|\|`) | Only the first `binsof` term is used |
 
 ---
 

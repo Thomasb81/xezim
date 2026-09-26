@@ -3258,11 +3258,21 @@ struct CgBin {
     /// whose hits come from the sampled values.
     key: Option<String>,
     /// The declared bin name (`auto[k]` for an automatic bin).
-    #[allow(dead_code)]
     name: String,
     /// Constant value ranges; empty for a transition bin or non-constant
     /// values.
     ranges: Vec<(i64, i64)>,
+}
+
+/// Which bins own one product of a cross's bins (§19.6.1).
+enum CrossOwner {
+    /// Removed by the ignore_bins or illegal_bins at this index of the
+    /// cross body.
+    Excluded(usize),
+    /// An automatic cross bin of its own.
+    Auto,
+    /// Held by these user bins (indices among the body's `bins`).
+    User(Vec<usize>),
 }
 
 /// The bins of a coverpoint, or of a crossed variable.
@@ -43626,7 +43636,11 @@ impl Simulator {
             // LRM §19.5 per-explicit-bin hit counts. Empty for coverpoints
             // that didn't declare bins.
             json.push_str("}, \"bins\": {");
-            let mut b_iter = inst.bin_hits.iter().peekable();
+            let mut b_iter = inst
+                .bin_hits
+                .iter()
+                .chain(inst.cross_bin_hits.iter())
+                .peekable();
             while let Some((name, count)) = b_iter.next() {
                 json.push_str(&format!(
                     "\"{}\": {}{}",
@@ -116682,14 +116696,15 @@ impl Simulator {
         Some((v as u64 / group).min(nbins.saturating_sub(1)))
     }
 
-    /// Width of the values sampled for `name` (1 when none was).
-    fn cg_sampled_width(name: &str, insts: &[&CovergroupInstance]) -> u32 {
+    /// Width of the values sampled for `name`, else `hint`, else 1.
+    fn cg_sampled_width(name: &str, insts: &[&CovergroupInstance], hint: Option<u32>) -> u32 {
         insts
             .iter()
             .filter_map(|i| i.point_hits.get(name))
             .flat_map(|h| h.keys())
             .next()
             .map(|v| v.width)
+            .or(hint)
             .unwrap_or(1)
     }
 
@@ -116699,7 +116714,7 @@ impl Simulator {
         insts: &[&CovergroupInstance],
         at_least: u64,
     ) -> (u64, u64) {
-        let shape = Self::cg_auto_shape(Self::cg_sampled_width(name, insts), 64);
+        let shape = Self::cg_auto_shape(Self::cg_sampled_width(name, insts, None), 64);
         let mut hits: HashMap<u64, u64> = HashMap::default();
         for i in insts {
             for (v, &c) in i.point_hits.get(name).into_iter().flatten() {
@@ -116879,6 +116894,7 @@ impl Simulator {
         def: &crate::ast::decl::CovergroupDeclaration,
         cp: &crate::ast::decl::Coverpoint,
         insts: &[&CovergroupInstance],
+        width_hint: Option<u32>,
     ) -> CpShape {
         let ctor: &[(String, Value)] = insts.first().map(|i| i.ctor_args.as_slice()).unwrap_or(&[]);
         let excl = self.cg_excluded_ranges(cp, ctor);
@@ -116893,8 +116909,10 @@ impl Simulator {
                 .cg_option_i64(def, &cp.options, "auto_bin_max", ctor)
                 .filter(|&n| n > 0)
                 .unwrap_or(64) as u64;
-            let (space, group, nbins) =
-                Self::cg_auto_shape(Self::cg_sampled_width(&cp_name, insts), auto_bin_max);
+            let (space, group, nbins) = Self::cg_auto_shape(
+                Self::cg_sampled_width(&cp_name, insts, width_hint),
+                auto_bin_max,
+            );
             // One-value bins wholly excluded by ignore/illegal values are
             // not bins; wider automatic bins always are.
             let mut bins = Vec::new();
@@ -117048,6 +117066,7 @@ impl Simulator {
         def: &crate::ast::decl::CovergroupDeclaration,
         name: &str,
         insts: &[&CovergroupInstance],
+        width_hint: Option<u32>,
     ) -> CpShape {
         let cp = def.items.iter().find_map(|d| match d {
             CovergroupItem::Coverpoint(cp) if cp.name.as_ref().is_some_and(|n| n.name == name) => {
@@ -117056,10 +117075,10 @@ impl Simulator {
             _ => None,
         });
         match cp {
-            Some(cp) => self.cg_point_shape(def, cp, insts),
+            Some(cp) => self.cg_point_shape(def, cp, insts, width_hint),
             None => {
                 let (space, group, nbins) =
-                    Self::cg_auto_shape(Self::cg_sampled_width(name, insts), 64);
+                    Self::cg_auto_shape(Self::cg_sampled_width(name, insts, width_hint), 64);
                 let bins = (0..nbins)
                     .map(|k| {
                         let lo = (k * group) as i64;
@@ -117123,7 +117142,7 @@ impl Simulator {
             CovergroupItem::Coverpoint(cp) => {
                 let at_least = self.cg_at_least(def, &cp.options, insts);
                 let cp_name = Self::cg_point_name(cp);
-                let shape = self.cg_point_shape(def, cp, insts);
+                let shape = self.cg_point_shape(def, cp, insts, None);
                 let hits = Self::cg_shape_hits(&cp_name, &shape, insts);
                 let covered = hits.iter().filter(|&&c| c >= at_least).count() as u64;
                 // §19.7 option.weight (default 1) weights this coverpoint in
@@ -117142,31 +117161,29 @@ impl Simulator {
             }
             CovergroupItem::Cross(cr) => {
                 let cr_name = Self::cg_cross_name(cr);
-                let at_least = self.cg_at_least(def, &[], insts);
-                if !cr.bins.is_empty() {
-                    let hit = cr
-                        .bins
-                        .iter()
-                        .filter(|b| {
-                            let key = format!("{}.{}", cr_name, b.name.name);
-                            insts
-                                .iter()
-                                .filter_map(|i| i.cross_bin_hits.get(&key))
-                                .sum::<u64>()
-                                >= at_least
-                        })
-                        .count();
-                    return Some((hit as u64, cr.bins.len() as u64, 1.0));
-                }
+                let at_least = self.cg_at_least(def, &cr.options, insts);
+                let weight = cr
+                    .options
+                    .iter()
+                    .find_map(|(n, v)| {
+                        (n == "weight")
+                            .then(|| self.cg_const_i64(v, ctor))
+                            .flatten()
+                    })
+                    .unwrap_or(1)
+                    .max(0) as f64;
                 // §19.6 automatic cross bins: the Cartesian product of the
                 // crossed items' bins; a sampled tuple hits the product of
-                // the bins each of its values falls into.
+                // the bins each of its values falls into. §19.6.1: the
+                // products a user bin selects belong to that bin, and the
+                // products an ignore_bins or illegal_bins selects to none;
+                // the remaining products stay automatic bins.
                 let axes: Vec<CpShape> = cr
                     .items
                     .iter()
-                    .map(|it| self.cg_cross_axis(def, &it.name, insts))
+                    .map(|it| self.cg_cross_axis(def, &it.name, insts, None))
                     .collect();
-                let total = axes
+                let n_prod = axes
                     .iter()
                     .fold(1u64, |t, a| t.saturating_mul(a.bins.len() as u64));
                 let mut hits: HashMap<Vec<usize>, u64> = HashMap::default();
@@ -117177,11 +117194,218 @@ impl Simulator {
                         }
                     }
                 }
-                let covered = hits.values().filter(|&&c| c >= at_least).count() as u64;
-                Some((covered, total, 1.0))
+                if cr.bins.is_empty() {
+                    let covered = hits.values().filter(|&&c| c >= at_least).count() as u64;
+                    return Some((covered, n_prod, weight));
+                }
+                let user: Vec<&crate::ast::decl::CrossBin> = cr
+                    .bins
+                    .iter()
+                    .filter(|b| matches!(b.kind, crate::ast::decl::CoverBinKind::Bins))
+                    .collect();
+                let mut nonempty = vec![false; user.len()];
+                let mut auto_total = 0u64;
+                if n_prod > 0 && n_prod <= 1 << 20 {
+                    let mut prod = vec![0usize; axes.len()];
+                    'enumerate: loop {
+                        match self.cg_cross_owner(cr, &axes, &prod, ctor, None) {
+                            CrossOwner::Excluded(_) => {}
+                            CrossOwner::Auto => auto_total += 1,
+                            CrossOwner::User(js) => {
+                                for j in js {
+                                    nonempty[j] = true;
+                                }
+                            }
+                        }
+                        for k in (0..prod.len()).rev() {
+                            prod[k] += 1;
+                            if prod[k] < axes[k].bins.len() {
+                                continue 'enumerate;
+                            }
+                            prod[k] = 0;
+                        }
+                        break;
+                    }
+                } else if n_prod > 0 {
+                    auto_total = n_prod;
+                    nonempty.iter_mut().for_each(|n| *n = true);
+                }
+                let mut covered = 0u64;
+                for (prod, &c) in &hits {
+                    if c >= at_least
+                        && matches!(
+                            self.cg_cross_owner(cr, &axes, prod, ctor, None),
+                            CrossOwner::Auto
+                        )
+                    {
+                        covered += 1;
+                    }
+                }
+                for (j, b) in user.iter().enumerate() {
+                    let key = format!("{}.{}", cr_name, b.name.name);
+                    if nonempty[j]
+                        && insts
+                            .iter()
+                            .filter_map(|i| i.cross_bin_hits.get(&key))
+                            .sum::<u64>()
+                            >= at_least
+                    {
+                        covered += 1;
+                    }
+                }
+                let total = auto_total + nonempty.iter().filter(|&&n| n).count() as u64;
+                Some((covered, total, weight))
             }
             _ => None,
         }
+    }
+
+    /// Which bins own a cross product (§19.6.1): an ignore_bins or
+    /// illegal_bins selecting it removes it; otherwise the user bins that
+    /// select it, else it is an automatic bin. `guards` (at sampling) masks
+    /// the bins whose `iff` is false.
+    fn cg_cross_owner(
+        &self,
+        cr: &crate::ast::decl::Cross,
+        axes: &[CpShape],
+        prod: &[usize],
+        ctor: &[(String, Value)],
+        guards: Option<&[bool]>,
+    ) -> CrossOwner {
+        let mut user = Vec::new();
+        let mut j = 0usize;
+        for (bi, b) in cr.bins.iter().enumerate() {
+            let live = guards.is_none_or(|g| g.get(bi).copied().unwrap_or(true));
+            match b.kind {
+                crate::ast::decl::CoverBinKind::Ignore
+                | crate::ast::decl::CoverBinKind::Illegal => {
+                    if live && self.cg_select(&b.select, cr, axes, prod, ctor) {
+                        return CrossOwner::Excluded(bi);
+                    }
+                }
+                crate::ast::decl::CoverBinKind::Bins => {
+                    if live && self.cg_select(&b.select, cr, axes, prod, ctor) {
+                        user.push(j);
+                    }
+                    j += 1;
+                }
+                crate::ast::decl::CoverBinKind::Default => {}
+            }
+        }
+        if user.is_empty() {
+            CrossOwner::Auto
+        } else {
+            CrossOwner::User(user)
+        }
+    }
+
+    /// §19.6.1 select_expression over one product of the cross's bins.
+    fn cg_select(
+        &self,
+        sel: &crate::ast::decl::CrossSelect,
+        cr: &crate::ast::decl::Cross,
+        axes: &[CpShape],
+        prod: &[usize],
+        ctor: &[(String, Value)],
+    ) -> bool {
+        use crate::ast::decl::CrossSelect;
+        match sel {
+            CrossSelect::Binsof { cp, bin, intersect } => {
+                let Some(k) = cr.items.iter().position(|i| i.name == cp.name) else {
+                    return false;
+                };
+                let b = &axes[k].bins[prod[k]];
+                if bin.as_ref().is_some_and(|bn| b.name != bn.name) {
+                    return false;
+                }
+                match intersect {
+                    None => true,
+                    Some(rs) => {
+                        let want: Vec<(i64, i64)> = rs
+                            .iter()
+                            .filter_map(|r| self.cg_range_bounds(r, ctor))
+                            .collect();
+                        b.ranges
+                            .iter()
+                            .any(|&(l, h)| want.iter().any(|&(a, c)| l <= c && a <= h))
+                    }
+                }
+            }
+            CrossSelect::Not(a) => !self.cg_select(a, cr, axes, prod, ctor),
+            CrossSelect::And(a, b) => {
+                self.cg_select(a, cr, axes, prod, ctor) && self.cg_select(b, cr, axes, prod, ctor)
+            }
+            CrossSelect::Or(a, b) => {
+                self.cg_select(a, cr, axes, prod, ctor) || self.cg_select(b, cr, axes, prod, ctor)
+            }
+            CrossSelect::With(a, e) => {
+                self.cg_select(a, cr, axes, prod, ctor)
+                    && self.cg_with_holds(e, cr, axes, prod, ctor)
+            }
+            CrossSelect::All => true,
+        }
+    }
+
+    /// `select with (expr)`: true when `expr`, with each crossed item's name
+    /// bound to a value of its bin in `prod`, holds for some value tuple.
+    fn cg_with_holds(
+        &self,
+        e: &Expression,
+        cr: &crate::ast::decl::Cross,
+        axes: &[CpShape],
+        prod: &[usize],
+        ctor: &[(String, Value)],
+    ) -> bool {
+        const MAX_VALUES: usize = 256;
+        const MAX_TUPLES: usize = 1 << 16;
+        let sets: Vec<Vec<i64>> = prod
+            .iter()
+            .enumerate()
+            .map(|(k, &b)| {
+                let mut vs = Vec::new();
+                'fill: for &(l, h) in &axes[k].bins[b].ranges {
+                    let mut v = l;
+                    while v <= h {
+                        if vs.len() >= MAX_VALUES {
+                            break 'fill;
+                        }
+                        if !Self::cg_in_ranges(v, &axes[k].excl) {
+                            vs.push(v);
+                        }
+                        v += 1;
+                    }
+                }
+                vs
+            })
+            .collect();
+        if sets.iter().any(|s| s.is_empty()) {
+            return false;
+        }
+        let mut params: HashMap<String, Value> = ctor.iter().cloned().collect();
+        let mut idx = vec![0usize; sets.len()];
+        for _ in 0..MAX_TUPLES {
+            for (k, it) in cr.items.iter().enumerate() {
+                params.insert(it.name.clone(), Value::from_u64(sets[k][idx[k]] as u64, 64));
+            }
+            if super::elaborate::const_eval_i64_with_params(e, Some(&params))
+                .is_some_and(|v| v != 0)
+            {
+                return true;
+            }
+            let mut k = idx.len();
+            loop {
+                if k == 0 {
+                    return false;
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] < sets[k].len() {
+                    break;
+                }
+                idx[k] = 0;
+            }
+        }
+        false
     }
 
     /// The product bins (one bin index per axis) a sampled value tuple hits.
@@ -117530,35 +117754,82 @@ impl Simulator {
                         tuple.push(val);
                     }
                     let cr_name = Self::cg_cross_name(cr);
-                    // LRM §19.6 cross body bin filters. For each
-                    // `bins NAME = binsof(<cp>) intersect { ranges };`,
-                    // look up cp's index in the cross items list and
-                    // check whether the tuple's component at that index
-                    // falls in any of the bin's constant ranges. Compute
-                    // the increments here BEFORE the mutable borrow of
-                    // the cg instance below.
+                    // §19.6.1: the user bins the sampled tuple falls in (a
+                    // bin whose `iff` is false takes nothing); a tuple in an
+                    // illegal_bins is an error.
                     let mut bin_increments: Vec<String> = Vec::new();
-                    for b in &cr.bins {
-                        let idx_opt = cr.items.iter().position(|i| i.name == b.cp_ref.name);
-                        let Some(idx) = idx_opt else { continue };
-                        let Some(v) = tuple.get(idx).cloned() else {
-                            continue;
-                        };
-                        let in_range = b.ranges.iter().any(|r| match r {
-                            crate::ast::decl::ConstraintRange::Value(e) => {
-                                self.eval_expr(e).to_u64() == v.to_u64()
+                    let mut illegal: Vec<String> = Vec::new();
+                    if !cr.bins.is_empty() {
+                        let guards: Vec<bool> = cr
+                            .bins
+                            .iter()
+                            .map(|b| {
+                                b.iff_guard
+                                    .as_ref()
+                                    .is_none_or(|g| self.eval_expr(g).is_true())
+                            })
+                            .collect();
+                        if let Some(Some(inst)) = self.cg_heap.get(handle) {
+                            let insts = [inst];
+                            let ctor = inst.ctor_args.as_slice();
+                            let axes: Vec<CpShape> = cr
+                                .items
+                                .iter()
+                                .zip(&tuple)
+                                .map(|(it, v)| {
+                                    self.cg_cross_axis(&def, &it.name, &insts, Some(v.width))
+                                })
+                                .collect();
+                            let user: Vec<&crate::ast::decl::CrossBin> = cr
+                                .bins
+                                .iter()
+                                .filter(|b| matches!(b.kind, crate::ast::decl::CoverBinKind::Bins))
+                                .collect();
+                            let mut hit = vec![false; user.len()];
+                            for prod in Self::cg_tuple_products(&axes, &tuple) {
+                                match self.cg_cross_owner(cr, &axes, &prod, ctor, Some(&guards)) {
+                                    CrossOwner::User(js) => {
+                                        for j in js {
+                                            hit[j] = true;
+                                        }
+                                    }
+                                    CrossOwner::Excluded(bi)
+                                        if cr.bins[bi].kind
+                                            == crate::ast::decl::CoverBinKind::Illegal =>
+                                    {
+                                        let key = format!("{}.{}", cr_name, cr.bins[bi].name.name);
+                                        if !illegal.contains(&key) {
+                                            illegal.push(key);
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
-                            crate::ast::decl::ConstraintRange::Range { lo, hi } => {
-                                let lo_v = self.eval_expr(lo).to_u64().unwrap_or(0);
-                                let hi_v = self.eval_expr(hi).to_u64().unwrap_or(0);
-                                let v_v = v.to_u64().unwrap_or(0);
-                                lo_v <= v_v && v_v <= hi_v
+                            for (j, b) in user.iter().enumerate() {
+                                if hit[j] {
+                                    bin_increments.push(format!("{}.{}", cr_name, b.name.name));
+                                }
                             }
-                        });
-                        if in_range {
-                            bin_increments.push(format!("{}.{}", cr_name, b.name.name));
                         }
                     }
+                    if !illegal.is_empty() {
+                        let text = format!(
+                            "({})",
+                            tuple
+                                .iter()
+                                .map(Self::cg_value_text)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        for key in &illegal {
+                            let body = format!(
+                                "Illegal cross bin hit at values {}: {}.{}",
+                                text, cg_name, key
+                            );
+                            self.emit_severity_text("Error", &body);
+                        }
+                    }
+                    bin_increments.extend(illegal);
                     if let Some(Some(inst)) = self.cg_heap.get_mut(handle) {
                         *inst
                             .cross_hits
