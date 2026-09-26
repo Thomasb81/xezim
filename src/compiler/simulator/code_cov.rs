@@ -14,6 +14,7 @@
 //! time slot, off the dirty set the waveform writers share.
 use super::*;
 use crate::ast::Span;
+use crate::compiler::elaborate::InitialBlock;
 
 pub const KIND_STATEMENT: u8 = 1;
 pub const KIND_BRANCH: u8 = 2;
@@ -212,6 +213,8 @@ pub(crate) struct CodeCov {
     counters: u32,
     /// Continuous assignment (origin span start, end, scope) -> its counter.
     ca_counter: HashMap<(usize, usize, String), u32>,
+    /// Instance paths below the top.
+    inst_paths: HashSet<String>,
     pub(crate) toggle: Option<Toggle>,
 }
 
@@ -1051,9 +1054,12 @@ impl Simulator {
             return;
         };
         let kinds = cfg.kinds;
-        // Every block must exist as an AST to be rewritten; the lazy forms
-        // are only a memory saving.
-        self.module.materialize_pending();
+        let inst_paths: HashSet<String> = self
+            .module
+            .instances
+            .iter()
+            .map(|i| i.path.clone())
+            .collect();
         let mut cov = CodeCov {
             kinds,
             limit: cfg.scopes,
@@ -1063,36 +1069,19 @@ impl Simulator {
             branches: Vec::new(),
             counters: 0,
             ca_counter: HashMap::default(),
+            inst_paths: inst_paths.clone(),
             toggle: None,
         };
-        let inst_paths: HashSet<String> = self
-            .module
-            .instances
-            .iter()
-            .map(|i| i.path.clone())
-            .collect();
+        // Initial blocks and continuous assignments are instrumented where
+        // `compile` and `build_comb_entries` take them (`cov_initial`,
+        // `cov_contassign`): most of them are still lazy here, and building
+        // them early would change the order and the passes they go through.
         if kinds & (KIND_STATEMENT | KIND_BRANCH) != 0 {
-            let mut initial = std::mem::take(&mut self.module.initial_blocks);
-            for ib in initial.iter_mut() {
-                if Self::cov_synthesized_initial(&ib.stmt) {
-                    continue;
-                }
-                if let Some(sc) = self.cov_instance_scope(&mut cov, &inst_paths, &ib.scope) {
-                    let span = ib.stmt.span;
-                    let s =
-                        std::mem::replace(&mut ib.stmt, Statement::new(StatementKind::Null, span));
-                    ib.stmt = Instr {
-                        cov: &mut cov,
-                        kinds,
-                        scope: sc,
-                    }
-                    .wrap(s);
-                }
-            }
-            self.module.initial_blocks = initial;
             let mut program = std::mem::take(&mut self.module.program_initial_blocks);
             for ib in program.iter_mut() {
-                if let Some(sc) = self.cov_instance_scope(&mut cov, &inst_paths, &ib.scope) {
+                if let Some(sc) =
+                    Self::cov_instance_scope(&self.module, &mut cov, &inst_paths, &ib.scope)
+                {
                     let span = ib.stmt.span;
                     let s =
                         std::mem::replace(&mut ib.stmt, Statement::new(StatementKind::Null, span));
@@ -1107,7 +1096,9 @@ impl Simulator {
             self.module.program_initial_blocks = program;
             let mut fin = std::mem::take(&mut self.module.final_blocks);
             for fb in fin.iter_mut() {
-                if let Some(sc) = self.cov_instance_scope(&mut cov, &inst_paths, &fb.scope) {
+                if let Some(sc) =
+                    Self::cov_instance_scope(&self.module, &mut cov, &inst_paths, &fb.scope)
+                {
                     let span = fb.stmt.span;
                     let s =
                         std::mem::replace(&mut fb.stmt, Statement::new(StatementKind::Null, span));
@@ -1122,7 +1113,9 @@ impl Simulator {
             self.module.final_blocks = fin;
             let mut always = std::mem::take(&mut self.module.always_blocks);
             for ab in always.iter_mut() {
-                if let Some(sc) = self.cov_instance_scope(&mut cov, &inst_paths, &ab.scope) {
+                if let Some(sc) =
+                    Self::cov_instance_scope(&self.module, &mut cov, &inst_paths, &ab.scope)
+                {
                     let kind = match ab.kind {
                         crate::ast::decl::AlwaysKind::Always => "always",
                         crate::ast::decl::AlwaysKind::AlwaysComb => "always_comb",
@@ -1192,42 +1185,6 @@ impl Simulator {
             }
             self.module.tasks = tasks;
             self.cov_instrument_classes(&mut cov);
-            let mut cas = std::mem::take(&mut self.module.continuous_assigns);
-            for ca in cas.iter_mut() {
-                let Some((span, scope)) = ca.origin.clone() else {
-                    continue;
-                };
-                let scope = if scope.is_empty() {
-                    Self::cov_lhs_base(&ca.lhs)
-                        .and_then(|n| n.rsplit_once('.').map(|(p, _)| p.to_string()))
-                        .unwrap_or_default()
-                } else {
-                    scope
-                };
-                let Some(sc) = self.cov_instance_scope(&mut cov, &inst_paths, &scope) else {
-                    continue;
-                };
-                let mut ins = Instr {
-                    cov: &mut cov,
-                    kinds,
-                    scope: sc,
-                };
-                ins.expr(&mut ca.rhs);
-                if kinds & KIND_STATEMENT != 0 {
-                    let key = (span.start, span.end, scope);
-                    if !ins.cov.ca_counter.contains_key(&key) {
-                        let counter = ins.counter();
-                        ins.cov.stmts.push(StmtSite {
-                            scope: sc,
-                            span,
-                            kind: "assign",
-                            counter,
-                        });
-                        ins.cov.ca_counter.insert(key, counter);
-                    }
-                }
-            }
-            self.module.continuous_assigns = cas;
         }
         if kinds & KIND_TOGGLE != 0 {
             let names = std::mem::take(&mut self.code_cov_toggle_names);
@@ -1248,6 +1205,83 @@ impl Simulator {
             StatementKind::Assertion(a) => a.is_property || a.deferred.is_some(),
             _ => false,
         }
+    }
+
+    /// Instrument an initial block as `compile` schedules it.
+    pub(super) fn cov_initial(&mut self, mut ib: InitialBlock) -> InitialBlock {
+        let Some(mut cov) = self.code_cov.take() else {
+            return ib;
+        };
+        let kinds = cov.kinds;
+        if kinds & (KIND_STATEMENT | KIND_BRANCH) != 0 && !Self::cov_synthesized_initial(&ib.stmt) {
+            let paths = std::mem::take(&mut cov.inst_paths);
+            if let Some(sc) = Self::cov_instance_scope(&self.module, &mut cov, &paths, &ib.scope) {
+                let span = ib.stmt.span;
+                let s = std::mem::replace(&mut ib.stmt, Statement::new(StatementKind::Null, span));
+                ib.stmt = Instr {
+                    cov: &mut cov,
+                    kinds,
+                    scope: sc,
+                }
+                .wrap(s);
+            }
+            cov.inst_paths = paths;
+            self.code_cov_hits.resize(cov.counters as usize, 0);
+        }
+        self.code_cov = Some(cov);
+        ib
+    }
+
+    /// Instrument a continuous assignment as `build_comb_entries` takes it:
+    /// its `?:`s become branches, and it gets its statement counter (shared
+    /// by the pieces one assignment expands to), which is returned. Takes
+    /// the fields it needs: the caller's iterator holds `module`.
+    pub(super) fn cov_contassign(
+        module: &ElaboratedModule,
+        code_cov: &mut Option<Box<CodeCov>>,
+        hits: &mut Vec<u64>,
+        ca: &mut crate::compiler::elaborate::ContinuousAssignment,
+    ) -> Option<u32> {
+        let (span, scope) = ca.origin.clone()?;
+        let cov = code_cov.as_mut()?;
+        let kinds = cov.kinds;
+        let scope = if scope.is_empty() {
+            Self::cov_lhs_base(&ca.lhs)
+                .and_then(|n| n.rsplit_once('.').map(|(p, _)| p.to_string()))
+                .unwrap_or_default()
+        } else {
+            scope
+        };
+        let paths = std::mem::take(&mut cov.inst_paths);
+        let sc = Self::cov_instance_scope(module, cov, &paths, &scope);
+        cov.inst_paths = paths;
+        let sc = sc?;
+        let mut ins = Instr {
+            cov,
+            kinds,
+            scope: sc,
+        };
+        ins.expr(&mut ca.rhs);
+        let mut counter = None;
+        if kinds & KIND_STATEMENT != 0 {
+            let key = (span.start, span.end, scope);
+            counter = Some(match ins.cov.ca_counter.get(&key) {
+                Some(&c) => c,
+                None => {
+                    let c = ins.counter();
+                    ins.cov.stmts.push(StmtSite {
+                        scope: sc,
+                        span,
+                        kind: "assign",
+                        counter: c,
+                    });
+                    ins.cov.ca_counter.insert(key, c);
+                    c
+                }
+            });
+        }
+        hits.resize(cov.counters as usize, 0);
+        counter
     }
 
     /// The signal-name base of a continuous assignment's target.
@@ -1272,7 +1306,7 @@ impl Simulator {
     /// prefix that names an instance, else the top. `None` when the command
     /// line's scope limit leaves it out.
     fn cov_instance_scope(
-        &self,
+        module: &ElaboratedModule,
         cov: &mut CodeCov,
         inst_paths: &HashSet<String>,
         scope: &str,
@@ -1287,13 +1321,13 @@ impl Simulator {
                 None => path = "",
             }
         };
-        let wrapper = self.module.name == xezim_core::MULTI_TOP_WRAPPER;
+        let wrapper = module.name == xezim_core::MULTI_TOP_WRAPPER;
         let name = if wrapper {
             inst.to_string()
         } else if inst.is_empty() {
-            self.module.name.clone()
+            module.name.clone()
         } else {
-            format!("{}.{}", self.module.name, inst)
+            format!("{}.{}", module.name, inst)
         };
         if name.is_empty() {
             return None;
@@ -1313,16 +1347,16 @@ impl Simulator {
             return Some(i);
         }
         let unit = if inst.is_empty() {
-            self.module.name.clone()
+            module.name.clone()
         } else {
-            self.module
+            module
                 .instances
                 .iter()
                 .find(|i| i.path == inst)
                 .map(|i| i.def_name.clone())
                 .unwrap_or_default()
         };
-        let src = self.module.src_file_of_module.get(&unit).copied();
+        let src = module.src_file_of_module.get(&unit).copied();
         let i = cov.scopes.len() as u32;
         cov.scopes.push(Scope {
             name,
@@ -1385,7 +1419,7 @@ impl Simulator {
             return self.cov_package_scope(cov, &pkg, &pkg, "package");
         }
         let scope = key.rsplit_once('.').map(|(p, _)| p).unwrap_or("");
-        self.cov_instance_scope(cov, inst_paths, scope)
+        Self::cov_instance_scope(&self.module, cov, inst_paths, scope)
     }
 
     fn cov_instrument_classes(&mut self, cov: &mut CodeCov) {
@@ -1448,27 +1482,6 @@ impl Simulator {
             classes.insert(key, arc);
         }
         self.module.classes = classes;
-    }
-
-    /// The comb-entry counter of an instrumented continuous assignment.
-    pub(super) fn cov_ca_counter(
-        &self,
-        ca: &crate::compiler::elaborate::ContinuousAssignment,
-    ) -> Option<u32> {
-        let cov = self.code_cov.as_ref()?;
-        if cov.kinds & KIND_STATEMENT == 0 {
-            return None;
-        }
-        let (span, scope) = ca.origin.as_ref()?;
-        if let Some(&c) = cov.ca_counter.get(&(span.start, span.end, scope.clone())) {
-            return Some(c);
-        }
-        let inferred = Self::cov_lhs_base(&ca.lhs)
-            .and_then(|n| n.rsplit_once('.').map(|(p, _)| p.to_string()))
-            .unwrap_or_default();
-        cov.ca_counter
-            .get(&(span.start, span.end, inferred))
-            .copied()
     }
 
     /// Count counter `c` (`Insn::CovHit`). Out of line, so the executors'
@@ -1642,7 +1655,7 @@ impl Simulator {
                 }
                 cut = p;
             }
-            let Some(sc) = self.cov_instance_scope(cov, inst_paths, inst) else {
+            let Some(sc) = Self::cov_instance_scope(&self.module, cov, inst_paths, inst) else {
                 continue;
             };
             let k = if t.slot[id] != u32::MAX {

@@ -364,11 +364,17 @@ endmodule
 }
 
 const SMALL: &str = "\
+module sub(input logic a, output logic y);
+  assign y = ~a;
+  initial $display(\"sub\");
+endmodule
 module tb;
   int x;
+  logic a = 0, y;
+  sub u(.a(a), .y(y));
   initial begin
     x = 1;
-    if (x > 0) $display(\"x=%0d\", x);
+    #1 if (x > 0) $display(\"x=%0d y=%b\", x, y);
     $error(\"boom\");
   end
 endmodule
@@ -376,7 +382,8 @@ endmodule
 
 /// Without code coverage nothing changes: the output and exit status are
 /// the same as with it, and no results file is written for a design with
-/// no covergroup or assertion.
+/// no covergroup or assertion. The instance's blocks are elaborated lazily;
+/// instrumenting them keeps the order they run in.
 #[test]
 fn off_by_default_output_unchanged() {
     let d = scratch("off");

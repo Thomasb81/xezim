@@ -15465,6 +15465,7 @@ impl Simulator {
             .map(|p| p.materialize())
             .chain(initial_blocks)
         {
+            let ib = self.cov_initial(ib);
             let scope = ib.scope;
             let span = ib.stmt.span;
             let block_label = match &ib.stmt.kind {
@@ -32653,7 +32654,7 @@ impl Simulator {
         let mut ca_compile_fail: HashMap<&'static str, usize> = HashMap::default();
         let mut ca_compile_fail_samples = 0usize;
         let cont_loop_t0 = std::time::Instant::now();
-        for ca in cas
+        for mut ca in cas
             .into_iter()
             .chain({
                 let params_snapshot = self.module.parameters.clone();
@@ -32738,7 +32739,12 @@ impl Simulator {
             // Statement coverage counts this assignment's evaluations: keep it
             // on a form that runs a counter (compiled, or interpreted).
             let cov_counter = if self.code_cov.is_some() {
-                self.cov_ca_counter(&ca)
+                Self::cov_contassign(
+                    &self.module,
+                    &mut self.code_cov,
+                    &mut self.code_cov_hits,
+                    &mut ca,
+                )
             } else {
                 None
             };
