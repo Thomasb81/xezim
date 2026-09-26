@@ -66368,6 +66368,145 @@ impl Simulator {
         self.heap.get(handle)?.as_ref()?.properties.get(m).cloned()
     }
 
+    /// `h.m(args)`: `h` a name `plain_ident_read` resolves to a live object
+    /// and `m` a method some class declares, none declares static, and no
+    /// interceptor of the call dispatch names (the builtin collection, enum,
+    /// string, mailbox, randomization, process, factory and coverage
+    /// methods). The dispatch's other arms key on such a method name or on a
+    /// receiver that is a package, class, type parameter, typedef,
+    /// collection, interface alias or subroutine scope; `h` is none of those,
+    /// so the call is the dispatch's own tail: the non-virtual binding
+    /// through `h`'s declared class, else the virtual method call.
+    fn plain_member_call(&mut self, func: &Expression, args: &[Expression]) -> Option<Value> {
+        let ExprKind::MemberAccess { expr: recv, member } = &func.kind else {
+            return None;
+        };
+        let ExprKind::Ident(h) = &recv.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || h.root.is_some() || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let n = h.path[0].name.name.as_str();
+        let m = member.name.as_str();
+        if matches!(n, "super" | "this" | "std" | "process")
+            || BuiltinM::classify(m) != BuiltinM::Other
+            || Self::is_array_builtin_method(m)
+            || matches!(
+                m,
+                "new"
+                    | "rand_mode"
+                    | "constraint_mode"
+                    | "randomize"
+                    | "srandom"
+                    | "get_randstate"
+                    | "set_randstate"
+                    | "name"
+                    | "tolower"
+                    | "toupper"
+                    | "putc"
+                    | "compare"
+                    | "icompare"
+                    | "itoa"
+                    | "hextoa"
+                    | "octtoa"
+                    | "bintoa"
+                    | "realtoa"
+                    | "atoreal"
+                    | "atoi"
+                    | "atohex"
+                    | "atooct"
+                    | "atobin"
+                    | "put"
+                    | "get"
+                    | "try_get"
+                    | "try_put"
+                    | "peek"
+                    | "try_peek"
+                    | "get_next_item"
+                    | "create"
+                    | "create_component_by_name"
+                    | "create_object_by_name"
+                    | "get_coverage"
+                    | "get_inst_coverage"
+                    | "start"
+                    | "stop"
+                    | "self"
+                    | "status"
+                    | "kill"
+                    | "await"
+                    | "suspend"
+                    | "resume"
+            )
+        {
+            return None;
+        }
+        {
+            let names = self.class_member_names();
+            if !names.methods.contains(m)
+                || names.static_methods.contains(m)
+                || names.vif_props.contains(n)
+                || names.params.contains(n)
+            {
+                return None;
+            }
+            let mut key = self.hint_key_scratch.borrow_mut();
+            key.clear();
+            key.push_str(n);
+            key.push('.');
+            key.push_str(m);
+            if names.subroutine_suffixes.contains(key.as_str()) {
+                return None;
+            }
+        }
+        if self.module.packages.contains(n)
+            || self.module.classes.contains_key(n)
+            || self.module.dynamic_arrays.contains(n)
+            || self.module.associative_arrays.contains_key(n)
+            || self.module.arrays.contains_key(n)
+            || self.coll_member_possible(n)
+            || self.iface_alias_for(n).is_some()
+            || self.dyn_name_lookup(n).is_some()
+        {
+            return None;
+        }
+        // A receiver that is no frame local and no signal is first tried as
+        // a class-scope name (a typedef alias of a class).
+        if !self.local_stack.last().is_some_and(|l| l.contains_key(n)) {
+            if self.resolve_hier_name(h) != n
+                || self.signal_name_to_id.contains_key(n)
+                || self.signals.contains_key(n)
+                || self.lookup_typedef_target(n).is_some()
+            {
+                return None;
+            }
+        }
+        let handle = self.plain_ident_read(h)?.to_u64()? as usize;
+        if handle == 0 || !matches!(self.heap.get(handle), Some(Some(_))) {
+            return None;
+        }
+        if self.cg_index(handle).is_some() {
+            return None;
+        }
+        if let Some(decl_cls) = self.class_of_var(n) {
+            let decl_base = decl_cls.split('#').next().unwrap_or(&decl_cls).to_string();
+            if let Some(target) = self.nonvirtual_target_class(&decl_base, m) {
+                let runtime = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .map(|i| i.class_name.clone());
+                let target_on_chain = runtime
+                    .as_deref()
+                    .is_some_and(|rt| target == rt || self.class_is_a(rt, &target));
+                if target_on_chain && runtime.as_deref() != Some(target.as_str()) {
+                    return Some(self.exec_method_in_class_hierarchy(handle, &target, m, args));
+                }
+            }
+        }
+        Some(self.exec_method_call(handle, m, args))
+    }
+
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
@@ -66382,6 +66521,11 @@ impl Simulator {
             }
             ExprKind::MemberAccess { expr: base, member } => {
                 if let Some(v) = self.plain_member_read(base, member) {
+                    return v;
+                }
+            }
+            ExprKind::Call { func, args } => {
+                if let Some(v) = self.plain_member_call(func, args) {
                     return v;
                 }
             }
