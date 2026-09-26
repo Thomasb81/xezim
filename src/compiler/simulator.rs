@@ -66242,6 +66242,132 @@ impl Simulator {
             .cloned()
     }
 
+    /// Read fast path for `h.p`: `h` a name `plain_ident_read` resolves to a
+    /// live object, `p` an instance property of it. The member read's other
+    /// arms key on names these two miss (vif, struct-capable, static,
+    /// parameter, class, package, union-tag, associative), on an interface
+    /// alias or clocking signal of that spelling, on a registered layout for
+    /// `h`, or on a flat `h.p` frame key or signal (probed, also under the
+    /// scope hint); any of those returns `None`.
+    fn plain_member_read(
+        &self,
+        base: &Expression,
+        member: &crate::ast::Identifier,
+    ) -> Option<Value> {
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || h.root.is_some() || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let n = h.path[0].name.name.as_str();
+        let m = member.name.as_str();
+        if matches!(m, "size" | "num" | "triggered" | "status")
+            || matches!(n, "super" | "this" | "process")
+            || self.name_stats_on
+            || self.rand_receiver.is_some()
+            || self.item_alias.is_some()
+            || self.iface_alias_for(n).is_some()
+        {
+            return None;
+        }
+        let names = self.class_member_names();
+        if names.vif_props.contains(n)
+            || names.params.contains(n)
+            || names.static_or_param.contains(m)
+            || self.struct_prop_name_possible(n)
+            || self.struct_prop_name_possible(m)
+        {
+            return None;
+        }
+        if n == self.module.name
+            || n.starts_with("genblk")
+            || m.starts_with("genblk")
+            || self.module.classes.contains_key(n)
+            || self.module.packages.contains(n)
+            || self.module.package_enum_members.contains_key(n)
+            || self.module.packed_struct_fields.contains_key(n)
+            || self.module.associative_arrays.contains_key(n)
+            || self.active_union_tag.contains_key(n)
+            || self.dyn_name_lookup(n).is_some()
+            || (self.clocking_read_possible(base)
+                && self.try_clocking_signal_read(&[n, m]).is_some())
+        {
+            return None;
+        }
+        if self.resolve_hier_name(h) != n {
+            return None;
+        }
+        // The struct-layout projection: a typedef'd name whose type is a
+        // struct, a module signal, or a typedef name.
+        match self.var_typedef_types.get(n) {
+            Some(tn) => {
+                if let Some(dt) = self.module.typedef_types.get(tn.as_str()) {
+                    let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
+                    if Self::struct_field_layout(&resolved).is_some() {
+                        return None;
+                    }
+                }
+            }
+            None => {
+                if self.signal_name_to_id.contains_key(n)
+                    || self.module.typedef_types.contains_key(n)
+                {
+                    return None;
+                }
+            }
+        }
+        let recv = self.plain_ident_read(h)?;
+        {
+            let mut key = self.hint_key_scratch.borrow_mut();
+            key.clear();
+            key.push_str(n);
+            key.push('.');
+            if self.any_struct_formal_markers
+                && self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(key.as_str()))
+            {
+                return None;
+            }
+            key.push_str(m);
+            if self
+                .local_stack
+                .last()
+                .is_some_and(|l| l.contains_key(key.as_str()))
+                || self.signal_name_to_id.contains_key(key.as_str())
+                || self.signals.contains_key(key.as_str())
+            {
+                return None;
+            }
+            if let Some(hint) = self.name_resolve_hint.borrow().as_deref() {
+                let mut scope = hint;
+                let mut scoped = String::new();
+                loop {
+                    scoped.clear();
+                    scoped.push_str(scope);
+                    scoped.push('.');
+                    scoped.push_str(&key);
+                    if self.signal_name_to_id.contains_key(scoped.as_str())
+                        || self.signals.contains_key(&scoped)
+                    {
+                        return None;
+                    }
+                    match scope.rsplit_once('.') {
+                        Some((p, _)) => scope = p,
+                        None => break,
+                    }
+                }
+            }
+        }
+        let handle = recv.to_u64()? as usize;
+        if handle == 0 {
+            return None;
+        }
+        self.heap.get(handle)?.as_ref()?.properties.get(m).cloned()
+    }
+
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
@@ -66253,6 +66379,11 @@ impl Simulator {
             }
             ExprKind::SystemCall { name, args } if name == SVA_SIG_MARKER => {
                 return self.sva_sig_read(args);
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                if let Some(v) = self.plain_member_read(base, member) {
+                    return v;
+                }
             }
             _ => {}
         }
