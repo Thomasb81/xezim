@@ -542,7 +542,8 @@ hit, so a combined percentage can't be worked out from them alone.
   `$coverage_get_max`, `$coverage_merge`, `$coverage_save`, `$set_coverage_db_name`
   and `$load_coverage_db`. They print `Warning: unknown system task '<name>' ignored`
   once, and the functions return 0.
-- `coverage save` and `coverage report` in a `-do` script: ignored with a warning.
+- `coverage save` and `coverage report` in a `-do` script: ignored with a warning;
+  the results are in `xezim_cov.json`.
 
 #### Where a covergroup can be declared
 

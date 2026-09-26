@@ -102,6 +102,8 @@ fn do_subset_ignores_logging_and_coverage() {
         "{:?}",
         p.warnings
     );
+    // xezim does write coverage, to its own file.
+    assert!(p.warnings[2].contains("xezim_cov.json"), "{:?}", p.warnings);
     // One warning per kind, however often it appears.
     let p = plan("log a; log -r /*\nadd wave x; add wave y; coverage report -file c.txt; run 5ns")
         .unwrap();

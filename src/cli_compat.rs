@@ -271,7 +271,7 @@ pub(crate) struct DoPlan {
 /// `$dumpvars` with `--wave`/`--fst`) and coverage database files.
 fn no_op_command(words: &[&str]) -> Option<(&'static str, &'static str)> {
     const WAVES: &str = "use --fst (or --wave for $dumpvars) for waveforms";
-    const COVERAGE: &str = "xezim writes no coverage database";
+    const COVERAGE: &str = "xezim writes its coverage to xezim_cov.json (XEZIM_COV_DB) at the end";
     match words {
         ["log", ..] => Some(("log", WAVES)),
         ["add", "wave", ..] => Some(("add wave", WAVES)),
