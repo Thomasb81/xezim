@@ -64816,7 +64816,9 @@ impl Simulator {
         // §14.3 clocking-block signal read. Inside a task/function the
         // parser yields MemberAccess for `cb.sig` (module scope yields
         // a flat hier Ident), so this arm needs the same handling.
-        if let Some(mut segs) = Self::flatten_member_path(expr) {
+        if self.clocking_read_possible(expr)
+            && let Some(mut segs) = Self::flatten_member_path(expr)
+        {
             segs.push(member.name.clone());
             let refs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
             if let Some(v) = self.try_clocking_signal_read(&refs) {
@@ -106880,6 +106882,68 @@ impl Simulator {
         }
     }
 
+    /// `flatten_member_path` joined with `.` into `out`, without the per-
+    /// segment copies: the number of segments written, or `None` for a shape
+    /// it does not flatten.
+    fn push_member_path(expr: &Expression, out: &mut String) -> Option<usize> {
+        match &expr.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                for (i, s) in h.path.iter().enumerate() {
+                    if i > 0 {
+                        out.push('.');
+                    }
+                    out.push_str(&s.name.name);
+                }
+                Some(h.path.len())
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let n = Self::push_member_path(base, out)?;
+                if n > 0 {
+                    out.push('.');
+                }
+                out.push_str(&member.name);
+                Some(n + 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// Can `<recv>.<member>` read a clocking-block signal? Every key
+    /// `resolve_clocking_key` tries for the receiver ends in the receiver's
+    /// last segment, except the vif alias of its first segment, which needs
+    /// a vif-capable name.
+    fn clocking_read_possible(&self, recv: &Expression) -> bool {
+        if self.clocking_meta.is_empty() {
+            return false;
+        }
+        let mut cur = recv;
+        let mut last: Option<&str> = None;
+        let first = loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr: base, member } => {
+                    last.get_or_insert(member.name.as_str());
+                    cur = base;
+                }
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    let Some(f) = h.path.first() else {
+                        return false;
+                    };
+                    if last.is_none() {
+                        last = h.path.last().map(|s| s.name.name.as_str());
+                    }
+                    break f.name.name.as_str();
+                }
+                _ => return false,
+            }
+        };
+        let last = last.unwrap_or(first);
+        self.vif_name_possible(first)
+            || self
+                .clocking_meta
+                .keys()
+                .any(|k| k == last || k.strip_suffix(last).is_some_and(|p| p.ends_with('.')))
+    }
+
     fn try_clocking_signal_read(&self, segs: &[&str]) -> Option<Value> {
         if segs.len() < 2 {
             return None;
@@ -109870,9 +109934,13 @@ impl Simulator {
         // spelling had no handler and silently evaluated to 0 / dropped the
         // mutation.
         if let ExprKind::MemberAccess { expr: recv, member } = &func.kind {
-            if let Some(mut segs) = Self::flatten_member_path(recv) {
-                segs.push(member.name.clone());
-                let joined = segs.join(".");
+            let mut joined = String::new();
+            if let Some(nsegs) = Self::push_member_path(recv, &mut joined) {
+                let recv_len = joined.len();
+                if nsegs > 0 {
+                    joined.push('.');
+                }
+                joined.push_str(&member.name);
                 // Every subroutine key below is `joined` or ends in
                 // `.joined`.
                 let may_be_subroutine = self
@@ -109915,9 +109983,10 @@ impl Simulator {
                         }
                     }
                 }
-                // Collection builtin on the flattened receiver name.
-                if segs.len() >= 2 {
-                    let mut recv_name = segs[..segs.len() - 1].join(".");
+                // Collection builtin on the flattened receiver name (the
+                // receiver's segments plus the member are always two or more).
+                {
+                    let mut recv_name = joined[..recv_len].to_string();
                     // A class-qualified STATIC collection receiver
                     // (`ClassName::staticColl.push_back(x)` / `.size()`)
                     // flattens to the DOT form `ClassName.staticColl`, which
