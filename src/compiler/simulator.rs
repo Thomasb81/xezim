@@ -3233,9 +3233,9 @@ struct CovergroupInstance {
     point_hits: HashMap<String, HashMap<Value, u64>>,
     /// Cross hits: cross_name -> observed value tuple -> times sampled
     cross_hits: HashMap<String, HashMap<Vec<Value>, u64>>,
-    /// LRM §19.6 cross-bin filter hit counts. Key: `cross_name.bin_name`.
-    /// Sampling increments the counter when the referenced coverpoint's
-    /// component of the cross-tuple falls in any of the bin's ranges.
+    /// §19.6.1 hit counts of the bins of a cross body. Key:
+    /// `cross_name.bin_name`. A sample counts once for each bin selecting a
+    /// product of the bins its values fall in.
     cross_bin_hits: HashMap<String, u64>,
     /// Per-explicit-bin hit counts (LRM §19.5). Key: `coverpoint.bin`. Only
     /// populated for coverpoints that declared `bins`. Sampling increments
@@ -116562,8 +116562,8 @@ impl Simulator {
     }
 
     /// §19.8/§19.11 TYPE coverage of one coverpoint or cross: over the
-    /// union of the instances' hits with `merge_instances`, else the
-    /// average of the instances, with their bin counts summed.
+    /// instances' hits added up with `merge_instances`, else the average of
+    /// the instances, with their bin counts summed.
     fn cg_type_item_counts(&self, cg_name: &str, item: &str) -> Option<(f64, u64, u64)> {
         let insts = self.cg_type_instances(cg_name);
         if self.cg_merge_instances(cg_name) || insts.is_empty() {
@@ -116594,8 +116594,8 @@ impl Simulator {
         (self.calculate_coverage(handle), c, t)
     }
 
-    /// Type coverage (percent) and bin counts: of the union of the
-    /// instances' hits with `merge_instances`, else summed over them.
+    /// Type coverage (percent) and bin counts: of the instances' hits added
+    /// up with `merge_instances`, else summed over the instances.
     fn cg_type_counts(&self, cg_name: &str) -> (f64, u64, u64) {
         let insts = self.cg_type_instances(cg_name);
         let (c, t) = if self.cg_merge_instances(cg_name) {
