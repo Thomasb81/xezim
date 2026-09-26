@@ -172,6 +172,8 @@ mod covergroup_implicit_names;
 mod covergroup_placement;
 #[path = "classes/covergroup_sample_args.rs"]
 mod covergroup_sample_args;
+#[path = "classes/covergroup_sampling_event.rs"]
+mod covergroup_sampling_event;
 #[path = "classes/factory_run_test.rs"]
 mod factory_run_test;
 #[path = "classes/foreach_member_multidim.rs"]

@@ -6028,6 +6028,14 @@ pub struct Simulator {
     instance_event_waiters: Vec<InstanceEventWaiter>,
     /// Covergroups waiting for sampling events
     cg_event_waiters: Vec<(usize, Vec<SensitivityId>)>,
+    /// Covergroups sampled on a named event (`@(ev)`), by the event's
+    /// signal id: (instance, the event term's `iff`). Sampled when the
+    /// event fires; a trigger right after a process wakes on an edge was
+    /// missed by the edge scan.
+    cg_named_event_waiters: HashMap<usize, Vec<(usize, Option<Expression>)>>,
+    /// Class-embedded covergroups sampled on an event property of their
+    /// object, by (object, event name).
+    cg_instance_event_waiters: HashMap<(usize, String), Vec<(usize, Option<Expression>)>>,
     /// Swap buffer for event_waiters filtering (avoids allocation per cycle)
     event_waiters_swap: Vec<EventWaiter>,
     /// Reused per tick: the triggered continuations of
@@ -9954,6 +9962,8 @@ impl Simulator {
             instance_event_waiters: Vec::new(),
             fe_trusted_types: HashSet::default(),
             cg_event_waiters: Vec::new(),
+            cg_named_event_waiters: HashMap::default(),
+            cg_instance_event_waiters: HashMap::default(),
             event_waiters_swap: Vec::new(),
             triggered_conts_buf: Vec::new(),
             sig_wake_rank: HashMap::default(),
@@ -51144,16 +51154,17 @@ impl Simulator {
         let _t_cg = self.profile_timing.then(std::time::Instant::now);
         for i in 0..self.cg_event_waiters.len() {
             let handle = self.cg_event_waiters[i].0;
-            let mut triggered = false;
+            let mut triggered = None;
             for j in 0..self.cg_event_waiters[i].1.len() {
                 let sid = &self.cg_event_waiters[i].1[j];
                 if self.check_edge_id(sid.signal_id, sid.edge) {
-                    triggered = true;
+                    triggered = Some(sid.iff.clone());
                     break;
                 }
             }
-            if triggered {
-                self.sample_covergroup(handle);
+            // §9.4.2.3: `@(posedge clk iff en)` samples only while `en` holds.
+            if let Some(iff) = triggered {
+                self.sample_covergroup_guarded(handle, iff.as_ref());
             }
         }
         if let Some(t) = _t_cg {
@@ -77488,6 +77499,9 @@ impl Simulator {
         // name-keyed path uses, under a synthetic per-instance key.
         let stamp = Self::instance_event_stamp_key(&key);
         self.event_triggered_time.insert(stamp, now);
+        if let Some(w) = self.cg_instance_event_waiters.get(&key).cloned() {
+            self.sample_event_covergroups(w);
+        }
         let mut woken = Vec::new();
         self.instance_event_waiters.retain(|w| {
             if w.key == key {
@@ -77556,6 +77570,16 @@ impl Simulator {
                         // `e.triggered` returns 1 in the same time slot.
                         self.event_triggered_time
                             .insert(sig_name.clone(), self.time);
+                        if !self.cg_named_event_waiters.is_empty() {
+                            let waiters = self
+                                .signal_name_to_id
+                                .get(sig_name.as_str())
+                                .and_then(|id| self.cg_named_event_waiters.get(id))
+                                .cloned();
+                            if let Some(w) = waiters {
+                                self.sample_event_covergroups(w);
+                            }
+                        }
                     }
                 }
                 // Also stamp the bare name (covers cases where the signal
@@ -116164,22 +116188,50 @@ impl Simulator {
 
         // Register automatic sampling if event is present
         if let Some(event) = &cg_def.event {
+            // §19.3: `@(ev)` on an event property of the owning object.
+            if let (Some(h), EventControl::EventExpr(terms)) = (owner, event) {
+                if let [t] = terms.as_slice() {
+                    if let ExprKind::Ident(id) = &t.expr.kind {
+                        let is_prop =
+                            t.edge.is_none()
+                                && id.path.len() == 1
+                                && self.heap.get(h).and_then(|o| o.as_ref()).is_some_and(|o| {
+                                    o.properties.contains_key(&id.path[0].name.name)
+                                });
+                        if is_prop {
+                            self.cg_instance_event_waiters
+                                .entry((h, id.path[0].name.name.clone()))
+                                .or_default()
+                                .push((handle, t.iff.clone()));
+                            return Value::from_u64((CG_HANDLE_TAG + handle) as u64, 32);
+                        }
+                    }
+                }
+            }
             let sens = self.event_to_sens(event);
-            let resolved: Vec<SensitivityId> = sens
-                .iter()
-                .filter_map(|s| {
-                    self.signal_name_to_id
-                        .get(s.signal_name.as_str())
-                        .map(|&id| SensitivityId {
-                            signal_id: id,
-                            edge: s.edge,
-                            iff: s.iff.clone(),
-                            value_of: None,
-                            wake_rank: 0,
-                        })
-                })
-                .collect();
-            self.cg_event_waiters.push((handle, resolved));
+            let mut resolved: Vec<SensitivityId> = Vec::new();
+            for s in &sens {
+                let Some(&id) = self.signal_name_to_id.get(s.signal_name.as_str()) else {
+                    continue;
+                };
+                if self.module.events.contains(s.signal_name.as_str()) {
+                    self.cg_named_event_waiters
+                        .entry(id)
+                        .or_default()
+                        .push((handle, s.iff.clone()));
+                    continue;
+                }
+                resolved.push(SensitivityId {
+                    signal_id: id,
+                    edge: s.edge,
+                    iff: s.iff.clone(),
+                    value_of: None,
+                    wake_rank: 0,
+                });
+            }
+            if !resolved.is_empty() {
+                self.cg_event_waiters.push((handle, resolved));
+            }
         }
 
         // Tagged so a covergroup handle can never be mistaken for a class
@@ -116294,7 +116346,7 @@ impl Simulator {
                     }
                     frame.insert(port.name.name.clone(), v);
                 }
-                self.sample_covergroup_with(handle, frame);
+                self.sample_covergroup_with(handle, frame, None);
                 Value::zero(32)
             }
             _ => Value::zero(32),
@@ -116968,14 +117020,31 @@ impl Simulator {
     }
 
     fn sample_covergroup(&mut self, handle: usize) {
-        self.sample_covergroup_with(handle, HashMap::default());
+        self.sample_covergroup_with(handle, HashMap::default(), None);
+    }
+
+    /// Sample on the covergroup's event, whose `iff` term is `guard`.
+    fn sample_covergroup_guarded(&mut self, handle: usize, guard: Option<&Expression>) {
+        self.sample_covergroup_with(handle, HashMap::default(), guard);
+    }
+
+    /// Sample every covergroup waiting on a fired event.
+    fn sample_event_covergroups(&mut self, waiters: Vec<(usize, Option<Expression>)>) {
+        for (handle, iff) in waiters {
+            self.sample_covergroup_guarded(handle, iff.as_ref());
+        }
     }
 
     /// Sample instance `handle` with the §19.8.1 `with function sample`
     /// formals bound to `sample_args`. They share one frame with the §19.3
     /// constructor formals: a second frame on top hid the first, so a
     /// covergroup with both never saw its sample arguments.
-    fn sample_covergroup_with(&mut self, handle: usize, sample_args: HashMap<String, Value>) {
+    fn sample_covergroup_with(
+        &mut self,
+        handle: usize,
+        sample_args: HashMap<String, Value>,
+        guard: Option<&Expression>,
+    ) {
         let (owner, mut ctor_args, ctor_refs) =
             match self.cg_heap.get(handle).and_then(|x| x.as_ref()) {
                 Some(i) => (i.owner, i.ctor_args.clone(), i.ctor_refs.clone()),
@@ -116998,10 +117067,13 @@ impl Simulator {
         }
         if let Some(h) = owner {
             self.this_stack.push(Some(h));
+        }
+        // The guard reads the instance's scope (its object and formals).
+        if guard.is_none_or(|g| self.eval_expr(g).is_true()) {
             self.sample_covergroup_inner(handle);
+        }
+        if owner.is_some() {
             self.this_stack.pop();
-        } else {
-            self.sample_covergroup_inner(handle);
         }
         if has_args {
             self.pop_local_frame();

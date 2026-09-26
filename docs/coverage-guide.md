@@ -16,7 +16,7 @@ how to read the results.
 | Area | Supported |
 |---|---|
 | Where covergroups live | Any module (the top or an instantiated one), an interface, a package, file scope, and classes. See [Where a covergroup can be declared](#where-a-covergroup-can-be-declared) |
-| Sampling | A sampling event (`covergroup cg @(posedge clk)`), explicit `sample()`, `with function sample(...)` arguments, constructor arguments (`covergroup cg (int lo, int hi)`) |
+| Sampling | A sampling event (`covergroup cg @(posedge clk)`, `@(posedge clk iff en)`, a named event `@(ev)`), explicit `sample()`, `with function sample(...)` arguments, constructor arguments (`covergroup cg (int lo, int hi)`) |
 | Bins | Values and ranges (`{0, [2:5], [8:$]}`), automatic bins, array bins `name[]`, `wildcard` bins, transition bins `(1 => 2 => 3)` and `([0:1] => [2:3])`, `default`, `ignore_bins`, `illegal_bins` |
 | Guards | `coverpoint x iff (cond)`, `cross a, b iff (cond)` |
 | Crosses | Automatic cross bins (every combination of the coverpoints' bins), `bins name = binsof(cp) intersect {...}` |
@@ -551,7 +551,6 @@ it.
 |---|---|
 | `start()`, `stop()` | No effect: sampling continues after `stop()` |
 | `option.per_instance`, `option.goal`, `option.name`, `option.comment` | Accepted, no effect. The results file always has one entry per instance, named after the type |
-| `@(posedge clk iff cond)` as the sampling event | The `iff` is ignored and every edge samples. Put the condition on the coverpoints: `coverpoint x iff (cond)` |
 | `bins name[N] = {...}` | Treated as `name[]`: one bin per value, not N bins |
 | Transition sets and repetition: `(1, 5 => 3)`, `(3 [*2])`, `[->n]`, `[=n]` | Never hit |
 | In a cross body: `ignore_bins`, `illegal_bins`, `binsof(cp.bin)`, `binsof(...) with (...)` | Ignored. Only `bins name = binsof(cp) intersect {...}` is used. To leave values out of a cross, put `ignore_bins` on the coverpoint, as in [the cross example](#crosses-and-ignore_bins) |
