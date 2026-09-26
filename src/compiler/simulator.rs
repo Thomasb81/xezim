@@ -46157,9 +46157,11 @@ impl Simulator {
     /// settles at its boundary and would read stale state. Conservative:
     /// unresolvable names are ignored (they compile-bail elsewhere).
     fn stmt_has_comb_feedback(&self, stmt: &Statement) -> bool {
-        let mut reads: HashSet<String> = HashSet::default();
+        // Writes first: the read set names every element of a dynamically
+        // indexed array (65,536 per testbench memory-load loop on c906), and
+        // it only matters once some comb entry is downstream of a write.
         let mut writes: HashSet<String> = HashSet::default();
-        Self::collect_stmt_reads(stmt, &self.module, &mut reads, &mut writes);
+        Self::collect_stmt_rw(stmt, &self.module, None, &mut writes, None);
         if writes.is_empty() {
             return false;
         }
@@ -46178,14 +46180,9 @@ impl Simulator {
         }) {
             return true;
         }
-        if reads.is_empty() {
-            return false;
-        }
         let to_id = |n: &String| self.signal_name_to_id.get(n.as_str()).copied();
-        let read_ids: HashSet<usize> = reads.iter().filter_map(to_id).collect();
-        if read_ids.is_empty() {
-            return false;
-        }
+        // Every signal the writes reach through comb entries.
+        let mut reached: HashSet<usize> = HashSet::default();
         let mut frontier: Vec<usize> = writes.iter().filter_map(to_id).collect();
         let mut seen_entries: HashSet<u32> = HashSet::default();
         while let Some(id) = frontier.pop() {
@@ -46199,14 +46196,22 @@ impl Simulator {
                     continue;
                 }
                 for &out in &self.comb_entries[e as usize].cold.write_signal_ids {
-                    if read_ids.contains(&out) {
-                        return true;
+                    if reached.insert(out) {
+                        frontier.push(out);
                     }
-                    frontier.push(out);
                 }
             }
         }
-        false
+        if reached.is_empty() {
+            return false;
+        }
+        let mut reads: HashSet<String> = HashSet::default();
+        writes.clear();
+        Self::collect_stmt_reads(stmt, &self.module, &mut reads, &mut writes);
+        reads
+            .iter()
+            .filter_map(to_id)
+            .any(|id| reached.contains(&id))
     }
 
     /// Is this expression free of side effects, structurally? Conservative:
