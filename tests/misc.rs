@@ -69,6 +69,8 @@ mod constant_expression_contexts;
 mod cont_assign_rhs_undeclared;
 #[path = "misc/cov_assertion_basic.rs"]
 mod cov_assertion_basic;
+#[path = "misc/cover_sequence.rs"]
+mod cover_sequence;
 #[path = "misc/coverage_db.rs"]
 mod coverage_db;
 #[path = "misc/defparam_local_targets.rs"]

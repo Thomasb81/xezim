@@ -2803,6 +2803,9 @@ struct SvaClockedSite {
     /// 0 assert, 1 assume, 2 cover (§16.5): a cover miss is not a failure
     /// and fires no else-action; a cover match fires the pass action.
     kind: u8,
+    /// §16.14.3 `cover sequence`: an attempt counts every match of the
+    /// sequence and lives on while it can still match.
+    all_matches: bool,
     /// Resolved signal name for the clock; we re-resolve to value
     /// each tick rather than caching an id (small site count).
     clock_signal: String,
@@ -76623,6 +76626,7 @@ impl Simulator {
                                 span_key,
                                 dedup_scope: self.current_scope.clone(),
                                 kind,
+                                all_matches: a.is_sequence,
                                 clock_signal,
                                 edge,
                                 iff,
@@ -81668,7 +81672,25 @@ impl Simulator {
             attempts.push(Self::sva_new_state(&node));
             let mut results: Vec<SvaOutcome> = Vec::new();
             let mut live: Vec<SvaState> = Vec::with_capacity(attempts.len());
+            let all_matches = self.sva_sites[i].all_matches;
             for mut st in attempts.drain(..) {
+                if all_matches {
+                    let step = match (&*node, &mut st) {
+                        (SvaNode::Seq(nfa, _), SvaState::Seq(run)) => {
+                            Some(self.sva_run_advance(nfa, run, false))
+                        }
+                        _ => None,
+                    };
+                    if let Some((matched, alive)) = step {
+                        if matched {
+                            results.push(SvaOutcome::Pass);
+                        }
+                        if alive {
+                            live.push(st);
+                        }
+                        continue;
+                    }
+                }
                 match self.sva_advance(&node, &mut st) {
                     Some(r) => results.push(r),
                     None => live.push(st),

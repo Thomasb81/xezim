@@ -22,7 +22,7 @@ how to read the results.
 | Crosses | Automatic cross bins (every combination of the coverpoints' bins); `bins`, `ignore_bins` and `illegal_bins` selected with `binsof(cp)`, `binsof(cp.bin)`, `intersect {...}`, `!`, `&&`, `\|\|` and `with (...)` |
 | Options | `option.at_least`, `option.weight`, `option.auto_bin_max`, `type_option.merge_instances`, `type_option.weight` |
 | Queries | `get_inst_coverage()` and `get_coverage()` on a covergroup, a coverpoint or a cross, with or without `(covered, total)`; `cg_type::get_coverage()`; `$get_coverage()`; `start()` and `stop()` |
-| Assertion coverage | Counts for `cover property`, `assert property`, `assume property` and the immediate `cover`, `assert` and `assume` |
+| Assertion coverage | Counts for `cover property`, `cover sequence`, `assert property`, `assume property` and the immediate `cover`, `assert` and `assume` |
 | Results | The `xezim_cov.json` file, and `[COV]` summary lines with `--verbose` |
 
 ---
@@ -427,7 +427,7 @@ For the [assertion example](#assertion-coverage):
 
 | Statement | `pass` | `fail` |
 |---|---|---|
-| `cover property` | Matches | Always 0 |
+| `cover property`, `cover sequence` | Matches | Always 0 |
 | `assert property`, `assume property` | Attempts that succeeded, including vacuous ones (`gnt` low, so `gnt \|-> ...` holds) | Attempts that failed |
 | Immediate `cover`, `assert`, `assume` | Evaluations where the expression was true | Evaluations where it was false |
 
@@ -544,7 +544,6 @@ hit, so a combined percentage can't be worked out from them alone.
 - Code coverage: line, statement, branch, condition, expression, toggle and FSM.
 - Coverage databases in other formats (such as UCIS), text or HTML coverage
   reports, and merging results across runs.
-- `cover sequence`: a parse error. Use `cover property` with the sequence.
 - The coverage system functions `$coverage_control`, `$coverage_get`,
   `$coverage_get_max`, `$coverage_merge`, `$coverage_save`, `$set_coverage_db_name`
   and `$load_coverage_db`. They print `Warning: unknown system task '<name>' ignored`
