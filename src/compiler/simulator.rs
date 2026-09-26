@@ -14480,19 +14480,10 @@ impl Simulator {
                 _ => (false, Vec::new()),
             };
             let v = if let (Some(kind), true) = (cont_kind, is_new) {
-                let ch = self.heap.len();
-                self.heap.push(Some(ClassInstance {
-                    class_name: kind.to_string(),
-                    properties: PropMap::default(),
-                    type_bindings: HashMap::default(),
-                    spec: None,
-                    creation_scope: self.active_instance_scope(),
-                }));
-                if kind == "semaphore" {
-                    self.semaphores.insert(ch, 0);
-                } else {
-                    self.mailboxes.insert(ch, std::collections::VecDeque::new());
-                }
+                // §15.3.1/§15.4.1: the constructor argument is the initial
+                // key count / the bound — allocating a zero-key semaphore
+                // made the first `get()` block forever.
+                let ch = self.alloc_builtin_container(kind, &ctor_args);
                 Value::from_u64(ch as u64, 32)
             } else if is_new {
                 // A CLASS-typed static with `= new(...)`/`= new` constructs
@@ -104512,19 +104503,11 @@ impl Simulator {
                 if matches!(&func.kind, ExprKind::Ident(h)
                     if h.path.len() == 1 && h.path[0].name.name == "new"));
             let v = if let (Some(kind), true) = (cont_kind, is_new) {
-                let ch = self.heap.len();
-                self.heap.push(Some(ClassInstance {
-                    class_name: kind.to_string(),
-                    properties: PropMap::default(),
-                    type_bindings: HashMap::default(),
-                    spec: None,
-                    creation_scope: self.active_instance_scope(),
-                }));
-                if kind == "semaphore" {
-                    self.semaphores.insert(ch, 0);
-                } else {
-                    self.mailboxes.insert(ch, std::collections::VecDeque::new());
-                }
+                let ctor_args: &[Expression] = match &init.kind {
+                    ExprKind::Call { args, .. } => args.as_slice(),
+                    _ => &[],
+                };
+                let ch = self.alloc_builtin_container(kind, ctor_args);
                 Value::from_u64(ch as u64, 32)
             } else {
                 self.class_context_stack.push(Some(cname.clone()));
@@ -110591,6 +110574,11 @@ impl Simulator {
                         *count += v.to_u64().unwrap_or(1) as i64;
                         self.wake_semaphore_waiters(handle);
                     }
+                } else if let Some(count) = self.semaphores.get_mut(&handle) {
+                    // §15.3.2: `put()` returns ONE key. The no-argument form
+                    // added nothing here, so the next `get()` blocked forever.
+                    *count += 1;
+                    self.wake_semaphore_waiters(handle);
                 }
                 return Value::zero(32);
             }
@@ -118914,19 +118902,9 @@ impl Simulator {
                     _ => (false, &[]),
                 };
                 if let (Some(kind), true) = (cont_kind, is_new) {
-                    let ch = self.heap.len();
-                    self.heap.push(Some(ClassInstance {
-                        class_name: kind.to_string(),
-                        properties: PropMap::default(),
-                        type_bindings: HashMap::default(),
-                        spec: None,
-                        creation_scope: self.active_instance_scope(),
-                    }));
-                    if kind == "semaphore" {
-                        self.semaphores.insert(ch, 0);
-                    } else {
-                        self.mailboxes.insert(ch, std::collections::VecDeque::new());
-                    }
+                    // `semaphore s = new(1);`: the argument is the initial
+                    // key count (§15.3.1) or the mailbox bound (§15.4.1).
+                    let ch = self.alloc_builtin_container(kind, ctor_args);
                     if let Some(Some(inst)) = self.heap.get_mut(handle) {
                         inst.properties
                             .insert(pname, Value::from_u64(ch as u64, 32));

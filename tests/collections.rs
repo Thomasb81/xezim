@@ -101,6 +101,8 @@ mod queue_dyn_write_semantics;
 mod assoc_of_struct;
 #[path = "collections/builtin_class_construction_forms.rs"]
 mod builtin_class_construction_forms;
+#[path = "collections/class_member_semaphore_keys.rs"]
+mod class_member_semaphore_keys;
 #[path = "collections/foreach_live_size_bounds.rs"]
 mod foreach_live_size_bounds;
 #[path = "collections/foreach_packed_multidim.rs"]
