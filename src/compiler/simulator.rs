@@ -3418,8 +3418,12 @@ struct ProcFsm {
     /// snapshot of comb outputs this process can never clobber.
     writes: Option<Arc<[u32]>>,
     /// Event-control specs for WaitEdge insns, with the lazily resolved
-    /// sensitivity cached after the first suspension.
-    waits: Vec<(crate::ast::stmt::EventControl, Option<Vec<Sensitivity>>)>,
+    /// sensitivity and its signal-id terms cached after the first suspension.
+    waits: Vec<(
+        crate::ast::stmt::EventControl,
+        Option<Vec<Sensitivity>>,
+        Option<Vec<SensitivityId>>,
+    )>,
     pc: u32,
     regs: Vec<Value>,
     scope: String,
@@ -20330,11 +20334,14 @@ impl Simulator {
             }
             return false;
         }
-        let waits: Vec<(crate::ast::stmt::EventControl, Option<Vec<Sensitivity>>)> =
-            std::mem::take(&mut compiler.wait_specs)
-                .into_iter()
-                .map(|ev| (ev, None))
-                .collect();
+        let waits: Vec<(
+            crate::ast::stmt::EventControl,
+            Option<Vec<Sensitivity>>,
+            Option<Vec<SensitivityId>>,
+        )> = std::mem::take(&mut compiler.wait_specs)
+            .into_iter()
+            .map(|ev| (ev, None, None))
+            .collect();
         let mut cb = compiler.finish();
         // Constant-delay fold: an integer bare delay elaborates to
         // `LoadConst(int) ; LoadConst(real scale) ; Mul ; WaitDelayReg`.
@@ -45825,6 +45832,27 @@ impl Simulator {
         self.prof_fallback_insns = fallbacks_before;
     }
 
+    /// Signal-id terms of FSM wait `ix`, resolved on its first suspension and
+    /// reused after: re-resolving hashed every term's name again each time
+    /// the process parked on its clock. Left uncached while a term names no
+    /// signal yet or the wake ranks are not built, so a later suspension
+    /// resolves afresh exactly as before.
+    fn fsm_wait_terms(&mut self, f: &mut ProcFsm, ix: usize) -> Vec<SensitivityId> {
+        if let Some(terms) = &f.waits[ix].2 {
+            return terms.clone();
+        }
+        let slot = &mut f.waits[ix];
+        if slot.1.is_none() {
+            slot.1 = Some(self.event_to_sens(&slot.0));
+        }
+        let sens = slot.1.as_deref().unwrap_or_default();
+        let terms = self.resolve_sens_ids(sens);
+        if terms.len() == sens.len() && self.wake_rank_built {
+            slot.2 = Some(terms.clone());
+        }
+        terms
+    }
+
     fn run_proc_fsm_inner(&mut self, pid: usize) {
         self.current_pid = pid;
         self.flush_deferred_asserts(pid);
@@ -45896,14 +45924,9 @@ impl Simulator {
                     }
                     2 => {
                         let ix = out[1] as usize;
-                        let sens = {
-                            let slot = &mut f.waits[ix];
-                            if slot.1.is_none() {
-                                slot.1 = Some(self.event_to_sens(&slot.0));
-                            }
-                            slot.1.clone().unwrap_or_default()
-                        };
-                        let w = self.make_event_waiter_kind(pid, sens, ProcCont::empty(), false);
+                        let terms = self.fsm_wait_terms(&mut f, ix);
+                        let w =
+                            self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), false);
                         self.event_waiters.push(w);
                         f.pc = npc;
                         break;
@@ -45981,14 +46004,9 @@ impl Simulator {
                         }
                     }
                     FsmWait::Edge(ix) => {
-                        let sens = {
-                            let slot = &mut f.waits[ix as usize];
-                            if slot.1.is_none() {
-                                slot.1 = Some(self.event_to_sens(&slot.0));
-                            }
-                            slot.1.clone().unwrap_or_default()
-                        };
-                        let w = self.make_event_waiter_kind(pid, sens, ProcCont::empty(), false);
+                        let terms = self.fsm_wait_terms(&mut f, ix as usize);
+                        let w =
+                            self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), false);
                         self.event_waiters.push(w);
                     }
                 }
