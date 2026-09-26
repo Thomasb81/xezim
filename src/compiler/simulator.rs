@@ -2691,6 +2691,10 @@ impl<'a> IntoIterator for &'a PropMap {
     }
 }
 
+/// Property -> (class-table key, definition) of the first class on a class's
+/// `extends` chain that declares it (see `Simulator::prop_owners`).
+type PropOwners = HashMap<String, (String, Arc<super::elaborate::ElaboratedClass>)>;
+
 /// Property names some class declares with a given property kind; a name in
 /// none of them skips the per-class checks for that kind.
 struct ClassMemberNames {
@@ -2707,6 +2711,9 @@ struct ClassMemberNames {
     assoc_props: HashSet<String>,
     /// Every `string` property name.
     string_props: HashSet<String>,
+    /// Every static property and class `localparam` name: the only names
+    /// `static_prop_key` can resolve.
+    static_or_param: HashSet<String>,
     /// Names `plain_ident_read` leaves to the full path: static, vif and
     /// struct-capable properties, and the UVM activity constants.
     ident_slow: HashSet<String>,
@@ -5964,6 +5971,9 @@ pub struct Simulator {
     plain_class_types: std::cell::RefCell<Option<HashSet<String>>>,
     /// Reused `<name>.size` key buffer of the queue-frame save/restore.
     queue_key_scratch: String,
+    /// See `prop_owners`.
+    #[allow(clippy::type_complexity)]
+    prop_owner_index: std::cell::RefCell<HashMap<String, std::rc::Rc<PropOwners>>>,
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
@@ -9988,6 +9998,7 @@ impl Simulator {
             class_enclosing_cache: std::cell::RefCell::new(HashMap::default()),
             plain_class_types: std::cell::RefCell::new(None),
             queue_key_scratch: String::new(),
+            prop_owner_index: std::cell::RefCell::new(HashMap::default()),
             formal_parts_pool: Vec::new(),
             method_receiver_hint_ids: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
@@ -79811,20 +79822,11 @@ impl Simulator {
             Some(i) => i,
             None => return false,
         };
-        // Walk the inheritance chain looking for a class that declares
-        // `prop` as a string property.
-        let mut cur = Some(inst.class_name.clone());
-        while let Some(cn) = cur {
-            if let Some(cd) = self.module.classes.get(&cn) {
-                if cd.string_properties.contains(&prop) {
-                    return true;
-                }
-                cur = cd.extends.clone();
-            } else {
-                break;
-            }
-        }
-        false
+        // Does a class on the inheritance chain declare `prop` as a string
+        // property?
+        self.class_string_props_of(&inst.class_name)
+            .iter()
+            .any(|p| *p == prop)
     }
 
     /// Peek a class-typed procedural local's heap handle WITHOUT mutating
@@ -97494,9 +97496,10 @@ impl Simulator {
         handle: Option<usize>,
         prop: &str,
     ) -> Option<u32> {
-        let mut cur: Option<&str> = Some(class_name);
-        while let Some(cn) = cur {
-            let cd = self.module.classes.get(cn)?;
+        let owners = self.prop_owners(class_name);
+        {
+            let (cn, cd) = owners.get(prop)?;
+            let cn = cn.as_str();
             if let Some(sig) = cd.properties.get(prop) {
                 if sig.is_real
                     || sig
@@ -97536,9 +97539,36 @@ impl Simulator {
                 }
                 return Some(sig.width).filter(|w| *w > 0);
             }
-            cur = cd.extends.as_deref();
         }
         None
+    }
+
+    /// Where each property of `class_name`'s `extends` chain is declared:
+    /// the first class that declares it, as a chain walk finds it (the walk
+    /// stops at a class missing from the table). Built once per class; the
+    /// class tables are fixed at run time.
+    fn prop_owners(&self, class_name: &str) -> std::rc::Rc<PropOwners> {
+        if let Some(hit) = self.prop_owner_index.borrow().get(class_name) {
+            return hit.clone();
+        }
+        let mut owners: PropOwners = HashMap::default();
+        let mut cur: Option<&str> = Some(class_name);
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            for p in cd.properties.keys() {
+                owners
+                    .entry(p.clone())
+                    .or_insert_with(|| (cn.to_string(), cd.clone()));
+            }
+            cur = cd.extends.as_deref();
+        }
+        let owners = std::rc::Rc::new(owners);
+        self.prop_owner_index
+            .borrow_mut()
+            .insert(class_name.to_string(), owners.clone());
+        owners
     }
 
     /// Declared width of `prop` on the object `handle` points at, resolved
@@ -105345,6 +105375,11 @@ impl Simulator {
         prop: &str,
         spec_override: Option<&(String, String)>,
     ) -> Option<String> {
+        // Only a name some class declares static (or as a localparam) can
+        // match below.
+        if !self.class_member_names().static_or_param.contains(prop) {
+            return None;
+        }
         let mut cur = Some(start_class.to_string());
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(&cname) {
@@ -125692,8 +125727,8 @@ impl Simulator {
 
     /// Declared width of `prop` on the object `handle` points at (class chain).
     fn class_prop_width_of(&self, handle: usize, prop: &str) -> Option<u32> {
-        let cn = self.heap.get(handle)?.as_ref()?.class_name.clone();
-        self.class_prop_width(&cn, prop)
+        let cn = &self.heap.get(handle)?.as_ref()?.class_name;
+        self.class_prop_width(cn, prop)
     }
 
     /// §18.4: re-validate the constraints declared inside every `rand` object
@@ -128863,6 +128898,7 @@ impl Simulator {
             let mut params: HashSet<String> = HashSet::default();
             let mut assoc_props: HashSet<String> = HashSet::default();
             let mut string_props: HashSet<String> = HashSet::default();
+            let mut static_or_param: HashSet<String> = HashSet::default();
             for cd in self.module.classes.values() {
                 string_props.extend(cd.string_properties.iter().cloned());
                 statics.extend(cd.static_properties.iter().cloned());
@@ -128872,6 +128908,8 @@ impl Simulator {
                 params.extend(cd.type_param_names.iter().cloned());
                 params.extend(cd.param_order.iter().cloned());
                 assoc_props.extend(cd.assoc_properties.keys().cloned());
+                static_or_param.extend(cd.static_properties.iter().cloned());
+                static_or_param.extend(cd.param_defaults.iter().map(|(n, _)| n.clone()));
             }
             let mut subroutine_suffixes: HashSet<String> = HashSet::default();
             for k in self.module.functions.keys().chain(self.module.tasks.keys()) {
@@ -128898,6 +128936,7 @@ impl Simulator {
                 params,
                 assoc_props,
                 string_props,
+                static_or_param,
             }
         })
     }
@@ -130273,9 +130312,9 @@ impl Simulator {
     }
 
     fn class_prop_type_named(&self, class_name: &str, prop: &str) -> Option<String> {
-        let mut cur: Option<&str> = Some(class_name);
-        while let Some(cname) = cur {
-            if let Some(cd) = self.module.classes.get(cname) {
+        let owners = self.prop_owners(class_name);
+        {
+            if let Some((_, cd)) = owners.get(prop) {
                 if let Some(sig) = cd.properties.get(prop) {
                     if let Some(t) = &sig.type_name {
                         if self.module.classes.contains_key(t)
@@ -130312,9 +130351,6 @@ impl Simulator {
                     }
                     return None;
                 }
-                cur = cd.extends.as_deref();
-            } else {
-                break;
             }
         }
         None
