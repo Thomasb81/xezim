@@ -118879,7 +118879,7 @@ impl Simulator {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
-            let mut deferred_call_inits: Vec<(String, Expression)> = Vec::new();
+            let mut deferred_call_inits: Vec<(String, Expression, String)> = Vec::new();
             for (pname, init) in inits {
                 // A STATIC member is shared across all instances (it lives in
                 // `class_statics`, not per-instance), so it must NOT be
@@ -118893,6 +118893,18 @@ impl Simulator {
                 if cdef.static_properties.contains(&pname) {
                     continue;
                 }
+                // §8.10: a property this class declares but a derived class
+                // redeclares lives under `<Class>::<name>` (seeded above);
+                // its initializer must land there, not in the derived copy.
+                let slot = {
+                    let q = format!("{}::{}", cdef.name, pname);
+                    let shadowed = self
+                        .heap
+                        .get(handle)
+                        .and_then(|o| o.as_ref())
+                        .is_some_and(|i| i.properties.contains_key(&q));
+                    if shadowed { q } else { pname.clone() }
+                };
                 // A mailbox/semaphore member with an inline `= new()` must be
                 // ALLOCATED here. The `expr_contains_call` skip below leaves it
                 // null otherwise (the constructor has no explicit `mb = new()`),
@@ -118916,8 +118928,7 @@ impl Simulator {
                     // key count (§15.3.1) or the mailbox bound (§15.4.1).
                     let ch = self.alloc_builtin_container(kind, ctor_args);
                     if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                        inst.properties
-                            .insert(pname, Value::from_u64(ch as u64, 32));
+                        inst.properties.insert(slot, Value::from_u64(ch as u64, 32));
                     }
                     continue;
                 }
@@ -118950,7 +118961,7 @@ impl Simulator {
                                 let v = self.instantiate_class(&cd2, ctor_args);
                                 self.current_spec = saved_spec;
                                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                    inst.properties.insert(pname, v);
+                                    inst.properties.insert(slot, v);
                                 }
                                 continue;
                             }
@@ -118975,7 +118986,7 @@ impl Simulator {
                                     ta.as_deref(),
                                 );
                                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                                    inst.properties.insert(pname, v);
+                                    inst.properties.insert(slot, v);
                                 }
                                 continue;
                             }
@@ -118992,7 +119003,7 @@ impl Simulator {
                     // field-order dependencies resolve (a later-declared field
                     // can read an earlier one). Collected here and run after
                     // the non-call initializers so singletons are up.
-                    deferred_call_inits.push((pname.clone(), init.clone()));
+                    deferred_call_inits.push((pname.clone(), init.clone(), slot));
                     continue;
                 }
                 // Queue / dynamic-array member initializer (`int q[$] =
@@ -119089,7 +119100,7 @@ impl Simulator {
                     }
                 }
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
-                    inst.properties.insert(pname, val);
+                    inst.properties.insert(slot, val);
                 }
             }
             // Fixed point over the deferred call-bearing instance property
@@ -119107,11 +119118,11 @@ impl Simulator {
             // times (reference: ids 1/2 3/4 5/6; the loop gave 5/6 11/12 17/18).
             if !deferred_call_inits.is_empty() {
                 let order = &cdef.property_order;
-                deferred_call_inits.sort_by_key(|(pname, _)| {
+                deferred_call_inits.sort_by_key(|(pname, _, _)| {
                     order.iter().position(|p| p == pname).unwrap_or(usize::MAX)
                 });
-                for (pname, init) in &deferred_call_inits {
-                    self.evaluate_call_init_at_construct(handle, pname, init);
+                for (_, init, slot) in &deferred_call_inits {
+                    self.evaluate_call_init_at_construct(handle, slot, init);
                 }
             }
             self.class_context_stack.pop();
