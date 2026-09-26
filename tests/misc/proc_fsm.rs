@@ -226,3 +226,58 @@ endmodule
         text
     );
 }
+
+/// A delay-bearing monitor that reads `<top>.<path>` (a testbench macro such
+/// as `tb.dut.core.retire`) compiles into a process FSM by default, as one
+/// reading the unprefixed path does. The prefixed read used to fall back,
+/// which kept the whole body on the AST process path for every clock.
+#[test]
+fn fsm_monitor_reads_top_prefixed_path() {
+    let src = r#"
+module leaf(input clk, output o);
+  reg r = 0;
+  always @(posedge clk) r <= ~r;
+  assign o = r;
+endmodule
+module mid(input clk);
+  wire w;
+  leaf u2(.clk(clk), .o(w));
+endmodule
+module tb;
+  reg clk = 0;
+  always #5 clk = ~clk;
+  mid u1(.clk(clk));
+  integer n = 0;
+  always @(posedge clk) begin
+    if (tb.u1.u2.o) n <= n + 1;
+    if (n == 3) begin
+      #1;
+      $display("n=%0d t=%0t", n, $time);
+      $finish;
+    end
+  end
+endmodule
+"#;
+    let dir = std::env::temp_dir().join(format!("xezim_proc_fsm_top_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let f = dir.join("t.sv");
+    std::fs::write(&f, src).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(["--no-cache", "-s", "tb", "--max-time", "1000"])
+        .arg(&f)
+        .env("XEZIM_PROC_LOOP_STATS", "1")
+        .output()
+        .expect("run xezim");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("[PROC-FSM] registered"),
+        "monitor not compiled:\n{}",
+        text
+    );
+    assert!(!text.contains("gated out"), "monitor gated out:\n{}", text);
+    assert!(text.contains("n=3 t=66"), "monitor result:\n{}", text);
+}

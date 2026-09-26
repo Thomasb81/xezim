@@ -20313,6 +20313,10 @@ impl Simulator {
         compiler.set_array_first_id(&self.array_first_id);
         compiler.set_string_signals(&self.module.string_signals);
         compiler.set_signal_real(&self.signal_real);
+        // `<top>.<path>` reads (a testbench's `tb.dut.x` macros) resolve as
+        // in every other compiled block; without it each one fell back and
+        // the whole body stayed on the AST process path.
+        compiler.top_module_name = Some(self.module.name.clone());
         let dbg = std::env::var_os("XEZIM_PROC_LOOP_STATS").is_some();
         if !compiler.compile_stmt(stmt) {
             if dbg {
