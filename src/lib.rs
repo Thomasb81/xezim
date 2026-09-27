@@ -52,6 +52,31 @@ pub use xezim_core::{
     tokenize_file, write_compiled,
 };
 
+static PREPROCESSED_STASH: std::sync::Mutex<Option<xezim_core::PreprocessedSources>> =
+    std::sync::Mutex::new(None);
+
+/// Hand a finished preprocessing pass over the design to the next
+/// `simulate_multi` call, which reuses it when its inputs match exactly
+/// (otherwise it preprocesses afresh).
+pub fn stash_preprocessed(pre: xezim_core::PreprocessedSources) {
+    if let Ok(mut slot) = PREPROCESSED_STASH.lock() {
+        *slot = Some(pre);
+    }
+}
+
+fn take_preprocessed(
+    sources: &[String],
+    source_paths: &[String],
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+) -> Option<xezim_core::PreprocessedSources> {
+    PREPROCESSED_STASH
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .filter(|p| p.matches(sources, source_paths, include_dirs, defines))
+}
+
 /// Content-addressed cache for elaborated designs. The payload uses the
 /// versioned `.xezbc` format, so cache hits skip parsing and elaboration while
 /// runtime state is still rebuilt for each simulation.
@@ -126,6 +151,7 @@ fn design_cache_key(
     top_module_name: Option<&str>,
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
+    pre: Option<&xezim_core::PreprocessedSources>,
 ) -> (
     String,
     Vec<String>,
@@ -177,14 +203,23 @@ fn design_cache_key(
     // `begin_top_level_file` matches the parse-time preprocessor state.
     let mut preprocessed_texts: Vec<String> = Vec::with_capacity(sources.len());
     let mut line_maps = Vec::with_capacity(sources.len());
-    for (idx, source) in sources.iter().enumerate() {
-        let source_path = source_paths.get(idx).map(std::path::PathBuf::from);
-        hash.text(source_paths.get(idx).map_or("", String::as_str));
-        pp.begin_top_level_file();
-        let text = pp.preprocess_file(source, source_path.as_deref());
-        hash.text(&text);
-        preprocessed_texts.push(text);
-        line_maps.push(pp.take_line_map());
+    if let Some(pre) = pre {
+        // Same text a fresh pass would produce (`matches` checked the
+        // inputs); the caller keeps ownership for elaboration.
+        for (idx, text) in pre.texts.iter().enumerate() {
+            hash.text(source_paths.get(idx).map_or("", String::as_str));
+            hash.text(text);
+        }
+    } else {
+        for (idx, source) in sources.iter().enumerate() {
+            let source_path = source_paths.get(idx).map(std::path::PathBuf::from);
+            hash.text(source_paths.get(idx).map_or("", String::as_str));
+            pp.begin_top_level_file();
+            let text = pp.preprocess_file(source, source_path.as_deref());
+            hash.text(&text);
+            preprocessed_texts.push(text);
+            line_maps.push(pp.take_line_map());
+        }
     }
 
     let mut dependencies = config.dependency_files.clone();
@@ -951,11 +986,25 @@ fn simulate_multi_inner(
     // IEEE 1800-2017 §9.4.5: the parser discards intra-assignment delays
     // (`lhs = #d rhs`); canonicalize them into a marker call the simulator
     // implements (see `intra_delay`) before parsing.
+    let raw_sources = sources;
     let sources: Vec<String> = sources
         .iter()
         .map(|s| intra_delay::rewrite_intra_assignment_delays(s))
         .collect();
+    // The driver's own preprocessing pass (main.rs), reusable when the
+    // rewrite above left every source untouched.
+    let mut pre = take_preprocessed(raw_sources, source_paths, include_dirs, defines)
+        .filter(|_| sources.as_slice() == raw_sources);
     let cache = design_cache_config();
+    if cache.is_some() && pre.is_none() {
+        // One pass serves both the cache key and (on a miss) elaboration.
+        pre = Some(xezim_core::preprocess_design(
+            &sources,
+            source_paths,
+            include_dirs,
+            defines,
+        ));
+    }
     let mut cache_pp_texts: Vec<String> = Vec::new();
     let mut cache_line_maps = Vec::new();
     let cache_key = cache.as_ref().map(|config| {
@@ -966,6 +1015,7 @@ fn simulate_multi_inner(
             top_module_name,
             include_dirs,
             defines,
+            pre.as_ref(),
         );
         cache_pp_texts = texts;
         cache_line_maps = maps;
@@ -981,8 +1031,16 @@ fn simulate_multi_inner(
         // the cache-key pass so runtime diagnostics keep `file:line`
         // resolution on cache hits. `source_files` / `src_file_of_module`
         // travel inside the artifact.
-        elab.source_texts = std::mem::take(&mut cache_pp_texts);
-        elab.source_line_maps = std::mem::take(&mut cache_line_maps);
+        match pre.take() {
+            Some(p) => {
+                elab.source_texts = p.texts;
+                elab.source_line_maps = p.line_maps;
+            }
+            None => {
+                elab.source_texts = std::mem::take(&mut cache_pp_texts);
+                elab.source_line_maps = std::mem::take(&mut cache_line_maps);
+            }
+        }
         if elab.source_files.is_empty() {
             elab.source_files = source_paths.to_vec();
         }
@@ -1001,12 +1059,13 @@ fn simulate_multi_inner(
         // Fresh per-kind duplicate counters for this elaboration, so a second
         // run in the same process/thread reports its own first five.
         xezim_core::elab_diag_reset_counts();
-        let (definitions, mut elab) = parse_and_elaborate_multi(
+        let (definitions, mut elab) = xezim_core::parse_and_elaborate_multi_preprocessed(
             &sources,
             top_module_name,
             include_dirs,
             source_paths,
             defines,
+            pre.take(),
         )?;
 
         // §18.5.1: recover any out-of-class constraint body that the class-table

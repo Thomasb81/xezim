@@ -219,3 +219,61 @@ endmodule
         l
     );
 }
+
+/// The CLI preprocesses the design once, on its own thread, and hands the
+/// result to elaboration on the simulation thread. Directive state that pass
+/// records outside the text (`unconnected_drive` regions, `default_nettype
+/// none`) has to reach elaboration too.
+fn run_cli(tag: &str, src: &str) -> (String, bool) {
+    let path = std::env::temp_dir().join(format!(
+        "pp_reuse_{}_{}_{}.sv",
+        tag,
+        std::process::id(),
+        line!()
+    ));
+    std::fs::write(&path, src).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .arg("--max-time")
+        .arg("10")
+        .arg(&path)
+        .output()
+        .expect("run xezim");
+    let _ = std::fs::remove_file(&path);
+    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    (text, out.status.success())
+}
+
+#[test]
+fn cli_preprocess_reuse_keeps_directive_state() {
+    let (o, ok) = run_cli(
+        "ud",
+        r#"
+`unconnected_drive pull1
+module pass_thru(input wire i, output wire o); assign o = i; endmodule
+`nounconnected_drive
+module pass_thru0(input wire i, output wire o); assign o = i; endmodule
+module tb;
+  wire o1, o0;
+  pass_thru  u1(.i(), .o(o1));
+  pass_thru0 u0(.i(), .o(o0));
+  initial #1 $display("R|%b %b", o1, o0);
+endmodule
+"#,
+    );
+    assert!(ok && o.contains("R|1 z"), "{o}");
+    let (o, ok) = run_cli(
+        "nn",
+        r#"
+`default_nettype none
+module tb;
+  assign w = 1'b1;
+  initial #1 $display("W|%b", w);
+endmodule
+"#,
+    );
+    assert!(
+        !ok && o.contains("Implicit net 'w' under `default_nettype none"),
+        "{o}"
+    );
+}

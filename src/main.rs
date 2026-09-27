@@ -636,35 +636,19 @@ fn preprocess_sources(
     source_files: &[String],
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
-) -> Result<(Vec<String>, LineMaps), Vec<String>> {
-    let mut pp = xezim::preprocessor::Preprocessor::new();
-    for dir in include_dirs {
-        pp.add_include_dir(std::path::PathBuf::from(dir));
-    }
-    for (name, val) in defines {
-        pp.define(
-            name.clone(),
-            xezim::preprocessor::MacroDef {
-                name: name.clone(),
-                params: None,
-                body: val.clone().unwrap_or_default(),
-            },
-        );
-    }
-
-    let mut preprocessed = Vec::with_capacity(sources.len());
-    let mut maps = Vec::with_capacity(sources.len());
-    for (i, source) in sources.iter().enumerate() {
-        let source_path = source_files.get(i).map(|p| std::path::PathBuf::from(p));
-        preprocessed.push(pp.preprocess_file(source, source_path.as_deref()));
-        maps.push(pp.take_line_map());
-    }
+) -> Result<(Vec<String>, LineMaps, xezim_core::PreprocessedSources), Vec<String>> {
+    // The same pass elaboration runs; its result is handed to the simulate
+    // path (see `xezim::stash_preprocessed`) so the design is not
+    // preprocessed a second time.
+    let mut pre = xezim_core::preprocess_design(sources, source_files, include_dirs, defines);
     // §22 strict-mode directive errors (`\`line`/`\`pragma`/`\`resetall`/…)
     // and failed `include`s; a non-empty list fails the run.
-    if !pp.errors().is_empty() {
-        return Err(pp.errors().to_vec());
+    if !pre.errors.is_empty() {
+        return Err(std::mem::take(&mut pre.errors));
     }
-    Ok((preprocessed, maps))
+    let texts = std::mem::take(&mut pre.texts);
+    let maps = std::mem::take(&mut pre.line_maps);
+    Ok((texts, maps, pre))
 }
 
 /// Expand `$VAR` and `${VAR}` style references against the process
@@ -3023,7 +3007,7 @@ suppressed but the explicit SDF annotation still applies."
         top_module = Some(wrap_name.to_string());
     }
 
-    let (preprocessed_sources, line_maps) =
+    let (mut preprocessed_sources, mut line_maps, mut pp_state) =
         match preprocess_sources(&sources, &source_files, &include_dirs, &defines) {
             Ok(v) => v,
             Err(errors) => {
@@ -3338,6 +3322,13 @@ suppressed but the explicit SDF annotation still applies."
 
     chatter_out!("Max time: {} ns", max_time);
     chatter_out!("------------------------------");
+    // Hand the preprocessing above to elaboration instead of redoing it. Kept
+    // local when --dump-merged-sv still needs the texts after the run.
+    if dump_merged_sv.is_none() {
+        pp_state.texts = std::mem::take(&mut preprocessed_sources);
+        pp_state.line_maps = std::mem::take(&mut line_maps);
+        xezim::stash_preprocessed(pp_state);
+    }
     xezim::compiler::simulator::set_sim_debug(sim_debug);
     xezim::compiler::simulator::set_dump_timescales(dump_timescales);
     xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
