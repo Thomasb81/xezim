@@ -115002,10 +115002,27 @@ impl Simulator {
             }
 
             // Built-in method on a class associative-array member —
-            // `m.exists/num/delete/...` or `obj.m.exists(...)`.
-            if let Some(an) = self.expr_assoc_name(expr) {
-                if let Some(res) = self.eval_builtin_method(&an, mname, args) {
-                    return res;
+            // `m.exists/num/delete/...` or `obj.m.exists(...)`. A method name
+            // `eval_builtin_method` does not implement answers `None` there
+            // whatever the store, and for a receiver `expr_assoc_name` only
+            // looks up (no evaluation) the probe itself has no effect.
+            let assoc_probe_idle = BuiltinM::classify(mname) == BuiltinM::Other
+                && match &expr.kind {
+                    ExprKind::Ident(h) => {
+                        h.path.len() <= 2 && h.path.first().is_some_and(|s| s.selects.is_empty())
+                    }
+                    ExprKind::MemberAccess { expr: b, .. } => match &b.kind {
+                        ExprKind::This => true,
+                        ExprKind::Ident(bh) => bh.path.len() == 1,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+            if !assoc_probe_idle {
+                if let Some(an) = self.expr_assoc_name(expr) {
+                    if let Some(res) = self.eval_builtin_method(&an, mname, args) {
+                        return res;
+                    }
                 }
             }
 
