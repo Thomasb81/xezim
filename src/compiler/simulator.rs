@@ -102884,6 +102884,28 @@ impl Simulator {
         out
     }
 
+    /// The base of a flat path `base[..][..]` that `split_flat_path` reads as
+    /// ONE segment named by the text before the first `[`; None for any
+    /// other shape (a `.` or other text outside the brackets).
+    fn flat_single_base(flat: &str) -> Option<&str> {
+        let mut depth = 0usize;
+        let mut first_open: Option<usize> = None;
+        for (i, ch) in flat.char_indices() {
+            match ch {
+                '[' => {
+                    depth += 1;
+                    first_open.get_or_insert(i);
+                }
+                ']' if depth > 0 => depth -= 1,
+                _ if depth > 0 => {}
+                '.' | ']' => return None,
+                _ if first_open.is_some() => return None,
+                _ => {}
+            }
+        }
+        Some(&flat[..first_open.unwrap_or(flat.len())])
+    }
+
     /// Declared type of a flattened SUB-PATH (`c.nodes[0].str`, `cmb[20]`),
     /// which has no declaration of its own — walk the base variable's declared
     /// type. The second element holds the element indices when the path still
@@ -102969,7 +102991,12 @@ impl Simulator {
             .var_decl_types
             .get(name)
             .map(Cow::Borrowed)
-            .or_else(|| self.flat_path_type(name).map(|(d, _)| Cow::Owned(d)))
+            .or_else(|| match Self::flat_single_base(name) {
+                // `flat_path_type` of a one-segment path is its base's
+                // declared type: borrow it.
+                Some(base) => self.module.var_decl_types.get(base).map(Cow::Borrowed),
+                None => self.flat_path_type(name).map(|(d, _)| Cow::Owned(d)),
+            })
             .or_else(|| {
                 // An ELEMENT (`arr[2]`) carries no type of its own, but
                 // `var_decl_types` holds the container's ELEMENT type — so the
