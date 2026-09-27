@@ -27296,37 +27296,47 @@ impl Simulator {
             };
             *ca_driver_counts.entry(name).or_insert(0) += 1;
         }
+        // INPUT identity connects only (`u1.din = src`, rhs in parent
+        // scope): the child name re-points at the parent's id. Output
+        // connects (`snk = u1.dout`) must KEEP their propagation step:
+        // a waiter parked on the same edge reads the parent net before
+        // a blocking write in the child reaches it (reference-verified
+        // in scheduling::waiter_edge_ordering), so collapsing them is
+        // observably wrong, not just unprofitable. These shape tests and the
+        // resolved rhs name do not change between passes, so they are taken
+        // once, in assign order.
+        let port_candidates: Vec<(&str, String)> = self
+            .module
+            .continuous_assigns
+            .iter()
+            .filter_map(|ca| {
+                if ca.delay != 0 {
+                    return None;
+                }
+                let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&ca.lhs.kind, &ca.rhs.kind)
+                else {
+                    return None;
+                };
+                if lh.path.len() != 1
+                    || !lh.path[0].selects.is_empty()
+                    || !rh.path.iter().all(|s| s.selects.is_empty())
+                    || !ca.rhs_parent_scoped
+                {
+                    return None;
+                }
+                Some((
+                    lh.path[0].name.name.as_str(),
+                    Self::resolve_hier_name_static(rh, &self.module),
+                ))
+            })
+            .collect();
         // Chains (leaf -> mid -> top) resolve over multiple passes; they are
         // short, and each pass only ever re-points names, so a small bound
         // is plenty.
         for _ in 0..8 {
             let mut changed = false;
-            for ca in &self.module.continuous_assigns {
-                if ca.delay != 0 {
-                    continue;
-                }
-                let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&ca.lhs.kind, &ca.rhs.kind)
-                else {
-                    continue;
-                };
-                if lh.path.len() != 1
-                    || !lh.path[0].selects.is_empty()
-                    || !rh.path.iter().all(|s| s.selects.is_empty())
-                {
-                    continue;
-                }
-                // INPUT identity connects only (`u1.din = src`, rhs in parent
-                // scope): the child name re-points at the parent's id. Output
-                // connects (`snk = u1.dout`) must KEEP their propagation step:
-                // a waiter parked on the same edge reads the parent net before
-                // a blocking write in the child reaches it (reference-verified
-                // in scheduling::waiter_edge_ordering), so collapsing them is
-                // observably wrong, not just unprofitable.
-                if !ca.rhs_parent_scoped {
-                    continue;
-                }
-                let lhs_name = lh.path[0].name.name.as_str();
-                let rhs_name = Self::resolve_hier_name_static(rh, &self.module);
+            for (lhs_name, rhs_name) in &port_candidates {
+                let lhs_name: &str = lhs_name;
                 // Only connections the elaborator recorded as WHOLE-NET
                 // identity (the same predicate the dump-side fold trusts).
                 if self.module.port_aliases.get(lhs_name).map(String::as_str)
@@ -27413,23 +27423,34 @@ impl Simulator {
                 self.buf_collapse_write_sets.clone().unwrap_or_default();
             let leaf_of = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
             let mut buf_collapsed = 0usize;
-            for _ in 0..8 {
-                let mut changed = false;
-                for ca in &self.module.continuous_assigns {
+            // Whole-net identity assigns and their resolved names: fixed
+            // across passes, taken once in assign order.
+            let buf_candidates: Vec<(String, String)> = self
+                .module
+                .continuous_assigns
+                .iter()
+                .filter_map(|ca| {
                     if ca.delay != 0 {
-                        continue;
+                        return None;
                     }
                     let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&ca.lhs.kind, &ca.rhs.kind)
                     else {
-                        continue;
+                        return None;
                     };
                     if !lh.path.iter().all(|s| s.selects.is_empty())
                         || !rh.path.iter().all(|s| s.selects.is_empty())
                     {
-                        continue;
+                        return None;
                     }
-                    let ln = Self::resolve_hier_name_static(lh, &self.module);
-                    let rn = Self::resolve_hier_name_static(rh, &self.module);
+                    Some((
+                        Self::resolve_hier_name_static(lh, &self.module),
+                        Self::resolve_hier_name_static(rh, &self.module),
+                    ))
+                })
+                .collect();
+            for _ in 0..8 {
+                let mut changed = false;
+                for (ln, rn) in &buf_candidates {
                     let (Some(&lid), Some(&rid)) = (
                         self.signal_name_to_id.get(ln.as_str()),
                         self.signal_name_to_id.get(rn.as_str()),
@@ -27451,7 +27472,7 @@ impl Simulator {
                         continue;
                     }
                     self.signal_name_to_id.insert(ln.as_str().into(), rid);
-                    self.collapsed_port_children.insert(ln);
+                    self.collapsed_port_children.insert(ln.clone());
                     buf_collapsed += 1;
                     changed = true;
                 }
