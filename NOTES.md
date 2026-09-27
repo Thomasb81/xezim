@@ -3,9 +3,9 @@
 Release notes, verified workloads and compliance results. The user guide
 and the development workflow are in [README.md](README.md).
 
-# What's new in 0.10
+# What's new in 0.11
 
-### Unreleased
+### 0.11.0 — code coverage, reference-parity fixes, faster UVM (September 2026)
 
 **Correctness**
 
@@ -275,6 +275,195 @@ and the development workflow are in [README.md](README.md).
   array and does not reduce to one number, and then selected from that
   number; an accumulator fed by `bk.arr[i]` stayed at 0 while `$display` of
   the same expression printed the right element.
+
+**Usability**
+
+* Code coverage: `--code-coverage[=stmt,branch,toggle]` (all three by
+  default), `--code-coverage-scope=<path>[,...]` and `XEZIM_CODE_COVERAGE`
+  turn on statement, branch (if/else and case arms including the implicit
+  ones, `?:`) and toggle (per-bit rise/fall) coverage; `+cover[=sbt]` and
+  `-coverage` now enable it too. Results go in `xezim_cov.json` under
+  `code_coverage`, per instance and per design unit, with a per-scope
+  summary under `--verbose`. It is off by default and costs nothing when
+  off. See docs/coverage-guide.md.
+* `$fwrite`/`$fdisplay` to regular files are buffered (64 KB per handle)
+  and flushed on `$fflush`, `$fclose`, `$finish`, `$system`, `$fopen`,
+  `$readmem*`/`$writemem*`, DPI/VPI calls and before any read of the same
+  file; a 400k-line trace testbench went from 1.78 s to 1.15 s. A
+  `tail -f` on a trace file now lags until the next flush.
+* The default simulation time limit is 100 ms instead of 100 µs, so UVM
+  tests that run for milliseconds (for example 2–25 ms of simulated time)
+  finish instead of stopping early. A design that never calls `$finish`
+  still stops at the limit; `--max-time` sets a different one, and
+  `-do "run -all"` runs until `$finish`.
+* Command lines written for other simulators run as-is: bare or `work.`
+  top names, `-F`, `-g`/`-G` parameter overrides, `-sv_seed`,
+  `-sv_lib`/`-sv_root`, `-svNNcompat`, and a `-do` subset (`run -all`,
+  `run <time>`, `quit`, `exit`, `do <file>`; `log`, `add wave` and
+  `coverage save/report` are accepted with a warning; anything else is an
+  error). Library options (`-work`, `-L`, `-lib`) are ignored with one
+  warning; `-c` and `-l` keep their xezim meanings. `run -all` runs past
+  the default time cap, and after `run <time>` the closing line and
+  `final` blocks see the stop time.
+* Runs are quiet by default. The transcript holds the design's output,
+  warnings and errors, and one closing line, `Simulation finished at time N
+  ($finish called)`. The version banner, `[PHASE]` timings,
+  `[PROF]`/`[FUSE]`/`[EVENT-EDGE]`/`[COV]` counters, `[CACHE]` hits and
+  `--compile`'s design summary now need `--verbose` (or `XEZIM_VERBOSE=1`,
+  `--profile` or `--sim-debug`). The apb AVIP transcript went from 189 lines
+  to 150.
+* Parse, preprocessor and elaboration errors print `file:line:col` with the
+  source line and a caret. A line that came from an `include`d file names
+  that file, with an "In file included from" chain, and text produced by a
+  macro names the macro invocation. Runtime locations (hang reports,
+  port-width warnings) are no longer shifted by `include`s.
+* Preprocessor errors and warnings print once per run instead of once per
+  pass. Parser warnings, such as an unsupported UDP table, now carry their
+  location, and `` `__LINE__ `` after a multi-line `define` reports the right
+  line.
+
+**Performance** (instruction counts, output identical)
+
+* UVM class code, round three: member reads, calls, member-target
+  assignments and comparisons take direct paths, and flat names, handle
+  keys and element names are built without `format!` or clones. UVM stress
+  bench: 10.8 M -> 9.0 M host instructions per item (-17%); the six AVIPs
+  run 13-15% fewer instructions (axi4 46.6 G -> 39.8 G).
+* RTL: process FSMs resolve `<top>.path` reads (a testbench monitor ran on
+  the AST path with name lookups every clock), `check_edges` reuses its
+  fired-edge buffers, and FSM wait terms are cached: c906 CoreMark 471.5 G
+  -> 459.5 G (-2.5%), c906 memcpy -2.1%.
+* UVM class code, round two: formal snapshots by position, plain-type
+  fast paths for locals and formals, per-class property-owner indexes,
+  forward-declared classes (`typedef class X;`, 110 in UVM) on the plain
+  paths, and name-set gates in member and call lookup. UVM stress bench:
+  11.5 M -> 10.1 M host instructions per item (-12%); axi4 AVIP -6.2%.
+* c906 CoreMark -0.4% (elaboration -2.4 G): loop-feedback analysis only
+  walks reads when a write reaches a combinational block, waiter wake
+  ranks are tracked only once a nonzero rank fires, and the legality
+  checker hashes scopes faster and builds messages lazily.
+* UVM class code: name-kind checks answer from per-design name tables and
+  per-class memos, bare names read and write on direct paths, class task
+  bodies are shared instead of cloned per call, and `foreach` over
+  associative arrays uses the element index. UVM stress bench: 20.6 M ->
+  11.5 M host instructions per sequence item (-44%); the six AVIPs run
+  19-27% fewer instructions; c906 CoreMark unchanged.
+* A two-state block that reads an x or z bit no longer re-runs on the
+  four-state VM: the same lowered stream runs on an x-plane executor that
+  applies the VM's four-state rules (Kleene logic, `&&`/`||`/`!` through
+  definite-1/definite-0/unknown, ambiguous equality, all-x arithmetic,
+  plane shifts, an x selector merging its arms, `if (x)` taking the else
+  arm, an x index reading all-x and writing nothing). On the SoC
+  benchmarks three quarters of what the VM still executed were such
+  re-runs — tiny muxes whose unselected arm or an unwritten register file
+  holds x. `XEZIM_TS_X=0` restores the VM re-run; `x_plane_runs=` counts
+  them in the profile report.
+* Dynamically indexed reads of memory elements wider than 64 bits — a
+  vector register file, a cache-line array — now run on the two-state
+  executor, both as operands (`vrf[rs]` in wide logic) and as the fused
+  memory-read flop (`rdata <= line[raddr]`). They were the largest labelled
+  reason for a clocked or combinational block to stay on the four-state VM
+  on both SoC benchmarks (21% of a C910 SoC's interpreted combinational
+  evaluations, 31% of a C906's).
+* `scripts/build-pgo.sh` run without a training command builds a
+  profile-guided binary from a bundled trainer (the `tests/perf` shapes,
+  `scripts/pgo-train`, `xezim-bench`): about −0.5% host instructions on the
+  SoC benchmarks, −12% on a loop-heavy DRAM model, output identical. It is
+  the recommended release build; see README.
+* Loop-heavy clocked blocks with `int` counters — memory models that walk
+  lanes, byte-lane writes into a packed memory, per-lane write pointers —
+  now run on the two-state executor instead of the four-state VM. The
+  counter's signed tag, its increment, a slice read at a run-time offset and
+  range stores at a run-time offset (blocking and non-blocking, into
+  vectors wider than 64 bits) all lower now. A DRAM-model reproducer runs
+  in a third of the instructions.
+* Clocked blocks whose range-store bounds only become constants after
+  folding — a generate arm writing `v[g*8 +: 8]` or `mem[g][7:4]` — now
+  compile to constant range stores on the element, which the two-state
+  executor runs; the dynamic and array forms they used to take kept the
+  whole block on the four-state VM (16 such flops on a c906 SoC, 400 on a
+  C910 SoC).
+* A block that bails on an x read every time it runs (an unwritten memory
+  element it keeps reading) no longer pays the two-state entry and guard on
+  every evaluation before running interpreted: after eight bails in a row
+  it sleeps, doubling the sleep while the bails continue, and wakes for one
+  attempt so a value that clears after reset gets its fast path back. x-read
+  bails on a c906 SoC fall by 72%.
+* Combinational blocks with registers wider than 128 bits — up to 512 —
+  run on the two-state executor by default now (`XEZIM_TS_WIDE512=0`
+  restores the old behaviour). Three shapes that kept such blocks on the
+  four-state VM lower as well: a bus read and then rewritten in the same
+  block (`bus = {bus[..], ..}`), a mux between two wide values, and a
+  wide `'x` reset default (`{N{1'bx}}`). c906 memcpy runs 1.2% fewer
+  instructions from the wide class alone, a C910 SoC 2.5%.
+* `tests/perf/loop_block_counters.rs` guards this path with work-counter
+  ceilings (two-state admission, bytecode length, backoff engagement).
+* The bytecode such blocks compile to is leaner first: a loop variable's
+  reads are forwarded into their consumers instead of being copied into a
+  temporary each time, `& K`, `* K`, `- K` and `| K` fold their constant
+  operand like `+ K` already did, a constant that only becomes one after
+  folding is fused too, and `i = i + 1` is two instructions rather than
+  five. The same reproducer executes 34% fewer VM instructions before the
+  two-state gain above.
+* A clocked block whose inputs did not change may now skip an idle edge even
+  when another block writes a different part of the same register or a
+  different element of the same array. Generated logic that gives
+  `status[0]` its own `always` block beside one for `status[6:1]`, or
+  `mem[0]` beside `mem[1]`, used to keep every such block firing every
+  cycle; each owns its own bits, so all may rest. Blocks that write
+  overlapping bits, and any block beside a writer whose element index is
+  computed at run time, still fire on every edge. A C910 SoC runs 6.6% fewer
+  instructions, a c906 SoC 1.2%.
+* Writes that combine two dynamic steps into a packed vector now compile
+  instead of falling back to the interpreter: `q[i][j]`, `mem[a][(i*W) +: W]`,
+  `s.arr[i].field` and their blocking forms, with either index dynamic. A
+  fallback inside a loop over a register-held variable demotes the whole loop,
+  so these statements cost microseconds each; a memory model built from them
+  runs 41x faster here, and a c906 run is unchanged.
+* Selects whose declared dimension does not start at zero or runs ascending
+  compile instead of falling back: `v[hi:lo]`, `v[b +: w]`, `v[b -: w]` and
+  bit selects on such a vector, and on an element of a packed array. A lane
+  vector selected in a loop runs 11x faster here. An element of an UNPACKED
+  array keeps the interpreter path, where its label mapping already agrees
+  with the writes.
+* `XEZIM_FALLBACK_SITES=1` reports every construct handed to the interpreter
+  with its reason, source byte span and scope, so the statements worth
+  compiling on a slow design can be found without guessing. It now also
+  reports the expensive case, a statement that takes its whole loop to the
+  interpreter because a fallback cannot be emitted inside one.
+* Merging same-sensitivity clocked blocks no longer costs the idle-edge
+  skip. The blocks folded into a merged one keep their original statements,
+  and the skip census still counted those writes, so every merged output
+  looked like it had two drivers and the merged block was disqualified: on a
+  c906 SoC only 618 of 3605 blocks could skip, and 55 million flop fires that
+  used to be skipped ran. Merging is now worth 6.9% on that design instead of
+  costing 18%.
+* Reading an element of a packed memory no longer copies the whole memory.
+  `mem[addr]` on a `logic [N-1:0][W-1:0]` loaded every bit of `mem` into a
+  register and selected the word from that, so each read cost as much as the
+  memory is big: a 16x deeper memory cost 3x per read. The slice is taken
+  where it lies now, read cost is flat in the memory's size, and a
+  32-port read benchmark runs 42% faster.
+* Starting a design with large memories is faster again: deciding which
+  clocked blocks may skip idle edges asked a hash map, once per element of
+  every memory a block writes, whether anything else wrote it. A c906 SoC
+  spent 1.8 seconds and several hundred megabytes on 19 million of those
+  questions; one byte per signal answers them now, and whole arrays are
+  counted as ranges. The pass went from 2.8 seconds to 30 milliseconds and a
+  c906 run drops another 4%.
+* Designs with large memory arrays start simulating sooner: the pass that
+  decides which clocked blocks may skip idle edges named every element of
+  every memory a block writes, one string per element, and then read names it
+  discarded. A c906 SoC spent 33 seconds there, a second per one-million-entry
+  SRAM; that is now arithmetic on the element range, with the same skip
+  decisions. The whole run drops 36% of its instructions.
+
+# What's new in 0.10
+
+### 0.10.6 — assertion engine, instance-scoped collections, faster small testbenches (September 2026)
+
+**Correctness**
+
 * Concurrent assertions evaluate as attempts with real sequence matching
   (issues #176–#183): a multi-cycle antecedent (`a ##1 b |-> c`) triggers on
   its last cycle; a ranged consequent (`##[1:2] b`) fails only when the whole
@@ -393,193 +582,7 @@ and the development workflow are in [README.md](README.md).
   (issue #155): `core.seq`, `core.get_seq()` and `u_w.p.peek()` work from a
   method of a class declared inside a module.
 
-**Usability**
-
-* Code coverage: `--code-coverage[=stmt,branch,toggle]` (all three by
-  default), `--code-coverage-scope=<path>[,...]` and `XEZIM_CODE_COVERAGE`
-  turn on statement, branch (if/else and case arms including the implicit
-  ones, `?:`) and toggle (per-bit rise/fall) coverage; `+cover[=sbt]` and
-  `-coverage` now enable it too. Results go in `xezim_cov.json` under
-  `code_coverage`, per instance and per design unit, with a per-scope
-  summary under `--verbose`. It is off by default and costs nothing when
-  off. See docs/coverage-guide.md.
-* `$fwrite`/`$fdisplay` to regular files are buffered (64 KB per handle)
-  and flushed on `$fflush`, `$fclose`, `$finish`, `$system`, `$fopen`,
-  `$readmem*`/`$writemem*`, DPI/VPI calls and before any read of the same
-  file; a 400k-line trace testbench went from 1.78 s to 1.15 s. A
-  `tail -f` on a trace file now lags until the next flush.
-
-* The default simulation time limit is 100 ms instead of 100 µs, so UVM
-  tests that run for milliseconds (for example 2–25 ms of simulated time)
-  finish instead of stopping early. A design that never calls `$finish`
-  still stops at the limit; `--max-time` sets a different one, and
-  `-do "run -all"` runs until `$finish`.
-
-* Command lines written for other simulators run as-is: bare or `work.`
-  top names, `-F`, `-g`/`-G` parameter overrides, `-sv_seed`,
-  `-sv_lib`/`-sv_root`, `-svNNcompat`, and a `-do` subset (`run -all`,
-  `run <time>`, `quit`, `exit`, `do <file>`; `log`, `add wave` and
-  `coverage save/report` are accepted with a warning; anything else is an
-  error). Library options (`-work`, `-L`, `-lib`) are ignored with one
-  warning; `-c` and `-l` keep their xezim meanings. `run -all` runs past
-  the default time cap, and after `run <time>` the closing line and
-  `final` blocks see the stop time.
-
-* Runs are quiet by default. The transcript holds the design's output,
-  warnings and errors, and one closing line, `Simulation finished at time N
-  ($finish called)`. The version banner, `[PHASE]` timings,
-  `[PROF]`/`[FUSE]`/`[EVENT-EDGE]`/`[COV]` counters, `[CACHE]` hits and
-  `--compile`'s design summary now need `--verbose` (or `XEZIM_VERBOSE=1`,
-  `--profile` or `--sim-debug`). The apb AVIP transcript went from 189 lines
-  to 150.
-* Parse, preprocessor and elaboration errors print `file:line:col` with the
-  source line and a caret. A line that came from an `include`d file names
-  that file, with an "In file included from" chain, and text produced by a
-  macro names the macro invocation. Runtime locations (hang reports,
-  port-width warnings) are no longer shifted by `include`s.
-* Preprocessor errors and warnings print once per run instead of once per
-  pass. Parser warnings, such as an unsupported UDP table, now carry their
-  location, and `` `__LINE__ `` after a multi-line `define` reports the right
-  line.
-
 **Performance** (instruction counts, output identical)
-
-* UVM class code, round three: member reads, calls, member-target
-  assignments and comparisons take direct paths, and flat names, handle
-  keys and element names are built without `format!` or clones. UVM stress
-  bench: 10.8 M -> 9.0 M host instructions per item (-17%); the six AVIPs
-  run 13-15% fewer instructions (axi4 46.6 G -> 39.8 G).
-* RTL: process FSMs resolve `<top>.path` reads (a testbench monitor ran on
-  the AST path with name lookups every clock), `check_edges` reuses its
-  fired-edge buffers, and FSM wait terms are cached: c906 CoreMark 471.5 G
-  -> 459.5 G (-2.5%), c906 memcpy -2.1%.
-
-* UVM class code, round two: formal snapshots by position, plain-type
-  fast paths for locals and formals, per-class property-owner indexes,
-  forward-declared classes (`typedef class X;`, 110 in UVM) on the plain
-  paths, and name-set gates in member and call lookup. UVM stress bench:
-  11.5 M -> 10.1 M host instructions per item (-12%); axi4 AVIP -6.2%.
-* c906 CoreMark -0.4% (elaboration -2.4 G): loop-feedback analysis only
-  walks reads when a write reaches a combinational block, waiter wake
-  ranks are tracked only once a nonzero rank fires, and the legality
-  checker hashes scopes faster and builds messages lazily.
-
-* UVM class code: name-kind checks answer from per-design name tables and
-  per-class memos, bare names read and write on direct paths, class task
-  bodies are shared instead of cloned per call, and `foreach` over
-  associative arrays uses the element index. UVM stress bench: 20.6 M ->
-  11.5 M host instructions per sequence item (-44%); the six AVIPs run
-  19-27% fewer instructions; c906 CoreMark unchanged.
-
-* A two-state block that reads an x or z bit no longer re-runs on the
-  four-state VM: the same lowered stream runs on an x-plane executor that
-  applies the VM's four-state rules (Kleene logic, `&&`/`||`/`!` through
-  definite-1/definite-0/unknown, ambiguous equality, all-x arithmetic,
-  plane shifts, an x selector merging its arms, `if (x)` taking the else
-  arm, an x index reading all-x and writing nothing). On the SoC
-  benchmarks three quarters of what the VM still executed were such
-  re-runs — tiny muxes whose unselected arm or an unwritten register file
-  holds x. `XEZIM_TS_X=0` restores the VM re-run; `x_plane_runs=` counts
-  them in the profile report.
-* Dynamically indexed reads of memory elements wider than 64 bits — a
-  vector register file, a cache-line array — now run on the two-state
-  executor, both as operands (`vrf[rs]` in wide logic) and as the fused
-  memory-read flop (`rdata <= line[raddr]`). They were the largest labelled
-  reason for a clocked or combinational block to stay on the four-state VM
-  on both SoC benchmarks (21% of a C910 SoC's interpreted combinational
-  evaluations, 31% of a C906's).
-* `scripts/build-pgo.sh` run without a training command builds a
-  profile-guided binary from a bundled trainer (the `tests/perf` shapes,
-  `scripts/pgo-train`, `xezim-bench`): about −0.5% host instructions on the
-  SoC benchmarks, −12% on a loop-heavy DRAM model, output identical. It is
-  the recommended release build; see README.
-* Loop-heavy clocked blocks with `int` counters — memory models that walk
-  lanes, byte-lane writes into a packed memory, per-lane write pointers —
-  now run on the two-state executor instead of the four-state VM. The
-  counter's signed tag, its increment, a slice read at a run-time offset and
-  range stores at a run-time offset (blocking and non-blocking, into
-  vectors wider than 64 bits) all lower now. A DRAM-model reproducer runs
-  in a third of the instructions.
-* Clocked blocks whose range-store bounds only become constants after
-  folding — a generate arm writing `v[g*8 +: 8]` or `mem[g][7:4]` — now
-  compile to constant range stores on the element, which the two-state
-  executor runs; the dynamic and array forms they used to take kept the
-  whole block on the four-state VM (16 such flops on a c906 SoC, 400 on a
-  C910 SoC).
-* A block that bails on an x read every time it runs (an unwritten memory
-  element it keeps reading) no longer pays the two-state entry and guard on
-  every evaluation before running interpreted: after eight bails in a row
-  it sleeps, doubling the sleep while the bails continue, and wakes for one
-  attempt so a value that clears after reset gets its fast path back. x-read
-  bails on a c906 SoC fall by 72%.
-* Combinational blocks with registers wider than 128 bits — up to 512 —
-  run on the two-state executor by default now (`XEZIM_TS_WIDE512=0`
-  restores the old behaviour). Three shapes that kept such blocks on the
-  four-state VM lower as well: a bus read and then rewritten in the same
-  block (`bus = {bus[..], ..}`), a mux between two wide values, and a
-  wide `'x` reset default (`{N{1'bx}}`). c906 memcpy runs 1.2% fewer
-  instructions from the wide class alone, a C910 SoC 2.5%.
-* `tests/perf/loop_block_counters.rs` guards this path with work-counter
-  ceilings (two-state admission, bytecode length, backoff engagement).
-* The bytecode such blocks compile to is leaner first: a loop variable's
-  reads are forwarded into their consumers instead of being copied into a
-  temporary each time, `& K`, `* K`, `- K` and `| K` fold their constant
-  operand like `+ K` already did, a constant that only becomes one after
-  folding is fused too, and `i = i + 1` is two instructions rather than
-  five. The same reproducer executes 34% fewer VM instructions before the
-  two-state gain above.
-* A clocked block whose inputs did not change may now skip an idle edge even
-  when another block writes a different part of the same register or a
-  different element of the same array. Generated logic that gives
-  `status[0]` its own `always` block beside one for `status[6:1]`, or
-  `mem[0]` beside `mem[1]`, used to keep every such block firing every
-  cycle; each owns its own bits, so all may rest. Blocks that write
-  overlapping bits, and any block beside a writer whose element index is
-  computed at run time, still fire on every edge. A C910 SoC runs 6.6% fewer
-  instructions, a c906 SoC 1.2%.
-* Writes that combine two dynamic steps into a packed vector now compile
-  instead of falling back to the interpreter: `q[i][j]`, `mem[a][(i*W) +: W]`,
-  `s.arr[i].field` and their blocking forms, with either index dynamic. A
-  fallback inside a loop over a register-held variable demotes the whole loop,
-  so these statements cost microseconds each; a memory model built from them
-  runs 41x faster here, and a c906 run is unchanged.
-* Selects whose declared dimension does not start at zero or runs ascending
-  compile instead of falling back: `v[hi:lo]`, `v[b +: w]`, `v[b -: w]` and
-  bit selects on such a vector, and on an element of a packed array. A lane
-  vector selected in a loop runs 11x faster here. An element of an UNPACKED
-  array keeps the interpreter path, where its label mapping already agrees
-  with the writes.
-* `XEZIM_FALLBACK_SITES=1` reports every construct handed to the interpreter
-  with its reason, source byte span and scope, so the statements worth
-  compiling on a slow design can be found without guessing. It now also
-  reports the expensive case, a statement that takes its whole loop to the
-  interpreter because a fallback cannot be emitted inside one.
-* Merging same-sensitivity clocked blocks no longer costs the idle-edge
-  skip. The blocks folded into a merged one keep their original statements,
-  and the skip census still counted those writes, so every merged output
-  looked like it had two drivers and the merged block was disqualified: on a
-  c906 SoC only 618 of 3605 blocks could skip, and 55 million flop fires that
-  used to be skipped ran. Merging is now worth 6.9% on that design instead of
-  costing 18%.
-* Reading an element of a packed memory no longer copies the whole memory.
-  `mem[addr]` on a `logic [N-1:0][W-1:0]` loaded every bit of `mem` into a
-  register and selected the word from that, so each read cost as much as the
-  memory is big: a 16x deeper memory cost 3x per read. The slice is taken
-  where it lies now, read cost is flat in the memory's size, and a
-  32-port read benchmark runs 42% faster.
-* Starting a design with large memories is faster again: deciding which
-  clocked blocks may skip idle edges asked a hash map, once per element of
-  every memory a block writes, whether anything else wrote it. A c906 SoC
-  spent 1.8 seconds and several hundred megabytes on 19 million of those
-  questions; one byte per signal answers them now, and whole arrays are
-  counted as ranges. The pass went from 2.8 seconds to 30 milliseconds and a
-  c906 run drops another 4%.
-* Designs with large memory arrays start simulating sooner: the pass that
-  decides which clocked blocks may skip idle edges named every element of
-  every memory a block writes, one string per element, and then read names it
-  discarded. A c906 SoC spent 33 seconds there, a second per one-million-entry
-  SRAM; that is now arithmetic on the element range, with the same skip
-  decisions. The whole run drops 36% of its instructions.
 
 * A compiled stimulus process (the default for clocked initial-block loops)
   now runs its wait-to-wait segments on the two-state executor: waits are
