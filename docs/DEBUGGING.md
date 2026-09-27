@@ -102,10 +102,11 @@ the default matches commercial behavior.
 
 ## Reference-differential recipe
 
+Run `test.sv` (top module `top`) on the reference simulator and save its
+transcript as `ref.out`, stripping any prefix the tool adds to each line.
+Then:
+
 ```sh
-vlib w
-vlog -sv -work w test.sv
-vsim -c -work w top -do "run -all; quit -f" | sed 's/^# //' > ref.out
 xezim --simulate -s top test.sv --no-cache > mine.out
 diff ref.out mine.out
 ```

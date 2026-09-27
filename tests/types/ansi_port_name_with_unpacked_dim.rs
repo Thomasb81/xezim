@@ -9,7 +9,7 @@
 //! a comma / `)` / `=` means it was the port name.
 //!
 //! (The strict-LRM note: an implicit ANSI output is a NET, and the reference
-//! simulator rejects procedural writes to it outright — vlog-2110. xezim
+//! simulator rejects procedural writes to it outright. xezim
 //! keeps its existing leniency and runs such designs, matching the lenient
 //! vendor the testbench was written for.)
 

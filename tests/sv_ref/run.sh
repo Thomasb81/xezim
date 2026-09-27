@@ -6,17 +6,22 @@
 #   ./run.sh both            # run both and compare the verdicts
 #
 # Each testcase prints "TEST <name>: N checks, M errors -> PASS|FAIL".
-# The reference toolchain is taken from $REF_LIB/$REF_COMP/$REF_SIM so no
-# vendor tool name is baked into this script or its logs.
+# The `ref` and `both` modes need the reference toolchain's library, compile
+# and simulate commands in $REF_LIB, $REF_COMP and $REF_SIM, so no vendor
+# tool name is baked into this script or its logs.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${HERE}/out"
 XEZIM="${XEZIM:-${HERE}/../../target/release/xezim}"
-REF_LIB="${REF_LIB:-vlib}"
-REF_COMP="${REF_COMP:-vlog}"
-REF_SIM="${REF_SIM:-vsim}"
+REF_LIB="${REF_LIB:-}"
+REF_COMP="${REF_COMP:-}"
+REF_SIM="${REF_SIM:-}"
 MODE="${1:-both}"
+if [[ ( "$MODE" == ref || "$MODE" == both ) && ( -z "$REF_LIB" || -z "$REF_COMP" || -z "$REF_SIM" ) ]]; then
+  echo "run.sh: set REF_LIB, REF_COMP and REF_SIM to the reference toolchain's library, compile and simulate commands (or run './run.sh xezim')" >&2
+  exit 2
+fi
 
 TESTS=(
   packed_port_elem_select
