@@ -149,3 +149,54 @@ endmodule
     );
     assert_eq!(u(&sim, "e"), 0xF0);
 }
+
+/// A formal's metadata is saved when first written and restored on return:
+/// a nested call binding a class-typed formal of the same name, and a local
+/// declared in the body, must not leave their types behind for the caller's
+/// same-named variable (`h = new` constructs the variable's own class).
+#[test]
+fn formal_metadata_restored_after_nested_writes() {
+    const SRC: &str = "class A; int x; endclass
+class B; string s; int y; endclass
+class t;
+  function int inner(B h);
+    if (h == null) return 0;
+    return 1;
+  endfunction
+  function int mid(int h);
+    int r;
+    r = inner(null);
+    begin
+      B h2;
+      h2 = new;
+      h2.y = 3;
+      r = r + h2.y;
+    end
+    return h + r;
+  endfunction
+  function int deep(A h);
+    int v;
+    v = mid(10);
+    h = new;
+    h.x = v;
+    return h.x;
+  endfunction
+endclass
+module tb;
+  A h;
+  int r1, r2, ok;
+  initial begin
+    t o = new;
+    r1 = o.mid(5);
+    r2 = o.deep(null);
+    h = new;
+    h.x = 7;
+    ok = h.x;
+  end
+endmodule
+";
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "r1"), 8);
+    assert_eq!(u(&sim, "r2"), 13);
+    assert_eq!(u(&sim, "ok"), 7);
+}

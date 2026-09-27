@@ -2692,6 +2692,20 @@ fn name_bit(n: &str) -> u64 {
     (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63))
 }
 
+/// Two filter bits of a formal-metadata key's base name (the text before the
+/// first `.`), from its first two bytes: constant time on every write (see
+/// `Simulator::meta_note`).
+#[inline]
+fn meta_key_bits(key: &str) -> u64 {
+    let b = key.as_bytes();
+    let b0 = b.first().copied().unwrap_or(0);
+    let b1 = match b.get(1) {
+        Some(&c) if c != b'.' => c,
+        _ => 0,
+    };
+    (1u64 << (b0 & 63)) | (1u64 << (b1 & 63))
+}
+
 #[inline]
 fn note_store_write(bits: u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -3570,6 +3584,13 @@ struct MethodCallPlan {
     /// Every formal is a plain scalar or plain class: none has an actual to
     /// resolve as a virtual interface (type tables).
     all_plain: bool,
+    /// The `formal_meta_name` positions: the names whose metadata a call
+    /// saves and restores (declaration only).
+    meta_ks: Vec<usize>,
+    /// `meta_key_bits` of every one of those names, OR-ed.
+    meta_bloom: u64,
+    /// `meta_key_bits` of each of those names, by position.
+    meta_bits: Vec<u64>,
     /// `(vif_local_names.len(), no formal name is in vif_local_names)` at the
     /// last look; the set only grows, so an equal length is the same set.
     vif_absent: std::cell::Cell<(usize, bool)>,
@@ -3599,6 +3620,40 @@ struct InstTemplate {
     /// claim: a declared type name and no queue, associative, fixed,
     /// multi-dimensional or static collection property of the class.
     coll_candidates: Vec<(usize, String)>,
+}
+
+impl MethodCallPlan {
+    /// The `k`-th saved name (see `meta_ks`).
+    fn meta_name(&self, k: usize) -> &str {
+        use crate::ast::decl::ClassMethodKind;
+        let (ports, ret) = match &self._method.kind {
+            ClassMethodKind::Function(f) => (&f.ports[..], Some(f.name.name.name.as_str())),
+            ClassMethodKind::Task(t) => (&t.ports[..], None),
+            _ => (&[][..], None),
+        };
+        match ports.get(k) {
+            Some(p) => p.name.name.as_str(),
+            None => ret.unwrap_or_default(),
+        }
+    }
+}
+
+/// An active class-method activation's formal-metadata save. The snapshot
+/// of each formal and return-variable name (see `snapshot_formal_parts`) is
+/// taken when that name's metadata is first written — up to then the tables
+/// hold the entry state for it, which is what an eager snapshot would have
+/// saved — and a name never written has nothing to restore. Every writer of
+/// the six tables calls `meta_note` first.
+struct MetaFrame {
+    plan: std::rc::Rc<MethodCallPlan>,
+    /// Positions in `plan.meta_ks` already saved (all of them once `full`).
+    saved: u64,
+    full: bool,
+    parts: Vec<(usize, FormalMetaParts)>,
+    /// `meta_bloom` of this save and of every save below it.
+    cum_bloom: u64,
+    /// `meta_bits` of the names not saved yet, OR-ed.
+    unsaved_bloom: u64,
 }
 
 /// See `MethodCallPlan`.
@@ -6254,6 +6309,10 @@ pub struct Simulator {
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
     /// Emptied `current_spec` save buffers (see `clone_spec_pooled`).
     spec_buf_pool: Vec<(String, String)>,
+    /// Open class-method metadata saves, innermost last (see `MetaFrame`).
+    meta_frames: Vec<MetaFrame>,
+    /// How many of `meta_frames` have not taken their snapshot yet.
+    meta_pending: usize,
     /// Call plans by `Arc<ClassMethod>` address (see `MethodCallPlan`).
     method_plans: std::cell::RefCell<HashMap<usize, std::rc::Rc<MethodCallPlan>>>,
     /// Moves whenever a procedural `typedef` or an inline-enum local edits the
@@ -10347,6 +10406,8 @@ impl Simulator {
             formal_parts_pool: Vec::new(),
             spec_buf_pool: Vec::new(),
             method_plans: std::cell::RefCell::new(HashMap::default()),
+            meta_frames: Vec::new(),
+            meta_pending: 0,
             type_tables_gen: 0,
             local_type_pool: Vec::new(),
             sync_name_pool: Vec::new(),
@@ -74827,6 +74888,7 @@ impl Simulator {
                     None
                 })?;
             let v = vars.first()?.as_ref()?.name.clone();
+            self.meta_note(&v);
             self.var_typedef_types.insert(v.clone(), kt);
             // The loop var is a FRESH declaration (§12.7.3) — its type
             // binding shadows class properties and stale flat-map
@@ -75803,6 +75865,9 @@ impl Simulator {
             Value::new(w)
         };
         for d in declarators {
+            // Every metadata key this declaration writes is its name or
+            // `name.member` (or a `@` per-call key, never a formal's name).
+            self.meta_note(&d.name.name);
             // A fresh local declaration shadows any prior global-scoped
             // collection registration left over from another frame's
             // same-named local (subroutine locals use bare names). Reset
@@ -95319,6 +95384,7 @@ impl Simulator {
 
     fn restore_loop_vars(&mut self, saved: &[(String, Option<Value>, bool, Option<String>, bool)]) {
         for (n, cur, had_frame, prior_td, was_trusted) in saved {
+            self.meta_note(n);
             match prior_td {
                 Some(t) => {
                     self.var_typedef_types.insert(n.clone(), t.clone());
@@ -107262,6 +107328,7 @@ impl Simulator {
         queue_data_type: &crate::ast::types::DataType,
     ) -> Option<String> {
         use crate::ast::types::{DataType, UnpackedDimension};
+        self.meta_note(pname);
         if !matches!(
             dims.first(),
             Some(UnpackedDimension::Queue { .. }) | Some(UnpackedDimension::Unsized(_))
@@ -117649,6 +117716,7 @@ impl Simulator {
     /// A packed-struct member leaf (`s.p` of `struct { pk_t p; } s`) aliases
     /// its fields into the leaf, as a packed-struct variable does.
     fn register_packed_leaf_layout(&mut self, key: &str, dt: &DataType) {
+        self.meta_note(key);
         if let Some(fields) = super::elaborate::packed_struct_field_layout(
             dt,
             &self.module.parameters,
@@ -119009,6 +119077,11 @@ impl Simulator {
             .take()
             .or_else(|| self.module.func_decl_scope.get(&fd.name.name.name).cloned());
         let normalized = Self::normalize_call_args(&fd.ports, args);
+        // The formals' and return variable's metadata are written below.
+        for port in fd.ports.iter() {
+            self.meta_note(&port.name.name);
+        }
+        self.meta_note(&fd.name.name.name);
         // §7.4.1: packed-of-packed FORMALS (and the return variable) need
         // their element width registered under the bare formal name, or the
         // body's `x[i]` reads collapse to single-bit selects (same defect as
@@ -119897,6 +119970,77 @@ impl Simulator {
         }
     }
 
+    /// Formal-metadata write barrier: called before any write to the six
+    /// tables `snapshot_formal_parts` reads, with the written key. Every open
+    /// class-method save (see `MetaFrame`) that names the key's base and has
+    /// no snapshot yet takes it now.
+    #[inline]
+    fn meta_note(&mut self, key: &str) {
+        if self.meta_pending != 0 {
+            // The innermost save's filter covers every open save's names.
+            let bits = meta_key_bits(key);
+            if self
+                .meta_frames
+                .last()
+                .is_some_and(|f| f.cum_bloom & bits == bits)
+            {
+                self.meta_note_slow(key, bits);
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn meta_note_slow(&mut self, key: &str, bits: u64) {
+        // `packed_signal_elem_widths` also keys `name.member` under `name`.
+        let base = key.split('.').next().unwrap_or(key);
+        for i in (0..self.meta_frames.len()).rev() {
+            let frame = &self.meta_frames[i];
+            if frame.full || frame.unsaved_bloom & bits != bits {
+                continue;
+            }
+            let plan = frame.plan.clone();
+            let saved = frame.saved;
+            let n = plan.meta_ks.len();
+            if n > 64 {
+                // More than 64 names: the first write saves all of them.
+                if plan.meta_ks.iter().any(|&k| plan.meta_name(k) == base) {
+                    for &k in &plan.meta_ks {
+                        let snap = self.snapshot_formal_parts(plan.meta_name(k));
+                        self.meta_frames[i].parts.push((k, snap));
+                    }
+                    self.meta_frames[i].full = true;
+                    self.meta_pending -= 1;
+                }
+            } else {
+                for pos in 0..n {
+                    let bit = 1u64 << pos;
+                    if plan.meta_bits[pos] != bits || saved & bit != 0 {
+                        continue;
+                    }
+                    let k = plan.meta_ks[pos];
+                    if plan.meta_name(k) != base {
+                        continue;
+                    }
+                    let snap = self.snapshot_formal_parts(base);
+                    let frame = &mut self.meta_frames[i];
+                    frame.parts.push((k, snap));
+                    frame.saved |= bit;
+                    frame.unsaved_bloom = (0..n)
+                        .filter(|p| frame.saved & (1u64 << p) == 0)
+                        .fold(0, |acc, p| acc | plan.meta_bits[p]);
+                    if frame.saved.count_ones() as usize == n {
+                        frame.full = true;
+                        self.meta_pending -= 1;
+                    }
+                    break;
+                }
+            }
+            if self.meta_pending == 0 {
+                break;
+            }
+        }
+    }
+
     /// `snapshot_formal_metadata` without the owned name, for a caller that
     /// keeps the name itself.
     fn snapshot_formal_parts(&self, name: &str) -> FormalMetaParts {
@@ -119933,6 +120077,7 @@ impl Simulator {
     }
 
     fn clear_formal_metadata(&mut self, name: &str) {
+        self.meta_note(name);
         self.module.var_decl_types.remove(name);
         self.module.packed_struct_fields.remove(name);
         self.clear_formal_elem_widths(name);
@@ -119943,6 +120088,7 @@ impl Simulator {
 
     /// The `packed_signal_elem_widths` part of `clear_formal_metadata`.
     fn clear_formal_elem_widths(&mut self, name: &str) {
+        self.meta_note(name);
         if self.elem_base_has_dotted(name) {
             self.module.packed_signal_elem_widths.retain(|key, _| {
                 key.as_str() != name
@@ -120077,6 +120223,7 @@ impl Simulator {
     /// `snapshot_formal_metadata` that MOVES the entries out instead of
     /// cloning them: the declaration about to run re-registers its own.
     fn take_formal_metadata(&mut self, name: &str) -> FormalMetadataSnapshot {
+        self.meta_note(name);
         let packed_element_widths = if self.elem_base_has_dotted(name) {
             let snap = self.snapshot_formal_parts(name).packed_element_widths;
             for (k, _) in &snap {
@@ -120161,6 +120308,7 @@ impl Simulator {
     /// `restore_formal_metadata` for a snapshot taken by
     /// `snapshot_formal_parts`.
     fn restore_formal_parts(&mut self, name: &str, saved: FormalMetaParts) {
+        self.meta_note(name);
         // Each table ends up holding exactly the snapshot's entry for the
         // name: overwritten in place or removed, without the clear pass.
         fn put<V>(map: &mut HashMap<String, V>, name: &str, v: Option<V>) {
@@ -120213,6 +120361,7 @@ impl Simulator {
     }
 
     fn register_formal_type_metadata(&mut self, name: &str, dt: &DataType, no_unpacked_dims: bool) {
+        // `clear_formal_metadata` notes `name` before any write.
         self.clear_formal_metadata(name);
         self.module
             .var_decl_types
@@ -133548,12 +133697,34 @@ impl Simulator {
         let all_plain = ports
             .iter()
             .all(|p: &PortPlan| p.plain_scalar || p.class_ref.is_some());
+        let ret_name = match &method.kind {
+            ClassMethodKind::Function(f) => Some(f.name.name.name.as_str()),
+            _ => None,
+        };
+        let port_decls = match &method.kind {
+            ClassMethodKind::Function(f) => &f.ports[..],
+            ClassMethodKind::Task(t) => &t.ports[..],
+            _ => &[],
+        };
+        let mut meta_ks = Vec::new();
+        let mut meta_bloom = 0u64;
+        let mut meta_bits = Vec::new();
+        for k in 0..=port_decls.len() {
+            if let Some(n) = Self::formal_meta_name(port_decls, ret_name, k) {
+                meta_ks.push(k);
+                meta_bloom |= meta_key_bits(n);
+                meta_bits.push(meta_key_bits(n));
+            }
+        }
         MethodCallPlan {
             _method: method.clone(),
             type_gen: self.type_tables_gen,
             ports,
             ret,
             all_plain,
+            meta_ks,
+            meta_bloom,
+            meta_bits,
             vif_absent: std::cell::Cell::new((usize::MAX, false)),
         }
     }
@@ -133718,12 +133889,22 @@ impl Simulator {
                 };
                 // Saved by position (see `formal_meta_name`) into a pooled
                 // vector: no name copies and no allocation per call.
-                let mut formal_parts = self.formal_parts_pool.pop().unwrap_or_default();
-                for k in 0..=ports.len() {
-                    if let Some(n) = Self::formal_meta_name(ports, fn_ret_name, k) {
-                        let parts = self.snapshot_formal_parts(n);
-                        formal_parts.push((k, parts));
-                    }
+                // The formals' and return variable's metadata are saved when
+                // first written (see `MetaFrame`).
+                let meta_open = !plan.meta_ks.is_empty();
+                if meta_open {
+                    let parts = self.formal_parts_pool.pop().unwrap_or_default();
+                    let cum_bloom =
+                        plan.meta_bloom | self.meta_frames.last().map_or(0, |f| f.cum_bloom);
+                    self.meta_frames.push(MetaFrame {
+                        plan: plan.clone(),
+                        saved: 0,
+                        full: false,
+                        parts,
+                        cum_bloom,
+                        unsaved_bloom: plan.meta_bloom,
+                    });
+                    self.meta_pending += 1;
                 }
                 let ret_is_string = match (&method.kind, plan.ret.as_ref()) {
                     (ClassMethodKind::Function(_), Some(r))
@@ -134106,12 +134287,14 @@ impl Simulator {
                         let forward_declared = class_ref == Some(true);
                         if !forward_declared && self.module.classes.contains_key(&type_name) {
                             self.record_local_class_type(&port.name.name, &type_name);
+                            self.meta_note(&port.name.name);
                             self.var_class_types
                                 .insert(port.name.name.clone(), type_name.clone());
                         } else if self.module.enum_members.contains_key(&type_name)
                             || self.module.typedefs.contains_key(&type_name)
                         {
                             self.record_local_typedef_type(&port.name.name, &type_name);
+                            self.meta_note(&port.name.name);
                             self.var_typedef_types
                                 .insert(port.name.name.clone(), type_name);
                         } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
@@ -134133,6 +134316,7 @@ impl Simulator {
                                     ));
                             if cn_is_class {
                                 frame_class_ports.push((port.name.name.clone(), concrete.clone()));
+                                self.meta_note(&port.name.name);
                                 self.var_class_types
                                     .insert(port.name.name.clone(), concrete);
                             }
@@ -134231,6 +134415,7 @@ impl Simulator {
                     // the report-server `$display` fires natively.
                     if let Some(cn) = plan.ret.as_ref().and_then(|r| r.class.as_deref()) {
                         self.record_local_class_type(rn, cn);
+                        self.meta_note(rn);
                         self.var_class_types.insert(rn.to_string(), cn.to_string());
                     }
                 }
@@ -134769,15 +134954,25 @@ impl Simulator {
                     }
                     self.purge_assoc_param(&param, prior);
                 }
-                while let Some((k, parts)) = formal_parts.pop() {
-                    let n = match ports.get(k) {
-                        Some(p) => p.name.name.as_str(),
-                        None => fn_ret_name.unwrap_or_default(),
-                    };
-                    self.restore_formal_parts(n, parts);
-                }
-                if self.formal_parts_pool.len() < 64 {
-                    self.formal_parts_pool.push(formal_parts);
+                if let Some(frame) = meta_open.then(|| self.meta_frames.pop()).flatten() {
+                    if !frame.full {
+                        self.meta_pending -= 1;
+                    }
+                    // The saved names in the eager order (last position
+                    // first); a name never written still holds its entry
+                    // state.
+                    let mut formal_parts = frame.parts;
+                    formal_parts.sort_by_key(|(k, _)| *k);
+                    while let Some((k, parts)) = formal_parts.pop() {
+                        let n = match ports.get(k) {
+                            Some(p) => p.name.name.as_str(),
+                            None => fn_ret_name.unwrap_or_default(),
+                        };
+                        self.restore_formal_parts(n, parts);
+                    }
+                    if self.formal_parts_pool.len() < 64 {
+                        self.formal_parts_pool.push(formal_parts);
+                    }
                 }
                 if let Some(h) = reg_guard_obj {
                     self.factory_reg_in_progress.remove(&h);
