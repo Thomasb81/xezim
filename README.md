@@ -294,6 +294,31 @@ an existing checkout instead, set `XEZIM_UVM_DIR` to its root or clone it as a
 
 ---
 
+## Contributing
+
+Bug reports and pull requests are welcome. What makes them quick to land:
+
+* **Report bugs with a small self-checking testcase** — a module that prints
+  `PASS`/`FAIL` per check, plus the output you expected and where it comes from
+  (the IEEE 1800 section, or another simulator's result).
+* **Base the pull request on current `main`.** The code moves quickly; a
+  branch several releases behind usually conflicts. Rebase before opening or
+  updating it.
+* **Keep formatting separate.** Run `cargo fmt` on your change, but don't mix
+  a reformat of untouched code into a fix.
+* **Add a regression test for each fix** under `tests/<group>/`, registered
+  in `tests/<group>.rs`, that fails without the fix. Expected values should
+  follow the LRM; cite the section in a comment. When you checked them against
+  another simulator, say "the reference simulator" rather than naming a
+  product.
+* **Run the full suite** (`cargo test --release`) and include the result.
+* **Mind the hot paths.** The simulator, bytecode and `Value` code run billions
+  of times per simulation; for changes there, include an instruction count
+  (`perf stat -e instructions`) before and after on a representative design,
+  with identical output.
+* **Fix the root cause**, not the one testcase, and keep each pull request to
+  one topic.
+
 # Run
 
 Run a simple example via cargo:
@@ -661,8 +686,12 @@ tests, and tooling all move the project forward:
   accompanying SystemVerilog compliance cases.
 * **Jayaraman RP** — cross-platform installation scripts, including the macOS
   installer with UVM setup.
+* **Ganesh T S** — wide-number parsing for `$sscanf`/`$fscanf`/`$value$plusargs`
+  and the string conversion methods (arbitrary-precision decimal in the core),
+  loop-variable scoping against same-named identifiers in child instances, and
+  detailed self-checking bug reports for struct and class member access.
 
-New contributors are welcome — see [Development workflow](#development-workflow).
+New contributors are welcome — see [Contributing](#contributing).
 
 ---
 
