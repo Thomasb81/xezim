@@ -3584,6 +3584,23 @@ struct MethodDef {
     plan: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<MethodCallPlan>>>>,
 }
 
+/// Per leaf class: the facts of its `extends` chain that instantiation used
+/// to re-derive on every `new` (see `Simulator::inst_template`). The class
+/// tables are fixed at run time; the template also records the chain it was
+/// built from and is only used for that same chain (compared by pointer).
+struct InstTemplate {
+    chain: Vec<Arc<crate::compiler::elaborate::ElaboratedClass>>,
+    /// Per chain entry, per property in `properties` order: 0 = static or
+    /// associative (not seeded per instance), 1 = seeded under its bare
+    /// name, 2 = seeded under `Class::name` (redeclared nearer the leaf).
+    seed: Vec<Vec<u8>>,
+    /// The `(chain index, property)` pairs, in the registration loop's
+    /// order, that the type-parameter-bound collection registration can
+    /// claim: a declared type name and no queue, associative, fixed,
+    /// multi-dimensional or static collection property of the class.
+    coll_candidates: Vec<(usize, String)>,
+}
+
 /// See `MethodCallPlan`.
 struct PortPlan {
     /// `port_is_plain_scalar` (declaration only).
@@ -5803,6 +5820,8 @@ pub struct Simulator {
     /// `"<Class>::<name>"`; the set is the cheap gate that keeps every
     /// unshadowed access on the bare-name fast path.
     shadowed_prop_names: HashSet<String>,
+    /// Instantiation templates by leaf class name (see `InstTemplate`).
+    inst_templates: std::cell::RefCell<HashMap<String, std::rc::Rc<InstTemplate>>>,
     /// §18.11: when `obj.randomize(a, b)` names a MEMBER SUBSET, only those
     /// properties are solved; every other rand member keeps its current value
     /// and acts as state. Empty/None means the ordinary whole-object form.
@@ -10187,6 +10206,7 @@ impl Simulator {
             rand_receiver: None,
             randomize_subset: None,
             shadowed_prop_names: HashSet::default(),
+            inst_templates: std::cell::RefCell::new(HashMap::default()),
             settling: false,
             in_edge_block: false,
             in_edge_cont: false,
@@ -123917,13 +123937,14 @@ impl Simulator {
         // walk below bumps refcounts; the leaf reuses its map Arc when the
         // caller's reference IS that object (pointer-verified), and only
         // an off-map def (factory-synthesized) pays a real clone.
-        let leaf_arc = self
+        let leaf_from_map = self
             .module
             .classes
             .get(&class_def.name)
             .filter(|c| std::sync::Arc::as_ptr(c) == class_def as *const _)
-            .cloned()
-            .unwrap_or_else(|| std::sync::Arc::new(class_def.clone()));
+            .cloned();
+        let leaf_in_map = leaf_from_map.is_some();
+        let leaf_arc = leaf_from_map.unwrap_or_else(|| std::sync::Arc::new(class_def.clone()));
         let mut classes_to_init = vec![leaf_arc];
         let mut cur: Option<&str> = class_def.extends.as_deref();
         // Cycle guard — `sanitize_class_hierarchy` already severs `extends`
@@ -124017,7 +124038,12 @@ impl Simulator {
         // including across TYPES, where a base `string` read back a derived
         // `int`'s bits. The leaf-most declarer keeps the bare key; every
         // other declarer stores under `"<Class>::<name>"`.
-        let leaf_declarer: HashMap<&str, &str> = {
+        // A chain from the class table has its per-property facts in a
+        // template (see `InstTemplate`); an off-table definition derives them.
+        let tpl = leaf_in_map.then(|| self.inst_template(&classes_to_init));
+        let leaf_declarer: HashMap<&str, &str> = if tpl.is_some() {
+            HashMap::default()
+        } else {
             let mut m: HashMap<&str, &str> = HashMap::default();
             for cdef in &classes_to_init {
                 // leaf-first: the first declarer seen is the leaf-most.
@@ -124027,22 +124053,36 @@ impl Simulator {
             }
             m
         };
-        for cdef in classes_to_init.iter().rev() {
-            for (prop_name, prop_sig) in &cdef.properties {
+        for (ci, cdef) in classes_to_init.iter().enumerate().rev() {
+            for (pi, (prop_name, prop_sig)) in cdef.properties.iter().enumerate() {
                 // Static properties live in the shared `class_statics`
                 // cell; associative-array properties live in the
                 // instance-scoped signal map — neither is a per-instance
                 // scalar, so skip both here.
-                if cdef.static_properties.contains(prop_name)
-                    || cdef.assoc_properties.contains_key(prop_name)
-                {
+                let seed = match tpl.as_ref() {
+                    Some(t) => t.seed[ci][pi],
+                    None => {
+                        if cdef.static_properties.contains(prop_name)
+                            || cdef.assoc_properties.contains_key(prop_name)
+                        {
+                            0
+                        } else if leaf_declarer
+                            .get(prop_name.as_str())
+                            .is_some_and(|l| *l != cdef.name.as_str())
+                        {
+                            2
+                        } else {
+                            1
+                        }
+                    }
+                };
+                if seed == 0 {
                     continue;
                 }
-                let key = if leaf_declarer
-                    .get(prop_name.as_str())
-                    .is_some_and(|l| *l != cdef.name.as_str())
-                {
-                    self.shadowed_prop_names.insert(prop_name.clone());
+                let key = if seed == 2 {
+                    if !self.shadowed_prop_names.contains(prop_name.as_str()) {
+                        self.shadowed_prop_names.insert(prop_name.clone());
+                    }
                     format!("{}::{}", cdef.name, prop_name)
                 } else {
                     prop_name.clone()
@@ -124357,16 +124397,34 @@ impl Simulator {
         // `<handle>#member` as a dynamic array once this instance's type
         // bindings (set above) resolve the parameter to a concrete collection
         // type.
-        for cdef in &classes_to_init {
-            for (prop, sig) in &cdef.properties {
-                if cdef.queue_properties.contains_key(prop)
-                    || cdef.assoc_properties.contains_key(prop)
-                    || cdef.array_properties.contains_key(prop)
-                    || cdef.array_nd_properties.contains_key(prop)
-                    || cdef.static_collections.iter().any(|(n, ..)| n == prop)
-                {
-                    continue;
+        let all_candidates: Vec<(usize, String)>;
+        let candidates: &[(usize, String)] = match tpl.as_ref() {
+            Some(t) => &t.coll_candidates,
+            None => {
+                let mut v = Vec::new();
+                for (ci, cdef) in classes_to_init.iter().enumerate() {
+                    for (prop, sig) in &cdef.properties {
+                        if !(cdef.queue_properties.contains_key(prop)
+                            || cdef.assoc_properties.contains_key(prop)
+                            || cdef.array_properties.contains_key(prop)
+                            || cdef.array_nd_properties.contains_key(prop)
+                            || cdef.static_collections.iter().any(|(n, ..)| n == prop)
+                            || sig.type_name.is_none())
+                        {
+                            v.push((ci, prop.clone()));
+                        }
+                    }
                 }
+                all_candidates = v;
+                &all_candidates
+            }
+        };
+        for (ci, prop) in candidates {
+            let cdef = &classes_to_init[*ci];
+            let Some(sig) = cdef.properties.get(prop) else {
+                continue;
+            };
+            {
                 if !self.prop_bound_collection(handle, &cdef.name, prop) {
                     continue;
                 }
@@ -133220,6 +133278,77 @@ impl Simulator {
                 static_or_param,
             }
         })
+    }
+
+    /// The instantiation template of the class chain `chain` (leaf first).
+    fn inst_template(
+        &self,
+        chain: &[Arc<crate::compiler::elaborate::ElaboratedClass>],
+    ) -> std::rc::Rc<InstTemplate> {
+        let leaf = chain[0].name.as_str();
+        if let Some(t) = self.inst_templates.borrow().get(leaf) {
+            if t.chain.len() == chain.len()
+                && t.chain.iter().zip(chain).all(|(a, b)| Arc::ptr_eq(a, b))
+            {
+                return t.clone();
+            }
+        }
+        let mut leaf_declarer: HashMap<&str, &str> = HashMap::default();
+        for cdef in chain {
+            // leaf-first: the first declarer seen is the leaf-most.
+            for p in cdef.properties.keys() {
+                leaf_declarer
+                    .entry(p.as_str())
+                    .or_insert(cdef.name.as_str());
+            }
+        }
+        let seed = chain
+            .iter()
+            .map(|cdef| {
+                cdef.properties
+                    .keys()
+                    .map(|p| {
+                        if cdef.static_properties.contains(p)
+                            || cdef.assoc_properties.contains_key(p)
+                        {
+                            0
+                        } else if leaf_declarer
+                            .get(p.as_str())
+                            .is_some_and(|l| *l != cdef.name.as_str())
+                        {
+                            2
+                        } else {
+                            1
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut coll_candidates = Vec::new();
+        for (ci, cdef) in chain.iter().enumerate() {
+            for (prop, sig) in &cdef.properties {
+                if cdef.queue_properties.contains_key(prop)
+                    || cdef.assoc_properties.contains_key(prop)
+                    || cdef.array_properties.contains_key(prop)
+                    || cdef.array_nd_properties.contains_key(prop)
+                    || cdef.static_collections.iter().any(|(n, ..)| n == prop)
+                    // `prop_bound_collection` answers false without one.
+                    || sig.type_name.is_none()
+                {
+                    continue;
+                }
+                coll_candidates.push((ci, prop.clone()));
+            }
+        }
+        let t = std::rc::Rc::new(InstTemplate {
+            chain: chain.to_vec(),
+            seed,
+            coll_candidates,
+        });
+        self.inst_templates
+            .borrow_mut()
+            .insert(leaf.to_string(), t.clone());
+        t
     }
 
     /// The call plan of `method` (see `MethodCallPlan`).
