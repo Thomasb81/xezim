@@ -852,6 +852,16 @@ struct LocalArrayBind {
     is_real: bool,
 }
 
+/// `format!("{}.{}", scope, name)` without the formatting machinery: the
+/// compiler builds one such scoped key per identifier lookup.
+fn cat_dot(scope: &str, name: &str) -> String {
+    let mut s = String::with_capacity(scope.len() + 1 + name.len());
+    s.push_str(scope);
+    s.push('.');
+    s.push_str(name);
+    s
+}
+
 pub struct BytecodeCompiler<'a> {
     insns: Vec<Insn>,
     next_reg: u32,
@@ -1233,7 +1243,7 @@ impl<'a> BytecodeCompiler<'a> {
         if !raw.contains('.')
             && let Some(scope) = &self.scope_hint
         {
-            candidates.push(format!("{}.{}", scope, raw));
+            candidates.push(cat_dot(scope, &raw));
         }
         if let Some(leaf) = hier.path.last() {
             candidates.push(leaf.name.name.clone());
@@ -1530,7 +1540,7 @@ impl<'a> BytecodeCompiler<'a> {
             return true;
         }
         if let Some(scope) = &self.scope_hint {
-            let qual = format!("{}.{}", scope, raw);
+            let qual = cat_dot(scope, &raw);
             if d.contains(&qual) || q.contains(&qual) {
                 return true;
             }
@@ -1600,7 +1610,7 @@ impl<'a> BytecodeCompiler<'a> {
             return true;
         }
         if let Some(scope) = &self.scope_hint {
-            if m.contains_key(&format!("{}.{}", scope, raw)) {
+            if m.contains_key(&cat_dot(scope, &raw)) {
                 return true;
             }
         }
@@ -1633,7 +1643,7 @@ impl<'a> BytecodeCompiler<'a> {
             .or_else(|| {
                 self.scope_hint
                     .as_ref()
-                    .and_then(|sc| m.get(format!("{}.{}", sc, raw).as_str()))
+                    .and_then(|sc| m.get(cat_dot(sc, &raw).as_str()))
             })
             .or_else(|| {
                 if hier.path.len() != 1 {
@@ -3216,7 +3226,7 @@ impl<'a> BytecodeCompiler<'a> {
             .map(|s| (raw.clone(), *s))
             .or_else(|| {
                 self.scope_hint.as_ref().and_then(|sc| {
-                    let q = format!("{}.{}", sc, raw);
+                    let q = cat_dot(sc, &raw);
                     arrays_2d.get(q.as_str()).map(|s| (q, *s))
                 })
             })?;
@@ -3990,11 +4000,20 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn hier_raw_name(hier: &HierarchicalIdentifier) -> String {
-        hier.path
-            .iter()
-            .map(|s| s.name.name.as_str())
-            .collect::<Vec<_>>()
-            .join(".")
+        match hier.path.as_slice() {
+            [one] => one.name.name.clone(),
+            path => {
+                let len = path.iter().map(|s| s.name.name.len() + 1).sum::<usize>();
+                let mut out = String::with_capacity(len.saturating_sub(1));
+                for (i, seg) in path.iter().enumerate() {
+                    if i > 0 {
+                        out.push('.');
+                    }
+                    out.push_str(&seg.name.name);
+                }
+                out
+            }
+        }
     }
 
     /// §7.2.1: `base.member` where `base` resolves to a packed-struct SIGNAL
@@ -4023,7 +4042,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let raw = Self::hier_raw_name(h);
         if let Some(scope) = &self.scope_hint {
-            let q = format!("{}.{}", scope, raw);
+            let q = cat_dot(scope, &raw);
             if let Some(l) = fields_tbl.get(&q) {
                 return Some(l.clone());
             }
@@ -5022,7 +5041,7 @@ impl<'a> BytecodeCompiler<'a> {
         let rooted = hier.root.is_some();
         if !raw.contains('.') && !rooted {
             if let Some(scope) = &self.scope_hint {
-                let qualified = format!("{}.{}", scope, raw);
+                let qualified = cat_dot(scope, &raw);
                 if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
                     return Some(id);
                 }
@@ -5033,7 +5052,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
         if !rooted {
             if let Some(scope) = &self.scope_hint {
-                let qualified = format!("{}.{}", scope, raw);
+                let qualified = cat_dot(scope, &raw);
                 if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
                     return Some(id);
                 }
@@ -5075,7 +5094,7 @@ impl<'a> BytecodeCompiler<'a> {
         let raw = Self::hier_raw_name(hier);
         let mut keys: Vec<String> = Vec::with_capacity(3);
         if let Some(scope) = &self.scope_hint {
-            keys.push(format!("{}.{}", scope, raw));
+            keys.push(cat_dot(scope, &raw));
         }
         keys.push(raw.clone());
         if hier.path.len() == 1 {
@@ -5101,7 +5120,7 @@ impl<'a> BytecodeCompiler<'a> {
             return Some(v.clone());
         }
         if let Some(scope) = &self.scope_hint {
-            let q = format!("{}.{}", scope, raw);
+            let q = cat_dot(scope, &raw);
             if let Some(v) = params.get(&q) {
                 return Some(v.clone());
             }
@@ -5274,7 +5293,7 @@ impl<'a> BytecodeCompiler<'a> {
             return true;
         }
         if let Some(scope) = &self.scope_hint {
-            if set.contains(format!("{}.{}", scope, raw).as_str()) {
+            if set.contains(cat_dot(scope, &raw).as_str()) {
                 return true;
             }
         }
@@ -5529,7 +5548,7 @@ impl<'a> BytecodeCompiler<'a> {
                     .or_else(|| {
                         self.scope_hint
                             .as_ref()
-                            .and_then(|sc| m.get(format!("{}.{}", sc, raw).as_str()).copied())
+                            .and_then(|sc| m.get(cat_dot(sc, &raw).as_str()).copied())
                     })
                     // The bare-leaf fallback is for a SINGLE-segment name only.
                     // Applying it to `inp.sram_renA` (a packed-struct member
@@ -5840,7 +5859,7 @@ impl<'a> BytecodeCompiler<'a> {
             return dense(&raw).then_some(raw);
         }
         if let Some(scope) = &self.scope_hint {
-            let qualified = format!("{}.{}", scope, raw);
+            let qualified = cat_dot(scope, &raw);
             if self.arrays.contains_key(&qualified) {
                 return dense(&qualified).then_some(qualified);
             }
