@@ -6245,6 +6245,10 @@ pub struct Simulator {
     /// See `prop_owners`.
     #[allow(clippy::type_complexity)]
     prop_owner_index: std::cell::RefCell<HashMap<String, std::rc::Rc<PropOwners>>>,
+    /// `class_prop_width_impl` answers that no instance can change, by class
+    /// then property; `None` marks a width the instance's bindings decide.
+    #[allow(clippy::type_complexity)]
+    prop_width_memo: std::cell::RefCell<HashMap<String, HashMap<String, Option<Option<u32>>>>>,
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
@@ -10339,6 +10343,7 @@ impl Simulator {
             coll_member_names: std::cell::RefCell::new(None),
             queue_key_scratch: String::new(),
             prop_owner_index: std::cell::RefCell::new(HashMap::default()),
+            prop_width_memo: std::cell::RefCell::new(HashMap::default()),
             formal_parts_pool: Vec::new(),
             spec_buf_pool: Vec::new(),
             method_plans: std::cell::RefCell::new(HashMap::default()),
@@ -99803,6 +99808,27 @@ impl Simulator {
         handle: Option<usize>,
         prop: &str,
     ) -> Option<u32> {
+        let memo = self
+            .prop_width_memo
+            .borrow()
+            .get(class_name)
+            .and_then(|m| m.get(prop))
+            .copied();
+        let fixed = match memo {
+            Some(v) => v,
+            None => {
+                let v = self.class_prop_width_fixed(class_name, prop);
+                self.prop_width_memo
+                    .borrow_mut()
+                    .entry(class_name.to_string())
+                    .or_default()
+                    .insert(prop.to_string(), v);
+                v
+            }
+        };
+        if let Some(w) = fixed {
+            return w;
+        }
         let owners = self.prop_owners(class_name);
         {
             let (cn, cd) = owners.get(prop)?;
@@ -99848,6 +99874,56 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// `class_prop_width_impl`'s answer when it cannot depend on the instance
+    /// (the class tables are fixed at run time): `Some(answer)`, or `None`
+    /// for a type-parameter-typed property or a packed range sized by a
+    /// class parameter.
+    fn class_prop_width_fixed(&self, class_name: &str, prop: &str) -> Option<Option<u32>> {
+        let owners = self.prop_owners(class_name);
+        let Some((cn, cd)) = owners.get(prop) else {
+            return Some(None);
+        };
+        let Some(sig) = cd.properties.get(prop) else {
+            return Some(None);
+        };
+        if sig.is_real
+            || sig
+                .type_name
+                .as_ref()
+                .is_some_and(|t| self.module.classes.contains_key(t))
+            || cd.string_properties.contains(prop)
+        {
+            return Some(None);
+        }
+        if sig
+            .type_name
+            .as_ref()
+            .is_some_and(|t| cd.type_param_names.contains(t))
+        {
+            return None;
+        }
+        // `respec_packed_width` answers only for a range that is not constant
+        // on its own (its classification, without the instance).
+        let respec = self.module.classes.get(cn.as_str()).is_none_or(|c| {
+            let dims = match c.property_types.get(prop) {
+                Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
+                    dimensions
+                }
+                Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => dimensions,
+                _ => return false,
+            };
+            dims.iter().any(|d| {
+                matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                    if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
+                        || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
+            })
+        });
+        if respec {
+            return None;
+        }
+        Some(Some(sig.width).filter(|w| *w > 0))
     }
 
     /// Where each property of `class_name`'s `extends` chain is declared:
