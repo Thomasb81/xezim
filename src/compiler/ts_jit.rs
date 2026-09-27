@@ -694,7 +694,7 @@ pub mod enabled {
                         let r = b.ins().bor(x, y);
                         set!(*d, r);
                     }
-                    T::Sel { d, c, a, b: bb } => {
+                    T::Sel { d, c, a, b: bb, .. } => {
                         let (cv, x, y) = (reg!(*c), reg!(*a), reg!(*bb));
                         let r = b.ins().select(cv, x, y);
                         set!(*d, r);
