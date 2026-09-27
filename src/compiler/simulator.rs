@@ -6161,6 +6161,15 @@ pub struct Simulator {
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
+    /// Emptied `local_type_stack` overlay pairs, reused by `push_local_frame`
+    /// (capacity kept, contents cleared) instead of allocating a map pair for
+    /// every activation that records a class/typedef-typed name.
+    local_type_pool: Vec<(HashMap<String, String>, HashMap<String, String>)>,
+    /// Emptied subroutine names of popped `static_local_syncs` frames, reused
+    /// by the next frame push instead of allocating a copy of the name.
+    sync_name_pool: Vec<String>,
+    /// Scratch key for `cleanup_dyn_storage`.
+    dyn_key_scratch: String,
     /// Interned scope hints and head identifiers for `method_receiver_cache` keys (see there).
     method_receiver_hint_ids: HashMap<String, u32>,
     /// `resolve_typeref_class_name` memo: name -> scope -> class ctx -> (class-table size, answer).
@@ -10235,6 +10244,9 @@ impl Simulator {
             queue_key_scratch: String::new(),
             prop_owner_index: std::cell::RefCell::new(HashMap::default()),
             formal_parts_pool: Vec::new(),
+            local_type_pool: Vec::new(),
+            sync_name_pool: Vec::new(),
+            dyn_key_scratch: String::new(),
             method_receiver_hint_ids: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
@@ -95481,15 +95493,21 @@ impl Simulator {
         if !key.starts_with('@') {
             return;
         }
-        let size_key = format!("{}.size", key);
-        let elem_prefix = format!("{}[", key);
-        let mut stale: Vec<String> = self.signals.keys_with_elem_prefix(&elem_prefix);
-        if self.signals.contains_key(&size_key) {
-            stale.push(size_key.clone());
-        }
+        let mut size_key = std::mem::take(&mut self.dyn_key_scratch);
+        size_key.clear();
+        size_key.push_str(key);
+        size_key.push_str(".size");
+        // Every element key is indexed under its base (`key`), and a `@`
+        // key holds no `[`: the index entry is exactly the `key[` keys.
+        let stale: Vec<String> = self.signals.elem_keys(key);
+        let has_size = self.signals.contains_key(&size_key);
         for k in stale {
             self.signals.remove(&k);
             self.widths.remove(&k);
+        }
+        if has_size {
+            self.signals.remove(&size_key);
+            self.widths.remove(&size_key);
         }
         self.module.dynamic_arrays.remove(key);
         self.module.arrays.remove(key);
@@ -95498,9 +95516,10 @@ impl Simulator {
         self.module.descending_arrays.remove(key);
         self.module.var_decl_types.remove(key);
         self.module.array_elem_class.remove(key);
-        self.signals.remove(&format!("{}.size", key));
+        self.signals.remove(&size_key);
         self.widths.remove(key);
         self.string_signals.remove(key);
+        self.dyn_key_scratch = size_key;
     }
 
     /// Caller-frame state for a queue/dynamic-array LOCAL that a nested call
@@ -100001,15 +100020,38 @@ impl Simulator {
         self.local_stack.push(f);
         let fgen = self.next_frame_gen();
         self.local_gen_stack.push(fgen);
-        self.local_type_stack
-            .push((HashMap::default(), HashMap::default()));
+        let pair = self.local_type_pool.pop().unwrap_or_default();
+        self.local_type_stack.push(pair);
+    }
+
+    /// Return a popped `local_type_stack` pair to the pool: only lookups ever
+    /// read these maps, so a cleared map with retained capacity is as good as
+    /// a fresh one.
+    fn recycle_local_types(
+        &mut self,
+        pair: Option<(HashMap<String, String>, HashMap<String, String>)>,
+    ) {
+        if let Some(mut pair) = pair {
+            // A pair that never allocated is free to drop and to rebuild.
+            let (c0, c1) = (pair.0.capacity(), pair.1.capacity());
+            if (c0 | c1) != 0 && self.local_type_pool.len() < 64 && c0 <= 16 && c1 <= 16 {
+                if !pair.0.is_empty() {
+                    pair.0.clear();
+                }
+                if !pair.1.is_empty() {
+                    pair.1.clear();
+                }
+                self.local_type_pool.push(pair);
+            }
+        }
     }
 
     /// Pop a local frame, keeping the type overlay in lockstep. The frame
     /// map is recycled into `frame_pool` (capacity kept, contents cleared);
     /// use `pop_local_frame_take` when the caller needs the contents.
     fn pop_local_frame(&mut self) {
-        self.local_type_stack.pop();
+        let pair = self.local_type_stack.pop();
+        self.recycle_local_types(pair);
         self.local_gen_stack.pop();
         if let Some(mut f) = self.local_stack.pop() {
             if self.frame_pool.len() < 64 {
@@ -100021,7 +100063,8 @@ impl Simulator {
 
     /// Pop a local frame and hand the map to the caller (writeback reads).
     fn pop_local_frame_take(&mut self) -> Option<HashMap<String, Value>> {
-        self.local_type_stack.pop();
+        let pair = self.local_type_stack.pop();
+        self.recycle_local_types(pair);
         self.local_gen_stack.pop();
         self.local_stack.pop()
     }
@@ -116894,6 +116937,11 @@ impl Simulator {
         let DataType::TypeReference { name: tn, .. } = rt else {
             return false;
         };
+        // A plain class name is no type parameter, instance binding or
+        // typedef (see `plain_class_ref`), so the walk below ends at once.
+        if self.plain_class_ref(rt).is_some() {
+            return false;
+        }
         // Follow a typedef chain, then a type-parameter binding, then its
         // typedef, back to the base kind.
         let mut n = tn.name.name.to_string();
@@ -118405,11 +118453,22 @@ impl Simulator {
             .map(|(_, key)| key.clone())
     }
 
+    /// A `static_local_syncs` frame name: a pooled buffer holding `name`.
+    fn sync_frame_name(&mut self, name: &str) -> String {
+        let mut s = self.sync_name_pool.pop().unwrap_or_default();
+        s.clear();
+        s.push_str(name);
+        s
+    }
+
     /// §6.21: on subroutine return, copy each `static` local's final value from
     /// the (about-to-be-popped) local frame back into the persistent store, then
     /// close this call's sync frame. Called before `local_stack` is popped.
     fn sync_static_locals(&mut self) {
-        if let Some((_name, syncs)) = self.static_local_syncs.pop() {
+        if let Some((name, syncs)) = self.static_local_syncs.pop() {
+            if self.sync_name_pool.len() < 64 {
+                self.sync_name_pool.push(name);
+            }
             for (local_name, key) in syncs {
                 // Live-sourced statics keep `static_local_vars` authoritative
                 // (literal write-through + read-through); writing back the
@@ -119236,8 +119295,8 @@ impl Simulator {
         );
         let saved_m_scope_fn = std::mem::replace(&mut self.m_scope_stack, m_fn_entry);
         // §6.21: open a static-local sync frame keyed by this subroutine name.
-        self.static_local_syncs
-            .push((fd.name.name.name.clone(), Vec::new()));
+        let sync_name = self.sync_frame_name(&fd.name.name.name);
+        self.static_local_syncs.push((sync_name, Vec::new()));
         // Execute function body
         for stmt in &fd.items {
             self.exec_statement(stmt);
@@ -120343,8 +120402,8 @@ impl Simulator {
         }
         self.push_local_frame(locals);
         // §6.21: open a static-local sync frame keyed by this task name.
-        self.static_local_syncs
-            .push((td.name.name.name.clone(), Vec::new()));
+        let sync_name = self.sync_frame_name(&td.name.name.name);
+        self.static_local_syncs.push((sync_name, Vec::new()));
         // LRM §25.9: virtual-interface formals. When a formal's
         // declared data type names a known interface, register an
         // alias from the formal name to the caller's actual ident.
@@ -133691,12 +133750,19 @@ impl Simulator {
                 // `str.len()` dispatch to the string paths. Walk the inheritance
                 // chain from the callee's class and add each string property
                 // for the duration of this frame (removed on exit below).
-                {
-                    let props = self.class_string_props_of(&cname);
-                    for sp in props.iter() {
-                        if !self.string_signals.contains(sp) {
-                            self.string_signals.insert(sp.clone());
-                            frame_string_signals.push(sp.clone());
+                // The inserted properties are remembered by position in the
+                // (immutable, shared) list rather than by a second copy of
+                // the name; they are removed after the formals, as before.
+                let frame_string_props = self.class_string_props_of(&cname);
+                let mut frame_string_prop_mask: u64 = 0;
+                let mut frame_string_prop_more: Vec<usize> = Vec::new();
+                for (i, sp) in frame_string_props.iter().enumerate() {
+                    if !self.string_signals.contains(sp) {
+                        self.string_signals.insert(sp.clone());
+                        if i < 64 {
+                            frame_string_prop_mask |= 1u64 << i;
+                        } else {
+                            frame_string_prop_more.push(i);
                         }
                     }
                 }
@@ -133925,8 +133991,8 @@ impl Simulator {
                 // inside `get()` was re-initialized every call and class
                 // factory singletons never survived.) The key itself is
                 // made class/spec-aware at the declaration site above.
-                self.static_local_syncs
-                    .push((method_name.to_string(), Vec::new()));
+                let sync_name = self.sync_frame_name(method_name);
+                self.static_local_syncs.push((sync_name, Vec::new()));
                 // §21.2.1.7: the method body starts its own `%m` chain (see
                 // `m_path`); the caller's named blocks are not its scope.
                 let saved_m_scope = std::mem::take(&mut self.m_scope_stack);
@@ -133950,6 +134016,15 @@ impl Simulator {
                 self.close_decl_shadow_frame();
                 for n in &frame_string_signals {
                     self.string_signals.remove(n);
+                }
+                let mut mask = frame_string_prop_mask;
+                while mask != 0 {
+                    let i = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    self.string_signals.remove(&frame_string_props[i]);
+                }
+                for &i in &frame_string_prop_more {
+                    self.string_signals.remove(&frame_string_props[i]);
                 }
                 if let Some(removed) = self.string_signals_removed.pop() {
                     for n in removed {
