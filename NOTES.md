@@ -9,6 +9,18 @@ and the development workflow are in [README.md](README.md).
 
 **Correctness**
 
+* UVM: a blocking task called on a function result
+  (`pool.get("x").wait_trigger()`) suspends the caller;
+  `iface_array[i].handle = new` constructs the object; `$typename` of class
+  handles, `this` and class typedefs prints `class [pkg::]name #(params)`;
+  `std::randomize(obj.member) with {...}` works; queue and dynamic-array
+  locals of class methods are per call; 2-state class properties and
+  struct members drop X/Z on assignment (UVM register reads of a status
+  field returned X); inline constraints tying rand sub-objects together
+  are solved jointly; parked `wait(cond)` statements re-check only when a
+  name they read changes; SIGTERM and Ctrl-C end a run stuck in a
+  constraint solve within 5 s.
+* The `--features jit` build compiles again.
 * Functional coverage: covergroups work in instantiated modules,
   interfaces, packages, file scope, multi-top designs and classes declared
   in modules (each module instance gets its own covergroup, named `u0.cg`
@@ -383,6 +395,20 @@ and the development workflow are in [README.md](README.md).
 
 **Usability**
 
+* Code coverage: `--code-coverage[=stmt,branch,toggle]` (all three by
+  default), `--code-coverage-scope=<path>[,...]` and `XEZIM_CODE_COVERAGE`
+  turn on statement, branch (if/else and case arms including the implicit
+  ones, `?:`) and toggle (per-bit rise/fall) coverage; `+cover[=sbt]` and
+  `-coverage` now enable it too. Results go in `xezim_cov.json` under
+  `code_coverage`, per instance and per design unit, with a per-scope
+  summary under `--verbose`. It is off by default and costs nothing when
+  off. See docs/coverage-guide.md.
+* `$fwrite`/`$fdisplay` to regular files are buffered (64 KB per handle)
+  and flushed on `$fflush`, `$fclose`, `$finish`, `$system`, `$fopen`,
+  `$readmem*`/`$writemem*`, DPI/VPI calls and before any read of the same
+  file; a 400k-line trace testbench went from 1.78 s to 1.15 s. A
+  `tail -f` on a trace file now lags until the next flush.
+
 * The default simulation time limit is 100 ms instead of 100 µs, so UVM
   tests that run for milliseconds (for example 2–25 ms of simulated time)
   finish instead of stopping early. A design that never calls `$finish`
@@ -417,6 +443,16 @@ and the development workflow are in [README.md](README.md).
   line.
 
 **Performance** (instruction counts, output identical)
+
+* UVM class code, round three: member reads, calls, member-target
+  assignments and comparisons take direct paths, and flat names, handle
+  keys and element names are built without `format!` or clones. UVM stress
+  bench: 10.8 M -> 9.0 M host instructions per item (-17%); the six AVIPs
+  run 13-15% fewer instructions (axi4 46.6 G -> 39.8 G).
+* RTL: process FSMs resolve `<top>.path` reads (a testbench monitor ran on
+  the AST path with name lookups every clock), `check_edges` reuses its
+  fired-edge buffers, and FSM wait terms are cached: c906 CoreMark 471.5 G
+  -> 459.5 G (-2.5%), c906 memcpy -2.1%.
 
 * UVM class code, round two: formal snapshots by position, plain-type
   fast paths for locals and formals, per-class property-owner indexes,
