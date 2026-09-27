@@ -3,7 +3,7 @@
 // the original MWE plus all 11 analysis probes, combined into ONE
 // self-checking matrix (tests/classes SVTEST_* macro style).
 //
-// Bug family (full source-level path analysis in SOURCE_ROOT_CAUSE.md):
+// Bug family:
 //   * An interpreted `for (int i = ...)` / `foreach (arr[k])` writes its
 //     index variable under the BARE name into the runtime signals map, but
 //     every READ of the same name goes through hierarchical name
@@ -39,11 +39,10 @@
 //     which is what forces the AST-interpreter path (loop-bail) in xezim.
 //
 // Expected: on the unfixed build the seven collision probes (p1-p5, p8, p11)
-// fail their checks and the four controls stay green (TEST_FAIL count=11-12);
-// a correct simulator (and a fixed build) prints TEST_PASS.
+// fail their checks and the four controls stay green (TEST_FAIL count=7);
+// the reference simulator (and a fixed build) prints TEST_PASS.
 //
-// Run:  xezim loopvar_leaf_collision.sv -s tb_top --module-timescale 1ps/1ps --max-time 40
-//       xrun  loopvar_leaf_collision.sv -sv -timescale 1ps/1ps -exit
+// Run:  xezim loopvar_collision_child_leaf.sv -s tb_top
 
 `timescale 1ps/1ps
 

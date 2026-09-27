@@ -7193,12 +7193,12 @@ pub struct Simulator {
     /// activation: `Some(scope)` for an instance-scoped activation,
     /// `Some("")` for a top-scope one (its own names are the bare keys),
     /// `None` outside any activation (build/detection evals). Installed
-    /// at activation entry (§ run_process_stmts for process
+    /// at activation entry (run_process_stmts for process
     /// activations, the edge-block AST-fallback branch for edge blocks)
     /// and restored on exit. Unlike `name_resolve_hint` it is NEVER
     /// advanced by the resolution ratchet, so a bare name the
     /// activation's own scope declares always wins over a mid-block
-    /// hierarchical reference's ratcheted hint (§ 23.6: an
+    /// hierarchical reference's ratcheted hint (§23.6: an
     /// unqualified name never resolves DOWNWARD into an instance).
     /// Outside activations it stays None so compile-time evals keep
     /// their deliberate hint-first order (clock-gen detection installs
@@ -30243,18 +30243,18 @@ impl Simulator {
     }
 
     fn exec_bytecode(&mut self, block_idx: usize) -> bool {
-        // Install THIS block's activation scope (see `activation_scope`) §
+        // Install THIS block's activation scope (see `activation_scope`) —
         // the same contract as run_process_stmts. exec_bytecode is the edge
         // block's activation entry from every caller (sequential dispatch,
         // the needs_hint AST-fallback branch, parallel), and its interpreter
-        // can execute StmtFallback insns § raw AST statements whose
+        // can execute StmtFallback insns — raw AST statements whose
         // bare names must resolve in this block's scope even after an
         // earlier statement's hierarchical reference ratcheted the resolve
         // hint into an instance (a `u_child.x = 1` write must not redirect
         // the block's own bare names into u_child). The needs_hint branch
         // re-installs the same value around its post-return AST fallback.
-        // Fast path: re-firing with the same scope already installed skips
-        // the clone and RefCell churn on this hottest path.
+        // Fast path: a nested activation whose scope is already installed
+        // skips the clone and RefCell churn.
         //
         // A light block (see `edge_block_light`) never resolves a name, so
         // it needs no activation scope at all. Returning before the install
@@ -46862,7 +46862,7 @@ impl Simulator {
     }
 
     fn run_process_stmts(&mut self, pid: usize, pc: &ProcCont) {
-        // Install this activation's own scope (see `activation_scope`) §
+        // Install this activation's own scope (see `activation_scope`) —
         // the ratchet-proof twin of the hint reset performed inside. A
         // mid-block hierarchical reference (`u_child.x = 1` right before
         // a loop) ratchets the hint away, but a bare name this process's
@@ -54187,7 +54187,7 @@ impl Simulator {
                     let saved_hint = self.name_resolve_hint.borrow().clone();
                     // Same activation-scope install as run_process_stmts:
                     // the fallback stmts execute as THIS block's activation
-                    // ("" for a top block § its own names are the
+                    // ("" for a top block — its own names are the
                     // bare keys), ratchet-proof against a mid-block
                     // hierarchical reference redirecting the block's bare
                     // names downward into an instance.
@@ -84709,8 +84709,9 @@ impl Simulator {
         }
         // Scope-qualified shadowing for SINGLE-SEGMENT bare names — LRM
         // §22.4 / §23.6: a local declaration in the enclosing scope
-        // shadows a same-named member brought in via wildcard packag
-        // import. Without this, two modules' anon-enum members
+        // shadows a same-named member brought in via wildcard package
+        // import. If `hint.name` resolves, prefer it over the global
+        // bare name. Without this, two modules' anon-enum members
         // (e.g. cv32e40p_alu_div::FINISH=2 vs
         // cv32e40p_pkg::mult_state_e::FINISH=4) share one global slot;
         // whichever was registered last wins and the divider's FSM
@@ -84728,9 +84729,9 @@ impl Simulator {
         // Mirrors the bytecode compiler's lookup_signal_id scope-first
         // order, gated on `activation_scope`: the own-scope lookup uses
         // the ACTIVATION's scope (never the ratcheted hint, never a stale
-        // current_pid), and compile-time evals § which leave
+        // current_pid), and compile-time evals — which leave
         // activation_scope None and deliberately install the correct
-        // scope through the resolve hint § keep their hint-first
+        // scope through the resolve hint — keep their hint-first
         // order.
         if !raw.contains('.') {
             let activation = self.activation_scope.borrow();
@@ -84744,7 +84745,7 @@ impl Simulator {
                 }
                 // Instance-scoped activation: the scope-qualified key.
                 // When the scope does not declare the name, fall through
-                // § the bare key may be another module's hoisted
+                // — the bare key may be another module's hoisted
                 // name or a shared enum-member slot, and the hint (the
                 // own scope at activation entry) plus the pre-existing
                 // fallbacks own that decision.
