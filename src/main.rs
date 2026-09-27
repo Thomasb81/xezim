@@ -2974,7 +2974,10 @@ suppressed but the explicit SDF annotation still applies."
         match std::fs::read(path) {
             Ok(bytes) => {
                 file_labels.push(sf.clone());
-                sources.push(String::from_utf8_lossy(&bytes).into_owned());
+                sources.push(
+                    String::from_utf8(bytes)
+                        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+                );
             }
             Err(e) => {
                 eprintln!("Error: cannot read '{}': {}", sf, e);
