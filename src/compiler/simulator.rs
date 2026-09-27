@@ -7548,7 +7548,7 @@ impl Simulator {
                             next = val.wrapping_add(1);
                             members.push((m.name.name.clone(), val));
                         }
-                        module.typedefs.entry(name.clone()).or_insert(base_width);
+                        module.typedefs.insert_if_absent(name.clone(), base_width);
                         module.enum_members.insert(name, members);
                     }
                     _ => {
@@ -7558,7 +7558,7 @@ impl Simulator {
                             Some(&module.typedefs),
                         )
                         .max(1);
-                        module.typedefs.entry(name.clone()).or_insert(w);
+                        module.typedefs.insert_if_absent(name.clone(), w);
                         module.typedef_types.entry(name).or_insert(dt);
                     }
                 }
@@ -9787,7 +9787,7 @@ impl Simulator {
                 .max(1);
                 m.insert(name.clone(), (w, super::elaborate::is_type_signed(dt)));
             }
-            for (name, &w) in &module.typedefs {
+            for (name, &w) in module.typedefs.iter() {
                 m.entry(name.clone()).or_insert((w.max(1), false));
             }
             m

@@ -1152,7 +1152,7 @@ impl Simulator {
             let copy = |k: &str, sp: Span| {
                 !k.contains('.') && !k.contains("::") && dotted.contains(&(k.to_string(), sp.start))
             };
-            let mut functions = std::mem::take(&mut self.module.functions);
+            let mut functions = std::mem::take(&mut self.module.functions).into_map();
             for (key, fd) in functions.iter_mut() {
                 if copy(key, fd.span) && !self.module.pkg_subr_owner.contains_key(key.as_str()) {
                     continue;
@@ -1167,7 +1167,7 @@ impl Simulator {
                     .stmts(items);
                 }
             }
-            self.module.functions = functions;
+            self.module.functions = xezim_core::elaborate::FuncTable::from_map(functions);
             let mut tasks = std::mem::take(&mut self.module.tasks);
             for (key, td) in tasks.iter_mut() {
                 if copy(key, td.span) && !self.module.pkg_subr_owner.contains_key(key.as_str()) {
