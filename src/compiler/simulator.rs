@@ -75834,10 +75834,16 @@ impl Simulator {
             // back to a packed scalar copy: an unpacked struct has no
             // container signal, so every member was lost and the queue
             // yielded zeros. Module-scope queues were unaffected because
-            // elaboration registers them.
-            self.module
-                .var_decl_types
-                .insert(d.name.name.clone(), data_type.clone());
+            // elaboration registers them. (A recurring name keeps its key:
+            // only the value is replaced.)
+            match self.module.var_decl_types.get_mut(d.name.name.as_str()) {
+                Some(slot) => *slot = data_type.clone(),
+                None => {
+                    self.module
+                        .var_decl_types
+                        .insert(d.name.name.clone(), data_type.clone());
+                }
+            }
             // §7.4.1: a packed-of-packed local (`u8_vec16_t y;`)
             // needs its ELEMENT width registered, or `y[i]` reads
             // and writes degrade to single-BIT selects. This was the
@@ -76886,7 +76892,9 @@ impl Simulator {
                 // `%0d` display). A fresh decl also clears a stale
                 // same-named signed flag from another frame.
                 if !plain_class && self.type_is_signed_concrete(data_type) {
-                    self.signed_signals.insert(d.name.name.clone());
+                    if !self.signed_signals.contains(d.name.name.as_str()) {
+                        self.signed_signals.insert(d.name.name.clone());
+                    }
                 } else {
                     self.signed_signals.remove(&d.name.name);
                 }
@@ -76940,7 +76948,9 @@ impl Simulator {
                                 .contains_key(cn.split('#').next().unwrap_or(cn)));
                     if cn_is_class {
                         self.record_local_class_type(&d.name.name, cn);
-                        self.var_class_types.insert(d.name.name.clone(), cn.clone());
+                        if self.var_class_types.get(d.name.name.as_str()) != Some(cn) {
+                            self.var_class_types.insert(d.name.name.clone(), cn.clone());
+                        }
                         // A typedef'd local (e.g. `table_q_t rq` where
                         // `table_q_t = shared#(Foo[$])`) resolves to
                         // `cn` but hides the type_args inside the
