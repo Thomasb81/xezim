@@ -23,9 +23,16 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb_top", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "tb_top",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
+    let _ = std::fs::remove_dir_all(&dir);
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
     text
@@ -34,6 +41,7 @@ fn run(name: &str, src: &str) -> String {
 #[test]
 fn loopvar_collision_child_leaf_all_probes() {
     let text = run("merged", include_str!("loopvar_collision_child_leaf.sv"));
+    // The checker prints `FAIL @<time> : <probe>` per failed probe.
+    assert!(!text.contains("FAIL @"), "{text}");
     assert!(text.contains("TEST_PASS"), "{text}");
-    assert!(!text.contains("FAIL:"), "{text}");
 }
