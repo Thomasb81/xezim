@@ -101928,10 +101928,10 @@ impl Simulator {
 
     /// The unpacked-struct element type of queue `obj_name`, if it has one.
     fn queue_elem_struct(&self, obj_name: &str) -> Option<crate::ast::types::StructUnionType> {
-        if let Some(dt) = self.p_elem_type(obj_name) {
-            if let DataType::Struct(su) = self.resolve_dt(&dt) {
-                if Self::spreads_member_wise(&su) {
-                    return Some(su);
+        if let Some(dt) = self.p_elem_type_ref(obj_name) {
+            if let DataType::Struct(su) = self.resolve_dt_ref(&dt) {
+                if Self::spreads_member_wise(su) {
+                    return Some(su.clone());
                 }
             }
             return None;
