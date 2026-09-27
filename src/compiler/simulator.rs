@@ -87473,7 +87473,10 @@ impl Simulator {
     ) {
         let saved_ts = self.timescale_scope_override.take();
         self.timescale_scope_override = hint.map(|h| h.to_string());
-        self.set_m_block_scope(hint);
+        // `%m` wants the instance-relative scope the interpreter's edge path
+        // records; a root block's hint is the top module's name.
+        let m_scope = hint.map(|h| self.instance_relative_scope(h));
+        self.set_m_block_scope(m_scope.as_deref());
         let saved_hint = {
             let prev = self.name_resolve_hint.borrow().clone();
             if let Some(sc) = hint {
