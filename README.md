@@ -271,11 +271,30 @@ means your local checkout is active).
 
 ## Test Suite
 
-~2,370 integration tests run in CI, each in **both** execution modes — the
-bytecode interpreter (`cargo test`) and the JIT (`cargo test --features jit`).
-A large share are differential tests whose expected values were measured on a
-commercial reference simulator; their doc comments cite the LRM section and
-the measured behavior.
+The suite has **3,152 tests**: 3,110 integration tests in ten suites plus 42
+unit tests (as of 0.11; 9 more are marked `#[ignore]`). Each suite is one test
+binary, `tests/<suite>.rs`, with its cases in `tests/<suite>/`:
+
+| Suite | Tests | Covers |
+|---|---:|---|
+| `classes` | 460 | classes, UVM, randomization, covergroups |
+| `collections` | 155 | queues, dynamic and associative arrays, array methods |
+| `gates` | 122 | gate primitives, UDPs, drive strengths, waveform dumps |
+| `hierarchy` | 246 | instances, ports, interfaces, binds, hierarchical references |
+| `misc` | 1,009 | CLI, lint, elaboration, assignments and other cases |
+| `perf` | 35 | deterministic work counters that catch performance regressions |
+| `scheduling` | 432 | event regions, sensitivity, timing, assertions |
+| `strings` | 152 | strings, formatting, DPI |
+| `types` | 495 | data types, widths, selects, operators |
+| `upf` | 4 | power intent (`--upf`) |
+
+The xezim-core repo has its own 144 tests for the parser and elaboration.
+
+CI runs the suite twice: in a default build (`cargo test`) and in a build with
+the JIT compiled in (`cargo test --features jit`). JIT execution itself is
+switched on at run time with `XEZIM_JIT=1`. A large share are differential
+tests whose expected values were measured on a commercial reference simulator;
+their doc comments cite the LRM section and the measured behavior.
 
 **Credit:**
 All `pr*.v` tests were taken from the **Icarus Verilog test suite**.
