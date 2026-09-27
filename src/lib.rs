@@ -321,6 +321,7 @@ mod design_cache_tests {
             top,
             &["include".to_string()],
             &[("FEATURE".to_string(), Some("1".to_string()))],
+            None,
         )
         .0
     }
@@ -400,6 +401,7 @@ mod design_cache_tests {
             Some("top"),
             &[include_dir.clone()],
             &[],
+            None,
         );
         std::fs::write(&header, "`define WIDTH 16\n").unwrap();
         let after = design_cache_key(
@@ -409,6 +411,7 @@ mod design_cache_tests {
             Some("top"),
             &[include_dir],
             &[],
+            None,
         );
         let _ = std::fs::remove_dir_all(dir);
         assert_ne!((before.0, before.1), (after.0, after.1));
