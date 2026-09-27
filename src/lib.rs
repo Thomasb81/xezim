@@ -1095,6 +1095,11 @@ fn simulate_multi_inner(
         "[PHASE] compilation: {:.1}ms",
         compilation_start.elapsed().as_secs_f64() * 1000.0
     );
+    // Startup-cost measurement: stop once the design is ready to simulate,
+    // before any time-0 process runs.
+    if std::env::var_os("XEZIM_EXIT_AFTER_COMPILE").is_some() {
+        std::process::exit(0);
+    }
 
     if let Some(path) = emit_hypergraph {
         let t = std::time::Instant::now();

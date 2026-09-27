@@ -351,6 +351,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: trace named-event trigger/wait matching",
     ),
     (
+        "XEZIM_EXIT_AFTER_COMPILE",
+        "Profiling: exit right after elaboration and compile, before simulation time 0",
+    ),
+    (
         "XEZIM_FALLBACK_SITES",
         "Report each construct handed to the AST interpreter: reason, source byte span, scope",
     ),
