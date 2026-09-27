@@ -77100,26 +77100,11 @@ impl Simulator {
                 if shadow_frame {
                     self.push_local_frame(HashMap::default());
                 }
-                // Init-declared loop vars are automatic. The unconditional
-                // frame push above means they never land in the bare signal
-                // table from this arm, so the auto_loop_vars recording
-                // below cannot fire (a fork in the body instead captures
-                // the per-iteration value from the frame copy that
-                // inherit_fork_child_context gives each child, LRM
-                // §9.3.2). Kept for the day the frame push regains a
-                // condition. Popped on every exit path below.
-                let auto_pushed: usize = if self.local_stack.last().is_none() {
-                    let mut n = 0;
-                    for fi in init {
-                        if let ForInit::VarDecl { name, .. } = fi {
-                            self.auto_loop_vars.push(name.name.clone());
-                            n += 1;
-                        }
-                    }
-                    n
-                } else {
-                    0
-                };
+                // Init-declared loop vars are automatic. With the frame push
+                // above they always live in a local frame, never in the bare
+                // signal table, so a fork in the body captures the
+                // per-iteration value from the frame copy that
+                // inherit_fork_child_context gives each child (LRM §9.3.2).
                 for fi in init {
                     match fi {
                         ForInit::VarDecl {
@@ -77230,9 +77215,6 @@ impl Simulator {
                             v.is_signed = true;
                         }
                     }
-                }
-                for _ in 0..auto_pushed {
-                    self.auto_loop_vars.pop();
                 }
                 if shadow_frame {
                     self.pop_local_frame();
