@@ -1740,8 +1740,7 @@ const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 /// Measured on `bench/run_uvm_bench.sh`: -3.6% median across the UVM examples,
 /// which spend ~98% of the loop on this path. It is a TRADE, not a free win —
 /// `Arc::from` per splice costs a tight `forever` re-splicing a large block
-/// (+9% on the `cont_post_100` synthetic). See
-/// docs/perf_dump_offload_2026-07-28.md §6b.
+/// (+9% on the `cont_post_100` synthetic).
 #[derive(Clone, Debug)]
 struct ProcCont {
     stmts: Arc<[Statement]>,

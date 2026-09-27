@@ -7,9 +7,8 @@
 # simulation loop in `process`, with settle_calls=0, entry_evals=0, insns~0 and
 # no edge waiters at all. That is the AST-interpreted procedural path: task
 # inlining, blocking begin/end flattening, continuation capture on every
-# `#delay`. Nothing else here measures it, which is why two attempts at that
-# path (docs/perf_dump_offload_2026-07-28.md §6b, §6.2) had to be judged on
-# synthetics.
+# `#delay`. Nothing else here measures it, which is why two earlier attempts
+# at that path had to be judged on synthetics.
 #
 # So: this is the benchmark to use for procedural/testbench work, and NOT for
 # DUT work. On a UVM example `settle` is zero; on c910 `process` is one-time
