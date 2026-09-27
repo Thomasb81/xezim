@@ -27,13 +27,12 @@ The simulator is being developed incrementally, starting from simple combination
 Current capabilities include:
 
 * IEEE 1800-2023 grammar by default (`--sv2017` opts back to the earlier edition)
-* SystemVerilog module parsing
-* Signal and net representation
-* Continuous assignments
-* Basic expression evaluation
-* Combinational logic simulation
-* Sequential simulation infrastructure
-* Test execution framework
+* Event-driven simulation of RTL and gate-level netlists — continuous
+  assignments, procedural blocks and the IEEE 1800 scheduling regions, UDPs and
+  drive strengths, specify-block delays and timing checks, and SDF
+  back-annotation (`--sdf`)
+* Classes, constrained randomization, covergroups and concurrent assertions
+  (SVA) — the base the UVM support below runs on
 * Waveform / trace dumps (**`--wave`**, off by default) — VCD
   (`$dumpfile`/`$dumpvars`; IEEE 1800-2017 §21.7, and matches Verilator/Icarus
   in GTKWave), **FST** (`--fst`, GTKWave's binary format, written on a
@@ -50,7 +49,9 @@ Current capabilities include:
   objection-driven termination → report summary. The reference testbench
   (GettingVerilatorStartedWithUVM) reaches exact Verilator parity on the 2017
   library and runs green on 2020.3.1, and 32/35 UVM 1800.2-2017 example
-  testbenches pass. Multiple top
+  testbenches pass. The mbits-mirafra AVIP base tests for axi4, apb, i3c, spi
+  and axi4Lite print the same UVM messages as a commercial reference
+  simulator. Multiple top
   modules (`-s hdl_top -s hvl_top`) and virtual-interface `config_db` are supported.
   See [docs/uvm-guide.md](docs/uvm-guide.md).
 * **UVM's DPI-C library, built in** — compile UVM without `-DUVM_NO_DPI` and its
@@ -137,10 +138,51 @@ flows. Portable code should not rely on them.
 
 ---
 
+# Performance
+
+Whole-run wall-clock time on one machine (Intel Core i7-9800X, 6 cores,
+Linux): xezim 0.11 as a plain release build, against a commercial reference
+simulator in its optimized mode (no debug visibility). Both simulators produce
+the same results on every row.
+
+| Workload | xezim 0.11 | Reference simulator |
+|---|---|---|
+| XuanTie C906 SoC, CoreMark ×1 (295,294 cycles) | 91 s | 82 s, 44 s of it simulating |
+| XuanTie C910 dual-core SoC, memcpy ×200, cold start | 118 s, about 18 s of it compiling | 136 s, 97 s of it simulating |
+| AXI4 AVIP, UVM base test | 5.8 s | 97 s, 51 s of it simulating |
+| Peak memory, C906 CoreMark | 2.6 GB (0.9 GB with `XEZIM_PACKED_MEM=1`) | 57 MB |
+
+What the table shows:
+
+* **xezim starts fast.** It compiles and elaborates the 468-file C910 in
+  about 18 s, and a short UVM test finishes long before the reference has
+  started simulating. Test suites made of many short runs favour xezim.
+* **On long runs the reference's kernel is faster.** Its simulation phase is
+  about 2× faster on the C906. The gap is widest on UVM throughput: a sequence
+  item costs xezim about 9 M host instructions against about 120 K for the
+  reference, so long UVM runs still favour the reference. 0.11 cut xezim's
+  cost per item by about 60%, and this is where the current work goes.
+* **Memory is the other gap.** Most of the C906 figure is its large on-chip
+  RAMs; `XEZIM_PACKED_MEM=1` stores byte-wide memories compactly at the same
+  speed.
+
+To get the most out of a build, use the [profile-guided
+build](#profile-guided-build-recommended-for-release) (up to 14.5% fewer
+instructions when trained on your own workload) and keep the [warm design
+cache](#warm-design-cache) on. [Native compilation](#native-compilation) pays
+on designs with few, very hot blocks (Ibex CoreMark −23%) and is a net loss on
+large SoCs, so measure it on yours.
+
+# Conformance
+
+On the [sv-tests](https://github.com/chipsalliance/sv-tests) suite, xezim
+0.11.0 passes 4,722 of 4,770 tests (99.0%). Its own regression suite is
+described under [Test Suite](#test-suite).
+
 # Release notes
 
-Per-release change lists, the verified-workload table and the compliance
-results live in [NOTES.md](NOTES.md).
+Per-release change lists and earlier workload measurements live in
+[NOTES.md](NOTES.md).
 
 # Development workflow
 
@@ -420,6 +462,7 @@ Selected env knobs (off by default unless noted):
 | `XEZIM_NO_NATIVE_CACHE=1` | Disable the persistent native-library cache (`~/.cache/xezim/native`) |
 | `XEZIM_REGIONS=1` | Fuse dependency-connected compiled combinational entries into region blocks (experimental; currently net-negative on the benchmark set) |
 | `XEZIM_STUCK_CLOCK=1` | Flag a process parked on a clock/reset that never changes while the design keeps churning edges (`abort` variant for CI) |
+| `XEZIM_PACKED_MEM=1` | Store large byte-wide memories in a compact arena (C906: 2.6 GB → 0.9 GB peak memory, same speed) |
 | `XEZIM_INIT_ZERO=1` | Coerce X-initialized signals/arrays to 0 (required for some C910/C906 workloads, e.g. cmark) |
 | `XEZIM_PROGRESS=N` | Emit a `[PROGRESS]` line every N wall-seconds (sim_time, iters, edges_fired, nba_q) |
 | `XEZIM_CACHE_DIR=<dir>` | Override the elaborated-design cache directory |
