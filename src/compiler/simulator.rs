@@ -5820,6 +5820,8 @@ pub struct Simulator {
     /// `"<Class>::<name>"`; the set is the cheap gate that keeps every
     /// unshadowed access on the bare-name fast path.
     shadowed_prop_names: HashSet<String>,
+    /// Scratch key for the property-initializer loop of instantiation.
+    inst_key_scratch: String,
     /// Instantiation templates by leaf class name (see `InstTemplate`).
     inst_templates: std::cell::RefCell<HashMap<String, std::rc::Rc<InstTemplate>>>,
     /// §18.11: when `obj.randomize(a, b)` names a MEMBER SUBSET, only those
@@ -10207,6 +10209,7 @@ impl Simulator {
             randomize_subset: None,
             shadowed_prop_names: HashSet::default(),
             inst_templates: std::cell::RefCell::new(HashMap::default()),
+            inst_key_scratch: String::new(),
             settling: false,
             in_edge_block: false,
             in_edge_cont: false,
@@ -124487,13 +124490,19 @@ impl Simulator {
                 // redeclares lives under `<Class>::<name>` (seeded above);
                 // its initializer must land there, not in the derived copy.
                 let slot = {
-                    let q = format!("{}::{}", cdef.name, pname);
+                    let mut q = std::mem::take(&mut self.inst_key_scratch);
+                    q.clear();
+                    q.push_str(&cdef.name);
+                    q.push_str("::");
+                    q.push_str(&pname);
                     let shadowed = self
                         .heap
                         .get(handle)
                         .and_then(|o| o.as_ref())
-                        .is_some_and(|i| i.properties.contains_key(&q));
-                    if shadowed { q } else { pname.clone() }
+                        .is_some_and(|i| i.properties.contains_key(q.as_str()));
+                    let slot = if shadowed { q.clone() } else { pname.clone() };
+                    self.inst_key_scratch = q;
+                    slot
                 };
                 // A mailbox/semaphore member with an inline `= new()` must be
                 // ALLOCATED here. The `expr_contains_call` skip below leaves it
@@ -124600,10 +124609,17 @@ impl Simulator {
                 // '{1,2,3}`): the per-instance storage lives at
                 // `<handle>#member`, NOT in the scalar `properties` map.
                 // Evaluate the initializer and populate the queue namespace.
-                let scoped_q = format!("{}#{}", handle, pname);
-                if cdef.queue_properties.contains_key(&pname)
-                    || self.module.dynamic_arrays.contains(&scoped_q)
-                {
+                let is_queue_init = cdef.queue_properties.contains_key(&pname) || {
+                    use std::fmt::Write as _;
+                    let mut q = std::mem::take(&mut self.inst_key_scratch);
+                    q.clear();
+                    let _ = write!(q, "{}#{}", handle, pname);
+                    let hit = self.module.dynamic_arrays.contains(q.as_str());
+                    self.inst_key_scratch = q;
+                    hit
+                };
+                if is_queue_init {
+                    let scoped_q = format!("{}#{}", handle, pname);
                     self.populate_queue_from_init(&scoped_q, &init);
                     continue;
                 }
