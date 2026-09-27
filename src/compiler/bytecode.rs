@@ -10971,6 +10971,14 @@ impl<'a> BytecodeCompiler<'a> {
                 // per literal string, deduped with the elaboration/AST sites.
                 crate::compiler::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_str_radix(value, r, w);
+                // Same inline cache the AST evaluator keeps on this node: a
+                // literal in a declared range is re-evaluated for every
+                // reference to the signal.
+                if w <= 64 {
+                    if let Some((vb, xz)) = v.inline_bits() {
+                        cached_val.set(Some((vb, xz, w)));
+                    }
+                }
                 v.is_signed = *signed;
                 v.is_fill = xz_fill;
                 Some(v)
