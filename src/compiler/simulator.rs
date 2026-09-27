@@ -30255,6 +30255,19 @@ impl Simulator {
         // re-installs the same value around its post-return AST fallback.
         // Fast path: re-firing with the same scope already installed skips
         // the clone and RefCell churn on this hottest path.
+        //
+        // A light block (see `edge_block_light`) never resolves a name, so
+        // it needs no activation scope at all. Returning before the install
+        // keeps the per-firing String clone off the dispatch of the
+        // overwhelming majority of RTL blocks.
+        if self
+            .edge_block_light
+            .get(block_idx)
+            .copied()
+            .unwrap_or(false)
+        {
+            return self.exec_bytecode_inner(block_idx);
+        }
         let already = {
             let scope = self
                 .edge_blocks
@@ -46872,7 +46885,10 @@ impl Simulator {
             return self.run_process_stmts_inner(pid, pc);
         }
         let saved_activation_scope = self.activation_scope.replace(Some(
-            self.process_scope_hint.get(&pid).cloned().unwrap_or_default(),
+            self.process_scope_hint
+                .get(&pid)
+                .cloned()
+                .unwrap_or_default(),
         ));
         self.run_process_stmts_inner(pid, pc);
         *self.activation_scope.borrow_mut() = saved_activation_scope;
@@ -77234,8 +77250,7 @@ impl Simulator {
             // sees a local frame and takes the normal path, so every exit of
             // that path pops nothing extra.
             StatementKind::Foreach { vars, .. }
-                if self.local_stack.last().is_none()
-                    && vars.iter().any(|v| v.is_some()) =>
+                if self.local_stack.last().is_none() && vars.iter().any(|v| v.is_some()) =>
             {
                 self.push_local_frame(HashMap::default());
                 self.exec_statement(stmt);
@@ -84718,7 +84733,7 @@ impl Simulator {
         // scope through the resolve hint § keep their hint-first
         // order.
         if !raw.contains('.') {
-            let activation = self.activation_scope.borrow().clone();
+            let activation = self.activation_scope.borrow();
             match activation.as_deref() {
                 // Top-scope activation: its own module's names are the
                 // bare keys.
