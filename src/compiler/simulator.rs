@@ -46202,6 +46202,8 @@ impl Simulator {
                     if let Some(slot) = parent_frames[i].get_mut(k) {
                         if slot != v {
                             *slot = v.clone();
+                            // A parked `wait` of the parent may read it.
+                            note_store_write(name_bit(k));
                         }
                     }
                 }
