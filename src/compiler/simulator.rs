@@ -3554,6 +3554,74 @@ struct FormalMetaParts {
     typedef_type: Option<String>,
 }
 
+/// Declaration facts of one class method's formals and return value, built
+/// once per method (see `Simulator::method_call_plan`). The facts marked
+/// "type tables" read `typedefs` / `typedef_types` / `parameters` /
+/// `enum_members` / `plain_class_types`, which a procedural `typedef` or an
+/// inline-enum local can change at run time: they hold while
+/// `Simulator::type_tables_gen` equals `type_gen`, and every use re-derives them
+/// otherwise.
+struct MethodCallPlan {
+    /// Keeps the method alive, and with it the address the plan is keyed by.
+    _method: Arc<crate::ast::decl::ClassMethod>,
+    type_gen: u64,
+    ports: Vec<PortPlan>,
+    ret: Option<RetPlan>,
+    /// Every formal is a plain scalar or plain class: none has an actual to
+    /// resolve as a virtual interface (type tables).
+    all_plain: bool,
+    /// `(vif_local_names.len(), no formal name is in vif_local_names)` at the
+    /// last look; the set only grows, so an equal length is the same set.
+    vif_absent: std::cell::Cell<(usize, bool)>,
+}
+
+/// A memoized `method_defining_class` answer: the defining class, the
+/// method, and its call plan once built (see `MethodCallPlan`).
+#[derive(Clone)]
+struct MethodDef {
+    class: String,
+    method: Arc<crate::ast::decl::ClassMethod>,
+    plan: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<MethodCallPlan>>>>,
+}
+
+/// See `MethodCallPlan`.
+struct PortPlan {
+    /// `port_is_plain_scalar` (declaration only).
+    plain_scalar: bool,
+    /// `port_class_ref` (type tables).
+    class_ref: Option<bool>,
+    /// Width of a built-in integer or literal-range vector formal (type
+    /// tables); `None` for any other type.
+    fixed_width: Option<u32>,
+    /// `is_type_signed` of the declared type (declaration only).
+    signed: bool,
+    /// `is_virtual_iface_type` is false whatever the specialization: neither
+    /// an interface nor a type reference, or a plain class (type tables).
+    never_vif: bool,
+}
+
+/// See `MethodCallPlan` (functions only).
+struct RetPlan {
+    /// `method_return_is_string`, when no specialization can change it (type
+    /// tables).
+    is_string: Option<bool>,
+    /// The declared type is `string` (declaration only).
+    decl_string: bool,
+    /// `dyn_ret_type` of the call path (declaration only).
+    dyn_ret: Option<DataType>,
+    /// `unpacked_struct_of` (type tables).
+    unpacked: Option<crate::ast::types::StructUnionType>,
+    /// `resolve_type_width` of the declared type (type tables).
+    width: u32,
+    signed: bool,
+    real: bool,
+    two_state: bool,
+    /// A declared class-type return (the class tables are fixed).
+    class: Option<String>,
+    /// `fn_returns_collection` (type tables).
+    collection: bool,
+}
+
 /// The name-keyed type metadata a subroutine-local declaration displaced
 /// (see `decl_shadow_log`).
 #[derive(Debug, Clone)]
@@ -6138,9 +6206,7 @@ pub struct Simulator {
     string_keyed_member_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<bool>>>>,
     /// See `method_defining_class`.
     #[allow(clippy::type_complexity)]
-    method_def_cache: std::cell::RefCell<
-        HashMap<String, HashMap<String, Option<(String, Arc<crate::ast::decl::ClassMethod>)>>>,
-    >,
+    method_def_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<MethodDef>>>>,
     /// Every covergroup key and its leaf after the last `::` or `.` (see
     /// `covergroup_def_for`).
     covergroup_leaf_names: std::cell::OnceCell<HashSet<String>>,
@@ -6161,6 +6227,11 @@ pub struct Simulator {
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
+    /// Call plans by `Arc<ClassMethod>` address (see `MethodCallPlan`).
+    method_plans: std::cell::RefCell<HashMap<usize, std::rc::Rc<MethodCallPlan>>>,
+    /// Moves whenever a procedural `typedef` or an inline-enum local edits the
+    /// type tables at run time (see `MethodCallPlan`).
+    type_tables_gen: u64,
     /// Emptied `local_type_stack` overlay pairs, reused by `push_local_frame`
     /// (capacity kept, contents cleared) instead of allocating a map pair for
     /// every activation that records a class/typedef-typed name.
@@ -10244,6 +10315,8 @@ impl Simulator {
             queue_key_scratch: String::new(),
             prop_owner_index: std::cell::RefCell::new(HashMap::default()),
             formal_parts_pool: Vec::new(),
+            method_plans: std::cell::RefCell::new(HashMap::default()),
+            type_tables_gen: 0,
             local_type_pool: Vec::new(),
             sync_name_pool: Vec::new(),
             dyn_key_scratch: String::new(),
@@ -75905,6 +75978,7 @@ impl Simulator {
                         data_type,
                         &self.module.parameters,
                     ) {
+                        self.type_tables_gen += 1;
                         self.module.enum_members.insert(d.name.name.clone(), m);
                         if let Some(set) = self.plain_class_types.borrow_mut().as_mut() {
                             set.remove(&d.name.name);
@@ -78844,6 +78918,7 @@ impl Simulator {
                     Some(&self.module.parameters),
                     Some(&self.module.typedefs),
                 );
+                self.type_tables_gen += 1;
                 self.module.typedefs.insert(td.name.name.clone(), w);
                 self.module
                     .typedef_types
@@ -78886,6 +78961,8 @@ impl Simulator {
                     self.module
                         .enum_members
                         .insert(td.name.name.clone(), members);
+                    // The member values were evaluated after the first bump.
+                    self.type_tables_gen += 1;
                 }
             }
             StatementKind::VarDecl {
@@ -124624,10 +124701,14 @@ impl Simulator {
         // Ctor-time binding: a call on the object UNDER CONSTRUCTION starts
         // its search at the constructing class, not the runtime leaf.
         if method_name != "new" {
-            if let Some((ch, cc)) = self.ctor_class_stack.last().cloned() {
-                if ch == handle && self.class_has_method(&cc, method_name) {
-                    return self.exec_method_in_class_hierarchy(handle, &cc, method_name, args);
+            let ctor_class = match self.ctor_class_stack.last() {
+                Some((ch, cc)) if *ch == handle && self.class_has_method(cc, method_name) => {
+                    Some(cc.clone())
                 }
+                _ => None,
+            };
+            if let Some(cc) = ctor_class {
+                return self.exec_method_in_class_hierarchy(handle, &cc, method_name, args);
             }
         }
         // IEEE 1800-2023 §9.7 process class: kill/await/suspend/resume on a
@@ -133132,13 +133213,124 @@ impl Simulator {
         })
     }
 
+    /// The call plan of `method` (see `MethodCallPlan`).
+    fn method_call_plan(
+        &self,
+        method: &Arc<crate::ast::decl::ClassMethod>,
+    ) -> std::rc::Rc<MethodCallPlan> {
+        let key = Arc::as_ptr(method) as usize;
+        if let Some(p) = self.method_plans.borrow().get(&key) {
+            return p.clone();
+        }
+        let plan = std::rc::Rc::new(self.build_method_call_plan(method));
+        self.method_plans.borrow_mut().insert(key, plan.clone());
+        plan
+    }
+
+    fn build_method_call_plan(
+        &self,
+        method: &Arc<crate::ast::decl::ClassMethod>,
+    ) -> MethodCallPlan {
+        use crate::ast::decl::ClassMethodKind;
+        let ports = match &method.kind {
+            ClassMethodKind::Function(f) => &f.ports[..],
+            ClassMethodKind::Task(t) => &t.ports[..],
+            _ => &[],
+        };
+        let ports: Vec<PortPlan> = ports
+            .iter()
+            .map(|port| {
+                let class_ref = self.port_class_ref(port);
+                let dt = &port.data_type;
+                let fixed_width = (matches!(dt, DataType::IntegerAtom { .. })
+                    || Self::packed_dims_are_literal(dt))
+                .then(|| {
+                    super::elaborate::resolve_type_width(
+                        dt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    )
+                });
+                let never_vif = match dt {
+                    DataType::Interface { .. } => false,
+                    DataType::TypeReference { .. } => self.plain_class_ref(dt).is_some(),
+                    _ => true,
+                };
+                PortPlan {
+                    plain_scalar: Self::port_is_plain_scalar(port),
+                    class_ref,
+                    fixed_width,
+                    signed: super::elaborate::is_type_signed(dt),
+                    never_vif,
+                }
+            })
+            .collect();
+        let ret = match &method.kind {
+            ClassMethodKind::Function(f) => {
+                let rt = &f.return_type;
+                let is_string = match rt {
+                    DataType::TypeReference { .. } => {
+                        self.plain_class_ref(rt).is_some().then_some(false)
+                    }
+                    _ => Some(Self::is_string_data_type(rt)),
+                };
+                let dims = match rt {
+                    DataType::IntegerVector { dimensions, .. } => Some(dimensions),
+                    DataType::Implicit { dimensions, .. } => Some(dimensions),
+                    _ => None,
+                };
+                let dyn_ret = dims
+                    .filter(|ds| {
+                        ds.iter().any(|d| {
+                            matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
+                                if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
+                                    || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
+                        })
+                    })
+                    .map(|_| rt.clone());
+                let class = match rt {
+                    DataType::TypeReference { name, .. }
+                        if self.module.classes.contains_key(&name.name.name) =>
+                    {
+                        Some(name.name.name.clone())
+                    }
+                    _ => None,
+                };
+                Some(RetPlan {
+                    is_string,
+                    decl_string: Self::is_string_data_type(rt),
+                    dyn_ret,
+                    unpacked: self.unpacked_struct_of(rt),
+                    width: super::elaborate::resolve_type_width(
+                        rt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    ),
+                    signed: super::elaborate::is_type_signed(rt),
+                    real: super::elaborate::is_type_real(rt),
+                    two_state: super::elaborate::is_type_two_state(rt),
+                    class,
+                    collection: self.fn_returns_collection(rt),
+                })
+            }
+            _ => None,
+        };
+        let all_plain = ports
+            .iter()
+            .all(|p: &PortPlan| p.plain_scalar || p.class_ref.is_some());
+        MethodCallPlan {
+            _method: method.clone(),
+            type_gen: self.type_tables_gen,
+            ports,
+            ret,
+            all_plain,
+            vif_absent: std::cell::Cell::new((usize::MAX, false)),
+        }
+    }
+
     /// The class on `start_class`'s chain that defines function/task
     /// `method_name`, with the method; memoized per (start class, method).
-    fn method_defining_class(
-        &self,
-        start_class: &str,
-        method_name: &str,
-    ) -> Option<(String, Arc<crate::ast::decl::ClassMethod>)> {
+    fn method_defining_class(&self, start_class: &str, method_name: &str) -> Option<MethodDef> {
         if let Some(hit) = self
             .method_def_cache
             .borrow()
@@ -133151,7 +133343,11 @@ impl Simulator {
         let mut probe: Option<&str> = Some(start_class);
         while let Some(cn) = probe {
             if let Some(m) = self.cached_class_method(cn, method_name) {
-                found = Some((cn.to_string(), m));
+                found = Some(MethodDef {
+                    class: cn.to_string(),
+                    method: m,
+                    plan: std::rc::Rc::new(std::cell::RefCell::new(None)),
+                });
                 break;
             }
             probe = self
@@ -133225,8 +133421,9 @@ impl Simulator {
         // this function). The search is pure lookup, so it can hold a borrow;
         // only the class that actually defines the method is materialized.
         let found = self.method_defining_class(start_class, method_name);
-        let mut found_method = found.as_ref().map(|(_, m)| m.clone());
-        let mut cur_class: Option<String> = found.map(|(cn, _)| cn);
+        let mut found_method = found.as_ref().map(|d| d.method.clone());
+        let found_plan = found.as_ref().map(|d| d.plan.clone());
+        let mut cur_class: Option<String> = found.map(|d| d.class);
         while let Some(cname) = cur_class {
             let method_opt = found_method.take();
             cur_class = None;
@@ -133235,6 +133432,26 @@ impl Simulator {
                     ClassMethodKind::Function(f) => (&f.ports, &f.items),
                     ClassMethodKind::Task(t) => (&t.ports, &t.items),
                     _ => unreachable!("non-Function/Task methods filtered out above"),
+                };
+                // The plan rides on the memoized definition; it is (re)built
+                // when missing or when a run-time `typedef` moved the type
+                // tables since.
+                let cached_plan = found_plan
+                    .as_ref()
+                    .and_then(|c| c.borrow().clone())
+                    .filter(|p| p.type_gen == self.type_tables_gen);
+                let plan = match cached_plan {
+                    Some(p) => p,
+                    None => {
+                        self.method_plans
+                            .borrow_mut()
+                            .remove(&(Arc::as_ptr(&method) as usize));
+                        let p = self.method_call_plan(&method);
+                        if let Some(c) = found_plan.as_ref() {
+                            *c.borrow_mut() = Some(p.clone());
+                        }
+                        p
+                    }
                 };
                 let mut locals: HashMap<String, Value> = self.take_pooled_frame();
                 // §13.5.3: reorder named args into formal order and fill any
@@ -133258,31 +133475,32 @@ impl Simulator {
                         formal_parts.push((k, parts));
                     }
                 }
-                let ret_is_string = matches!(&method.kind,
-                    ClassMethodKind::Function(f) if self.method_return_is_string(&f.return_type));
+                let ret_is_string = match (&method.kind, plan.ret.as_ref()) {
+                    (ClassMethodKind::Function(_), Some(r))
+                        if plan.type_gen == self.type_tables_gen =>
+                    {
+                        match r.is_string {
+                            Some(s) => s,
+                            None => match &method.kind {
+                                ClassMethodKind::Function(f) => {
+                                    self.method_return_is_string(&f.return_type)
+                                }
+                                _ => false,
+                            },
+                        }
+                    }
+                    (ClassMethodKind::Function(f), _) => {
+                        self.method_return_is_string(&f.return_type)
+                    }
+                    _ => false,
+                };
                 // A packed return type whose range references a CLASS
                 // parameter (`function bit [W-1:0] mk();`) can only be
                 // sized per instance — capture it for the clamp at the
                 // return point below. Literal ranges resolve here (params
                 // = None succeeds) and stay un-clamped as before.
-                let dyn_ret_type: Option<DataType> = match &method.kind {
-                    ClassMethodKind::Function(f) => {
-                        let dims = match &f.return_type {
-                            DataType::IntegerVector { dimensions, .. } => Some(dimensions),
-                            DataType::Implicit { dimensions, .. } => Some(dimensions),
-                            _ => None,
-                        };
-                        dims.filter(|ds| {
-                            ds.iter().any(|d| {
-                                matches!(d, crate::ast::types::PackedDimension::Range { left, right, .. }
-                                    if crate::elaborate::const_eval_i64_with_params(left, None).is_none()
-                                        || crate::elaborate::const_eval_i64_with_params(right, None).is_none())
-                            })
-                        })
-                        .map(|_| f.return_type.clone())
-                    }
-                    _ => None,
-                };
+                let dyn_ret_type: Option<DataType> =
+                    plan.ret.as_ref().and_then(|r| r.dyn_ret.clone());
                 self.push_queue_frame();
                 // `output`/`inout`/`ref` formals copy back to the caller's
                 // actual on return (e.g. `randomize_instr(output riscv_instr
@@ -133292,16 +133510,49 @@ impl Simulator {
                 // A plain scalar or class formal cannot be bound to an
                 // interface; its actual is not resolved (a stale key under its
                 // name is still cleared).
-                let vif_formals: Vec<(&str, Option<&Expression>)> = ports
-                    .iter()
-                    .enumerate()
-                    .map(|(i, port)| {
-                        let plain =
-                            Self::port_is_plain_scalar(port) || self.port_class_ref(port).is_some();
-                        (port.name.name.as_str(), args.get(i).filter(|_| !plain))
-                    })
-                    .collect();
-                let vif_saved = self.vif_formals_enter(&vif_formals);
+                let plan_fresh = plan.type_gen == self.type_tables_gen;
+                // All formals plain and none ever keyed a `__vif_local__`:
+                // `vif_formals_enter` would only move the store generation
+                // (once per formal, i.e. once) and save nothing.
+                let vif_len0 = self.vif_local_names.len();
+                let vif_fast = plan_fresh && plan.all_plain && {
+                    let (len, absent) = plan.vif_absent.get();
+                    if len == vif_len0 {
+                        absent
+                    } else {
+                        let absent = ports
+                            .iter()
+                            .all(|p| !self.vif_local_names.contains(&p.name.name));
+                        plan.vif_absent.set((vif_len0, absent));
+                        absent
+                    }
+                };
+                let vif_formals: Vec<(&str, Option<&Expression>)> = if vif_fast {
+                    Vec::new()
+                } else {
+                    ports
+                        .iter()
+                        .enumerate()
+                        .map(|(i, port)| {
+                            let pp = &plan.ports[i];
+                            let plain = pp.plain_scalar
+                                || if plan_fresh {
+                                    pp.class_ref.is_some()
+                                } else {
+                                    self.port_class_ref(port).is_some()
+                                };
+                            (port.name.name.as_str(), args.get(i).filter(|_| !plain))
+                        })
+                        .collect()
+                };
+                let vif_saved = if vif_fast {
+                    if !ports.is_empty() {
+                        bump_store_gen();
+                    }
+                    Vec::new()
+                } else {
+                    self.vif_formals_enter(&vif_formals)
+                };
                 let mut queue_writebacks: Vec<(String, String)> = Vec::new();
                 let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
                 let mut assoc_params: Vec<(String, String, bool, Option<bool>)> = Vec::new();
@@ -133323,9 +133574,14 @@ impl Simulator {
                 for (i, port) in ports.iter().enumerate() {
                     // A plain scalar or class formal: none of the struct,
                     // collection, array or width probes below can claim it.
-                    let class_ref = self.port_class_ref(port);
+                    let pp = &plan.ports[i];
+                    let class_ref = if plan.type_gen == self.type_tables_gen {
+                        pp.class_ref
+                    } else {
+                        self.port_class_ref(port)
+                    };
                     let plain_class = class_ref.is_some();
-                    let plain = plain_class || Self::port_is_plain_scalar(port);
+                    let plain = plain_class || pp.plain_scalar;
                     if !plain && matches!(self.resolve_dt_ref(&port.data_type), DataType::Struct(_))
                     {
                         self.register_formal_type_metadata(
@@ -133571,18 +133827,22 @@ impl Simulator {
                         // unsigned actual signed and letting the frame widen it
                         // later sign-extended `2'b10` into -2 for every such
                         // method formal.
-                        let pw = super::elaborate::resolve_type_width(
-                            &port.data_type,
-                            Some(&self.module.parameters),
-                            Some(&self.module.typedefs),
-                        );
+                        let pp = &plan.ports[i];
+                        let pw = match pp.fixed_width {
+                            Some(w) if plan.type_gen == self.type_tables_gen => w,
+                            _ => super::elaborate::resolve_type_width(
+                                &port.data_type,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            ),
+                        };
                         if val.is_real {
                             val = Self::real_to_int(val.to_f64(), pw.max(1));
                         } else if pw > 0 && pw != val.width {
                             val = val.resize_for_assign(pw);
                         }
-                        val.is_signed = super::elaborate::is_type_signed(&port.data_type);
-                    } else if super::elaborate::is_type_signed(&port.data_type) {
+                        val.is_signed = pp.signed;
+                    } else if plan.ports[i].signed {
                         val.is_signed = true;
                     }
                     if let DataType::TypeReference { name: tn, .. } = &port.data_type {
@@ -133636,7 +133896,11 @@ impl Simulator {
                     // type; without them a member write inside the body escaped
                     // the frame.
                     if let ClassMethodKind::Function(f) = &method.kind {
-                        if let Some(su) = self.unpacked_struct_of(&f.return_type) {
+                        let su = match plan.ret.as_ref() {
+                            Some(r) if plan.type_gen == self.type_tables_gen => r.unpacked.clone(),
+                            _ => self.unpacked_struct_of(&f.return_type),
+                        };
+                        if let Some(su) = su {
                             for (k, w, is_real) in self.unpacked_struct_leaf_keys(rn, &su) {
                                 let seed = if is_real {
                                     Value::from_f64(0.0)
@@ -133652,8 +133916,10 @@ impl Simulator {
                     // string Value, not a 32-bit int — otherwise an implicit
                     // `funcname = {a, "b", ...}` string-concat assignment
                     // coerces to the int's 32-bit width and reads back empty.
-                    let init = if let ClassMethodKind::Function(f) = &method.kind {
-                        if Self::is_string_data_type(&f.return_type) {
+                    let init = if let (ClassMethodKind::Function(f), Some(rp)) =
+                        (&method.kind, plan.ret.as_ref())
+                    {
+                        if rp.decl_string {
                             Value::from_string("")
                         } else {
                             // Size the implicit return cell to the declared
@@ -133663,11 +133929,15 @@ impl Simulator {
                             // cell dropped the upper half. Register the width
                             // too so a later `retname = <narrow>` zero-extends
                             // back, mirroring a typed VarDecl.
-                            let rw = super::elaborate::resolve_type_width(
-                                &f.return_type,
-                                Some(&self.module.parameters),
-                                Some(&self.module.typedefs),
-                            )
+                            let rw = if plan.type_gen == self.type_tables_gen {
+                                rp.width
+                            } else {
+                                super::elaborate::resolve_type_width(
+                                    &f.return_type,
+                                    Some(&self.module.parameters),
+                                    Some(&self.module.typedefs),
+                                )
+                            }
                             .max(1);
                             match self.widths.get_mut(rn) {
                                 Some(slot) => *slot = rw,
@@ -133675,7 +133945,7 @@ impl Simulator {
                                     self.widths.insert(rn.to_string(), rw);
                                 }
                             }
-                            if super::elaborate::is_type_signed(&f.return_type) {
+                            if rp.signed {
                                 if !self.signed_signals.contains(rn) {
                                     self.signed_signals.insert(rn.to_string());
                                 }
@@ -133684,9 +133954,9 @@ impl Simulator {
                             }
                             // §13.4.1: type default — x for 4-state (see
                             // the module-function twin above).
-                            if super::elaborate::is_type_real(&f.return_type) {
+                            if rp.real {
                                 Value::from_f64(0.0)
-                            } else if super::elaborate::is_type_two_state(&f.return_type) {
+                            } else if rp.two_state {
                                 Value::zero(rw)
                             } else {
                                 Value::new(rw)
@@ -133709,16 +133979,9 @@ impl Simulator {
                     // (`new_report_message = new(name)`); fixing it makes the
                     // real report message's set_action/get_action persist so
                     // the report-server `$display` fires natively.
-                    if let ClassMethodKind::Function(f) = &method.kind {
-                        if let crate::ast::types::DataType::TypeReference { name, .. } =
-                            &f.return_type
-                        {
-                            let cn = name.name.name.clone();
-                            if self.module.classes.contains_key(&cn) {
-                                self.record_local_class_type(rn, &cn);
-                                self.var_class_types.insert(rn.to_string(), cn);
-                            }
-                        }
+                    if let Some(cn) = plan.ret.as_ref().and_then(|r| r.class.as_deref()) {
+                        self.record_local_class_type(rn, cn);
+                        self.var_class_types.insert(rn.to_string(), cn.to_string());
                     }
                 }
                 // Mark string-typed return variable and params so `s[i]`
@@ -133738,7 +134001,7 @@ impl Simulator {
                 // scope's `string <name>`.
                 self.string_signals_removed.push(Vec::new());
                 if let ClassMethodKind::Function(f) = &method.kind {
-                    if Self::is_string_data_type(&f.return_type) {
+                    if plan.ret.as_ref().is_some_and(|r| r.decl_string) {
                         if self.string_signals.insert(f.name.name.name.clone()) {
                             frame_string_signals.push(f.name.name.name.clone());
                         }
@@ -133788,8 +134051,9 @@ impl Simulator {
                 // NOW, while `this_stack` is still the CALLER's context
                 // (the bound vif lives there), before pushing the callee's.
                 let mut iface_alias_frame: HashMap<String, String> = HashMap::default();
+                let plan_fresh = plan.type_gen == self.type_tables_gen;
                 for (i, port) in ports.iter().enumerate() {
-                    if i < args.len() {
+                    if i < args.len() && !(plan_fresh && plan.ports[i].never_vif) {
                         if let Some((f, b)) =
                             self.vif_formal_alias(&port.data_type, &port.name.name, &args[i])
                         {
@@ -133859,10 +134123,11 @@ impl Simulator {
                         if inst.spec.is_some() {
                             self.current_spec = inst.spec.clone();
                         } else if let Some(cd) = self.module.classes.get(cn) {
-                            let mut param_names = cd.param_order.clone();
-                            if param_names.is_empty() {
-                                param_names = cd.type_param_names.clone();
-                            }
+                            let param_names: &[String] = if cd.param_order.is_empty() {
+                                &cd.type_param_names
+                            } else {
+                                &cd.param_order
+                            };
                             if !param_names.is_empty() {
                                 let sig_frags: Vec<String> = param_names
                                     .iter()
@@ -133985,8 +134250,13 @@ impl Simulator {
                 // here too — otherwise the shared `StatementKind::Return`
                 // lost the whole collection (an empty `'{}` came back as a
                 // one-element queue when assigned to a queue variable).
-                let method_ret_collection = match &method.kind {
-                    ClassMethodKind::Function(f) => self.fn_returns_collection(&f.return_type),
+                let method_ret_collection = match (&method.kind, plan.ret.as_ref()) {
+                    (ClassMethodKind::Function(_), Some(r))
+                        if plan.type_gen == self.type_tables_gen =>
+                    {
+                        r.collection
+                    }
+                    (ClassMethodKind::Function(f), _) => self.fn_returns_collection(&f.return_type),
                     _ => false,
                 };
                 self.fn_ret_collection_stack.push(method_ret_collection);
@@ -134061,8 +134331,13 @@ impl Simulator {
                 // return cell — its members are frame leaves, so the bare name
                 // read back x. Collapse them into the packed form while the
                 // frame is still live, exactly as a free function does.
-                let unpacked_ret_su = match &method.kind {
-                    ClassMethodKind::Function(f) => self.unpacked_struct_of(&f.return_type),
+                let unpacked_ret_su = match (&method.kind, plan.ret.as_ref()) {
+                    (ClassMethodKind::Function(_), Some(r))
+                        if plan.type_gen == self.type_tables_gen =>
+                    {
+                        r.unpacked.clone()
+                    }
+                    (ClassMethodKind::Function(f), _) => self.unpacked_struct_of(&f.return_type),
                     _ => None,
                 };
                 if let (Some(rn), Some(su)) = (fn_ret_name, unpacked_ret_su.as_ref()) {
@@ -134121,15 +134396,21 @@ impl Simulator {
                     );
                     if plainly_integral && !ret.is_real && !ret_is_string && dyn_ret_type.is_none()
                     {
-                        let w = resolve_type_width(
-                            &f.return_type,
-                            Some(&self.module.parameters),
-                            Some(&self.module.typedefs),
-                        );
+                        let w = match plan.ret.as_ref() {
+                            Some(r) if plan.type_gen == self.type_tables_gen => r.width,
+                            _ => resolve_type_width(
+                                &f.return_type,
+                                Some(&self.module.parameters),
+                                Some(&self.module.typedefs),
+                            ),
+                        };
                         if w > 0 && w != ret.width {
                             ret = ret.resize(w);
                         }
-                        ret.is_signed = super::elaborate::is_type_signed(&f.return_type);
+                        ret.is_signed = plan.ret.as_ref().map_or_else(
+                            || super::elaborate::is_type_signed(&f.return_type),
+                            |r| r.signed,
+                        );
                     }
                 }
                 // Snapshot output/ref formal values before dropping locals.
@@ -134178,7 +134459,24 @@ impl Simulator {
                     self.writeback_array_args(&array_writebacks);
                 }
                 let outs: Vec<&str> = writebacks.iter().map(|(pn, _, _)| pn.as_str()).collect();
-                let vif_ended = self.vif_formals_exit(vif_saved, &vif_formals, &outs);
+                let vif_ended = if !vif_fast {
+                    self.vif_formals_exit(vif_saved, &vif_formals, &outs)
+                } else if self.vif_local_names.len() == vif_len0 {
+                    // Still no formal name keyed: the exit only moves the
+                    // store generation again.
+                    if !ports.is_empty() {
+                        bump_store_gen();
+                    }
+                    HashMap::default()
+                } else {
+                    // The body keyed some name: replay the general exit from
+                    // the (empty) entry state.
+                    let vf: Vec<(&str, Option<&Expression>)> =
+                        ports.iter().map(|p| (p.name.name.as_str(), None)).collect();
+                    let saved: Vec<(String, Option<Value>)> =
+                        ports.iter().map(|_| (String::new(), None)).collect();
+                    self.vif_formals_exit(saved, &vf, &outs)
+                };
                 for (pn, v, caller) in writebacks {
                     if let Some(nm) = vif_ended.get(&pn) {
                         self.vif_bind_actual(&caller, nm);

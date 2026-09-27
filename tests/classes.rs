@@ -373,6 +373,8 @@ mod implication_joint_distribution;
 mod member_collection_runtime_class;
 #[path = "classes/member_visibility_local_protected.rs"]
 mod member_visibility_local_protected;
+#[path = "classes/method_call_plans.rs"]
+mod method_call_plans;
 #[path = "classes/method_int_formal_zero_extends.rs"]
 mod method_int_formal_zero_extends;
 #[path = "classes/method_local_base_per_process.rs"]
