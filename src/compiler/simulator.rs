@@ -108501,12 +108501,14 @@ impl Simulator {
 
     /// Check if `derived` extends `ancestor` (directly or transitively).
     fn class_extends(&self, derived: &str, ancestor: &str) -> bool {
-        let mut cur = Some(derived.to_string());
+        let mut cur: Option<&str> = Some(derived);
         while let Some(cname) = cur {
             if cname == ancestor {
                 return true;
             }
-            cur = self.get_class_def(&cname).and_then(|cd| cd.extends.clone());
+            cur = self
+                .get_class_def(cname)
+                .and_then(|cd| cd.extends.as_deref());
         }
         false
     }
@@ -123837,19 +123839,20 @@ impl Simulator {
             .cloned()
             .unwrap_or_else(|| std::sync::Arc::new(class_def.clone()));
         let mut classes_to_init = vec![leaf_arc];
-        let mut cur = class_def.extends.clone();
+        let mut cur: Option<&str> = class_def.extends.as_deref();
         // Cycle guard — `sanitize_class_hierarchy` already severs `extends`
         // cycles, but keep a defensive `seen` check so a stale chain can
-        // never spin this walk.
-        let mut seen: HashSet<String> = HashSet::default();
-        seen.insert(class_def.name.clone());
+        // never spin this walk. (A chain is a handful of names: a linear
+        // scan of borrowed names, no copies.)
+        let mut seen: Vec<&str> = vec![class_def.name.as_str()];
         while let Some(cname) = cur {
-            if !seen.insert(cname.clone()) {
+            if seen.contains(&cname) {
                 break;
             }
-            if let Some(cdef) = self.module.classes.get(&cname) {
+            seen.push(cname);
+            if let Some(cdef) = self.module.classes.get(cname) {
                 classes_to_init.push(std::sync::Arc::clone(cdef));
-                cur = cdef.extends.clone();
+                cur = cdef.extends.as_deref();
             } else {
                 break;
             }
@@ -123928,12 +123931,12 @@ impl Simulator {
         // including across TYPES, where a base `string` read back a derived
         // `int`'s bits. The leaf-most declarer keeps the bare key; every
         // other declarer stores under `"<Class>::<name>"`.
-        let leaf_declarer: HashMap<String, String> = {
-            let mut m: HashMap<String, String> = HashMap::default();
+        let leaf_declarer: HashMap<&str, &str> = {
+            let mut m: HashMap<&str, &str> = HashMap::default();
             for cdef in &classes_to_init {
                 // leaf-first: the first declarer seen is the leaf-most.
                 for p in cdef.properties.keys() {
-                    m.entry(p.clone()).or_insert_with(|| cdef.name.clone());
+                    m.entry(p.as_str()).or_insert(cdef.name.as_str());
                 }
             }
             m
@@ -123950,8 +123953,8 @@ impl Simulator {
                     continue;
                 }
                 let key = if leaf_declarer
-                    .get(prop_name)
-                    .is_some_and(|l| *l != cdef.name)
+                    .get(prop_name.as_str())
+                    .is_some_and(|l| *l != cdef.name.as_str())
                 {
                     self.shadowed_prop_names.insert(prop_name.clone());
                     format!("{}::{}", cdef.name, prop_name)
@@ -124018,7 +124021,10 @@ impl Simulator {
         // writes above the default width (and a wrong `$bits` until the first
         // whole write). The bindings this instance actually carries are only
         // complete now, after the loop above, so re-resolve those ranges here.
-        for cdef in &classes_to_init {
+        // With no parameter anywhere on the chain the bindings gathered below
+        // are always empty and every property is skipped.
+        let chain_has_params = classes_to_init.iter().any(|c| !c.param_defaults.is_empty());
+        for cdef in classes_to_init.iter().filter(|_| chain_has_params) {
             for (prop, dt) in &cdef.property_types {
                 let dims = match dt {
                     DataType::IntegerVector { dimensions, .. } if !dimensions.is_empty() => {
@@ -124314,10 +124320,10 @@ impl Simulator {
             // context unset, so `e_a v = DUP;` fell through to the flat
             // design-wide map and picked up an unrelated class's `DUP`.
             self.class_context_stack.push(Some(cdef.name.clone()));
-            let inits: Vec<(String, Expression)> = cdef
+            let inits: Vec<(String, &Expression)> = cdef
                 .property_inits
                 .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
+                .map(|(k, v)| (k.clone(), v))
                 .collect();
             let mut deferred_call_inits: Vec<(String, Expression, String)> = Vec::new();
             for (pname, init) in inits {
