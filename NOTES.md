@@ -5,6 +5,17 @@ and the development workflow are in [README.md](README.md).
 
 # What's new in 0.11
 
+### Unreleased
+
+**Correctness**
+
+* A loop variable declared in `for (int i = ...)` or `foreach (arr[k])` no
+  longer binds to a same-named variable in a child instance: the loop runs on
+  its own storage. It used to read the child's x and run zero iterations, or
+  step the child's counter. A bare name also no longer follows an earlier
+  hierarchical reference such as `u.x = 1` down into that child. (#195, from
+  PR #196 by Ganesh T S)
+
 ### 0.11.0 — code coverage, reference-parity fixes, faster UVM (September 2026)
 
 **Correctness**
