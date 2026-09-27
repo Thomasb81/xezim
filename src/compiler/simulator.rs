@@ -103024,10 +103024,9 @@ impl Simulator {
     /// `%p` argument quoting matches the concrete bound type.
     fn p_local_is_string(&self, name: &str) -> bool {
         use crate::ast::types::{DataType, SimpleType};
-        let Some(dt0) = self.module.var_decl_types.get(name).cloned() else {
+        let Some(mut dt) = self.module.var_decl_types.get(name) else {
             return self.string_signals.contains(name);
         };
-        let mut dt = dt0;
         // A typedef may alias a specialization of a class of the SAME name
         // (`typedef req_t #(.DW(DW)) req_t;`, snitch mem_test) — following
         // it lands on itself. Stop on any name seen before, or after a few
@@ -103043,7 +103042,7 @@ impl Simulator {
             ) {
                 return true;
             }
-            match &dt {
+            match dt {
                 DataType::TypeReference { name: tn, .. } => {
                     let n = tn.name.name.as_str();
                     if seen.iter().any(|sn| sn == n) || seen.len() >= 16 {
@@ -103052,7 +103051,7 @@ impl Simulator {
                     seen.push(n.to_string());
                     // Type parameter -> concrete bound type name.
                     if let Some(bound) = self.resolve_type_param_binding(n) {
-                        if let Some(bdt) = self.module.typedef_types.get(&bound).cloned() {
+                        if let Some(bdt) = self.module.typedef_types.get(&bound) {
                             dt = bdt;
                             continue 'walk;
                         }
@@ -103061,7 +103060,7 @@ impl Simulator {
                         return bound == "string";
                     }
                     // Named typedef -> its base.
-                    if let Some(bdt) = self.module.typedef_types.get(n).cloned() {
+                    if let Some(bdt) = self.module.typedef_types.get(n) {
                         dt = bdt;
                         continue 'walk;
                     }
