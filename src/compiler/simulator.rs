@@ -6227,6 +6227,8 @@ pub struct Simulator {
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
+    /// Emptied `current_spec` save buffers (see `clone_spec_pooled`).
+    spec_buf_pool: Vec<(String, String)>,
     /// Call plans by `Arc<ClassMethod>` address (see `MethodCallPlan`).
     method_plans: std::cell::RefCell<HashMap<usize, std::rc::Rc<MethodCallPlan>>>,
     /// Moves whenever a procedural `typedef` or an inline-enum local edits the
@@ -10315,6 +10317,7 @@ impl Simulator {
             queue_key_scratch: String::new(),
             prop_owner_index: std::cell::RefCell::new(HashMap::default()),
             formal_parts_pool: Vec::new(),
+            spec_buf_pool: Vec::new(),
             method_plans: std::cell::RefCell::new(HashMap::default()),
             type_tables_gen: 0,
             local_type_pool: Vec::new(),
@@ -47972,7 +47975,7 @@ impl Simulator {
                                 if let ExprKind::Specialization { .. } = &mrecv.kind {
                                     recv_spec = self.resolve_call_spec_params(
                                         Self::extract_call_spec(&func.clone()),
-                                        &self.current_spec.clone(),
+                                        &self.current_spec,
                                     );
                                 }
                             }
@@ -63056,10 +63059,9 @@ impl Simulator {
                 // cell). Without this `C#(int)::n = 5` fell through to a
                 // bare-name store the later read never consulted.
                 if let ExprKind::Specialization { .. } = &expr.kind {
-                    if let Some((base, sig)) = self.resolve_call_spec_params(
-                        Self::extract_call_spec(expr),
-                        &self.current_spec.clone(),
-                    ) {
+                    if let Some((base, sig)) = self
+                        .resolve_call_spec_params(Self::extract_call_spec(expr), &self.current_spec)
+                    {
                         if self.module.classes.contains_key(&base)
                             && !self.signal_name_to_id.contains_key(base.as_str())
                         {
@@ -93492,10 +93494,7 @@ impl Simulator {
                 type_args_text,
             } => {
                 let (b_name, b_sig) = self
-                    .resolve_call_spec_params(
-                        Self::extract_call_spec(e),
-                        &self.current_spec.clone(),
-                    )
+                    .resolve_call_spec_params(Self::extract_call_spec(e), &self.current_spec)
                     .unwrap_or_else(|| {
                         let name = if let ExprKind::Ident(h) = &base.kind {
                             h.path
@@ -93836,7 +93835,7 @@ impl Simulator {
                                 || cd.param_order.iter().any(|t| t == &frag)
                             {
                                 if let Some(resolved) =
-                                    self.resolve_type_param_with(&frag, &self.current_spec.clone())
+                                    self.resolve_type_param_with(&frag, &self.current_spec)
                                 {
                                     return Some(resolved);
                                 }
@@ -112516,7 +112515,7 @@ impl Simulator {
                 ExprKind::Specialization { .. } => {
                     let Some((b, s)) = self.resolve_call_spec_params(
                         Self::extract_call_spec(base),
-                        &self.current_spec.clone(),
+                        &self.current_spec,
                     ) else {
                         return None;
                     };
@@ -124326,13 +124325,13 @@ impl Simulator {
         // — `static this_type m_inst; m_inst = new()` inside a static method
         // dispatched on `typedef Common#(int,"alpha") AliasT;` — answer
         // value-parameter lookups in later virtual calls.
-        let active_spec = self.current_spec.clone().or(computed_spec.clone());
+        let active_spec = self.current_spec.as_ref().or(computed_spec.as_ref());
         if let Some((b, sig)) = active_spec {
             let c_base = class_def.name.split('#').next().unwrap_or(&class_def.name);
             if b == c_base {
-                instance.spec = Some((b.clone(), sig));
-            } else if self.class_extends(&b, c_base) {
-                if let Some(anc_sig) = self.ancestor_spec(&b, &sig, c_base) {
+                instance.spec = Some((b.clone(), sig.clone()));
+            } else if self.class_extends(b, c_base) {
+                if let Some(anc_sig) = self.ancestor_spec(b, sig, c_base) {
                     let anc_sig = self.canonicalize_spec_sig(c_base, &anc_sig);
                     instance.spec = Some((c_base.to_string(), anc_sig));
                 }
@@ -124688,12 +124687,12 @@ impl Simulator {
                 self.this_stack.pop();
             }
         }
-        let saved_spec = self.current_spec.clone();
+        let saved_spec = self.clone_spec_pooled();
         if computed_spec.is_some() {
             self.current_spec = computed_spec.clone();
         }
         self.exec_method_call(handle, "new", args);
-        self.current_spec = saved_spec;
+        self.restore_spec_pooled(saved_spec);
         Value::from_u64(handle as u64, 32)
     }
 
@@ -133328,6 +133327,26 @@ impl Simulator {
         }
     }
 
+    /// A copy of `current_spec` in recycled buffers (see `recycle_spec`):
+    /// the save half of a save/restore around a call, without allocating.
+    fn clone_spec_pooled(&mut self) -> Option<(String, String)> {
+        let (b, s) = self.current_spec.as_ref()?;
+        let mut buf = self.spec_buf_pool.pop().unwrap_or_default();
+        buf.0.clone_from(b);
+        buf.1.clone_from(s);
+        Some(buf)
+    }
+
+    /// Put `saved` back as `current_spec`, keeping the displaced value's
+    /// buffers for the next `clone_spec_pooled`.
+    fn restore_spec_pooled(&mut self, saved: Option<(String, String)>) {
+        if let Some(old) = std::mem::replace(&mut self.current_spec, saved) {
+            if self.spec_buf_pool.len() < 64 {
+                self.spec_buf_pool.push(old);
+            }
+        }
+    }
+
     /// The class on `start_class`'s chain that defines function/task
     /// `method_name`, with the method; memoized per (start class, method).
     fn method_defining_class(&self, start_class: &str, method_name: &str) -> Option<MethodDef> {
@@ -134074,7 +134093,7 @@ impl Simulator {
                 // bound leaf names in declaration order (the parser now captures
                 // builtin type args as Ident leaf names, so this matches
                 // extract_call_spec's type_args_text).
-                let saved_spec = self.current_spec.clone();
+                let saved_spec = self.clone_spec_pooled();
                 if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
                     let cn = &inst.class_name;
                     let bindings = &inst.type_bindings;
@@ -134120,8 +134139,16 @@ impl Simulator {
                         }
                     };
                     if differs {
-                        if inst.spec.is_some() {
-                            self.current_spec = inst.spec.clone();
+                        if let Some(src) = inst.spec.as_ref() {
+                            // Copied into the current buffers when there are
+                            // any (same value as a fresh clone).
+                            match self.current_spec.as_mut() {
+                                Some(dst) => {
+                                    dst.0.clone_from(&src.0);
+                                    dst.1.clone_from(&src.1);
+                                }
+                                None => self.current_spec = Some(src.clone()),
+                            }
                         } else if let Some(cd) = self.module.classes.get(cn) {
                             let param_names: &[String] = if cd.param_order.is_empty() {
                                 &cd.type_param_names
@@ -134307,7 +134334,7 @@ impl Simulator {
                         self.string_signals.insert(n);
                     }
                 }
-                self.current_spec = saved_spec;
+                self.restore_spec_pooled(saved_spec);
                 if let Some(prev) = saved_resolve_hint {
                     *self.name_resolve_hint.borrow_mut() = prev;
                 }
