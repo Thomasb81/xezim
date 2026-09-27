@@ -9234,10 +9234,7 @@ impl Simulator {
                     elem_name_buf.clear();
                     elem_name_buf.push_str(base);
                     elem_name_buf.push('[');
-                    {
-                        use std::fmt::Write as _;
-                        let _ = write!(elem_name_buf, "{}", idx);
-                    }
+                    Self::push_i64(&mut elem_name_buf, idx);
                     elem_name_buf.push(']');
                     push_elem_named(
                         elem_name_buf.as_str(),
@@ -9535,31 +9532,29 @@ impl Simulator {
                 || module.string_signals.contains(base)
         };
         if want_two_state || want_string || want_gate {
+            // The three sets are small next to the name table, so an exact
+            // (length, last byte) prefilter answers almost every probe
+            // without hashing the whole name.
+            let two_state_f = ShapeFilter::new(module.two_state_signals.iter().map(String::as_str));
+            let string_f = ShapeFilter::new(module.string_signals.iter().map(String::as_str));
+            let gate_f = ShapeFilter::new(module.gate_driven_nets.iter().map(String::as_str));
+            let two_state_has =
+                |s: &str| two_state_f.may_contain(s) && module.two_state_signals.contains(s);
+            let string_has = |s: &str| string_f.may_contain(s) && module.string_signals.contains(s);
+            let gate_has = |s: &str| gate_f.may_contain(s) && module.gate_driven_nets.contains(s);
             for (name, &id) in signal_name_to_id.iter() {
                 if id >= num_signals {
                     continue;
                 }
                 let name_ref: &str = name.as_ref();
-                let leaf = name_ref.rsplit('.').next().unwrap_or(name_ref);
-                let base = leaf.split('[').next().unwrap_or(leaf);
-                if want_two_state
-                    && (module.two_state_signals.contains(name_ref)
-                        || module.two_state_signals.contains(base))
-                {
+                let (leaf, base) = leaf_and_base(name_ref);
+                if want_two_state && (two_state_has(name_ref) || two_state_has(base)) {
                     signal_two_state[id] = true;
                 }
-                if want_string
-                    && (module.string_signals.contains(name_ref)
-                        || module.string_signals.contains(leaf)
-                        || module.string_signals.contains(base))
-                {
+                if want_string && (string_has(name_ref) || string_has(leaf) || string_has(base)) {
                     signal_is_string[id] = true;
                 }
-                if want_gate
-                    && (module.gate_driven_nets.contains(name_ref)
-                        || module.gate_driven_nets.contains(leaf)
-                        || module.gate_driven_nets.contains(base))
-                {
+                if want_gate && (gate_has(name_ref) || gate_has(leaf) || gate_has(base)) {
                     signal_gate_driven[id] = true;
                 }
             }
@@ -9717,38 +9712,57 @@ impl Simulator {
         // values are identical strings either way (they are compared and
         // sorted by CONTENT below and in `best_scope_from_leaf_index`), so
         // sharing the allocations is invisible to behaviour.
+        //
+        // The walk goes over `id_to_name` (every key of `signal_name_to_id`,
+        // in id order, i.e. sorted, with a name re-registered by an array
+        // counted twice — the dedup below absorbs that): consecutive names
+        // then mostly share their parent, which is reused without a lookup.
         let mut parent_intern: HashMap<Arc<str>, Arc<str>> = HashMap::default();
-        for full_name in signal_name_to_id
-            .keys()
+        let mut last_parent: Option<Arc<str>> = None;
+        for full_name in id_to_name
+            .iter()
             .map(|name| name.as_ref())
             .chain(module.arrays.keys().map(String::as_str))
             .chain(module.arrays_2d.keys().map(String::as_str))
             .chain(module.arrays_nd.keys().map(String::as_str))
         {
-            if let Some((parent, leaf)) = full_name.rsplit_once('.') {
-                let parent_arc = match parent_intern.get(parent) {
-                    Some(a) => a.clone(),
-                    None => {
-                        let a: Arc<str> = Arc::from(parent);
-                        parent_intern.insert(a.clone(), a.clone());
-                        a
-                    }
-                };
-                match scope_parents_by_leaf.get_mut(leaf) {
-                    Some(v) => v.push(parent_arc),
-                    None => {
-                        scope_parents_by_leaf.insert(Arc::from(leaf), vec![parent_arc]);
-                    }
+            let Some(dot) = full_name.bytes().rposition(|b| b == b'.') else {
+                continue;
+            };
+            let (parent, leaf) = (&full_name[..dot], &full_name[dot + 1..]);
+            let parent_arc = match &last_parent {
+                Some(a) if a.as_ref() == parent => a.clone(),
+                _ => {
+                    let a = match parent_intern.get(parent) {
+                        Some(a) => a.clone(),
+                        None => {
+                            let a: Arc<str> = Arc::from(parent);
+                            parent_intern.insert(a.clone(), a.clone());
+                            a
+                        }
+                    };
+                    last_parent = Some(a.clone());
+                    a
+                }
+            };
+            match scope_parents_by_leaf.get_mut(leaf) {
+                Some(v) => v.push(parent_arc),
+                None => {
+                    scope_parents_by_leaf.insert(Arc::from(leaf), vec![parent_arc]);
                 }
             }
         }
+        drop(last_parent);
         drop(parent_intern);
         for parents in scope_parents_by_leaf.values_mut() {
             // A leaf seen under exactly one scope — the common case here, since
             // every distinct array-element name has its own leaf — is already
-            // sorted and already unique.
+            // sorted and already unique. Id order usually leaves the rest
+            // sorted too.
             if parents.len() > 1 {
-                parents.sort_unstable();
+                if !parents.is_sorted() {
+                    parents.sort_unstable();
+                }
                 parents.dedup();
             }
         }
@@ -139599,5 +139613,89 @@ mod vm_fastpath_tests {
             assert_eq!(wide.width, w);
             assert_eq!(wide.is_signed, s);
         }
+    }
+}
+
+/// The last `.`-separated segment of a hierarchical name and that segment
+/// cut at its first `[` — what `rsplit('.')` / `split('[')` give, in one
+/// pass over the bytes.
+fn leaf_and_base(name: &str) -> (&str, &str) {
+    let leaf = match name.bytes().rposition(|b| b == b'.') {
+        Some(dot) => &name[dot + 1..],
+        None => name,
+    };
+    let base = match leaf.bytes().position(|b| b == b'[') {
+        Some(br) => &leaf[..br],
+        None => leaf,
+    };
+    (leaf, base)
+}
+
+/// Exact membership prefilter for a string set: a bitmap over (length,
+/// last byte). A string whose shape no member has is certainly absent; one
+/// that matches a shape still needs the real lookup.
+struct ShapeFilter {
+    bits: Vec<u64>,
+}
+
+impl ShapeFilter {
+    const LENS: usize = 1024;
+
+    fn key(s: &str) -> usize {
+        let len = s.len().min(Self::LENS - 1);
+        let last = s.as_bytes().last().copied().unwrap_or(0) as usize;
+        len * 256 + last
+    }
+
+    fn new<'a>(members: impl Iterator<Item = &'a str>) -> Self {
+        let mut bits = vec![0u64; Self::LENS * 256 / 64];
+        for m in members {
+            let k = Self::key(m);
+            bits[k >> 6] |= 1u64 << (k & 63);
+        }
+        Self { bits }
+    }
+
+    fn may_contain(&self, s: &str) -> bool {
+        let k = Self::key(s);
+        self.bits[k >> 6] & (1u64 << (k & 63)) != 0
+    }
+}
+
+#[cfg(test)]
+mod name_table_helper_tests {
+    use super::{ShapeFilter, leaf_and_base};
+
+    #[test]
+    fn leaf_and_base_match_the_split_forms() {
+        for name in [
+            "",
+            "a",
+            "a.b",
+            "top.u1.mem[3]",
+            "x[2].y",
+            "a.b[1][2]",
+            "a..b",
+            "a.",
+            ".a",
+            "[3]",
+        ] {
+            let leaf = name.rsplit('.').next().unwrap_or(name);
+            let base = leaf.split('[').next().unwrap_or(leaf);
+            assert_eq!(leaf_and_base(name), (leaf, base), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn shape_filter_never_rejects_a_member() {
+        let long = "x".repeat(2000);
+        let members = ["a", "top.sig", "mem[3]", "", long.as_str()];
+        let f = ShapeFilter::new(members.iter().copied());
+        for m in members {
+            assert!(f.may_contain(m), "{m:?}");
+        }
+        assert!(f.may_contain(&"y".repeat(1500).replace('y', "x")));
+        assert!(!f.may_contain("b"));
+        assert!(!f.may_contain("top.sig2"));
     }
 }
