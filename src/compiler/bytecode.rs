@@ -862,6 +862,25 @@ fn cat_dot(scope: &str, name: &str) -> String {
     s
 }
 
+thread_local! {
+    static SCOPED_KEY_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Run `f` on `scope.name` without allocating it: the key is built in a
+/// reused buffer (a nested use falls back to a fresh string).
+fn with_dotted<R>(scope: &str, name: &str, f: impl FnOnce(&str) -> R) -> R {
+    SCOPED_KEY_BUF.with(|b| match b.try_borrow_mut() {
+        Ok(mut buf) => {
+            buf.clear();
+            buf.push_str(scope);
+            buf.push('.');
+            buf.push_str(name);
+            f(&buf)
+        }
+        Err(_) => f(&cat_dot(scope, name)),
+    })
+}
+
 pub struct BytecodeCompiler<'a> {
     insns: Vec<Insn>,
     next_reg: u32,
@@ -1605,12 +1624,12 @@ impl<'a> BytecodeCompiler<'a> {
         let Some(m) = self.assoc_arrays else {
             return false;
         };
-        let raw = Self::hier_raw_name(hier);
-        if m.contains_key(&raw) {
+        let raw = Self::hier_raw_cow(hier);
+        if m.contains_key(raw.as_ref()) {
             return true;
         }
         if let Some(scope) = &self.scope_hint {
-            if m.contains_key(&cat_dot(scope, &raw)) {
+            if with_dotted(scope, &raw, |k| m.contains_key(k)) {
                 return true;
             }
         }
@@ -1637,13 +1656,13 @@ impl<'a> BytecodeCompiler<'a> {
     /// reference) must never match an unrelated same-named declaration
     /// elsewhere in the design (see `packed_elem_width_of`).
     fn packed_full_dims_of(&self, hier: &HierarchicalIdentifier) -> Option<&'a Vec<(i64, i64)>> {
-        let raw = Self::hier_raw_name(hier);
+        let raw = Self::hier_raw_cow(hier);
         let m = self.packed_full_dims?;
-        m.get(raw.as_str())
+        m.get(raw.as_ref())
             .or_else(|| {
                 self.scope_hint
                     .as_ref()
-                    .and_then(|sc| m.get(cat_dot(sc, &raw).as_str()))
+                    .and_then(|sc| with_dotted(sc, &raw, |k| m.get(k)))
             })
             .or_else(|| {
                 if hier.path.len() != 1 {
@@ -3999,6 +4018,14 @@ impl<'a> BytecodeCompiler<'a> {
         self.insns.push(insn);
     }
 
+    /// `hier_raw_name`, borrowed when the path has a single segment.
+    fn hier_raw_cow(hier: &HierarchicalIdentifier) -> std::borrow::Cow<'_, str> {
+        match hier.path.as_slice() {
+            [one] => std::borrow::Cow::Borrowed(one.name.name.as_str()),
+            _ => std::borrow::Cow::Owned(Self::hier_raw_name(hier)),
+        }
+    }
+
     fn hier_raw_name(hier: &HierarchicalIdentifier) -> String {
         match hier.path.as_slice() {
             [one] => one.name.name.clone(),
@@ -5023,11 +5050,12 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
-        let raw = Self::hier_raw_name(hier);
+        let raw = Self::hier_raw_cow(hier);
+        let raw: &str = &raw;
         // Targeted override for for-loop variables — see for_loop_var_ids
         // doc + compile_for's comment for the c910 motivation.
         if !self.for_loop_var_ids.is_empty() && hier.path.len() == 1 && !raw.contains('.') {
-            if let Some(&id) = self.for_loop_var_ids.get(&raw) {
+            if let Some(&id) = self.for_loop_var_ids.get(raw) {
                 return Some(id);
             }
         }
@@ -5041,19 +5069,21 @@ impl<'a> BytecodeCompiler<'a> {
         let rooted = hier.root.is_some();
         if !raw.contains('.') && !rooted {
             if let Some(scope) = &self.scope_hint {
-                let qualified = cat_dot(scope, &raw);
-                if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
+                if let Some(id) =
+                    with_dotted(scope, raw, |k| self.signal_name_to_id.get(k).copied())
+                {
                     return Some(id);
                 }
             }
         }
-        if let Some(&id) = self.signal_name_to_id.get(raw.as_str()) {
+        if let Some(&id) = self.signal_name_to_id.get(raw) {
             return Some(id);
         }
         if !rooted {
             if let Some(scope) = &self.scope_hint {
-                let qualified = cat_dot(scope, &raw);
-                if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
+                if let Some(id) =
+                    with_dotted(scope, raw, |k| self.signal_name_to_id.get(k).copied())
+                {
                     return Some(id);
                 }
             }
@@ -5068,8 +5098,10 @@ impl<'a> BytecodeCompiler<'a> {
         // refs whose absolute path was baked in by xezim's port-rewriting
         // (top-level instances have no prefix in signal_name_to_id).
         if let Some(top) = &self.top_module_name {
-            let with_dot = format!("{}.", top);
-            if let Some(stripped) = raw.strip_prefix(&with_dot) {
+            if let Some(stripped) = raw
+                .strip_prefix(top.as_str())
+                .and_then(|rest| rest.strip_prefix('.'))
+            {
                 if let Some(&id) = self.signal_name_to_id.get(stripped) {
                     return Some(id);
                 }
@@ -5091,23 +5123,24 @@ impl<'a> BytecodeCompiler<'a> {
     /// same-named parameter of another scope.
     fn param_twin_value(&self, hier: &HierarchicalIdentifier, id: usize) -> Option<Value> {
         let params = self.params?;
-        let raw = Self::hier_raw_name(hier);
-        let mut keys: Vec<String> = Vec::with_capacity(3);
+        let raw = Self::hier_raw_cow(hier);
+        // The exact keys, in order: scope-qualified, raw, bare single
+        // segment. The first one naming signal `id` decides.
+        let check = |k: &str| -> Option<Option<Value>> {
+            (self.signal_name_to_id.get(k).copied() == Some(id))
+                .then(|| params.get(k).filter(|v| !v.is_real).cloned())
+        };
         if let Some(scope) = &self.scope_hint {
-            keys.push(cat_dot(scope, &raw));
+            if let Some(r) = with_dotted(scope, &raw, check) {
+                return r;
+            }
         }
-        keys.push(raw.clone());
+        if let Some(r) = check(&raw) {
+            return r;
+        }
         if hier.path.len() == 1 {
-            keys.push(hier.path[0].name.name.clone());
-        }
-        for k in keys {
-            if self.signal_name_to_id.get(k.as_str()).copied() == Some(id) {
-                if let Some(v) = params.get(k.as_str()) {
-                    if !v.is_real {
-                        return Some(v.clone());
-                    }
-                }
-                return None;
+            if let Some(r) = check(&hier.path[0].name.name) {
+                return r;
             }
         }
         None
@@ -5115,14 +5148,14 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
         let params = self.params?;
-        let raw = Self::hier_raw_name(hier);
-        if let Some(v) = params.get(&raw) {
+        let raw = Self::hier_raw_cow(hier);
+        let raw: &str = &raw;
+        if let Some(v) = params.get(raw) {
             return Some(v.clone());
         }
         if let Some(scope) = &self.scope_hint {
-            let q = cat_dot(scope, &raw);
-            if let Some(v) = params.get(&q) {
-                return Some(v.clone());
+            if let Some(v) = with_dotted(scope, raw, |k| params.get(k).cloned()) {
+                return Some(v);
             }
         }
         if hier.path.len() == 1 {
@@ -5141,13 +5174,13 @@ impl<'a> BytecodeCompiler<'a> {
                 && raw.ends_with(name)
                 && (raw.len() == name.len() || raw.as_bytes()[raw.len() - name.len() - 1] == b'.');
             let key_has_raw_suffix = name.len() >= raw.len()
-                && name.ends_with(raw.as_str())
+                && name.ends_with(raw)
                 && (name.len() == raw.len() || name.as_bytes()[name.len() - raw.len() - 1] == b'.');
             raw_has_key_suffix || key_has_raw_suffix
         };
         let mut found: Option<&Value> = None;
         if let Some(idx) = self.param_leaf_idx {
-            let leaf = raw.rsplit('.').next().unwrap_or(raw.as_str());
+            let leaf = raw.rsplit('.').next().unwrap_or(raw);
             for name in idx.get(leaf).map(|v| v.as_slice()).unwrap_or(&[]) {
                 if is_match(name) {
                     if found.is_some() {
@@ -5538,17 +5571,17 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn packed_elem_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
-        let raw = Self::hier_raw_name(hier);
+        let raw = Self::hier_raw_cow(hier);
         self.packed_elem_widths
             .and_then(|m| {
-                m.get(raw.as_str())
+                m.get(raw.as_ref())
                     .copied()
                     // Inside an inlined instance the name is spelled bare
                     // while the table holds it under the instance path.
                     .or_else(|| {
                         self.scope_hint
                             .as_ref()
-                            .and_then(|sc| m.get(cat_dot(sc, &raw).as_str()).copied())
+                            .and_then(|sc| with_dotted(sc, &raw, |k| m.get(k).copied()))
                     })
                     // The bare-leaf fallback is for a SINGLE-segment name only.
                     // Applying it to `inp.sram_renA` (a packed-struct member
