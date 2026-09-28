@@ -25,6 +25,9 @@ fn gate_on() {
     // Safety: tests run in one process; the env var leaks between tests,
     // but every test in this file asserts gate-ON behavior only.
     unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
+    // Eager tier (0): these tests pin the COMPILED path; the default
+    // tiering threshold would keep cold bodies on the interpreter.
+    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
@@ -74,7 +77,7 @@ module top;
   end
 endmodule
 "#;
-    let mut sim = simulate(src).expect("simulate");
+    let mut sim = simulate(src, 100).expect("simulate");
     sim.run();
     assert_eq!(u(&sim, "a"), 20);
     assert_eq!(u(&sim, "b"), 10);
@@ -113,7 +116,7 @@ module top;
   end
 endmodule
 "#;
-    let mut sim = simulate(src).expect("simulate");
+    let mut sim = simulate(src, 100).expect("simulate");
     sim.run();
     assert_eq!(u(&sim, "a"), 7);
     assert_eq!(u(&sim, "b"), 3);
@@ -160,7 +163,7 @@ module top;
   end
 endmodule
 "#;
-    let mut sim = simulate(src).expect("simulate");
+    let mut sim = simulate(src, 100).expect("simulate");
     sim.run();
     assert_eq!(u(&sim, "a"), 1);
     assert_eq!(u(&sim, "b"), 1);
@@ -205,7 +208,7 @@ module top;
   end
 endmodule
 "#;
-    let mut sim = simulate(src).expect("simulate");
+    let mut sim = simulate(src, 100).expect("simulate");
     sim.run();
     assert_eq!(u(&sim, "a"), 5, "create-item handle must not be nulled");
     assert_eq!(u(&sim, "b"), 1);

@@ -203,6 +203,24 @@ fn compiled_methods_enabled() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// class-perf tiering: with the gate on, a method body is compiled only
+/// once it has been CALLED at least this many times (`XEZIM_METHOD_TIER`;
+/// default 100). Cold methods — the bulk of any UVM run — never pay
+/// admission or compilation and stay on the AST interpreter; hot ones
+/// converge to the compiled block after a bounded warmup. `0` restores
+/// compile-on-first-call (the pilot behavior the compiled_method_* tests
+/// pin). The interpreter frames below the threshold are bit-identical to
+/// a gate-OFF run, so tiering cannot change observable behavior.
+fn method_tier_threshold() -> u32 {
+    static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("XEZIM_METHOD_TIER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(100)
+    })
+}
 /// Sampler thread: read the hot thread's current hash and bump.
 pub fn sampler_sample() {
     let h = CUR_METHOD_HASH.load(Ordering::Relaxed);
@@ -6220,6 +6238,11 @@ pub struct Simulator {
     /// memoizing them skips the gate + type-resolution re-validation on every
     /// one of the (mostly negative-cached) UVM calls.
     compiled_method_skip: HashSet<(u32, u32)>,
+    /// class-perf tiering: per-(cid, mid) call counters. Bumped on every
+    /// call below the tier threshold, then never touched again (the
+    /// compiled path above the threshold is counter-free, so a hot method
+    /// pays zero map traffic once compiled).
+    compiled_method_call_counts: HashMap<(u32, u32), u32>,
    /// `resolve_typeref_class_name` memo: name -> scope -> class ctx -> (class-table size, answer).
     #[allow(clippy::type_complexity)]
     typeref_class_memo: std::cell::RefCell<
@@ -10282,6 +10305,7 @@ impl Simulator {
             compiled_method_block_cache: HashMap::default(),
             compiled_method_plans: HashMap::default(),
             compiled_method_skip: HashSet::default(),
+            compiled_method_call_counts: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
@@ -133865,6 +133889,23 @@ impl Simulator {
         // (the dominant cost on the hier-gen perf workload even though the block cache hits).
         if self.compiled_method_skip.contains(&(cid, mid)) {
             return None;
+        }
+        // Tiering: bump the call counter until the method proves itself
+        // hot. Every call below the threshold runs the AST interpreter
+        // verbatim (gate-OFF frames), so cold methods pay neither
+        // admission nor compilation; once the threshold is passed the
+        // counter is never touched again and the path below is
+        // counter-free.
+        let tier = method_tier_threshold();
+        if tier > 0 {
+            let calls = self
+                .compiled_method_call_counts
+                .entry((cid, mid))
+                .or_insert(0);
+            if *calls < tier {
+                *calls += 1;
+                return None;
+            }
         }
         // Step 7b: PREBOUND gate. Everything between the skip cache and the
         // block cache is a pure function of the class declaration + module

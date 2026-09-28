@@ -532,6 +532,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "class-perf: sample class-method execution (in-process sampling profiler)",
     ),
     (
+        "XEZIM_METHOD_TIER",
+        "class-perf: compile a class method only after N calls (0 = first call)",
+    ),
+    (
         "XEZIM_NAME_STATS",
         "Count string-keyed name lookups per site (UVM runtime-ID investigation)",
     ),

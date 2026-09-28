@@ -29,6 +29,9 @@ fn gate_on() {
     // Safety: tests run in one process; the env var leaks between tests,
     // but every test in this file asserts gate-ON behavior only.
     unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
+    // Eager tier (0): these tests pin the COMPILED path; the default
+    // tiering threshold would keep cold bodies on the interpreter.
+    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {

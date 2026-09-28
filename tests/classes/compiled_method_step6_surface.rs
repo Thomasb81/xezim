@@ -33,6 +33,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 fn gate_on() {
     // TODO: Audit that the environment access only happens in single-threaded code.
     unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
+    // Eager tier (0): these tests pin the COMPILED path; the default
+    // tiering threshold would keep cold bodies on the interpreter.
+    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
 }
 
 /// The `uvm_phase::get_schedule` shape: class-typed local seeded from `this`,
