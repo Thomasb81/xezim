@@ -89464,6 +89464,25 @@ impl Simulator {
         // of allocations.
         let (recv_expr, mname): (&Expression, &str) = match &func.kind {
             ExprKind::MemberAccess { expr, member } => (expr, member.name.as_str()),
+            // A BARE `f(...)` call inside a class-method frame is
+            // this-bounded: its width is the return type of the method
+            // resolved from the CURRENT lexical class. Without this arm the
+            // width probe EVALUATED the call, so a left-nested binary like
+            // f(a) + f(b) + f(c) ran its inner-left operand twice (the
+            // probe of the inner calls, then the value pass) — every
+            // side-effecting bare call in a left-nested sub-expression
+            // fired twice (reference-validated: 3 executions, not 5).
+            // Bare-name shadowing stays safe: method_ret_width returns
+            // None unless the chain actually declares the method, and the
+            // caller then falls through to the module-function lookup.
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                if let Some(Some(cn)) = self.class_context_stack.last() {
+                    if let Some(w) = self.method_ret_width(cn, h.path[0].name.name.as_str()) {
+                        return Some(w);
+                    }
+                }
+                return None;
+            }
             ExprKind::Ident(h) if h.path.len() == 2 => {
                 // `recv.m(...)` flattened to Ident([recv, m]). Reconstruct a
                 // borrowable Identifier for the receiver segment (no
