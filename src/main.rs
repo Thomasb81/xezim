@@ -316,8 +316,8 @@ fn print_usage() {
     eprintln!("Other simulators' spellings (also accepted inside -f files):");
     eprintln!("  <top> ...        A bare design-unit name (or work.<top>) that is not a file");
     eprintln!("                   names a top module, like -s; repeat for several tops");
-    eprintln!("  -F <file>        Args file; +incdir+ paths resolve like file names (as given,");
-    eprintln!("                   else against the args file's directory). -file = -f");
+    eprintln!("  -F <file>        Args file; +incdir+ paths resolve against the args file's");
+    eprintln!("                   directory, else as given. -file = -f");
     eprintln!(
         "  -do \"<cmds>\"     Also -do <file.do>. Subset: run -all (until $finish), run <n><unit>"
     );
@@ -597,6 +597,24 @@ fn push_plus_define(arg: &str, defines: &mut Vec<(String, Option<String>)>) {
     }
 }
 
+/// `-F`'s `+incdir+` rule: a relative directory names one next to the args
+/// file first, and only falls back to the path as given when there is none.
+/// resolve_rel()'s as-given-first order cannot do this: `.` always exists, so
+/// `+incdir+.` in an args file elsewhere meant the working directory, never
+/// the file's own.
+fn resolve_rel_file_first(base: &Path, p: &str) -> String {
+    let pp = Path::new(p);
+    if pp.is_absolute() {
+        return p.to_string();
+    }
+    let joined = base.join(pp);
+    if joined.exists() || !pp.exists() {
+        joined.to_string_lossy().to_string()
+    } else {
+        p.to_string()
+    }
+}
+
 fn resolve_rel(base: &Path, p: &str) -> String {
     let pp = Path::new(p);
     if pp.is_absolute() {
@@ -826,8 +844,8 @@ fn process_command_file(
                     xezim::compiler::simulator::set_no_timing_checks(true);
                 }
                 // `-F` differs from `-f` only in resolving `+incdir+` paths
-                // like file names: as given, else against the args file's own
-                // directory. `-file` is a long spelling of `-f`.
+                // against the args file's own directory, else as given (see
+                // resolve_rel_file_first). `-file` is a long spelling of `-f`.
                 "-f" | "-c" | "-F" | "-file" => {
                     let nested_rel = t == "-F";
                     i += 1;
@@ -884,7 +902,7 @@ fn process_command_file(
                     push_plus_incdir(t, include_dirs);
                     if incdir_rel {
                         for d in &mut include_dirs[first..] {
-                            *d = resolve_rel(base, d);
+                            *d = resolve_rel_file_first(base, d);
                         }
                     }
                 }
@@ -1826,7 +1844,7 @@ fn run_main() -> i32 {
                 &compat.libs,
             ) => {}
             // `-F` also resolves `+incdir+` paths against the args file's
-            // directory when they do not exist as given; `-file` is `-f`.
+            // directory first (resolve_rel_file_first); `-file` is `-f`.
             "-c" | "-f" | "-F" | "-file" => {
                 let incdir_rel = arg == "-F";
                 i += 1;
