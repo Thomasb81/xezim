@@ -56,7 +56,11 @@ module top;\n\
     $finish;\n\
   end endmodule";
     let t = tags(src);
-    assert_eq!(t, vec!["TAG_PASS"], "all draws must satisfy the coupled set");
+    assert_eq!(
+        t,
+        vec!["TAG_PASS"],
+        "all draws must satisfy the coupled set"
+    );
 }
 
 /// The SAME set reached through an INLINE `randomize() with {…}` (as the UVM
@@ -77,5 +81,38 @@ module top; initial begin : b\n\
     $display(\"TAG_FAIL vals %0d %0d %0d\", g.m_length, g.m_data.size(), g.m_streaming);\n\
   else $display(\"TAG_PASS\");\n\
   $finish; end endmodule\n";
-    assert_eq!(tags(src), vec!["TAG_PASS"], "inline with + .size must solve");
+    assert_eq!(
+        tags(src),
+        vec!["TAG_PASS"],
+        "inline with + .size must solve"
+    );
+}
+
+/// §18.5.8.1 — `d.size() == n` sizes the array FROM n, so n is still drawn
+/// over its whole range. Reading the current size back into n pinned it to
+/// the first call's length forever. Cross-checked against the reference
+/// simulator.
+#[test]
+fn size_tied_scalar_keeps_its_full_range() {
+    let src = r#"
+class dq;
+  rand bit [7:0] d[];
+  rand bit [3:0] n;
+  constraint c1 { d.size() == n; n inside {[3:8]}; }
+endclass
+module tb;
+  initial begin
+    automatic dq q = new;
+    automatic int sizes[int];
+    automatic int bad = 0;
+    for (int i = 0; i < 100; i++) begin
+      void'(q.randomize());
+      sizes[q.n] = 1;
+      if (q.d.size() != q.n) bad++;
+    end
+    $display("TAG_SIZES=%0d BAD=%0d", sizes.num(), bad);
+  end
+endmodule
+"#;
+    assert_eq!(tags(src), vec!["TAG_SIZES=6 BAD=0"]);
 }

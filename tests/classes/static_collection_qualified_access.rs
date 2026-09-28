@@ -73,7 +73,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "r0"), 7, "qualified static-collection element read inside a method");
+    assert_eq!(
+        u(&sim, "r0"),
+        7,
+        "qualified static-collection element read inside a method"
+    );
     assert_eq!(u(&sim, "r1"), 9, "module-scope read control");
 }
 
@@ -116,7 +120,11 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "r_a"), 5, "a_cfg::tbl[0]");
-    assert_eq!(u(&sim, "r_b"), 1006, "b_cfg::tbl[0] (its own store, not a_cfg's)");
+    assert_eq!(
+        u(&sim, "r_b"),
+        1006,
+        "b_cfg::tbl[0] (its own store, not a_cfg's)"
+    );
 }
 
 /// A class-qualified static-collection `push_back` (module-static-init /

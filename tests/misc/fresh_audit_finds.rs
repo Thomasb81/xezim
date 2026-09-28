@@ -33,8 +33,14 @@ endmodule
     let sim = simulate(src, 10).expect("simulate failed");
     let o = outs(&sim);
     assert!(o.contains(&"T|sorted='{1, 2, 4, 5}".to_string()), "{o:?}");
-    assert!(o.contains(&"T|afterdel='{1, 4, 5} sum=10".to_string()), "{o:?}");
-    assert!(o.contains(&"T|wsum=20".to_string()), "named iterator in reductions: {o:?}");
+    assert!(
+        o.contains(&"T|afterdel='{1, 4, 5} sum=10".to_string()),
+        "{o:?}"
+    );
+    assert!(
+        o.contains(&"T|wsum=20".to_string()),
+        "named iterator in reductions: {o:?}"
+    );
 }
 
 /// Reference: seen=4 — the wait parks until the FIELD changes.
@@ -55,7 +61,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert!(outs(&sim).contains(&"T|seen=4".to_string()), "{:?}", outs(&sim));
+    assert!(
+        outs(&sim).contains(&"T|seen=4".to_string()),
+        "{:?}",
+        outs(&sim)
+    );
 }
 
 /// §6.21 (audit #44, reference-validated): a local variable WITH an
@@ -76,7 +86,10 @@ endmodule
         Ok(_) => panic!("static-task local with init must be rejected"),
         Err(e) => e,
     };
-    assert!(err.contains("implicitly static"), "diagnostic names the rule, got: {err}");
+    assert!(
+        err.contains("implicitly static"),
+        "diagnostic names the rule, got: {err}"
+    );
 
     let bad_pkg = r#"
 package pk;
@@ -86,7 +99,10 @@ module tb;
   initial void'(pk::f());
 endmodule
 "#;
-    assert!(simulate(bad_pkg, 10).is_err(), "package-scope static function local with init must be rejected");
+    assert!(
+        simulate(bad_pkg, 10).is_err(),
+        "package-scope static function local with init must be rejected"
+    );
 
     let ok = r#"
 module tb;

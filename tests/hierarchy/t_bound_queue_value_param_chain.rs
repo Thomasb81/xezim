@@ -54,16 +54,40 @@ module top;
 endmodule
 "#;
     let out: Vec<String> = simulate_multi(
-        &[src.to_string()], 1000, Some("top"), &[], &[], None, false, None, None,
-        &[], &[], None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &[src.to_string()],
+        1000,
+        Some("top"),
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
     )
     .expect("sim")
     .output
     .iter()
     .map(|o| o.message.clone())
     .collect();
-    assert!(out.iter().any(|l| l.contains("CD5 sz=4 1,2,3,4")),
-        "expected full element set; got {:?}", out);
+    assert!(
+        out.iter().any(|l| l.contains("CD5 sz=4 1,2,3,4")),
+        "expected full element set; got {:?}",
+        out
+    );
     assert!(out.iter().any(|l| l == "CD5_PASS"), "got {:?}", out);
     assert!(!out.iter().any(|l| l == "CD5_FAIL"), "got {:?}", out);
 }

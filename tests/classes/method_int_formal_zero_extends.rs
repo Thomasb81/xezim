@@ -32,7 +32,15 @@ fn narrow_actual_to_int_method_formal_zero_extends() {
   end
 endmodule",
     );
-    for want in ["ctor=2", "lit=2", "named=2", "method=2 byte=6", "neg=-3", "vec=2 b8=2", "vecneg=-7"] {
+    for want in [
+        "ctor=2",
+        "lit=2",
+        "named=2",
+        "method=2 byte=6",
+        "neg=-3",
+        "vec=2 b8=2",
+        "vecneg=-7",
+    ] {
         assert!(msgs.iter().any(|m| m == want), "missing {want}: {msgs:?}");
     }
 }

@@ -151,7 +151,12 @@ fn decode(path: &PathBuf) -> Fst {
     reader
         .read_hierarchy(|entry| match entry {
             FstHierarchyEntry::Scope { name, tpe, .. } => {
-                assert_eq!(tpe, FstScopeType::Module, "scope `{}` is not a module", name);
+                assert_eq!(
+                    tpe,
+                    FstScopeType::Module,
+                    "scope `{}` is not a module",
+                    name
+                );
                 scopes.push(name);
             }
             FstHierarchyEntry::UpScope => {
@@ -380,7 +385,12 @@ fn wide_vectors_round_trip_at_full_width() {
     assert_eq!(v.length, 96);
     let tl = fst.timeline("top.vwide");
     for (_, val) in &tl {
-        assert_eq!(val.len(), 96, "a 96-bit net must emit 96 characters: {}", val);
+        assert_eq!(
+            val.len(),
+            96,
+            "a 96-bit net must emit 96 characters: {}",
+            val
+        );
     }
     assert_eq!(tl[0].1, "0".repeat(96));
     // +1<<64 per posedge: bit 64 set, counting up in the high 32 bits.
@@ -499,7 +509,12 @@ fn an_event_emits_a_pulse_at_every_trigger() {
     let pulses: Vec<u64> = fst
         .changes
         .get(&fst.var("top.ev").handle)
-        .map(|v| v.iter().filter(|(_, x)| x == "1").map(|(t, _)| *t).collect())
+        .map(|v| {
+            v.iter()
+                .filter(|(_, x)| x == "1")
+                .map(|(t, _)| *t)
+                .collect()
+        })
         .unwrap_or_default();
     assert_eq!(pulses, vec![5, 15, 25], "one pulse per trigger");
 }
@@ -546,7 +561,16 @@ endmodule
         let _ = std::fs::remove_file(out);
         let o = std::process::Command::new(&bin)
             .current_dir(&dir)
-            .args(["--simulate", "--max-time", "200", "-s", "top", "--fst-scope", scope, "--fst"])
+            .args([
+                "--simulate",
+                "--max-time",
+                "200",
+                "-s",
+                "top",
+                "--fst-scope",
+                scope,
+                "--fst",
+            ])
             .arg(out)
             .arg(&sv)
             .output()
@@ -581,9 +605,5 @@ endmodule
     let err = run("top.gen[0]", &ok_fst);
     assert!(ok_fst.exists(), "indexed generate scope must dump:\n{err}");
     let fst = decode(&ok_fst);
-    assert!(
-        fst.has("top.gen[0].gsig"),
-        "have {:?}",
-        fst.paths()
-    );
+    assert!(fst.has("top.gen[0].gsig"), "have {:?}", fst.paths());
 }

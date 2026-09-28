@@ -14,8 +14,10 @@ fn run_aot(src: &str) -> String {
     let _ = std::fs::create_dir_all(&dir);
     let f = dir.join("aot_native_paths.sv");
     std::fs::write(&f, src).unwrap();
+    // `--verbose`: the "[AOT] comb entries compiled" line asserted below is
+    // engine chatter, off by default.
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--no-cache", "-s", "tb", "--max-time", "1000"])
+        .args(["--no-cache", "--verbose", "-s", "tb", "--max-time", "1000"])
         .arg(&f)
         .env("XEZIM_JIT", "1")
         .env("XEZIM_AOT", "1")
@@ -82,7 +84,10 @@ endmodule
     let sig = |n: &str| -> u64 {
         let pat = format!("{}=", n);
         text.lines()
-            .find_map(|l| l.strip_prefix(&pat).and_then(|v| u64::from_str_radix(v.trim(), 16).ok()))
+            .find_map(|l| {
+                l.strip_prefix(&pat)
+                    .and_then(|v| u64::from_str_radix(v.trim(), 16).ok())
+            })
             .unwrap_or_else(|| panic!("missing {} in output:\n{}", n, text))
     };
     // The design prints nothing itself; read values via $display added here:
@@ -145,7 +150,8 @@ endmodule
     std::fs::write(&f, body).unwrap();
     let run = |aot: bool| -> String {
         let mut c = Command::new(env!("CARGO_BIN_EXE_xezim"));
-        c.args(["--no-cache", "-s", "tb", "--max-time", "1000"]).arg(&f);
+        c.args(["--no-cache", "-s", "tb", "--max-time", "1000"])
+            .arg(&f);
         if aot {
             c.env("XEZIM_JIT", "1").env("XEZIM_AOT", "1");
         }
@@ -199,7 +205,8 @@ endmodule
     std::fs::write(&f, body).unwrap();
     let run = |aot: bool| -> String {
         let mut c = Command::new(env!("CARGO_BIN_EXE_xezim"));
-        c.args(["--no-cache", "-s", "tb", "--max-time", "1000"]).arg(&f);
+        c.args(["--no-cache", "-s", "tb", "--max-time", "1000"])
+            .arg(&f);
         if aot {
             c.env("XEZIM_JIT", "1").env("XEZIM_AOT", "1");
         }
@@ -212,8 +219,14 @@ endmodule
     };
     let plain = run(false);
     let aot = run(true);
-    assert!(plain.starts_with("EDGE "), "interpreter run produced no result");
-    assert_eq!(aot, plain, "AOT edge-block values must match the interpreter");
+    assert!(
+        plain.starts_with("EDGE "),
+        "interpreter run produced no result"
+    );
+    assert_eq!(
+        aot, plain,
+        "AOT edge-block values must match the interpreter"
+    );
 }
 
 #[test]

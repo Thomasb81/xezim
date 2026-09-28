@@ -52,5 +52,9 @@ endmodule
         "T|cc 34 ff 00 -3 11 22 xx",
         "force holds / 2-state fits / negative-lo lives"
     );
-    assert_eq!(line(&sim, "T|after"), "T|after mem0=02", "release restores writability");
+    assert_eq!(
+        line(&sim, "T|after"),
+        "T|after mem0=02",
+        "release restores writability"
+    );
 }

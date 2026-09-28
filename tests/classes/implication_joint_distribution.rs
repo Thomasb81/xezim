@@ -41,7 +41,10 @@ module tb;
   end
 endmodule",
     );
-    let line = msgs.iter().find(|m| m.starts_with("DIST ")).expect("no DIST line");
+    let line = msgs
+        .iter()
+        .find(|m| m.starts_with("DIST "))
+        .expect("no DIST line");
     assert!(line.ends_with("bad=0 majority=1"), "{line}");
 }
 
@@ -77,6 +80,9 @@ module tb;
   end
 endmodule",
     );
-    let line = msgs.iter().find(|m| m.starts_with("DIST ")).expect("no DIST line");
+    let line = msgs
+        .iter()
+        .find(|m| m.starts_with("DIST "))
+        .expect("no DIST line");
     assert!(line.ends_with("bad=0 spread=1"), "{line}");
 }

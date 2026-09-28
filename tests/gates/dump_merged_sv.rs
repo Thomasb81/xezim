@@ -53,13 +53,25 @@ fn merged_dump_resolves_ifdefs_and_reruns_standalone() {
         text.contains("Wrote merged preprocessed SV"),
         "dump confirmation missing; got:\n{text}"
     );
-    assert!(text.contains("VAL a5"), "original run must still simulate; got:\n{text}");
+    assert!(
+        text.contains("VAL a5"),
+        "original run must still simulate; got:\n{text}"
+    );
 
     let m = std::fs::read_to_string(&merged).expect("merged file written");
-    assert!(m.contains("picked_b"), "`else branch must be selected:\n{m}");
-    assert!(!m.contains("picked_a"), "dead `ifdef branch must be gone:\n{m}");
+    assert!(
+        m.contains("picked_b"),
+        "`else branch must be selected:\n{m}"
+    );
+    assert!(
+        !m.contains("picked_a"),
+        "dead `ifdef branch must be gone:\n{m}"
+    );
     assert!(m.contains("[8-1:0]"), "`WIDTH macro must be expanded:\n{m}");
-    assert!(m.contains("===== file 1/2"), "per-file provenance banner:\n{m}");
+    assert!(
+        m.contains("===== file 1/2"),
+        "per-file provenance banner:\n{m}"
+    );
 
     // The whole point: the merged artifact re-runs standalone.
     let out2 = Command::new(&bin)

@@ -112,6 +112,10 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "whole"), 0b0101);
-    assert_eq!(u(&sim, "memb"), 0b0101, "member read through the scoped path");
+    assert_eq!(
+        u(&sim, "memb"),
+        0b0101,
+        "member read through the scoped path"
+    );
     assert_eq!(u(&sim, "bit_n"), 1, "s.x[2] with the module's N=2");
 }

@@ -101,7 +101,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "p0"), 0x1A5, "member write reaches through the port");
+    assert_eq!(
+        u(&sim, "p0"),
+        0x1A5,
+        "member write reaches through the port"
+    );
     assert_eq!(u(&sim, "p2"), 0x25B);
 }
 
@@ -177,8 +181,16 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "through_iface"), 0b1010, "vif write aliases the instance");
+    assert_eq!(
+        u(&sim, "through_iface"),
+        0b1010,
+        "vif write aliases the instance"
+    );
     assert_eq!(u(&sim, "through_vif"), 0b1010);
-    assert_eq!(u(&sim, "c0"), 21, "unpacked member through an accessor-returned vif");
+    assert_eq!(
+        u(&sim, "c0"),
+        21,
+        "unpacked member through an accessor-returned vif"
+    );
     assert_eq!(u(&sim, "c1"), 99);
 }

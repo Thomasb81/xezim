@@ -124,8 +124,16 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "seen_before"), 0x11, "NBA is not visible in the same region");
-    assert_eq!(u(&sim, "seen_after"), 0xEE, "NBA committed before the delay resumed");
+    assert_eq!(
+        u(&sim, "seen_before"),
+        0x11,
+        "NBA is not visible in the same region"
+    );
+    assert_eq!(
+        u(&sim, "seen_after"),
+        0xEE,
+        "NBA committed before the delay resumed"
+    );
 }
 
 /// The multi-block clocked pipeline the interface testbench exercised: a DUT

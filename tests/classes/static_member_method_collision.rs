@@ -56,7 +56,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "r"), 42, "holder.get_sev() must call msg::get_sev (runtime class), not catcher::get_sev");
+    assert_eq!(
+        u(&sim, "r"),
+        42,
+        "holder.get_sev() must call msg::get_sev (runtime class), not catcher::get_sev"
+    );
 }
 
 /// Control: the same message read through a concrete catcher-derived path

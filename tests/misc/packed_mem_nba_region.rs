@@ -78,7 +78,10 @@ fn packed_nba_matures_in_nba_region() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Same-cycle read must see the OLD value (reference-verified R1_11_aa);
     // the immediate-commit bug read back AA in the same edge.
-    assert!(stdout.contains("R1_11_aa"), "packed NBA leaked early:\n{stdout}");
+    assert!(
+        stdout.contains("R1_11_aa"),
+        "packed NBA leaked early:\n{stdout}"
+    );
     assert!(stdout.contains("R2_aa"), "{stdout}");
     // And identical behavior with packing OFF (control).
     let out2 = Command::new(xezim())

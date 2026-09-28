@@ -60,8 +60,24 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 #[test]
 fn module_type_param_class_handles_construct_per_instance() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "def_id"), 0xDEAD_BEEF, "defaulted CLASS_T constructs the default class");
-    assert_eq!(u(&sim, "def_direct"), 0xDEAD_BEEF, "direct class handle (control)");
-    assert_eq!(u(&sim, "ovr_id"), 0x5A5A_5A5A, "overridden CLASS_T constructs the override class");
-    assert_eq!(u(&sim, "prim_bits"), 32, "a primitive type param still sizes locals");
+    assert_eq!(
+        u(&sim, "def_id"),
+        0xDEAD_BEEF,
+        "defaulted CLASS_T constructs the default class"
+    );
+    assert_eq!(
+        u(&sim, "def_direct"),
+        0xDEAD_BEEF,
+        "direct class handle (control)"
+    );
+    assert_eq!(
+        u(&sim, "ovr_id"),
+        0x5A5A_5A5A,
+        "overridden CLASS_T constructs the override class"
+    );
+    assert_eq!(
+        u(&sim, "prim_bits"),
+        32,
+        "a primitive type param still sizes locals"
+    );
 }

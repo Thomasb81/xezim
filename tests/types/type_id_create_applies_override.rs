@@ -79,8 +79,10 @@ module top;
         b handled = new(name);
         return handled;
       end
-      T handled = new(name);
-      return handled;
+      begin
+        T handled = new(name);
+        return handled;
+      end
     endfunction
   endclass
 

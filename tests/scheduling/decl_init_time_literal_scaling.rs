@@ -149,8 +149,16 @@ endmodule
 "#;
     let got = notes(src);
     assert!(got.contains(&"NOTE: ns 100".to_string()), "got {:?}", got);
-    assert!(got.contains(&"NOTE: ps 100000".to_string()), "got {:?}", got);
-    assert!(got.contains(&"NOTE: fs 100000000".to_string()), "got {:?}", got);
+    assert!(
+        got.contains(&"NOTE: ps 100000".to_string()),
+        "got {:?}",
+        got
+    );
+    assert!(
+        got.contains(&"NOTE: fs 100000000".to_string()),
+        "got {:?}",
+        got
+    );
 }
 
 /// A design already at the default 1 ns unit was accidentally correct before

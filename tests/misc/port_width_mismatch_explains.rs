@@ -38,14 +38,21 @@ fn port_width_mismatch_names_the_connection_and_its_fields() {
     std::fs::write(&src, SRC).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--compile", "-s", "test", src.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--compile",
+            "-s",
+            "test",
+            src.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
 
     assert!(
-        text.contains("port width mismatch") && text.contains("116 bit(s)")
+        text.contains("port width mismatch")
+            && text.contains("116 bit(s)")
             && text.contains("86 bit(s)"),
         "keeps the §23.3.3 mismatch report:\n{}",
         text
@@ -87,11 +94,20 @@ fn matching_widths_stay_silent() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("ok.sv");
-    std::fs::write(&src, SRC.replace("localparam int P_UNSET = 0;", "localparam int P_UNSET = 6;"))
-        .unwrap();
+    std::fs::write(
+        &src,
+        SRC.replace("localparam int P_UNSET = 0;", "localparam int P_UNSET = 6;"),
+    )
+    .unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--compile", "-s", "test", src.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--compile",
+            "-s",
+            "test",
+            src.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -123,12 +139,20 @@ fn mismatch_location_names_the_parent_modules_file() {
     )
     .unwrap();
     let pad = "// padding so the root file is larger than the leaf offset\n".repeat(400);
-    std::fs::write(&top, format!("module test;\n  mid u_mid ();\nendmodule\n{}", pad)).unwrap();
+    std::fs::write(
+        &top,
+        format!("module test;\n  mid u_mid ();\nendmodule\n{}", pad),
+    )
+    .unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .args([
-            "--compile", "-s", "test",
-            top.to_str().unwrap(), leaf.to_str().unwrap(), "--no-cache",
+            "--compile",
+            "-s",
+            "test",
+            top.to_str().unwrap(),
+            leaf.to_str().unwrap(),
+            "--no-cache",
         ])
         .output()
         .expect("run xezim");
@@ -176,7 +200,13 @@ endmodule
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--compile", "-s", "testbench", src.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--compile",
+            "-s",
+            "testbench",
+            src.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();

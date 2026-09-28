@@ -101,7 +101,15 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "direct_z"), 1, "formal y must shadow module function y");
+    assert_eq!(
+        u(&sim, "direct_z"),
+        1,
+        "formal y must shadow module function y"
+    );
     assert_eq!(u(&sim, "direct_y"), 1, "nested scoped call");
-    assert_eq!(u(&sim, "comb_d"), 1, "always_comb refires on vars read in scoped callees");
+    assert_eq!(
+        u(&sim, "comb_d"),
+        1,
+        "always_comb refires on vars read in scoped callees"
+    );
 }

@@ -69,14 +69,26 @@ endmodule
 fn generate_if_scope_struct_widths() {
     let sim = simulate(SRC, 50).expect("simulate failed");
     assert_eq!(u(&sim, "t_w_all"), 292);
-    assert_eq!(u(&sim, "t_w_elem"), 146, "was 1: no element metadata in generate scopes");
-    assert_eq!(u(&sim, "t_w_memb"), 64, "was 1: no member strides in generate scopes");
+    assert_eq!(
+        u(&sim, "t_w_elem"),
+        146,
+        "was 1: no element metadata in generate scopes"
+    );
+    assert_eq!(
+        u(&sim, "t_w_memb"),
+        64,
+        "was 1: no member strides in generate scopes"
+    );
 }
 
 #[test]
 fn generate_if_scope_struct_values_flow() {
     let sim = simulate(SRC, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "t_lane00"), 0xBBBB_BBBB_BBBB_BBB0, "lanes[0] is the LOW lane");
+    assert_eq!(
+        u(&sim, "t_lane00"),
+        0xBBBB_BBBB_BBBB_BBB0,
+        "lanes[0] is the LOW lane"
+    );
     assert_eq!(u(&sim, "t_lane11"), 0xDDDD_DDDD_DDDD_DDD1);
     assert_eq!(u(&sim, "t_m10"), 0xF0);
 }
@@ -111,7 +123,11 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     let g = |n: &str| sim.get_signal(n).unwrap().to_u64().unwrap();
-    assert_eq!(g("t_d0"), 0x22, "read through gl[0]. — was 0, writes vanished");
+    assert_eq!(
+        g("t_d0"),
+        0x22,
+        "read through gl[0]. — was 0, writes vanished"
+    );
     assert_eq!(g("t_d1"), 0x44);
 }
 

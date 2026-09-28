@@ -29,11 +29,11 @@ module top;
   initial begin
     string value;
     int n;
+    string t = "";
     value = "abcdefghijk";          // 11 chars
     n = packlen(value);
     $display("LEN %0d", n);          // must be 11
     // build a string the way uvm unpack does: append then char-write
-    string t = "";
     t = {t, " "}; t[0] = "A";
     t = {t, " "}; t[1] = "B";
     t = {t, " "}; t[2] = "C";
@@ -50,5 +50,8 @@ endmodule
 fn string_foreach_uses_content_len_first() {
     let out = sim_src(STRING_FOREACH_PRECEDENCE);
     let msg = out.join("\n");
-    assert!(msg.contains("TAG_PASS"), "string foreach precedence broke:\n{msg}");
+    assert!(
+        msg.contains("TAG_PASS"),
+        "string foreach precedence broke:\n{msg}"
+    );
 }

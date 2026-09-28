@@ -37,6 +37,10 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "woke_at"), 10, "@(ev.triggered) must block until the trigger");
+    assert_eq!(
+        u(&sim, "woke_at"),
+        10,
+        "@(ev.triggered) must block until the trigger"
+    );
     assert_eq!(u(&sim, "woke_plain"), 10, "@(ev) unchanged");
 }

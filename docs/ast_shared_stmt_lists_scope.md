@@ -4,7 +4,7 @@
 day of work, and the two most recent attempts in this area both measured
 negative.**
 
-Prerequisite identified by `perf_dump_offload_2026-07-28.md` §6b, where the
+Prerequisite identified by an earlier offload study, where the
 frame-chain rewrite was built, proved correct, and measured **+5% slower**
 because it added `Arc::from(vec)` per *splice* to remove a deep clone per
 *suspension* — and splices are far more frequent.

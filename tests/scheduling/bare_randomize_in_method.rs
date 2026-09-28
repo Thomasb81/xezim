@@ -25,7 +25,11 @@ use std::process::Command;
 fn bare_randomize_in_method() {
     let test_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/scheduling");
     let test_file = test_dir.join("bare_randomize_in_method.sv");
-    assert!(test_file.exists(), "Test file not found: {}", test_file.display());
+    assert!(
+        test_file.exists(),
+        "Test file not found: {}",
+        test_file.display()
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg("--simulate")

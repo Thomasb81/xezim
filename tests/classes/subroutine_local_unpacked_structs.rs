@@ -52,8 +52,16 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "callee_reads"), 0x32, "the callee must read back its OWN write");
-    assert_eq!(u(&sim, "caller_after"), 0x88, "and must not disturb the caller's");
+    assert_eq!(
+        u(&sim, "callee_reads"),
+        0x32,
+        "the callee must read back its OWN write"
+    );
+    assert_eq!(
+        u(&sim, "caller_after"),
+        0x88,
+        "and must not disturb the caller's"
+    );
 }
 
 /// The collision can come from any scope: the calling block, another block, or
@@ -82,8 +90,16 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "r_mod"), 0x31, "shadowing a module-scope struct");
-    assert_eq!(u(&sim, "r_same"), 0x32, "shadowing a local of the CALLING block");
-    assert_eq!(u(&sim, "r_other"), 0x33, "shadowing a local of another block");
+    assert_eq!(
+        u(&sim, "r_same"),
+        0x32,
+        "shadowing a local of the CALLING block"
+    );
+    assert_eq!(
+        u(&sim, "r_other"),
+        0x33,
+        "shadowing a local of another block"
+    );
 }
 
 /// Tasks too, and a whole-struct pattern write into a subroutine local must
@@ -122,8 +138,16 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "fn_a"), 0x31, "function local");
-    assert_eq!((u(&sim, "tk_a"), u(&sim, "tk_b")), (0x41, 0x42), "task local");
-    assert_eq!((u(&sim, "pat_a"), u(&sim, "pat_b")), (0x51, 0x52), "whole pattern into a local");
+    assert_eq!(
+        (u(&sim, "tk_a"), u(&sim, "tk_b")),
+        (0x41, 0x42),
+        "task local"
+    );
+    assert_eq!(
+        (u(&sim, "pat_a"), u(&sim, "pat_b")),
+        (0x51, 0x52),
+        "whole pattern into a local"
+    );
 }
 
 /// Each call gets a FRESH automatic local — a member left unwritten by the
@@ -148,7 +172,11 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "first"), 0x20);
-    assert_eq!(u(&sim, "second_unwritten"), 1, "a fresh call must not see the previous one's member");
+    assert_eq!(
+        u(&sim, "second_unwritten"),
+        1,
+        "a fresh call must not see the previous one's member"
+    );
 }
 
 /// §13.5.2 — UNPACKED-struct FORMALS. A task bound none of them, so its body
@@ -185,12 +213,32 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "i1"), u(&sim, "i2")), (0x01, 0x02), "task input formal");
+    assert_eq!(
+        (u(&sim, "i1"), u(&sim, "i2")),
+        (0x01, 0x02),
+        "task input formal"
+    );
     assert_eq!(u(&sim, "fi"), 0x01, "function input formal");
-    assert_eq!((u(&sim, "oa"), u(&sim, "ob")), (0x7a, 0x7b), "task output formal");
-    assert_eq!((u(&sim, "ra"), u(&sim, "rb")), (0xF0, 0x0b), "ref formal writes through");
-    assert_eq!((u(&sim, "ioa"), u(&sim, "iob")), (0x30, 0x31), "inout reads in and writes back");
-    assert_eq!((u(&sim, "foa"), u(&sim, "fob")), (0x6a, 0x6b), "function output formal");
+    assert_eq!(
+        (u(&sim, "oa"), u(&sim, "ob")),
+        (0x7a, 0x7b),
+        "task output formal"
+    );
+    assert_eq!(
+        (u(&sim, "ra"), u(&sim, "rb")),
+        (0xF0, 0x0b),
+        "ref formal writes through"
+    );
+    assert_eq!(
+        (u(&sim, "ioa"), u(&sim, "iob")),
+        (0x30, 0x31),
+        "inout reads in and writes back"
+    );
+    assert_eq!(
+        (u(&sim, "foa"), u(&sim, "fob")),
+        (0x6a, 0x6b),
+        "function output formal"
+    );
 }
 
 /// §13.4.1 — struct RETURN types. The return variable is a variable of the
@@ -235,9 +283,29 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "pma"), u(&sim, "pmb")), (0x11, 0x12), "packed return, member writes");
-    assert_eq!((u(&sim, "pwa"), u(&sim, "pwb")), (0x11, 0x12), "packed return, whole pattern");
-    assert_eq!((u(&sim, "uma"), u(&sim, "umb")), (0x11, 0x12), "unpacked return, member writes");
-    assert_eq!((u(&sim, "uwa"), u(&sim, "uwb")), (0x11, 0x12), "unpacked return, whole pattern");
-    assert_eq!((u(&sim, "ula"), u(&sim, "ulb")), (0x11, 0x12), "unpacked return of a local");
+    assert_eq!(
+        (u(&sim, "pma"), u(&sim, "pmb")),
+        (0x11, 0x12),
+        "packed return, member writes"
+    );
+    assert_eq!(
+        (u(&sim, "pwa"), u(&sim, "pwb")),
+        (0x11, 0x12),
+        "packed return, whole pattern"
+    );
+    assert_eq!(
+        (u(&sim, "uma"), u(&sim, "umb")),
+        (0x11, 0x12),
+        "unpacked return, member writes"
+    );
+    assert_eq!(
+        (u(&sim, "uwa"), u(&sim, "uwb")),
+        (0x11, 0x12),
+        "unpacked return, whole pattern"
+    );
+    assert_eq!(
+        (u(&sim, "ula"), u(&sim, "ulb")),
+        (0x11, 0x12),
+        "unpacked return of a local"
+    );
 }

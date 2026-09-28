@@ -61,7 +61,8 @@ endmodule
         // ARMED filtering supersedes epochs by default. Keep this test focused
         // on the fallback path retained for XEZIM_ARMED_EDGE=0.
         .env("XEZIM_ARMED_EDGE", "0")
-        .args(["--simulate", "-s", "top"])
+        // `--verbose`: the "[EVENT-EDGE]" counters read below.
+        .args(["--simulate", "--verbose", "-s", "top"])
         .arg(&source)
         .output()
         .expect("run xezim");

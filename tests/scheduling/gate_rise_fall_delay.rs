@@ -63,8 +63,16 @@ fn gate_rise_delay_uses_the_first_value() {
 #[test]
 fn gate_fall_delay_uses_the_second_value() {
     let sim = simulate(SRC, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "rf_fall"), 45, "#(2,5) must fall 5 after the input, not 2");
-    assert_eq!(u(&sim, "buf_fall"), 46, "#(1,6) must fall 6 after the input, not 1");
+    assert_eq!(
+        u(&sim, "rf_fall"),
+        45,
+        "#(2,5) must fall 5 after the input, not 2"
+    );
+    assert_eq!(
+        u(&sim, "buf_fall"),
+        46,
+        "#(1,6) must fall 6 after the input, not 1"
+    );
 }
 
 /// A single-delay spec still governs BOTH edges — the fall path must not

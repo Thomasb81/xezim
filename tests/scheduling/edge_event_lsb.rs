@@ -36,7 +36,11 @@ module tb;
   end
 endmodule
 "#;
-    assert_eq!(count(src, "EDGE="), Some(2), "edge(vector) must be LSB-only");
+    assert_eq!(
+        count(src, "EDGE="),
+        Some(2),
+        "edge(vector) must be LSB-only"
+    );
 }
 
 #[test]
@@ -48,7 +52,11 @@ module tb;
   initial begin #10 b=1; #10 b=0; #10 b=1; #5 $display("E1=%0d", h); $finish; end
 endmodule
 "#;
-    assert_eq!(count(src, "E1="), Some(3), "1-bit edge = posedge OR negedge");
+    assert_eq!(
+        count(src, "E1="),
+        Some(3),
+        "1-bit edge = posedge OR negedge"
+    );
 }
 
 #[test]

@@ -241,8 +241,16 @@ fn port_width_comes_from_the_formal_not_the_connection() {
         assert_eq!(u(&sim, &format!("bw_{sfx}")), 8, "$bits(pa) with {what}");
         assert_eq!(u(&sim, &format!("ew_{sfx}")), 4, "$bits(pa[0]) with {what}");
     }
-    assert_eq!(u(&sim, "v_n"), 0x05, "narrow actual zero-extends to the formal");
-    assert_eq!(u(&sim, "v_w"), 0x21, "wide actual truncates to the formal's low 8");
+    assert_eq!(
+        u(&sim, "v_n"),
+        0x05,
+        "narrow actual zero-extends to the formal"
+    );
+    assert_eq!(
+        u(&sim, "v_w"),
+        0x21,
+        "wide actual truncates to the formal's low 8"
+    );
 }
 
 /// Guard for the leniency this fix had to preserve: writing an INPUT port
@@ -310,7 +318,11 @@ endmodule
 #[test]
 fn typedefd_packed_multi_d_port_keeps_its_element_stride() {
     let sim = simulate(SRC_TYPEDEF_PORT, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "tew"), 4, "$bits(tp[0]) through a typedef'd packed multi-D port");
+    assert_eq!(
+        u(&sim, "tew"),
+        4,
+        "$bits(tp[0]) through a typedef'd packed multi-D port"
+    );
     assert_eq!(u(&sim, "t0"), 0xD, "tp[0] must be the low nibble of 8'h2D");
     assert_eq!(
         u(&sim, "t1"),

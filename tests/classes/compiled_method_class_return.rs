@@ -48,10 +48,11 @@ module tb;
     node a = new(10);
     node b = new(20);
     node n = new(30);
+    node got;
     a.child = b;
     b.parent = a;
     // The returned handle must dispatch: b's child chain works.
-    node got = a.get_child();
+    got = a.get_child();
     p = got.get_parent().get_id();
     ia = a.get_id();
     ib = got.get_id();

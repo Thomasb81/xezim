@@ -32,7 +32,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "seen_plain"), 0, "plain @(posedge) resume is pre-NBA");
+    assert_eq!(
+        u(&sim, "seen_plain"),
+        0,
+        "plain @(posedge) resume is pre-NBA"
+    );
     assert_eq!(
         u(&sim, "seen_zero"),
         1,
@@ -82,8 +86,16 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "s_plain"), 0, "waiter resumes pre-NBA (active region)");
-    assert_eq!(u(&sim, "s_zero"), 0, "#0 hop after the waiter is still pre-NBA");
+    assert_eq!(
+        u(&sim, "s_plain"),
+        0,
+        "waiter resumes pre-NBA (active region)"
+    );
+    assert_eq!(
+        u(&sim, "s_zero"),
+        0,
+        "#0 hop after the waiter is still pre-NBA"
+    );
     assert_eq!(u(&sim, "r"), 1, "the flop still updates");
 }
 

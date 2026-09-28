@@ -25,7 +25,13 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "test", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "test",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -65,9 +71,18 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|inner gave 1 'base.unit'"), "inner writeback:\n{text}");
-    assert!(text.contains("T|outer n=1"), "no phantom leading entry:\n{text}");
-    assert!(text.contains("T|out[0]='base.unit.LEAF'"), "composed entry:\n{text}");
+    assert!(
+        text.contains("T|inner gave 1 'base.unit'"),
+        "inner writeback:\n{text}"
+    );
+    assert!(
+        text.contains("T|outer n=1"),
+        "no phantom leading entry:\n{text}"
+    );
+    assert!(
+        text.contains("T|out[0]='base.unit.LEAF'"),
+        "composed entry:\n{text}"
+    );
 }
 
 #[test]
@@ -101,8 +116,14 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|n=2"), "writeback survives the frame restore:\n{text}");
-    assert!(text.contains("T|s[0]=7") && text.contains("T|s[1]=9"), "values:\n{text}");
+    assert!(
+        text.contains("T|n=2"),
+        "writeback survives the frame restore:\n{text}"
+    );
+    assert!(
+        text.contains("T|s[0]=7") && text.contains("T|s[1]=9"),
+        "values:\n{text}"
+    );
 }
 
 #[test]

@@ -71,21 +71,13 @@ endmodule
 
 fn run() -> String {
     let out = output_of(&simulate(SRC, 1).expect("sim"));
-    assert!(
-        !out.contains("BAD"),
-        "unexpected failures:\n{}",
-        out
-    );
+    assert!(!out.contains("BAD"), "unexpected failures:\n{}", out);
     out
 }
 
 #[test]
 fn queue_literal_return_preserves_elements() {
     let out = run();
-    assert!(
-        out.contains("TAG_PASS"),
-        "expected TAG_PASS, got:\n{}",
-        out
-    );
+    assert!(out.contains("TAG_PASS"), "expected TAG_PASS, got:\n{}", out);
     assert!(!out.contains("TAG_FAIL"));
 }

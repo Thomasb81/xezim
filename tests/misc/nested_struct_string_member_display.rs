@@ -13,7 +13,13 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "test", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "test",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();

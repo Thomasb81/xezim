@@ -76,8 +76,16 @@ endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
     assert_eq!(u(&sim, "flat_r"), 0b1111, "flat[j] <= … with loop-var j");
-    assert_eq!(u(&sim, "unp_r"), 0b11, "unp[1][j] <= unp[0][j] with loop-var j");
-    assert_eq!(u(&sim, "pk_r"), 0b11, "pk[1][j] <= pk[0][j] with loop-var j");
+    assert_eq!(
+        u(&sim, "unp_r"),
+        0b11,
+        "unp[1][j] <= unp[0][j] with loop-var j"
+    );
+    assert_eq!(
+        u(&sim, "pk_r"),
+        0b11,
+        "pk[1][j] <= pk[0][j] with loop-var j"
+    );
 }
 
 /// Constant-index writes into an unpacked element, blocking and NBA — the
@@ -113,8 +121,16 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "q1_r"), 0b11, "NBA bit writes into an unpacked element");
-    assert_eq!(u(&sim, "q2_r"), 0b11, "blocking bit writes into an unpacked element");
+    assert_eq!(
+        u(&sim, "q1_r"),
+        0b11,
+        "NBA bit writes into an unpacked element"
+    );
+    assert_eq!(
+        u(&sim, "q2_r"),
+        0b11,
+        "blocking bit writes into an unpacked element"
+    );
 }
 
 /// The element itself may be a multi-dim packed array — `[j]` then selects a
@@ -184,7 +200,15 @@ endmodule
     let sim = simulate(src, 100).expect("simulate failed");
     assert_eq!(u(&sim, "rd0"), 0xA5, "lane 0 read, not bit 0");
     assert_eq!(u(&sim, "rd1"), 0x3C, "lane 1 read, not bit 1");
-    assert_eq!(u(&sim, "bits_n"), 8, "$bits of a lane select is the lane width");
+    assert_eq!(
+        u(&sim, "bits_n"),
+        8,
+        "$bits of a lane select is the lane width"
+    );
     assert_eq!(u(&sim, "wr"), 0x3CA5, "lane writes assemble the full field");
-    assert_eq!(u(&sim, "other_r"), 0xFF, "the neighbouring member is untouched");
+    assert_eq!(
+        u(&sim, "other_r"),
+        0xFF,
+        "the neighbouring member is untouched"
+    );
 }

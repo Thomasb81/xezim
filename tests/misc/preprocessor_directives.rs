@@ -37,7 +37,11 @@ endmodule
     let sim = simulate(src, 10).expect("simulate failed");
     let msgs = lines(&sim);
     assert!(msgs.iter().any(|m| m == "T|one"), "got {:?}", msgs);
-    assert!(msgs.iter().any(|m| m == "T|two"), "post-`endif stmt dropped: {:?}", msgs);
+    assert!(
+        msgs.iter().any(|m| m == "T|two"),
+        "post-`endif stmt dropped: {:?}",
+        msgs
+    );
 }
 
 #[test]
@@ -199,7 +203,19 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     let l = lines(&sim);
-    assert!(l.iter().any(|m| m == "T|a=[1] b=[]"), "empty arg stringifies empty: {:?}", l);
-    assert!(l.iter().any(|m| m == "T|x1=1 x2=42"), "empty arg substitutes nothing: {:?}", l);
-    assert!(l.iter().any(|m| m == "T|emptydef=115a"), "empty arg with default takes it: {:?}", l);
+    assert!(
+        l.iter().any(|m| m == "T|a=[1] b=[]"),
+        "empty arg stringifies empty: {:?}",
+        l
+    );
+    assert!(
+        l.iter().any(|m| m == "T|x1=1 x2=42"),
+        "empty arg substitutes nothing: {:?}",
+        l
+    );
+    assert!(
+        l.iter().any(|m| m == "T|emptydef=115a"),
+        "empty arg with default takes it: {:?}",
+        l
+    );
 }

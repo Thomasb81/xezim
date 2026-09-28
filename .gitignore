@@ -76,3 +76,4 @@ target-*/
 
 # Local-only working notes (perf resume docs etc.) — never published.
 *_RESUME.md
+*-target/

@@ -38,9 +38,9 @@
 //!
 //! 1. **Better cache locality**: When scanning signals, we access contiguous
 //!    memory instead of jumping between struct fields.
-//! 
+//!
 //! 2. **SIMD-friendly**: Regular arrays enable SIMD operations.
-//! 
+//!
 //! 3. **Memory efficiency**: No padding between fields.
 //!
 //! # Implementation Strategy
@@ -89,7 +89,7 @@ impl InlineSignalArray {
         let mut val_bits = Vec::with_capacity(values.len());
         let mut xz_bits = Vec::with_capacity(values.len());
         let mut widths = Vec::with_capacity(values.len());
-        
+
         for v in values {
             if v.width <= 64 {
                 // Inline value
@@ -109,7 +109,7 @@ impl InlineSignalArray {
                 widths.push(v.width);
             }
         }
-        
+
         Self {
             val_bits,
             xz_bits,
@@ -153,7 +153,11 @@ impl InlineSignalArray {
     #[inline]
     pub fn mask_val(&self, idx: usize, val: u64) -> u64 {
         let width = self.widths[idx];
-        let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+        let mask = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
         val & mask
     }
 
@@ -167,7 +171,7 @@ impl InlineSignalArray {
     #[inline]
     pub fn get_bit(&self, idx: usize, bit_pos: u8) -> u8 {
         if bit_pos >= 64 {
-            return 0;  // Beyond inline range
+            return 0; // Beyond inline range
         }
         let val = self.val_bits[idx];
         let xz = self.xz_bits[idx];
@@ -207,7 +211,7 @@ impl PackedWideSignalArray {
         // TODO: Use packed_value when it's fully integrated
         let mut data = Vec::with_capacity(values.len());
         let mut widths = Vec::with_capacity(values.len());
-        
+
         for v in values {
             if v.width > 64 {
                 // For now, store as empty - packed representation will be added later
@@ -215,13 +219,9 @@ impl PackedWideSignalArray {
                 widths.push(v.width);
             }
         }
-        
+
         let len = data.len();
-        Self {
-            data,
-            widths,
-            len,
-        }
+        Self { data, widths, len }
     }
 
     /// Get the number of signals.
@@ -267,28 +267,28 @@ impl PackedBitConvert for xezim_core::value::LogicBit {
 pub fn logic_bits_to_packed(bits: &[xezim_core::value::LogicBit]) -> Vec<u8> {
     let num_bytes = (bits.len() + 3) / 4;
     let mut packed = vec![0u8; num_bytes];
-    
+
     for (i, &bit) in bits.iter().enumerate() {
         let byte_idx = i / 4;
         let shift = (i % 4) * 2;
         let code = bit.to_packed();
         packed[byte_idx] |= code << shift;
     }
-    
+
     packed
 }
 
 /// Helper to convert packed bytes to Vec<LogicBit>.
 pub fn packed_to_logic_bits(packed: &[u8], len: usize) -> Vec<xezim_core::value::LogicBit> {
     let mut bits = Vec::with_capacity(len);
-    
+
     for i in 0..len {
         let byte_idx = i / 4;
         let shift = (i % 4) * 2;
         let code = (packed[byte_idx] >> shift) & 0b11;
         bits.push(xezim_core::value::LogicBit::from_packed(code));
     }
-    
+
     bits
 }
 
@@ -309,20 +309,20 @@ impl SoaSignalTable {
     /// Create a new SOA signal table from a slice of Values.
     pub fn from_values(values: &[Value]) -> Self {
         let inline = InlineSignalArray::from_values(values);
-        
+
         // Find wide signals
         let mut wide_indices = Vec::new();
         let mut wide_values = Vec::new();
-        
+
         for (idx, v) in values.iter().enumerate() {
             if v.width > 64 {
                 wide_indices.push(idx);
                 wide_values.push(v.clone());
             }
         }
-        
+
         let wide = PackedWideSignalArray::from_wide_values(&wide_values);
-        
+
         Self {
             inline,
             wide,
@@ -338,7 +338,7 @@ impl SoaSignalTable {
         if self.wide_indices.contains(&idx) {
             // Wide signal - return low 64 bits
             // This would need to extract from packed storage
-            (0, 0)  // TODO: implement
+            (0, 0) // TODO: implement
         } else {
             self.inline.get_bits(idx)
         }
@@ -354,39 +354,50 @@ mod benchmarks {
     #[test]
     fn test_soa_vs_aos_memory() {
         let num_signals = 10000;
-        let width = 64;  // All inline
-        
+        let width = 64; // All inline
+
         // AoS: Vec<Value>
         let aos: Vec<Value> = (0..num_signals)
             .map(|_| Value::from_u64(0xAAAA_AAAA_AAAA_AAAA, width))
             .collect();
-        
+
         // SOA: InlineSignalArray
         let soa = InlineSignalArray::from_values(&aos);
-        
+
         // Memory usage
         let aos_size = aos.capacity() * std::mem::size_of::<Value>();
         let soa_size = soa.val_bits.capacity() * 8  // u64
             + soa.xz_bits.capacity() * 8
             + soa.widths.capacity() * 4;
-        
+
         println!("Signals: {}, Width: {} bits", num_signals, width);
-        println!("AoS memory: {} bytes ({:.2} KB)", aos_size, aos_size as f64 / 1024.0);
-        println!("SOA memory: {} bytes ({:.2} KB)", soa_size, soa_size as f64 / 1024.0);
-        println!("SOA is {:.1}x more efficient", aos_size as f64 / soa_size as f64);
+        println!(
+            "AoS memory: {} bytes ({:.2} KB)",
+            aos_size,
+            aos_size as f64 / 1024.0
+        );
+        println!(
+            "SOA memory: {} bytes ({:.2} KB)",
+            soa_size,
+            soa_size as f64 / 1024.0
+        );
+        println!(
+            "SOA is {:.1}x more efficient",
+            aos_size as f64 / soa_size as f64
+        );
     }
 
     #[test]
     fn test_soa_access() {
         let num_signals = 1000;
         let width = 64;
-        
+
         let values: Vec<Value> = (0..num_signals)
             .map(|i| Value::from_u64(i as u64, width))
             .collect();
-        
+
         let soa = InlineSignalArray::from_values(&values);
-        
+
         // Test all access patterns
         for i in 0..num_signals {
             let (v, x) = soa.get_bits(i);
@@ -399,7 +410,7 @@ mod benchmarks {
     #[test]
     fn test_packed_conversion() {
         use xezim_core::value::LogicBit as CoreLogicBit;
-        
+
         let bits = vec![
             CoreLogicBit::Zero,
             CoreLogicBit::One,
@@ -408,10 +419,10 @@ mod benchmarks {
             CoreLogicBit::One,
             CoreLogicBit::Zero,
         ];
-        
+
         let packed = logic_bits_to_packed(&bits);
         let unpacked = packed_to_logic_bits(&packed, bits.len());
-        
+
         assert_eq!(bits, unpacked);
     }
 }

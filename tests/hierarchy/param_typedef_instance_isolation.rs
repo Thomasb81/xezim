@@ -64,7 +64,11 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "r4v"), 4, "a variable of the typedef");
-    assert_eq!(u(&sim, "r4f"), 4, "the W=4 instance's function must not return 20 bits");
+    assert_eq!(
+        u(&sim, "r4f"),
+        4,
+        "the W=4 instance's function must not return 20 bits"
+    );
     assert_eq!(u(&sim, "r20f"), 20);
     assert_eq!(u(&sim, "rdf"), 20, "same W under another hierarchy");
 }
@@ -112,7 +116,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "rb"), 0x11234a5, "the wide instance packs at ITS widths");
+    assert_eq!(
+        u(&sim, "rb"),
+        0x11234a5,
+        "the wide instance packs at ITS widths"
+    );
     assert_eq!(u(&sim, "rs"), 0x19c7, "the narrow one at its own");
     assert_eq!(u(&sim, "rd"), 0x15e3, "and the nested one at its own");
 }

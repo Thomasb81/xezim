@@ -20,7 +20,11 @@ fn run(src: &str, name: &str, extra: &[&str]) -> i32 {
     let sv = dir.join(format!("{name}.sv"));
     std::fs::write(&sv, src).expect("write");
     let mut cmd = Command::new(xezim_bin());
-    cmd.arg("--simulate").arg("-s").arg("top").arg("--max-time").arg("10");
+    cmd.arg("--simulate")
+        .arg("-s")
+        .arg("top")
+        .arg("--max-time")
+        .arg("10");
     for a in extra {
         cmd.arg(a);
     }
@@ -39,7 +43,11 @@ fn fatal_always_exits_nonzero() {
 
 #[test]
 fn error_exits_zero_by_default_and_nonzero_when_promoted() {
-    assert_eq!(run(ERR, "err_default", &[]), 0, "$error stays non-fatal by default");
+    assert_eq!(
+        run(ERR, "err_default", &[]),
+        0,
+        "$error stays non-fatal by default"
+    );
     assert_ne!(
         run(ERR, "err_promoted", &["--error-exit"]),
         0,

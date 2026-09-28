@@ -32,7 +32,13 @@ fn self_named_class_typedef_alias_does_not_spin() {
     let src = dir.join("top.sv");
     std::fs::write(&src, DESIGN).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "top", src.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            src.to_str().unwrap(),
+            "--no-cache",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

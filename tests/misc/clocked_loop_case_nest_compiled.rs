@@ -64,7 +64,13 @@ endmodule
     let path = dir.join("tb.sv");
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "tb",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .env("XEZIM_PROFILE_TIMING", "1")
         .output()
         .expect("run xezim");

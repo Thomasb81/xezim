@@ -47,9 +47,21 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert_eq!(bits(&sim, "as_copy"), "z", "assign must pass z through (§10.3)");
-    assert_eq!(bits(&sim, "buf_out"), "x", "buf primitive maps z to x (§28.4)");
-    assert_eq!(bits(&sim, "not_out"), "x", "not primitive maps z to x (§28.4)");
+    assert_eq!(
+        bits(&sim, "as_copy"),
+        "z",
+        "assign must pass z through (§10.3)"
+    );
+    assert_eq!(
+        bits(&sim, "buf_out"),
+        "x",
+        "buf primitive maps z to x (§28.4)"
+    );
+    assert_eq!(
+        bits(&sim, "not_out"),
+        "x",
+        "not primitive maps z to x (§28.4)"
+    );
 }
 
 /// Chained scalar assigns — the shape the buf-fanout fusion groups — keep `z`
@@ -76,7 +88,11 @@ endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
     for n in ["a", "b", "c", "d", "e", "f", "g"] {
-        assert_eq!(bits(&sim, n), "z", "{n} must read z after the source returns to z");
+        assert_eq!(
+            bits(&sim, n),
+            "z",
+            "{n} must read z after the source returns to z"
+        );
     }
 }
 

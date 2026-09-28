@@ -191,7 +191,11 @@ endmodule
         out
     );
     assert!(out.iter().any(|l| l == "v=3"), "{:?}", out);
-    assert!(!out.iter().any(|l| l == "v=x"), "premature X print: {:?}", out);
+    assert!(
+        !out.iter().any(|l| l == "v=x"),
+        "premature X print: {:?}",
+        out
+    );
 }
 
 #[test]
@@ -237,12 +241,7 @@ module top;
   end
 endmodule
 "#,
-        &[
-            "p 15 8 8 15",
-            "asc 0 7 -1",
-            "p2 2 3",
-            "m2 3 1 0 4",
-        ],
+        &["p 15 8 8 15", "asc 0 7 -1", "p2 2 3", "m2 3 1 0 4"],
     );
 }
 
@@ -317,5 +316,8 @@ endmodule
         "observer must fire exactly once (no t0 pseudo-edge): {:?}",
         fires
     );
-    assert_eq!(fires[0], "FIRE T5000 y=0", "the single fire is the z->0 change");
+    assert_eq!(
+        fires[0], "FIRE T5000 y=0",
+        "the single fire is the z->0 change"
+    );
 }

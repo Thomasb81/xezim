@@ -56,7 +56,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "av"), 2, "virtual: runtime type wins through a base handle");
+    assert_eq!(
+        u(&sim, "av"),
+        2,
+        "virtual: runtime type wins through a base handle"
+    );
     assert_eq!(u(&sim, "anv"), 10, "non-virtual: declared type wins");
     assert_eq!(u(&sim, "bv"), 2, "derived handle: derived override");
     assert_eq!(u(&sim, "bnv"), 20, "derived handle: derived non-virtual");
@@ -118,7 +122,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 300).expect("simulate failed");
-    assert_eq!(u(&sim, "consts"), 1, "all five constants have their §9.7 values");
+    assert_eq!(
+        u(&sim, "consts"),
+        1,
+        "all five constants have their §9.7 values"
+    );
     assert_eq!(u(&sim, "waiting_ok"), 1, "a #-blocked process is WAITING");
     assert_eq!(u(&sim, "finished_ok"), 1, "a completed process is FINISHED");
     assert_eq!(u(&sim, "killed_ok"), 1, "a killed process is KILLED");
@@ -131,7 +139,8 @@ fn fscanf_advances_only_past_what_it_matched() {
     // audit_round45_finds: a CWD-relative $fopen kept re-tracking its file).
     let tmp = std::env::temp_dir().join(format!("xezim_fscanf_pos_{}.txt", std::process::id()));
     let tmp_path = tmp.to_string_lossy().replace('\\', "/");
-    let src = format!(r#"
+    let src = format!(
+        r#"
 module top;
   int fd, r, eof_mid, a, b;
   string w1, w2;
@@ -149,7 +158,8 @@ module top;
     $display("W1=%s W2=%s A=%0d B=%0d", w1, w2, a, b);
   end
 endmodule
-"#);
+"#
+    );
     let sim = simulate(&src, 20).expect("simulate failed");
     let _ = std::fs::remove_file(&tmp);
     assert_eq!(u(&sim, "eof_mid"), 0, "$feof false with the line half-read");

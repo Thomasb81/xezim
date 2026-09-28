@@ -82,22 +82,58 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 #[test]
 fn replicated_assignment_patterns_expand_to_elements() {
     let sim = simulate(REPLICATION, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "top_v"), 0x7E7E_7E7E, "a 4x replication fills four elements");
+    assert_eq!(
+        u(&sim, "top_v"),
+        0x7E7E_7E7E,
+        "a 4x replication fills four elements"
+    );
     assert_eq!(u(&sim, "part_v"), 0xC3C3, "two-element replication");
     assert_eq!(u(&sim, "nest_v"), 0xABAB, "replication of a nested pattern");
-    assert_eq!(u(&sim, "ovr_v"), 0x5A5A_5A5A, "replicated instance override");
-    assert_eq!(u(&sim, "def_v"), 0x1111_1111, "replicated instantiated default");
-    assert_eq!(u(&sim, "elem_v"), 0x7E, "element select into a replicated pattern");
+    assert_eq!(
+        u(&sim, "ovr_v"),
+        0x5A5A_5A5A,
+        "replicated instance override"
+    );
+    assert_eq!(
+        u(&sim, "def_v"),
+        0x1111_1111,
+        "replicated instantiated default"
+    );
+    assert_eq!(
+        u(&sim, "elem_v"),
+        0x7E,
+        "element select into a replicated pattern"
+    );
 }
 
 #[test]
 fn extends_clause_binds_ancestor_value_parameters() {
     let sim = simulate(EXTENDS_ARGS, 100).expect("simulate failed");
     assert_eq!(u(&sim, "d_bits"), 4, "plain extends keeps the base default");
-    assert_eq!(u(&sim, "d_mk"), 0xF, "return clamped to the base default width");
-    assert_eq!(u(&sim, "d8_bits"), 8, "extends base #(8) sizes the inherited property");
+    assert_eq!(
+        u(&sim, "d_mk"),
+        0xF,
+        "return clamped to the base default width"
+    );
+    assert_eq!(
+        u(&sim, "d8_bits"),
+        8,
+        "extends base #(8) sizes the inherited property"
+    );
     assert_eq!(u(&sim, "d8_mk"), 0xFF, "and the inherited method's return");
-    assert_eq!(u(&sim, "d8_store"), 0xFF, "a store is not truncated to the default");
-    assert_eq!(u(&sim, "f_bits"), 6, "extends base #(N) forwards the derived parameter");
-    assert_eq!(u(&sim, "f_mk"), 0x3F, "forwarded parameter clamps the return to 6 bits");
+    assert_eq!(
+        u(&sim, "d8_store"),
+        0xFF,
+        "a store is not truncated to the default"
+    );
+    assert_eq!(
+        u(&sim, "f_bits"),
+        6,
+        "extends base #(N) forwards the derived parameter"
+    );
+    assert_eq!(
+        u(&sim, "f_mk"),
+        0x3F,
+        "forwarded parameter clamps the return to 6 bits"
+    );
 }

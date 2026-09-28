@@ -46,8 +46,16 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "not_blocked_t"), 1, "an NBA never blocks the process");
-    assert_eq!(u(&sim, "in_flight"), 0x55, "unchanged before the edge — not clobbered");
+    assert_eq!(
+        u(&sim, "not_blocked_t"),
+        1,
+        "an NBA never blocks the process"
+    );
+    assert_eq!(
+        u(&sim, "in_flight"),
+        0x55,
+        "unchanged before the edge — not clobbered"
+    );
     assert_eq!(u(&sim, "post_edge"), 0x66, "updated at the edge");
 }
 
@@ -74,7 +82,11 @@ endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
     assert_ne!(u(&sim, "after_one"), 0x77, "not yet after one edge");
-    assert_eq!(u(&sim, "after_two"), 0x77, "captured RHS lands after two edges");
+    assert_eq!(
+        u(&sim, "after_two"),
+        0x77,
+        "captured RHS lands after two edges"
+    );
 }
 
 /// An event that never fires: the update never lands, and the variable is
@@ -133,7 +145,11 @@ endmodule
     assert_eq!(u(&sim, "b_early"), 0x11, "<= #d not yet");
     assert_eq!(u(&sim, "b_late"), 0x33, "<= #d landed");
     assert_eq!(u(&sim, "c2"), 0x44, "blocking event assign");
-    assert_eq!(u(&sim, "t_block_ev"), 15, "blocking form suspends to the edge");
+    assert_eq!(
+        u(&sim, "t_block_ev"),
+        15,
+        "blocking form suspends to the edge"
+    );
     assert_eq!(u(&sim, "c3"), 0x55, "blocking repeat form");
     assert_eq!(u(&sim, "t_block_rep"), 35, "two further edges");
 }

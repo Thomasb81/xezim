@@ -43,8 +43,29 @@ module top;
 endmodule
 "#;
     let out: Vec<String> = simulate_multi(
-        &[src.to_string()], 1000, Some("top"), &[], &[], None, false, None, None,
-        &[], &[], None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &[src.to_string()],
+        1000,
+        Some("top"),
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
     )
     .expect("sim")
     .output
@@ -53,8 +74,16 @@ endmodule
     .collect();
     // Both variants must carry the full element set {3,4,5,6} (reference
     // matches byte-for-byte). Before the fix these read back 0,0,0,0 sz=1.
-    assert!(out.iter().any(|l| l == "R2 setA(concrete)->T member: 3,4,5,6 sz=4"),
-        "R2 (concrete->T member) mismatch; got {:?}", out);
-    assert!(out.iter().any(|l| l == "R3 setC(T param)->T member: 3,4,5,6 sz=4"),
-        "R3 (T param->T member) mismatch; got {:?}", out);
+    assert!(
+        out.iter()
+            .any(|l| l == "R2 setA(concrete)->T member: 3,4,5,6 sz=4"),
+        "R2 (concrete->T member) mismatch; got {:?}",
+        out
+    );
+    assert!(
+        out.iter()
+            .any(|l| l == "R3 setC(T param)->T member: 3,4,5,6 sz=4"),
+        "R3 (T param->T member) mismatch; got {:?}",
+        out
+    );
 }

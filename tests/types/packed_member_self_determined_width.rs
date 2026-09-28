@@ -61,5 +61,8 @@ fn packed_member_keeps_its_width_in_self_determined_context() {
     // member=ace15307 (37-bit concat truncated to the 32-bit field),
     // wide=00ace15307 (full 37 bits), shifted=05670a98,
     // mixed={8'h12, (addr>>8) as 32 bits, 3'h3} truncated to 40 bits
-    assert_eq!(notes(SRC), ["NOTE: ace15307 00ace15307 05670a98 9005670a9b"]);
+    assert_eq!(
+        notes(SRC),
+        ["NOTE: ace15307 00ace15307 05670a98 9005670a9b"]
+    );
 }

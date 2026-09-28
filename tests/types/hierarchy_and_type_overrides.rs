@@ -50,7 +50,11 @@ endmodule
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "r_top"), 0x01, "$root read of the top's own signal");
     assert_eq!(u(&sim, "r_b"), 0xB1, "$root read through an instance");
-    assert_eq!(u(&sim, "r_top2"), 0x77, "$root WRITE landed (was silently dropped)");
+    assert_eq!(
+        u(&sim, "r_top2"),
+        0x77,
+        "$root WRITE landed (was silently dropped)"
+    );
     assert_eq!(u(&sim, "r_b2"), 0xB7);
 }
 
@@ -75,7 +79,11 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     let g = |n: &str| sim.get_signal(n).unwrap().to_u64().unwrap();
-    assert_eq!(g("u_c.w_in"), 32, "port took the OVERRIDE's width, not the default 8");
+    assert_eq!(
+        g("u_c.w_in"),
+        32,
+        "port took the OVERRIDE's width, not the default 8"
+    );
     assert_eq!(g("w_port"), 32);
     assert_eq!(g("r"), 0x0DEA_DBEE, "32-bit data flows, not an 8-bit slice");
 }
@@ -101,7 +109,15 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     let g = |n: &str| sim.get_signal(n).unwrap().to_u64().unwrap();
-    assert_eq!(g("u2.w2"), 16, "m2's t is the $unit 16-bit type — was 64 when m1 inlined first");
+    assert_eq!(
+        g("u2.w2"),
+        16,
+        "m2's t is the $unit 16-bit type — was 64 when m1 inlined first"
+    );
     assert_eq!(g("u2.v2"), 0x1234);
-    assert_eq!(g("u1.v1"), 0xFEDC_BA98_7654_3210, "m1 keeps its own 64-bit local");
+    assert_eq!(
+        g("u1.v1"),
+        0xFEDC_BA98_7654_3210,
+        "m1 keeps its own 64-bit local"
+    );
 }

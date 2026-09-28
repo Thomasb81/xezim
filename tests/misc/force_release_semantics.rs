@@ -40,7 +40,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(lookup(&sim, "s_forced"), 0xCAFE, "force must override the variable");
+    assert_eq!(
+        lookup(&sim, "s_forced"),
+        0xCAFE,
+        "force must override the variable"
+    );
     assert_eq!(
         lookup(&sim, "s_blocked"),
         0xCAFE,
@@ -80,7 +84,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(lookup(&sim, "s_forced"), 0xFF, "force must override the net");
+    assert_eq!(
+        lookup(&sim, "s_forced"),
+        0xFF,
+        "force must override the net"
+    );
     assert_eq!(
         lookup(&sim, "s_driver_change"),
         0xFF,
@@ -91,6 +99,40 @@ endmodule
         0x3C,
         "a released NET must re-evaluate to its continuous drivers"
     );
+}
+
+/// A released net takes its drivers' value in the releasing statement
+/// itself; nets downstream of it still update at the next settle.
+/// Reference-verified: `n` reads 3c right after `release`, `m` reads 00
+/// until the next time step.
+#[test]
+fn net_release_reads_driver_value_at_once() {
+    const SRC: &str = r#"
+module tb;
+  reg  [7:0] drv = 8'hA5;
+  wire [7:0] n, m;
+  assign n = drv;
+  assign m = n ^ 8'hFF;
+  reg [7:0] s_now, s_m_now, s_later;
+  initial begin
+    #1 force n = 8'hFF;
+    #1 drv = 8'h3C;
+    #1 release n;
+    s_now = n;
+    s_m_now = m;
+    #1 s_later = m;
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    assert_eq!(lookup(&sim, "s_now"), 0x3C, "released net reads its driver");
+    assert_eq!(
+        lookup(&sim, "s_m_now"),
+        0x00,
+        "fanout updates at the settle"
+    );
+    assert_eq!(lookup(&sim, "s_later"), 0xC3);
 }
 
 /// §10.6.1: a procedural continuous assignment (`assign` statement on a
@@ -117,7 +159,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(lookup(&sim, "s_assigned"), 0xF0F0, "assign must drive the variable");
+    assert_eq!(
+        lookup(&sim, "s_assigned"),
+        0xF0F0,
+        "assign must drive the variable"
+    );
     assert_eq!(
         lookup(&sim, "s_blocked"),
         0xF0F0,

@@ -54,7 +54,10 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("doubly nested must elaborate");
-    assert!(has(&sim, "T|leaf V=9"), "nested-nested param override applies");
+    assert!(
+        has(&sim, "T|leaf V=9"),
+        "nested-nested param override applies"
+    );
     assert!(has(&sim, "T|mid"));
     assert!(has(&sim, "T|top"));
 }
@@ -138,9 +141,5 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 10).expect("simulate failed");
-    assert_eq!(
-        line(&sim, "T|m="),
-        "T|m=000000000000000100010010000000000"
-    );
+    assert_eq!(line(&sim, "T|m="), "T|m=000000000000000100010010000000000");
 }
-

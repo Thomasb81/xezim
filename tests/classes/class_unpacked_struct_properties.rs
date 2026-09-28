@@ -96,16 +96,31 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "i_n"), u(&sim, "i_am"), u(&sim, "i_arr")), (0x21, 0x32, 0x41),
-               "written inside, read outside");
-    assert_eq!((u(&sim, "ci_n"), u(&sim, "ci_this")), (0x21, 0x21),
-               "read inside, implicit and explicit this");
-    assert_eq!((u(&sim, "ci_am"), u(&sim, "ci_arr")), (0x32, 0x41),
-               "indexed leaves read inside");
-    assert_eq!((u(&sim, "o_n"), u(&sim, "o_am"), u(&sim, "o_arr")), (0x71, 0x72, 0x73),
-               "written outside, read outside");
-    assert_eq!((u(&sim, "co_n2"), u(&sim, "co_am2"), u(&sim, "co_arr2")),
-               (0x71, 0x72, 0x73), "written outside, read inside");
+    assert_eq!(
+        (u(&sim, "i_n"), u(&sim, "i_am"), u(&sim, "i_arr")),
+        (0x21, 0x32, 0x41),
+        "written inside, read outside"
+    );
+    assert_eq!(
+        (u(&sim, "ci_n"), u(&sim, "ci_this")),
+        (0x21, 0x21),
+        "read inside, implicit and explicit this"
+    );
+    assert_eq!(
+        (u(&sim, "ci_am"), u(&sim, "ci_arr")),
+        (0x32, 0x41),
+        "indexed leaves read inside"
+    );
+    assert_eq!(
+        (u(&sim, "o_n"), u(&sim, "o_am"), u(&sim, "o_arr")),
+        (0x71, 0x72, 0x73),
+        "written outside, read outside"
+    );
+    assert_eq!(
+        (u(&sim, "co_n2"), u(&sim, "co_am2"), u(&sim, "co_arr2")),
+        (0x71, 0x72, 0x73),
+        "written outside, read inside"
+    );
 }
 
 /// A whole struct property as a value: copied out, and returned from a method.
@@ -136,9 +151,17 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "d_a"), u(&sim, "d_b")), (0x11, 0x12), "whole property copied out");
+    assert_eq!(
+        (u(&sim, "d_a"), u(&sim, "d_b")),
+        (0x11, 0x12),
+        "whole property copied out"
+    );
     assert_eq!(u(&sim, "p_a"), 0x11, "method returning a property");
-    assert_eq!(u(&sim, "i_a"), 0x21, "method returning via the implicit variable");
+    assert_eq!(
+        u(&sim, "i_a"),
+        0x21,
+        "method returning via the implicit variable"
+    );
     assert_eq!(u(&sim, "l_a"), 0x31, "method returning a local");
 }
 
@@ -165,7 +188,11 @@ endmodule
     assert_eq!(u(&sim, "w_n"), 24);
     assert_eq!(u(&sim, "w_na"), 40, "an array of nested structs, too");
     assert_eq!((u(&sim, "w_fa"), u(&sim, "w_elem")), (64, 16));
-    assert_eq!(u(&sim, "w_type"), 32, "the type itself, not just a variable");
+    assert_eq!(
+        u(&sim, "w_type"),
+        32,
+        "the type itself, not just a variable"
+    );
 }
 
 /// A member selected directly off a call result, for every struct shape.
@@ -192,7 +219,15 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "f_a"), 0x11, "flat");
-    assert_eq!((u(&sim, "n_a"), u(&sim, "n_z")), (0x21, 0x23), "nested member of a call result");
-    assert_eq!((u(&sim, "a_tag"), u(&sim, "a_a1")), (0x31, 0x32), "indexed member of a call result");
+    assert_eq!(
+        (u(&sim, "n_a"), u(&sim, "n_z")),
+        (0x21, 0x23),
+        "nested member of a call result"
+    );
+    assert_eq!(
+        (u(&sim, "a_tag"), u(&sim, "a_a1")),
+        (0x31, 0x32),
+        "indexed member of a call result"
+    );
     assert_eq!(u(&sim, "p_a"), 0x41, "packed return is unaffected");
 }

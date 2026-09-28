@@ -97,8 +97,7 @@ fn run_negative_compliance_test(filename: &str) {
     assert!(
         has_diagnostic,
         "Negative test {} failed without an error diagnostic. Output:\n{}",
-        filename,
-        combined
+        filename, combined
     );
 }
 

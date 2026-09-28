@@ -48,7 +48,10 @@ module tb;
   initial begin t = TB; p = PA; #1 $display("TOP name=%s pkg=%s next=%s", t.name(), p.name(), t.next().name()); end
 endmodule
 "#);
-    for expect in ["SUB name=SB fn=SA first=SA num=2", "TOP name=TB pkg=PA next=TA"] {
+    for expect in [
+        "SUB name=SB fn=SA first=SA num=2",
+        "TOP name=TB pkg=PA next=TA",
+    ] {
         assert!(o.contains(expect), "expected `{expect}` in:\n{o}");
     }
 }

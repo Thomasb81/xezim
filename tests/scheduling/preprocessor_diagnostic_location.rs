@@ -34,11 +34,11 @@ fn parse_mode_reports_reserved_macro_file_and_line() {
     assert!(!strict.status.success());
     let stderr = String::from_utf8_lossy(&strict.stderr);
     assert!(
-        stderr.contains(&format!("{}:2: `__FILE__", source.display())),
+        stderr.contains(&format!("{}:2:1: error: `__FILE__", source.display())),
         "missing __FILE__ location:\n{stderr}"
     );
     assert!(
-        stderr.contains(&format!("{}:3: `__LINE__", source.display())),
+        stderr.contains(&format!("{}:3:1: error: `__LINE__", source.display())),
         "missing __LINE__ location:\n{stderr}"
     );
 

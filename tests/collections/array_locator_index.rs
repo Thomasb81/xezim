@@ -37,11 +37,11 @@ endmodule
     let want = [
         "U='{3, 1, 4, 5, 9}", // unique preserves first-seen order
         "F='{4, 5, 9}",
-        "M=9,1",   // max=9 not 1, min=1
-        "UI=3,4",  // unique()[0]=3, unique()[2]=4
-        "FI=2",    // index of the first 4
-        "FF=4",    // first element > 3
-        "PF=4",    // paren-wrapped find, index 1
+        "M=9,1",  // max=9 not 1, min=1
+        "UI=3,4", // unique()[0]=3, unique()[2]=4
+        "FI=2",   // index of the first 4
+        "FF=4",   // first element > 3
+        "PF=4",   // paren-wrapped find, index 1
     ];
     for w in want {
         assert!(out.iter().any(|m| m == w), "missing {:?}; got {:?}", w, out);

@@ -31,7 +31,10 @@ fn artifact_modes_round_trip() {
 
     let compile = |out: &str, extra: &[&str]| {
         let mut c = Command::new(&bin);
-        c.arg("--compile").arg(dir.join("t.sv")).args(["-s", "tb", "-o"]).arg(dir.join(out));
+        c.arg("--compile")
+            .arg(dir.join("t.sv"))
+            .args(["-s", "tb", "-o"])
+            .arg(dir.join(out));
         c.args(extra);
         let o = c.output().expect("compile");
         assert!(
@@ -46,11 +49,16 @@ fn artifact_modes_round_trip() {
     compile("b_19", &["--artifact-compression=19"]);
 
     let sz = |n: &str| std::fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0);
-    assert!(sz("b_none") > sz("b_default"), "raw must be larger than zstd");
+    assert!(
+        sz("b_none") > sz("b_default"),
+        "raw must be larger than zstd"
+    );
 
     for n in ["b_default", "b_none", "b_19"] {
+        // `--verbose`: "Loaded compiled:" is part of the run banner.
         let o = Command::new(&bin)
             .arg("--simulate")
+            .arg("--verbose")
             .arg(dir.join(n))
             .output()
             .expect("simulate");
@@ -59,7 +67,10 @@ fn artifact_modes_round_trip() {
             String::from_utf8_lossy(&o.stdout),
             String::from_utf8_lossy(&o.stderr)
         );
-        assert!(text.contains("Loaded compiled:"), "{n}: fast path; got:\n{text}");
+        assert!(
+            text.contains("Loaded compiled:"),
+            "{n}: fast path; got:\n{text}"
+        );
         assert!(text.contains("VAL a7"), "{n}: sim output; got:\n{text}");
     }
     let _ = std::fs::remove_dir_all(&dir);

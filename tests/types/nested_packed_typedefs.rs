@@ -61,11 +61,19 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "w_sp"), 16);
-    assert_eq!(u(&sim, "w_via"), 32, "member typedef must not fall back to 32 bits");
+    assert_eq!(
+        u(&sim, "w_via"),
+        32,
+        "member typedef must not fall back to 32 bits"
+    );
     assert_eq!(u(&sim, "w_three"), 40);
     assert_eq!(u(&sim, "w_zzz"), 16);
     assert_eq!(u(&sim, "w_mmm"), 24);
-    assert_eq!(u(&sim, "w_un"), 16, "a packed union is as wide as its widest member");
+    assert_eq!(
+        u(&sim, "w_un"),
+        16,
+        "a packed union is as wide as its widest member"
+    );
 }
 
 /// A signal of a nested typedef must be exactly as wide as the type, so a whole
@@ -129,10 +137,26 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "u.in_hi"), u(&sim, "u.in_lo")), (0x12, 0x34), "read inside the child");
-    assert_eq!(u(&sim, "u.in_un_hi"), 0xbe, "union member read inside the child");
-    assert_eq!((u(&sim, "out_hi"), u(&sim, "out_lo")), (0x12, 0x34), "read from the parent");
-    assert_eq!((u(&sim, "out_un_hi"), u(&sim, "out_un_lo")), (0xbe, 0xef), "union overlay");
+    assert_eq!(
+        (u(&sim, "u.in_hi"), u(&sim, "u.in_lo")),
+        (0x12, 0x34),
+        "read inside the child"
+    );
+    assert_eq!(
+        u(&sim, "u.in_un_hi"),
+        0xbe,
+        "union member read inside the child"
+    );
+    assert_eq!(
+        (u(&sim, "out_hi"), u(&sim, "out_lo")),
+        (0x12, 0x34),
+        "read from the parent"
+    );
+    assert_eq!(
+        (u(&sim, "out_un_hi"), u(&sim, "out_un_lo")),
+        (0xbe, 0xef),
+        "union overlay"
+    );
     assert_eq!(u(&sim, "tail_x"), 1, "an unwritten member stays x");
 }
 

@@ -72,8 +72,14 @@ endmodule
         "the t=0 inactive-region posedge must wake the waiter, got: {:?}",
         sim.output.iter().map(|o| &o.message).collect::<Vec<_>>()
     );
-    assert!(find_line(&sim, "MISSED").is_none(), "watchdog fired: edge was lost");
-    assert_eq!(sim.time, 0, "the waiter must fire at time 0, not at the watchdog");
+    assert!(
+        find_line(&sim, "MISSED").is_none(),
+        "watchdog fired: edge was lost"
+    );
+    assert_eq!(
+        sim.time, 0,
+        "the waiter must fire at time 0, not at the watchdog"
+    );
 }
 
 /// S1 shape (b): same class at a NONZERO time — `#5; #0 clk = 1;`.
@@ -113,7 +119,10 @@ endmodule
         "the t=0 inactive-region negedge must wake the waiter, got: {:?}",
         sim.output.iter().map(|o| &o.message).collect::<Vec<_>>()
     );
-    assert!(find_line(&sim, "MISSED").is_none(), "watchdog fired: edge was lost");
+    assert!(
+        find_line(&sim, "MISSED").is_none(),
+        "watchdog fired: edge was lost"
+    );
     assert_eq!(sim.time, 0);
 }
 
@@ -225,7 +234,9 @@ endmodule
 "#;
     let sim = run(SRC, &[]);
     assert_eq!(sim.time, 10, "the cascade must settle and let time advance");
-    let line = find_line(&sim, "CHAIN ").expect("no CHAIN line").to_string();
+    let line = find_line(&sim, "CHAIN ")
+        .expect("no CHAIN line")
+        .to_string();
     // Declaration initialization creates NO event (§6.8 — reference-simulator
     // verified), so each stage fires exactly once, for the #0-driven wave.
     // The b and c re-triggers are the part the old coalescing dropped;
@@ -264,7 +275,10 @@ fn settle_limit_warning_names_the_oscillating_signals() {
         "module t;\n  logic a, b;\n  always_comb a = ~b;\n  always_comb b = a;\n  initial begin a = 0; #10 $finish; end\nendmodule\n",
     )
     .expect("write sv");
-    let out = Command::new(xezim_bin()).arg(&sv).output().expect("run xezim");
+    let out = Command::new(xezim_bin())
+        .arg(&sv)
+        .output()
+        .expect("run xezim");
     let stderr = String::from_utf8_lossy(&out.stderr);
     // The established first line must survive (scripts grep it). The
     // iteration count is the CONFIGURED limit, not part of the contract —
@@ -335,7 +349,9 @@ fn nba_feedback_loop_is_reported_not_dropped() {
     .unwrap();
     let mut bin = std::env::current_exe().unwrap();
     bin.pop();
-    if bin.ends_with("deps") { bin.pop(); }
+    if bin.ends_with("deps") {
+        bin.pop();
+    }
     let out = std::process::Command::new(bin.join("xezim"))
         .arg(&sv)
         .output()

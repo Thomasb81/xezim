@@ -55,7 +55,10 @@ fn unsized_literal_keeps_digits_beyond_32_bits() {
     assert_eq!(get(&sim, "eq_hex") & 1, 1);
     // Other radices carry their digits too.
     assert_eq!(get(&sim, "oct_unsized"), 0o1234567012345670123);
-    assert_eq!(get(&sim, "bin_unsized"), 0b1010101010101010101010101010101010101010);
+    assert_eq!(
+        get(&sim, "bin_unsized"),
+        0b1010101010101010101010101010101010101010
+    );
     assert_eq!(get(&sim, "dec_unsized"), 1234567890123456789);
     // A literal that already fit in 32 bits behaves exactly as before.
     assert_eq!(get(&sim, "small_unsized") & 0xFFFF_FFFF, 0xDEAD);

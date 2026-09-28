@@ -85,7 +85,11 @@ module top;
   end
 endmodule
 "#;
-    assert_eq!(notes(src), vec!["NOTE: hi=5 lo=6"], "the formal must win, not the module variable");
+    assert_eq!(
+        notes(src),
+        vec!["NOTE: hi=5 lo=6"],
+        "the formal must win, not the module variable"
+    );
 }
 
 /// A packed-struct LOCAL declared inside the nested task has the same shape.

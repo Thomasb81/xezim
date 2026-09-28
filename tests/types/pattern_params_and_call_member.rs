@@ -113,26 +113,70 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 fn pattern_parameter_defaults_and_overrides_pack() {
     let sim = simulate(PATTERN_PARAMS, 100).expect("simulate failed");
     assert_eq!(u(&sim, "top_whole"), 0xCCDD, "top-scope pattern default");
-    assert_eq!(u(&sim, "top_e1"), 0xCC, "element select on a pattern parameter");
-    assert_eq!(u(&sim, "dflt_v"), 0x9A9A_9A9A, "a default-keyed pattern replicates");
+    assert_eq!(
+        u(&sim, "top_e1"),
+        0xCC,
+        "element select on a pattern parameter"
+    );
+    assert_eq!(
+        u(&sim, "dflt_v"),
+        0x9A9A_9A9A,
+        "a default-keyed pattern replicates"
+    );
     assert_eq!(u(&sim, "nest_v"), 0xABCD, "nested 3-D pattern");
     assert_eq!(u(&sim, "lp_v"), 0x3344, "localparam pattern");
-    assert_eq!(u(&sim, "ovr_cap"), 0xAABB, "an instance pattern override packs");
-    assert_eq!(u(&sim, "def_cap"), 0x0FF0, "an instantiated pattern default packs");
-    assert_eq!(u(&sim, "def_keyed"), 0x5566, "index-keyed pattern is NOT an assoc literal");
-    assert_eq!(u(&sim, "if_cap"), 0x1122, "interface parameter override packs");
+    assert_eq!(
+        u(&sim, "ovr_cap"),
+        0xAABB,
+        "an instance pattern override packs"
+    );
+    assert_eq!(
+        u(&sim, "def_cap"),
+        0x0FF0,
+        "an instantiated pattern default packs"
+    );
+    assert_eq!(
+        u(&sim, "def_keyed"),
+        0x5566,
+        "index-keyed pattern is NOT an assoc literal"
+    );
+    assert_eq!(
+        u(&sim, "if_cap"),
+        0x1122,
+        "interface parameter override packs"
+    );
     assert_eq!(u(&sim, "if_e1"), 0x11, "interface variable element select");
-    assert_eq!(u(&sim, "ovr_param_e1"), 0xAA, "hierarchical parameter element select");
+    assert_eq!(
+        u(&sim, "ovr_param_e1"),
+        0xAA,
+        "hierarchical parameter element select"
+    );
 }
 
 #[test]
 fn member_access_on_call_results_projects_fields() {
     let sim = simulate(CALL_MEMBER, 100).expect("simulate failed");
     assert_eq!(u(&sim, "free_tag"), 0x7F, "free function result field");
-    assert_eq!(u(&sim, "meth_tag"), 0xE0, "class method result field (type-param return)");
-    assert_eq!(u(&sim, "ifc_tag"), 0xE0, "interface-class virtual dispatch result field");
-    assert_eq!(u(&sim, "nested_hi"), 0xA, "nested struct member on a call result");
-    assert_eq!(u(&sim, "nested_rest"), 0x7F, "sibling member after nested access");
+    assert_eq!(
+        u(&sim, "meth_tag"),
+        0xE0,
+        "class method result field (type-param return)"
+    );
+    assert_eq!(
+        u(&sim, "ifc_tag"),
+        0xE0,
+        "interface-class virtual dispatch result field"
+    );
+    assert_eq!(
+        u(&sim, "nested_hi"),
+        0xA,
+        "nested struct member on a call result"
+    );
+    assert_eq!(
+        u(&sim, "nested_rest"),
+        0x7F,
+        "sibling member after nested access"
+    );
     assert_eq!(u(&sim, "vec_e1"), 0xCC, "element select on a call result");
     assert_eq!(u(&sim, "vec_e0"), 0xDD, "element select on a call result");
 }

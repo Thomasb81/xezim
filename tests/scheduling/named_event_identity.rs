@@ -57,7 +57,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "woke_on_sibling"), 0, "a sibling element must not wake it");
+    assert_eq!(
+        u(&sim, "woke_on_sibling"),
+        0,
+        "a sibling element must not wake it"
+    );
     assert_eq!(u(&sim, "t_one"), 20, "@ev[1] resumes when ev[1] fires");
     assert_eq!(u(&sim, "t_two"), 30, "@ev[2] likewise");
 }
@@ -80,8 +84,16 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "t_trig"), 10, "wait(ev[1].triggered) completes at the trigger");
-    assert_eq!(u(&sim, "n_always"), 2, "always @(ev[1]) fires once per trigger");
+    assert_eq!(
+        u(&sim, "t_trig"),
+        10,
+        "wait(ev[1].triggered) completes at the trigger"
+    );
+    assert_eq!(
+        u(&sim, "n_always"),
+        2,
+        "always @(ev[1]) fires once per trigger"
+    );
 }
 
 /// A class-property event driven and waited on from OUTSIDE the class.
@@ -108,8 +120,16 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "t_at"), 20, "@(h.ce) blocks until the handle's event fires");
-    assert_eq!(u(&sim, "t_trig"), 20, "and .triggered reads through the handle");
+    assert_eq!(
+        u(&sim, "t_at"),
+        20,
+        "@(h.ce) blocks until the handle's event fires"
+    );
+    assert_eq!(
+        u(&sim, "t_trig"),
+        20,
+        "and .triggered reads through the handle"
+    );
 }
 
 /// Two instances of the same class have INDEPENDENT events — the per-instance
@@ -159,7 +179,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "t_woke"), 30, "the caller's waiter resumes at the ref trigger");
+    assert_eq!(
+        u(&sim, "t_woke"),
+        30,
+        "the caller's waiter resumes at the ref trigger"
+    );
 }
 
 /// §15.5.4: after `e1 = e2` the two names denote ONE object — a waiter on
@@ -241,9 +265,21 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "n_wakes"), 2, "one wake per slot, then the ->> wake");
+    assert_eq!(
+        u(&sim, "n_wakes"),
+        2,
+        "one wake per slot, then the ->> wake"
+    );
     assert_eq!(u(&sim, "woke"), 20, "the ->> trigger landed at t=20");
-    assert_eq!(u(&sim, "trig_same_slot"), 1, ".triggered holds for the slot");
+    assert_eq!(
+        u(&sim, "trig_same_slot"),
+        1,
+        ".triggered holds for the slot"
+    );
     assert_eq!(u(&sim, "trig_next_slot"), 0, "and clears in the next one");
-    assert_eq!(u(&sim, "nb_seen_immediately"), 0, "->> does not resume a waiter inline");
+    assert_eq!(
+        u(&sim, "nb_seen_immediately"),
+        0,
+        "->> does not resume a waiter inline"
+    );
 }

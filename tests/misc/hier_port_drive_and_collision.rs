@@ -22,7 +22,13 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb_top", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "tb_top",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -152,7 +158,10 @@ module tb_top;
 endmodule
 "#,
     );
-    assert!(text.contains("TEST_PASS"), "same-name identity actual:\n{text}");
+    assert!(
+        text.contains("TEST_PASS"),
+        "same-name identity actual:\n{text}"
+    );
 }
 
 /// §23.3.3: an EXPRESSION actual over a parent net named like the child's
@@ -189,8 +198,14 @@ endmodule
 "#,
     );
     // Child reads the PARENT d (src) through the substituted actual: src^1.
-    assert!(text.contains("CHILD d=11111110"), "child first sample:\n{text}");
-    assert!(text.contains("CHILD d=12121213"), "child second sample:\n{text}");
+    assert!(
+        text.contains("CHILD d=11111110"),
+        "child first sample:\n{text}"
+    );
+    assert!(
+        text.contains("CHILD d=12121213"),
+        "child second sample:\n{text}"
+    );
     // Parent reads its own d (== src), u1.d == src^1, q1 == previous u1.d.
     assert!(
         text.contains("TOP src=13131313 d=13131313 u1d=13131312 q1=12121213"),
@@ -254,7 +269,10 @@ module tb_top;
 endmodule
 "#,
     );
-    assert!(text.contains("TEST_PASS"), "shadowed hier-assign rhs:\n{text}");
+    assert!(
+        text.contains("TEST_PASS"),
+        "shadowed hier-assign rhs:\n{text}"
+    );
 }
 
 /// Two reference-verified mechanisms from one TB (§23.10.1 + §10.3.3):
@@ -305,5 +323,8 @@ module tb_top;
 endmodule
 "#,
     );
-    assert!(text.contains("TEST_PASS"), "delayed echo through bind:\n{text}");
+    assert!(
+        text.contains("TEST_PASS"),
+        "delayed echo through bind:\n{text}"
+    );
 }

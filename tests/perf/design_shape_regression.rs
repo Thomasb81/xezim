@@ -15,7 +15,15 @@
 fn run_profiled(name: &str) -> String {
     let path = format!("{}/tests/perf/{}", env!("CARGO_MANIFEST_DIR"), name);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "top", &path, "--no-cache", "--max-time", "2000000"])
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            &path,
+            "--no-cache",
+            "--max-time",
+            "2000000",
+        ])
         .env("XEZIM_PROFILE_TIMING", "1")
         .output()
         .expect("run profiled design");
@@ -43,7 +51,11 @@ fn riscv_shape_compiles_and_matches_reference() {
         out.contains("IBX acc=940fc24b chk=8efa3394 dec=[nop\tr15,0xc248]"),
         "wrong answer:\n{out}"
     );
-    assert_eq!(stat(&out, "fallbacks="), 0, "AST fallbacks crept in:\n{out}");
+    assert_eq!(
+        stat(&out, "fallbacks="),
+        0,
+        "AST fallbacks crept in:\n{out}"
+    );
     assert!(
         stat(&out, "insns=") <= 10_000_000,
         "instruction count regressed:\n{out}"
@@ -57,7 +69,11 @@ fn cipher_shape_compiles_and_matches_reference() {
         out.contains("AESM digest=41570f4d35f01fe3878b8a131109d7b1 blocks=2000"),
         "wrong answer:\n{out}"
     );
-    assert_eq!(stat(&out, "fallbacks="), 0, "AST fallbacks crept in:\n{out}");
+    assert_eq!(
+        stat(&out, "fallbacks="),
+        0,
+        "AST fallbacks crept in:\n{out}"
+    );
     assert!(
         stat(&out, "insns=") <= 10_000_000,
         "instruction count regressed:\n{out}"

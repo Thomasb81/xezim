@@ -54,11 +54,7 @@ endmodule
 fn omitted_formal_direction_inherits_from_previous() {
     assert_eq!(
         notes(SRC),
-        vec![
-            "NOTE: fn m=6 n=7 o=8",
-            "NOTE: task p=15 q=25",
-            "NOTE: g=10",
-        ],
+        vec!["NOTE: fn m=6 n=7 o=8", "NOTE: task p=15 q=25", "NOTE: g=10",],
         "r1..rN of a comma-continued output list must be OUTPUTS (§13.5.2)"
     );
 }

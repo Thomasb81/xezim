@@ -47,15 +47,39 @@ end
 endmodule
 "#;
     let out: Vec<String> = simulate_multi(
-        &[src.to_string()], 1000, Some("top"), &[], &[], None, false, None, None,
-        &[], &[], None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &[src.to_string()],
+        1000,
+        Some("top"),
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
     )
     .expect("sim")
     .output
     .iter()
     .map(|o| o.message.clone())
     .collect();
-    assert!(out.iter().any(|l| l.contains("N2_PASS")),
-        "expected nested value-param to resolve to active spec; got {:?}", out);
+    assert!(
+        out.iter().any(|l| l.contains("N2_PASS")),
+        "expected nested value-param to resolve to active spec; got {:?}",
+        out
+    );
     assert!(!out.iter().any(|l| l.contains("N2_FAIL")), "got {:?}", out);
 }

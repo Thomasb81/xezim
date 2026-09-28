@@ -42,7 +42,7 @@ module tb;
       rc = $cast(l_verbosity, v);
       if (rc == 0) begin
         // out-of-range -> int path (as uvm_report_handler does for a non-member)
-        lv = v; // not reached for 301/501 after the fix
+        lv = verbosity'(v); // not reached for 301/501 after the fix
         return 0;
       end
       return 1;
@@ -62,10 +62,22 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "rc_301"), 0, "301 not a verbosity member -> cast FAILS");
+    assert_eq!(
+        u(&sim, "rc_301"),
+        0,
+        "301 not a verbosity member -> cast FAILS"
+    );
     assert_eq!(u(&sim, "rc_501"), 0, "501 (past U_DEBUG=500) -> cast FAILS");
-    assert_eq!(u(&sim, "rc_400"), 1, "U_FULL=400 is a member -> cast succeeds");
-    assert_eq!(u(&sim, "rc_100"), 1, "U_LOW=100 is a member -> cast succeeds");
+    assert_eq!(
+        u(&sim, "rc_400"),
+        1,
+        "U_FULL=400 is a member -> cast succeeds"
+    );
+    assert_eq!(
+        u(&sim, "rc_100"),
+        1,
+        "U_LOW=100 is a member -> cast succeeds"
+    );
 }
 
 /// Sanity control: the same out-of-range `$cast` on a module-scope enum var is

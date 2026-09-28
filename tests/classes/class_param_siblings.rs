@@ -178,21 +178,41 @@ fn parameter_sized_unpacked_class_arrays_are_fixed_arrays() {
 #[test]
 fn struct_pattern_parameters_pack_at_instance_sites() {
     let sim = simulate(STRUCT_PARAM_SITES, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "ovr_v"), 0x99_4455_6677, "named struct-pattern override");
-    assert_eq!(u(&sim, "def_v"), 0x11_2233_4455, "instantiated struct-pattern default");
+    assert_eq!(
+        u(&sim, "ovr_v"),
+        0x99_4455_6677,
+        "named struct-pattern override"
+    );
+    assert_eq!(
+        u(&sim, "def_v"),
+        0x11_2233_4455,
+        "instantiated struct-pattern default"
+    );
 }
 
 #[test]
 fn method_return_width_follows_the_specialization() {
     let sim = simulate(RETURN_WIDTH, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "wide_v"), 0xBEEF, "default-spec return keeps 16 bits");
-    assert_eq!(u(&sim, "narrow_v"), 0xF, "box#(4) clamps the return to 4 bits");
+    assert_eq!(
+        u(&sim, "wide_v"),
+        0xBEEF,
+        "default-spec return keeps 16 bits"
+    );
+    assert_eq!(
+        u(&sim, "narrow_v"),
+        0xF,
+        "box#(4) clamps the return to 4 bits"
+    );
 }
 
 #[test]
 fn nested_call_chain_projects_the_field() {
     let sim = simulate(NESTED_CHAIN, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "chained_tag"), 0xE0, "o.get().rd().tag via static receiver typing");
+    assert_eq!(
+        u(&sim, "chained_tag"),
+        0xE0,
+        "o.get().rd().tag via static receiver typing"
+    );
 }
 
 #[test]
@@ -209,7 +229,11 @@ fn class_body_enum_members_resolve_as_constants() {
 #[test]
 fn anonymous_inline_struct_property_projects_fields() {
     let sim = simulate(ANON_STRUCT, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "whole"), 0xAB5, "whole-value access (already worked)");
+    assert_eq!(
+        u(&sim, "whole"),
+        0xAB5,
+        "whole-value access (already worked)"
+    );
     assert_eq!(u(&sim, "f_v"), 0xAB, "field sized by a class parameter");
     assert_eq!(u(&sim, "g_v"), 0x5, "literal-width field");
     assert_eq!(u(&sim, "s_bits"), 12, "$bits of the anonymous struct");

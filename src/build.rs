@@ -24,11 +24,7 @@ fn main() {
                 .ok()
                 .map(|o| !o.stdout.is_empty())
                 .unwrap_or(false);
-            if dirty {
-                format!("{}-dirty", h)
-            } else {
-                h
-            }
+            if dirty { format!("{}-dirty", h) } else { h }
         })
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=XEZIM_GIT_HASH={}", git_hash);
@@ -59,10 +55,21 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=XEZIM_GIT_TAG={}", git_tag);
     // HEAD ref + index changes should retrigger the build script so the hash
-    // does not go stale between commits.
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    println!("cargo:rerun-if-changed=.git/index");
-    println!("cargo:rerun-if-changed=.git/refs/tags");
+    // does not go stale between commits. Ask git for the paths: in a linked
+    // worktree `.git` is a file, and a watched path that does not exist makes
+    // cargo rerun the script (and rebuild the crate) on every invocation.
+    for p in ["HEAD", "index", "refs/tags"] {
+        let path = Command::new("git")
+            .args(["rev-parse", "--git-path", p])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty() && std::path::Path::new(s).exists());
+        if let Some(path) = path {
+            println!("cargo:rerun-if-changed={}", path);
+        }
+    }
 
     // UVM checkout for the UVM integration tests
     // (tests/classes/uvm_integration_tests.rs): a single
@@ -72,8 +79,7 @@ fn main() {
     // sibling) or an offline build skips it — the tests' own locator clones
     // on demand as a fallback.
     println!("cargo:rerun-if-env-changed=XEZIM_UVM_DIR");
-    let manifest =
-        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let uvm_dest = manifest.join("target/uvm-checkout");
     let uvm_present = std::env::var_os("XEZIM_UVM_DIR").is_some()
         || manifest.join("../UVM/1.2/src/uvm_pkg.sv").exists()

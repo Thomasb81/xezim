@@ -63,7 +63,11 @@ fn typedef_survives_same_named_module() {
     let sim = simulate(SRC_A, 1000).expect("simulate failed");
     // If the module had clobbered the typedef, `shared h; h=new()` could not
     // resolve to `base_k`, so `h.a` would read X instead of 3.
-    assert_eq!(u(&sim, "out"), 3, "typedef before module: handle must resolve via the typedef");
+    assert_eq!(
+        u(&sim, "out"),
+        3,
+        "typedef before module: handle must resolve via the typedef"
+    );
 }
 
 #[test]
@@ -72,5 +76,9 @@ fn typedef_survives_module_declared_first() {
     // Module-first ordering: the typedef must not evict the module from the
     // name-keyed slot (it must still be the top module) AND must remain
     // resolvable as the handle's data type.
-    assert_eq!(u(&sim, "out"), 13, "module first: typedef must coexist and resolve");
+    assert_eq!(
+        u(&sim, "out"),
+        13,
+        "module first: typedef must coexist and resolve"
+    );
 }

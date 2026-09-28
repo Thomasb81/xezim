@@ -69,7 +69,11 @@ endmodule
     assert_eq!(u(&sim, "m_qsz"), 1, "module scope still works");
     assert_eq!(u(&sim, "t_qsz"), 2, "push_back inside the task lands");
     assert_eq!(u(&sim, "t_q0"), 4, "and the element reads back");
-    assert_eq!(u(&sim, "t_dbl"), 10, "an interface function called from a task");
+    assert_eq!(
+        u(&sim, "t_dbl"),
+        10,
+        "an interface function called from a task"
+    );
 }
 
 /// The vif itself, held three ways: a module variable used in a task, a task
@@ -106,11 +110,27 @@ endmodule
 "
     );
     let sim = simulate(&src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "a_usa"), 0x13, "nested unpacked member through a module vif");
-    assert_eq!(u(&sim, "a_qsz"), 1, "queue op through a module vif in a task");
-    assert_eq!(u(&sim, "a_dbl"), 8, "interface function through a module vif");
+    assert_eq!(
+        u(&sim, "a_usa"),
+        0x13,
+        "nested unpacked member through a module vif"
+    );
+    assert_eq!(
+        u(&sim, "a_qsz"),
+        1,
+        "queue op through a module vif in a task"
+    );
+    assert_eq!(
+        u(&sim, "a_dbl"),
+        8,
+        "interface function through a module vif"
+    );
     assert_eq!(u(&sim, "b_usa"), 0x23, "a task's vif formal");
-    assert_eq!(u(&sim, "c_fn"), 0x25, "a FREE FUNCTION's vif formal is aliased too");
+    assert_eq!(
+        u(&sim, "c_fn"),
+        0x25,
+        "a FREE FUNCTION's vif formal is aliased too"
+    );
 }
 
 /// A vif class property used inside methods — and two objects on two
@@ -154,5 +174,9 @@ endmodule
     assert_eq!(u(&sim, "r0_q0"), 0x41);
     assert_eq!(u(&sim, "r1_usa"), 0x50, "agent 1 does not see agent 0's");
     assert_eq!(u(&sim, "r1_q0"), 0x51);
-    assert_eq!(u(&sim, "direct0"), 0x40, "the write landed on the real instance");
+    assert_eq!(
+        u(&sim, "direct0"),
+        0x40,
+        "the write landed on the real instance"
+    );
 }

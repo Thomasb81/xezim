@@ -66,5 +66,8 @@ endmodule
         u64::from_str_radix("fffffffffffffffd", 16).unwrap(),
         "class-method formal of a 64-bit typedef must sign-extend a 32-bit negative actual"
     );
-    assert!(tag(&sim) == "TAG_PASS", "must round-trip the sign-extended value");
+    assert!(
+        tag(&sim) == "TAG_PASS",
+        "must round-trip the sign-extended value"
+    );
 }

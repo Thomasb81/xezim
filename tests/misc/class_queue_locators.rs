@@ -21,7 +21,13 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "test", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "test",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -71,12 +77,30 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|neq-enum n=1 first=0"), "enum != predicate:\n{text}");
-    assert!(text.contains("T|eq-int n=1 first=0"), "int == predicate:\n{text}");
-    assert!(text.contains("T|always n=1 first=0 size=2"), "with(1) sees elements:\n{text}");
-    assert!(text.contains("T|none n=0"), "impossible predicate yields empty:\n{text}");
-    assert!(text.contains("T|int-q n=1 first=1"), "int member queue:\n{text}");
-    assert!(text.contains("T|ff n=1 tag=7"), "find_first returns the element:\n{text}");
+    assert!(
+        text.contains("T|neq-enum n=1 first=0"),
+        "enum != predicate:\n{text}"
+    );
+    assert!(
+        text.contains("T|eq-int n=1 first=0"),
+        "int == predicate:\n{text}"
+    );
+    assert!(
+        text.contains("T|always n=1 first=0 size=2"),
+        "with(1) sees elements:\n{text}"
+    );
+    assert!(
+        text.contains("T|none n=0"),
+        "impossible predicate yields empty:\n{text}"
+    );
+    assert!(
+        text.contains("T|int-q n=1 first=1"),
+        "int member queue:\n{text}"
+    );
+    assert!(
+        text.contains("T|ff n=1 tag=7"),
+        "find_first returns the element:\n{text}"
+    );
 }
 
 #[test]
@@ -108,6 +132,12 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|none n=0"), "impossible predicate yields empty:\n{text}");
-    assert!(text.contains("T|seven n=1 first=1"), "match is at index 1, not 0:\n{text}");
+    assert!(
+        text.contains("T|none n=0"),
+        "impossible predicate yields empty:\n{text}"
+    );
+    assert!(
+        text.contains("T|seven n=1 first=1"),
+        "match is at index 1, not 0:\n{text}"
+    );
 }

@@ -62,7 +62,11 @@ endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
     assert_eq!(u(&sim, "t_usa"), 0x44, "top: member write");
-    assert_eq!((u(&sim, "t_us2a"), u(&sim, "t_us2b")), (0x11, 0x2233), "top: whole-struct write");
+    assert_eq!(
+        (u(&sim, "t_us2a"), u(&sim, "t_us2b")),
+        (0x11, 0x2233),
+        "top: whole-struct write"
+    );
     assert_eq!(u(&sim, "n_usa"), 0x44, "nested: member write");
     assert_eq!(
         (u(&sim, "n_us2a"), u(&sim, "n_us2b")),

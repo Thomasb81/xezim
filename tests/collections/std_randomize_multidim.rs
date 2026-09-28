@@ -37,7 +37,10 @@ endmodule
 "
     ));
     for want in ["LT ok=1 n=10", "EQ ok=1 n=10", "EL ok=1 a=1 b=1 c=1"] {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
 }
 
@@ -60,7 +63,8 @@ endmodule
     // `inside` is checked, not repaired element-wise, so only require the
     // draw to have happened and the check to be honest.
     assert!(
-        msgs.iter().any(|m| m.starts_with("IN ok=") && m.contains("nz=10")),
+        msgs.iter()
+            .any(|m| m.starts_with("IN ok=") && m.contains("nz=10")),
         "2-D unpacked target must be drawn; got {msgs:?}"
     );
 }
@@ -89,5 +93,9 @@ module tb;
 endmodule
 "
     ));
-    assert!(msgs.iter().any(|m| m == "CP ok=1 bad_lt=0 bad_eq=0 varied=1"), "got {msgs:?}");
+    assert!(
+        msgs.iter()
+            .any(|m| m == "CP ok=1 bad_lt=0 bad_eq=0 varied=1"),
+        "got {msgs:?}"
+    );
 }

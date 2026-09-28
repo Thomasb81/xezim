@@ -61,12 +61,22 @@ module tb;
 endmodule
 "
     ));
-    for want in ["R1 11011 11011 11011 11011 i=x", "R2 00001 00001 00001 00001 i=x"] {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+    for want in [
+        "R1 11011 11011 11011 11011 i=x",
+        "R2 00001 00001 00001 00001 i=x",
+    ] {
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
     // one iteration set per activation: the interpreted blocks must not
     // re-trigger themselves through the module-level `i`
     for tag in ["  g2 i=4", "  g4 i=4"] {
-        assert_eq!(msgs.iter().filter(|m| *m == tag).count(), 1, "{tag} count; got {msgs:?}");
+        assert_eq!(
+            msgs.iter().filter(|m| *m == tag).count(),
+            1,
+            "{tag} count; got {msgs:?}"
+        );
     }
 }

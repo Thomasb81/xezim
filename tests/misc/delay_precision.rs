@@ -123,7 +123,15 @@ module tb;
 endmodule
 "#;
     let text = run(src, "fine");
-    assert!(text.contains("FINE t=2 mark=1"), "2ps must survive:\n{}", text);
+    assert!(
+        text.contains("FINE t=2 mark=1"),
+        "2ps must survive:\n{}",
+        text
+    );
     // 0.4ps rounds to the 1ps precision grid -> 0.
-    assert!(text.contains("FINE2 t=2"), "0.4ps rounds to zero:\n{}", text);
+    assert!(
+        text.contains("FINE2 t=2"),
+        "0.4ps rounds to zero:\n{}",
+        text
+    );
 }

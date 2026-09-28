@@ -32,7 +32,11 @@ fn find_uvm_root() -> Option<String> {
     if let Ok(home) = std::env::var("UVM_HOME") {
         candidates.push(home);
     }
-    for rel in ["../1800.2-2020.3.1", "../UVM/1800.2-2020", "../UVM/1800.2-2017"] {
+    for rel in [
+        "../1800.2-2020.3.1",
+        "../UVM/1800.2-2020",
+        "../UVM/1800.2-2017",
+    ] {
         candidates.push(format!("{}/{}", manifest, rel));
     }
     candidates
@@ -173,7 +177,9 @@ endmodule
     };
     println!("{}", out);
     assert!(
-        out.contains("TAG_TOP_BODY") && out.contains("TAG_MID_BODY") && out.contains("TAG_LEAF_BODY")
+        out.contains("TAG_TOP_BODY")
+            && out.contains("TAG_MID_BODY")
+            && out.contains("TAG_LEAF_BODY")
             && out.contains("TAG_DONE"),
         "nested sequence bodies must all run and dispatch to their subclasses (reference-verified): {}",
         out

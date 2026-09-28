@@ -116,6 +116,9 @@ endmodule
 "#;
     let out = outs(&simulate(src, 10).expect("sim"));
     assert!(out.contains("T|elem null=0"), "element constructs:\n{out}");
-    assert!(out.contains("T|size=1"), "push_front + class-method dispatch:\n{out}");
+    assert!(
+        out.contains("T|size=1"),
+        "push_front + class-method dispatch:\n{out}"
+    );
     assert!(out.contains("T|out null=0 id=7"), "round-trip:\n{out}");
 }

@@ -9,7 +9,7 @@
 //! a comma / `)` / `=` means it was the port name.
 //!
 //! (The strict-LRM note: an implicit ANSI output is a NET, and the reference
-//! simulator rejects procedural writes to it outright — vlog-2110. xezim
+//! simulator rejects procedural writes to it outright. xezim
 //! keeps its existing leniency and runs such designs, matching the lenient
 //! vendor the testbench was written for.)
 
@@ -60,9 +60,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "v0"), 1, "implicit 1-bit port, unpacked dim on the name");
+    assert_eq!(
+        u(&sim, "v0"),
+        1,
+        "implicit 1-bit port, unpacked dim on the name"
+    );
     assert_eq!(u(&sim, "v1"), 0);
-    assert_eq!(u(&sim, "w0"), 0xABCD, "ranged port with unpacked dim on the name");
+    assert_eq!(
+        u(&sim, "w0"),
+        0xABCD,
+        "ranged port with unpacked dim on the name"
+    );
     assert_eq!(u(&sim, "w1"), 0xCAFE);
-    assert_eq!(u(&sim, "tpv"), 0xA55A, "typedef [dims] name still parses as a TYPE");
+    assert_eq!(
+        u(&sim, "tpv"),
+        0xA55A,
+        "typedef [dims] name still parses as a TYPE"
+    );
 }

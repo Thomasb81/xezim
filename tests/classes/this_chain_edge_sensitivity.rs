@@ -148,5 +148,8 @@ endmodule
 "#,
         "nested",
     );
-    assert!(out.contains("nested woke at 15"), "missing nested wake: {out}");
+    assert!(
+        out.contains("nested woke at 15"),
+        "missing nested wake: {out}"
+    );
 }

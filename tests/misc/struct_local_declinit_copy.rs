@@ -20,7 +20,13 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "test", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "test",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -160,5 +166,8 @@ endmodule
         text.contains("T|va=0000000000000000 vc=xxxxxxxxxxxxxxxx"),
         "2-state typedef local is 0, 4-state stays x:\n{text}"
     );
-    assert!(text.contains("T|or va=0000000000003a00"), "|= into clean 0 base:\n{text}");
+    assert!(
+        text.contains("T|or va=0000000000003a00"),
+        "|= into clean 0 base:\n{text}"
+    );
 }

@@ -31,7 +31,13 @@ fn run(trace: &str, src_name: &str, src: &str) -> String {
     let path = dir.join(src_name);
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "test", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "test",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .env("XEZIM_VALUE_TRACE", trace)
         .output()
         .expect("run xezim");
@@ -44,7 +50,10 @@ fn run(trace: &str, src_name: &str, src: &str) -> String {
 fn traces_blocking_writes_with_process_origin() {
     let text = run("wdata,vld", "vt_blk.sv", SRC);
     // Pattern resolution is announced so a typo is visible immediately.
-    assert!(text.contains("pattern 'wdata' matched 1 signal(s)"), "{text}");
+    assert!(
+        text.contains("pattern 'wdata' matched 1 signal(s)"),
+        "{text}"
+    );
     // Blocking writes carry old -> new, the active phase, and the writer.
     assert!(
         text.contains("t=5 wdata 00000000 -> 10100101 (active; initial block at"),
@@ -66,7 +75,10 @@ fn traces_nba_commits_without_stale_origin() {
         text.contains("t=25 stage2 xxxxxxxx -> 10100101 (nba; nba commit)"),
         "{text}"
     );
-    assert!(!text.contains("stage1 xxxxxxxx -> 10100101 (nba; initial"), "{text}");
+    assert!(
+        !text.contains("stage1 xxxxxxxx -> 10100101 (nba; initial"),
+        "{text}"
+    );
 }
 
 #[test]

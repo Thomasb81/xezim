@@ -46,7 +46,13 @@ fn run(jit: bool) -> String {
     let sv = dir.join(if jit { "t_jit.sv" } else { "t_default.sv" });
     std::fs::write(&sv, DESIGN).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
-    cmd.args(["--simulate", "-s", "top", "--no-cache", sv.to_str().unwrap()]);
+    cmd.args([
+        "--simulate",
+        "-s",
+        "top",
+        "--no-cache",
+        sv.to_str().unwrap(),
+    ]);
     if jit {
         cmd.env("XEZIM_JIT", "1");
     }
@@ -59,8 +65,14 @@ fn run(jit: bool) -> String {
 
 fn check(text: &str) {
     for tag in ["level", "star", "process", "top"] {
-        assert!(text.contains(&format!("{tag} forced q=00")), "{tag}: force not applied:\n{text}");
-        assert!(text.contains(&format!("{tag} released q=a5")), "{tag}: release did not re-drive the net:\n{text}");
+        assert!(
+            text.contains(&format!("{tag} forced q=00")),
+            "{tag}: force not applied:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("{tag} released q=a5")),
+            "{tag}: release did not re-drive the net:\n{text}"
+        );
     }
 }
 

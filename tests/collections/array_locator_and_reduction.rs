@@ -73,7 +73,10 @@ endmodule
         inline.trim_start_matches("INLINE "),
         "inline and assigned forms must agree"
     );
-    assert!(inline.contains('{'), "inline locator prints a queue: {inline}");
+    assert!(
+        inline.contains('{'),
+        "inline locator prints a queue: {inline}"
+    );
     assert_eq!(get("FIND "), "FIND '{5, 9}", "find with a filter");
     assert_eq!(get("MIN "), "MIN '{3}", "min returns a one-element queue");
     assert_eq!(get("MAX "), "MAX '{9}", "max likewise");
@@ -130,7 +133,11 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "one_bit"), 1, "a 1-bit predicate wraps at 1 bit");
-    assert_eq!(u(&sim, "widened"), 3, "an explicitly 32-bit expression does not");
+    assert_eq!(
+        u(&sim, "widened"),
+        3,
+        "an explicitly 32-bit expression does not"
+    );
     assert_eq!(u(&sim, "casted"), 3, "nor does an int' cast");
     assert_eq!(u(&sim, "plain"), 30, "no with clause: the element type");
 }
@@ -158,4 +165,23 @@ endmodule
     assert_eq!(u(&sim, "a"), 1, "and");
     assert_eq!(u(&sim, "o"), 15, "or");
     assert_eq!(u(&sim, "x"), 4, "xor");
+}
+
+/// §7.12.4: `item.index` (or `<iterator>.index`) in a reduction's `with`
+/// clause is the element's index; it read 0. Cross-checked against the
+/// reference simulator.
+#[test]
+fn reduction_with_reads_item_index() {
+    let src = r#"
+module top;
+  int a[4] = '{5, 6, 7, 8};
+  int q[$] = {1, 2, 3};
+  initial begin
+    $display("S1=%0d S2=%0d S3=%0d", a.sum() with (item * item.index), q.sum(x) with (x * x.index), a.sum() with (item.index));
+  end
+endmodule
+"#;
+    let sim = simulate(src, 20).expect("simulate failed");
+    let o = outs(&sim);
+    assert!(o.iter().any(|l| l.contains("S1=44 S2=8 S3=6")), "{o:?}");
 }

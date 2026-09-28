@@ -22,7 +22,13 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "test", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "test",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -93,7 +99,10 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|has()=1 has(RTL)=1"), "pool key consistency:\n{text}");
+    assert!(
+        text.contains("T|has()=1 has(RTL)=1"),
+        "pool key consistency:\n{text}"
+    );
 }
 
 #[test]
@@ -135,8 +144,14 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|declinit null=0"), "T x = new with nested spec:\n{text}");
-    assert!(text.contains("T|elem null=0 nm='RTL'"), "pool[key] = new(key):\n{text}");
+    assert!(
+        text.contains("T|declinit null=0"),
+        "T x = new with nested spec:\n{text}"
+    );
+    assert!(
+        text.contains("T|elem null=0 nm='RTL'"),
+        "pool[key] = new(key):\n{text}"
+    );
 }
 
 #[test]
@@ -233,7 +248,10 @@ module test;
 endmodule
 "#,
     );
-    assert!(text.contains("T|mod=2 inst=1 v0=11"), "member shadows global:\n{text}");
+    assert!(
+        text.contains("T|mod=2 inst=1 v0=11"),
+        "member shadows global:\n{text}"
+    );
 }
 
 #[test]

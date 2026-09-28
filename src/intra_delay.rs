@@ -13,8 +13,8 @@
 //! and the simulator implements §9.4.5 for the marker call: evaluate the RHS
 //! immediately, suspend the process `d` time units, then assign the saved
 //! value. The rewrite preserves every byte of whitespace (line numbers do not
-//! shift). Intra-assignment EVENT controls (`= @(...)`, `= repeat(n) @(...)`)
-//! keep the parser's existing discard behavior, as do min:typ:max delays.
+//! shift). A min:typ:max delay `#(1:2:3)` is copied as written; the parser
+//! reads the parenthesized triple as its typical value.
 //! Files pulled in via `include are preprocessed inside xezim-core and are
 //! not seen by this pass.
 
@@ -120,7 +120,6 @@ fn extract_delay_and_rhs(b: &[u8], i: usize) -> Option<(usize, usize)> {
     if j < b.len() && b[j] == b'(' {
         let mut k = j + 1;
         let mut depth = 1i32;
-        let mut top_colon = false;
         while k < b.len() && depth > 0 {
             match b[k] {
                 b'"' => {
@@ -129,23 +128,18 @@ fn extract_delay_and_rhs(b: &[u8], i: usize) -> Option<(usize, usize)> {
                 }
                 b'(' | b'[' | b'{' => depth += 1,
                 b')' | b']' | b'}' => depth -= 1,
-                // min:typ:max delay `#(1:2:3)` — not an expression; keep the
-                // parser's discard behavior.
-                b':' if depth == 1 => top_colon = true,
                 _ => {}
             }
             k += 1;
         }
-        if depth != 0 || top_colon {
+        if depth != 0 {
             return None;
         }
         delay_end = k;
     } else {
         // `#5`, `#1.5ns`, `#delay_id` — one literal/identifier token.
         let mut k = j;
-        while k < b.len()
-            && (b[k].is_ascii_alphanumeric() || matches!(b[k], b'_' | b'$' | b'.'))
-        {
+        while k < b.len() && (b[k].is_ascii_alphanumeric() || matches!(b[k], b'_' | b'$' | b'.')) {
             k += 1;
         }
         if k == j {
@@ -162,12 +156,27 @@ fn extract_delay_and_rhs(b: &[u8], i: usize) -> Option<(usize, usize)> {
 }
 
 /// Given `i` at the `@` of an intra-assignment event control, return
-/// `(edge, sig_text, rhs_start, semi)`. `None` -> leave unchanged (bare
-/// `@id`, multi-term lists, empty RHS).
+/// `(edge, sig_text, rhs_start, semi)`. `None` -> leave unchanged
+/// (multi-term lists, empty RHS).
 fn extract_event_and_rhs(b: &[u8], src: &str, i: usize) -> Option<(u8, String, usize, usize)> {
     let j = skip_ws_comments(b, i + 1);
-    if j >= b.len() || b[j] != b'(' {
+    if j >= b.len() {
         return None;
+    }
+    // §9.4.2 `@ hierarchical_event_identifier` without parentheses.
+    if b[j] != b'(' {
+        if !(b[j].is_ascii_alphabetic() || b[j] == b'_') {
+            return None;
+        }
+        let mut k = j;
+        while k < b.len() && (b[k].is_ascii_alphanumeric() || matches!(b[k], b'_' | b'$' | b'.')) {
+            k += 1;
+        }
+        let semi = find_stmt_semi(b, k)?;
+        if b[k..semi].iter().all(|c| c.is_ascii_whitespace()) {
+            return None;
+        }
+        return Some((0, src[j..k].to_string(), k, semi));
     }
     let mut k = j + 1;
     let mut depth = 1i32;
@@ -216,7 +225,7 @@ fn extract_event_and_rhs(b: &[u8], src: &str, i: usize) -> Option<(u8, String, u
 /// marker form (see module docs). Returns the input unchanged when no
 /// intra-assignment delay is present.
 pub fn rewrite_intra_assignment_delays(src: &str) -> String {
-    if !src.contains('#') {
+    if !src.contains('#') && !src.contains('@') {
         return src.to_string();
     }
     let b = src.as_bytes();
@@ -275,8 +284,18 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
             let blocking = p1 == b'='
                 && !matches!(
                     p2,
-                    b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|'
-                        | b'^' | b'~'
+                    b'=' | b'!'
+                        | b'<'
+                        | b'>'
+                        | b'+'
+                        | b'-'
+                        | b'*'
+                        | b'/'
+                        | b'%'
+                        | b'&'
+                        | b'|'
+                        | b'^'
+                        | b'~'
                 );
             let nba = p1 == b'=' && p2 == b'<' && p3 != b'<';
             if blocking || nba {
@@ -341,8 +360,18 @@ pub fn rewrite_intra_assignment_delays(src: &str) -> String {
             let blocking_c = p1 == b'='
                 && !matches!(
                     p2,
-                    b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&'
-                        | b'|' | b'^' | b'~'
+                    b'=' | b'!'
+                        | b'<'
+                        | b'>'
+                        | b'+'
+                        | b'-'
+                        | b'*'
+                        | b'/'
+                        | b'%'
+                        | b'&'
+                        | b'|'
+                        | b'^'
+                        | b'~'
                 );
             let nba_c = p1 == b'=' && p2 == b'<' && p3 != b'<';
             if blocking_c || nba_c {
@@ -421,12 +450,27 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_min_typ_max_delay() {
+        let r = rewrite_intra_assignment_delays("v = # (2:10:17) 4'h5;\n");
+        assert_eq!(r, "v = $__xz_intra_delay( (2:10:17), 4'h5);\n");
+    }
+
+    #[test]
+    fn rewrites_bare_event_identifier() {
+        let s = "v = @ ev 4'h5;\nw = repeat (5) @top.ev 1'b1 && 1'b1;\n";
+        let r = rewrite_intra_assignment_delays(s);
+        assert_eq!(
+            r,
+            "v = $__xz_intra_ev(1,0,ev, 4'h5);\nw = $__xz_intra_ev(5,0,top.ev, 1'b1 && 1'b1);\n"
+        );
+    }
+
+    #[test]
     fn leaves_non_intra_untouched() {
         for s in [
             "if (a <= 3) b = 1;\n",
             "#5 v = 1;\n",
             "a = b ## 2;\n",
-            "x = #(1:2:3) y;\n", // min:typ:max — parser keeps discarding
             "s = \"= #2 5;\";\n",
             "// v = #2 5;\n",
         ] {

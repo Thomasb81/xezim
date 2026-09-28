@@ -30,9 +30,13 @@ module tb;
 endmodule
 "#;
 
+// `a` is 4 bits so each automatic bin of cp_a holds one value: `intersect`
+// selects BINS whose values meet the ranges (§19.6.1), and an `int`'s 64
+// automatic bins put 2, 5 and 12 in one bin.
 const SRC_BINSOF: &str = r#"
 module tb;
-  int a, b;
+  bit [3:0] a;
+  int b;
   covergroup cg;
     cp_a: coverpoint a;
     cp_b: coverpoint b;

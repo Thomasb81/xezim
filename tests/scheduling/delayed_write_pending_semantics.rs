@@ -36,8 +36,14 @@ module top;
 endmodule
 "#,
     );
-    assert!(out.contains(&"A_cafebabezzzzzzzz11111111".to_string()), "{out:?}");
-    assert!(out.contains(&"B_feedfacezzzzzzzzzzzzzzzz".to_string()), "{out:?}");
+    assert!(
+        out.contains(&"A_cafebabezzzzzzzz11111111".to_string()),
+        "{out:?}"
+    );
+    assert!(
+        out.contains(&"B_feedfacezzzzzzzzzzzzzzzz".to_string()),
+        "{out:?}"
+    );
 }
 
 #[test]

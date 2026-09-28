@@ -57,9 +57,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "sb"), 40, "$bits(local typedef) sees body localparams");
-    assert_eq!(u(&sim, "portw_ok"), 1, "$bits(concat-of-replications) port range");
-    assert_eq!(u(&sim, "f2_ok"), 1, "bit-writes into localparam-sized member land");
+    assert_eq!(
+        u(&sim, "sb"),
+        40,
+        "$bits(local typedef) sees body localparams"
+    );
+    assert_eq!(
+        u(&sim, "portw_ok"),
+        1,
+        "$bits(concat-of-replications) port range"
+    );
+    assert_eq!(
+        u(&sim, "f2_ok"),
+        1,
+        "bit-writes into localparam-sized member land"
+    );
 }
 
 /// Fix 3 in isolation: bit-select member writes, top level.

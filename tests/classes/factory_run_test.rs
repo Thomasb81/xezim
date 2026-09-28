@@ -47,9 +47,5 @@ endmodule
         .output()
         .expect("xezim failed to start");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("PASS"),
-        "Expected PASS, got:\n{}",
-        stdout
-    );
+    assert!(stdout.contains("PASS"), "Expected PASS, got:\n{}", stdout);
 }

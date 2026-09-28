@@ -59,7 +59,10 @@ endmodule
 #[test]
 fn struct_signal_survives_shadowing_formal_call() {
     let got = notes(SRC);
-    assert!(got.contains(&"NOTE: pre lanes2=ab tag=5a".to_string()), "{got:?}");
+    assert!(
+        got.contains(&"NOTE: pre lanes2=ab tag=5a".to_string()),
+        "{got:?}"
+    );
     assert!(got.contains(&"NOTE: call=11".to_string()), "{got:?}");
     assert!(
         got.contains(&"NOTE: post lanes2=ab tag=5a".to_string()),

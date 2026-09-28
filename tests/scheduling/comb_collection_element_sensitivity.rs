@@ -47,9 +47,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "q_after"), 12, "a queue element write re-fires the reader");
-    assert_eq!(u(&sim, "da_after"), 7, "a dynamic-array element write re-fires the reader");
-    assert_eq!(u(&sim, "aa_after"), 9, "an associative element write re-fires the reader");
+    assert_eq!(
+        u(&sim, "q_after"),
+        12,
+        "a queue element write re-fires the reader"
+    );
+    assert_eq!(
+        u(&sim, "da_after"),
+        7,
+        "a dynamic-array element write re-fires the reader"
+    );
+    assert_eq!(
+        u(&sim, "aa_after"),
+        9,
+        "an associative element write re-fires the reader"
+    );
 }
 
 /// A fixed array with a literal `[N]` dimension must NOT be disturbed — that
@@ -71,5 +83,9 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "after"), 7, "fixed-array comb sensitivity still works");
+    assert_eq!(
+        u(&sim, "after"),
+        7,
+        "fixed-array comb sensitivity still works"
+    );
 }

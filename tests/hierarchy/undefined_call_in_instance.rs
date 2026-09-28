@@ -72,13 +72,18 @@ endmodule
 "#;
 
 fn dir(name: &str) -> PathBuf {
-    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("undefined_call").join(name);
+    let d = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("undefined_call")
+        .join(name);
     std::fs::create_dir_all(&d).unwrap();
     d
 }
 
 fn run(args: &[&str]) -> (bool, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_xezim")).args(args).output().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args(args)
+        .output()
+        .unwrap();
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     (output.status.success(), text)
@@ -120,17 +125,32 @@ fn shadowed_include_copy_is_reported_and_missing_helper_is_an_error() {
     std::fs::write(&src, USES_HEADER).unwrap();
     let inc_old = format!("+incdir+{}", old.display());
     let inc_new = format!("+incdir+{}", new.display());
-    let (ok, text) =
-        run(&["--simulate", "-s", "top", src.to_str().unwrap(), &inc_old, &inc_new]);
+    let (ok, text) = run(&[
+        "--simulate",
+        "-s",
+        "top",
+        src.to_str().unwrap(),
+        &inc_old,
+        &inc_new,
+    ]);
     assert!(!ok, "stale header accepted:\n{text}");
-    assert!(text.contains("Undeclared identifier 'helper'"), "no call diagnostic:\n{text}");
+    assert!(
+        text.contains("Undeclared identifier 'helper'"),
+        "no call diagnostic:\n{text}"
+    );
     assert!(
         text.contains("[PP] warning: `include \"shared.h\"") && text.contains("is shadowed"),
         "no shadowing warning:\n{text}"
     );
     // Search order reversed: the newer copy wins and the design runs.
-    let (ok, text) =
-        run(&["--simulate", "-s", "top", src.to_str().unwrap(), &inc_new, &inc_old]);
+    let (ok, text) = run(&[
+        "--simulate",
+        "-s",
+        "top",
+        src.to_str().unwrap(),
+        &inc_new,
+        &inc_old,
+    ]);
     assert!(ok, "newer header rejected:\n{text}");
 }
 
@@ -253,13 +273,25 @@ fn dump_merged_sv_is_self_contained_and_rejected_when_helpers_are_missing() {
     std::fs::write(&glue, GLUE_V).unwrap();
     let inc_stale = format!("+incdir+{}", stale.display());
     let inc_current = format!("+incdir+{}", current.display());
-    let common = ["-s", "testbench", "--max-time", "100ns", "--module-timescale", "1ns/1ns"];
+    let common = [
+        "-s",
+        "testbench",
+        "--max-time",
+        "100ns",
+        "--module-timescale",
+        "1ns/1ns",
+    ];
 
     // Control: current header first.
     let good = d.join("merged_full.sv");
     let mut args: Vec<&str> = vec![tb.to_str().unwrap(), glue.to_str().unwrap()];
     args.extend_from_slice(&common);
-    args.extend_from_slice(&[&inc_current, &inc_stale, "--dump-merged-sv", good.to_str().unwrap()]);
+    args.extend_from_slice(&[
+        &inc_current,
+        &inc_stale,
+        "--dump-merged-sv",
+        good.to_str().unwrap(),
+    ]);
     let (ok, text) = run(&args);
     assert!(ok, "control run failed:\n{text}");
     assert!(
@@ -272,7 +304,15 @@ fn dump_merged_sv_is_self_contained_and_rejected_when_helpers_are_missing() {
         2,
         "dump lacks the helper definitions:\n{dumped}"
     );
-    let (ok, text) = run(&[good.to_str().unwrap(), "-s", "testbench", "--max-time", "100ns", "--module-timescale", "1ns/1ns"]);
+    let (ok, text) = run(&[
+        good.to_str().unwrap(),
+        "-s",
+        "testbench",
+        "--max-time",
+        "100ns",
+        "--module-timescale",
+        "1ns/1ns",
+    ]);
     assert!(ok, "re-running the dump failed:\n{text}");
     assert!(
         text.contains("feature_mode -> bus4_st_valid violated"),
@@ -283,17 +323,36 @@ fn dump_merged_sv_is_self_contained_and_rejected_when_helpers_are_missing() {
     let bad = d.join("merged.sv");
     let mut args: Vec<&str> = vec![tb.to_str().unwrap(), glue.to_str().unwrap()];
     args.extend_from_slice(&common);
-    args.extend_from_slice(&[&inc_stale, &inc_current, "--dump-merged-sv", bad.to_str().unwrap()]);
+    args.extend_from_slice(&[
+        &inc_stale,
+        &inc_current,
+        "--dump-merged-sv",
+        bad.to_str().unwrap(),
+    ]);
     let (ok, text) = run(&args);
     assert!(!ok, "stale header run was accepted:\n{text}");
     assert!(
         text.contains("Undeclared identifier 'chk_implies'") && text.contains("datapath_glue.v:"),
         "diagnostic missing or unlocated:\n{text}"
     );
-    assert!(text.contains("is shadowed by the search order"), "no shadow warning:\n{text}");
+    assert!(
+        text.contains("is shadowed by the search order"),
+        "no shadow warning:\n{text}"
+    );
     if let Ok(dumped) = std::fs::read_to_string(&bad) {
         assert_eq!(dumped.matches("function void chk_").count(), 0);
-        let (ok, text) = run(&[bad.to_str().unwrap(), "-s", "testbench", "--max-time", "100ns", "--module-timescale", "1ns/1ns"]);
-        assert!(!ok && text.contains("Undeclared identifier 'chk_implies'"), "broken dump accepted:\n{text}");
+        let (ok, text) = run(&[
+            bad.to_str().unwrap(),
+            "-s",
+            "testbench",
+            "--max-time",
+            "100ns",
+            "--module-timescale",
+            "1ns/1ns",
+        ]);
+        assert!(
+            !ok && text.contains("Undeclared identifier 'chk_implies'"),
+            "broken dump accepted:\n{text}"
+        );
     }
 }

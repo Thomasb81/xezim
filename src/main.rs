@@ -5,6 +5,44 @@ use std::path::{Path, PathBuf};
 // CLI-only plumbing, so it lives in the binary, not the library.
 mod report;
 
+// Other simulators' command-line spellings (`-do`, `-g`, `-sv_seed`, ...).
+mod cli_compat;
+
+/// The library's `chatter!` for the CLI: internal lines (run banner, `[PHASE]`
+/// timings) print only under `--verbose`/`--profile`/`--sim-debug`.
+macro_rules! chatter {
+    ($($arg:tt)*) => {
+        if xezim::verbose() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+/// Stdout twin of `chatter!`, for the banner lines that have always gone to
+/// stdout.
+macro_rules! chatter_out {
+    ($($arg:tt)*) => {
+        if xezim::verbose() {
+            println!($($arg)*);
+        }
+    };
+}
+
+/// `run -all`: no time cap short of $finish or an empty event queue. Large,
+/// yet small enough that the simulator's conversion to ticks at a 1 fs
+/// precision still leaves room above it.
+const RUN_ALL_NS: u64 = 9_000_000_000_000;
+
+/// The one line every simulating run ends with. Scripts grep its
+/// `Simulation finished at time N` prefix.
+fn print_finish_line(time: u64, finished: bool) {
+    if finished {
+        println!("Simulation finished at time {} ($finish called)", time);
+    } else {
+        println!("Simulation finished at time {}", time);
+    }
+}
+
 // The `#[global_allocator]` lives in `xezim-core/src/lib.rs`, not here: Rust
 // allows only one per binary, and declaring it in the shared library covers the
 // test binaries and xezim-b as well as this CLI.
@@ -17,7 +55,10 @@ fn default_design_cache_dir() -> PathBuf {
         return PathBuf::from(path).join("xezim").join("designs");
     }
     if let Some(home) = env::var_os("HOME").filter(|p| !p.is_empty()) {
-        return PathBuf::from(home).join(".cache").join("xezim").join("designs");
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("xezim")
+            .join("designs");
     }
     PathBuf::from(".xezim-cache")
 }
@@ -31,10 +72,14 @@ fn design_dependency_files(
     let default_exts = ["v".to_string(), "sv".to_string(), "V".to_string()];
     let exts = lib_exts.unwrap_or(&default_exts);
     for dir in lib_dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if path.is_file() && exts.iter().any(|candidate| candidate == ext) {
                 files.push(path);
             }
@@ -107,7 +152,6 @@ fn print_usage() {
     eprintln!("  --compile        Parse + elaborate, report diagnostics (no simulation)");
     eprintln!("  --simulate       Parse + elaborate + simulate (default)");
     eprintln!("Options:");
-    eprintln!("  -v               Verbose output");
     eprintln!("  -V               Print version and exit");
     eprintln!("  -I <dir>         Add directory to include search path");
     eprintln!("  -D <name>[=val]  Define a macro");
@@ -116,25 +160,47 @@ fn print_usage() {
     eprintln!("  --preprocess     Run the preprocessor only; emit expanded text");
     eprintln!("  --dump-tokens    With --parse, print the token stream");
     eprintln!("  --dump-ast       With --parse, print the AST");
-    eprintln!("  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100000)");
-    eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug)");
+    eprintln!(
+        "  --max-time <n>[ps|ns|us|ms|s]   Maximum simulation time; bare <n> is ns (default: 100ms)"
+    );
+    eprintln!("  --sim-debug      Enable simulator [DEBUG]/[OPT] output (alias: --sim_debug);");
+    eprintln!("                   implies the --verbose engine lines");
     eprintln!("  --strict-top     Error out if -s names a module that does not exist (default)");
     eprintln!("  --no-strict-top  Warn and auto-detect the design root instead when -s names");
     eprintln!("                   a module that does not exist (for generated corpora whose");
     eprintln!("                   recorded top names are known-stale)");
     eprintln!("  --profile        Print the [PROF] end-of-run profile report (edge-block, settle");
-    eprintln!("                   and timing counters). Same as XEZIM_PROFILE_REPORT=1.");
-    eprintln!("  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
+    eprintln!("                   and timing counters) plus the --verbose engine lines ([PHASE]");
+    eprintln!("                   timings etc.). Same as XEZIM_PROFILE_REPORT=1. Adds overhead.");
+    eprintln!(
+        "  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
   --relax-implicit-static  Accept `int x = ...;` inside a static subroutine
                    (§6.21) with a warning instead of an error. Also enabled by
-                   XEZIM_ALLOW_IMPLICIT_STATIC=1.");
-    eprintln!("  --verbose        Per-file compile progress: each file as it is parsed and the");
-    eprintln!("                   definitions (modules/interfaces/packages/...) it contributed");
+                   XEZIM_ALLOW_IMPLICIT_STATIC=1."
+    );
+    eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
+    eprintln!("                   stmt, branch, toggle (or all, the default). Counts go to");
+    eprintln!("                   xezim_cov.json (XEZIM_COV_DB) with the functional coverage;");
+    eprintln!("                   --verbose prints a summary. XEZIM_CODE_COVERAGE=<kinds> too.");
+    eprintln!("  --code-coverage-scope <path>[,<path>...]  Only instrument these instance");
+    eprintln!("                   subtrees (tb.dut) and packages. Repeatable.");
+    eprintln!("  --verbose        Internal engine lines, off by default: the version banner,");
+    eprintln!("                   [PHASE] timings, end-of-run engine counters ([PROF]/[FUSE]/");
+    eprintln!("                   [EVENT-EDGE]/[COV]), compile-time optimisation notes and");
+    eprintln!("                   --compile's design summary; plus per-file compile progress");
+    eprintln!("                   (each file as it is parsed and the definitions it contributed).");
+    eprintln!("                   Same as XEZIM_VERBOSE=1.");
     eprintln!("  --dump-files-list  Print the full resolved file list (after -f expansion):");
     eprintln!("                     sources in parse order, -v library files, -y library dirs");
-    eprintln!("  --upf <file>             Load IEEE 1801 power intent (repeatable): supply nets, power");
-    eprintln!("                           switches, domain corruption, isolation; UPF package functions");
-    eprintln!("  --upf-top <path>         Instance the UPF scope applies to (default: first instance of");
+    eprintln!(
+        "  --upf <file>             Load IEEE 1801 power intent (repeatable): supply nets, power"
+    );
+    eprintln!(
+        "                           switches, domain corruption, isolation; UPF package functions"
+    );
+    eprintln!(
+        "  --upf-top <path>         Instance the UPF scope applies to (default: first instance of"
+    );
     eprintln!("                           the set_design_top module)");
     eprintln!("  --dump-merged-sv <file>  Write the sources, fully preprocessed (`ifdef");
     eprintln!("                     resolved, macros expanded, `includes inlined), into one");
@@ -159,12 +225,20 @@ fn print_usage() {
     eprintln!("                   XEZIM_TRACE_SIGNAL=name[,name...]  Trace elaboration");
     eprintln!("                   signal-table writes for matching names (debug).");
     eprintln!("                   XEZIM_TRACE_TYPE=name[,name...]  Trace typedef-width table");
-    eprintln!("                   writes and type-width resolutions for matching type names (debug).");
+    eprintln!(
+        "                   writes and type-width resolutions for matching type names (debug)."
+    );
     eprintln!("                   Also settable as X_WARN_LIMIT=N.");
     eprintln!("  --module-timescale <unit>/<prec>            Timescale for every module with no");
-    eprintln!("                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the");
-    eprintln!("                     named form limits it to the listed modules). Repeatable. Never");
-    eprintln!("                     overrides a `timeunit`/`timeprecision` decl or an active `timescale.");
+    eprintln!(
+        "                     [mod1,mod2=]<unit>/<prec>   explicit source-level timescale (the"
+    );
+    eprintln!(
+        "                     named form limits it to the listed modules). Repeatable. Never"
+    );
+    eprintln!(
+        "                     overrides a `timeunit`/`timeprecision` decl or an active `timescale."
+    );
     eprintln!("  --timescale <unit>/<prec>  Alias for the un-named --module-timescale form,");
     eprintln!("  -timescale <unit>/<prec>     spelled as other simulators spell it. Same rule:");
     eprintln!("                     it is a DEFAULT for design elements with no timescale");
@@ -173,9 +247,13 @@ fn print_usage() {
     eprintln!("                   (human text; '=json' emits one JSON line instead). Off by");
     eprintln!("                   default. XEZIM_REPORT_STATS=1|json enables it too; the");
     eprintln!("                   flag wins over the environment.");
-    eprintln!("  --cache          Enable the EXPERIMENTAL warm-start design cache (off by default;");
+    eprintln!(
+        "  --cache          Enable the EXPERIMENTAL warm-start design cache (off by default;"
+    );
     eprintln!("                   also enabled by XEZIM_ENABLE_CACHE=1 or --cache-dir).");
-    eprintln!("  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)");
+    eprintln!(
+        "  --cache-dir <dir> Store/reuse content-addressed elaborated designs (implies --cache)"
+    );
     eprintln!("                    (default: $XEZIM_CACHE_DIR or $XDG_CACHE_HOME/xezim/designs).");
     eprintln!("  --no-cache       Force-disable the design cache (default; XEZIM_NO_CACHE=1 too).");
     eprintln!("  --artifact-compression <none|1-22>  -o artifact compression: 'none' writes raw");
@@ -186,16 +264,20 @@ fn print_usage() {
     eprintln!("                   Can also be set via XEZIM_CACHE_COMPRESSION_LEVEL=N.");
     eprintln!("  --cache-stats    Print compression statistics when reading/writing cache files.");
     eprintln!("                   Can also be set via XEZIM_CACHE_STATS=1.");
-    eprintln!("  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
+    eprintln!(
+        "  -l, --log <file> Redirect all stdout/stderr (including DPI output) to <file>
   -v <file>        Library file: modules compiled only to resolve instantiations
   --primitive-verbose  Show parse/adoption diagnostics for explicit -v files
   -y <dir>         Library directory: <module>.<ext> loaded on demand
   +libext+<ext>+.. Extension list for -y search (replaces default .v/.sv/.V)
-  +nospecify       Suppress specify-block path delays (zero-delay gate sim)
+  +nospecify       Suppress specify-block path delays and timing checks (zero-delay gate sim)
   +delay_mode_zero Force all structural (specify/SDF) delays to 0 (fast functional GLS)
   +delay_mode_unit Collapse every nonzero structural delay to 1 time unit
   +mindelays/+typdelays/+maxdelays  min:typ:max selection (specify + SDF; default typ)
-  +notimingcheck   Accepted no-op (specify timing checks are not modeled)");
+  +notimingcheck   Disable specify timing checks ($setup, $hold, $width, ...)
+  +no_notifier     Report timing violations without toggling notifiers
+  +no_tchk_msg     Toggle notifiers without printing timing violations"
+    );
     eprintln!("  --xtrace <file>  Emit an XTrace dump to <file> (compliance Level 0:");
     eprintln!("                   dictionary + time + signal deltas + event records).");
     eprintln!("                   A '.zst'/'.zstd' suffix zstd-compresses the stream.");
@@ -231,6 +313,41 @@ fn print_usage() {
     eprintln!("                   (same seed -> byte-identical run; affects e.g. the");
     eprintln!("                   number of packets a random UVM test collects)");
     eprintln!("  -f/-c filelist   Recursive; options inside filelist are supported");
+    eprintln!("Other simulators' spellings (also accepted inside -f files):");
+    eprintln!("  <top> ...        A bare design-unit name (or work.<top>) that is not a file");
+    eprintln!("                   names a top module, like -s; repeat for several tops");
+    eprintln!("  -F <file>        Args file; +incdir+ paths resolve like file names (as given,");
+    eprintln!("                   else against the args file's directory). -file = -f");
+    eprintln!(
+        "  -do \"<cmds>\"     Also -do <file.do>. Subset: run -all (until $finish), run <n><unit>"
+    );
+    eprintln!(
+        "                   (summed; --max-time still caps), quit [-f], exit [-f], do <file>."
+    );
+    eprintln!(
+        "                   Other commands are an error. No run before quit = elaborate only"
+    );
+    eprintln!(
+        "  -gNAME=VAL       Parameter default for every module declaring an overridable NAME"
+    );
+    eprintln!("                   (instance values still win); -g/<top>/NAME=VAL: one module only");
+    eprintln!("  -GNAME=VAL       Same, and it also replaces instance and defparam values");
+    eprintln!("  -sv_seed <n|random>  Same as +seed=<n|random>");
+    eprintln!("  -sv_lib <name>, -sv_root <dir>  DPI library <dir>/<name>.so (see --dpi-lib)");
+    eprintln!("  -logfile <file>  Same as -l (redirects; the terminal gets nothing)");
+    eprintln!("  -c               With no file after it: accepted (batch mode is the only mode)");
+    eprintln!(
+        "  -work/-L/-Lf/-lib <lib>  Ignored with one warning: every run compiles from source"
+    );
+    eprintln!("  -sv12compat, -sv17compat  Same as --sv2017 (-sv05compat/-sv09compat warn)");
+    eprintln!("  +cover[=<letters>], -coverage  Code coverage (see --code-coverage): s, b, t");
+    eprintln!("                   = stmt, branch, toggle; bare = all three. Other letters are");
+    eprintln!("                   ignored with a warning");
+    eprintln!("  -sv, -mfcu, -quiet, -64, -batch, -nologo, +acc[=..], -<step>args=..,");
+    eprintln!("  -suppress <ids>, +fcover, -sva,");
+    eprintln!("  -assertdebug     Accepted, no effect");
+    eprintln!("  -sfcu, -t <res>, -wlf <file>  Accepted with a warning (one compilation unit;");
+    eprintln!("                   finest precision; waveforms come from --fst/--wave)");
 }
 
 fn print_version() {
@@ -238,7 +355,11 @@ fn print_version() {
     // parsed by scripts. The build provenance follows in the same shape the
     // run banner uses, so a log and a `-V` can be matched by eye.
     println!("xezim version {}", env!("CARGO_PKG_VERSION"));
-    println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
+    println!(
+        "git {} ({})",
+        env!("XEZIM_GIT_HASH"),
+        env!("XEZIM_GIT_DATE")
+    );
     println!("tag {}", env!("XEZIM_GIT_TAG"));
 }
 
@@ -252,7 +373,12 @@ fn parse_time_literal(s: &str) -> Result<i32, String> {
         "1" => 0,
         "10" => 1,
         "100" => 2,
-        other => return Err(format!("invalid time mantissa '{}' (must be 1, 10, or 100)", other)),
+        other => {
+            return Err(format!(
+                "invalid time mantissa '{}' (must be 1, 10, or 100)",
+                other
+            ));
+        }
     };
     let unit_exp = match unit.trim() {
         "s" => 0,
@@ -269,7 +395,10 @@ fn parse_time_literal(s: &str) -> Result<i32, String> {
 /// Parse a `<unit>/<precision>` timescale value, checking precision <= unit.
 fn parse_timescale_value(d: &str) -> Result<(i32, i32), String> {
     let (u, p) = d.split_once('/').ok_or_else(|| {
-        format!("invalid --module-timescale value '{}' (expected <unit>/<precision>)", d)
+        format!(
+            "invalid --module-timescale value '{}' (expected <unit>/<precision>)",
+            d
+        )
     })?;
     let ue = parse_time_literal(u)?;
     let pe = parse_time_literal(p)?;
@@ -311,10 +440,12 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     } else {
         (lower.as_str(), 1.0)
     };
-    let num: f64 = num_str
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])", raw))?;
+    let num: f64 = num_str.trim().parse().map_err(|_| {
+        format!(
+            "invalid --max-time value '{}' (expected <n>[ps|ns|us|ms|s])",
+            raw
+        )
+    })?;
     if !(num > 0.0) {
         return Err(format!("--max-time must be positive, got '{}'", raw));
     }
@@ -402,9 +533,9 @@ fn push_plus_libext(arg: &str, lib_exts: &mut Option<Vec<String>>) {
 /// - Flags whose effect xezim cannot model (`+delay_mode_distributed`, pulse
 ///   control, transport/multisource interconnect delays) warn ONCE so the user
 ///   knows the timing is approximated — never silent.
-/// - Timing-check controls (`+no_notifier`, `+neg_tchk`, …) are recognized
-///   no-ops: xezim does not model specify timing checks, so there is nothing to
-///   toggle (same rationale as `+notimingcheck`).
+/// - `+no_notifier` / `+no_tchk_msg` split a timing violation's two effects
+///   (notifier toggle, message). The other timing-check controls (`+neg_tchk`,
+///   …) are recognized no-ops.
 fn handle_gls_flag(flag: &str) -> bool {
     // `+pulse_e/0`, `+pulse_r/95` etc. carry a trailing value.
     let head = flag.split('/').next().unwrap_or(flag);
@@ -418,10 +549,17 @@ fn handle_gls_flag(flag: &str) -> bool {
         // Path delays are what xezim already uses when a specify block is
         // present — recognized, no behavior change.
         "+delay_mode_path" | "-delay_mode_path" => {}
-        // Timing-check control: nothing to disable (checks aren't modeled).
-        "+no_notifier" | "+no_tchk_msg" | "+neg_tchk" | "+nonegdelay"
-        | "+old_ntc" | "+ntc_warn" | "+nosdferror" | "+nocelldefinepragma"
-        | "+sdf_verbose" | "+sdfverbose" => {}
+        "+no_notifier" => xezim::compiler::simulator::set_no_notifier(true),
+        "+no_tchk_msg" => xezim::compiler::simulator::set_no_tchk_msg(true),
+        // Negative limits are always honored; the rest have no xezim analogue.
+        "+neg_tchk"
+        | "+nonegdelay"
+        | "+old_ntc"
+        | "+ntc_warn"
+        | "+nosdferror"
+        | "+nocelldefinepragma"
+        | "+sdf_verbose"
+        | "+sdfverbose" => {}
         // Behavior xezim cannot model — warn once, don't pretend.
         "+delay_mode_distributed" | "-delay_mode_distributed" => {
             eprintln!(
@@ -431,8 +569,12 @@ fn handle_gls_flag(flag: &str) -> bool {
                 flag
             );
         }
-        "+pulse_e" | "+pulse_r" | "+pulse_int_e" | "+pulse_int_r"
-        | "+transport_int_delays" | "+transport_path_delays"
+        "+pulse_e"
+        | "+pulse_r"
+        | "+pulse_int_e"
+        | "+pulse_int_r"
+        | "+transport_int_delays"
+        | "+transport_path_delays"
         | "+multisource_int_delays" => {
             eprintln!(
                 "Warning: {} (pulse/transport/multisource delay control) is not modeled by xezim; \
@@ -466,12 +608,17 @@ fn resolve_rel(base: &Path, p: &str) -> String {
     }
 }
 
+/// Per source: where each line of its preprocessed text came from.
+type LineMaps = Vec<Option<xezim::sv_parser::source_map::LineMap>>;
+
+/// Preprocessed text of each source and its line map. On failure, the
+/// rendered preprocessor diagnostics.
 fn preprocess_sources(
     sources: &[String],
     source_files: &[String],
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, LineMaps), Vec<String>> {
     let mut pp = xezim::preprocessor::Preprocessor::new();
     for dir in include_dirs {
         pp.add_include_dir(std::path::PathBuf::from(dir));
@@ -488,16 +635,18 @@ fn preprocess_sources(
     }
 
     let mut preprocessed = Vec::with_capacity(sources.len());
+    let mut maps = Vec::with_capacity(sources.len());
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(|p| std::path::PathBuf::from(p));
         preprocessed.push(pp.preprocess_file(source, source_path.as_deref()));
+        maps.push(pp.take_line_map());
     }
-    // §22 strict-mode directive errors (`\`line`/`\`pragma`/`\`resetall`/…).
-    // Collected only when strict checks are on; a non-empty list fails the run.
+    // §22 strict-mode directive errors (`\`line`/`\`pragma`/`\`resetall`/…)
+    // and failed `include`s; a non-empty list fails the run.
     if !pp.errors().is_empty() {
-        return Err(pp.errors().join("; "));
+        return Err(pp.errors().to_vec());
     }
-    Ok(preprocessed)
+    Ok((preprocessed, maps))
 }
 
 /// Expand `$VAR` and `${VAR}` style references against the process
@@ -587,6 +736,8 @@ fn process_command_file(
     nospecify: &mut bool,
     primitive_verbose: &mut bool,
     module_timescale_args: &mut Vec<String>,
+    compat: &mut cli_compat::CompatArgs,
+    incdir_rel: bool,
 ) -> Result<(), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read command file '{}': {}", path, e))?;
@@ -627,7 +778,18 @@ fn process_command_file(
         let mut i = 0usize;
         while i < toks.len() {
             let t = toks[i].as_str();
+            let used = cli_compat::handle_flag(&toks, i, compat, plusargs)
+                .map_err(|e| format!("{} (in args file '{}')", e, path))?;
+            if used > 0 {
+                i += used;
+                continue;
+            }
             match t {
+                // `-c` with no file after it: batch-mode switch, nothing to do.
+                "-c" if !cli_compat::c_takes_file(
+                    toks.get(i + 1).map(|s| s.as_str()),
+                    &compat.libs,
+                ) => {}
                 "-I" => {
                     i += 1;
                     if i < toks.len() {
@@ -660,8 +822,14 @@ fn process_command_file(
                 "+nospecify" | "-nospecify" => {
                     *nospecify = true;
                 }
-                "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {}
-                "-f" | "-c" => {
+                "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {
+                    xezim::compiler::simulator::set_no_timing_checks(true);
+                }
+                // `-F` differs from `-f` only in resolving `+incdir+` paths
+                // like file names: as given, else against the args file's own
+                // directory. `-file` is a long spelling of `-f`.
+                "-f" | "-c" | "-F" | "-file" => {
+                    let nested_rel = t == "-F";
                     i += 1;
                     if i < toks.len() {
                         let nested = resolve_rel(base, &toks[i]);
@@ -677,6 +845,8 @@ fn process_command_file(
                             nospecify,
                             primitive_verbose,
                             module_timescale_args,
+                            compat,
+                            nested_rel,
                         )?;
                     }
                 }
@@ -705,10 +875,18 @@ fn process_command_file(
                         nospecify,
                         primitive_verbose,
                         module_timescale_args,
+                        compat,
+                        false,
                     )?;
                 }
                 _ if t.starts_with("+incdir+") => {
+                    let first = include_dirs.len();
                     push_plus_incdir(t, include_dirs);
+                    if incdir_rel {
+                        for d in &mut include_dirs[first..] {
+                            *d = resolve_rel(base, d);
+                        }
+                    }
                 }
                 "--primitive-verbose" => {
                     *primitive_verbose = true;
@@ -835,11 +1013,7 @@ fn redirect_stdio_to_log(path: &str) -> std::io::Result<()> {
 /// runtime objects and the right column counts unique parsed definitions —
 /// a sanity check that the whole design was analyzed.
 fn print_design_summary(
-    defs: &std::collections::HashMap<
-        String,
-        xezim::SourceDefinition,
-        impl std::hash::BuildHasher,
-    >,
+    defs: &std::collections::HashMap<String, xezim::SourceDefinition, impl std::hash::BuildHasher>,
     elab: &xezim::compiler::ElaboratedModule,
 ) {
     use xezim::SourceDefinition as SD;
@@ -983,9 +1157,7 @@ fn emit_run_stats(
 /// but `package`s, which is where classes normally live) — otherwise an ANSI
 /// port list's `interface foo_if.mp p` would register `foo_if` as *defined* by
 /// the instantiating file and misroute every reference to it.
-fn scan_units_and_refs(
-    text: &str,
-) -> (Vec<String>, std::collections::HashSet<String>, bool) {
+fn scan_units_and_refs(text: &str) -> (Vec<String>, std::collections::HashSet<String>, bool) {
     use xezim::lexer::TokenKind as TK;
     let toks = xezim::lexer::Lexer::new(text).tokenize();
     let mut declared = Vec::new();
@@ -1021,8 +1193,8 @@ fn scan_units_and_refs(
             // `interface class C` is a CLASS declaration — don't also open an
             // interface scope for it, or the missing `endinterface` unbalances
             // everything that follows.
-            let iface_class = kind == "interface"
-                && toks.get(i + 1).is_some_and(|n| n.text == "class");
+            let iface_class =
+                kind == "interface" && toks.get(i + 1).is_some_and(|n| n.text == "class");
             // `typedef class C;` is a §6.18 forward declaration, not a
             // definition; the real one may live in another file entirely.
             let fwd = kind == "class" && prev == "typedef";
@@ -1144,17 +1316,21 @@ fn strip_duplicate_unit_subroutines(
     // first `(` or `;` minus qualifiers and the return type, i.e. the LAST
     // identifier token ("automatic logic [7:0] foo" -> "foo").
     fn header_name(rest: &str) -> Option<String> {
-        let head = rest
-            .split(['(', ';'])
-            .next()
-            .unwrap_or("");
+        let head = rest.split(['(', ';']).next().unwrap_or("");
         head.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
             .filter(|t| !t.is_empty() && !t.chars().next().is_some_and(|c| c.is_ascii_digit()))
             .next_back()
             .map(|t| t.to_string())
     }
     const OPENERS: [&str; 8] = [
-        "module", "macromodule", "interface", "package", "program", "class", "checker", "primitive",
+        "module",
+        "macromodule",
+        "interface",
+        "package",
+        "program",
+        "class",
+        "checker",
+        "primitive",
     ];
     const CLOSERS: [&str; 8] = [
         "endmodule",
@@ -1213,7 +1389,11 @@ fn strip_duplicate_unit_subroutines(
                         out.push_str(&format!(
                             "// [xezim] duplicate $unit {first} '{name}' suppressed; first definition kept\n"
                         ));
-                        let end_kw = if first == "task" { "endtask" } else { "endfunction" };
+                        let end_kw = if first == "task" {
+                            "endtask"
+                        } else {
+                            "endfunction"
+                        };
                         // A one-liner closes on this very line; only a
                         // multi-line body needs the skip state.
                         if !closes_here(t, end_kw) {
@@ -1318,7 +1498,10 @@ fn append_adopted_libs_to_merged(
     // further dropped primaries). Mirrors elaboration order — a name declared
     // by a primary resolves there before any library fallback.
     if let Some(kept) = kept {
-        let scanned: Vec<_> = primary_texts.iter().map(|t| scan_units_and_refs(t)).collect();
+        let scanned: Vec<_> = primary_texts
+            .iter()
+            .map(|t| scan_units_and_refs(t))
+            .collect();
         let mut owner: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (fi, (declared, _, _)) in scanned.iter().enumerate() {
             for name in declared {
@@ -1370,7 +1553,10 @@ fn append_adopted_libs_to_merged(
         .open(merged_out)
         .and_then(|mut f| std::io::Write::write_all(&mut f, extra.as_bytes()))
     {
-        eprintln!("Warning: cannot append libraries to '{}': {}", merged_out, e);
+        eprintln!(
+            "Warning: cannot append libraries to '{}': {}",
+            merged_out, e
+        );
         return;
     }
     println!(
@@ -1461,7 +1647,10 @@ fn run_main() -> i32 {
     // given we synthesize a wrapper module that instantiates them all and
     // elaborate that instead (a single root reaching every requested top).
     let mut top_modules: Vec<String> = Vec::new();
-    let mut max_time: u64 = 100_000;
+    // Default cap: 100 ms of simulated time, in ns. Long enough for UVM tests
+    // that run tens of milliseconds; a design that never calls `$finish`
+    // still stops.
+    let mut max_time: u64 = 100_000_000;
     let mut dump_tokens = false;
     let mut dump_ast = false;
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1476,7 +1665,6 @@ fn run_main() -> i32 {
     // §20.10 / issue #107: opt-in promotion of `$error` occurrences to a
     // failing exit status. `$fatal` always fails regardless of this flag.
     let mut error_exit = false;
-    let mut sv2023_mode = true;
     let mut strict_checks = true;
     let mut source_delay_select: u8 = 1;
     // Warm-start design cache is EXPERIMENTAL and OFF by default — every run
@@ -1489,7 +1677,7 @@ fn run_main() -> i32 {
     // Cache compression settings
     let mut cache_compression_level: Option<i32> = None;
     let mut cache_stats = false;
-    
+
     // Check environment variables for cache compression settings
     if let Ok(level_str) = env::var("XEZIM_CACHE_COMPRESSION_LEVEL") {
         if let Ok(level) = level_str.parse::<i32>() {
@@ -1525,6 +1713,9 @@ fn run_main() -> i32 {
     let mut xtrace_profile: Option<String> = None;
     let mut xtrace_compress: Option<String> = None;
     let mut wave = false;
+    // `--code-coverage[=<kinds>]` / `--code-coverage-scope`.
+    let mut code_cov_kinds: Option<u8> = None;
+    let mut code_cov_scopes: Vec<String> = Vec::new();
     let mut fst_file: Option<String> = None;
     let mut fst_scopes: Vec<String> = Vec::new();
     let mut sim_debug = false;
@@ -1551,9 +1742,25 @@ fn run_main() -> i32 {
     let mut include_dirs: Vec<String> = Vec::new();
     let mut defines: Vec<(String, Option<String>)> = Vec::new();
 
+    let mut compat = cli_compat::CompatArgs::default();
+    let mut max_time_explicit = false;
+
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
+        // Other simulators' spellings first: several (`-sv_seed`, `-suppress`,
+        // `-lib`) would otherwise read as the glued `-s<top>` / `-l<file>`.
+        match cli_compat::handle_flag(&args, i, &mut compat, &mut plusargs) {
+            Ok(0) => {}
+            Ok(n) => {
+                i += n;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         match arg.as_str() {
             "-h" | "--help" => {
                 print_usage();
@@ -1590,7 +1797,7 @@ fn run_main() -> i32 {
             _ if arg.starts_with("-o") && arg.len() > 2 => {
                 _output_file = Some(arg[2..].to_string());
             }
-            "-l" | "--log" => {
+            "-l" | "--log" | "-logfile" => {
                 i += 1;
                 if i < args.len() {
                     log_file = Some(args[i].clone());
@@ -1613,7 +1820,15 @@ fn run_main() -> i32 {
                 top_module = Some(arg[2..].to_string());
                 top_modules.push(arg[2..].to_string());
             }
-            "-c" | "-f" => {
+            // `-c` with no file after it: batch-mode switch, nothing to do.
+            "-c" if !cli_compat::c_takes_file(
+                args.get(i + 1).map(|s| s.as_str()),
+                &compat.libs,
+            ) => {}
+            // `-F` also resolves `+incdir+` paths against the args file's
+            // directory when they do not exist as given; `-file` is `-f`.
+            "-c" | "-f" | "-F" | "-file" => {
+                let incdir_rel = arg == "-F";
                 i += 1;
                 if i < args.len() {
                     match process_command_file(
@@ -1628,6 +1843,8 @@ fn run_main() -> i32 {
                         &mut nospecify,
                         &mut primitive_verbose,
                         &mut module_timescale_args,
+                        &mut compat,
+                        incdir_rel,
                     ) {
                         Ok(()) => {}
                         Err(e) => {
@@ -1650,6 +1867,8 @@ fn run_main() -> i32 {
                     &mut nospecify,
                     &mut primitive_verbose,
                     &mut module_timescale_args,
+                    &mut compat,
+                    false,
                 ) {
                     Ok(()) => {}
                     Err(e) => {
@@ -1686,10 +1905,8 @@ fn run_main() -> i32 {
                 push_plus_libext(arg, &mut lib_exts);
             }
             // Commercial GLS flags. `+nospecify` suppresses specify-block path
-            // delays (zero-delay gate sim). `+notimingcheck(s)` is accepted as a
-            // documented no-op: xezim does not model specify timing checks, so
-            // they are permanently "disabled" already. Xcelium's `-` spellings
-            // are accepted too.
+            // delays (zero-delay gate sim) and timing checks; `+notimingcheck(s)`
+            // only the timing checks. Xcelium's `-` spellings are accepted too.
             "+nospecify" | "-nospecify" => {
                 nospecify = true;
             }
@@ -1717,7 +1934,7 @@ fn run_main() -> i32 {
                 }
             }
             "+notimingcheck" | "+notimingchecks" | "-notimingchecks" => {
-                // no-op by design; recognized so flows don't carry a mystery plusarg
+                xezim::compiler::simulator::set_no_timing_checks(true);
             }
             _ if handle_gls_flag(arg) => {}
             _ if arg.starts_with('+') => {
@@ -1828,11 +2045,9 @@ fn run_main() -> i32 {
             "--sv2023" => {
                 // No-op now (default), kept for back-compat with existing scripts.
                 sv_parser::set_sv2023(true);
-                sv2023_mode = true;
             }
             "--sv2017" => {
                 sv_parser::set_sv2023(false);
-                sv2023_mode = false;
             }
             // Strict negative-test diagnostics (reject LRM-illegal constructs).
             // ON by default; `--no-strict` (alias `--lenient`) turns it off.
@@ -1889,7 +2104,10 @@ fn run_main() -> i32 {
                 i += 1;
                 if i < args.len() {
                     match parse_max_time(&args[i]) {
-                        Ok(v) => max_time = v,
+                        Ok(v) => {
+                            max_time = v;
+                            max_time_explicit = true;
+                        }
                         Err(e) => {
                             eprintln!("{}", e);
                             std::process::exit(1);
@@ -1899,7 +2117,10 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("--max-time=") => {
                 match parse_max_time(&arg["--max-time=".len()..]) {
-                    Ok(v) => max_time = v,
+                    Ok(v) => {
+                        max_time = v;
+                        max_time_explicit = true;
+                    }
                     Err(e) => {
                         eprintln!("{}", e);
                         std::process::exit(1);
@@ -2008,6 +2229,48 @@ fn run_main() -> i32 {
             "--wave" => {
                 wave = true;
             }
+            "--code-coverage" => {
+                code_cov_kinds = Some(
+                    xezim::compiler::simulator::KIND_STATEMENT
+                        | xezim::compiler::simulator::KIND_BRANCH
+                        | xezim::compiler::simulator::KIND_TOGGLE,
+                );
+            }
+            _ if arg.starts_with("--code-coverage=") => {
+                match xezim::compiler::simulator::parse_code_coverage_kinds(
+                    &arg["--code-coverage=".len()..],
+                ) {
+                    Ok(k) => code_cov_kinds = Some(k),
+                    Err(e) => {
+                        eprintln!("Error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "--code-coverage-scope" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => code_cov_scopes.extend(
+                        v.split(',')
+                            .map(str::trim)
+                            .filter(|p| !p.is_empty())
+                            .map(String::from),
+                    ),
+                    None => {
+                        eprintln!("Error: --code-coverage-scope requires an instance path");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            _ if arg.starts_with("--code-coverage-scope=") => {
+                code_cov_scopes.extend(
+                    arg["--code-coverage-scope=".len()..]
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|p| !p.is_empty())
+                        .map(String::from),
+                );
+            }
             "--fst" => {
                 i += 1;
                 if i < args.len() {
@@ -2078,7 +2341,10 @@ fn run_main() -> i32 {
                 if fmt == "json" {
                     report_stats_cli = Some(report::ReportMode::Json);
                 } else {
-                    eprintln!("Error: --report-stats={}: unknown format (expected 'json')", fmt);
+                    eprintln!(
+                        "Error: --report-stats={}: unknown format (expected 'json')",
+                        fmt
+                    );
                     std::process::exit(1);
                 }
             }
@@ -2112,7 +2378,9 @@ fn run_main() -> i32 {
                     _ => match v.parse::<i32>() {
                         Ok(n) if (1..=22).contains(&n) => xezim_core::set_zstd_level(n),
                         _ => {
-                            eprintln!("Error: --artifact-compression takes 'none' or a zstd level 1-22");
+                            eprintln!(
+                                "Error: --artifact-compression takes 'none' or a zstd level 1-22"
+                            );
                             std::process::exit(1);
                         }
                     },
@@ -2125,7 +2393,9 @@ fn run_main() -> i32 {
                     _ => match v.parse::<i32>() {
                         Ok(n) if (1..=22).contains(&n) => xezim_core::set_zstd_level(n),
                         _ => {
-                            eprintln!("Error: --artifact-compression takes 'none' or a zstd level 1-22");
+                            eprintln!(
+                                "Error: --artifact-compression takes 'none' or a zstd level 1-22"
+                            );
                             std::process::exit(1);
                         }
                     },
@@ -2137,7 +2407,9 @@ fn run_main() -> i32 {
                     if let Ok(level) = args[i].parse::<i32>() {
                         cache_compression_level = Some(level);
                     } else {
-                        eprintln!("Error: --cache-compression-level requires a number between 1 and 22");
+                        eprintln!(
+                            "Error: --cache-compression-level requires a number between 1 and 22"
+                        );
                         std::process::exit(1);
                     }
                 } else {
@@ -2149,7 +2421,9 @@ fn run_main() -> i32 {
                 if let Ok(level) = arg["--cache-compression-level=".len()..].parse::<i32>() {
                     cache_compression_level = Some(level);
                 } else {
-                    eprintln!("Error: --cache-compression-level requires a number between 1 and 22");
+                    eprintln!(
+                        "Error: --cache-compression-level requires a number between 1 and 22"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -2283,11 +2557,133 @@ fn run_main() -> i32 {
             _ if arg.starts_with('-') => {
                 eprintln!("Warning: unknown flag '{}' (ignored)", arg);
             }
-            _ => {
-                source_files.push(arg.clone());
-            }
+            // A design-unit name that is not a file names a top, as `-s` does.
+            _ => match cli_compat::bare_top_name(arg, &compat.libs) {
+                Some(top) => {
+                    top_module = Some(top.clone());
+                    top_modules.push(top);
+                }
+                None => source_files.push(arg.clone()),
+            },
         }
         i += 1;
+    }
+    // `--sv2017`/`--sv2023`, or a `-sv*compat` flag here or in an args file.
+    let sv2023_mode = sv_parser::is_sv2023();
+    dpi_libs.extend(cli_compat::resolve_sv_libs(&compat));
+    if !compat.param_overrides.is_empty() {
+        xezim_core::set_param_overrides(
+            compat
+                .param_overrides
+                .iter()
+                .map(|(module, name, value, force)| xezim_core::ParamOverride {
+                    module: module.clone(),
+                    name: name.clone(),
+                    value: value.clone(),
+                    force: *force,
+                })
+                .collect(),
+        );
+    }
+    // `-do`: its `run` commands set how long the run goes. An explicit
+    // `--max-time` stays a hard cap on top of them.
+    if !compat.do_scripts.is_empty() {
+        let plan = cli_compat::plan_do_scripts(&compat.do_scripts).map(|p| {
+            for w in &p.warnings {
+                eprintln!("Warning: {}", w);
+            }
+            p.run
+        });
+        match plan {
+            Ok(cli_compat::DoRun::All) => {
+                if !max_time_explicit {
+                    max_time = RUN_ALL_NS;
+                }
+            }
+            Ok(cli_compat::DoRun::For(0)) => {
+                eprintln!("Error: -do: a total run time of 0 is not supported");
+                std::process::exit(1);
+            }
+            Ok(cli_compat::DoRun::For(ns)) => {
+                if !max_time_explicit || ns <= max_time {
+                    max_time = ns;
+                    xezim::compiler::simulator::set_run_length_requested(true);
+                }
+            }
+            // Loaded and quit without a `run`: elaborate only.
+            Ok(cli_compat::DoRun::Load) => {
+                if !mode_explicit {
+                    mode = Mode::Compile;
+                }
+            }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Code coverage: `--code-coverage` wins over XEZIM_CODE_COVERAGE, which
+    // wins over other simulators' `+cover` / `-coverage`.
+    let cover_request = cli_compat::cover_request(&compat);
+    if let (Some(spec), Some((kinds, unsupported))) = (&compat.cover, &cover_request) {
+        if !unsupported.is_empty() {
+            let names: Vec<String> = unsupported
+                .chars()
+                .map(|c| match c {
+                    'c' => "condition (c)".to_string(),
+                    'e' => "expression (e)".to_string(),
+                    'f' => "FSM (f)".to_string(),
+                    'x' => "extended toggle (x)".to_string(),
+                    _ => format!("'{}'", c),
+                })
+                .collect();
+            let kept: Vec<&str> = [
+                (xezim::compiler::simulator::KIND_STATEMENT, "statement"),
+                (xezim::compiler::simulator::KIND_BRANCH, "branch"),
+                (xezim::compiler::simulator::KIND_TOGGLE, "toggle"),
+            ]
+            .iter()
+            .filter(|(k, _)| kinds & k != 0)
+            .map(|(_, n)| *n)
+            .collect();
+            eprintln!(
+                "Warning: +cover={}: xezim has no {} coverage; collecting {}",
+                spec,
+                names.join(", "),
+                if kept.is_empty() {
+                    "no code coverage".to_string()
+                } else {
+                    format!("{} coverage", kept.join(", "))
+                }
+            );
+        }
+    }
+    let env_cov = match env::var("XEZIM_CODE_COVERAGE") {
+        Ok(v) if !v.is_empty() && v != "0" => {
+            match xezim::compiler::simulator::parse_code_coverage_kinds(&v) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    eprintln!("Error: XEZIM_CODE_COVERAGE: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => None,
+    };
+    let code_cov = code_cov_kinds
+        .or(env_cov)
+        .or(cover_request.map(|(k, _)| k))
+        .unwrap_or(0);
+    if code_cov != 0 {
+        xezim::compiler::simulator::set_code_coverage(Some(
+            xezim::compiler::simulator::CodeCoverage {
+                kinds: code_cov,
+                scopes: code_cov_scopes,
+            },
+        ));
+    } else if !code_cov_scopes.is_empty() {
+        eprintln!("Warning: --code-coverage-scope has no effect without --code-coverage");
     }
 
     // Opt-in statistics footer: the CLI flag wins over XEZIM_REPORT_STATS.
@@ -2296,9 +2692,22 @@ fn run_main() -> i32 {
         report::mode_from_env_value(env::var("XEZIM_REPORT_STATS").ok().as_deref())
     });
 
+    // XEZIM_VERBOSE=1 is `--verbose` for scripts that cannot add a flag.
+    if env::var("XEZIM_VERBOSE").ok().as_deref() == Some("1") {
+        verbose = true;
+    }
     if verbose {
         xezim::set_compile_verbose(true);
     }
+    // Internal engine chatter (run banner, [PHASE] timings, end-of-run engine
+    // counters) is off by default: a plain run prints the design's own
+    // output, warnings/errors and the final result line. `--profile` sets
+    // XEZIM_PROFILE_REPORT while parsing, so both spellings turn it on, and
+    // XEZIM_PROFILE_TIMING's timers are only ever read from those lines.
+    let env_on = |k: &str| env::var(k).ok().as_deref() == Some("1");
+    xezim::set_verbose(
+        verbose || sim_debug || env_on("XEZIM_PROFILE_REPORT") || env_on("XEZIM_PROFILE_TIMING"),
+    );
 
     // `--dump-files-list`: the fully resolved compilation file set, after every
     // `-f` args file has been expanded. Printed BEFORE the files are read so
@@ -2420,12 +2829,21 @@ suppressed but the explicit SDF annotation still applies."
     }
 
     if design_cache_enabled && mode == Mode::Simulate {
-        let directory = design_cache_dir.clone().unwrap_or_else(default_design_cache_dir);
+        let directory = design_cache_dir
+            .clone()
+            .unwrap_or_else(default_design_cache_dir);
         let dependency_files = design_dependency_files(&lib_files, &lib_dirs, lib_exts.as_deref());
         let semantic_salt = format!(
-            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={}",
-            sv2023_mode, strict_checks, source_delay_select, module_timescale_args,
-            lib_dirs, lib_files, lib_exts, nospecify,
+            "sv2023={};strict={};delay_select={};module_timescale={:?};lib_dirs={:?};lib_files={:?};lib_exts={:?};nospecify={};param_overrides={:?}",
+            sv2023_mode,
+            strict_checks,
+            source_delay_select,
+            module_timescale_args,
+            lib_dirs,
+            lib_files,
+            lib_exts,
+            nospecify,
+            compat.param_overrides,
         );
         // Set cache compression settings before cache is used
         if let Some(level) = cache_compression_level {
@@ -2434,7 +2852,7 @@ suppressed but the explicit SDF annotation still applies."
         if cache_stats {
             xezim_core::set_compression_stats(true);
         }
-        
+
         xezim::set_design_cache(Some(xezim::DesignCacheConfig {
             directory,
             semantic_salt,
@@ -2455,11 +2873,15 @@ suppressed but the explicit SDF annotation still applies."
             if head.len() == 8 && &head[..] == xezim::XEZIM_BYTECODE_MAGIC {
                 match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
-                        println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-                        println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
-                        println!("Loaded compiled: {}", sf);
-                        println!("Max time: {} ns", max_time);
-                        println!("------------------------------");
+                        chatter_out!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+                        chatter_out!(
+                            "git {} ({})",
+                            env!("XEZIM_GIT_HASH"),
+                            env!("XEZIM_GIT_DATE")
+                        );
+                        chatter_out!("Loaded compiled: {}", sf);
+                        chatter_out!("Max time: {} ns", max_time);
+                        chatter_out!("------------------------------");
                         let total_start = std::time::Instant::now();
                         xezim::compiler::simulator::set_sim_debug(sim_debug);
                         xezim::compiler::simulator::set_dump_timescales(dump_timescales);
@@ -2489,34 +2911,31 @@ suppressed but the explicit SDF annotation still applies."
                             }
                             std::process::exit(1);
                         }
-                        eprintln!(
+                        chatter!(
                             "[PHASE] compilation: {:.1}ms",
                             compilation_start.elapsed().as_secs_f64() * 1000.0
                         );
                         let simulation_start = std::time::Instant::now();
                         sim.simulate();
-                        eprintln!(
+                        chatter!(
                             "[PHASE] simulation: {:.1}ms",
                             simulation_start.elapsed().as_secs_f64() * 1000.0
                         );
-                        eprintln!(
+                        chatter!(
                             "[PHASE] total: {:.1}ms",
                             total_start.elapsed().as_secs_f64() * 1000.0
                         );
-                        println!("------------------------------");
-                        println!("Simulation finished at time {}", sim.time);
-            {
-                let (hits, last_t) = sim.settle_limit_report();
-                if hits > 0 {
-                    eprintln!(
-                        "[WARN] settle limit was exhausted {} time(s) during this run (last at time {}) — results in those slots may not have converged; raise --settle-limit.",
-                        hits, last_t
-                    );
-                }
-            }
-                        if sim.finished {
-                            println!("($finish called)");
+                        chatter_out!("------------------------------");
+                        {
+                            let (hits, last_t) = sim.settle_limit_report();
+                            if hits > 0 {
+                                eprintln!(
+                                    "[WARN] settle limit was exhausted {} time(s) during this run (last at time {}) — results in those slots may not have converged; raise --settle-limit.",
+                                    hits, last_t
+                                );
+                            }
                         }
+                        print_finish_line(sim.time, sim.finished);
                         // Footer before the exit-status checks so it also
                         // appears for runs that end with a nonzero status.
                         emit_run_stats(report_mode, compile_wall_start, Some(sim.time));
@@ -2567,7 +2986,8 @@ suppressed but the explicit SDF annotation still applies."
     // Appended after the real sources so the instantiated modules are already
     // declared; the wrapper has no macros/includes, so preprocessing is a no-op.
     if top_modules.len() > 1 {
-        let wrap_name = "__xz_multitop__";
+        // The core's own multi-top root name, so every printed path drops it.
+        let wrap_name = xezim_core::MULTI_TOP_WRAPPER;
         let mut body = format!("module {wrap_name};\n");
         // Instance name = module name (legal — separate namespaces), so each
         // top keeps its identity in hierarchical paths: `tb.u_m.u_i` from a
@@ -2585,11 +3005,14 @@ suppressed but the explicit SDF annotation still applies."
         top_module = Some(wrap_name.to_string());
     }
 
-    let preprocessed_sources =
+    let (preprocessed_sources, line_maps) =
         match preprocess_sources(&sources, &source_files, &include_dirs, &defines) {
             Ok(v) => v,
-            Err(e) => {
-                eprintln!("Error: preprocessing failed: {}", e);
+            Err(errors) => {
+                for e in &errors {
+                    eprintln!("{}", e);
+                }
+                eprintln!("Error: preprocessing failed ({} error(s))", errors.len());
                 std::process::exit(1);
             }
         };
@@ -2684,8 +3107,12 @@ suppressed but the explicit SDF annotation still applies."
     // below. Build identity in --compile/--parse logs matters for exactly the
     // situation those modes are used in: debugging with a specific build.
     if mode != Mode::Preprocess {
-        println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-        println!("git {} ({})", env!("XEZIM_GIT_HASH"), env!("XEZIM_GIT_DATE"));
+        chatter_out!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+        chatter_out!(
+            "git {} ({})",
+            env!("XEZIM_GIT_HASH"),
+            env!("XEZIM_GIT_DATE")
+        );
     }
 
     if mode == Mode::Preprocess {
@@ -2722,10 +3149,18 @@ suppressed but the explicit SDF annotation still applies."
         let mut total_desc = 0;
         let mut total_err = 0;
         let mut total_warn = 0;
-        for (fi, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+        for (fi, (label, source)) in file_labels
+            .iter()
+            .zip(preprocessed_sources.iter())
+            .enumerate()
+        {
             xezim::progress_status(&format!(
                 "[{}] parsing {}/{}: {}",
-                if mode == Mode::Parse { "parse" } else { "compile" },
+                if mode == Mode::Parse {
+                    "parse"
+                } else {
+                    "compile"
+                },
                 fi + 1,
                 file_labels.len(),
                 label.rsplit('/').next().unwrap_or(label)
@@ -2734,13 +3169,7 @@ suppressed but the explicit SDF annotation still applies."
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
-            for err in diags
-                .iter()
-                .filter(|d| d.severity == xezim::diagnostics::Severity::Error)
-            {
-                let (line, col) = byte_to_line_col(source, err.span.start);
-                eprintln!("[{}] {}:{}: error: {}", label, line, col, err.message);
-            }
+            report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
             total_desc += source_ast.descriptions.len();
             total_err += diags
                 .iter()
@@ -2774,10 +3203,18 @@ suppressed but the explicit SDF annotation still applies."
         let mut total_err = 0;
         let mut total_warn = 0;
 
-        for (fi, (label, source)) in file_labels.iter().zip(preprocessed_sources.iter()).enumerate() {
+        for (fi, (label, source)) in file_labels
+            .iter()
+            .zip(preprocessed_sources.iter())
+            .enumerate()
+        {
             xezim::progress_status(&format!(
                 "[{}] parsing {}/{}: {}",
-                if mode == Mode::Parse { "parse" } else { "compile" },
+                if mode == Mode::Parse {
+                    "parse"
+                } else {
+                    "compile"
+                },
                 fi + 1,
                 file_labels.len(),
                 label.rsplit('/').next().unwrap_or(label)
@@ -2786,13 +3223,7 @@ suppressed but the explicit SDF annotation still applies."
             let mut parser = sv_parser::parse::Parser::new(tokens);
             let source_ast = parser.parse_source_text();
             let diags = parser.diagnostics().to_vec();
-            for err in diags
-                .iter()
-                .filter(|d| d.severity == xezim::diagnostics::Severity::Error)
-            {
-                let (line, col) = byte_to_line_col(source, err.span.start);
-                eprintln!("[{}] {}:{}: error: {}", label, line, col, err.message);
-            }
+            report_parse_diagnostics(&diags, source, line_maps[fi].as_ref(), label);
             total_desc += source_ast.descriptions.len();
             total_err += diags
                 .iter()
@@ -2853,8 +3284,12 @@ suppressed but the explicit SDF annotation still applies."
                         merged_kept.as_deref(),
                     );
                 }
-                print_design_summary(&_defs, &elab);
-                print_resource_usage(compile_wall_start);
+                // The flattened-design table and CPU/memory lines are
+                // engine detail; the verdict above is the mode's result.
+                if xezim::verbose() {
+                    print_design_summary(&_defs, &elab);
+                    print_resource_usage(compile_wall_start);
+                }
                 emit_run_stats(report_mode, compile_wall_start, None);
                 // §6.21: keep compiled artifacts consistent with the simulate
                 // path — re-issue static initializers that call simulation-time
@@ -2876,15 +3311,15 @@ suppressed but the explicit SDF annotation still applies."
                 }
             }
             Err(e) => {
-                eprintln!("Simulation error: {}", e);
+                report_fatal_error(&e);
                 std::process::exit(1);
             }
         }
         return 0;
     }
 
-    println!("Max time: {} ns", max_time);
-    println!("------------------------------");
+    chatter_out!("Max time: {} ns", max_time);
+    chatter_out!("------------------------------");
     xezim::compiler::simulator::set_sim_debug(sim_debug);
     xezim::compiler::simulator::set_dump_timescales(dump_timescales);
     xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
@@ -2942,7 +3377,7 @@ suppressed but the explicit SDF annotation still applies."
         multikernel_scope.as_deref(),
     ) {
         Ok(sim) => {
-            println!("------------------------------");
+            chatter_out!("------------------------------");
             if let Some(ref mo) = dump_merged_sv {
                 append_adopted_libs_to_merged(
                     mo,
@@ -2951,7 +3386,6 @@ suppressed but the explicit SDF annotation still applies."
                     merged_kept.as_deref(),
                 );
             }
-            println!("Simulation finished at time {}", sim.time);
             {
                 let (hits, last_t) = sim.settle_limit_report();
                 if hits > 0 {
@@ -2961,9 +3395,7 @@ suppressed but the explicit SDF annotation still applies."
                     );
                 }
             }
-            if sim.finished {
-                println!("($finish called)");
-            }
+            print_finish_line(sim.time, sim.finished);
             // Footer before the exit-status checks so it also appears for
             // runs that end with a nonzero status.
             emit_run_stats(report_mode, compile_wall_start, Some(sim.time));
@@ -2976,10 +3408,18 @@ suppressed but the explicit SDF annotation still applies."
             if code != 0 {
                 std::process::exit(code);
             }
-            0
+            // Exit here rather than returning: `main` exits with the code
+            // anyway, and returning would first drop the simulator (tens of
+            // millions of signal values, every side table, the elaborated
+            // module). On c910 that teardown is ~1.6 s after the last line of
+            // output. Everything with an observable side effect is already
+            // done: waves, traces and the `$display` writer are flushed and
+            // synced at the end of `simulate()`, the stats footer is printed,
+            // and `process::exit` flushes Rust's own stdout buffer.
+            std::process::exit(0);
         }
         Err(e) => {
-            eprintln!("Simulation error: {}", e);
+            report_fatal_error(&e);
             std::process::exit(1);
         }
     }
@@ -3000,19 +3440,45 @@ fn exit_status_for_severities(sim: &xezim::compiler::Simulator, error_exit: bool
     0
 }
 
-fn byte_to_line_col(source: &str, byte_offset: usize) -> (usize, usize) {
-    let mut line = 1;
-    let mut col = 1;
-    for (i, ch) in source.char_indices() {
-        if i >= byte_offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
+/// Print one file's parser errors and warnings (and, under --verbose, its
+/// informational notes), each at its original `file:line:col` with the
+/// source line (identical repeats dropped).
+fn report_parse_diagnostics(
+    diags: &[xezim::diagnostics::Diagnostic],
+    source: &str,
+    map: Option<&xezim::sv_parser::source_map::LineMap>,
+    label: &str,
+) {
+    use xezim::diagnostics::Severity;
+    let notes = if xezim::verbose() {
+        Some(Severity::Info)
+    } else {
+        None
+    };
+    for sev in [Severity::Error, Severity::Warning]
+        .into_iter()
+        .chain(notes)
+    {
+        for d in xezim::render_parse_diagnostics(diags, sev, source, map, label) {
+            xezim::progress_clear();
+            eprintln!("{}", d);
         }
     }
-    (line, col)
+}
+
+/// Print a fatal parse/elaboration error. A message that is already a
+/// located diagnostic (`file:line:col: error: ...`, or a "Parse errors in"
+/// block of them) stands on its own; anything else gets the generic prefix.
+fn report_fatal_error(e: &str) {
+    let first = e.lines().next().unwrap_or("");
+    let located = first.starts_with("In file included from")
+        || first.starts_with("Parse errors in")
+        || first.starts_with("Strict check failed in")
+        || first.starts_with("Preprocessing failed in")
+        || first.contains(": error: ");
+    if located {
+        eprintln!("{}", e);
+    } else {
+        eprintln!("Simulation error: {}", e);
+    }
 }

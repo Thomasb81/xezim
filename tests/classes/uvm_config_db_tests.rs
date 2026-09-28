@@ -102,12 +102,13 @@ fn test_config_db_inst_name() {
 module top;
   import uvm_pkg::*;
   initial begin
+    uvm_component comp1;
+    int val;
     #1;
     uvm_config_db#(int)::set(null, "tc", "my_int", 42);
     #1;
-    uvm_component comp1 = new("tc");
+    comp1 = new("tc");
     #1;
-    int val;
     if (uvm_config_db#(int)::get(comp1, "tc", "my_int", val))
       $display("GET1_OK: %0d", val);
     else
@@ -136,8 +137,16 @@ endmodule
     // "tc.tc" (cntxt full name + "." + inst_name) — a MISS. The old
     // GET1_OK expectation pinned the unresolved-DPI always-match bug that
     // the built-in uvm_re_match replaced with real POSIX-ERE semantics.
-    assert!(out.contains("GET1_FAIL"), "cross-scope get must miss: {}", out);
-    assert!(out.contains("GET3_OK: 99"), "wildcard get should hit: {}", out);
+    assert!(
+        out.contains("GET1_FAIL"),
+        "cross-scope get must miss: {}",
+        out
+    );
+    assert!(
+        out.contains("GET3_OK: 99"),
+        "wildcard get should hit: {}",
+        out
+    );
 }
 
 /// A wildcard `set(null, "*", field, v)` is visible to any getter, and the
@@ -150,12 +159,13 @@ fn test_config_db_wildcard() {
 module top;
   import uvm_pkg::*;
   initial begin
+    uvm_component comp;
+    int val;
     #1;
     uvm_config_db#(int)::set(null, "*", "my_int", 99);
     #1;
-    uvm_component comp = new("comp");
+    comp = new("comp");
     #1;
-    int val;
     if (uvm_config_db#(int)::get(comp, "any_path", "my_int", val)) begin
       if (val == 99)
         $display("TEST_PASS");
@@ -173,7 +183,11 @@ endmodule
         return;
     };
     println!("{}", out);
-    assert!(out.contains("TEST_PASS"), "wildcard value should round-trip: {}", out);
+    assert!(
+        out.contains("TEST_PASS"),
+        "wildcard value should round-trip: {}",
+        out
+    );
 }
 
 /// A specific-instance set hits its getter; a wildcard set hits any getter; a
@@ -186,12 +200,13 @@ fn test_config_db_hit_wildcard_and_miss() {
 module top;
   import uvm_pkg::*;
   initial begin
+    uvm_component comp;
+    int val;
     #1;
     uvm_config_db#(int)::set(null, "tc", "my_int", 42);
     #1;
-    uvm_component comp = new("comp");
+    comp = new("comp");
     #1;
-    int val;
     if (uvm_config_db#(int)::get(comp, "tc", "my_int", val))
       $display("T1_GET: %0d", val);
     else
@@ -224,7 +239,11 @@ endmodule
     // "comp.tc", which /^tc$/ from set(null, "tc", ...) does not match —
     // the reference prints T1_FAIL. The old T1_GET expectation pinned the
     // unresolved-DPI always-match bug.
-    assert!(out.contains("T1_FAIL"), "cross-scope get must miss: {}", out);
+    assert!(
+        out.contains("T1_FAIL"),
+        "cross-scope get must miss: {}",
+        out
+    );
     assert!(out.contains("T2_GET: 77"), "wildcard get: {}", out);
     assert!(out.contains("T3_OK"), "unset field should miss: {}", out);
 }

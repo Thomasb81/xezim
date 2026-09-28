@@ -19,7 +19,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use xezim::*;
 
-fn uvm_dir() -> PathBuf {
+pub(crate) fn uvm_dir() -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         if let Ok(d) = std::env::var("XEZIM_UVM_DIR") {
@@ -53,7 +53,9 @@ fn uvm_dir() -> PathBuf {
                  (set XEZIM_UVM_DIR to an existing checkout to skip the clone)"
             );
         }
-        target.canonicalize().expect("canonicalize target/uvm-checkout")
+        target
+            .canonicalize()
+            .expect("canonicalize target/uvm-checkout")
     })
     .clone()
 }
@@ -81,7 +83,12 @@ module top;
 endmodule
 "#;
 
-fn run_uvm(version: &str, extra_incdirs: &[String], test_src: String, top: &str) -> Result<compiler::Simulator, String> {
+fn run_uvm(
+    version: &str,
+    extra_incdirs: &[String],
+    test_src: String,
+    top: &str,
+) -> Result<compiler::Simulator, String> {
     run_uvm_opt(version, extra_incdirs, test_src, top, true)
 }
 
@@ -188,8 +195,16 @@ fn uvm_2020_complete_bench_runs_traffic() {
         "UVM errors:\n{}",
         out.join("\n")
     );
-    let checked = out.iter().filter(|l| l.contains("[SB] Checked data:")).count();
-    assert_eq!(checked, 10, "scoreboard must check all 10 transactions:\n{}", out.join("\n"));
+    let checked = out
+        .iter()
+        .filter(|l| l.contains("[SB] Checked data:"))
+        .count();
+    assert_eq!(
+        checked,
+        10,
+        "scoreboard must check all 10 transactions:\n{}",
+        out.join("\n")
+    );
     assert_eq!(sim.time, 100, "test drops its objection at t=100");
 }
 
@@ -407,7 +422,8 @@ endmodule
     .expect("UVM 2017 with DPI builtins failed to simulate");
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
-        msgs.iter().any(|m| m.contains("CFGDB/SET") && m.contains("knob")),
+        msgs.iter()
+            .any(|m| m.contains("CFGDB/SET") && m.contains("knob")),
         "+UVM_CONFIG_DB_TRACE must produce a CFGDB/SET trace for the knob set; output tail: {:?}",
         &msgs[msgs.len().saturating_sub(15)..]
     );
@@ -418,7 +434,6 @@ endmodule
     );
     assert_eq!(sim.time, 100, "phase cycle must still end at t=100");
 }
-
 
 /// TLM-1 blocking path audit (reference-verified 7/7): blocking put through
 /// an imp with REAL back-pressure (producer completes at t=6, gated by the
@@ -596,15 +611,19 @@ fn uvm_tlm1_blocking_ports_fifo_analysis() {
         out.iter().any(|m| m.contains("TEST_PASS")),
         "TLM1 blocking audit did not pass:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
     assert!(
         !out.iter().any(|m| m.starts_with("FAIL:")),
         "TLM1 blocking audit had failures:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
 }
 
@@ -699,18 +718,21 @@ fn uvm_tlm1_nonblocking_family_analysis_fifo() {
         out.iter().any(|m| m.contains("TEST_PASS")),
         "TLM1 nonblocking audit did not pass:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
     assert!(
         !out.iter().any(|m| m.starts_with("FAIL:")),
         "TLM1 nonblocking audit had failures:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
 }
-
 
 /// uvm_event trigger data + timing, uvm_barrier 3-way release, global event pool identity (reference-verified 6/6)
 const UVM_EVENTS_BARRIERS_POOLS_TEST: &str = r#"
@@ -765,22 +787,31 @@ module top; initial run_test("ev_test"); endmodule
 
 #[test]
 fn uvm_events_barriers_pools() {
-    let sim = run_uvm("1.2", &[], UVM_EVENTS_BARRIERS_POOLS_TEST.to_string(), "top")
-        .expect("UVM 1.2 uvm_events_barriers_pools failed to simulate");
+    let sim = run_uvm(
+        "1.2",
+        &[],
+        UVM_EVENTS_BARRIERS_POOLS_TEST.to_string(),
+        "top",
+    )
+    .expect("UVM 1.2 uvm_events_barriers_pools failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
         out.iter().any(|m| m.contains("TEST_PASS")),
         "uvm_events_barriers_pools did not pass:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
     assert!(
         !out.iter().any(|m| m.starts_with("FAIL:")),
         "uvm_events_barriers_pools had failures:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
 }
 
@@ -838,22 +869,31 @@ module top; initial run_test("rd_test"); endmodule
 
 #[test]
 fn uvm_resource_db_report_catcher() {
-    let sim = run_uvm("1.2", &[], UVM_RESOURCE_DB_REPORT_CATCHER_TEST.to_string(), "top")
-        .expect("UVM 1.2 uvm_resource_db_report_catcher failed to simulate");
+    let sim = run_uvm(
+        "1.2",
+        &[],
+        UVM_RESOURCE_DB_REPORT_CATCHER_TEST.to_string(),
+        "top",
+    )
+    .expect("UVM 1.2 uvm_resource_db_report_catcher failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
         out.iter().any(|m| m.contains("TEST_PASS")),
         "uvm_resource_db_report_catcher did not pass:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
     assert!(
         !out.iter().any(|m| m.starts_with("FAIL:")),
         "uvm_resource_db_report_catcher had failures:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
 }
 
@@ -935,15 +975,19 @@ fn uvm_tlm2_b_transport() {
         out.iter().any(|m| m.contains("TEST_PASS")),
         "uvm_tlm2_b_transport did not pass:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
     assert!(
         !out.iter().any(|m| m.starts_with("FAIL:")),
         "uvm_tlm2_b_transport had failures:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
 }
 
@@ -1009,15 +1053,22 @@ module top; initial run_test("fac_test"); endmodule
 
 #[test]
 fn uvm_factory_overrides_and_by_name() {
-    let sim = run_uvm("1.2", &[], UVM_FACTORY_OVERRIDES_AND_BY_NAME_TEST.to_string(), "top")
-        .expect("UVM 1.2 uvm_factory_overrides_and_by_name failed to simulate");
+    let sim = run_uvm(
+        "1.2",
+        &[],
+        UVM_FACTORY_OVERRIDES_AND_BY_NAME_TEST.to_string(),
+        "top",
+    )
+    .expect("UVM 1.2 uvm_factory_overrides_and_by_name failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
         out.iter().any(|m| m.contains("TEST_PASS")),
         "uvm_factory_overrides_and_by_name did not pass:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
 }
 
@@ -1081,15 +1132,22 @@ module top; initial run_test("fa_test"); endmodule
 
 #[test]
 fn uvm_field_automation_clone_pack() {
-    let sim = run_uvm("1.2", &[], UVM_FIELD_AUTOMATION_CLONE_PACK_TEST.to_string(), "top")
-        .expect("UVM 1.2 uvm_field_automation_clone_pack failed to simulate");
+    let sim = run_uvm(
+        "1.2",
+        &[],
+        UVM_FIELD_AUTOMATION_CLONE_PACK_TEST.to_string(),
+        "top",
+    )
+    .expect("UVM 1.2 uvm_field_automation_clone_pack failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
         out.iter().any(|m| m.contains("TEST_PASS")),
         "uvm_field_automation_clone_pack did not pass:
 {}",
-        out.join("
-")
+        out.join(
+            "
+"
+        )
     );
 }
 /// UVM 1.2 sequencer/driver handshake: a sequence's start_item must BLOCK
@@ -1108,14 +1166,24 @@ fn uvm_1_2_sequencer_driver_handshake() {
         .expect("UVM 1.2 sequencer handshake failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
-        !out.iter().any(|l| (l.contains("UVM_ERROR") && !l.contains("UVM_ERROR :"))
-            || (l.contains("UVM_FATAL") && !l.contains("UVM_FATAL :"))),
+        !out.iter()
+            .any(|l| (l.contains("UVM_ERROR") && !l.contains("UVM_ERROR :"))
+                || (l.contains("UVM_FATAL") && !l.contains("UVM_FATAL :"))),
         "UVM errors:\n{}",
         out.join("\n")
     );
     let got = out.iter().filter(|l| l.contains("DRV: got item")).count();
-    assert_eq!(got, 3, "driver must receive all 3 items:\n{}", out.join("\n"));
-    assert!(out.iter().any(|l| l.contains("TEST_PASS")), "TEST_PASS:\n{}", out.join("\n"));
+    assert_eq!(
+        got,
+        3,
+        "driver must receive all 3 items:\n{}",
+        out.join("\n")
+    );
+    assert!(
+        out.iter().any(|l| l.contains("TEST_PASS")),
+        "TEST_PASS:\n{}",
+        out.join("\n")
+    );
 }
 
 /// UVM 1.2 register-model FRONTDOOR path end-to-end: read of reset value,
@@ -1129,16 +1197,21 @@ fn uvm_1_2_sequencer_driver_handshake() {
 fn uvm_1_2_ral_frontdoor_read_write() {
     let test_src = std::fs::read_to_string("tests/uvm/uvm_ral_frontdoor.sv")
         .expect("Could not read uvm_ral_frontdoor.sv");
-    let sim = run_uvm("1.2", &[], test_src, "top")
-        .expect("UVM 1.2 RAL frontdoor failed to simulate");
+    let sim =
+        run_uvm("1.2", &[], test_src, "top").expect("UVM 1.2 RAL frontdoor failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
-        !out.iter().any(|l| (l.contains("UVM_ERROR") && !l.contains("UVM_ERROR :"))
-            || (l.contains("UVM_FATAL") && !l.contains("UVM_FATAL :"))),
+        !out.iter()
+            .any(|l| (l.contains("UVM_ERROR") && !l.contains("UVM_ERROR :"))
+                || (l.contains("UVM_FATAL") && !l.contains("UVM_FATAL :"))),
         "UVM errors:\n{}",
         out.join("\n")
     );
-    assert!(!out.iter().any(|l| l.starts_with("FAIL:")), "TB FAILs:\n{}", out.join("\n"));
+    assert!(
+        !out.iter().any(|l| l.starts_with("FAIL:")),
+        "TB FAILs:\n{}",
+        out.join("\n")
+    );
     for pin in [
         "read reset value (got 00000000000000c0)",
         "read-back (got 00000000a5a55a5a)",
@@ -1171,18 +1244,27 @@ fn uvm_1_2_ral_backdoor_peek_poke() {
         .expect("UVM 1.2 RAL backdoor failed to simulate");
     let out: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
-        !out.iter().any(|l| (l.contains("UVM_ERROR") && !l.contains("UVM_ERROR :"))
-            || (l.contains("UVM_FATAL") && !l.contains("UVM_FATAL :"))),
+        !out.iter()
+            .any(|l| (l.contains("UVM_ERROR") && !l.contains("UVM_ERROR :"))
+                || (l.contains("UVM_FATAL") && !l.contains("UVM_FATAL :"))),
         "UVM errors:\n{}",
         out.join("\n")
     );
-    assert!(!out.iter().any(|l| l.starts_with("FAIL:")), "TB FAILs:\n{}", out.join("\n"));
+    assert!(
+        !out.iter().any(|l| l.starts_with("FAIL:")),
+        "TB FAILs:\n{}",
+        out.join("\n")
+    );
     for pin in [
         "backdoor read reset (got 00000000000000c0)",
         "backdoor read-back (got 00000000facecafe)",
         "TEST_PASS",
     ] {
-        assert!(out.iter().any(|l| l.contains(pin)), "missing `{pin}`:\n{}", out.join("\n"));
+        assert!(
+            out.iter().any(|l| l.contains(pin)),
+            "missing `{pin}`:\n{}",
+            out.join("\n")
+        );
     }
 }
 
@@ -1337,3 +1419,146 @@ fn uvm_2020_printer_renders_enum_array_members() {
     );
 }
 
+/// A throughput-shaped bench — constrained items (`dist`, implication,
+/// ranges) through sequencer, driver (clocking block), monitor (covergroup
+/// with a cross), analysis port and scoreboard (associative array) — run
+/// short: every item must reach the scoreboard, with no UVM error and no
+/// failed `randomize()`. The same bench at 10 k-200 k items is the
+/// UVM-throughput benchmark (xezim ~4.9 ms per item, the reference
+/// simulator ~58 us).
+const STRESS_BENCH: &str = r#"
+`include "uvm_macros.svh"
+interface bus_if(input logic clk);
+  logic valid; logic [31:0] addr; logic [31:0] data; logic [3:0] kind;
+  clocking cb @(posedge clk); output valid, addr, data, kind; endclocking
+  clocking mcb @(posedge clk); input valid, addr, data, kind; endclocking
+endinterface
+package stress_pkg;
+  import uvm_pkg::*;
+  class item extends uvm_sequence_item;
+    rand bit [31:0] addr; rand bit [31:0] data; rand bit [3:0] kind; rand bit [7:0] len;
+    constraint c_addr { addr[1:0] == 0; addr inside {[32'h1000:32'h8FFF]}; }
+    constraint c_kind { kind dist { 0 := 40, [1:7] :/ 40, [8:15] :/ 20 }; }
+    constraint c_len  { if (kind < 4) len inside {[1:16]}; else len inside {[17:64]}; }
+    `uvm_object_utils_begin(item)
+      `uvm_field_int(addr, UVM_ALL_ON) `uvm_field_int(data, UVM_ALL_ON)
+      `uvm_field_int(kind, UVM_ALL_ON) `uvm_field_int(len, UVM_ALL_ON)
+    `uvm_object_utils_end
+    function new(string name = "item"); super.new(name); endfunction
+  endclass
+  class seq extends uvm_sequence #(item);
+    `uvm_object_utils(seq)
+    int n = 80;
+    function new(string name = "seq"); super.new(name); endfunction
+    task body();
+      void'($value$plusargs("N=%d", n));
+      repeat (n) begin
+        item it = item::type_id::create("it");
+        start_item(it);
+        if (!it.randomize()) `uvm_error("SEQ", "randomize failed")
+        finish_item(it);
+      end
+    endtask
+  endclass
+  class drv extends uvm_driver #(item);
+    `uvm_component_utils(drv)
+    virtual bus_if vif;
+    function new(string n, uvm_component p); super.new(n, p); endfunction
+    function void build_phase(uvm_phase phase);
+      if (!uvm_config_db#(virtual bus_if)::get(this, "", "vif", vif)) `uvm_fatal("DRV", "no vif")
+    endfunction
+    task run_phase(uvm_phase phase);
+      vif.cb.valid <= 0;
+      forever begin
+        seq_item_port.get_next_item(req);
+        @(vif.cb); vif.cb.valid <= 1; vif.cb.addr <= req.addr; vif.cb.data <= req.data; vif.cb.kind <= req.kind;
+        @(vif.cb); vif.cb.valid <= 0;
+        seq_item_port.item_done();
+      end
+    endtask
+  endclass
+  class mon extends uvm_monitor;
+    `uvm_component_utils(mon)
+    virtual bus_if vif; uvm_analysis_port #(item) ap;
+    covergroup cg with function sample(bit [3:0] k, bit [31:0] a);
+      cp_k: coverpoint k;
+      cp_a: coverpoint a[15:12] { bins lo[] = {[1:4]}; bins hi = {[5:8]}; }
+      x: cross cp_k, cp_a;
+    endgroup
+    function new(string n, uvm_component p); super.new(n, p); ap = new("ap", this); cg = new(); endfunction
+    function void build_phase(uvm_phase phase);
+      void'(uvm_config_db#(virtual bus_if)::get(this, "", "vif", vif));
+    endfunction
+    task run_phase(uvm_phase phase);
+      forever begin
+        @(vif.mcb);
+        if (vif.mcb.valid) begin
+          item t = item::type_id::create("t");
+          t.addr = vif.mcb.addr; t.data = vif.mcb.data; t.kind = vif.mcb.kind;
+          cg.sample(t.kind, t.addr);
+          ap.write(t);
+        end
+      end
+    endtask
+  endclass
+  class sb extends uvm_scoreboard;
+    `uvm_component_utils(sb)
+    uvm_analysis_imp #(item, sb) imp;
+    int unsigned count; bit [31:0] sig; int kinds[int];
+    function new(string n, uvm_component p); super.new(n, p); imp = new("imp", this); endfunction
+    function void write(item t);
+      count++; sig = {sig[30:0], sig[31]} ^ t.addr ^ (t.data * 3) ^ t.kind;
+      kinds[t.kind]++;
+    endfunction
+    function void report_phase(uvm_phase phase);
+      `uvm_info("SB", $sformatf("count=%0d sig=%h kinds=%0d", count, sig, kinds.num()), UVM_NONE)
+    endfunction
+  endclass
+  class env extends uvm_env;
+    `uvm_component_utils(env)
+    uvm_sequencer #(item) sqr; drv d; mon m; sb s;
+    function new(string n, uvm_component p); super.new(n, p); endfunction
+    function void build_phase(uvm_phase phase);
+      sqr = uvm_sequencer#(item)::type_id::create("sqr", this);
+      d = drv::type_id::create("d", this); m = mon::type_id::create("m", this); s = sb::type_id::create("s", this);
+    endfunction
+    function void connect_phase(uvm_phase phase);
+      d.seq_item_port.connect(sqr.seq_item_export); m.ap.connect(s.imp);
+    endfunction
+  endclass
+  class test extends uvm_test;
+    `uvm_component_utils(test)
+    env e;
+    function new(string n, uvm_component p); super.new(n, p); endfunction
+    function void build_phase(uvm_phase phase); e = env::type_id::create("e", this); endfunction
+    task run_phase(uvm_phase phase);
+      seq s = seq::type_id::create("s");
+      phase.raise_objection(this);
+      s.start(e.sqr);
+      #20;
+      phase.drop_objection(this);
+    endtask
+  endclass
+endpackage
+module tb;
+  import uvm_pkg::*; import stress_pkg::*;
+  logic clk = 0; always #5 clk = ~clk;
+  bus_if bif(clk);
+  initial begin
+    uvm_config_db#(virtual bus_if)::set(null, "*", "vif", bif);
+    run_test("test");
+  end
+endmodule
+"#;
+
+#[test]
+fn stress_bench_items_flow_end_to_end_1_2() {
+    let sim = run_uvm("1.2", &[], STRESS_BENCH.to_string(), "tb").expect("simulate failed");
+    let o: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
+    assert!(
+        o.iter().any(|l| l.contains("[SB] count=80 ")),
+        "not every item reached the scoreboard: {o:?}"
+    );
+    assert!(!o.iter().any(|l| l.contains("randomize failed")), "{o:?}");
+    assert!(o.iter().any(|l| l.contains("UVM_ERROR :    0")), "{o:?}");
+}

@@ -14,7 +14,13 @@ fn run(src: &str) -> String {
     let path = dir.join("t.sv");
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "tb", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "tb",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -24,8 +30,7 @@ fn run(src: &str) -> String {
 
 #[test]
 fn dead_giants_elide_and_live_giant_still_warns() {
-    let text = run(
-        r#"package p_defs;
+    let text = run(r#"package p_defs;
   typedef struct packed {
     bit [31:0] acc;
     bit [15:0] count;
@@ -48,8 +53,7 @@ module tb;
     $finish;
   end
 endmodule
-"#,
-    );
+"#);
     assert!(text.contains("TEST_PASS"), "sim result:\n{text}");
     assert!(
         text.contains("eliding dead 2228224-bit declaration 'dbg_stats_arr'"),

@@ -60,11 +60,11 @@ endclass
 module top;
   typedef Common#(int, "alpha") AlphaT;
   initial begin
+    AlphaT a;
     // static method via typedef'd specialization
     if (AlphaT::type_name() == "alpha") $display("PASS static");
     else $display("FAIL static got='%s'", AlphaT::type_name());
     // virtual method via instance returned from typedef'd static call
-    AlphaT a;
     a = AlphaT::get();
     if (a != null && a.get_type_name() == "alpha") $display("PASS virtual");
     else $display("FAIL virtual got='%s'", a==null?"null":a.get_type_name());
@@ -72,8 +72,14 @@ module top;
 endmodule
 "#;
     let out = run_xezim(src, "modlevel");
-    assert!(out.contains("PASS static"), "static typedef dispatch failed:\n{out}");
-    assert!(out.contains("PASS virtual"), "virtual typedef dispatch failed:\n{out}");
+    assert!(
+        out.contains("PASS static"),
+        "static typedef dispatch failed:\n{out}"
+    );
+    assert!(
+        out.contains("PASS virtual"),
+        "virtual typedef dispatch failed:\n{out}"
+    );
     assert!(!out.contains("FAIL"), "unexpected FAIL:\n{out}");
 }
 
@@ -174,7 +180,9 @@ module top;
 endmodule
 "#;
     let out = run_xezim(src, "static_field");
-    assert!(out.contains("PASS static_field"), "static field access failed:\n{out}");
+    assert!(
+        out.contains("PASS static_field"),
+        "static field access failed:\n{out}"
+    );
     assert!(!out.contains("FAIL"), "unexpected FAIL:\n{out}");
 }
-

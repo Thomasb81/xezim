@@ -50,7 +50,11 @@ module top;\n\
     if (fails == 0) $display(\"TAG_PASS\"); else $display(\"TAG_FAIL %0d\", fails);\n\
     $finish;\n\
   end endmodule\n";
-    assert_eq!(tags(src), vec!["TAG_PASS"], "prefixed inline members must be forced");
+    assert_eq!(
+        tags(src),
+        vec!["TAG_PASS"],
+        "prefixed inline members must be forced"
+    );
 }
 
 /// The prefixed member is pinned to a CONSTANT that is NOT 1 (receiver `t`,
@@ -70,7 +74,11 @@ module top; initial begin : body\n\
   if (r != 1 || o.size != 2) $display(\"TAG_FAIL %0d %0d\", r, o.size);\n\
   else $display(\"TAG_PASS\");\n\
   $finish; end endmodule\n";
-    assert_eq!(tags(src), vec!["TAG_PASS"], "prefixed scalar must be pinned exactly");
+    assert_eq!(
+        tags(src),
+        vec!["TAG_PASS"],
+        "prefixed scalar must be pinned exactly"
+    );
 }
 
 /// A prefixed rand member that couples a dynamic array's size (`m_data.size()
@@ -88,5 +96,9 @@ module top; initial begin : body\n\
     $display(\"TAG_FAIL %0d %0d %0d\", r, q.m_length, q.m_data.size());\n\
   else $display(\"TAG_PASS\");\n\
   $finish; end endmodule\n";
-    assert_eq!(tags(src), vec!["TAG_PASS"], "prefixed scalar must drive the dyn-array size");
+    assert_eq!(
+        tags(src),
+        vec!["TAG_PASS"],
+        "prefixed scalar must drive the dyn-array size"
+    );
 }

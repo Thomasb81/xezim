@@ -75,7 +75,8 @@ endmodule
     // later. A must have observed m=10. A FIFO parking-order resume runs B
     // first, whose re-arm sets m := -1, so A re-parks and a_seen stays -2.
     assert_eq!(
-        u(&sim, "a_seen"), 10,
+        u(&sim, "a_seen"),
+        10,
         "A (satisfied by the earlier write) must observe m=10 before B's \
          re-arm clobbers it"
     );

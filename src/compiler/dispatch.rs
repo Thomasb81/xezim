@@ -70,6 +70,7 @@ pub enum Opcode {
     SetSigned,
     Nop,
     LoadSignalRange,
+    LoadSignalRangeDyn,
     LoadSignalBit,
     NbaAssignConst,
     BranchUnlessZero,
@@ -81,6 +82,10 @@ pub enum Opcode {
     BinOpConstEq,
     BinOpConstCaseEq,
     BinOpConstXor,
+    BinOpConstAnd,
+    BinOpConstOr,
+    BinOpConstMul,
+    BinOpConstSub,
     CmpBranch,
     MoveResize,
     WaitDelayReg,
@@ -151,6 +156,7 @@ impl Opcode {
             Insn::BitSelect(_, _, _) => Self::BitSelect,
             Insn::BitSelectConst(_, _, _) => Self::BitSelectConst,
             Insn::RangeSelect(_, _, _, _) => Self::RangeSelect,
+            Insn::RangeSelectW(_, _, _, _, _) => Self::RangeSelect,
             Insn::RangeSelectConst(_, _, _, _) => Self::RangeSelectConst,
             Insn::Concat(_, _) => Self::Concat,
             Insn::Replicate(_, _, _) => Self::Replicate,
@@ -176,8 +182,9 @@ impl Opcode {
             Insn::SetSigned(_) => Self::SetSigned,
             Insn::ClearSigned(_) => Self::ClearSigned,
             Insn::Pow(_, _, _) => Self::Pow,
-            Insn::Nop => Self::Nop,
+            Insn::Nop | Insn::CovHit(_) => Self::Nop,
             Insn::LoadSignalRange(_, _, _, _) => Self::LoadSignalRange,
+            Insn::LoadSignalRangeDyn(_, _, _, _) => Self::LoadSignalRangeDyn,
             Insn::LoadSignalBit(_, _, _) => Self::LoadSignalBit,
             Insn::NbaAssignConst(_, _, _) => Self::NbaAssignConst,
             Insn::BranchUnlessZero(_, _) => Self::BranchUnlessZero,
@@ -190,6 +197,10 @@ impl Opcode {
                 BinOpConstKind::Eq => Self::BinOpConstEq,
                 BinOpConstKind::CaseEq => Self::BinOpConstCaseEq,
                 BinOpConstKind::Xor => Self::BinOpConstXor,
+                BinOpConstKind::And => Self::BinOpConstAnd,
+                BinOpConstKind::Or => Self::BinOpConstOr,
+                BinOpConstKind::Mul => Self::BinOpConstMul,
+                BinOpConstKind::Sub => Self::BinOpConstSub,
             },
             Insn::CmpBranch(..) => Self::CmpBranch,
             Insn::MoveResize(..) => Self::MoveResize,
@@ -219,7 +230,7 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 91;
+pub const NUM_OPCODES: usize = 96;
 
 /// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
 /// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to
@@ -234,7 +245,9 @@ pub struct DispatchTable {
 
 impl DispatchTable {
     pub fn new() -> Self {
-        Self { opcode_count: NUM_OPCODES }
+        Self {
+            opcode_count: NUM_OPCODES,
+        }
     }
 
     #[inline]
@@ -257,7 +270,7 @@ mod tests {
     fn test_opcode_from_insn() {
         let insn = Insn::Add(0, 1, 2);
         assert_eq!(Opcode::from_insn(&insn), Opcode::Add);
-        
+
         let insn = Insn::Nop;
         assert_eq!(Opcode::from_insn(&insn), Opcode::Nop);
     }

@@ -31,8 +31,14 @@ fn run(src: &str, two_state: bool) -> String {
     let path = dir.join("tb.sv");
     std::fs::write(&path, src).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
-    cmd.args(["--simulate", "-s", "tb_shape", path.to_str().unwrap(), "--no-cache"])
-        .env("XEZIM_PROFILE_TIMING", "1");
+    cmd.args([
+        "--simulate",
+        "-s",
+        "tb_shape",
+        path.to_str().unwrap(),
+        "--no-cache",
+    ])
+    .env("XEZIM_PROFILE_TIMING", "1");
     // These tests assert island-engagement STATISTICS; an ambient
     // XEZIM_JIT=1 would route the same blocks to the native backend
     // (checksums stay right, the island counters read zero).
@@ -89,7 +95,10 @@ fn signed_literals_shifts_and_const_add_lower() {
     let off = run(SHIFT_ADD_DUT, false);
     // Reference-verified for this stimulus.
     assert!(on.contains("CSUM=00007dfc"), "checksum changed:\n{on}");
-    assert!(off.contains("CSUM=00007dfc"), "4-state checksum changed:\n{off}");
+    assert!(
+        off.contains("CSUM=00007dfc"),
+        "4-state checksum changed:\n{off}"
+    );
     assert!(
         evals(&on) > 500,
         "islands did not engage on shift/const-add bodies (evals={}):\n{on}",

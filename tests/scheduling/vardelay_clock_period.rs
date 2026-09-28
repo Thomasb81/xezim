@@ -108,5 +108,8 @@ endmodule
         .iter()
         .find_map(|m| m.strip_prefix("edges=").and_then(|s| s.parse().ok()))
         .expect("edges= line");
-    assert!((18..=22).contains(&e), "constant clock rate wrong: edges={e}");
+    assert!(
+        (18..=22).contains(&e),
+        "constant clock rate wrong: edges={e}"
+    );
 }

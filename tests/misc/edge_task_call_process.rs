@@ -11,8 +11,11 @@
 use std::process::Command;
 
 fn run_default(src: &str, tag: &str) -> String {
-    let dir =
-        std::env::temp_dir().join(format!("xezim_edge_taskcall_{}_{}", tag, std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "xezim_edge_taskcall_{}_{}",
+        tag,
+        std::process::id()
+    ));
     let _ = std::fs::create_dir_all(&dir);
     let f = dir.join("t.sv");
     std::fs::write(&f, src).unwrap();

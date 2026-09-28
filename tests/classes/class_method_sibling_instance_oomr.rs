@@ -17,7 +17,10 @@ fn messages(src: &str) -> Vec<String> {
 
 fn expect(msgs: &[String], wants: &[&str]) {
     for want in wants {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
 }
 

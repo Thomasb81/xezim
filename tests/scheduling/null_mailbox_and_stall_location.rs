@@ -166,10 +166,10 @@ endmodule
 }
 
 /// An `\`include` shifts every following line in the preprocessed text. The
-/// reported number must be flagged as post-expansion rather than silently
-/// naming a line the file does not have.
+/// report must still name the line (and column) in the file itself, not a
+/// post-expansion number the file does not have.
 #[test]
-fn stall_line_past_end_of_file_is_flagged_as_preprocessed() {
+fn stall_line_after_an_include_names_the_real_line() {
     let filler = "// filler\n".repeat(3000);
     let top = r#"`include "big.svh"
 module top;
@@ -186,8 +186,8 @@ endmodule
     }
     assert!(out.contains("STALLED"), "got:\n{out}");
     assert!(
-        out.contains("preprocessed line"),
-        "a line past the end of the file must be flagged; got:\n{out}"
+        out.contains("t.sv:5:10 ") && !out.contains("preprocessed line"),
+        "the stall must be located in t.sv itself; got:\n{out}"
     );
     assert!(
         out.contains("its source:") && out.contains("forever"),

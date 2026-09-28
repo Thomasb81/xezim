@@ -54,5 +54,9 @@ fn param_const_eval_contexts() {
     // prints 6 — a display-context divergence noted in debug_notes,
     // deliberately not matched here. r_dyn is an int assignment, where
     // 3-bit signed 110 sign-extends to -2.
-    assert_eq!(u(&sim, "r_dyn") as u32 as i32, -2, "AW'(6) signed narrowing");
+    assert_eq!(
+        u(&sim, "r_dyn") as u32 as i32,
+        -2,
+        "AW'(6) signed narrowing"
+    );
 }

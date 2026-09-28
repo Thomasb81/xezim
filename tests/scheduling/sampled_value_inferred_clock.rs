@@ -55,7 +55,11 @@ endmodule
     let sim = simulate(src, 200).expect("simulate failed");
     assert_eq!(u(&sim, "n_rose"), 1, "$rose fires once");
     assert_eq!(u(&sim, "n_fell"), 1, "$fell fires once");
-    assert_eq!(u(&sim, "n_stable"), 2, "and $stable is not simply always true");
+    assert_eq!(
+        u(&sim, "n_stable"),
+        2,
+        "and $stable is not simply always true"
+    );
 }
 
 /// A NEGEDGE block infers its own edge, and `$past` supports a depth.
@@ -106,5 +110,9 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
-    assert_eq!(u(&sim, "xr"), 1, "an explicit clocking argument still resolves");
+    assert_eq!(
+        u(&sim, "xr"),
+        1,
+        "an explicit clocking argument still resolves"
+    );
 }

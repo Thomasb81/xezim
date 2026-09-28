@@ -75,7 +75,11 @@ endmodule
     assert_eq!(u(&sim, "l127"), 127);
     assert_eq!(u(&sim, "l128"), 128);
     assert_eq!(u(&sim, "l129"), 129, "129th char must not be dropped");
-    assert_eq!(u(&sim, "first_129"), b'e' as u64, "\"echo\" must not become \"cho\"");
+    assert_eq!(
+        u(&sim, "first_129"),
+        b'e' as u64,
+        "\"echo\" must not become \"cho\""
+    );
 }
 
 /// The guards: a non-string local still fits to its declared width, and a

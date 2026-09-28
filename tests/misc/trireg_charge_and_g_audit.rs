@@ -44,9 +44,17 @@ endmodule
     let sim = simulate(src, 100).expect("simulate failed");
     assert_eq!(line(&sim, "A="), "A=[xxxx]", "never-driven trireg reads x");
     assert_eq!(line(&sim, "B="), "B=[1010][0]");
-    assert_eq!(line(&sim, "C="), "C=[1010][0]", "charge holds when all drivers go z");
+    assert_eq!(
+        line(&sim, "C="),
+        "C=[1010][0]",
+        "charge holds when all drivers go z"
+    );
     assert_eq!(line(&sim, "D="), "D=[0101]");
-    assert_eq!(line(&sim, "E="), "E=[0101]", "charge tracks the new driven value");
+    assert_eq!(
+        line(&sim, "E="),
+        "E=[0101]",
+        "charge tracks the new driven value"
+    );
 }
 
 /// Reference: 8 / 8 / 16.

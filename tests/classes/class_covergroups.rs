@@ -64,7 +64,13 @@ fn run(jit: bool) -> String {
     let sv = dir.join(if jit { "t_jit.sv" } else { "t_default.sv" });
     std::fs::write(&sv, DESIGN).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
-    cmd.args(["--simulate", "-s", "top", "--no-cache", sv.to_str().unwrap()]);
+    cmd.args([
+        "--simulate",
+        "-s",
+        "top",
+        "--no-cache",
+        sv.to_str().unwrap(),
+    ]);
     if jit {
         cmd.env("XEZIM_JIT", "1");
     }
@@ -89,8 +95,11 @@ fn check(text: &str) {
         assert!(text.contains(want), "missing `{want}`:\n{text}");
     }
     // Five covergroup types (base::cg 12.5, ext::cg 25, withargs::cg 12.5,
-    // mcg 100, ocg 50): $get_coverage is their mean.
-    assert!(text.contains("GLOBAL 40.0"), "global coverage:\n{text}");
+    // mcg 100, ocg 50): $get_coverage is their mean weighted by each type's
+    // `type_option.weight` — ocg's is set to 5, so (12.5+25+12.5+100+5*50)/9.
+    // (This line used to expect the unweighted 40.0, which is not what the
+    // reference simulator prints.)
+    assert!(text.contains("GLOBAL 44.4"), "global coverage:\n{text}");
 }
 
 #[test]

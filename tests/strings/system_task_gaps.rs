@@ -37,9 +37,21 @@ endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
     let warned = sim.warned_system_task_names();
-    assert!(warned.contains(&"$bogus_task".to_string()), "warned: {:?}", warned);
-    assert!(warned.contains(&"$bogus_func".to_string()), "warned: {:?}", warned);
-    assert!(warned.contains(&"$another_missing".to_string()), "warned: {:?}", warned);
+    assert!(
+        warned.contains(&"$bogus_task".to_string()),
+        "warned: {:?}",
+        warned
+    );
+    assert!(
+        warned.contains(&"$bogus_func".to_string()),
+        "warned: {:?}",
+        warned
+    );
+    assert!(
+        warned.contains(&"$another_missing".to_string()),
+        "warned: {:?}",
+        warned
+    );
     // unknown function returns 0, does not abort simulation
     assert_eq!(u(&sim, "n"), 0);
 }
@@ -61,8 +73,16 @@ endmodule
     let sim = simulate(src, 1000).expect("simulate failed");
     let outs: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
     assert!(outs.contains(&"before"), "outs: {:?}", outs);
-    assert!(!outs.contains(&"after"), "$exit must stop the process: {:?}", outs);
-    assert!(!outs.contains(&"late"), "$exit must end simulation: {:?}", outs);
+    assert!(
+        !outs.contains(&"after"),
+        "$exit must stop the process: {:?}",
+        outs
+    );
+    assert!(
+        !outs.contains(&"late"),
+        "$exit must end simulation: {:?}",
+        outs
+    );
     assert!(sim.warned_system_task_names().is_empty());
 }
 
@@ -147,9 +167,16 @@ endmodule
     assert_eq!(u(&sim, "n1"), 2);
     assert_eq!(u(&sim, "r16"), 0x0102);
     assert_eq!(u(&sim, "n2"), 4);
-    assert_eq!((u(&sim, "m0"), u(&sim, "m1"), u(&sim, "m2"), u(&sim, "m3")), (3, 4, 5, 6));
+    assert_eq!(
+        (u(&sim, "m0"), u(&sim, "m1"), u(&sim, "m2"), u(&sim, "m3")),
+        (3, 4, 5, 6)
+    );
     assert_eq!(u(&sim, "n3"), 2);
-    assert_eq!(u(&sim, "w12"), 0x708, "12-bit dest keeps low 12 bits of 0x0708");
+    assert_eq!(
+        u(&sim, "w12"),
+        0x708,
+        "12-bit dest keeps low 12 bits of 0x0708"
+    );
     assert_eq!(u(&sim, "n4"), 2);
     assert_eq!(u(&sim, "r16b"), 0xAABB);
     assert_eq!(u(&sim, "n5"), 0, "EOF returns 0");
@@ -196,13 +223,77 @@ module tb;
   end
 endmodule
 "#;
-    let with = tpl.replace("ANNOTATE", &format!("$sdf_annotate(\"{}\");", sdf.display()));
+    let with = tpl.replace(
+        "ANNOTATE",
+        &format!("$sdf_annotate(\"{}\");", sdf.display()),
+    );
     let sim = simulate(&with, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "mid") & 1, 0, "IOPATH delay must postpone y past t=13");
+    assert_eq!(
+        u(&sim, "mid") & 1,
+        0,
+        "IOPATH delay must postpone y past t=13"
+    );
     assert_eq!(u(&sim, "fin") & 1, 1);
     let without = tpl.replace("ANNOTATE", "");
     let sim2 = simulate(&without, 1000).expect("simulate failed");
-    assert_eq!(u(&sim2, "mid") & 1, 1, "without annotation y updates immediately");
+    assert_eq!(
+        u(&sim2, "mid") & 1,
+        1,
+        "without annotation y updates immediately"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// SDF values count in the SDF TIMESCALE and scale to the simulation tick:
+/// in a 1ns/1ps design the 5 ns IOPATH is 5000 ticks, not 5 (it used to be
+/// scaled as if the tick were always 1 ns). The reference simulator reads
+/// the same file as mid=0 fin=1.
+#[test]
+fn sdf_annotate_scales_to_the_simulation_tick() {
+    let dir = std::env::temp_dir().join(format!("xezim_sdf_ps_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sdf = dir.join("t.sdf");
+    std::fs::write(
+        &sdf,
+        r#"(DELAYFILE
+  (SDFVERSION "3.0")
+  (TIMESCALE 1ns)
+  (CELL (CELLTYPE "andcell") (INSTANCE u1)
+    (DELAY (ABSOLUTE (IOPATH a y (5.0:5.0:5.0) (5.0:5.0:5.0))
+                     (IOPATH b y (5.0:5.0:5.0) (5.0:5.0:5.0)))))
+)
+"#,
+    )
+    .unwrap();
+    let src = format!(
+        r#"
+`timescale 1ns/1ps
+module andcell(input a, input b, output y);
+  assign y = a & b;
+  specify (a => y) = 0; (b => y) = 0; endspecify
+endmodule
+module tb;
+  reg a, b; wire y;
+  reg mid, fin;
+  andcell u1(.a(a), .b(b), .y(y));
+  initial begin
+    $sdf_annotate("{}");
+    a = 1; b = 0;
+    #10 b = 1;
+    #3  mid = y;
+    #10 fin = y;
+  end
+endmodule
+"#,
+        sdf.display()
+    );
+    let sim = simulate(&src, 100_000).expect("simulate failed");
+    assert_eq!(
+        u(&sim, "mid") & 1,
+        0,
+        "5 ns IOPATH must postpone y past t=13"
+    );
+    assert_eq!(u(&sim, "fin") & 1, 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -225,7 +316,10 @@ endmodule
         .or_else(|| sim.get_signal("done"))
         .and_then(|v| v.to_u64())
         .unwrap_or(0);
-    assert_ne!(done, 1, "simulation must stop before #1 after a missing SDF file");
+    assert_ne!(
+        done, 1,
+        "simulation must stop before #1 after a missing SDF file"
+    );
 }
 
 // ---------------------------------------------------------------- group 6
@@ -259,7 +353,9 @@ endmodule
     let meta = std::fs::metadata(&fst).expect(".fsdb path must be rewritten to .fst");
     assert!(meta.len() > 0, "FST dump must not be empty");
     assert!(
-        sim.warned_system_task_names().iter().any(|n| n.contains("$fsdbDump")),
+        sim.warned_system_task_names()
+            .iter()
+            .any(|n| n.contains("$fsdbDump")),
         "one fsdb mapping note must be recorded"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -293,7 +389,8 @@ endmodule
     assert!(text.contains("$enddefinitions"), "VCD must have a header");
     assert!(text.contains("#5"), "VCD must record changes while on");
     assert!(
-        sim.warned_system_task_names().contains(&"$vcdpluson".to_string()),
+        sim.warned_system_task_names()
+            .contains(&"$vcdpluson".to_string()),
         "one vcdplus mapping note must be recorded"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -335,10 +432,24 @@ endmodule
     assert_eq!(u(&sim, "m0"), 0x5A, "$sreadmemh leaves memory unchanged");
     let warned = sim.warned_system_task_names();
     for name in [
-        "$asserton", "$assertoff", "$assertkill", "$save", "$restart",
-        "$sreadmemh", "$countdrivers", "$key", "$log", "$list", "$getpattern",
+        "$asserton",
+        "$assertoff",
+        "$assertkill",
+        "$save",
+        "$restart",
+        "$sreadmemh",
+        "$countdrivers",
+        "$key",
+        "$log",
+        "$list",
+        "$getpattern",
     ] {
-        assert!(warned.contains(&name.to_string()), "missing stub warning for {}: {:?}", name, warned);
+        assert!(
+            warned.contains(&name.to_string()),
+            "missing stub warning for {}: {:?}",
+            name,
+            warned
+        );
     }
 }
 
@@ -390,9 +501,22 @@ end endmodule
         1000,
     )
     .expect("simulate");
-    let joined: String = sim.output.iter().map(|o| o.message.clone()).collect::<Vec<_>>().join("\n");
-    assert!(joined.contains("SEED_OK"), "$srandom(42) must reproduce the stream:\n{}", joined);
-    assert!(joined.contains("STATE_OK"), "get/set_randstate must round-trip:\n{}", joined);
+    let joined: String = sim
+        .output
+        .iter()
+        .map(|o| o.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("SEED_OK"),
+        "$srandom(42) must reproduce the stream:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("STATE_OK"),
+        "get/set_randstate must round-trip:\n{}",
+        joined
+    );
 }
 
 /// SDF back-annotation must OVERRIDE a specify path delay (SDF standard), and
@@ -434,14 +558,28 @@ fn sdf_annotation_overrides_specify_and_paths_agree() {
             .arg(&sv)
             .output()
             .expect("run");
-        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
     };
     // SDF (5) overrides specify (8): edge at t=6, so y=1 at t=7.
     let with_sdf = run(&["--sdf", sdf.to_str().unwrap()]);
-    assert!(with_sdf.contains("T7 y=1"), "SDF must override specify:\n{}", with_sdf);
-    // Specify-only (no SDF): edge at t=9, so y=0 at t=7.
+    assert!(
+        with_sdf.contains("T7 y=1"),
+        "SDF must override specify:\n{}",
+        with_sdf
+    );
+    // Specify-only (no SDF): edge at t=9, and the time-0 x->0 change waits
+    // for the path delay as well, so y is still x at t=7 (as the reference
+    // simulator prints).
     let no_sdf = run(&[]);
-    assert!(no_sdf.contains("T7 y=0"), "specify-only timing must be unchanged:\n{}", no_sdf);
+    assert!(
+        no_sdf.contains("T7 y=x"),
+        "specify-only timing must be unchanged:\n{}",
+        no_sdf
+    );
 }
 
 /// §20.5: $bitstoreal must reinterpret a 64-bit pattern as an IEEE-754 double
@@ -468,10 +606,26 @@ endmodule
         .map(|o| o.message.clone())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(joined.contains("B1 1.0000"), "$bitstoreal(0x3FF0…)=1.0:\n{}", joined);
-    assert!(joined.contains("B2 2.0000"), "$bitstoreal(0x4000…)=2.0:\n{}", joined);
-    assert!(joined.contains("RT 3ff0000000000000"), "$realtobits(1.0) bits:\n{}", joined);
-    assert!(joined.contains("ROUND 3.14159"), "round-trip must be exact:\n{}", joined);
+    assert!(
+        joined.contains("B1 1.0000"),
+        "$bitstoreal(0x3FF0…)=1.0:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("B2 2.0000"),
+        "$bitstoreal(0x4000…)=2.0:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("RT 3ff0000000000000"),
+        "$realtobits(1.0) bits:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("ROUND 3.14159"),
+        "round-trip must be exact:\n{}",
+        joined
+    );
 }
 
 /// §20.4: $itor honors the operand's sign ($itor(-5) = -5.0, not 4.29e9), and
@@ -540,14 +694,23 @@ endmodule
         .and_then(|s| s.split_whitespace().next())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    assert!(nz >= 38, "$random must vary (got {} non-zero of 40):\n{}", nz, joined);
-    assert!(neg > 0, "$random is signed — expected some negatives:\n{}", joined);
+    assert!(
+        nz >= 38,
+        "$random must vary (got {} non-zero of 40):\n{}",
+        nz,
+        joined
+    );
+    assert!(
+        neg > 0,
+        "$random is signed — expected some negatives:\n{}",
+        joined
+    );
 }
 
 // ---------------------------------------------------------------- group 8
 
 /// §20.12 assertion controls take a SCOPE argument. The field-confirmed
-/// killer: `initial begin $assertoff(0,testbench); wait(rst_l===1); 
+/// killer: `initial begin $assertoff(0,testbench); wait(rst_l===1);
 /// $asserton(0,testbench); end` failed whole-testbench elaboration with
 /// "Undeclared identifier 'testbench'".
 #[test]

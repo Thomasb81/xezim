@@ -77,7 +77,7 @@ fn value_param_resolved_not_symbolic() {
         })
         .collect::<Vec<u8>>()
         .into_iter()
-        .rev()  // string stored MSB-first: first char at the high end
+        .rev() // string stored MSB-first: first char at the high end
         .collect();
     let s = String::from_utf8_lossy(&bytes);
     assert!(

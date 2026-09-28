@@ -55,31 +55,36 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
-    let msgs: Vec<String> =
-        sim.output.iter().map(|o| o.message.clone()).collect();
+    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
         msgs.iter().any(|m| m == "RESULT const_fn=42"),
-        "package const must read 42 inside a function; got {:?}", msgs
+        "package const must read 42 inside a function; got {:?}",
+        msgs
     );
     assert!(
         msgs.iter().any(|m| m == "RESULT var_fn=100"),
-        "package variable must read 100 inside a function; got {:?}", msgs
+        "package variable must read 100 inside a function; got {:?}",
+        msgs
     );
     assert!(
         msgs.iter().any(|m| m == "RESULT param_fn=7"),
-        "package parameter inside a function; got {:?}", msgs
+        "package parameter inside a function; got {:?}",
+        msgs
     );
     assert!(
         msgs.iter().any(|m| m == "RESULT const_m=42"),
-        "package const inside a class method; got {:?}", msgs
+        "package const inside a class method; got {:?}",
+        msgs
     );
     assert!(
         msgs.iter().any(|m| m == "RESULT const_top=42"),
-        "module-scope reference unchanged; got {:?}", msgs
+        "module-scope reference unchanged; got {:?}",
+        msgs
     );
     assert!(
         msgs.iter().any(|m| m == "RESULT var_top=100"),
-        "module-scope variable unchanged; got {:?}", msgs
+        "module-scope variable unchanged; got {:?}",
+        msgs
     );
 }
 
@@ -109,14 +114,15 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
-    let msgs: Vec<String> =
-        sim.output.iter().map(|o| o.message.clone()).collect();
+    let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(
         msgs.iter().any(|m| m == "RESULT const_shadow=42"),
-        "explicit pkg::const bypasses a same-named local; got {:?}", msgs
+        "explicit pkg::const bypasses a same-named local; got {:?}",
+        msgs
     );
     assert!(
         msgs.iter().any(|m| m == "RESULT var_shadow=100"),
-        "explicit pkg::var bypasses a same-named local; got {:?}", msgs
+        "explicit pkg::var bypasses a same-named local; got {:?}",
+        msgs
     );
 }

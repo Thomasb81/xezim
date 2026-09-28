@@ -100,7 +100,9 @@ module tb;
   end
 endmodule
 "#);
-    assert!(o.contains("FN 8 8 40 40 INNER 2 2"), "function/task $bits(T) or child guard wrong:
-{o}");
+    assert!(
+        o.contains("FN 8 8 40 40 INNER 2 2"),
+        "function/task $bits(T) or child guard wrong:
+{o}"
+    );
 }
-

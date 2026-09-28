@@ -49,7 +49,11 @@ module tb;
 endmodule
 ";
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "result"), 1, "bare parameterless method name did not return its value");
+    assert_eq!(
+        u(&sim, "result"),
+        1,
+        "bare parameterless method name did not return its value"
+    );
 }
 
 /// A bare parameterless method name in an `!=` guard against an enum bitwise
@@ -84,6 +88,14 @@ module tb;
 endmodule
 ";
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "good"), 1, "bare method compared != equal enum-OR value");
-    assert_eq!(u(&sim, "bad"), 0, "bare method compared != different enum-OR value");
+    assert_eq!(
+        u(&sim, "good"),
+        1,
+        "bare method compared != equal enum-OR value"
+    );
+    assert_eq!(
+        u(&sim, "bad"),
+        0,
+        "bare method compared != different enum-OR value"
+    );
 }

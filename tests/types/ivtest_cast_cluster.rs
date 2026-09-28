@@ -18,7 +18,9 @@ fn passes(src: &str) -> bool {
     }
 }
 
-fn rejected(src: &str) -> bool { simulate(src, 100_000).is_err() }
+fn rejected(src: &str) -> bool {
+    simulate(src, 100_000).is_err()
+}
 
 #[test]
 fn group_a_implicit_cast1() {
@@ -153,7 +155,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast1 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast1 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -289,7 +294,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast2 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast2 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -425,7 +433,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast3 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast3 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -573,7 +584,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast4 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast4 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -782,7 +796,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast5 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast5 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -1067,7 +1084,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast6 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast6 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -1253,7 +1273,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast7 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast7 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -1425,7 +1448,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast8 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast8 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -1606,7 +1632,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast10 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast10 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -1767,7 +1796,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast11 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast11 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -2112,7 +2144,10 @@ end
 
 endmodule
 "#;
-    assert!(passes(SRC), "implicit_cast12 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "implicit_cast12 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -2424,7 +2459,10 @@ module test();
 
 endmodule // test
 "#;
-    assert!(passes(SRC), "sv_cast_integer must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "sv_cast_integer must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -2474,7 +2512,10 @@ module test();
 
 endmodule // test
 "#;
-    assert!(passes(SRC), "sv_cast_integer2 must print PASSED and never FAILED");
+    assert!(
+        passes(SRC),
+        "sv_cast_integer2 must print PASSED and never FAILED"
+    );
 }
 
 #[test]
@@ -2491,7 +2532,10 @@ end
 
 endmodule
 "#;
-    assert!(rejected(SRC), "br_gh130a is an illegal cast and must be rejected");
+    assert!(
+        rejected(SRC),
+        "br_gh130a is an illegal cast and must be rejected"
+    );
 }
 
 #[test]
@@ -2508,7 +2552,10 @@ end
 
 endmodule
 "#;
-    assert!(rejected(SRC), "br_gh265 is an illegal cast and must be rejected");
+    assert!(
+        rejected(SRC),
+        "br_gh265 is an illegal cast and must be rejected"
+    );
 }
 
 #[test]
@@ -2523,5 +2570,8 @@ assign enum_value = 1;
 
 endmodule
 "#;
-    assert!(rejected(SRC), "br_gh386c is an illegal cast and must be rejected");
+    assert!(
+        rejected(SRC),
+        "br_gh386c is an illegal cast and must be rejected"
+    );
 }

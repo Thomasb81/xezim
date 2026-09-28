@@ -59,10 +59,26 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!((u(&sim, "lx"), u(&sim, "ly")), (10, 20), "body-local struct");
-    assert_eq!((u(&sim, "ax"), u(&sim, "ay")), (10, 20), "ANSI struct formal");
-    assert_eq!((u(&sim, "nx"), u(&sim, "ny")), (10, 20), "non-ANSI struct formal");
-    assert_eq!(u(&sim, "bits_ansi"), 40, "whole-value width was always right");
+    assert_eq!(
+        (u(&sim, "lx"), u(&sim, "ly")),
+        (10, 20),
+        "body-local struct"
+    );
+    assert_eq!(
+        (u(&sim, "ax"), u(&sim, "ay")),
+        (10, 20),
+        "ANSI struct formal"
+    );
+    assert_eq!(
+        (u(&sim, "nx"), u(&sim, "ny")),
+        (10, 20),
+        "non-ANSI struct formal"
+    );
+    assert_eq!(
+        u(&sim, "bits_ansi"),
+        40,
+        "whole-value width was always right"
+    );
 }
 
 /// A typedef of a packed array: element selects, in module scope, as an
@@ -128,6 +144,10 @@ endmodule
     assert_eq!(u(&sim, "w_arr"), 32);
     assert_eq!(u(&sim, "w_arr_sel"), 16, "element is the struct, not a bit");
     assert_eq!(u(&sim, "w_nested"), 64);
-    assert_eq!(u(&sim, "w_nested_sel"), 32, "outer select keeps the sub-array");
+    assert_eq!(
+        u(&sim, "w_nested_sel"),
+        32,
+        "outer select keeps the sub-array"
+    );
     assert_eq!(u(&sim, "w_nested_sel2"), 16);
 }

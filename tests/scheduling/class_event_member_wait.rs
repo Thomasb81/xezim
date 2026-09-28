@@ -81,9 +81,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "t_direct"), 10, "@(direct.ev) parks until ->direct.ev");
-    assert_eq!(u(&sim, "t_by_obj"), 20, "@(by_obj[k].ev): assoc keyed by class handle");
-    assert_eq!(u(&sim, "t_by_int"), 30, "@(by_int[7].ev): assoc keyed by int");
+    assert_eq!(
+        u(&sim, "t_direct"),
+        10,
+        "@(direct.ev) parks until ->direct.ev"
+    );
+    assert_eq!(
+        u(&sim, "t_by_obj"),
+        20,
+        "@(by_obj[k].ev): assoc keyed by class handle"
+    );
+    assert_eq!(
+        u(&sim, "t_by_int"),
+        30,
+        "@(by_int[7].ev): assoc keyed by int"
+    );
     assert_eq!(u(&sim, "t_queue"), 40, "@(q[0].ev): queue element");
 }
 
@@ -141,8 +153,16 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "t_direct"), 10, "->>direct.ev flushes in the NBA region");
-    assert_eq!(u(&sim, "t_by_obj"), 20, "->>by_obj[k].ev: instance trigger alone must flush");
+    assert_eq!(
+        u(&sim, "t_direct"),
+        10,
+        "->>direct.ev flushes in the NBA region"
+    );
+    assert_eq!(
+        u(&sim, "t_by_obj"),
+        20,
+        "->>by_obj[k].ev: instance trigger alone must flush"
+    );
     assert_eq!(u(&sim, "t_queue"), 30, "->>q[0].ev: queue element");
 }
 
@@ -203,5 +223,9 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "woke_at"), 10, "the @ parks until the drop trigger (reference: 10)");
+    assert_eq!(
+        u(&sim, "woke_at"),
+        10,
+        "the @ parks until the drop trigger (reference: 10)"
+    );
 }

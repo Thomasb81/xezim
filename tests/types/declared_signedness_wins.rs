@@ -64,9 +64,17 @@ endmodule
     assert_eq!(u(&sim, "gt_u"), 1, "int unsigned holds 4294967295");
     assert_eq!(u(&sim, "gt_s"), 0, "a signed int is still negative");
     assert_eq!(u(&sim, "gt_b"), 1, "bit [15:0] holds 65535");
-    assert_eq!(u(&sim, "gt_l"), 0, "an explicitly signed vector stays signed");
+    assert_eq!(
+        u(&sim, "gt_l"),
+        0,
+        "an explicitly signed vector stays signed"
+    );
     assert_eq!(i(&sim, "add_b"), 65545, "unsigned arithmetic, not 9");
-    assert_eq!(i(&sim, "shr_u"), 2147483647, ">>> of unsigned shifts in zeros");
+    assert_eq!(
+        i(&sim, "shr_u"),
+        2147483647,
+        ">>> of unsigned shifts in zeros"
+    );
 }
 
 /// Faces 2 and 3: class properties and class method returns.
@@ -129,7 +137,11 @@ endmodule
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(i(&sim, "t_ux"), 65535);
     assert_eq!(i(&sim, "t_uy"), 65535);
-    assert_eq!(i(&sim, "t_sx"), 65535, "the untaken unsigned branch types the result");
+    assert_eq!(
+        i(&sim, "t_sx"),
+        65535,
+        "the untaken unsigned branch types the result"
+    );
     assert_eq!(i(&sim, "t_sy"), -1, "two signed branches stay signed");
 }
 

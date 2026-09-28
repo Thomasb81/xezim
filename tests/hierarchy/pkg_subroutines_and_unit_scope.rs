@@ -44,7 +44,11 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "a"), 111, "p1::get must reach p1's function");
-    assert_eq!(u(&sim, "b"), 222, "p2::get must reach p2's, not the hoisted bare one");
+    assert_eq!(
+        u(&sim, "b"),
+        222,
+        "p2::get must reach p2's, not the hoisted bare one"
+    );
     assert_eq!(u(&sim, "c"), 1);
     assert_eq!(u(&sim, "d"), 2);
 }

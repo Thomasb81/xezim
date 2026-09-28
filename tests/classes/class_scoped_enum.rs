@@ -50,10 +50,12 @@ module top;
     // module scope
     result = Base::STARTED;                  // 1
     // method scope (the previously-broken path)
-    Derived d = new();
-    result = result*10  + d.meth_val();      // 1*10 + 1     = 11
-    result = result*10  + d.meth_first();    // 11*10 + 0    = 110
-    result = result*10  + d.meth_last();     // 110*10 + 2   = 1102
+    begin
+      Derived d = new();
+      result = result*10  + d.meth_val();      // 1*10 + 1     = 11
+      result = result*10  + d.meth_first();    // 11*10 + 0    = 110
+      result = result*10  + d.meth_last();     // 110*10 + 2   = 1102
+    end
   end
 endmodule
 "#;

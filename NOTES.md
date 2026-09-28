@@ -1,0 +1,1185 @@
+# xezim technical notes
+
+Release notes, verified workloads and compliance results. The user guide
+and the development workflow are in [README.md](README.md).
+
+# What's new in 0.11
+
+### Unreleased
+
+**Correctness**
+
+* A loop variable declared in `for (int i = ...)` or `foreach (arr[k])` no
+  longer binds to a same-named variable in a child instance: the loop runs on
+  its own storage. It used to read the child's x and run zero iterations, or
+  step the child's counter. A bare name also no longer follows an earlier
+  hierarchical reference such as `u.x = 1` down into that child. (#195, from
+  PR #196 by Ganesh T S)
+
+### 0.11.0 — code coverage, reference-parity fixes, faster UVM (September 2026)
+
+**Correctness**
+
+* UVM: a blocking task called on a function result
+  (`pool.get("x").wait_trigger()`) suspends the caller;
+  `iface_array[i].handle = new` constructs the object; `$typename` of class
+  handles, `this` and class typedefs prints `class [pkg::]name #(params)`;
+  `std::randomize(obj.member) with {...}` works; queue and dynamic-array
+  locals of class methods are per call; 2-state class properties and
+  struct members drop X/Z on assignment (UVM register reads of a status
+  field returned X); inline constraints tying rand sub-objects together
+  are solved jointly; parked `wait(cond)` statements re-check only when a
+  name they read changes; SIGTERM and Ctrl-C end a run stuck in a
+  constraint solve within 5 s.
+* The `--features jit` build compiles again.
+* Functional coverage: covergroups work in instantiated modules,
+  interfaces, packages, file scope, multi-top designs and classes declared
+  in modules (each module instance gets its own covergroup, named `u0.cg`
+  in `xezim_cov.json`). Cross bodies support `binsof`, `intersect`, `!`,
+  `&&`, `||`, `with` and cross `ignore_bins`/`illegal_bins`; `bins x[N]`,
+  transition sets, lists and repetitions work; `option.at_least` applies to
+  automatic and cross bins; `@(clk iff en)` and named-event sampling work;
+  `cg_type::get_coverage()`, `(covered, total)`, `start()`/`stop()` and
+  `cg.option.<name>` reads are supported; `illegal_bins` hits are errors
+  (counted by `--error-exit`); unlabeled coverpoints are named after their
+  variable; `cover sequence` counts every match; and assertion entries in
+  `xezim_cov.json` carry `file` and `line`. Coverage numbers match the
+  reference simulator. See docs/coverage-guide.md.
+* UVM examples that hung now finish: a clock generator on an interface
+  member (`BUS.clk`) toggles its own signal; a non-root module drives
+  members of its own interface array (`assign INT[0].irq = ...`); class
+  handles in child instances start as null; `semaphore s = new(N)` as a
+  class member gets N keys; `new` through a typedef of a parameterized
+  class builds that specialization (UVM transaction event pools);
+  a redeclared base-class property keeps its own initializer; fixed-size
+  arrays declared in class methods are separate per call; a class
+  property takes precedence over a same-named module signal; and
+  `randomize() with {}` constraints on members of nested rand objects
+  (register-model fields) are solved.
+* sv-tests: 98.9% pass (from 97.6%). Strict checks reject malformed UDP
+  table rows, duplicate non-ANSI subroutine port declarations, constructor
+  body port declarations, end labels on unnamed blocks, `#([7:0] A)` without
+  `parameter`, `for (var [7:0] i ...)`, `void'` of a non-call, mixed
+  positional and named connections, inout port defaults, generate loops
+  without a genvar, self and generate-local `defparam` targets, and more;
+  non-ANSI port expressions (`.b(a[2:1])`, `{a, b}`) are supported, and a
+  ranged non-ANSI subroutine port redeclared as a `reg` is one port.
+* `obj.randomize() with {...}` binds names in the object first and then in
+  the calling scope (§18.7): caller locals, inherited members, array and
+  queue elements, handle members and `local::` names now work, and a
+  caller local no longer hides an object member. A receiver-less
+  `randomize() with {...}` in a class method applies its inline block.
+* Randomization semantics follow the reference simulator: `dist` weights
+  hold in coupled constraint sets (`:=` weighs every declared value, `:/`
+  the whole item), `solve a before b` picks `a` uniformly, `randomize(a,
+  b)` makes exactly the named members random (even non-`rand` ones), and
+  an `inside {[hi:lo]}` range with the bounds reversed is empty.
+* Processes waiting on a net driven by a continuous assignment (`assign
+  CLK2 = PCLK;`) resume after those waiting on its source, and waiters on
+  an interface's clock port after both, as in the reference simulator.
+  Testbenches that race on this order (the uart UVM example's modem tests)
+  now agree with it.
+* `%m` and the "Scope:" line of `$info`/`$warning`/`$error` name the
+  declaring scope (`pk.f`, `pk.C.show`, `tb.u.E.show`); generate blocks,
+  named `always` blocks and labelled assertions are scopes. Auto-detected
+  tops run in source order. A class and an interface may share a name,
+  a blocking `randcase` branch suspends its process, and package-scope
+  initializers may call `$sformatf`.
+* Absolute hierarchical writes (`tb.u.sig = v`) inside tasks, functions
+  and class methods take effect; a callee's local declaration no longer
+  changes a same-named variable's type in the caller (a signed `int` read
+  back through `inout` printed unsigned); arithmetic wider than 128 bits
+  keeps every bit; a forked package task runs as its own process;
+  `s.h = new` on a struct's class-handle member constructs it; `defparam`
+  paths resolve upward; a bare name in a class method must be visible from
+  that class (UVM 1.2's removed global `factory` is rejected, as the
+  reference simulator does).
+* sv-tests: 97.7% pass (from 94.8%). New legality checks reject what the
+  LRM forbids and the reference simulator rejects: enum, unpacked-array
+  and class-handle assignment compatibility, subroutine argument binding,
+  constant expressions in ranges/parameters/part-selects, automatic
+  variables in NBAs and procedural assigns, enum base types, packed struct
+  members, net output ports, replication counts and casting sizes, gate
+  terminal counts, package exports and scoped names, and parameter
+  overrides. Parser: min:typ:max delays, `and #6 (q, a, b)`, net
+  declaration delays after the data type, nameless UDP instances,
+  `this.super.x`, and `begin_keywords "1364-2001-noconfig"`.
+* UVM 1800.2 (2020.3) DPI: `uvm_re_comp`/`uvm_re_exec`/`uvm_re_compexec`/
+  `uvm_re_deglobbed` follow UVM's C code, and `uvm_hdl_signal_size` and
+  the `uvm_polling_*` value-change API are built in. UVM testbenches
+  compiled without `UVM_NO_DPI` used to abort at time 0 on unresolved
+  regex symbols.
+* An `inout` or `output` formal passes a virtual-interface handle back to
+  its caller even when the actual was null on entry (`uvm_resource_db::
+  read_by_name` returned nothing), and a formal no longer leaks into a
+  same-named class property.
+* An unconnected 2-state `output` port of an interface or module starts at
+  0 instead of x, so a clock driven through one toggles.
+* Deferred immediate assertions (`assert #0`, `assert final`) run their
+  action blocks at the end of the time slot; a report whose process
+  resumes first is dropped, and one still pending at `$finish` prints a
+  note instead.
+* A path-delayed output also delays its first change at time 0, as the
+  reference simulator does.
+* `randomize() with { ... }` over struct members is about 13x faster.
+* UVM tables print their rows: copying a whole element out of a
+  class-property collection of unpacked structs (`row = m_rows[i]`, queue,
+  dynamic, fixed or associative) gave zeros, so the topology print and
+  `sprint()` tables were blank. Such elements now copy, return, compare and
+  print with `%p` correctly, and `this.q[i].m` reads and writes them. `%s`
+  of a string member reached through a select no longer pads, `%p` of a
+  string-valued call prints the string, and `%0p` prints it unquoted.
+* Unpacked-struct locals in `initial` blocks and subroutines: member writes
+  through selects, packed-member fields and declaration initializers take
+  effect, 2-state members start at 0, and members that are arrays of
+  structs survive whole-struct assignment.
+* Time-0 activation order follows the reference simulator: depth-first
+  source order through the hierarchy, bound instances after their host's
+  own items (several binds into one host in reverse order), and `initial`
+  blocks that cannot suspend run as one group.
+* Assertions: named properties and sequences declared in sub-modules and
+  interfaces work in `assert property`, every instance of an assertion
+  interface evaluates its own assertions (only the first one did), `bind`
+  accepts interface targets by name or path, and an action block reports
+  its assertion's own scope.
+* A virtual interface can be bound to a nested interface instance by
+  hierarchical path (`a.d`, `g[0].a.d`), and tasks can be called through a
+  generate-block path.
+* UVM's DPI-C functions are built in, so `+define+UVM_NO_DPI` is optional:
+  regular expressions and globs for config_db, resource_db, factory
+  overrides and `+uvm_set_*` plusargs, the command-line processor, and the
+  `uvm_hdl_*` backdoor (read, deposit, force, release by hierarchical
+  path). A `--dpi-lib` that defines a symbol still takes precedence.
+* A second hierarchical write such as `u_sub.sig = v` went into a class
+  object instead of the signal once any class object existed (every UVM
+  testbench). 2-state variables in instantiated modules no longer hold x/z,
+  and a released net takes its drivers' value immediately.
+* Specify path delays count the declaring module's timeunit (they ran 1000x
+  short in a 1ns/1ps module). All path forms are modelled (`*>`, polarity,
+  edge-sensitive, `if`/`ifnone`, 2/3/6/12-value delay lists), the delay is
+  chosen per transition and enabled path, and outputs reject pulses
+  narrower than the delay. SDF IOPATH still overrides them.
+* Identifiers declared nowhere in the design are an error inside task,
+  function, class-method, package, interface and program bodies, as they
+  already were elsewhere.
+* Untyped parameters take the width and signedness of their initializer
+  (`localparam C = {8'h1, 8'h2}` is 16 bits, `{4{B}}` and string literals
+  keep all their bits, `parameter unsigned P = 5` is unsigned). A `string`
+  parameter prints with `%s` like a string variable.
+* Several tops each act as their own root: the internal wrapper name no
+  longer appears in `%m`, messages, VPI or VCD/FST/XTrace scopes, a
+  `defparam` path may start at a top, and `$bits(<type>)` in a child
+  instance uses that instance's parameters.
+* From the sv-tests suite (now 94.8%): `` `include `` of a function-like
+  macro expands fully; paren-less `aa.size` counts entries; `item.index`
+  works in locator `with` clauses; `repeat` rounds a real count; `expect`
+  blocks until its attempt finishes; `= @ev rhs` without parentheses waits;
+  input port defaults use the instance's own parameters; subroutines in
+  labelled generate branches resolve; `$bits` of a class type parameter
+  works in class constants. Strict mode rejects a second or mis-sized
+  non-ANSI port redeclaration, `specparam`/module declarations inside
+  generate blocks, class/string/chandle/event nets, and an unqualified
+  interface-class typedef used by an implementing class.
+* Casts evaluate their operand at the cast type's width (IEEE 1800-2017
+  §6.24.1): `int'(a + b)` over 8-bit operands is 300, not 44. This holds
+  in procedural code, continuous assigns, constants, packed dimensions and
+  constraints; `signed'`/`unsigned'` keep the operand's own width.
+  `pkg::T'(x)` casts are no longer dropped, and interpreted `/` and `%`
+  size by both operands (`(a + b) / 3` gave 14 instead of 100).
+* Typed parameters use their declared width as the context of their value
+  (`localparam int P = A + B`), and module header parameters keep their
+  declared signedness (`parameter bit [7:0] P = 200` read -56).
+* Reductions and sorts with a `with` clause work on class properties
+  (`o.arr.sum() with (item * 2)`, `this.arr`, `objs[i].arr`), and
+  associative arrays reduce over their keys (`aa.sum()` returned 0).
+* Associative-array elements follow their declared type: a missing key
+  reads 0 for `int` and x for `integer`/`logic` (function and task locals
+  read a 1-bit x), stores take the element's signedness, and `++`/`--`
+  keep the operand's signedness (`seen[k]++` on a new key gave x).
+* Specify-block timing checks are modelled: `$setup`, `$hold`,
+  `$setuphold`, `$recovery`, `$removal`, `$recrem`, `$skew`, `$timeskew`,
+  `$fullskew`, `$period`, `$width` and `$nochange`, with edge qualifiers,
+  `&&&` conditions, notifiers (toggled in the NBA region, once per time
+  step) and negative `$setuphold`/`$recrem` limits. A violation prints one
+  `** Error: ... violation in <instance> at time <t>` line, counts toward
+  `--error-exit`, and does not stop the run. `+notimingcheck(s)` and
+  `+nospecify` disable the checks (the flag used to be a no-op), and
+  `+no_notifier` / `+no_tchk_msg` are honoured. A `specparam` declared
+  inside a specify block is now a module-scoped constant instead of being
+  dropped.
+* SDF TIMINGCHECK entries (with edges, `COND` and `INSTANCE *`)
+  back-annotate check limits through `--sdf` and `$sdf_annotate`. SDF
+  delays now scale to the simulation tick: designs with ps precision got
+  delays 1000x too short.
+* A package parameter takes its signedness from its declared type:
+  `parameter bit B = 1` is 1, not -1, and a ranged untyped package
+  parameter takes the declared range's width. The apb AVIP never built its
+  master driver because of this.
+* A task of an interface or module instance, called in a `forever` loop
+  through a virtual interface or a hierarchical path, keeps running. The
+  loop used to stop silently or with a false "null receiver" error.
+* Clock generators keep first-in-first-out order with the other events of
+  their time slot: a `#delay` scheduled after the generator's previous
+  toggle resumes after this one. A reset asserted and released around a
+  clock edge now spans that edge as it does in the reference simulator.
+* A one-element array of instances (`bus_if b[1]`) has its element `b[0]`.
+* `@(cb)` for a clocking block declared in a module or interface instance
+  waits for the block's clock inside that instance's tasks and processes
+  instead of returning at once.
+* `randomize()` solves constraint sets that tie many variables together:
+  an array `sum()` (including `with (... item.index ...)`), `unique`,
+  orderings between elements or arrays, and `->`/`if` around them. When
+  the per-variable solver fails, a bounded joint search takes over.
+  Infeasible sets of this kind return 0 promptly and leave the random
+  variables, array elements included, unchanged. Sums such as
+  `a + b + c == K` compare at the full context width instead of wrapping
+  at the operand width. A random size variable tied to `arr.size()` is no
+  longer pinned to the previous size, and `item.index` reads the element
+  index inside reduction `with` clauses.
+* String methods on a subroutine formal or local (`name.len()`,
+  `name.getc(i)`, `name.substr(i, j)`) read that variable, not a same-named
+  signal of some design instance (an interface's `string name`). UVM's
+  resource-name check read the wrong string, so its `UVM/RSRC/NOREGEX`
+  warning never fired on testbenches with such interfaces.
+* A module or interface task reached through a virtual interface or a
+  hierarchical path resolves names in its own scope. Called from a class
+  method, an unqualified call in its body used to bind to the calling
+  class's method of the same name — which is how `uvm_info` inside a BFM
+  task was attributed to the calling component instead of the global
+  reporter.
+* Covergroup coverage numbers match the LRM: `ignore_bins` and
+  `illegal_bins` values are excluded from array and automatic bins; an
+  automatic cross has the product of its coverpoints' bins (not of their
+  value ranges); a crossed variable without a coverpoint is an implicit
+  coverpoint that is sampled and counts in the group; `cg.cp.get_coverage()`
+  and `cg.cp.get_inst_coverage()` report that coverpoint or cross (they
+  returned the group's number); type coverage averages the instances unless
+  `type_option.merge_instances` is set; `$get_coverage` weights each type by
+  its `type_option.weight`; a `ref` constructor formal reads its actual at
+  every sample; bin bounds may be expressions of constructor formals.
+* A concurrent assertion clocked by an event without an edge (`@(clk)`, or
+  `@clk` on a checker's event formal) samples on every change of the clock,
+  as §9.4.2 defines; it used to sample on the rising edge only.
+* A checker's event formal accepts an edge actual (`chk u(v, posedge clk)`),
+  which used to be a parse error, and the checker's assertions clock on
+  that edge.
+* A declaration after a statement in a `begin`-`end` or `fork`-`join` block
+  or a subroutine body is rejected (§9.3.1); `--no-strict` still accepts it.
+* A replication whose count is a signed constant expression is read as
+  signed: `{$bits(T) - 1{1'b1}}` in a type-parameterized class whose type
+  parameter is unresolved replicates nothing instead of wrapping to about
+  four billion copies, which never finished elaborating. Specializations
+  keep their widths (`int` gives 31 ones, `byte` gives 7).
+* `mailbox` and `semaphore` objects are constructed by every form of
+  `new`: a parenthesis-less `mailbox mb = new;` or `mb = new;`, and a
+  declaration inside a block (`automatic mailbox #(int) mb = new(2);`,
+  `automatic semaphore s = new(1);`). These left the mailbox null (the run
+  stopped at "null mailbox handle") or the semaphore without its keys.
+* Reading an unpacked-array element with an out-of-range index yields x at
+  the element's width (§7.4.6). Three paths produced a 1-bit x that the
+  store then zero-extended to `0000000X`: the fused memory-read flop
+  (`q <= mem[i]`), a blocking read in a process (`a = mem[i]`) and the same
+  read through a task output. Combinational reads were already right.
+* Selecting from a class property inside an `always` block or an `assign`
+  reads the property instead of zero. `bk.arr[i]`, `bk.arr[3][0]` and
+  `bk.arr[i][3:0]` asked the interpreter for `bk.arr` alone, which is an
+  array and does not reduce to one number, and then selected from that
+  number; an accumulator fed by `bk.arr[i]` stayed at 0 while `$display` of
+  the same expression printed the right element.
+
+**Usability**
+
+* Code coverage: `--code-coverage[=stmt,branch,toggle]` (all three by
+  default), `--code-coverage-scope=<path>[,...]` and `XEZIM_CODE_COVERAGE`
+  turn on statement, branch (if/else and case arms including the implicit
+  ones, `?:`) and toggle (per-bit rise/fall) coverage; `+cover[=sbt]` and
+  `-coverage` now enable it too. Results go in `xezim_cov.json` under
+  `code_coverage`, per instance and per design unit, with a per-scope
+  summary under `--verbose`. It is off by default and costs nothing when
+  off. See docs/coverage-guide.md.
+* `$fwrite`/`$fdisplay` to regular files are buffered (64 KB per handle)
+  and flushed on `$fflush`, `$fclose`, `$finish`, `$system`, `$fopen`,
+  `$readmem*`/`$writemem*`, DPI/VPI calls and before any read of the same
+  file; a 400k-line trace testbench went from 1.78 s to 1.15 s. A
+  `tail -f` on a trace file now lags until the next flush.
+* The default simulation time limit is 100 ms instead of 100 µs, so UVM
+  tests that run for milliseconds (for example 2–25 ms of simulated time)
+  finish instead of stopping early. A design that never calls `$finish`
+  still stops at the limit; `--max-time` sets a different one, and
+  `-do "run -all"` runs until `$finish`.
+* Command lines written for other simulators run as-is: bare or `work.`
+  top names, `-F`, `-g`/`-G` parameter overrides, `-sv_seed`,
+  `-sv_lib`/`-sv_root`, `-svNNcompat`, and a `-do` subset (`run -all`,
+  `run <time>`, `quit`, `exit`, `do <file>`; `log`, `add wave` and
+  `coverage save/report` are accepted with a warning; anything else is an
+  error). Library options (`-work`, `-L`, `-lib`) are ignored with one
+  warning; `-c` and `-l` keep their xezim meanings. `run -all` runs past
+  the default time cap, and after `run <time>` the closing line and
+  `final` blocks see the stop time.
+* Runs are quiet by default. The transcript holds the design's output,
+  warnings and errors, and one closing line, `Simulation finished at time N
+  ($finish called)`. The version banner, `[PHASE]` timings,
+  `[PROF]`/`[FUSE]`/`[EVENT-EDGE]`/`[COV]` counters, `[CACHE]` hits and
+  `--compile`'s design summary now need `--verbose` (or `XEZIM_VERBOSE=1`,
+  `--profile` or `--sim-debug`). The apb AVIP transcript went from 189 lines
+  to 150.
+* Parse, preprocessor and elaboration errors print `file:line:col` with the
+  source line and a caret. A line that came from an `include`d file names
+  that file, with an "In file included from" chain, and text produced by a
+  macro names the macro invocation. Runtime locations (hang reports,
+  port-width warnings) are no longer shifted by `include`s.
+* Preprocessor errors and warnings print once per run instead of once per
+  pass. Parser warnings, such as an unsupported UDP table, now carry their
+  location, and `` `__LINE__ `` after a multi-line `define` reports the right
+  line.
+
+**Performance** (instruction counts, output identical)
+
+* UVM class code, round three: member reads, calls, member-target
+  assignments and comparisons take direct paths, and flat names, handle
+  keys and element names are built without `format!` or clones. UVM stress
+  bench: 10.8 M -> 9.0 M host instructions per item (-17%); the six AVIPs
+  run 13-15% fewer instructions (axi4 46.6 G -> 39.8 G).
+* RTL: process FSMs resolve `<top>.path` reads (a testbench monitor ran on
+  the AST path with name lookups every clock), `check_edges` reuses its
+  fired-edge buffers, and FSM wait terms are cached: c906 CoreMark 471.5 G
+  -> 459.5 G (-2.5%), c906 memcpy -2.1%.
+* UVM class code, round two: formal snapshots by position, plain-type
+  fast paths for locals and formals, per-class property-owner indexes,
+  forward-declared classes (`typedef class X;`, 110 in UVM) on the plain
+  paths, and name-set gates in member and call lookup. UVM stress bench:
+  11.5 M -> 10.1 M host instructions per item (-12%); axi4 AVIP -6.2%.
+* c906 CoreMark -0.4% (elaboration -2.4 G): loop-feedback analysis only
+  walks reads when a write reaches a combinational block, waiter wake
+  ranks are tracked only once a nonzero rank fires, and the legality
+  checker hashes scopes faster and builds messages lazily.
+* UVM class code: name-kind checks answer from per-design name tables and
+  per-class memos, bare names read and write on direct paths, class task
+  bodies are shared instead of cloned per call, and `foreach` over
+  associative arrays uses the element index. UVM stress bench: 20.6 M ->
+  11.5 M host instructions per sequence item (-44%); the six AVIPs run
+  19-27% fewer instructions; c906 CoreMark unchanged.
+* A two-state block that reads an x or z bit no longer re-runs on the
+  four-state VM: the same lowered stream runs on an x-plane executor that
+  applies the VM's four-state rules (Kleene logic, `&&`/`||`/`!` through
+  definite-1/definite-0/unknown, ambiguous equality, all-x arithmetic,
+  plane shifts, an x selector merging its arms, `if (x)` taking the else
+  arm, an x index reading all-x and writing nothing). On the SoC
+  benchmarks three quarters of what the VM still executed were such
+  re-runs — tiny muxes whose unselected arm or an unwritten register file
+  holds x. `XEZIM_TS_X=0` restores the VM re-run; `x_plane_runs=` counts
+  them in the profile report.
+* Dynamically indexed reads of memory elements wider than 64 bits — a
+  vector register file, a cache-line array — now run on the two-state
+  executor, both as operands (`vrf[rs]` in wide logic) and as the fused
+  memory-read flop (`rdata <= line[raddr]`). They were the largest labelled
+  reason for a clocked or combinational block to stay on the four-state VM
+  on both SoC benchmarks (21% of a C910 SoC's interpreted combinational
+  evaluations, 31% of a C906's).
+* `scripts/build-pgo.sh` run without a training command builds a
+  profile-guided binary from a bundled trainer (the `tests/perf` shapes,
+  `scripts/pgo-train`, `xezim-bench`): about −0.5% host instructions on the
+  SoC benchmarks, −12% on a loop-heavy DRAM model, output identical. It is
+  the recommended release build; see README.
+* Loop-heavy clocked blocks with `int` counters — memory models that walk
+  lanes, byte-lane writes into a packed memory, per-lane write pointers —
+  now run on the two-state executor instead of the four-state VM. The
+  counter's signed tag, its increment, a slice read at a run-time offset and
+  range stores at a run-time offset (blocking and non-blocking, into
+  vectors wider than 64 bits) all lower now. A DRAM-model reproducer runs
+  in a third of the instructions.
+* Clocked blocks whose range-store bounds only become constants after
+  folding — a generate arm writing `v[g*8 +: 8]` or `mem[g][7:4]` — now
+  compile to constant range stores on the element, which the two-state
+  executor runs; the dynamic and array forms they used to take kept the
+  whole block on the four-state VM (16 such flops on a c906 SoC, 400 on a
+  C910 SoC).
+* A block that bails on an x read every time it runs (an unwritten memory
+  element it keeps reading) no longer pays the two-state entry and guard on
+  every evaluation before running interpreted: after eight bails in a row
+  it sleeps, doubling the sleep while the bails continue, and wakes for one
+  attempt so a value that clears after reset gets its fast path back. x-read
+  bails on a c906 SoC fall by 72%.
+* Combinational blocks with registers wider than 128 bits — up to 512 —
+  run on the two-state executor by default now (`XEZIM_TS_WIDE512=0`
+  restores the old behaviour). Three shapes that kept such blocks on the
+  four-state VM lower as well: a bus read and then rewritten in the same
+  block (`bus = {bus[..], ..}`), a mux between two wide values, and a
+  wide `'x` reset default (`{N{1'bx}}`). c906 memcpy runs 1.2% fewer
+  instructions from the wide class alone, a C910 SoC 2.5%.
+* `tests/perf/loop_block_counters.rs` guards this path with work-counter
+  ceilings (two-state admission, bytecode length, backoff engagement).
+* The bytecode such blocks compile to is leaner first: a loop variable's
+  reads are forwarded into their consumers instead of being copied into a
+  temporary each time, `& K`, `* K`, `- K` and `| K` fold their constant
+  operand like `+ K` already did, a constant that only becomes one after
+  folding is fused too, and `i = i + 1` is two instructions rather than
+  five. The same reproducer executes 34% fewer VM instructions before the
+  two-state gain above.
+* A clocked block whose inputs did not change may now skip an idle edge even
+  when another block writes a different part of the same register or a
+  different element of the same array. Generated logic that gives
+  `status[0]` its own `always` block beside one for `status[6:1]`, or
+  `mem[0]` beside `mem[1]`, used to keep every such block firing every
+  cycle; each owns its own bits, so all may rest. Blocks that write
+  overlapping bits, and any block beside a writer whose element index is
+  computed at run time, still fire on every edge. A C910 SoC runs 6.6% fewer
+  instructions, a c906 SoC 1.2%.
+* Writes that combine two dynamic steps into a packed vector now compile
+  instead of falling back to the interpreter: `q[i][j]`, `mem[a][(i*W) +: W]`,
+  `s.arr[i].field` and their blocking forms, with either index dynamic. A
+  fallback inside a loop over a register-held variable demotes the whole loop,
+  so these statements cost microseconds each; a memory model built from them
+  runs 41x faster here, and a c906 run is unchanged.
+* Selects whose declared dimension does not start at zero or runs ascending
+  compile instead of falling back: `v[hi:lo]`, `v[b +: w]`, `v[b -: w]` and
+  bit selects on such a vector, and on an element of a packed array. A lane
+  vector selected in a loop runs 11x faster here. An element of an UNPACKED
+  array keeps the interpreter path, where its label mapping already agrees
+  with the writes.
+* `XEZIM_FALLBACK_SITES=1` reports every construct handed to the interpreter
+  with its reason, source byte span and scope, so the statements worth
+  compiling on a slow design can be found without guessing. It now also
+  reports the expensive case, a statement that takes its whole loop to the
+  interpreter because a fallback cannot be emitted inside one.
+* Merging same-sensitivity clocked blocks no longer costs the idle-edge
+  skip. The blocks folded into a merged one keep their original statements,
+  and the skip census still counted those writes, so every merged output
+  looked like it had two drivers and the merged block was disqualified: on a
+  c906 SoC only 618 of 3605 blocks could skip, and 55 million flop fires that
+  used to be skipped ran. Merging is now worth 6.9% on that design instead of
+  costing 18%.
+* Reading an element of a packed memory no longer copies the whole memory.
+  `mem[addr]` on a `logic [N-1:0][W-1:0]` loaded every bit of `mem` into a
+  register and selected the word from that, so each read cost as much as the
+  memory is big: a 16x deeper memory cost 3x per read. The slice is taken
+  where it lies now, read cost is flat in the memory's size, and a
+  32-port read benchmark runs 42% faster.
+* Starting a design with large memories is faster again: deciding which
+  clocked blocks may skip idle edges asked a hash map, once per element of
+  every memory a block writes, whether anything else wrote it. A c906 SoC
+  spent 1.8 seconds and several hundred megabytes on 19 million of those
+  questions; one byte per signal answers them now, and whole arrays are
+  counted as ranges. The pass went from 2.8 seconds to 30 milliseconds and a
+  c906 run drops another 4%.
+* Designs with large memory arrays start simulating sooner: the pass that
+  decides which clocked blocks may skip idle edges named every element of
+  every memory a block writes, one string per element, and then read names it
+  discarded. A c906 SoC spent 33 seconds there, a second per one-million-entry
+  SRAM; that is now arithmetic on the element range, with the same skip
+  decisions. The whole run drops 36% of its instructions.
+
+# What's new in 0.10
+
+### 0.10.6 — assertion engine, instance-scoped collections, faster small testbenches (September 2026)
+
+**Correctness**
+
+* Concurrent assertions evaluate as attempts with real sequence matching
+  (issues #176–#183): a multi-cycle antecedent (`a ##1 b |-> c`) triggers on
+  its last cycle; a ranged consequent (`##[1:2] b`) fails only when the whole
+  window has passed; `not (a ##1 b)` fails only on a match; `$past` inside a
+  deferred consequent reads the previous clock cycle and returns the type's
+  default before enough history exists; `disable iff` cancels attempts in
+  flight; property `and`/`or` parse and evaluate; and `(##2 (b))` means the
+  same as `##2 b`.
+* Sequence operators that used to be accepted and ignored now evaluate:
+  repetition `s[*n]`, `s[*m:n]`, `b[->n]`, `b[=n]`; `throughout`, `within`,
+  `intersect`, sequence `and`/`or` (also inside an antecedent);
+  `first_match`; `strong(...)`/`weak(...)`, with a strong property still
+  pending at the end of simulation reported as a failure; `@(negedge clk)`
+  and `@(posedge clk iff en)` clocking events; a clockless `assert property`
+  under `default clocking`; and named sequences and properties with formal
+  arguments used inside a property body.
+* Package-qualified variables inside tasks and functions: a write such as
+  `store_pkg::scalar = d;`, `pkg::arr[i] = v;` or `pkg::v[3:0] = x;` in a
+  subroutine body was silently dropped, and a read of `pkg::arr[i]` or
+  `pkg::v[h:l]` there returned 0; both worked from an initial block.
+* `%m` inside a continuous assignment whose expression falls back to the
+  interpreter names the assignment's instance, and `$time` there scales to
+  that instance's timescale, as always-block fallbacks already did.
+* With the native compiler on (`XEZIM_JIT=1`), a `$display` or other
+  interpreted statement inside a compiled clocked block now runs under the
+  block's own instance: `%m` names the instance, bare names resolve there,
+  and `$realtime`/`%t` use its timescale. Previously such statements ran
+  under the top scope.
+* With the native compiler on, a bit-select, part-select or array element
+  read whose index or bound carries x/z now yields x across the full
+  width, and an element or part-select write with such an index modifies
+  nothing, matching the interpreter and IEEE 1800 7.4.6 / 11.5.1. The
+  native code previously zeroed the unknown bits and used the result as
+  the index.
+* A constant part-select write with a negative label (`x[4:-1] = v`,
+  `x[0:-1] <= v`) in a clocked block or compiled process keeps its in-range
+  bits (IEEE 1800 §11.5.1); the compiled path folded the bounds unsigned,
+  dropped the write, and the non-blocking form stored a bit past the MSB.
+* A non-blocking read of an array element through an index that holds x or
+  z (`q <= mem[idx]`) queues an all-x element instead of element 0, in the
+  two-state and four-state engines alike.
+* A constant part-select `[l:r]` whose bound is a variable is now an
+  elaboration error, as IEEE 1800 §11.5.1 requires; only `[base +: width]`
+  and `[base -: width]` take a variable base. Every engine previously read
+  the bound from the variable's current value.
+* Bit- and part-selects follow IEEE 1800 §11.5.1 in every engine: an
+  index or bound with an x or z bit reads x and discards the write instead of
+  using bit 0; a constant select below a vector's declared low bound reads x
+  instead of the low bits; an ascending vector (`logic [3:10] a`) places label
+  `p` at bit `10 - p` for reads and writes alike, so `a[3] = 1` sets the MSB;
+  an out-of-range or unknown element index into a packed 2-D value reads a
+  whole-x element. A part-select that is partially out of range keeps the
+  §11.5.1 per-bit form (only the out-of-range bits read x);
+  `XEZIM_OOB_SELECT=whole` makes such a select read x as a whole and
+  discards a write through it, as some simulators do.
+* An intra-assignment delay inside an edge-triggered `always` block is
+  honoured: `q <= #5 v;` schedules the update five time units out and
+  `q = #5 v;` suspends the block, as in an `initial` block. Both forms
+  previously assigned at once with no warning (#160).
+* A class property that is a fixed array of collections (`int q[2][2][$]`,
+  `int d[3][]`, `int a[2][int]`) has storage for every element: `q[i][j]`
+  accepts `push_back`, `size`, `new[n]`, `exists` and element reads and
+  writes, from inside the class and through a handle. Previously each
+  element collection was silently empty while `$size(q)` and `foreach`
+  answered off the outer shape.
+* An unpacked array parameter whose elements are assignment patterns
+  (`localparam cfg_t A [3] = '{'{4,2}, …}`) evaluates each element instead
+  of reading 0, for packed-struct, unpacked-struct and packed-vector
+  element types declared at compilation-unit scope. A constant function
+  containing `signed'(e)` or `unsigned'(e)` is now evaluated at
+  elaboration, so a `localparam` or typedef width derived from it in a
+  sub-instance is correct (it read 0, giving one-bit typedefs).
+* A continuous assignment accepts the rise/fall/turn-off delay form,
+  `assign #(rise, fall[, turnoff]) net = expr;`, and applies the delay by
+  transition as §10.3.3 specifies; a transition to x takes the smallest.
+* Collections declared in a module keep one copy per instance. Sibling
+  instances of the same module no longer share a queue, dynamic array or
+  associative array, and a packed-struct element of such a collection
+  (`q[i].field`) reads and writes correctly inside any sub-instance. A
+  UVM-style BFM with ten per-client request queues now grants requests.
+* Constrained random: without `solve … before`, the antecedent of an
+  implication is drawn in proportion to the solution space it selects, as
+  §18.5.10 requires, and the consequent's variables are drawn inside the
+  implied ranges. `solve … before` keeps the antecedent uniform.
+* VPI: `vpi_iterate(vpiPort, module)` yields port objects with name,
+  full name, direction and size for the top module and sub-instances, and
+  values read through the connected signal; nets and variables keep their
+  `vpiNet`/`vpiReg` types. `vpiPort`, `vpiPortBit`, `vpiDirection` and the
+  direction values are in `include/vpi_user.h`.
+* Write-path fixes: a bit-select write whose index is x or z modifies
+  nothing; a continuous assign with a constant right-hand side drives its
+  net in a UVM testbench; a non-blocking assignment to a packed-array
+  element through a virtual interface keeps its width; a write to a nested
+  packed-struct member (`f.hdr.d = v`) lands; elements of a class
+  unpacked-struct array read back what was written.
+* `always @(sig)` keeps firing after a write made by a process that a
+  clock edge resumed.
+* A named event or signal written by a process that a clocking block
+  resumed (`##2; -> ev;`) wakes its waiters in the same time step instead
+  of one clock toggle later.
+* A narrow actual bound to an `int`, `logic signed` or `bit signed`
+  class-method or constructor formal is extended correctly (`new(2'b10)`
+  read −2).
+* `#delay` inside a package class, a compilation-unit class, a `$unit`
+  task or function, or a `program` scales by the timescale in effect; a
+  `timeunit` declared inside a package is honoured.
+* Handle chains of any length (`w.r.c`) read correctly from a task inside a
+  sub-instance, including a task-local handle named like a sibling
+  instance.
+* Locals declared inside an instance's tasks, functions and blocks shadow
+  the module's own names.
+* `bind` with a parameter value assignment is applied; previously the
+  bound harness never existed.
+* A `ref` formal named like its actual no longer overflows the stack.
+* Class methods reach sibling module instances by hierarchical reference
+  (issue #155): `core.seq`, `core.get_seq()` and `u_w.p.peek()` work from a
+  method of a class declared inside a module.
+
+**Performance** (instruction counts, output identical)
+
+* A compiled stimulus process (the default for clocked initial-block loops)
+  now runs its wait-to-wait segments on the two-state executor: waits are
+  opcodes that suspend the executor, the process keeps its own two-state
+  register file, and a segment that reads an unknown value re-runs on the
+  four-state VM from the values it started with, backing off after repeated
+  bails. The 100k-cycle self-checking testbench: 2.20G to 2.08G
+  instructions; c906 neutral. `XEZIM_PROC_FSM_TS=0` keeps the VM.
+* Two more per-tick trims for small testbenches: the check of whether a
+  compiled stimulus process can clobber a combinational entry's outputs is
+  cached per entry, and a compiled block's two-state stream is no longer
+  reference-counted on every evaluation. The 100k-cycle self-checking
+  testbench: 2.29G to 2.20G instructions; c906 neutral.
+* A clocked block whose only uncompilable statement is a `$display`-style
+  call on a cold branch (a check macro's failing arm) now runs on the
+  two-state fast path; the interpreter is called for that one statement
+  only when it is reached. Blocks that read a signal they later overwrite
+  (`failures++`) are admitted too, with those signals restored on a bail
+  so the four-state re-run stays exact, and `'0`/`'1` fill literals lower.
+  A 100k-cycle self-checking testbench: 2.50G to 2.28G instructions;
+  c906 neutral.
+* Small clocked testbenches run about 15% fewer instructions: the per-tick
+  scratch vectors of the waiter drain, the clock generators and the
+  in-process combinational snapshot are reused instead of reallocated,
+  parked waiters that do not fire stay in place, and a compiled stimulus
+  process skips snapshotting the outputs it can never write. A 100k-cycle
+  self-checking testbench: 2.94G to 2.50G instructions, output identical;
+  c906 neutral.
+* Experimental, opt-in: `XEZIM_TS_WIDE512=1` lets the two-state path carry
+  registers up to 512 bits (the c906 vector-unit buses) instead of 128. It
+  is off by default because on c906 it costs 5% more instructions: the
+  admitted blocks read x-holding buses and fall back every evaluation.
+* A testbench's stimulus loop in an `initial` block — clocked waits,
+  blocking or non-blocking assignments, `if`/`case`, counted loops and
+  system tasks — now runs as a compiled process by default instead of on
+  the AST interpreter. A 100k-cycle self-checking testbench went from
+  2.8 s to 0.37 s. `XEZIM_PROC_FSM=0` restores the interpreter for every
+  initial block; `XEZIM_PROC_FSM=1` still compiles every body that can be.
+* The `--profile` report prints the time that fell outside combinational
+  entries and clocked blocks (interpreted processes, waiters) as its own
+  line, so a run dominated by an interpreted testbench loop no longer
+  reports 90% attributed to the little that was sampled.
+* `--profile` no longer slows the run it measures: construct times come
+  from a 10 kHz sampler thread instead of two clock reads around every
+  evaluation. On a 16k-cell gate-level DRAM the profiled simulation phase
+  went from 39% slower than an unprofiled run to about 5%; the report's
+  percentages are unchanged and its header now states the sample count.
+* Two- and three-part concatenations on the two-state fast path carry their
+  operands in the instruction, and the settle loop prefetches the header of
+  the next injected entry. C906 memcpy at 300 iterations: 2 % fewer cycles
+  across both changes, output identical.
+* A testbench loop that writes a memory through an absolute hierarchical
+  path (`tb.x_soc.<...>.ram0.mem[i][7:0] = ...`) now compiles to bytecode
+  like a local-array store. The XuanTie C910 and C906 memory-image loops
+  (2.1 million stores at time 0) run in 0.9 s instead of 2.9 s; C906
+  memcpy at 300 iterations: 7.7 % fewer instructions, output identical.
+* A successful run exits as soon as its output is complete instead of
+  first freeing the whole design; on the C910 that was 1.6 s after the
+  last line of output.
+* Statements run by the interpreter no longer scan the design's whole
+  instance list to tell an interface instance from a signal on every
+  execution; C910 memcpy at 200 iterations: 135 s -> 127 s.
+* The edge detector no longer re-baselines every edge signal after each
+  pass: under the dirty-edge scan only the signals that changed are
+  re-baselined (plus the operands of sampled-value functions), which is
+  what the scan already did for them. C906 CoreMark: 4.0 % fewer
+  instructions, output identical; UVM benchmarks unchanged.
+* `casez`/`casex` decoders compiled to a jump table now lay their wildcard
+  chains out with forward jumps only, and a `casez`/`casex` compare against
+  a constant pattern runs on the two-state fast path. The C906 instruction
+  decoders (up to 7,500 instructions each) leave the 4-state interpreter;
+  CoreMark 0.3 % fewer instructions, output identical.
+* The bytecode compiler folds constant register chains: an unrolled
+  `i = 0; bus[i] = v; i = i + 1; …` sequence (the C906 decode blocks carried
+  230 chained constant adds each) becomes static bit writes, and constants
+  nothing reads are dropped. C906 CoreMark: 5.2 % fewer instructions,
+  output identical; UVM benchmarks unchanged. `XEZIM_FOLD_CONST_REGS=0`
+  disables it.
+* The idle-edge prefilter that decides whether a clocked block runs at a
+  clock edge now reads one packed state byte per block instead of four
+  flag arrays. C906 CoreMark: 1.3 % fewer instructions, output identical.
+* Combinational blocks that write one bit or a constant-bound slice into a
+  bus wider than 64 bits (`bus[k] = v;`, `dst[63:0] = src[127:64];`, the
+  C906 decode-bus shapes) now run on the two-state fast path instead of the
+  4-state interpreter, and clocked blocks that read wide buses skip idle
+  edges in the prefilter. C906 CoreMark: 2.6 % fewer instructions on top of
+  the array-arming change, output identical; UVM benchmarks unchanged.
+* Edge-triggered blocks that read or write an unpacked array through a
+  dynamic index (register files, memories: `q <= mem[raddr]`,
+  `mem[waddr] <= d`) now take part in the idle-edge skip. Every element of
+  the array arms the block on write, so an edge with no input change is
+  skipped instead of re-executed. On the C906 CoreMark run 858 of 906
+  previously always-executed flop blocks now skip: 8.1 % fewer
+  instructions, 11 % fewer cycles. UVM benchmarks unchanged.
+* `XEZIM_CYCLE_MODE=cycle` selects the cycle-based engine (default
+  `event` is the engine as before). Its first stage evaluates the clock
+  tree eagerly at each clock-generator edge instead of through the
+  combinational worklist; on the C906 CoreMark run it converts the clocks
+  of 64 % of the edge blocks, cuts settle passes by 12 %, and produces
+  identical output for 0.4 % fewer instructions. Later stages will add
+  cycle stepping after reset with event-driven fallback.
+* The statement interpreter's three largest routines keep smaller stack
+  frames (the statement dispatcher went from 7.8 KB to 3.8 KB per nested
+  call), so a deeply nested testbench statement chain stays in cache: the
+  UVM benchmark runs about 1.7 % fewer cycles, output identical.
+* Process wake-ups are cheaper: the scheduler no longer hashes with
+  SipHash, allocates an empty continuation, or clones the process scope
+  string on every wake-up, and the timing wheel covers 4096 ticks before
+  spilling to the ordered overflow; the next event time is memoized and
+  an empty waiter list is skipped. A timed real-number model runs 26.9 %
+  fewer instructions; the UVM and CPU benchmarks are unchanged.
+* A delay-driven `always` block with a compound body, the timed
+  integration step of a real-number model, runs from compiled bytecode
+  instead of the AST interpreter: 3.8x faster per step on a fitted-lag
+  model (4.1 µs to 1.07 µs), results unchanged (#159).
+* Combinational settle passes track entries triggered mid-pass in a bitset
+  instead of a heap, array element accesses in compiled blocks resolve
+  inline, and an assignment whose value already has the target width copies
+  it directly: 5.6 % fewer instructions on the C906 CoreMark run.
+* Reads and writes from class methods no longer build a scoped name string
+  for every lookup, and virtual-interface bindings are probed without
+  allocating, an assignment no longer probes for a pending interface
+  return on every write, and the width of a plain variable target is
+  remembered per statement: 3.6 % fewer instructions on the axi4 AVIP.
+* Clocked monitor blocks that contain a rare `#delay` run compiled instead
+  of interpreted, with the same process semantics: 0.3 % fewer instructions
+  on C906 CoreMark.
+* Combinational settle passes evaluate each entry once per pass, and
+  clocked blocks with a blocking statement no longer copy their body on
+  every activation: 5.3 % fewer instructions on the C906 CoreMark run.
+* Two-state blocks check for x/z as they load: 3.6 % fewer on C906
+  CoreMark.
+* Wide values (over 64 bits) are copied, tested and resized a word at a
+  time; 128-bit concatenations and single-bit replications are built in
+  place: 20 % fewer on C906 CoreMark.
+* Faster process re-parks and two-state block execution:
+  2 % fewer on C906 CoreMark.
+* Arithmetic operands are evaluated once when their width is needed: 9 %
+  fewer on the axi4 AVIP.
+* Parked `wait(cond)` processes that read only class state stay parked
+  until that state changes: 11 % fewer on a UVM bench.
+* Fewer per-identifier lookups inside class methods: 4.9 % fewer on the
+  axi4 AVIP.
+* Clocked blocks that only need arming skip the value compare, two-state
+  blocks run from one contiguous code arena with a packed per-entry
+  header, and the settle loop takes the two-state path before touching
+  the entry table: C906 memcpy (2000 iterations) 375 s to 313 s, output
+  identical.
+* Two-state blocks may now carry signed narrow registers (`integer` loop
+  counters and their compares), dynamic bit selects, non-blocking dynamic
+  bit writes (`q[i] <= v`) and range writes into buses wider than 64 bits;
+  a block is admitted after a read-before-write analysis of its control
+  flow instead of a fixed statement-order rule. Every clocked block is
+  offered to the two-state lowering regardless of size, and the eight most
+  common adjacent instruction pairs run fused. The four `for`-loop flop
+  blocks that dominated the C906 interpreter time (arbiters, fill buffer,
+  GPIO) now run two-state: memcpy 313 s to 295 s, CoreMark 18 % fewer
+  cycles, output identical; UVM benchmarks unchanged.
+* Single-bit gates whose output only clocked blocks read (half of all
+  combinational evaluations on the C906) are evaluated in one batch at the
+  end of each settle pass instead of through the worklist; a default
+  assignment of a wide bus (`bus = {265{1'b0}}`) and a 65..128-bit window
+  written into a wider bus now lower to the two-state path; the signal
+  mirror that only native (JIT) code reads is no longer maintained on
+  every write in ordinary runs. C906 memcpy (2000 iterations) 295 s to
+  275 s, output identical; UVM benchmarks unchanged.
+* A write to a signal that no clocked block or edge sensitivity observes
+  (59 % of all writes on the C906) skips the write observer after one
+  lookup, and single-bit gates feeding only clocked blocks commit through
+  a direct inline path. C906 memcpy 275 s to 263 s, output identical; UVM
+  benchmarks unchanged.
+
+### 0.10.5 — class covergroups, DPI exports and unit scope, faster UVM (September 2026)
+* **Typedef'd packed arrays keep their dimensions inside instances**: a
+  `u7_t [4:0][1:0] a` declared in an instantiated module (including every
+  top of a multi-top design, which runs under the synthetic wrapper) had no
+  packed geometry recorded, so `foreach (a[i, j])` walked its 70 bits
+  instead of its 10 elements while the same module run as the selected top
+  was right. The declared dimensions are now chained with the typedef's for
+  instance variables, ports and nets alike.
+* **`--profile`** prints the end-of-run profile report (by design unit,
+  instance and construct, plus the opcode and entry histograms); the same
+  as `XEZIM_PROFILE_REPORT=1`.
+
+* **`foreach` and `std::randomize` over multi-dimensional targets**: a
+  `foreach (a[i, j])` over a purely packed array (`u7_t [4:0][1:0]`,
+  `bit [6:0][4:0][1:0]`) now iterates every named dimension, declared
+  dimensions first and then the typedef's (it used to iterate one and leave
+  `j` x). `std::randomize(...) with { foreach (a[i, j]) ... }` now draws a
+  packed target wider than 64 bits and every element of a 2-D or N-D unpacked
+  array (both were left at 0), checks the constraint body with all loop
+  variables bound (it passed vacuously before), and repairs per element:
+  relational bounds, `elem == e` pins, and `$countones(mask[i][j]) ==
+  count[i][j]` couplings, which draw the mask with exactly that many ones.
+  A `rand` class property wider than 64 bits is drawn in full as well.
+* **`export "DPI-C"` aliases and package-scope exports reach C**: an export
+  with a C linkage name (`export "DPI-C" c_reg_write = task reg_write;`)
+  now emits the `c_reg_write` symbol the loaded library calls (it emitted the
+  SV name, and the library died with `undefined symbol: c_reg_write` on its
+  first call). Exports declared inside a package are registered whether the
+  package is wildcard-imported, imported by name, or never imported (they
+  name a global symbol either way); an unimported package's subroutine is
+  reached under its qualified name.
+* **Loop variables shadow a same-named variable of an inlined instance**: a
+  `for (integer i = 0; ...)` or `foreach (a[i])` inside a child module that
+  also declares `integer i` at module scope now binds `i` to the loop. The
+  inliner used to prefix every use of `i` to the child's module variable
+  while the loop's own declaration stayed bare, so the loop compared an
+  x-valued `u.i` and never ran (a gray-code pointer decoder stayed at x and
+  an asynchronous FIFO popped the same word forever). The interpreted form
+  had the matching runtime defect: the loop variable was written by name
+  through the process scope, which for a `foreach` re-triggered the block
+  on its own write.
+* **Associative-array probes no longer scan the whole signal table**:
+  `exists()` on an absent key, the nested-element probe behind every
+  associative-array check, and `first()` / `next()` key enumeration now read
+  the per-array element index (one set per array) instead of comparing
+  every signal name in the design against a prefix. The associative-array
+  check itself exits after one byte scan when the name can only be a plain
+  collection, the static-collection key is borrowed instead of allocated on
+  every builtin-method call, and a dozen per-call debug and tuning flags
+  (`XEZIM_ACTIVE_REGION`, `XEZIM_TRACE_SPIN`, `XEZIM_PSETTLE_STATS`, the
+  `*_DBG` switches) are read once. The axi4 AVIP retires 6.7 % fewer
+  instructions, output identical. `XEZIM_BM_CENSUS=1` prints every builtin
+  method call as `[bm] <receiver> <method>` for aggregation.
+* **`obj.randomize()` over multi-dimensional properties**: a packed
+  multi-dimensional class property (`rand u7_t [4:0][1:0] d`) now has element
+  geometry, so `d[i][j]` reads and writes address the element (they were
+  single-bit selects) and `foreach (d[i, j])` iterates every element from a
+  method or from the module. Elements of a 2-D array property wider than
+  64 bits are drawn (they stayed 0). Every fixed array property is drawn on
+  every call and the constraint repair then runs over the fresh draws: arrays
+  under a `foreach` used to be skipped by the draw and repaired from their
+  previous values, so `e[i] < 100` kept zeros and repeated calls returned the
+  same values, and the draw used to clobber element pins (`a[0] == 5`
+  returned 0) and `foreach` bodies that read another drawn array
+  (`$countones(m[i][j]) == e[i][j]`).
+* **A `forever` / `always` process no longer re-clones its loop body on every
+  wake-up**: the continuation it parks with is built once per loop and
+  shared afterwards (C906 memcpy retires 4.2 % fewer instructions, output
+  identical). A subroutine-local `virtual` interface variable now binds in
+  the frame that owns it, so two class tasks interleaved on delays keep their
+  own bindings instead of reading each other's. `cover property` sites are
+  tallied as covers in every clocked path, including `s_eventually` /
+  `s_always` watchers and vacuous implications. From Thomas Burg's PR #150:
+  the two condition-waiter drains are one parameterised routine, the
+  `--max-time` hang report lists processes parked for the NBA region, and the
+  `this`-property probe no longer clones the class name per lookup.
+* **Packed-struct member selects no longer collide with same-named arrays**:
+  inside an instance, `inp.sram_renA[2]` on a struct port compiled as a
+  two-bit element select whenever any other module declared a packed
+  multi-dimensional array called `sram_renA`, because the compiler's
+  element-width and dimension lookups fell back to the bare leaf name. They
+  now try the exact name, then the instance-scoped name, and use the bare
+  leaf only for single-segment names. Elaboration now also removes the bare
+  declarator keys that inlining a submodule registers for its own body
+  (element widths, packed dimensions, struct layouts, string signals) once
+  that instance is fully inlined, so they can no longer be matched from
+  anywhere else in the design.
+* **System-function results keep their LRM width in compiled blocks** (§20,
+  §21): `$countones`, `$clog2`, `$bits`, `$size`, `$countbits`, and the other
+  `int`-valued functions contribute 32 bits to an expression's context, the
+  `bit`-valued ones 1, `$time` 64, and `$signed`/`$unsigned`/`$past` their
+  argument's width. Inside an `always_ff`, `narrow <= $countones(be) >> 3`
+  used to size the shift at the 4-bit target and truncate the count before
+  shifting; the procedural path was already right. From the audit that
+  followed: `int`-valued results are now SIGNED everywhere (`$countones(x) - 8
+  < 0` compares signed, `$fgetc` end-of-file tests below zero), the
+  interpreter no longer sizes a system call by evaluating it (`$fgetc(fd) &
+  mask` consumed two bytes and `$urandom % n` advanced the generator twice),
+  `$test$plusargs`/`$value$plusargs` return `int`, a procedural `$past(v)` is
+  no longer one edge late and reports "no history" at the operand's width,
+  `$sampled(e)` evaluates outside properties, and `$onehot`/`$onehot0`/
+  `$isunknown` fold to one bit in constant expressions.
+* **Performance round (measured with interleaved `perf stat`, output
+  byte-identical in every case):** whole-net identity buffers (`assign y = x`)
+  now collapse onto their source by default (`XEZIM_BUF_COLLAPSE=0` opts
+  out) — the pass leaves alone any net that is a `force`/`release`/procedural
+  `assign` target, any source a process writes (the copy's delta step stays
+  observable), gate-driven nets, 2-state/4-state pairs, SDF designs, and
+  designs with DPI/VPI libraries; C906 memcpy runs 10.7 % fewer instructions
+  and 14 % less wall time, bit-exact against the reference transcript. On UVM
+  workloads the runtime scalar-index helper no longer hands calls and member
+  accesses to the elaboration-time constant folder (which cloned the whole
+  function table per attempt), process contexts are moved rather than cloned
+  across wakeups, and clocking blocks poll their clock by signal id; the axi4
+  AVIP base test retires 3.7 % fewer instructions.
+* **Default timescale for untimed units is `1ns/1ns`** for any module,
+  interface, or package without a `` `timescale `` directive (IEEE 1800
+  §3.14.2.2 leaves the default tool-defined; this matches the reference
+  simulator). Previously an untimed unit reported `1s/1s` while its delays
+  counted the design's global tick; now `#1`, `$time`, and `$realtime` all agree
+  on nanoseconds and `--dump-timescales` flags every defaulted unit. Pass
+  `--module-timescale` to pick a different default.
+* **Covergroups declared inside classes work** (§19.3): the class-body
+  covergroup is registered, the implicit variable it declares exists, `cg = new`
+  in the constructor instantiates it, `cg.sample()` reads the object's
+  properties (also when sampled from outside through `obj.cg`), a derived class
+  that redeclares `cg` gets its own coverpoints, constructor formals
+  (`covergroup cg (int lo, int hi)`) reach the bins, `with function
+  sample(...)` formals are bound per call, `option.auto_bin_max` (coverpoint or
+  covergroup level) and `cg::type_option.<field>` are honoured, and
+  `$get_coverage()` reports the mean over covergroup types. Covergroup and class handles no longer share one
+  integer namespace, which had dispatched class object 1 as covergroup 1.
+* **DPI at compilation-unit scope** (§35.5.4): `import "DPI-C"` and
+  `export "DPI-C"` written at the top of a file are visible in every module,
+  like a `$unit` function; they used to be reported as undeclared. Small
+  integral returns (`byte unsigned`, `shortint`) read at their declared width
+  and sign in expressions, and a 1-bit `logic` argument carries x/z as svLogic.
+* **A real assigned to an integral subroutine local rounds** (§6.12.2), as it
+  always did for module variables; the local used to keep the real value, so
+  `int div = freq / rate;` compared as 32.55 forever and a baud-clock divider
+  written that way never toggled.
+* **Concurrent assertions inside instantiated modules and interfaces** are
+  registered and fire; inlining used to drop them silently. Sequence
+  consequents (`a |-> a ##1 b ##1 c`, `a |=> s`) walk their steps cycle by
+  cycle, named sequences with unclocked bodies expand, and `cover property`
+  is tallied as cover with misses not counted as failures.
+
+### 0.10.4 — power intent, packed-struct codegen, opt-in waveforms (September 2026)
+
+* **Packed-struct member assignments compile** instead of falling back to the
+  AST interpreter. `s.m`, nested `s.p.m` (and every `union`-in-struct form),
+  `arr[i].m`, an assignment pattern into an array element (`arr[i] <= '{...}`),
+  and a function whose body is `return '{...}` were all interpreted at roughly
+  3.8 µs per statement. On a struct-payload pipeline benchmark — 8 lanes × 3
+  stages of an 88-bit struct, 20k cycles — this took the run from **16.05s to
+  0.83s**, reference-exact throughout. Neutral where the shape is absent
+  (Ibex is instruction-identical).
+* **Streaming concatenations and 2-D array stores compile.** `{>>{…}}` and
+  `{<<N{…}}` lower to constant range selects plus one concat instead of the
+  AST interpreter (a byte swap written `{<<8{x}}` was ~32% slower than the
+  same swap written by hand; it is now within 7%). A store to a 2-D unpacked
+  element (`a[i][j] <= v`) reuses the row-major flat index the read path
+  already had — a 4×4 array written element-wise every cycle went from 1.92s
+  to 0.16s (**12×**), and a loop containing one no longer drops to the AST
+  path wholesale. The 1-D memory case always compiled.
+* **Mailbox and semaphore ARRAY elements allocate on `new()`.** `mb[i] = new()`
+  stored a live-looking handle with nothing behind it, so every `put` silently
+  vanished, `num()` stayed 0 and `try_get` always failed, while the same
+  mailbox declared as a scalar worked. Fixed for every lvalue shape: module
+  scope, inside a class method, through `this.`, through a class handle, and
+  in associative / dynamic / queue / multi-dimensional collections.
+* **Waveform dumping is opt-in** via `--wave` (see Features). An active dump
+  forces loops that would otherwise compile onto the AST path and builds a
+  per-signal trace table, so a run that never dumps no longer pays for it, and
+  a design that calls `$dumpvars` no longer starts writing a file
+  unannounced. `--fst`/`--xtrace` imply it, so existing command lines are
+  unchanged.
+
+* **IEEE 1801 power intent** via `--upf` / `--upf-top`: supply nets with
+  state and voltage, power switches, corruption of powered-down elements,
+  isolation clamps and retention, driven from the testbench through the
+  standard `UPF` package (`supply_on` and friends). Multi-file intent chains
+  with `load_upf -scope`, `-update` merges into a named strategy, and
+  `-elements {.}` names the scope instance. `examples/upf/` is a runnable
+  example; see "Power intent (UPF)".
+* **`release` inside a level-sensitive block** (`always @(en)`, `@*`, or a
+  process resumed by `@(en)`) now returns the net to its continuous drivers
+  immediately. It used to keep the forced value until the driver happened to
+  change again, because the re-drive was lost inside the settle pass.
+### 0.10.1 – 0.10.3 — native compilation and process conformance (August 2026)
+
+* **AOT native backend** (`XEZIM_JIT=1 XEZIM_AOT=1`, needs a `--features jit` build) — the
+  compiler emits Rust for eligible combinational entries, edge blocks, and
+  process FSMs, builds it with `rustc`, and loads it through a single exported
+  API symbol. On the C910 CoreMark run 18,916 / 21,305 edge blocks and
+  108,248 / 215,494 combinational entries compile natively.
+* **Persistent native cache** — the generated library is keyed on the source,
+  optimization level, and xezim build, then stored under
+  `$XEZIM_CACHE_DIR` / `$XDG_CACHE_HOME/xezim/native` / `~/.cache/xezim/native`.
+  The first run pays the `rustc` cost; later runs load the cached `.so`
+  directly. `XEZIM_NO_NATIVE_CACHE=1` opts out.
+* **Compiled process FSMs** (`XEZIM_PROC_FSM=1`) — a blocking `always` body
+  compiles into a bytecode state machine with explicit wait instructions, so a
+  resume re-enters at the saved program counter with per-process registers
+  instead of re-walking the AST continuation chain. Blocking tasks and
+  `initial` blocks inline into the same FSM, and the FSMs themselves are
+  eligible for the native backend.
+* **Blocking task calls inside clocked blocks follow process semantics**
+  (§9.2.2) — an `always @(posedge clk)` body that calls a task which consumes
+  time is no longer executed on the fast edge path. Previously the callee's
+  delay advanced simulation time while that slot's non-blocking updates were
+  still queued, so a `q <= d;` scheduled before the call committed a few
+  picoseconds late; edges arriving mid-call were also mishandled. Such blocks
+  now run as processes: NBAs commit in their own slot, and edges that arrive
+  while the body is busy are missed, matching the reference simulator.
+* **Delays quantize at the declaring scope's precision** (§3.14.3) — a constant
+  fractional delay such as `#0.002` is folded and snapped to the precision grid
+  of the scope that declares it, at elaboration time, including delays inside
+  interface and class methods.
+* **`bind` by instance path** (§23.11) — `bind top.u_dut.u_sub tb u_tb();` and
+  the colon form specialize only the named instances; module-name binds are
+  applied before path binds, and upward references from the bound module
+  resolve against the instance it was bound into.
+* **Opt-in combinational region fusion** (`XEZIM_REGIONS=1`) — dependency-
+  connected compiled entries fuse into topologically ordered region blocks.
+  Measured net-negative on the current benchmark set (recompute cost outweighs
+  the dispatch saving), so it ships off by default and stays available for
+  experiments.
+
+### 0.10.0 — waveform integrity, cocotb, and class-storage fixes (August 2026)
+
+* **FST dumps are correct at scale** — a break-even compression case wrote the
+  time table raw while flagging it compressed, corrupting large dumps in
+  GTKWave; the writer now records what it actually wrote, dumps are finalized on
+  `Ctrl-C`, the final time slot is flushed, and values render on the writer
+  thread instead of the simulation thread. Cross-format agreement is checked by
+  decoding VCD, FST, and XTrace, not by comparing file sizes.
+* **cocotb backend** — Python testbenches run against xezim via
+  `contrib/cocotb/xezim_runner.py`, backed by VPI timed and synchronous
+  callbacks and a repaired VPI object model.
+* **Scheduling-region fixes** — the postponed region is serviced from the nested
+  event loop and on livelock recovery, and a delay closes out the slot it
+  resumed in, which removed a `$monitor`-vs-waveform timestamp skew.
+* **Class and scope storage** — class member arrays resolve through the runtime
+  class, `localparam` arrays inside classes elaborate, each instance gets its
+  own static task local under non-blocking assignment, packed-struct formals
+  read their members from the call frame, and `%m` no longer leaks the scope of
+  a suspended task.
+
+---
+
+# What's new in 0.9
+
+### 0.9.8 — reference-parity audit campaign (August 2026)
+
+Dozens of differential test batteries were run against a commercial reference
+simulator; every divergence found was measured construct-by-construct, fixed,
+and pinned with a regression test citing the LRM section:
+
+* **Per-evaluator continuous-assign propagation is now the default** (#35) —
+  combinational updates propagate with LRM evaluation ordering instead of a
+  single batched settle, resolving process-observation orderings that were
+  previously unattainable with either batching mode. Escape hatches:
+  `XEZIM_EAGER_PROC_SETTLE=1` (previous default) and `XEZIM_LAZY_PROC_SETTLE=1`.
+* **UVM `run_test()` termination** (#109) — the phase scheduler advances time
+  through run-phase objections; live regression pins run the real Accellera
+  library (1.2, 1800.2-2017, 1800.2-2020) in every CI gate.
+* **Package export semantics** (§26.6) — `export P::*`, `export P::sym` and
+  `export *::*` are honored: a wildcard import re-exposes a package's own
+  imports only when exported, and a wildcard export covers only names the
+  exporting package references — unexported/unreferenced names are rejected
+  exactly as the reference rejects them.
+* **Implicitly-static initializer legality** (§6.21) — a local variable with an
+  initializer in a static-lifetime task/function is now a compile error
+  (explicit `static`/`automatic` required), matching reference behavior;
+  for-header declarations, block locals and class methods stay accepted.
+* **`alias` as true net unification** (§10.11) and `trireg` charge storage
+  (§6.6.4) — aliased nets share one signal slot rather than lowering to an
+  assign cycle.
+* **Cycle delays synchronize** (§14.11) — `##0` (and a runtime `##(n)` that
+  evaluates to 0) waits for the default clocking event when off-edge and is a
+  no-op at the edge; `##n` without a designated `default clocking` is rejected.
+* **Formatting parity** (§21.2.1.7, §21.2.1.3) — associative arrays print with
+  the reference's `'{k:v, ... }` spacing; explicit-width `%h`/`%b`/`%o`
+  zero-pad to the minimal core without truncation.
+* **Array-method iterators** (§7.12) — `q.sort(x) with (x)` binds the declared
+  iterator (sorts and `with`-reductions no longer act on zeros); event controls
+  on packed-struct fields (§9.4.2) arm the base vector with a field-value
+  compare instead of waking spuriously.
+* **`ref` formals alias the actual** (§13.5.2) — callee writes are visible to
+  parallel observers mid-call, observer writes reach the callee, and the
+  element identity of `ref arr[i]` is frozen at call time.
+
+* **UVM 1800.2-2020.3.1 runs green** — the reference testbench passes against the
+  2020.3.1 library (`UVM_ERROR : 0` / `UVM_FATAL : 0`, in/out monitors agree).
+  Closing this required a general preprocessor fix (inline
+  `` `ifdef ``/`` `endif `` mid-line, §22.6), class-body `localparam` constants,
+  and sequencer-path fixes (`process::self()`, fork/join_none automatic-variable
+  sharing).
+* **User-defined nettypes** (LRM §6.6.7) — `nettype` declarations with
+  user resolution functions, Z-skip, and built-in resolution.
+* **Per-module timescales** — `$time`/`$realtime` scale to the calling module's
+  unit; `timeunit`/`timeprecision` declarations scale delays; `$timeformat`/`%t`
+  and `$printtimescale` honored; sub-ns precision down to `fs`; new
+  [`--module-timescale`](#module-timescale-extension) CLI extension for
+  legacy RTL with no source-level timescale.
+* **String & aggregate conformance fixes** — `s[i]` read/write on string
+  variables (§11.4.13), `ref`/`output` queue arguments copy back on return
+  (§13.5.2), `%p` renders function-local queues/associative arrays (§21.2.1.7),
+  `foreach` over a string iterates its content length, `q = {}` clears string
+  queues, and a never-touched module-scope queue reports `size() == 0`.
+* **Free functions no longer see the caller's class context** (§13.4) — a bare
+  name in a package/module function that collided with a caller class property
+  used to silently alias the property; queue-property access from outside the
+  class (`obj.q.push_back(x)`, `%p` of `obj.q`) now resolves correctly.
+* **Gate-level & structural robustness** — multi-dimensional packed arrays of
+  unpacked elements (`arr[i][j]`, §7.4), `foreach` over negative/descending and
+  packed dimensions (§12.7.3), non-ANSI ports completed by a `reg`/`logic`
+  declaration (§23.2.2.1), and per-iteration uniquification of declarations
+  inside **nested** generate-for loops (`for(a) for(b) localparam Idx = f(a,b)`).
+* **Behavioral clocks & PLLs** — a clock generator whose delay reads a runtime
+  variable (`always #(half) clk = ~clk`) now re-evaluates its period every
+  toggle, so a PLL reprogrammed at runtime actually changes frequency; verified
+  against a commercial simulator alongside UDP primitives, tristate/pull
+  strengths, `specify`/timing-check, and divider chains.
+* **Dead-clock watchdog** — `XEZIM_STUCK_CLOCK` flags a process parked on a
+  clock/reset that never changes while the design keeps churning edges (an
+  undriven-net / dropped-cell hang), turning a silent multi-minute grind into an
+  immediate, actionable diagnostic (`warn` by default; `abort` for CI).
+
+---
+
+# Verified Workloads
+
+End-to-end TEST PASSED with bit-identical results vs the workloads' own
+golden expectations:
+
+| Design | Test | sim_time / cycles | baseline wall | +O1 wall |
+|---|---|---|---|---|
+| XuanTie C910 (dual-core) | hello | sim_time 44695 | 95s | **73s** (1.30×) |
+| XuanTie C910 | memcpy ×7000 | sim_time 101965 | 216s | **166s** (1.30×) |
+| XuanTie C910 | cmark ×1 (`+iterations=1`, INIT_ZERO=1) | 167124 cycles | 87 min | **73 min** (1.19×) |
+| XuanTie C906 (single-core) | memcpy ×50 | — | 99s | **88s** (1.13×) |
+| XuanTie C906 | cmark ×1 (INIT_ZERO=1) | 295294 cycles | 714s | **587s** (1.22×) |
+| riscv-dv (UVM 1.2) | `+num_of_tests=10` random RV32IMC | — | — | 10/10 assemble clean |
+
+Larger runs measured during the 0.10 campaign:
+
+| Design | Test | Result | wall |
+|---|---|---|---|
+| lowRISC Ibex (`simple_system`) | CoreMark ×10 | score 2.477304 CoreMark/MHz, 2,765,321 instret, halt at 41,454,505 ns — byte-identical | 447s |
+| XuanTie C906 | cmark ×2 | TEST PASSED, 286,469 cycles/iteration | 516s |
+| XuanTie C910 (dual-core) | cmark ×2 | TEST PASSED, CoreMark 6.327752, halt at 34,985,250 | 8,028s, including a cold native compile of the whole design |
+| mbits-mirafra AVIP suite (UVM) | apb / spi / i3c / axi4 / axi4Lite / uart base tests | 6 of 6 reproduce the reference's `UVM_ERROR` counts and end times, run unmodified with no `--module-timescale` (the untimed BFMs take the `1ns/1ns` default; uart alone needs `--module-timescale 1ps/1ps`); `ahb` runs in xezim but the reference fails to elaborate it | 33s for axi4Lite (28s with FSM + AOT), about 60s for uart, seconds for the rest |
+
+On these CPU workloads a commercial reference simulator is still roughly
+4–5× faster; the campaign narrowed the Ibex CoreMark gap from about 30× to
+4.3×. **Where the remaining cost sits depends on the design**, and the two
+cores profile as opposites:
+
+* **C906 is scheduling-bound.** Running the reference with its optimizer
+  disabled (321s) against optimized (77s) and xezim (489s) puts ~4.2× on its
+  optimizer and only ~1.5× on the kernel itself, and a symbol profile spends
+  ~34% of the run evaluating the design against ~22% deciding what to
+  evaluate. Every net stays externally visible, so each combinational result
+  is published and its readers notified — the cost the reference's optimizer
+  removes by keeping intermediate nets in registers.
+* **Ibex is evaluation-bound.** ~62% of the run is in the bytecode
+  interpreter (`exec_insns` alone is 38%) against ~22% scheduling. It has
+  1,553 combinational entries to C906's 35,267, so the same work is spread
+  over ~23× fewer, ~37× hotter blocks.
+
+That split is why native compilation is opt-in rather than default: it is
+worth ~23% on Ibex and a net loss on C906 (see **Native compilation**).
+
+The picture is design-shape dependent, and the benchmark set above — all
+CPU cores and class-based UVM — under-represents struct-heavy modern RTL. On a
+struct-payload pipeline microbenchmark (8 lanes × 3 stages of an 88-bit packed
+struct written member-wise, 20k cycles) xezim runs it in 0.83s against the
+reference's 59.5s. That is a microbenchmark, not a workload, but it is the
+shape the table above contains none of.
+
+UVM run-phase (see [docs/uvm-guide.md](docs/uvm-guide.md)):
+
+| Testbench | Result |
+|---|---|
+| GettingVerilatorStartedWithUVM vs **1800.2-2017** (`data0`/`data1`/`random`/`many_random`) | 4/4 — exact Verilator parity (monitors agree, `UVM_ERROR`/`UVM_FATAL` = 0) |
+| GettingVerilatorStartedWithUVM vs **1800.2-2020.3.1** | green — in/out monitors agree (77/77 packets), `UVM_ERROR`/`UVM_FATAL` = 0 |
+| sv-tests UVM 1800.2-2017 example suite | 32/35 pass (3 out of scope: deprecated UVM-1.0 macros, DPI backdoor) |
+
+---
+
+# Compliance
+
+Full [sv-tests](https://github.com/chipsalliance/sv-tests) run with the
+suite's own `xezim` runner (`make report RUNNERS=Xezim`), xezim 0.8.1. The
+generated HTML report and per-test CSV are checked in under `reports/`
+(`svtests_index.html`, `svtests_report.csv`, and `sv-tests-compliance.md`).
+
+| Category | Pass / Total | Rate |
+|---|---|---|
+| **All tests** | **4354 / 4768** | **91.3 %** |
+| &nbsp;&nbsp;UVM (1800.2-2017) | 484 / 487 | 99.4 % |
+| &nbsp;&nbsp;non-`ivtest` | 2153 / 2237 | 96.2 % |
+| &nbsp;&nbsp;Icarus `ivtest` suite | 2201 / 2531 | 87.0 % |
+
+An earlier run scored only 52 % because a `-I` library directory
+(`ivtest/ivltests/`, ~1000 mutually independent single-file tests) was scanned
+too eagerly: xezim honors IEEE §23.3.2 library semantics — an `-I` dir supplies
+module definitions to satisfy unresolved instantiations — but it was adopting
+*every* definition in the directory, so typedefs/enums from unrelated sibling
+files leaked into the primary design and failed a spurious §6.18 base-type
+check. `resolve_library_modules` now pulls in only the library modules actually
+reachable from the compiled design (transitively), which reclaimed ~1870
+`ivtest` cases with no change to the native LRM/UVM results.
+
+---

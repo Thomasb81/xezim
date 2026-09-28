@@ -114,13 +114,19 @@ endmodule
 #[test]
 fn constructor_typedef_dispatch_in_function() {
     let sim = simulate(SRC_CTOR_IN_FUNC, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "result"), 1,
-        "constructor dispatch with typedef alias in function body must produce non-null handle");
+    assert_eq!(
+        u(&sim, "result"),
+        1,
+        "constructor dispatch with typedef alias in function body must produce non-null handle"
+    );
 }
 
 #[test]
 fn constructor_typedef_dispatch_module_level_var() {
     let sim = simulate(SRC_MODULE_LEVEL_VAR, 1000).expect("simulate failed");
-    assert_eq!(u(&sim, "result"), 1,
-        "constructor dispatch with typedef alias on module-level variable must produce non-null handle");
+    assert_eq!(
+        u(&sim, "result"),
+        1,
+        "constructor dispatch with typedef alias on module-level variable must produce non-null handle"
+    );
 }

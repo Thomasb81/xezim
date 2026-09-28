@@ -39,7 +39,12 @@ endmodule
 
 fn tmp(stem: &str, ext: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("xezim_fmt_agree_{}_{}.{}", stem, std::process::id(), ext));
+    p.push(format!(
+        "xezim_fmt_agree_{}_{}.{}",
+        stem,
+        std::process::id(),
+        ext
+    ));
     let _ = fs::remove_file(&p);
     p
 }
@@ -91,7 +96,10 @@ fn fst_sig_changes(path: &std::path::Path) -> Vec<(u64, String)> {
                 FstSignalValue::String(b) => String::from_utf8_lossy(b).to_string(),
                 FstSignalValue::Real(f) => format!("r{}", f),
             };
-            changes.entry(handle.get_index()).or_default().push((time, rendered));
+            changes
+                .entry(handle.get_index())
+                .or_default()
+                .push((time, rendered));
             Ok::<(), ()>(())
         })
         .expect("FST value changes do not decode");

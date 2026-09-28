@@ -7,7 +7,11 @@
 use xezim::simulate;
 
 fn out_of(sim: &xezim::compiler::Simulator) -> String {
-    sim.output.iter().map(|o| o.message.as_str()).collect::<Vec<_>>().join("\n")
+    sim.output
+        .iter()
+        .map(|o| o.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -21,7 +25,11 @@ module top;
 endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("R a"), "each element drives out[k]=din[k]:\n{}", out);
+    assert!(
+        out.contains("R a"),
+        "each element drives out[k]=din[k]:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -41,7 +49,11 @@ module top;
 endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("F c"), "flop bank latches din per bit (want F c):\n{}", out);
+    assert!(
+        out.contains("F c"),
+        "flop bank latches din per bit (want F c):\n{}",
+        out
+    );
 }
 
 /// Non-zero-based / offset range: `m[3:1]` connected to `out[3:1]` must map
@@ -58,7 +70,11 @@ module top;
 endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("O 1010"), "offset-range array drives absolute bits:\n{}", out);
+    assert!(
+        out.contains("O 1010"),
+        "offset-range array drives absolute bits:\n{}",
+        out
+    );
 }
 
 /// §23.3.2 W-bit formal: an actual W*N wide is split into per-element W-bit
@@ -75,7 +91,11 @@ endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
     // ~8'hA5 = ~10100101 = 01011010, distributed per 2-bit slice.
-    assert!(out.contains("W 01011010"), "2-bit formal splits 8-bit actual per slice:\n{}", out);
+    assert!(
+        out.contains("W 01011010"),
+        "2-bit formal splits 8-bit actual per slice:\n{}",
+        out
+    );
 }
 
 /// §23.3.2 replication: an actual whose width EQUALS the formal width is NOT
@@ -93,7 +113,11 @@ module top;
 endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
-    assert!(out.contains("C 0000"), "1-bit actual broadcasts to every element:\n{}", out);
+    assert!(
+        out.contains("C 0000"),
+        "1-bit actual broadcasts to every element:\n{}",
+        out
+    );
 }
 
 /// §23.3.2 by-name connections may be written in ANY order and must still bind
@@ -113,7 +137,11 @@ endmodule
 "#;
     let out = out_of(&simulate(SRC, 100).expect("sim"));
     // element k: {i4[k], ~i4[k]}; i4=1010 -> k0=01,k1=10,k2=01,k3=10 -> 10011001
-    assert!(out.contains("N 10011001"), "by-name conns slice by their own port width:\n{}", out);
+    assert!(
+        out.contains("N 10011001"),
+        "by-name conns slice by their own port width:\n{}",
+        out
+    );
 }
 
 /// §23.3.2 hierarchical read: an internal net of an array element is reachable

@@ -67,11 +67,7 @@ endmodule
 fn subclass_member_array_resolves_through_inherited_bare_call() {
     assert_eq!(
         notes(BARE_CALL_FIXED),
-        vec![
-            "NOTE: item[0]=10",
-            "NOTE: item[1]=20",
-            "NOTE: item[2]=30",
-        ],
+        vec!["NOTE: item[0]=10", "NOTE: item[1]=20", "NOTE: item[2]=30",],
         "foreach must complete all three iterations, not replay index 0"
     );
 }

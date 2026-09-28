@@ -77,18 +77,18 @@ impl Arena {
     fn alloc_raw(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
         let align = align.max(MIN_ALIGN);
         let offset = self.offset.get();
-        
+
         // Calculate aligned offset
         let aligned_offset = (offset + align - 1) & !(align - 1);
-        
+
         // Check if we have enough space
         if aligned_offset + size > self.buffer.capacity() {
             return None;
         }
-        
+
         // Update offset
         self.offset.set(aligned_offset + size);
-        
+
         // Safety: We've verified the buffer has enough capacity
         unsafe {
             let ptr = self.buffer.as_ptr().add(aligned_offset);
@@ -105,10 +105,11 @@ impl Arena {
     pub fn alloc<T>(&self, value: T) -> &mut T {
         let size = size_of::<T>();
         let align = align_of::<T>();
-        
-        let ptr = self.alloc_raw(size, align)
+
+        let ptr = self
+            .alloc_raw(size, align)
             .expect("Arena allocation failed: out of space");
-        
+
         // Write the value
         unsafe {
             let raw_ptr = ptr.as_ptr() as *mut T;
@@ -130,14 +131,13 @@ impl Arena {
     pub fn alloc_slice<T>(&self, len: usize) -> &mut [T] {
         let size = size_of::<T>() * len;
         let align = align_of::<T>();
-        
-        let ptr = self.alloc_raw(size, align)
+
+        let ptr = self
+            .alloc_raw(size, align)
             .expect("Arena slice allocation failed: out of space");
-        
+
         // The slice is uninitialized - caller must initialize it
-        unsafe {
-            std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, len)
-        }
+        unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr() as *mut T, len) }
     }
 
     /// Allocate a slice and initialize with a value.
@@ -232,13 +232,13 @@ mod tests {
     #[test]
     fn test_arena_basic() {
         let arena = Arena::with_capacity(1024);
-        
+
         let v1 = arena.alloc(42u32);
         assert_eq!(*v1, 42);
-        
+
         let v2 = arena.alloc(100u64);
         assert_eq!(*v2, 100);
-        
+
         *v1 = 99;
         assert_eq!(*v1, 99);
     }
@@ -246,13 +246,13 @@ mod tests {
     #[test]
     fn test_arena_reset() {
         let arena = Arena::with_capacity(1024);
-        
+
         let v1 = arena.alloc(42u32);
-        assert_eq!(arena.offset(), 4);  // u32 is 4 bytes
-        
+        assert_eq!(arena.offset(), 4); // u32 is 4 bytes
+
         arena.reset();
         assert_eq!(arena.offset(), 0);
-        
+
         let v2 = arena.alloc(99u32);
         assert_eq!(*v2, 99);
     }
@@ -260,28 +260,28 @@ mod tests {
     #[test]
     fn test_arena_slice() {
         let arena = Arena::with_capacity(1024);
-        
+
         let slice = arena.alloc_slice::<u32>(10);
         assert_eq!(slice.len(), 10);
-        
+
         for (i, v) in slice.iter_mut().enumerate() {
             *v = i as u32;
         }
-        
+
         assert_eq!(slice[5], 5);
     }
 
     #[test]
     fn test_arena_guard() {
         let arena = Arena::with_capacity(1024);
-        
+
         {
             let _guard = ArenaGuard::new(&arena);
             let v = arena.alloc(42u32);
             assert_eq!(*v, 42);
             assert!(arena.offset() > 0);
         }
-        
+
         // Guard has been dropped, arena should be reset
         assert_eq!(arena.offset(), 0);
     }

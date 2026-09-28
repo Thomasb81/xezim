@@ -1,9 +1,9 @@
 //! Commercial gate-level-sim flags: `+nospecify` suppresses specify-block
-//! module path delays (zero-delay GLS); `+notimingcheck`/`+notimingchecks`
-//! are accepted as documented no-ops (xezim does not model specify timing
-//! checks, so they are permanently "disabled" already). Xcelium's `-`
-//! spellings are accepted for both. CLI-level tests because the switch is a
-//! process-global set by argument parsing.
+//! module path delays (zero-delay GLS) and timing checks;
+//! `+notimingcheck`/`+notimingchecks` suppress only the §31 timing checks;
+//! `+no_notifier` / `+no_tchk_msg` keep one of a violation's two effects.
+//! Xcelium's `-` spellings are accepted too. CLI-level tests because the
+//! switches are process-globals set by argument parsing.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -55,13 +55,19 @@ fn run(tag: &str, args: &[&str]) -> String {
     )
 }
 
-/// Default: the (a => y) = 10 path delay holds y at 0 two ns after the input
-/// edge, and it arrives by the end.
+/// Default: the (a => y) = 10 path delay defers y — two ns after the input
+/// edge it still holds x, because the time-0 x->0 change also waits for the
+/// path delay and the 1 at 5 ns replaced it — and the 1 arrives by the end.
+/// Cross-checked against the reference simulator.
 #[test]
 fn specify_path_delay_applies_by_default() {
     let out = run("default", &[]);
-    assert!(out.contains("MID y=0"), "path delay must defer y:\n{}", out);
-    assert!(out.contains("END y=1"), "y must eventually arrive:\n{}", out);
+    assert!(out.contains("MID y=x"), "path delay must defer y:\n{}", out);
+    assert!(
+        out.contains("END y=1"),
+        "y must eventually arrive:\n{}",
+        out
+    );
 }
 
 /// `+nospecify` (and Xcelium's `-nospecify`): zero-delay — y flips immediately.
@@ -78,10 +84,10 @@ fn nospecify_suppresses_path_delays() {
     }
 }
 
-/// The timing-check disables are recognized no-ops — no unknown-flag warning,
-/// simulation unchanged.
+/// The timing-check disables are recognized — no unknown-flag warning — and
+/// leave path delays alone.
 #[test]
-fn notimingcheck_is_a_quiet_noop() {
+fn notimingcheck_keeps_path_delays() {
     for flag in ["+notimingcheck", "+notimingchecks", "-notimingchecks"] {
         let out = run("ntc", &[flag]);
         assert!(
@@ -90,8 +96,94 @@ fn notimingcheck_is_a_quiet_noop() {
             flag,
             out
         );
-        assert!(out.contains("MID y=0"), "{} must not change timing:\n{}", flag, out);
+        assert!(
+            out.contains("MID y=x"),
+            "{} must not change timing:\n{}",
+            flag,
+            out
+        );
     }
+}
+
+const TCHK_SRC: &str = "`timescale 1ns/1ns
+module ff(input d, input clk);
+  reg n = 0;
+  always @(n) $display(\"N=%b\", n);
+  specify $setup(d, posedge clk, 3, n); endspecify
+endmodule
+module tb;
+  reg d = 0, clk = 0;
+  ff u(.d(d), .clk(clk));
+  initial begin #10 d = 1; #1 clk = 1; #5 $finish; end
+endmodule
+";
+
+/// §31 timing checks: a setup violation prints one error and toggles the
+/// notifier (the reference simulator reports the same violation). The
+/// disables drop both effects or one of them, and `--error-exit` counts the
+/// violation as an error.
+#[test]
+fn timing_check_flags() {
+    let dir = std::env::temp_dir().join(format!("xezim_tchk_flags_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sv = dir.join("tc.sv");
+    std::fs::write(&sv, TCHK_SRC).unwrap();
+    let run = |args: &[&str]| -> (Option<i32>, String) {
+        let o = Command::new(xezim_bin())
+            .args(args)
+            .arg(&sv)
+            .output()
+            .unwrap();
+        (
+            o.status.code(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        )
+    };
+    let msg = "$setup( d:10 ns, posedge clk:11 ns, 3 ns ) violation in tb.u at time 11 ns";
+    let (code, out) = run(&[]);
+    assert!(
+        out.contains(msg) && out.contains("N=1"),
+        "default:\n{}",
+        out
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "a violation alone does not fail the run:\n{}",
+        out
+    );
+    let (code, out) = run(&["--error-exit"]);
+    assert_eq!(code, Some(1), "--error-exit counts the violation:\n{}", out);
+    for flag in [
+        "+notimingcheck",
+        "+notimingchecks",
+        "-notimingchecks",
+        "+nospecify",
+    ] {
+        let (_, out) = run(&[flag]);
+        assert!(
+            !out.contains("violation") && !out.contains("N=1"),
+            "{} must disable the check:\n{}",
+            flag,
+            out
+        );
+    }
+    let (_, out) = run(&["+no_notifier"]);
+    assert!(
+        out.contains(msg) && !out.contains("N=1"),
+        "+no_notifier:\n{}",
+        out
+    );
+    let (_, out) = run(&["+no_tchk_msg"]);
+    assert!(
+        !out.contains("violation") && out.contains("N=1"),
+        "+no_tchk_msg:\n{}",
+        out
+    );
 }
 
 const TRIPLET_SRC: &str = "`timescale 1ns/1ns
@@ -114,7 +206,8 @@ endmodule
 
 /// min:typ:max triplets: default typ, +mindelays/+maxdelays select the ends.
 /// A triplet used to derail the specify parser and silently drop the whole
-/// path delay to zero.
+/// path delay to zero. y reads x until its first path delay elapses (the
+/// reference simulator's output for all three selections).
 #[test]
 fn min_typ_max_triplet_selection() {
     let dir = std::env::temp_dir().join("xezim_specify_triplet");
@@ -134,23 +227,33 @@ fn min_typ_max_triplet_selection() {
         )
     };
     let typ = run(&[]);
-    assert!(typ.contains("T4 y=0") && typ.contains("T8 y=1"), "typ default (5ns):\n{}", typ);
+    assert!(
+        typ.contains("T4 y=x") && typ.contains("T8 y=1"),
+        "typ default (5ns):\n{}",
+        typ
+    );
     let min = run(&["+mindelays"]);
     assert!(min.contains("T4 y=1"), "+mindelays (2ns):\n{}", min);
     let max = run(&["+maxdelays"]);
-    assert!(max.contains("T8 y=0") && max.contains("T12 y=1"), "+maxdelays (9ns):\n{}", max);
+    assert!(
+        max.contains("T8 y=x") && max.contains("T12 y=1"),
+        "+maxdelays (9ns):\n{}",
+        max
+    );
 }
 
 /// The should-fail lint must see inside generate constructs — every rule was
 /// bypassed by wrapping illegal code in `generate begin ... end`.
 #[test]
 fn lint_checks_apply_inside_generate() {
-    let bad = "module t; reg fb = 0;\n generate begin : g always fb = ~fb; end endgenerate\nendmodule\n";
+    let bad =
+        "module t; reg fb = 0;\n generate begin : g always fb = ~fb; end endgenerate\nendmodule\n";
     assert!(
         xezim::simulate(bad, 1000).is_err(),
         "illegal always inside generate must be rejected"
     );
-    let good = "module t; reg c = 0;\n generate begin : g always #10 c = ~c; end endgenerate\nendmodule\n";
+    let good =
+        "module t; reg c = 0;\n generate begin : g always #10 c = ~c; end endgenerate\nendmodule\n";
     assert!(
         xezim::simulate(good, 100).is_ok(),
         "legal always inside generate must stay accepted"
@@ -166,7 +269,9 @@ fn delay_mode_zero_and_unit() {
     fn xbin() -> PathBuf {
         let mut p = std::env::current_exe().unwrap();
         p.pop();
-        if p.ends_with("deps") { p.pop(); }
+        if p.ends_with("deps") {
+            p.pop();
+        }
         p.join("xezim")
     }
     let dir = std::env::temp_dir().join(format!("xezim_delaymode_{}", std::process::id()));
@@ -183,12 +288,23 @@ fn delay_mode_zero_and_unit() {
     .unwrap();
     let run = |args: &[&str]| -> String {
         let o = Command::new(xbin()).args(args).arg(&sv).output().unwrap();
-        format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
     };
-    // default: specify 8ns → edge at t9, so y=0 at t3.
-    assert!(run(&[]).contains("T3 y=0"), "default specify delay");
+    // default: specify 8ns → edge at t9, so y is still x at t3 (the time-0
+    // value waits for the path delay too; the reference simulator agrees).
+    assert!(run(&[]).contains("T3 y=x"), "default specify delay");
     // zero: edge at t1 → y=1 at t3.
-    assert!(run(&["+delay_mode_zero"]).contains("T3 y=1"), "+delay_mode_zero");
+    assert!(
+        run(&["+delay_mode_zero"]).contains("T3 y=1"),
+        "+delay_mode_zero"
+    );
     // unit: 8→1, edge at t2 → y=1 at t3.
-    assert!(run(&["+delay_mode_unit"]).contains("T3 y=1"), "+delay_mode_unit");
+    assert!(
+        run(&["+delay_mode_unit"]).contains("T3 y=1"),
+        "+delay_mode_unit"
+    );
 }

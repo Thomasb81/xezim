@@ -56,8 +56,14 @@ endmodule
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "st_all"), 1, "every call reports success");
     assert_eq!(u(&sim, "zero_seen"), 0, "0 is outside the dist set");
-    assert!(u(&sim, "c1a") > u(&sim, "chia"), "unparenthesized: biased toward 1");
-    assert!(u(&sim, "c1b") > u(&sim, "chib"), "parenthesized: biased toward 1");
+    assert!(
+        u(&sim, "c1a") > u(&sim, "chia"),
+        "unparenthesized: biased toward 1"
+    );
+    assert!(
+        u(&sim, "c1b") > u(&sim, "chib"),
+        "parenthesized: biased toward 1"
+    );
 }
 
 /// A FALSE guard leaves the variable unconstrained — the dist must not apply.
@@ -79,7 +85,10 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert!(u(&sim, "zero_seen") > 0, "with en=0 the full 4-bit range is legal");
+    assert!(
+        u(&sim, "zero_seen") > 0,
+        "with en=0 the full 4-bit range is legal"
+    );
 }
 
 /// §18.5.9: `list.size() == N` sizes a dynamic-array target.
@@ -222,5 +231,9 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "st_all"), 1);
-    assert_eq!(u(&sim, "illegal"), 0, "bits outside `possible` stay 0 in the class path");
+    assert_eq!(
+        u(&sim, "illegal"),
+        0,
+        "bits outside `possible` stay 0 in the class path"
+    );
 }

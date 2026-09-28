@@ -60,7 +60,9 @@ endmodule
 #[test]
 fn nba_wait_yields_until_inactive_deltas_complete() {
     let out = run(SV_SRC, "test");
-    let zero_pos = out.find("ZERO_DELAY_DONE").expect("ZERO_DELAY_DONE printed");
+    let zero_pos = out
+        .find("ZERO_DELAY_DONE")
+        .expect("ZERO_DELAY_DONE printed");
     let nba_pos = out.find("WOKE_AFTER_NBA").expect("WOKE_AFTER_NBA printed");
     assert!(
         zero_pos < nba_pos,

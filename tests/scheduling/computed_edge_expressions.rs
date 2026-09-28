@@ -53,7 +53,11 @@ endmodule
     assert_eq!(u(&sim, "n_bit"), 1, "a bit-select still works");
     assert_eq!(u(&sim, "n_and"), 1, "AND term");
     assert_eq!(u(&sim, "n_or"), 1, "OR term");
-    assert_eq!(u(&sim, "n_not"), 1, "an inversion fires when the OPERAND falls");
+    assert_eq!(
+        u(&sim, "n_not"),
+        1,
+        "an inversion fires when the OPERAND falls"
+    );
 }
 
 /// Polarity, multi-bit LSB tracking, a mixed plain/computed list, an `iff`
@@ -94,8 +98,16 @@ endmodule
     assert_eq!(u(&sim, "n_and2"), 2, "AND of two varying operands");
     assert_eq!(u(&sim, "n_neg"), 1, "negedge of a computed term");
     assert_eq!(u(&sim, "n_vec"), 2, "a multi-bit term tracks its LSB");
-    assert_eq!(u(&sim, "n_mixed"), 3, "plain and computed terms in one list");
-    assert_eq!(u(&sim, "n_iff"), 1, "the iff guard still gates the computed term");
+    assert_eq!(
+        u(&sim, "n_mixed"),
+        3,
+        "plain and computed terms in one list"
+    );
+    assert_eq!(
+        u(&sim, "n_iff"),
+        1,
+        "the iff guard still gates the computed term"
+    );
     assert_eq!(u(&sim, "n_cond"), 3, "a conditional term");
 }
 
@@ -134,7 +146,11 @@ endmodule
     let sim = simulate(src, 100).expect("simulate failed");
     assert_eq!(u(&sim, "t_plain"), 1, "plain signal");
     assert_eq!(u(&sim, "t_and"), 1, "computed term in a fork arm");
-    assert_eq!(u(&sim, "t_not"), 2, "inversion fires when its operand falls");
+    assert_eq!(
+        u(&sim, "t_not"),
+        2,
+        "inversion fires when its operand falls"
+    );
     assert_eq!(u(&sim, "t_loop"), 1, "computed term inside a loop body");
     assert_eq!(u(&sim, "t_if"), 3, "computed term inside a branch");
 }

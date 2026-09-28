@@ -63,6 +63,10 @@ endmodule
     assert_eq!(u(&sim, "r_cont"), 0b010, "continuous const range write");
     assert_eq!(u(&sim, "r_port"), 0b110, "output-port part+bit connection");
     assert_eq!(u(&sim, "r_nr"), 0b010, "NBA const range write");
-    assert_eq!(u(&sim, "r_nb"), 0b010, "NBA dynamic bit write (declared idx 2 = offset 1)");
+    assert_eq!(
+        u(&sim, "r_nb"),
+        0b010,
+        "NBA dynamic bit write (declared idx 2 = offset 1)"
+    );
     assert_eq!(u(&sim, "r_niu"), 0b110, "NBA indexed-up write");
 }

@@ -71,7 +71,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "r_lit"), 11, "string-literal key, full value not the low bit");
+    assert_eq!(
+        u(&sim, "r_lit"),
+        11,
+        "string-literal key, full value not the low bit"
+    );
     assert_eq!(u(&sim, "r_str"), 22, "string-variable key");
     assert_eq!(u(&sim, "r_int"), 33, "int key");
     assert_eq!(u(&sim, "r_wide_ok"), 1, "wide element survives intact");
@@ -99,7 +103,11 @@ endmodule
     let sim = simulate(src, 5).expect("import ep::BUSY must elaborate");
     assert_eq!(u(&sim, "v"), 1, "imported member carries its value");
     assert_eq!(u(&sim, "r"), 1, "usable in any expression");
-    assert_eq!(u(&sim, "name_ok"), 1, ".name() resolves through the typedef");
+    assert_eq!(
+        u(&sim, "name_ok"),
+        1,
+        ".name() resolves through the typedef"
+    );
 }
 
 /// Gap 3: a parameter colliding with a module-local enum member is a
@@ -117,7 +125,10 @@ endmodule
         Ok(_) => panic!("must reject, as every other simulator does"),
         Err(e) => e,
     };
-    assert!(err.contains("duplicate declaration of 'BUSY'"), "got: {err}");
+    assert!(
+        err.contains("duplicate declaration of 'BUSY'"),
+        "got: {err}"
+    );
     assert!(
         err.contains("enum member of 'st_e'"),
         "must name the enum member as the first declaration; got: {err}"
@@ -156,6 +167,10 @@ endmodule
 "#;
     let sim = simulate(src, 5).expect("simulate failed");
     assert_eq!(u(&sim, "s.seen_c"), 900, "shadower keeps its own local");
-    assert_eq!(u(&sim, "u.v"), 2, "user's bare C is the enum member, not the sibling's local");
+    assert_eq!(
+        u(&sim, "u.v"),
+        2,
+        "user's bare C is the enum member, not the sibling's local"
+    );
     assert_eq!(u(&sim, "u.name_ok"), 1, "and stringifies as the member");
 }

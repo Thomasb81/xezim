@@ -103,7 +103,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "v"), 0x00, "whole-value NBA must override the partial");
+    assert_eq!(
+        u(&sim, "v"),
+        0x00,
+        "whole-value NBA must override the partial"
+    );
 }
 
 /// Reset priority through several cycles of real pipeline motion — the

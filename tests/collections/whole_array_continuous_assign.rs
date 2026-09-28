@@ -66,7 +66,11 @@ endmodule
     assert_eq!(u(&sim, "d1"), 0x022);
     assert_eq!(u(&sim, "d2"), 0x033);
     assert_eq!(u(&sim, "d3"), 0x044);
-    assert_eq!(u(&sim, "d1_after"), 0x077, "the assign stays live after the source changes");
+    assert_eq!(
+        u(&sim, "d1_after"),
+        0x077,
+        "the assign stays live after the source changes"
+    );
 }
 
 /// An array whose element type is a packed struct — the shape the CDC design
@@ -184,7 +188,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "seen"), 0x022, "a sub-module-local whole-array assign drives");
+    assert_eq!(
+        u(&sim, "seen"),
+        0x022,
+        "a sub-module-local whole-array assign drives"
+    );
 }
 
 /// End-to-end in the shape that surfaced it: an array output port feeds
@@ -224,7 +232,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 400).expect("simulate failed");
-    assert_eq!(u(&sim, "unk_at_1"), 0, "the struct resolves as soon as the array does");
+    assert_eq!(
+        u(&sim, "unk_at_1"),
+        0,
+        "the struct resolves as soon as the array does"
+    );
     assert_eq!(u(&sim, "pos0_at_21"), 2, "two posedges elapsed");
     assert_eq!(u(&sim, "w0_at_21"), 2, "and the member assign forwards it");
 }

@@ -162,10 +162,9 @@ endmodule
 /// Derived-class STATIC shadowing an INHERITED instance member: methods
 /// touching the shadowed bare name decline to the AST path (conservative
 /// admission) and produce identical output on both gates. Known,
-/// documented divergence vs reference simulators for this corner: they
-/// resolve `x = 5` in `B::new` to the derived static (fb/Bx = 5) while
-/// xezim's interpreter leaves the static at its initializer (2) —
-/// gate-ON preserves the interpreter's behavior exactly.
+/// `x = 5` in `B::new` resolves to the nearest (derived) static, matching
+/// reference simulators (fb/Bx = 5). Gate-ON preserves the interpreter's
+/// behavior exactly.
 #[test]
 fn static_shadows_inherited_member_parity() {
     gate_on();
@@ -198,7 +197,7 @@ endmodule
 "#;
     let sim = simulate(src, 100).expect("simulation should run");
     assert_eq!(u(&sim, "fa"), 1, "inherited instance member read");
-    assert_eq!(u(&sim, "fb"), 2, "static stays at initializer (interp parity)");
+    assert_eq!(u(&sim, "fb"), 5, "ctor store hits the derived static (interp parity)");
     assert_eq!(u(&sim, "fc"), 10, "instance member + localparam");
-    assert_eq!(u(&sim, "bx"), 2, "class-scope static unchanged by ctor store");
+    assert_eq!(u(&sim, "bx"), 5, "class-scope static written by ctor store");
 }

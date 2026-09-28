@@ -40,7 +40,10 @@ module top;
 endmodule
 "#;
     let out = outs(&simulate(src, 10).expect("sim"));
-    assert!(out.contains("T|fe=4 first=3"), "outermost packed dim, left-to-right:\n{out}");
+    assert!(
+        out.contains("T|fe=4 first=3"),
+        "outermost packed dim, left-to-right:\n{out}"
+    );
 }
 
 /// Reference: `[  Hi]` (leading NULs as spaces), `[Hi]` for %0s, `[A B]`
@@ -58,7 +61,10 @@ module top;
 endmodule
 "#;
     let out = outs(&simulate(src, 10).expect("sim"));
-    assert!(out.contains("T|[  Hi][Hi][A B][ ]"), "packed %s widths:\n{out}");
+    assert!(
+        out.contains("T|[  Hi][Hi][A B][ ]"),
+        "packed %s widths:\n{out}"
+    );
     assert!(out.contains("T|[Hi]"), "string var stays minimal:\n{out}");
 }
 
@@ -127,7 +133,8 @@ fn feof_is_sticky_not_positional() {
     // run, and blanket `git add -A` commits kept re-tracking it.
     let tmp = std::env::temp_dir().join(format!("xezim_audit45_feof_{}.txt", std::process::id()));
     let tmp_path = tmp.to_string_lossy().replace('\\', "/");
-    let src = format!(r#"
+    let src = format!(
+        r#"
 module top;
   int fd, n, a, b;
   string line;
@@ -146,9 +153,16 @@ module top;
     $fclose(fd);
   end
 endmodule
-"#);
+"#
+    );
     let out = outs(&simulate(&src, 10).expect("sim"));
     let _ = std::fs::remove_file(&tmp);
-    assert!(out.contains("T|n=2 eof=0"), "no flag before a failed read:\n{out}");
-    assert!(out.contains("T|eof2=1"), "flag after the failed read:\n{out}");
+    assert!(
+        out.contains("T|n=2 eof=0"),
+        "no flag before a failed read:\n{out}"
+    );
+    assert!(
+        out.contains("T|eof2=1"),
+        "flag after the failed read:\n{out}"
+    );
 }

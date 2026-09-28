@@ -205,12 +205,20 @@ fn dynamic_array_loop_write_reaches_comb_readers() {
 
 #[test]
 fn dynamic_array_const_index_in_loop_and_var_index_outside_both_notify() {
-    assert_eq!(ok_flag(DYN_INDEX_FORMS), 1, "a dynamic array index form lost its notification");
+    assert_eq!(
+        ok_flag(DYN_INDEX_FORMS),
+        1,
+        "a dynamic array index form lost its notification"
+    );
 }
 
 #[test]
 fn static_array_and_queue_loop_writes_still_notify() {
-    assert_eq!(ok_flag(STATIC_AND_QUEUE), 1, "a static array or queue loop write regressed");
+    assert_eq!(
+        ok_flag(STATIC_AND_QUEUE),
+        1,
+        "a static array or queue loop write regressed"
+    );
 }
 
 #[test]

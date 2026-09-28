@@ -83,7 +83,8 @@ endmodule
     // 3,2,1,0 (§12.7.3, reference-validated — the old 0..3 expectation
     // encoded the pre-fix ascending bug).
     assert!(
-        out.iter().any(|m| m.starts_with("R=0.3 0.2 0.1 0.0 1.3 1.2 1.1 1.0")),
+        out.iter()
+            .any(|m| m.starts_with("R=0.3 0.2 0.1 0.0 1.3 1.2 1.1 1.0")),
         "positive foreach regressed; got {:?}",
         out
     );

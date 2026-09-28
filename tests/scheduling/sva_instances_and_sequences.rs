@@ -47,7 +47,15 @@ fn run(jit: bool) -> String {
     let sv = dir.join(if jit { "t_jit.sv" } else { "t_default.sv" });
     std::fs::write(&sv, DESIGN).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
-    cmd.args(["--simulate", "-s", "top", "--no-cache", sv.to_str().unwrap()]);
+    // `--verbose`: the "[COV] assertions" site summary asserted below.
+    cmd.args([
+        "--simulate",
+        "--verbose",
+        "-s",
+        "top",
+        "--no-cache",
+        sv.to_str().unwrap(),
+    ]);
     if jit {
         cmd.env("XEZIM_JIT", "1");
     }
@@ -60,17 +68,33 @@ fn run(jit: bool) -> String {
 
 fn check(text: &str) {
     // The instance assertions fire once each: req at the t=15 tick, ack never.
-    assert!(text.contains("IFACE-FAIL t=25"), "interface assertion did not fire:\n{text}");
-    assert!(text.contains("SUBMOD-FAIL t=25"), "sub-module assertion did not fire:\n{text}");
-    assert_eq!(text.matches("IFACE-FAIL").count(), 1, "interface assertion count:\n{text}");
+    assert!(
+        text.contains("IFACE-FAIL t=25"),
+        "interface assertion did not fire:\n{text}"
+    );
+    assert!(
+        text.contains("SUBMOD-FAIL t=25"),
+        "sub-module assertion did not fire:\n{text}"
+    );
+    assert_eq!(
+        text.matches("IFACE-FAIL").count(),
+        1,
+        "interface assertion count:\n{text}"
+    );
     // The three sequence properties all pass on this stimulus.
     for bad in ["INLINE-FAIL", "NAMED-FAIL", "NEXT-FAIL"] {
         assert!(!text.contains(bad), "unexpected `{bad}`:\n{text}");
     }
-    assert!(text.contains("COVER-HIT t=25"), "cover property did not report its hit:\n{text}");
+    assert!(
+        text.contains("COVER-HIT t=25"),
+        "cover property did not report its hit:\n{text}"
+    );
     // Six sites: 2 instance asserts + 3 sequence asserts + 1 cover; the cover
     // is counted as cover, and its misses are not failures.
-    assert!(text.contains("assertions: 6 sites (assert=5, assume=0, cover=1)"), "site summary:\n{text}");
+    assert!(
+        text.contains("assertions: 6 sites (assert=5, assume=0, cover=1)"),
+        "site summary:\n{text}"
+    );
     assert!(text.contains("DONE"), "did not finish:\n{text}");
 }
 

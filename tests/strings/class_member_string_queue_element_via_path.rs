@@ -55,8 +55,16 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert!(has_line(&sim, "HELLO"), "h.q[0] displayed as text; got {:?}", sim.output);
-    assert!(has_line(&sim, "WORLD"), "h.q[1] displayed as text; got {:?}", sim.output);
+    assert!(
+        has_line(&sim, "HELLO"),
+        "h.q[0] displayed as text; got {:?}",
+        sim.output
+    );
+    assert!(
+        has_line(&sim, "WORLD"),
+        "h.q[1] displayed as text; got {:?}",
+        sim.output
+    );
 }
 
 /// Control: the identical queue read within the OWNING class method (bare

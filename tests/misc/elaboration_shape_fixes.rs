@@ -29,7 +29,8 @@ module tb;
 endmodule",
     );
     assert!(
-        msgs.iter().any(|m| m == "LP=4 5 6 x=2 1 3 PP=7 8 LU=9 10 BV=101 011"),
+        msgs.iter()
+            .any(|m| m == "LP=4 5 6 x=2 1 3 PP=7 8 LU=9 10 BV=101 011"),
         "{msgs:?}"
     );
 }
@@ -51,7 +52,10 @@ fn struct_pattern_elements_with_module_scope_typedef() {
   end
 endmodule"#,
     );
-    assert!(msgs.iter().any(|m| m == "LP=4 5 6 LL=4 5 LU=9 10"), "{msgs:?}");
+    assert!(
+        msgs.iter().any(|m| m == "LP=4 5 6 LL=4 5 LU=9 10"),
+        "{msgs:?}"
+    );
 }
 
 #[test]

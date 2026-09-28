@@ -90,7 +90,11 @@ endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
     assert_eq!(u(&sim, "ok_1d"), 1, "the 1-D control still holds");
-    assert_eq!(u(&sim, "ok_2d"), 1, "every element of every draw is in range");
+    assert_eq!(
+        u(&sim, "ok_2d"),
+        1,
+        "every element of every draw is in range"
+    );
 }
 
 /// An UNconstrained 2-D rand array must still be randomized (the pool pass now
@@ -115,5 +119,8 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert!(u(&sim, "nonzero") > 0, "elements take random values across draws");
+    assert!(
+        u(&sim, "nonzero") > 0,
+        "elements take random values across draws"
+    );
 }

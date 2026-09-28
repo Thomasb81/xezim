@@ -86,5 +86,8 @@ module tb;
   initial begin #1; $display("SHAD q=%0d", q.o); end
 endmodule
 "#);
-    assert!(o.contains("SHAD q=1"), "sibling member shadowing broke:\n{o}");
+    assert!(
+        o.contains("SHAD q=1"),
+        "sibling member shadowing broke:\n{o}"
+    );
 }

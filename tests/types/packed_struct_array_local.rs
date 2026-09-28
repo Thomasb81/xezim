@@ -132,6 +132,8 @@ module tb;
   end
 endmodule
 "#);
-    assert!(o.contains("LOC=a5 ARR=3c"), "two-dim typedef local parse/shape wrong:\n{o}");
+    assert!(
+        o.contains("LOC=a5 ARR=3c"),
+        "two-dim typedef local parse/shape wrong:\n{o}"
+    );
 }
-

@@ -45,8 +45,29 @@ module top;
 endmodule
 "#;
     let out: Vec<String> = simulate_multi(
-        &[src.to_string()], 1000, Some("top"), &[], &[], None, false, None, None,
-        &[], &[], None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &[src.to_string()],
+        1000,
+        Some("top"),
+        &[],
+        &[],
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
     )
     .expect("sim")
     .output
@@ -54,11 +75,14 @@ endmodule
     .map(|o| o.message.clone())
     .collect();
     assert!(
-        out.iter().any(|l| l == "TYN11 'More than one instance of type 'comp_b found'"),
-        "no-parens static method must be invoked (type name resolved); got {:?}", out
+        out.iter()
+            .any(|l| l == "TYN11 'More than one instance of type 'comp_b found'"),
+        "no-parens static method must be invoked (type name resolved); got {:?}",
+        out
     );
     assert!(
         out.iter().any(|l| l == "TYN11 direct ['comp_b']"),
-        "direct Class::method no-parens must call the method; got {:?}", out
+        "direct Class::method no-parens must call the method; got {:?}",
+        out
     );
 }

@@ -93,7 +93,8 @@ fn zero_mask_elides_only_pure_calls() {
     assert!(got.contains(&"NOTE: or_l=1023".to_string()), "{got:?}");
     assert!(got.contains(&"NOTE: or_r=1023".to_string()), "{got:?}");
     assert!(
-        got.iter().any(|l| l.starts_with("NOTE: xmask=") && l.contains('x')),
+        got.iter()
+            .any(|l| l.starts_with("NOTE: xmask=") && l.contains('x')),
         "an x mask is not all-zero, so the result must carry x: {got:?}"
     );
 }

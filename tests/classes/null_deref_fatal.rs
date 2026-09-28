@@ -21,7 +21,13 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
-    assert!(msgs.iter().any(|m| m.contains("null object dereference")), "error reported");
+    assert!(
+        msgs.iter().any(|m| m.contains("null object dereference")),
+        "error reported"
+    );
     assert!(msgs.iter().any(|m| m == "T|pre"));
-    assert!(!msgs.iter().any(|m| m == "T|post"), "sim must stop at the deref");
+    assert!(
+        !msgs.iter().any(|m| m == "T|post"),
+        "sim must stop at the deref"
+    );
 }

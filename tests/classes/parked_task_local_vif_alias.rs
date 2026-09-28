@@ -37,8 +37,18 @@ module tb;
 endmodule
 "#,
     );
-    for want in ["A5 i=0 id=1", "A5 i=1 id=1", "A5 i=2 id=1", "A7 i=0 id=2", "A7 i=1 id=2", "A7 i=2 id=2"] {
-        assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+    for want in [
+        "A5 i=0 id=1",
+        "A5 i=1 id=1",
+        "A5 i=2 id=1",
+        "A7 i=0 id=2",
+        "A7 i=1 id=2",
+        "A7 i=2 id=2",
+    ] {
+        assert!(
+            msgs.iter().any(|m| m == want),
+            "missing {want}; got {msgs:?}"
+        );
     }
 }
 
@@ -55,5 +65,8 @@ module tb;
 endmodule
 "#,
     );
-    assert!(msgs.iter().any(|m| m == "G id=2") && msgs.iter().any(|m| m == "G id=1"), "got {msgs:?}");
+    assert!(
+        msgs.iter().any(|m| m == "G id=2") && msgs.iter().any(|m| m == "G id=1"),
+        "got {msgs:?}"
+    );
 }

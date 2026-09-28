@@ -59,14 +59,23 @@ fn elab_err(files: &[(&str, &str)]) -> String {
 #[test]
 fn duplicate_parameter_reports_both_locations_across_files() {
     let err = elab_err(&[
-        ("a_pkg.sv", "package cfg_pkg;\n  parameter int UNUSED_A = 1;\n  parameter int UNUSED_B = 2;\nendpackage\n"),
-        ("b_defs.sv", "package other_pkg;\n  parameter int SOMETHING = 3;\nendpackage\n"),
+        (
+            "a_pkg.sv",
+            "package cfg_pkg;\n  parameter int UNUSED_A = 1;\n  parameter int UNUSED_B = 2;\nendpackage\n",
+        ),
+        (
+            "b_defs.sv",
+            "package other_pkg;\n  parameter int SOMETHING = 3;\nendpackage\n",
+        ),
         (
             "c_bfm.sv",
             "module cfg_bfm;\n  parameter int CONFIG = 5;\n  localparam int CONFIG = 9;\n  initial $display(\"%0d\", CONFIG);\nendmodule\n",
         ),
     ]);
-    assert!(err.contains("duplicate declaration of 'CONFIG'"), "got: {err}");
+    assert!(
+        err.contains("duplicate declaration of 'CONFIG'"),
+        "got: {err}"
+    );
     assert!(
         err.contains("first declaration (parameter/localparam) is at"),
         "must point at the FIRST declaration; got: {err}"
@@ -89,7 +98,10 @@ fn duplicate_variable_reports_both_locations() {
         "m.sv",
         "module dut4;\n  int  thing;\n  real thing;\n  initial $display(\"%0d\", thing);\nendmodule\n",
     )]);
-    assert!(err.contains("duplicate declaration of 'thing'"), "got: {err}");
+    assert!(
+        err.contains("duplicate declaration of 'thing'"),
+        "got: {err}"
+    );
     assert!(
         err.contains("first declaration (variable/net) is at"),
         "must point at the FIRST declaration; got: {err}"
@@ -128,8 +140,29 @@ fn local_declaration_beats_an_unimported_packages_enum_member() {
     ];
     let paths = ["pkg.sv".to_string(), "bfm.sv".to_string()];
     let sim = xezim::simulate_multi(
-        &sources, 10, None, &[], &paths, None, false, None, None, &[], &[],
-        None, &[], 0, u64::MAX, None, &[], None, None, None, None, false, None,
+        &sources,
+        10,
+        None,
+        &[],
+        &paths,
+        None,
+        false,
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+        0,
+        u64::MAX,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
     )
     .expect("a local declaration must not collide with an unimported package's enum member");
     let v = sim
@@ -147,11 +180,23 @@ fn local_declaration_beats_an_unimported_packages_enum_member() {
 #[test]
 fn unimported_package_name_declared_twice_is_still_a_duplicate() {
     let err = elab_err(&[
-        ("pkg.sv", "package p;\n  typedef enum logic [1:0] { CONFIG = 2'b00, B = 2'b01 } e_t;\nendpackage\n"),
-        ("bfm.sv", "module m2;\n  int CONFIG = 5;\n  int CONFIG = 6;\nendmodule\n"),
+        (
+            "pkg.sv",
+            "package p;\n  typedef enum logic [1:0] { CONFIG = 2'b00, B = 2'b01 } e_t;\nendpackage\n",
+        ),
+        (
+            "bfm.sv",
+            "module m2;\n  int CONFIG = 5;\n  int CONFIG = 6;\nendmodule\n",
+        ),
     ]);
-    assert!(err.contains("duplicate declaration of 'CONFIG'"), "got: {err}");
-    assert!(err.contains("bfm.sv:3"), "must point at the second local decl; got: {err}");
+    assert!(
+        err.contains("duplicate declaration of 'CONFIG'"),
+        "got: {err}"
+    );
+    assert!(
+        err.contains("bfm.sv:3"),
+        "must point at the second local decl; got: {err}"
+    );
     assert!(
         !err.contains("enum member"),
         "must blame the local declaration, not the package member; got: {err}"

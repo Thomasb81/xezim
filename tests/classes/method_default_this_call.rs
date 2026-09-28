@@ -69,6 +69,14 @@ module tb;
 endmodule
 ";
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "dflt_ok"), 1, "default arg evaluated via get_default_data (zero case)");
-    assert_eq!(u(&sim, "trig_ok"), 1, "default arg evaluated via get_default_data (set case)");
+    assert_eq!(
+        u(&sim, "dflt_ok"),
+        1,
+        "default arg evaluated via get_default_data (zero case)"
+    );
+    assert_eq!(
+        u(&sim, "trig_ok"),
+        1,
+        "default arg evaluated via get_default_data (set case)"
+    );
 }

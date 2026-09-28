@@ -31,7 +31,12 @@ module tb;
   end
 endmodule",
     );
-    for want in ["165000 A trigger", "165000 B woke on ev", "165000 C woke on flag", "165000 joined"] {
+    for want in [
+        "165000 A trigger",
+        "165000 B woke on ev",
+        "165000 C woke on flag",
+        "165000 joined",
+    ] {
         assert!(msgs.iter().any(|m| m == want), "missing {want}: {msgs:?}");
     }
 }

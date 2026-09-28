@@ -185,6 +185,14 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 400).expect("simulate failed");
-    assert_eq!(u(&sim, "lo"), 0xDEAD_BEEF, "element 0 lands in the low bits");
-    assert_eq!(u(&sim, "hi"), 0xCAFE_BABE, "element 4 lands in the high bits");
+    assert_eq!(
+        u(&sim, "lo"),
+        0xDEAD_BEEF,
+        "element 0 lands in the low bits"
+    );
+    assert_eq!(
+        u(&sim, "hi"),
+        0xCAFE_BABE,
+        "element 4 lands in the high bits"
+    );
 }

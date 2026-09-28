@@ -50,14 +50,23 @@ fn monitor_percent_m_names_the_arming_instance_from_the_first_render() {
     assert_eq!(
         n.first().map(String::as_str),
         Some("NOTE: inline testbench.u_probe"),
-        "inline %m must name the bound instance; got {:?}", n
+        "inline %m must name the bound instance; got {:?}",
+        n
     );
-    let monitors: Vec<&String> = n.iter().filter(|l| l.starts_with("NOTE: monitor ")).collect();
-    assert!(monitors.len() >= 2, "expected repeated monitor renders, got {:?}", n);
+    let monitors: Vec<&String> = n
+        .iter()
+        .filter(|l| l.starts_with("NOTE: monitor "))
+        .collect();
+    assert!(
+        monitors.len() >= 2,
+        "expected repeated monitor renders, got {:?}",
+        n
+    );
     for line in &monitors {
         assert!(
             line.starts_with("NOTE: monitor testbench.u_probe "),
-            "every monitor render must name the arming instance; got {:?}", monitors
+            "every monitor render must name the arming instance; got {:?}",
+            monitors
         );
     }
 }
@@ -119,7 +128,8 @@ endmodule
     let n = notes(src);
     assert!(
         n.iter().all(|l| l.starts_with("NOTE: monitor top ")),
-        "a top-level monitor must name the top, got {:?}", n
+        "a top-level monitor must name the top, got {:?}",
+        n
     );
 }
 

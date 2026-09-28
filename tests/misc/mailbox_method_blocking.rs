@@ -16,7 +16,15 @@ fn run(name: &str, src: &str) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "test", path.to_str().unwrap(), "--no-cache", "--max-time", "1000"])
+        .args([
+            "--simulate",
+            "-s",
+            "test",
+            path.to_str().unwrap(),
+            "--no-cache",
+            "--max-time",
+            "1000",
+        ])
         .output()
         .expect("run xezim");
     format!(
@@ -28,7 +36,9 @@ fn run(name: &str, src: &str) -> String {
 
 #[test]
 fn nested_handle_peek_get_chain() {
-    let text = run("nested_handle_peek_get_chain", r#"class fifo_c;
+    let text = run(
+        "nested_handle_peek_get_chain",
+        r#"class fifo_c;
   mailbox #(int) m;
   function new(); m = new(1); endfunction
   function bit try_put_it(int v); return m.try_put(v); endfunction
@@ -42,7 +52,8 @@ module test;
   initial begin w.fifo.peek_it(a); $display("T|peek a=%0d @%0t", a, $time); end
   initial begin w.fifo.get_it(b);  $display("T|get b=%0d @%0t", b, $time); end
   initial begin #5 ok = w.fifo.try_put_it(42); $display("T|tp=%0d @%0t", ok, $time); #10 $finish; end
-endmodule"#);
+endmodule"#,
+    );
     assert!(text.contains("T|tp=1 @5"), "{text}");
     assert!(text.contains("T|peek a=42 @5"), "{text}");
     assert!(text.contains("T|get b=42 @5"), "{text}");
@@ -50,7 +61,9 @@ endmodule"#);
 
 #[test]
 fn bounded_put_blocks_and_admits() {
-    let text = run("bounded_put_blocks_and_admits", r#"class fifo_c;
+    let text = run(
+        "bounded_put_blocks_and_admits",
+        r#"class fifo_c;
   mailbox #(int) m;
   function new(); m = new(2); endfunction
   task put_it(int v); m.put(v); endtask
@@ -68,7 +81,8 @@ module test;
   initial begin
     #10 f.get_it(x); $display("T|got %0d @%0t", x, $time);
   end
-endmodule"#);
+endmodule"#,
+    );
     assert!(text.contains("T|put2 @0"), "{text}");
     assert!(text.contains("T|got 1 @10"), "{text}");
     assert!(text.contains("T|put3 @10"), "{text}");
@@ -76,7 +90,9 @@ endmodule"#);
 
 #[test]
 fn semaphore_through_methods() {
-    let text = run("semaphore_through_methods", r#"class sem_c;
+    let text = run(
+        "semaphore_through_methods",
+        r#"class sem_c;
   semaphore s;
   function new(); s = new(0); endfunction
   task grab(); s.get(1); endtask
@@ -91,13 +107,16 @@ module test;
     $finish;
   end
   initial begin #7 c.free(); $display("T|freed @%0t", $time); end
-endmodule"#);
+endmodule"#,
+    );
     assert!(text.contains("T|grabbed @7"), "{text}");
 }
 
 #[test]
 fn class_event_through_methods() {
-    let text = run("class_event_through_methods", r#"class ev_c;
+    let text = run(
+        "class_event_through_methods",
+        r#"class ev_c;
   event ev;
   task wait_it(); @(ev); endtask
   function void fire(); -> ev; endfunction
@@ -111,13 +130,16 @@ module test;
     $finish;
   end
   initial begin #6 c.fire(); end
-endmodule"#);
+endmodule"#,
+    );
     assert!(text.contains("T|woke @6"), "{text}");
 }
 
 #[test]
 fn try_family_and_num() {
-    let text = run("try_family_and_num", r#"class fifo_c;
+    let text = run(
+        "try_family_and_num",
+        r#"class fifo_c;
   mailbox #(int) m;
   function new(); m = new(4); endfunction
   function bit tg(output int x); return m.try_get(x); endfunction
@@ -135,7 +157,8 @@ module test;
     g = f.tg(x);  $display("T|got=%0d x=%0d num=%0d", g, x, f.n());
     $finish;
   end
-endmodule"#);
+endmodule"#,
+    );
     assert!(text.contains("T|empty tg=0 tp=0 num=0"), "{text}");
     assert!(text.contains("T|peeked=1 x=5 num=2"), "{text}");
     assert!(text.contains("T|got=1 x=5 num=1"), "{text}");
@@ -143,7 +166,9 @@ endmodule"#);
 
 #[test]
 fn two_gets_round_robin() {
-    let text = run("two_gets_round_robin", r#"class fifo_c;
+    let text = run(
+        "two_gets_round_robin",
+        r#"class fifo_c;
   mailbox #(int) m;
   function new(); m = new(); endfunction
   task get_it(output int x); m.get(x); endtask
@@ -158,7 +183,8 @@ module test;
     #5 f.m.put(2);
     #5 $finish;
   end
-endmodule"#);
+endmodule"#,
+    );
     assert!(text.contains("T|A=1 @5"), "{text}");
     assert!(text.contains("T|B=2 @10"), "{text}");
 }

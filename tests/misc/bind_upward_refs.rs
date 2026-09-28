@@ -91,7 +91,11 @@ endmodule
     let pvals: Vec<&str> = text.lines().filter(|l| l.starts_with("PVAL ")).collect();
     assert_eq!(pvals.len(), 2, "both proxies must run:\n{}", text);
     for l in &pvals {
-        assert_eq!(*l, "PVAL '{id:777, active:1}", "%p upward struct:\n{}", text);
+        assert_eq!(
+            *l, "PVAL '{id:777, active:1}",
+            "%p upward struct:\n{}",
+            text
+        );
     }
     let p0vals: Vec<&str> = text.lines().filter(|l| l.starts_with("P0VAL ")).collect();
     for l in &p0vals {
@@ -146,7 +150,9 @@ endmodule
         text
     );
     assert!(
-        ticks.iter().any(|l| l.contains(" 15 ") || l.contains(" 20 ")),
+        ticks
+            .iter()
+            .any(|l| l.contains(" 15 ") || l.contains(" 20 ")),
         "expected strobes at later ticks:\n{}",
         text
     );

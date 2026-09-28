@@ -52,8 +52,14 @@ module tb;
   initial begin repeat (3) @(posedge clk); $finish; end
 endmodule
 "#);
-    assert!(out.contains("PUT num=1"), "put did not land in the mailbox:\n{out}");
-    assert!(out.contains("GET ok=1 got=42"), "try_get did not retrieve it:\n{out}");
+    assert!(
+        out.contains("PUT num=1"),
+        "put did not land in the mailbox:\n{out}"
+    );
+    assert!(
+        out.contains("GET ok=1 got=42"),
+        "try_get did not retrieve it:\n{out}"
+    );
     assert!(out.contains("END num=0"), "mailbox not drained:\n{out}");
 }
 
@@ -80,7 +86,10 @@ module tb;
   initial begin repeat (3) @(posedge clk); $finish; end
 endmodule
 "#);
-    assert!(out.contains("N 3 1 0"), "elements are not independent mailboxes:\n{out}");
+    assert!(
+        out.contains("N 3 1 0"),
+        "elements are not independent mailboxes:\n{out}"
+    );
 }
 
 #[test]
@@ -107,8 +116,14 @@ module tb;
   initial begin repeat (3) @(posedge clk); $finish; end
 endmodule
 "#);
-    assert!(out.contains("G0 num=1"), "genvar-indexed mailbox 0 empty:\n{out}");
-    assert!(out.contains("G1 num=1"), "genvar-indexed mailbox 1 empty:\n{out}");
+    assert!(
+        out.contains("G0 num=1"),
+        "genvar-indexed mailbox 0 empty:\n{out}"
+    );
+    assert!(
+        out.contains("G1 num=1"),
+        "genvar-indexed mailbox 1 empty:\n{out}"
+    );
 }
 
 #[test]
@@ -137,9 +152,15 @@ module tb;
 endmodule
 "#);
     // Two keys available, so the third attempt must fail.
-    assert!(out.contains("S1 ok=1"), "semaphore array element not allocated:\n{out}");
+    assert!(
+        out.contains("S1 ok=1"),
+        "semaphore array element not allocated:\n{out}"
+    );
     assert!(out.contains("S2 ok=1"), "second key not available:\n{out}");
-    assert!(out.contains("S3 ok=0"), "semaphore handed out more keys than it had:\n{out}");
+    assert!(
+        out.contains("S3 ok=0"),
+        "semaphore handed out more keys than it had:\n{out}"
+    );
 }
 
 // ---------------------------------------------------------------------------

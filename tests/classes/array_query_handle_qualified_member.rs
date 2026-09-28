@@ -61,8 +61,16 @@ endmodule
          the operand's 32-bit width:\n{}",
         o
     );
-    assert!(o.contains("N 2 4"), "per-dimension query on a 2-D member:\n{}", o);
-    assert!(o.contains("F 3"), "foreach over the same member still iterates 3:\n{}", o);
+    assert!(
+        o.contains("N 2 4"),
+        "per-dimension query on a 2-D member:\n{}",
+        o
+    );
+    assert!(
+        o.contains("F 3"),
+        "foreach over the same member still iterates 3:\n{}",
+        o
+    );
 }
 
 /// `this.M` resolves through the current handle, and an inherited member
@@ -89,7 +97,11 @@ endmodule
 "#;
     let o = out(SRC);
     assert!(o.contains("T 5"), "$size(this.M):\n{}", o);
-    assert!(o.contains("I 5"), "$size on an INHERITED member through a handle:\n{}", o);
+    assert!(
+        o.contains("I 5"),
+        "$size on an INHERITED member through a handle:\n{}",
+        o
+    );
 }
 
 /// A non-array member keeps the bit-width answer: `$size` of a packed field is
@@ -109,5 +121,9 @@ module top;
 endmodule
 "#;
     let o = out(SRC);
-    assert!(o.contains("B 89"), "packed member keeps its bit width:\n{}", o);
+    assert!(
+        o.contains("B 89"),
+        "packed member keeps its bit width:\n{}",
+        o
+    );
 }

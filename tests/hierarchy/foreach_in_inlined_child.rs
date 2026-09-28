@@ -59,11 +59,23 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "c_fe"), 36, "child reads its own array inside foreach");
+    assert_eq!(
+        u(&sim, "c_fe"),
+        36,
+        "child reads its own array inside foreach"
+    );
     assert_eq!(u(&sim, "c_for"), 36, "explicit loop agrees");
-    assert_eq!(u(&sim, "c_const"), 66, "a constant index inside the loop body");
+    assert_eq!(
+        u(&sim, "c_const"),
+        66,
+        "a constant index inside the loop body"
+    );
     assert_eq!(u(&sim, "c_1d"), 6, "one dimension was never affected");
-    assert_eq!(u(&sim, "p_fe"), 36, "parent reads the child's array inside foreach");
+    assert_eq!(
+        u(&sim, "p_fe"),
+        36,
+        "parent reads the child's array inside foreach"
+    );
     assert_eq!(u(&sim, "p_explicit"), 36);
     assert_eq!(u(&sim, "p_1d"), 6);
 }

@@ -28,7 +28,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "w"), 15, "extends Base#(N*3) evaluates with N bound");
+    assert_eq!(
+        u(&sim, "w"),
+        15,
+        "extends Base#(N*3) evaluates with N bound"
+    );
 }
 
 #[test]
@@ -52,5 +56,9 @@ endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
     assert_eq!(u(&sim, "iv"), 2, "nested class constructs with its inits");
-    assert_eq!(u(&sim, "os"), 5, "inner method sees enclosing class statics");
+    assert_eq!(
+        u(&sim, "os"),
+        5,
+        "inner method sees enclosing class statics"
+    );
 }

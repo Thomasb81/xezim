@@ -65,6 +65,14 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> i64 {
 #[test]
 fn property_new_initializer_constructs() {
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "sv"), 7, "simple s1 = new() must construct (not null)");
-    assert_eq!(u(&sim, "cv"), 14, "catcher c1 = new(14) must construct with arg");
+    assert_eq!(
+        u(&sim, "sv"),
+        7,
+        "simple s1 = new() must construct (not null)"
+    );
+    assert_eq!(
+        u(&sim, "cv"),
+        14,
+        "catcher c1 = new(14) must construct with arg"
+    );
 }

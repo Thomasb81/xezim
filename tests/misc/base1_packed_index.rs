@@ -21,7 +21,15 @@ fn run(name: &str, top: &str, src_path: Option<&str>, src_inline: Option<&str>) 
         p
     };
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", top, path.to_str().unwrap(), "--no-cache", "--max-time", "10000"])
+        .args([
+            "--simulate",
+            "-s",
+            top,
+            path.to_str().unwrap(),
+            "--no-cache",
+            "--max-time",
+            "10000",
+        ])
         .output()
         .expect("run xezim");
     format!(
@@ -70,7 +78,15 @@ fn lane_expander_lfsr_no_x_leak() {
     // The full self-checking lane-expander TB (renamed): pipe+skid input
     // stage, base-1 packed status vectors, LFSR stimulus with $isunknown
     // checks every cycle. Reference-verified ALL-PASS.
-    let text = run("lanex", "tb_lane_exp", Some("tests/misc/svtb/lane_expander.sv"), None);
-    assert!(text.contains(">>> ALL TESTS PASSED SUCCESSFULLY <<<"), "{text}");
+    let text = run(
+        "lanex",
+        "tb_lane_exp",
+        Some("tests/misc/svtb/lane_expander.sv"),
+        None,
+    );
+    assert!(
+        text.contains(">>> ALL TESTS PASSED SUCCESSFULLY <<<"),
+        "{text}"
+    );
     assert!(!text.contains("SVCHECK FAILED"), "{text}");
 }

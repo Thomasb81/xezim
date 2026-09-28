@@ -70,7 +70,11 @@ fn lexical_string_and_literal_semantics() {
     assert_eq!(u(&sim, "enum_def"), 0, "bare enum default-initializes to 0");
     assert_eq!(u(&sim, "atoi_ws"), 0, "atoi does not skip whitespace");
     assert_eq!(u(&sim, "atoi_us"), 1234, "atoi accepts underscores");
-    assert_eq!(u(&sim, "atoi_neg") as u32 as i32, -873, "atoi signed result");
+    assert_eq!(
+        u(&sim, "atoi_neg") as u32 as i32,
+        -873,
+        "atoi signed result"
+    );
     assert_eq!(u(&sim, "cast_len"), 2, "string cast strips NUL bytes");
     // {<<8{32'hAABBCCDD}} = DD CC BB AA, element 0 first; the signed byte
     // elements sign-extend into the int destinations (0xDD = -35).

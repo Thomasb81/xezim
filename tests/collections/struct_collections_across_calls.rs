@@ -57,8 +57,16 @@ endmodule
     assert_eq!(u(&sim, "r_n"), 1, "ref queue formal");
     assert_eq!(u(&sim, "i_n"), 1, "inout queue formal");
     assert_eq!(u(&sim, "o_n"), 1, "output queue formal");
-    assert_eq!(u(&sim, "read_n"), 2, "an input formal sees the caller's queue, not a previous call's");
-    assert_eq!((u(&sim, "d_n"), u(&sim, "d0")), (2, 5), "ref dynamic-array formal");
+    assert_eq!(
+        u(&sim, "read_n"),
+        2,
+        "an input formal sees the caller's queue, not a previous call's"
+    );
+    assert_eq!(
+        (u(&sim, "d_n"), u(&sim, "d0")),
+        (2, 5),
+        "ref dynamic-array formal"
+    );
     assert_eq!(u(&sim, "as_k"), 9, "ref associative formal");
 }
 
@@ -92,7 +100,11 @@ endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "sq_n"), 1);
-    assert_eq!((u(&sim, "sq0a"), u(&sim, "sq0b")), (3, 0x33), "queue-of-structs element members");
+    assert_eq!(
+        (u(&sim, "sq0a"), u(&sim, "sq0b")),
+        (3, 0x33),
+        "queue-of-structs element members"
+    );
     assert_eq!(u(&sim, "arr_sum"), 7, "struct-array input formal");
     assert_eq!(u(&sim, "out_a"), 77, "struct-array output formal");
 }
@@ -138,10 +150,18 @@ endmodule
     assert_eq!(u(&sim, "m_x"), 0x01, "module scope");
     assert_eq!(u(&sim, "i_x"), 0x11, "instance scope");
     assert_eq!(u(&sim, "c_x"), 0x01, "whole nested copy");
-    assert_eq!((u(&sim, "l_x"), u(&sim, "l_z")), (0x21, 0x23), "subroutine local");
+    assert_eq!(
+        (u(&sim, "l_x"), u(&sim, "l_z")),
+        (0x21, 0x23),
+        "subroutine local"
+    );
     assert_eq!(u(&sim, "f_in"), 0x02, "nested member of an input formal");
     assert_eq!(u(&sim, "o_x"), 0x31, "nested member of an output formal");
-    assert_eq!((u(&sim, "r_x"), u(&sim, "r_z")), (0x41, 0x43), "nested struct return");
+    assert_eq!(
+        (u(&sim, "r_x"), u(&sim, "r_z")),
+        (0x41, 0x43),
+        "nested struct return"
+    );
 }
 
 /// A struct with an unpacked-ARRAY member, through every scope and boundary.

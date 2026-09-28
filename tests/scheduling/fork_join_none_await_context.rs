@@ -22,10 +22,7 @@ fn messages(sim: &xezim::compiler::Simulator) -> Vec<String> {
 fn assert_pass(sim: &xezim::compiler::Simulator, tag: &str) {
     let msgs = messages(sim);
     let pass = msgs.iter().any(|m| m.contains(&format!("{tag}_PASS")));
-    assert!(
-        pass,
-        "expected {tag}_PASS in output\nfull output: {msgs:?}"
-    );
+    assert!(pass, "expected {tag}_PASS in output\nfull output: {msgs:?}");
 }
 
 /// A task forks a child that parks on a producer process's `await()` while the

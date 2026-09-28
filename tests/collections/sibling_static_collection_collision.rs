@@ -144,7 +144,7 @@ endmodule
 /// `uvm_sequence_library_utils` pattern: `simple_seq_lib_RST` redeclares
 /// `static m_typewide_sequences[$]` and `simple_seq_lib` (a subclass) inherits
 /// the base's — a `d::q` push must never bleed into `b::q` and vice-versa.
-/// Questa keeps `b::q` = [1,2] and `d::q` = [3].
+/// The reference simulator keeps `b::q` = [1,2] and `d::q` = [3].
 #[test]
 fn derived_redeclared_static_queue_is_separate_from_base() {
     let src = r#"
@@ -212,7 +212,7 @@ endmodule
 /// `uvm_sequence_library` `init_sequence_library()` pattern: the base `new`
 /// runs the base method reading `this_type::typewide` (the base cell), while
 /// the derived `new` runs the derived method reading `Derived::typewide` (its
-/// own cell). Questa's derived instance ends up holding BOTH the base's
+/// own cell). The reference simulator's derived instance ends up holding BOTH the base's
 /// [1,2] and its own [3] = 3 elements.
 #[test]
 fn base_method_this_type_static_resolves_to_defining_class() {

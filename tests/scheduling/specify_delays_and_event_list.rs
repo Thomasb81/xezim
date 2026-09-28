@@ -66,7 +66,11 @@ endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
     assert_eq!(u(&sim, "t_y1"), 14, "assign-cell path delay (a => y) = 4");
-    assert_eq!(u(&sim, "t_y2"), 13, "gate-cell path delay (a => y) = 3 — was 10 (dropped)");
+    assert_eq!(
+        u(&sim, "t_y2"),
+        13,
+        "gate-cell path delay (a => y) = 3 — was 10 (dropped)"
+    );
 }
 
 /// A computed-RHS cell output still works with NO specify — the compile gate
@@ -120,7 +124,10 @@ endmodule
     assert_eq!(u(&sim, "t_pos"), 10, "posedge capture");
     assert_eq!(u(&sim, "t_any"), 20, "any-edge capture — was stuck at 0");
     assert_eq!(u(&sim, "t_neg"), 20, "negedge capture");
-    assert!(u(&sim, "runs") >= 2, "the counter body re-fires per listed change");
+    assert!(
+        u(&sim, "runs") >= 2,
+        "the counter body re-fires per listed change"
+    );
 }
 
 /// A list wider than the body's reads must fire on the extra signal too —

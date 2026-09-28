@@ -65,10 +65,18 @@ endmodule
 "
     );
     let sim = simulate(&src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "gen_mp"), 0x11, "generic port, modport-qualified connection");
+    assert_eq!(
+        u(&sim, "gen_mp"),
+        0x11,
+        "generic port, modport-qualified connection"
+    );
     assert_eq!(u(&sim, "gen_pl"), 0x11, "generic port, plain connection");
     assert_eq!(u(&sim, "typ_mp"), 0x22, "typed modport port");
-    assert_eq!(u(&sim, "typ_pl"), 0x22, "typed modport port, plain connection");
+    assert_eq!(
+        u(&sim, "typ_pl"),
+        0x22,
+        "typed modport port, plain connection"
+    );
     assert_eq!(u(&sim, "pln_mp"), 0x33, "plain interface port");
 }
 
@@ -129,8 +137,24 @@ endmodule
     );
     let sim = simulate(&src, 50).expect("simulate failed");
     assert_eq!(u(&sim, "dup"), 0x5a, "generic port drives");
-    assert_eq!(u(&sim, "ack"), 0xa5, "generic port reads back what it drove");
-    assert_eq!(u(&sim, "recv"), 0x5a, "a second generic port reads the same interface");
-    assert_eq!(u(&sim, "nest"), 0x3c, "generic port handed down to another generic port");
-    assert_eq!((u(&sim, "two0"), u(&sim, "two1")), (0x01, 0x02), "two generic ports on one module");
+    assert_eq!(
+        u(&sim, "ack"),
+        0xa5,
+        "generic port reads back what it drove"
+    );
+    assert_eq!(
+        u(&sim, "recv"),
+        0x5a,
+        "a second generic port reads the same interface"
+    );
+    assert_eq!(
+        u(&sim, "nest"),
+        0x3c,
+        "generic port handed down to another generic port"
+    );
+    assert_eq!(
+        (u(&sim, "two0"), u(&sim, "two1")),
+        (0x01, 0x02),
+        "two generic ports on one module"
+    );
 }

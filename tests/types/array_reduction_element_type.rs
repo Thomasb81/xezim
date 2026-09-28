@@ -47,7 +47,11 @@ fn array_reductions_are_element_typed() {
     // into the 32-bit destination.
     assert_eq!(i(&sim, "r_sum"), -73, "byte fixed-array sum");
     // -5 * 3 * -120 = 1800; wrapped at 8 bits = 8.
-    assert_eq!(i(&sim, "r_prod"), 8, "byte queue product wraps at element width");
+    assert_eq!(
+        i(&sim, "r_prod"),
+        8,
+        "byte queue product wraps at element width"
+    );
     assert_eq!(i(&sim, "r_min"), -120, "signed min comparison");
     assert_eq!(i(&sim, "r_max"), 3, "signed max comparison");
     // Unsigned 32-bit elements: 10 + 0xFFFF_FFF0 + 6 wraps to 0.

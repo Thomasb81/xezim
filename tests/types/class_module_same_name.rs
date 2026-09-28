@@ -49,5 +49,9 @@ fn class_and_module_can_share_a_name() {
     // If the module had clobbered the class, `t.get()` would not see the
     // constructor's value (constructed through the module's empty body) and
     // `out` would be 0 instead of 42.
-    assert_eq!(u(&sim, "out"), 42, "class-typed handle must not be clobbered by a same-named module");
+    assert_eq!(
+        u(&sim, "out"),
+        42,
+        "class-typed handle must not be clobbered by a same-named module"
+    );
 }

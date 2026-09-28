@@ -60,5 +60,9 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert!(msgs(&sim).iter().any(|m| m == "T|A1 B0"), "got {:?}", msgs(&sim));
+    assert!(
+        msgs(&sim).iter().any(|m| m == "T|A1 B0"),
+        "got {:?}",
+        msgs(&sim)
+    );
 }

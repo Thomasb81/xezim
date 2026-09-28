@@ -65,10 +65,28 @@ fn single_top_module_unchanged() {
     let o = out(r#"
 module top; initial $display("M=%m"); endmodule
 "#);
-    assert!(o.contains("M=top"), "single-top %m must be the bare name; got: {}", o);
+    assert!(
+        o.contains("M=top"),
+        "single-top %m must be the bare name; got: {}",
+        o
+    );
     assert!(
         !o.contains("__xezim_multi_top"),
         "single-top must not synthesize a wrapper; got: {}",
         o
     );
+}
+
+/// Several auto-detected tops elaborate in SOURCE order, not name order, so
+/// their time-0 processes start in declaration order. Expectation
+/// cross-checked against the reference simulator (its top-level list and
+/// time-0 output follow the order the modules appear in the source).
+#[test]
+fn multiple_top_level_modules_run_in_source_order() {
+    let o = out(r#"
+module zeta; initial $display("zeta %m"); endmodule
+module alpha; initial $display("alpha %m"); endmodule
+module mid; initial $display("mid %m"); endmodule
+"#);
+    assert_eq!(o, "zeta zeta\nalpha alpha\nmid mid");
 }

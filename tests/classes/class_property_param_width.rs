@@ -153,11 +153,31 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 fn class_property_range_resolves_every_parameter_scope() {
     let sim = simulate(SCOPES, 100).expect("simulate failed");
     assert_eq!(u(&sim, "w_lit"), 16, "literal range (never broken)");
-    assert_eq!(u(&sim, "w_mp"), 12, "module parameter in a class property range");
-    assert_eq!(u(&sim, "w_lp"), 10, "module localparam in a class property range");
-    assert_eq!(u(&sim, "w_pp"), 20, "package parameter in a class property range");
-    assert_eq!(u(&sim, "w_up"), 24, "$unit parameter in a class property range");
-    assert_eq!(u(&sim, "w_cp"), 6, "class-body localparam in a class property range");
+    assert_eq!(
+        u(&sim, "w_mp"),
+        12,
+        "module parameter in a class property range"
+    );
+    assert_eq!(
+        u(&sim, "w_lp"),
+        10,
+        "module localparam in a class property range"
+    );
+    assert_eq!(
+        u(&sim, "w_pp"),
+        20,
+        "package parameter in a class property range"
+    );
+    assert_eq!(
+        u(&sim, "w_up"),
+        24,
+        "$unit parameter in a class property range"
+    );
+    assert_eq!(
+        u(&sim, "w_cp"),
+        6,
+        "class-body localparam in a class property range"
+    );
 }
 
 #[test]
@@ -165,9 +185,21 @@ fn each_specialization_sizes_its_own_properties() {
     let sim = simulate(PER_SPEC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "b16_bits"), 16, "box#(16) sizes data to its own W");
     assert_eq!(u(&sim, "b8_bits"), 8, "box#(8) sizes data to its own W");
-    assert_eq!(u(&sim, "bd_bits"), 8, "unspecialized box uses the W default");
-    assert_eq!(u(&sim, "b16_inner"), 16, "$bits inside a method sees the same width");
-    assert_eq!(u(&sim, "b16_wide_bits"), 32, "a range expression over W (2*W-1:0)");
+    assert_eq!(
+        u(&sim, "bd_bits"),
+        8,
+        "unspecialized box uses the W default"
+    );
+    assert_eq!(
+        u(&sim, "b16_inner"),
+        16,
+        "$bits inside a method sees the same width"
+    );
+    assert_eq!(
+        u(&sim, "b16_wide_bits"),
+        32,
+        "a range expression over W (2*W-1:0)"
+    );
 }
 
 /// A too-narrow property does not merely mis-report `$bits` — it truncates on
@@ -175,11 +207,23 @@ fn each_specialization_sizes_its_own_properties() {
 #[test]
 fn specialization_width_is_not_truncated_on_store() {
     let sim = simulate(PER_SPEC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "b16_data"), 0xABCD, "constructor argument stored full width");
+    assert_eq!(
+        u(&sim, "b16_data"),
+        0xABCD,
+        "constructor argument stored full width"
+    );
     assert_eq!(u(&sim, "b8_data"), 0x5A, "box#(8) keeps its 8-bit payload");
-    assert_eq!(u(&sim, "bd_data"), 0xFF, "default specialization keeps 8 bits");
+    assert_eq!(
+        u(&sim, "bd_data"),
+        0xFF,
+        "default specialization keeps 8 bits"
+    );
     assert_eq!(u(&sim, "b16_get"), 0xABCD, "method return is not narrowed");
-    assert_eq!(u(&sim, "b16_wide"), 0xDEAD_BEEF, "2*W-1:0 property holds 32 bits");
+    assert_eq!(
+        u(&sim, "b16_wide"),
+        0xDEAD_BEEF,
+        "2*W-1:0 property holds 32 bits"
+    );
 }
 
 /// Guards the fallback in `respec_packed_width`: a partially-resolvable range
@@ -188,13 +232,29 @@ fn specialization_width_is_not_truncated_on_store() {
 fn range_mixing_class_and_scope_parameters_keeps_elaborated_width() {
     let sim = simulate(MIXED_SCOPE, 100).expect("simulate failed");
     assert_eq!(u(&sim, "w_both"), 12, "W+MW-1:0 with W=8, MW=4");
-    assert_eq!(u(&sim, "w_class"), 8, "the class-only range still re-resolves");
-    assert_eq!(u(&sim, "v_both"), 0xABC, "a 12-bit payload is not truncated");
+    assert_eq!(
+        u(&sim, "w_class"),
+        8,
+        "the class-only range still re-resolves"
+    );
+    assert_eq!(
+        u(&sim, "v_both"),
+        0xABC,
+        "a 12-bit payload is not truncated"
+    );
 }
 
 #[test]
 fn derived_class_sizes_own_and_inherited_properties() {
     let sim = simulate(DERIVED, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "d_own"), 24, "derived#(24) sizes its own property from DW");
-    assert_eq!(u(&sim, "d_inherited"), 4, "inherited property keeps the base's width");
+    assert_eq!(
+        u(&sim, "d_own"),
+        24,
+        "derived#(24) sizes its own property from DW"
+    );
+    assert_eq!(
+        u(&sim, "d_inherited"),
+        4,
+        "inherited property keeps the base's width"
+    );
 }

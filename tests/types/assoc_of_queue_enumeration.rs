@@ -45,7 +45,11 @@ endmodule
     assert!(
         sim.output.iter().any(|l| l.message == "TAG_PASS"),
         "num/first/next on an assoc-of-queue must use distinct top-level keys.\n{}",
-        sim.output.iter().map(|l| l.message.clone()).collect::<Vec<_>>().join("\n")
+        sim.output
+            .iter()
+            .map(|l| l.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -81,6 +85,10 @@ endmodule
     assert!(
         sim.output.iter().any(|l| l.message == "TAG_PASS"),
         "two-variable foreach over an assoc-of-queue must iterate keys AND queue elements.\n{}",
-        sim.output.iter().map(|l| l.message.clone()).collect::<Vec<_>>().join("\n")
+        sim.output
+            .iter()
+            .map(|l| l.message.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }

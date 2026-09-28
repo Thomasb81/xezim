@@ -22,7 +22,11 @@ const SV_FILE: &str = "clockgen_x_clock_stays_x.sv";
 fn clockgen_x_clock_stays_x() {
     let test_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let test_file = test_dir.join(SV_FILE);
-    assert!(test_file.exists(), "Test file not found: {}", test_file.display());
+    assert!(
+        test_file.exists(),
+        "Test file not found: {}",
+        test_file.display()
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg("--simulate")
@@ -37,8 +41,14 @@ fn clockgen_x_clock_stays_x() {
     let combined = format!("{stdout}\n{stderr}");
 
     // Parse / simulation errors.
-    assert!(!combined.contains("Parse errors"), "Parse error:\n{combined}");
-    assert!(!combined.contains("Simulation error"), "Simulation error:\n{combined}");
+    assert!(
+        !combined.contains("Parse errors"),
+        "Parse error:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Simulation error"),
+        "Simulation error:\n{combined}"
+    );
 
     // X-start `clkX = ~clkX` must stay X forever (reference idles; the bug
     // fired 6 synthetic posedges). Pre-fix this printed TAG_FAIL_clock_active.

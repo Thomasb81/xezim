@@ -48,7 +48,10 @@ fn run(args: &[&str], relax_env: bool) -> (String, bool) {
 fn implicit_static_error_names_file_line_and_subroutine() {
     let dir = tempdir("istatic_err");
     let (pkg, top) = write_case(&dir, PKG);
-    let (text, ok) = run(&["--simulate", "-s", "top", &pkg, &top, "--no-cache"], false);
+    let (text, ok) = run(
+        &["--simulate", "-s", "top", &pkg, &top, "--no-cache"],
+        false,
+    );
     assert!(!ok, "must fail:\n{}", text);
     assert!(
         text.contains("Variable 'MIN' is implicitly static"),
@@ -80,10 +83,22 @@ fn relax_flag_and_env_downgrade_to_warning() {
     let (pkg, top) = write_case(&dir, PKG);
 
     let (text, ok) = run(
-        &["--simulate", "-s", "top", &pkg, &top, "--no-cache", "--relax-implicit-static"],
+        &[
+            "--simulate",
+            "-s",
+            "top",
+            &pkg,
+            &top,
+            "--no-cache",
+            "--relax-implicit-static",
+        ],
         false,
     );
-    assert!(ok, "--relax-implicit-static must let the run proceed:\n{}", text);
+    assert!(
+        ok,
+        "--relax-implicit-static must let the run proceed:\n{}",
+        text
+    );
     assert!(text.contains("T|3"), "simulation still runs:\n{}", text);
     assert!(
         text.contains("[xezim][warning]") && text.contains("implicitly static"),
@@ -92,8 +107,16 @@ fn relax_flag_and_env_downgrade_to_warning() {
     );
 
     let (text, ok) = run(&["--simulate", "-s", "top", &pkg, &top, "--no-cache"], true);
-    assert!(ok, "XEZIM_ALLOW_IMPLICIT_STATIC=1 must do the same:\n{}", text);
-    assert!(text.contains("T|3"), "simulation still runs under the env knob:\n{}", text);
+    assert!(
+        ok,
+        "XEZIM_ALLOW_IMPLICIT_STATIC=1 must do the same:\n{}",
+        text
+    );
+    assert!(
+        text.contains("T|3"),
+        "simulation still runs under the env knob:\n{}",
+        text
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -105,7 +128,10 @@ fn automatic_subroutine_is_not_flagged() {
         &dir,
         &PKG.replace("function int clamp_lo", "function automatic int clamp_lo"),
     );
-    let (text, ok) = run(&["--simulate", "-s", "top", &pkg, &top, "--no-cache"], false);
+    let (text, ok) = run(
+        &["--simulate", "-s", "top", &pkg, &top, "--no-cache"],
+        false,
+    );
     assert!(ok, "automatic lifetime is legal:\n{}", text);
     assert!(text.contains("T|3"), "runs:\n{}", text);
     assert!(
@@ -145,11 +171,21 @@ endmodule
     )
     .unwrap();
     let (text, ok) = run(
-        &["--simulate", "-s", "testbench", src.to_str().unwrap(), "--no-cache"],
+        &[
+            "--simulate",
+            "-s",
+            "testbench",
+            src.to_str().unwrap(),
+            "--no-cache",
+        ],
         false,
     );
     assert!(ok, "task-body localparam is legal:\n{}", text);
-    assert!(text.contains("T|min=24 max=42"), "constants read back:\n{}", text);
+    assert!(
+        text.contains("T|min=24 max=42"),
+        "constants read back:\n{}",
+        text
+    );
     assert!(
         !text.contains("implicitly static"),
         "no §6.21 diagnostic for a constant:\n{}",

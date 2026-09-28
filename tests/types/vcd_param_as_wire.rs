@@ -59,7 +59,10 @@ fn depth_var_line(vcd: &str) -> String {
 fn default_dumps_param_kind() {
     let vcd = run_and_read(false);
     let l = depth_var_line(&vcd);
-    assert!(l.starts_with("$var parameter 32 "), "default not `parameter`: {l}");
+    assert!(
+        l.starts_with("$var parameter 32 "),
+        "default not `parameter`: {l}"
+    );
     // value still present
     assert!(vcd.contains("b10000000"), "DEPTH=128 value missing:\n{vcd}");
 }

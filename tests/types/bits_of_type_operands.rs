@@ -90,15 +90,27 @@ fn bits_of_type_literal_operands() {
     assert_eq!(u(&sim, "c"), 128, "$bits(lst)");
     assert_eq!(u(&sim, "d"), 256, "$bits(lst [1:0])");
     assert_eq!(u(&sim, "e"), 128, "$bits(P::st) — scoped typedef");
-    assert_eq!(u(&sim, "f"), 256, "$bits(P::st [1:0]) — the pipeline-stage shape; 2 meant part-select sizing");
+    assert_eq!(
+        u(&sim, "f"),
+        256,
+        "$bits(P::st [1:0]) — the pipeline-stage shape; 2 meant part-select sizing"
+    );
     assert_eq!(u(&sim, "g"), 16, "$bits(logic [1:0][7:0]) — TypeLiteral");
-    assert_eq!(u(&sim, "h"), 4, "$bits(logic [0:0][1:0][1:0]) — 0 meant the TypeLiteral arm was missing");
+    assert_eq!(
+        u(&sim, "h"),
+        4,
+        "$bits(logic [0:0][1:0][1:0]) — 0 meant the TypeLiteral arm was missing"
+    );
 }
 
 #[test]
 fn bits_of_builtin_atom_types() {
     let sim = simulate(SRC, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "i_"), 32, "$bits(int) — 0 meant the atom-keyword fallback was missing");
+    assert_eq!(
+        u(&sim, "i_"),
+        32,
+        "$bits(int) — 0 meant the atom-keyword fallback was missing"
+    );
     assert_eq!(u(&sim, "j_"), 8, "$bits(byte)");
     assert_eq!(u(&sim, "k_"), 16, "$bits(shortint)");
     assert_eq!(u(&sim, "l_"), 64, "$bits(longint)");
@@ -108,7 +120,11 @@ fn bits_of_builtin_atom_types() {
 #[test]
 fn bits_guard_leaves_signal_part_selects_alone() {
     let sim = simulate(SRC, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "ps"), 8, "$bits(sig[7:0]) is still the part-select width");
+    assert_eq!(
+        u(&sim, "ps"),
+        8,
+        "$bits(sig[7:0]) is still the part-select width"
+    );
 }
 
 #[test]

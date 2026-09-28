@@ -52,11 +52,6 @@ endmodule
 fn inside_const_members_matches_reference() {
     assert_eq!(
         notes(SRC),
-        vec![
-            "NOTE: A 0 1",
-            "NOTE: B 1 1",
-            "NOTE: C x 0",
-            "NOTE: D x",
-        ]
+        vec!["NOTE: A 0 1", "NOTE: B 1 1", "NOTE: C x 0", "NOTE: D x",]
     );
 }

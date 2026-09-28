@@ -79,16 +79,17 @@ module tb;
     phase root = new(10, PH_SCHED);
     phase mid  = new(20, PH_SCHED);
     phase node = new(30, PH_NODE);
+    phase s1, s2, s3;
     mid.m_parent  = root;
     node.m_parent = mid;
     // hier walk from the node: node -> mid -> root, return the root.
-    phase s1 = node.get_sched(1);
+    s1 = node.get_sched(1);
     if (s1 == null) r_hier = 99; else r_hier = s1.id;
     // no walk: a NODE returns its parent when that parent is not a domain.
-    phase s2 = node.get_sched(0);
+    s2 = node.get_sched(0);
     if (s2 == null) r_nohier = 99; else r_nohier = s2.id;
     // hier walk from the middle schedule lands on the root.
-    phase s3 = mid.get_sched(1);
+    s3 = mid.get_sched(1);
     if (s3 == null) r_from_node = 99; else r_from_node = s3.id;
     r_ptype = node.get_ptype();
     if (root.get_parent() == null) r_null = 1; else r_null = 0;

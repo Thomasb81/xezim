@@ -53,7 +53,10 @@ module tb;
 endmodule
 "#
     ));
-    assert!(o.contains("Q=111"), "instance-name collision broke the net:\n{o}");
+    assert!(
+        o.contains("Q=111"),
+        "instance-name collision broke the net:\n{o}"
+    );
 }
 
 #[test]
@@ -79,7 +82,10 @@ module tb;
 endmodule
 "#
     ));
-    assert!(o.contains("G=11"), "generate-label collision broke the net:\n{o}");
+    assert!(
+        o.contains("G=11"),
+        "generate-label collision broke the net:\n{o}"
+    );
 }
 
 #[test]
@@ -101,5 +107,8 @@ module tb;
 endmodule
 "#
     ));
-    assert!(o.contains("C=11"), "top-level signal collision broke the net:\n{o}");
+    assert!(
+        o.contains("C=11"),
+        "top-level signal collision broke the net:\n{o}"
+    );
 }

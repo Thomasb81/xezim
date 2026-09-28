@@ -86,10 +86,18 @@ fn ok_flag(src: &str) -> u64 {
 
 #[test]
 fn masked_sbox_with_unknown_input_stays_x() {
-    assert_eq!(ok_flag(SBOX_X_INPUT), 1, "an x input did not propagate through the S-box");
+    assert_eq!(
+        ok_flag(SBOX_X_INPUT),
+        1,
+        "an x input did not propagate through the S-box"
+    );
 }
 
 #[test]
 fn unknown_array_index_reads_x_at_element_width() {
-    assert_eq!(ok_flag(X_INDEX_PRIMITIVE), 1, "an x-indexed array read did not yield element-width x");
+    assert_eq!(
+        ok_flag(X_INDEX_PRIMITIVE),
+        1,
+        "an x-indexed array read did not yield element-width x"
+    );
 }

@@ -43,5 +43,8 @@ endmodule
 ",
     );
     let want = "MT nc=10 np=10 n3=30 na=30 leaf_n=10 leaf_e21=77 rd=77 size1=5";
-    assert!(msgs.iter().any(|m| m == want), "missing {want}; got {msgs:?}");
+    assert!(
+        msgs.iter().any(|m| m == want),
+        "missing {want}; got {msgs:?}"
+    );
 }

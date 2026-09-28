@@ -99,19 +99,23 @@ endmodule
 
 #[test]
 fn defparam_does_not_override_localparam() {
-    // §6.20.4: a localparam is NOT overridable — the defparam must be ignored,
-    // keeping the localparam's own value (0xAB, not 0xCD).
-    assert!(passes(
+    // §6.20.4: a localparam is NOT overridable — a defparam naming one is an
+    // error (as in the reference simulator), not silently ignored.
+    let e = simulate(
         r#"
 module m(output [7:0] z); localparam L = 8'hAB; assign z = L; endmodule
 module top;
   wire [7:0] z;
   m u(.z(z));
-  defparam u.L = 8'hCD;                 // illegal target; must be ignored
+  defparam u.L = 8'hCD;                 // illegal target
   initial begin #1; if (z===8'hAB) $display("TEST_PASS"); else $display("TEST_FAIL"); end
 endmodule
-"#
-    ));
+"#,
+        100,
+    )
+    .err()
+    .expect("a defparam of a localparam must be rejected");
+    assert!(e.contains("not an overridable parameter"), "{e}");
 }
 
 #[test]

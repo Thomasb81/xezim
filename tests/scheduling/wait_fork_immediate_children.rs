@@ -42,7 +42,11 @@ endmodule
 "#;
     let sim = simulate(src, 200).expect("simulate failed");
     assert_eq!(u(&sim, "t_after"), 1, "returns when the CHILD finishes");
-    assert_eq!(u(&sim, "t_deep"), 7, "the grandchild still runs to completion");
+    assert_eq!(
+        u(&sim, "t_deep"),
+        7,
+        "the grandchild still runs to completion"
+    );
 }
 
 /// All immediate children are still awaited — the fix must not weaken that.
@@ -63,5 +67,9 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "t_after"), 7, "the slowest immediate child gates the wait");
+    assert_eq!(
+        u(&sim, "t_after"),
+        7,
+        "the slowest immediate child gates the wait"
+    );
 }

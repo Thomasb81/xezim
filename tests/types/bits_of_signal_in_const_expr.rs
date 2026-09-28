@@ -223,7 +223,11 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 20).expect("simulate failed");
-    assert_eq!(u(&sim, "q"), 7, "$bits of a parameter is its declared width");
+    assert_eq!(
+        u(&sim, "q"),
+        7,
+        "$bits of a parameter is its declared width"
+    );
     assert_eq!(u(&sim, "r"), 12, "$bits of a type name");
     assert_eq!(u(&sim, "s"), 3, "$bits of a sized literal");
 }

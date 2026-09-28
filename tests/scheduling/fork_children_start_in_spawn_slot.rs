@@ -20,7 +20,13 @@ fn run(src: &str) -> String {
     let path = dir.join("tb.sv");
     std::fs::write(&path, src).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "-s", "top", path.to_str().unwrap(), "--no-cache"])
+        .args([
+            "--simulate",
+            "-s",
+            "top",
+            path.to_str().unwrap(),
+            "--no-cache",
+        ])
         .output()
         .expect("run xezim");
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -34,8 +40,7 @@ fn fork_child_arms_before_later_queued_same_time_events() {
     // No clock here on purpose: the racing edge comes from a second process
     // resuming from the same `#delay`, so this pins the queue position of a
     // spawned child and nothing else.
-    let text = run(
-        r#"module top;
+    let text = run(r#"module top;
   reg s = 0;
   int t_child = -1;
   string order;
@@ -66,8 +71,7 @@ fn fork_child_arms_before_later_queued_same_time_events() {
     $finish;
   end
 endmodule
-"#,
-    );
+"#);
     assert!(
         text.contains("F child=10 order=abc"),
         "fork child missed the same-slot edge, or siblings lost source order:\n{text}"

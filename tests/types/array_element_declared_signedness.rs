@@ -40,10 +40,18 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "mismatches"), 0, "br_gh243: MSB-set elements compared signed");
+    assert_eq!(
+        u(&sim, "mismatches"),
+        0,
+        "br_gh243: MSB-set elements compared signed"
+    );
     assert_eq!(u(&sim, "l_ok"), 1, "4-state unsigned element");
     assert_eq!(u(&sim, "a2_ok"), 1, "2-D element");
-    assert_eq!(u(&sim, "disp"), 9, "unsigned element widens with zero-extension");
+    assert_eq!(
+        u(&sim, "disp"),
+        9,
+        "unsigned element widens with zero-extension"
+    );
 }
 
 /// Declared-signed element types still read back signed.
