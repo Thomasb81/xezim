@@ -134384,16 +134384,26 @@ impl Simulator {
                         let forward_declared = class_ref == Some(true);
                         if !forward_declared && self.module.classes.contains_key(&type_name) {
                             self.record_local_class_type(&port.name.name, &type_name);
-                            self.meta_note(&port.name.name);
-                            self.var_class_types
-                                .insert(port.name.name.clone(), type_name.clone());
+                            if self.var_class_types.get(port.name.name.as_str()) != Some(&type_name)
+                            {
+                                self.meta_note(&port.name.name);
+                                self.var_class_types
+                                    .insert(port.name.name.clone(), type_name.clone());
+                            }
                         } else if self.module.enum_members.contains_key(&type_name)
                             || self.module.typedefs.contains_key(&type_name)
                         {
                             self.record_local_typedef_type(&port.name.name, &type_name);
-                            self.meta_note(&port.name.name);
-                            self.var_typedef_types
-                                .insert(port.name.name.clone(), type_name);
+                            // An entry already holding this type is left as
+                            // is: rewriting it changes nothing, and an
+                            // untouched name needs no metadata save.
+                            if self.var_typedef_types.get(port.name.name.as_str())
+                                != Some(&type_name)
+                            {
+                                self.meta_note(&port.name.name);
+                                self.var_typedef_types
+                                    .insert(port.name.name.clone(), type_name);
+                            }
                         } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
                             // See the identical branch in exec_function_call's
                             // port loop: the formal is typed with a class TYPE
@@ -134413,9 +134423,13 @@ impl Simulator {
                                     ));
                             if cn_is_class {
                                 frame_class_ports.push((port.name.name.clone(), concrete.clone()));
-                                self.meta_note(&port.name.name);
-                                self.var_class_types
-                                    .insert(port.name.name.clone(), concrete);
+                                if self.var_class_types.get(port.name.name.as_str())
+                                    != Some(&concrete)
+                                {
+                                    self.meta_note(&port.name.name);
+                                    self.var_class_types
+                                        .insert(port.name.name.clone(), concrete);
+                                }
                             }
                         }
                     }
@@ -134512,8 +134526,10 @@ impl Simulator {
                     // the report-server `$display` fires natively.
                     if let Some(cn) = plan.ret.as_ref().and_then(|r| r.class.as_deref()) {
                         self.record_local_class_type(rn, cn);
-                        self.meta_note(rn);
-                        self.var_class_types.insert(rn.to_string(), cn.to_string());
+                        if self.var_class_types.get(rn).map(String::as_str) != Some(cn) {
+                            self.meta_note(rn);
+                            self.var_class_types.insert(rn.to_string(), cn.to_string());
+                        }
                     }
                 }
                 // Mark string-typed return variable and params so `s[i]`
