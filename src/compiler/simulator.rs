@@ -110793,12 +110793,33 @@ impl Simulator {
                     h.path[1..].iter().map(|sg| sg.name.name.clone()).collect(),
                 ))
             }
-            ExprKind::MemberAccess { expr: recv, member } => match &recv.kind {
-                ExprKind::Ident(h1) if h1.path.len() == 1 && h1.path[0].selects.is_empty() => {
-                    Some((h1.path[0].name.name.clone(), vec![member.name.clone()]))
+            // Inside a subroutine body a dotted name parses as a MemberAccess
+            // chain — `ai.bi.tick` is `(ai.bi).tick` — so flatten the whole
+            // chain down to its select-free root, not just one level. With
+            // only one level a three-segment enable in a task never inlined:
+            // it ran synchronously and its `#delay` loop outlived `$finish`.
+            ExprKind::MemberAccess { .. } => {
+                let mut members: Vec<String> = Vec::new();
+                let mut cur = func;
+                loop {
+                    match &cur.kind {
+                        ExprKind::MemberAccess { expr: recv, member } => {
+                            members.push(member.name.clone());
+                            cur = recv;
+                        }
+                        ExprKind::Ident(h1)
+                            if !h1.path.is_empty()
+                                && h1.path.iter().all(|sg| sg.selects.is_empty()) =>
+                        {
+                            let mut tail: Vec<String> =
+                                h1.path[1..].iter().map(|sg| sg.name.name.clone()).collect();
+                            tail.extend(members.into_iter().rev());
+                            break Some((h1.path[0].name.name.clone(), tail));
+                        }
+                        _ => break None,
+                    }
                 }
-                _ => None,
-            },
+            }
             _ => None,
         };
         if let Some((head, tail)) = head_parts {
