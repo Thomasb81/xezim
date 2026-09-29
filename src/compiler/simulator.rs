@@ -138913,6 +138913,21 @@ fn vpi_scope_members(sim: &Simulator, scope: &str) -> Vec<(String, usize)> {
 /// yields nothing, as the standard requires (callers test for it).
 #[unsafe(no_mangle)]
 pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
+    // Module paths and timing checks come from the object model when it has
+    // the sources; `vpi_api`'s view of the simulator's tables is the fallback
+    // (a design loaded from a compiled artifact). The delay routines accept
+    // either kind of handle.
+    const MOD_PATH: libc::c_int = 31;
+    const TCHK: libc::c_int = 61;
+    if type_ == MOD_PATH || type_ == TCHK {
+        if let Some(r) = try_active_sim("vpi_iterate", |sim| {
+            vpi_model::iterate(sim, type_, unsafe { vpi_deref(refh) })
+        })
+        .flatten()
+        {
+            return r;
+        }
+    }
     if let Some(it) = vpi_api::iterate_extra(type_, refh) {
         return it;
     }

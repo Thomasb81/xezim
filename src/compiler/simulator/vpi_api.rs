@@ -376,6 +376,60 @@ fn iterate_timing_objects(type_: c_int, refh: *mut c_void) -> *mut c_void {
     .unwrap_or(std::ptr::null_mut())
 }
 
+/// A module path or timing check handed out by the object model
+/// (`vpi_model.rs`) names the same simulator object as the handles made
+/// here: the k-th path into a given output net of an instance, or the k-th
+/// timing check of an instance, both lists in source order. Swap such a
+/// handle for this module's own before the simulator is borrowed.
+fn native_timing_handle(obj: *mut c_void) -> Option<*mut c_void> {
+    const MODULE: c_int = 32;
+    const EXPR: c_int = 102;
+    const MOD_PATH_OUT: c_int = 96;
+    let h = unsafe { vpi_deref(obj) }?;
+    if h.kind != VpiKind::Obj || (h.type_code != vc::MOD_PATH && h.type_code != vc::TCHK) {
+        return None;
+    }
+    let (type_, model_idx) = (h.type_code, h.signal_id);
+    let scan = |it: *mut c_void| -> Vec<*mut c_void> {
+        let mut v = Vec::new();
+        if !it.is_null() {
+            loop {
+                let x = super::vpi_scan(it);
+                if x.is_null() {
+                    break;
+                }
+                v.push(x);
+            }
+        }
+        v
+    };
+    let module = super::vpi_handle(MODULE, obj);
+    if module.is_null() {
+        return None;
+    }
+    let model_list = scan(super::vpi_iterate(type_, module));
+    let k = model_list
+        .iter()
+        .position(|&x| unsafe { vpi_deref(x) }.is_some_and(|y| y.signal_id == model_idx))?;
+    let native_list = scan(iterate_timing_objects(type_, module));
+    if type_ == vc::TCHK {
+        return native_list.get(k).copied();
+    }
+    let out_net = |p: *mut c_void| -> Option<usize> {
+        let terms = scan(super::vpi_iterate(MOD_PATH_OUT, p));
+        let e = super::vpi_handle(EXPR, *terms.first()?);
+        unsafe { vpi_deref(e) }.map(|eh| eh.signal_id)
+    };
+    let net = out_net(model_list[k])?;
+    let ordinal = model_list[..k]
+        .iter()
+        .filter(|&&p| out_net(p) == Some(net))
+        .count();
+    native_list.into_iter().find(|&p| {
+        unsafe { vpi_deref(p) }.is_some_and(|n| n.signal_id == net && n.lsb as usize == ordinal)
+    })
+}
+
 /// The instance scope a design-relative object name is declared in.
 fn scope_of(name: &str) -> &str {
     name.rsplit_once('.').map_or("", |(s, _)| s)
@@ -2115,6 +2169,7 @@ fn delay_call(
 /// `pulsere_flag` the reject and error limits read the delay itself.
 #[unsafe(no_mangle)]
 pub extern "C" fn vpi_get_delays(obj: *mut c_void, delay_p: *mut s_vpi_delay) {
+    let obj = native_timing_handle(obj).unwrap_or(obj);
     if delay_p.is_null() {
         vpi_error(
             vpi::ERROR,
@@ -2150,6 +2205,7 @@ pub extern "C" fn vpi_get_delays(obj: *mut c_void, delay_p: *mut s_vpi_delay) {
 /// limits), otherwise nothing is written.
 #[unsafe(no_mangle)]
 pub extern "C" fn vpi_put_delays(obj: *mut c_void, delay_p: *mut s_vpi_delay) {
+    let obj = native_timing_handle(obj).unwrap_or(obj);
     if delay_p.is_null() {
         vpi_error(
             vpi::ERROR,

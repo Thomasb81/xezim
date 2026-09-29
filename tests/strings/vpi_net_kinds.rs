@@ -135,7 +135,9 @@ fn array_reads_add_no_net_and_implicit_ports_are_nets() {
     let lib = shared_lib(&d, "probe", C);
     let text = run(&d, &lib, SV);
     let _ = std::fs::remove_dir_all(&d);
-    let nets: Vec<&str> = text.lines().filter(|l| l.starts_with("NET|")).collect();
+    // The object model iterates in declaration order; the set is what counts.
+    let mut nets: Vec<&str> = text.lines().filter(|l| l.starts_with("NET|")).collect();
+    nets.sort_unstable();
     assert_eq!(
         nets,
         [

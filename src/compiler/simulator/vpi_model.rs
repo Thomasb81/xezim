@@ -2540,9 +2540,12 @@ impl<'a> Builder<'a> {
         let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
         for d in &pd.declarators {
             let t = self.tdesc(&pd.data_type, &d.dimensions, ctx);
+            // A non-ANSI declaration with a data type and no net type
+            // (`input logic e;`) declares a variable, as the reference
+            // simulator reports it; only an implicit type makes a net.
             let nt = match pd.net_type {
                 Some(nt) => Self::net_type_code(nt),
-                None if self.port_is_net(dir, &t, explicit_type) => c::WIRE,
+                None if !explicit_type && dir != c::REF => c::WIRE,
                 None => 0,
             };
             self.declare(&d.name, t, nt, dir, false, false, pd.span, ctx);

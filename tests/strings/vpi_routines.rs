@@ -319,7 +319,7 @@ void arrays_read(void) {
 
     /* One dimension, declared [3:0]: sections run 3 -> 0. */
     vpiHandle m1 = H("top.m1");
-    CHECK(m1 && vpi_get(vpiType, m1) == vpiMemory, "m1 is a vpiMemory");
+    CHECK(m1 && vpi_get(vpiType, m1) == vpiRegArray, "m1 is a vpiRegArray");
     av.format = vpiIntVal; av.flags = 0; av.value.integers = NULL;
     idx[0] = 3;
     vpi_get_value_array(m1, &av, idx, 4);
@@ -1009,7 +1009,14 @@ void delays_probe(void) {
     }
     CHECK(paths == 1, "one module path in up");
     CHECK(p && vpi_get(vpiType, p) == vpiModPath, "vpiModPath object");
-    CHECK(p && strcmp(vpi_get_str(vpiFullName, p), "top.up.q") == 0, "its output net");
+    /* A module path has no name of its own; its output terminal names q. */
+    vpiHandle outs = p ? vpi_iterate(vpiModPathOut, p) : NULL;
+    vpiHandle oterm = outs ? vpi_scan(outs) : NULL;
+    vpiHandle onet = oterm ? vpi_handle(vpiExpr, oterm) : NULL;
+    const char *oname = onet ? vpi_get_str(vpiFullName, onet) : NULL;
+    CHECK(oname && strcmp(oname, "top.up.q") == 0, "its output net");
+    if (outs && oterm)
+        vpi_free_object(outs);
     show("path2", p, 2);
     show("path12", p, 12);
     put(p, 4, 1, 1, 1);

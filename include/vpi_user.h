@@ -781,8 +781,6 @@ PLI_INT32 vpi_remove_cb(vpiHandle cb_obj);
 /* Array object types. vpi_handle_by_name answers vpiMemory for a
  * one-dimensional array, vpiRegArray / vpiNetArray for a multi-dimensional
  * one and for a sub-array of one (`top.m[1]` of `logic [7:0] m[0:2][0:3]`). */
-#define vpiNetArray          114
-#define vpiRegArray          116
 
 /* The subobject selected by `num_index` indices, leftmost first: one per
  * unpacked dimension still open on `obj` gives an element, fewer a
@@ -844,23 +842,8 @@ void vpi_put_value_array(vpiHandle object, p_vpi_arrayvalue arrayvalue_p,
 /* --- Delays (IEEE 1800-2017 sections 38.10, 38.22, 38.32) -------------- */
 
 #define vpiInterModPath       26   /* intermodule path (port to port) */
-#define vpiModPath            31   /* module path (specify block) */
-#define vpiTchk               61   /* timing check */
 
 /* vpi_get(vpiTchkType, tchk). */
-#define vpiTchkType           38
-#define vpiSetup               1
-#define vpiHold                2
-#define vpiPeriod              3
-#define vpiWidth               4
-#define vpiSkew                5
-#define vpiRecovery            6
-#define vpiNoChange            7
-#define vpiSetupHold           8
-#define vpiFullskew            9
-#define vpiRecrem             10
-#define vpiRemoval            11
-#define vpiTimeskew           12
 
 typedef struct t_vpi_delay {
     struct t_vpi_time *da;   /* caller-allocated array of delay values */
