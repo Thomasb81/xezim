@@ -139131,18 +139131,22 @@ pub extern "C" fn vpi_get_str(
         return std::ptr::null_mut();
     };
     // VPI object model (vpi_model.rs): names, files and type names.
-    if !matches!(
-        h.kind,
-        VpiKind::SysTfCall | VpiKind::Constant | VpiKind::Iterator
-    ) {
-        if let Some(r) =
-            try_active_sim("vpi_get_str", |sim| vpi_model::get_str(sim, property, h)).flatten()
+    let model = match vpi_model::get_str_static(property, h) {
+        Some(r) => Some(r),
+        None if !matches!(
+            h.kind,
+            VpiKind::SysTfCall | VpiKind::Constant | VpiKind::Iterator
+        ) =>
         {
-            return match r {
-                Some(s) => vpi_model::str_result(&s),
-                None => std::ptr::null_mut(),
-            };
+            try_active_sim("vpi_get_str", |sim| vpi_model::get_str(sim, property, h)).flatten()
         }
+        None => None,
+    };
+    if let Some(r) = model {
+        return match r {
+            Some(s) => vpi_model::str_result(&s),
+            None => std::ptr::null_mut(),
+        };
     }
     let s = match property {
         vpi::NAME => h.name.clone(),
@@ -139486,14 +139490,19 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
     };
     // VPI object model (vpi_model.rs): the properties of every object it
     // knows, including the declared type.
-    if !matches!(
-        h.kind,
-        VpiKind::SysTfCall | VpiKind::Constant | VpiKind::Iterator
-    ) {
-        if let Some(v) = try_active_sim("vpi_get", |sim| vpi_model::get(sim, property, h)).flatten()
+    let model = match vpi_model::get_static(property, h) {
+        Some(v) => Some(v),
+        None if !matches!(
+            h.kind,
+            VpiKind::SysTfCall | VpiKind::Constant | VpiKind::Iterator
+        ) =>
         {
-            return v;
+            try_active_sim("vpi_get", |sim| vpi_model::get(sim, property, h)).flatten()
         }
+        None => None,
+    };
+    if let Some(v) = model {
+        return v;
     }
     if property == vpi::TYPE {
         return h.type_code;

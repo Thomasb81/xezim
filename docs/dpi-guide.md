@@ -599,6 +599,7 @@ that scope, not to the module around it.
 | generate scope | `vpiGenScope` | `vpiArrayMember`, `vpiImplicitDecl`; `vpiIndex` (a constant) and `vpiParent` (the array) for a loop element |
 | generate scope array | `vpiGenScopeArray` | `vpiSize` (elements); `vpi_handle_by_index` selects one |
 | named block | `vpiNamedBegin`, `vpiNamedFork` | `vpiJoinType` (fork), `vpiAutomatic` |
+| modport (in an interface; `vpi_iterate(vpiModport, ifc)`) | `vpiModport` | `vpiIODecl` iterates its ports: `vpiDirection`, and `vpiExpr`, the interface object (or modport expression) the port names |
 | task / function | `vpiTask`, `vpiFunction` | `vpiAutomatic`, `vpiVisibility` (`vpiPublicVis`), `vpiFuncType`, `vpiSize`, `vpiSigned` and `vpiTypespec` of the result; a DPI import has `vpiAccessType` `vpiDPIImportAcc`, `vpiDPIContext`, `vpiDPIPure`; `vpiIODecl` iterates the arguments (`vpiDirection`, `vpiSize`, ranges, `vpiTypespec`) |
 
 **Declared objects**, iterated from any scope: `vpiNet`, `vpiNetArray`,
@@ -700,12 +701,14 @@ them the same way.
 
 **Not modelled** in the object model: statements (a process's `vpiStmt` is
 only its named block, when it is one), classes and their objects, clocking
-blocks, concurrent assertions, modports, `let` and `checker` declarations,
+blocks, concurrent assertions, `let` and `checker` declarations,
 typedef and import objects (`vpiTypedef`, `vpiImport`), `vpiDriver` and
 `vpiLoad`, attributes, `vpiParamAssign`/`vpiDefParam`, `vpiGenVar`,
 `vpiSpecParam`, array objects for instance and primitive arrays
 (`vpiModuleArray`, `vpiGateArray`, ...; their elements are there), the
-`$unit` package, and `vpiDecompile`.
+`$unit` package, `vpiDecompile`, and the arguments of a task or function
+declared in its body (`function f; input int x; ...`) rather than in its
+header.
 
 
 ---

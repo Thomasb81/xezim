@@ -37,9 +37,9 @@
 //! value in `value` and its `vpiConstType` in `lsb`.
 use super::*;
 use crate::ast::decl::{
-    AlwaysKind, ContinuousAssign, DataDeclaration, FunctionDeclaration, GateInstantiation,
-    GateType, GenerateCase, GenerateFor, GenerateIf, ModuleInstantiation, ModuleItem,
-    NetDeclaration, PackageItem, ParamAssignment, ParameterDeclaration, ParameterKind,
+    AlwaysKind, BindDirective, ContinuousAssign, DataDeclaration, FunctionDeclaration,
+    GateInstantiation, GateType, GenerateCase, GenerateFor, GenerateIf, ModuleInstantiation,
+    ModuleItem, NetDeclaration, PackageItem, ParamAssignment, ParameterDeclaration, ParameterKind,
     PortConnection, PortDeclaration, SpecifyBlock, TaskDeclaration, TypedefDeclaration, UdpDecl,
 };
 use crate::ast::expr::{
@@ -113,6 +113,7 @@ pub(super) mod c {
     pub const INTERFACE: c_int = 601;
     pub const PROGRAM: c_int = 602;
     pub const TYPESPEC: c_int = 605;
+    pub const MODPORT: c_int = 606;
     /// A name the model cannot resolve to a declared object.
     pub const REF_OBJ: c_int = 608;
     pub const LONG_INT_VAR: c_int = 610;
@@ -366,6 +367,7 @@ pub(super) fn type_name(code: c_int) -> Option<&'static str> {
         c::INTERFACE => "vpiInterface",
         c::PROGRAM => "vpiProgram",
         c::TYPESPEC => "vpiTypespec",
+        c::MODPORT => "vpiModport",
         c::REF_OBJ => "vpiRefObj",
         c::LONG_INT_VAR => "vpiLongIntVar",
         c::SHORT_INT_VAR => "vpiShortIntVar",
@@ -663,6 +665,16 @@ pub(super) enum OData {
         left: i64,
         right: i64,
     },
+    /// An interface modport and its `vpiIODecl`s.
+    Modport {
+        ios: Vec<u32>,
+    },
+    /// One port of a modport: its direction and the interface object (or
+    /// modport expression) it names.
+    ModportIo {
+        dir: c_int,
+        expr: u32,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -692,6 +704,8 @@ pub(super) struct VpiModel {
     /// Flat signal names that stand for no object: the one-bit placeholder
     /// signals elaboration makes for generate block and instance names.
     pub placeholders: HashSet<String>,
+    /// The genvar and its value, per generate loop element scope.
+    pub genvars: HashMap<u32, (String, i64)>,
     /// Objects made on demand (typespecs, ranges), keyed by what they
     /// describe, so asking twice yields the same object.
     memo: HashMap<(u8, u32, u32), u32>,
@@ -996,6 +1010,29 @@ impl VpiModel {
         NONE
     }
 
+    /// The value of genvar `name` seen from `scope`, when `name` is no
+    /// declared object there.
+    fn genvar_value(&self, scope: u32, name: &str) -> Option<i64> {
+        let mut s = scope;
+        while s != NONE {
+            let sc = &self.scopes[s as usize];
+            let key = format!("{}.{}", sc.full, name);
+            if self.by_name.contains_key(&key) {
+                return None;
+            }
+            if let Some((g, v)) = self.genvars.get(&s) {
+                if g == name {
+                    return Some(*v);
+                }
+            }
+            if matches!(sc.kind, SKind::Module | SKind::Interface | SKind::Program) {
+                return None;
+            }
+            s = sc.parent;
+        }
+        None
+    }
+
     /// Resolve a simple name in `scope` the way SystemVerilog does: the scope
     /// itself, then each enclosing scope, then the packages.
     pub fn resolve_name(&self, scope: u32, name: &str) -> Option<MRef> {
@@ -1085,6 +1122,8 @@ struct Builder<'a> {
     m: VpiModel,
     defs: HashMap<&'a str, (DefRef<'a>, u32)>,
     packages: Vec<(&'a PackageDeclaration, u32)>,
+    /// §23.11 `bind` directives, with their source file.
+    binds: Vec<(&'a BindDirective, u32)>,
     typedefs: HashMap<String, (&'a TypedefDeclaration, u32)>,
     inst_by_path: HashMap<&'a str, usize>,
     attached: Vec<bool>,
@@ -1150,10 +1189,12 @@ impl<'a> Builder<'a> {
                 tops: Vec::new(),
                 packages: Vec::new(),
                 placeholders: HashSet::default(),
+                genvars: HashMap::default(),
                 memo: HashMap::default(),
             },
             defs: HashMap::default(),
             packages: Vec::new(),
+            binds: Vec::new(),
             typedefs: HashMap::default(),
             inst_by_path: HashMap::default(),
             attached: vec![false; sim.module.instances.len()],
@@ -1179,12 +1220,17 @@ impl<'a> Builder<'a> {
             items: &'b [ModuleItem],
             file: u32,
             defs: &mut HashMap<&'b str, (DefRef<'b>, u32)>,
+            binds: &mut Vec<(&'b BindDirective, u32)>,
         ) {
             for it in items {
-                if let ModuleItem::NestedModule(m) = it {
-                    defs.entry(m.name.name.as_str())
-                        .or_insert((DefRef::Module(m), file));
-                    nested(&m.items, file, defs);
+                match it {
+                    ModuleItem::NestedModule(m) => {
+                        defs.entry(m.name.name.as_str())
+                            .or_insert((DefRef::Module(m), file));
+                        nested(&m.items, file, defs, binds);
+                    }
+                    ModuleItem::Bind(b) => binds.push((b, file)),
+                    _ => {}
                 }
             }
         }
@@ -1196,7 +1242,7 @@ impl<'a> Builder<'a> {
                         self.defs
                             .entry(m.name.name.as_str())
                             .or_insert((DefRef::Module(m), fi));
-                        nested(&m.items, fi, &mut self.defs);
+                        nested(&m.items, fi, &mut self.defs, &mut self.binds);
                     }
                     D::Interface(m) => {
                         self.defs
@@ -1226,6 +1272,7 @@ impl<'a> Builder<'a> {
                             }
                         }
                     }
+                    D::Bind(b) => self.binds.push((b, fi)),
                     D::TypedefDecl(td) => {
                         self.typedefs.insert(td.name.name.clone(), (td, fi));
                     }
@@ -1584,6 +1631,30 @@ impl<'a> Builder<'a> {
         let mut port_decls = self.ansi_ports(ports, &ctx);
         let mut ord = 0u32;
         self.walk_items(items, &ctx, &mut ord, &mut port_decls);
+        // §23.11: instances `bind` adds to this one, connected in its scope.
+        let binds: Vec<(&'a BindDirective, u32)> = self
+            .binds
+            .iter()
+            .copied()
+            .filter(|(b, _)| {
+                let paths = std::iter::once(&b.target_path).chain(b.extra_paths.iter());
+                if b.target_path.is_empty() && b.extra_paths.is_empty() {
+                    b.target_module.name == def_name
+                } else {
+                    paths.filter(|p| !p.is_empty()).any(|p| {
+                        let joined: Vec<&str> = p.iter().map(|i| i.name.as_str()).collect();
+                        joined.join(".") == full
+                    })
+                }
+            })
+            .collect();
+        for (b, bf) in binds {
+            let bctx = Ctx {
+                file: bf,
+                ..ctx.clone()
+            };
+            self.instantiation(&b.instantiation, &bctx);
+        }
         self.implicit_nets(&ctx);
         self.make_ports(ports, &port_decls, &ctx, conns);
         self.depth -= 1;
@@ -1655,16 +1726,29 @@ impl<'a> Builder<'a> {
         names.sort();
         for (flat, id) in names {
             let leaf = flat.rsplit('.').next().unwrap_or(&flat).to_string();
-            let ty = if id == usize::MAX {
-                c::REG_ARRAY
+            // An unpacked array has no whole-array signal: its storage is its
+            // first element.
+            let arr = if id == usize::MAX {
+                sim.module.arrays.get(flat.as_str()).copied()
             } else {
-                vpi_type_of(sim, &flat, id)
+                None
+            };
+            let (ty, id) = match arr {
+                Some((lo, _, _)) => (
+                    c::REG_ARRAY,
+                    self.sig_of(&format!("{}[{}]", flat, lo))
+                        .unwrap_or(usize::MAX),
+                ),
+                None if id == usize::MAX => continue,
+                None => (vpi_type_of(sim, &flat, id), id),
             };
             let td = self.m.add_td(TDesc {
                 kind: TKind::Unknown,
                 signed: id != usize::MAX && sim.signal_signed.get(id).copied().unwrap_or(false),
                 packed: Vec::new(),
-                unpacked: Vec::new(),
+                unpacked: arr
+                    .map(|(lo, hi, _)| vec![UDim::Range(lo, hi)])
+                    .unwrap_or_default(),
                 name: None,
             });
             let d = if ty == c::PARAMETER {
@@ -1796,6 +1880,7 @@ impl<'a> Builder<'a> {
                 ModuleItem::TaskDeclaration(td) => self.task(td, ctx, None),
                 ModuleItem::DPIImport(di) => self.dpi_import(di, ctx),
                 ModuleItem::SpecifyBlock(sb) => self.specify(sb, ctx),
+                ModuleItem::ModportDeclaration(md) => self.modports(md, ctx),
                 _ => {}
             }
         }
@@ -3413,22 +3498,6 @@ impl<'a> Builder<'a> {
             Some(l) => l.clone(),
             None => format!("genblk{}", ord),
         };
-        let psc_full = self.m.scopes[ctx.scope as usize].full.clone();
-        let (file, line) = self.loc(gf.span, ctx.file);
-        let arr = self.m.add_obj(
-            MObj {
-                type_code: c::GEN_SCOPE_ARRAY,
-                name: name.clone(),
-                full: format!("{}.{}", psc_full, name),
-                scope: ctx.scope,
-                parent: NONE,
-                file,
-                line,
-                d: OData::GenArray { elems: Vec::new() },
-            },
-            true,
-            true,
-        );
         // The iteration values, as the elaborator computed them.
         let mut values: Vec<i64> = Vec::new();
         let mut i = gf.init_val;
@@ -3487,6 +3556,26 @@ impl<'a> Builder<'a> {
             }
             values.extend(set);
         }
+        if values.is_empty() {
+            // A loop that generated nothing has no array.
+            return;
+        }
+        let psc_full = self.m.scopes[ctx.scope as usize].full.clone();
+        let (file, line) = self.loc(gf.span, ctx.file);
+        let arr = self.m.add_obj(
+            MObj {
+                type_code: c::GEN_SCOPE_ARRAY,
+                name: name.clone(),
+                full: format!("{}.{}", psc_full, name),
+                scope: ctx.scope,
+                parent: NONE,
+                file,
+                line,
+                d: OData::GenArray { elems: Vec::new() },
+            },
+            true,
+            true,
+        );
         let mut elems = Vec::new();
         for v in values {
             let ename = format!("{}[{}]", name, v);
@@ -3515,6 +3604,7 @@ impl<'a> Builder<'a> {
                 v,
             );
             elems.push(sub.scope);
+            self.m.genvars.insert(sub.scope, (gf.var.clone(), v));
             let mut ord2 = 0u32;
             let mut ports = Vec::new();
             self.walk_items(&gf.items, &sub, &mut ord2, &mut ports);
@@ -3709,6 +3799,59 @@ impl<'a> Builder<'a> {
         match &di.proto {
             crate::ast::decl::DPIProto::Function(f) => self.function(f, ctx, Some(flags)),
             crate::ast::decl::DPIProto::Task(t) => self.task(t, ctx, Some(flags)),
+        }
+    }
+
+    // --- modports ------------------------------------------------------
+
+    fn modports(&mut self, md: &'a crate::ast::decl::ModportDeclaration, ctx: &Ctx) {
+        let sc_full = self.m.scopes[ctx.scope as usize].full.clone();
+        for item in &md.items {
+            let (file, line) = self.loc(item.span, ctx.file);
+            let full = format!("{}.{}", sc_full, item.name.name);
+            let mp = self.m.add_obj(
+                MObj {
+                    type_code: c::MODPORT,
+                    name: item.name.name.clone(),
+                    full: full.clone(),
+                    scope: ctx.scope,
+                    parent: NONE,
+                    file,
+                    line,
+                    d: OData::Modport { ios: Vec::new() },
+                },
+                true,
+                true,
+            );
+            let mut ios = Vec::new();
+            for port in &item.ports {
+                let e = match &port.expr {
+                    Some(e) => e.clone(),
+                    None => ident_expr(&port.name.name),
+                };
+                let expr = self.expr_obj(&e, ctx.scope, ctx.file);
+                let (f, l) = self.loc(port.span, ctx.file);
+                ios.push(self.m.add_obj(
+                    MObj {
+                        type_code: c::IO_DECL,
+                        name: port.name.name.clone(),
+                        full: format!("{}.{}", full, port.name.name),
+                        scope: ctx.scope,
+                        parent: mp,
+                        file: f,
+                        line: l,
+                        d: OData::ModportIo {
+                            dir: Self::dir_code(port.direction),
+                            expr,
+                        },
+                    },
+                    true,
+                    false,
+                ));
+            }
+            if let OData::Modport { ios: v } = &mut self.m.objs[mp as usize].d {
+                *v = ios;
+            }
         }
     }
 
@@ -4090,10 +4233,18 @@ fn expr_handle(m: &mut VpiModel, sim: &mut Simulator, o: u32) -> VpiHandle {
         e = inner;
     }
     if let ExprKind::Ident(h) = &e.kind {
-        if h.path.len() == 1 && h.path[0].selects.is_empty() {
-            let name = h.path[0].name.name.clone();
-            if let Some(r) = m.resolve_name(scope, &name) {
+        if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) {
+            // A name, possibly hierarchical (`u_sub.sig`, `top.x`).
+            let name = ident_path(h);
+            if let Some(r) = m
+                .resolve_name(scope, &name)
+                .or_else(|| m.by_name.get(&name).copied())
+            {
                 return ref_handle(m, sim, r);
+            }
+            // A genvar inside its loop is that element's index.
+            if let Some(v) = m.genvar_value(scope, &name) {
+                return int_const(v);
             }
         }
     }
@@ -4105,6 +4256,15 @@ fn expr_handle(m: &mut VpiModel, sim: &mut Simulator, o: u32) -> VpiHandle {
     plain_obj_handle(m, o)
 }
 
+/// The dotted spelling of a hierarchical identifier's path.
+fn ident_path(h: &HierarchicalIdentifier) -> String {
+    h.path
+        .iter()
+        .map(|s| s.name.name.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 /// Rewrite the names of an expression in `scope` to their flat signal
 /// names, so the simulator's evaluator reads the right signals.
 fn flatten_expr(m: &VpiModel, scope: u32, e: &Expression) -> Expression {
@@ -4114,28 +4274,69 @@ fn flatten_expr(m: &VpiModel, scope: u32, e: &Expression) -> Expression {
 }
 
 fn flatten_in_place(m: &VpiModel, scope: u32, e: &mut Expression) {
+    // A genvar of an enclosing generate loop is the loop element's index.
+    if let ExprKind::Ident(h) = &e.kind {
+        if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() {
+            if let Some(v) = m.genvar_value(scope, &h.path[0].name.name) {
+                e.kind = ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: true,
+                    base: NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: Cell::new(None),
+                });
+                e.cached_width.set(None);
+                return;
+            }
+        }
+    }
     match &mut e.kind {
         ExprKind::Ident(h) => {
             if h.path.is_empty() || h.root.is_some() {
                 return;
             }
-            let first = h.path[0].name.name.clone();
-            let Some(MRef::Obj(o)) = m.resolve_name(scope, &first) else {
-                return;
-            };
-            let flat = match &m.objs[o as usize].d {
-                OData::Var(v) => v.flat.clone(),
-                OData::Param { flat, .. } => flat.clone(),
-                _ => return,
-            };
-            h.path[0].name.name = flat;
-            h.cached_signal_id.set(None);
-            h.cached_resolved_name = std::cell::OnceCell::new();
             for seg in h.path.iter_mut() {
                 for s in seg.selects.iter_mut() {
                     flatten_in_place(m, scope, s);
                 }
             }
+            let flat_of = |r: Option<MRef>| match r {
+                Some(MRef::Obj(o)) => match &m.objs[o as usize].d {
+                    OData::Var(v) => Some(v.flat.clone()),
+                    OData::Param { flat, .. } => Some(flat.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let n = h.path.len();
+            // The whole (hierarchical) name, selects allowed on its last
+            // segment only; else its first segment.
+            let whole = if h.path[..n - 1].iter().all(|s| s.selects.is_empty()) {
+                let name = ident_path(h);
+                flat_of(
+                    m.resolve_name(scope, &name)
+                        .or_else(|| m.by_name.get(&name).copied()),
+                )
+            } else {
+                None
+            };
+            if let Some(flat) = whole {
+                if let Some(last) = h.path.pop() {
+                    h.path = vec![HierPathSegment {
+                        name: Identifier {
+                            name: flat,
+                            span: last.name.span,
+                        },
+                        selects: last.selects,
+                    }];
+                }
+            } else if let Some(flat) = flat_of(m.resolve_name(scope, &h.path[0].name.name)) {
+                h.path[0].name.name = flat;
+            } else {
+                return;
+            }
+            h.cached_signal_id.set(None);
+            h.cached_resolved_name = std::cell::OnceCell::new();
         }
         ExprKind::Unary { operand, .. } => flatten_in_place(m, scope, operand),
         ExprKind::Binary { left, right, .. } => {
@@ -4304,6 +4505,9 @@ fn select_by_name(
 ) -> Option<*mut libc::c_void> {
     let (base, idx) = split_select(name)?;
     let bh = handle_by_name(sim, base, scope)?;
+    if bh.is_null() {
+        return None;
+    }
     let b = unsafe { Box::from_raw(bh as *mut VpiHandle) };
     let r = select(sim, &b, idx);
     r.map(|h| h.into_raw())
@@ -4312,52 +4516,97 @@ fn select_by_name(
 /// Element `idx` of an array handle, or bit `idx` of a vector handle.
 fn select(sim: &mut Simulator, b: &VpiHandle, idx: i64) -> Option<VpiHandle> {
     with_model(sim, |m, sim| {
-        let o = match ident(m, b)? {
-            MRef::Obj(o) => o,
-            _ => return None,
+        let (o, base_full, mut indices) = match ident(m, b) {
+            Some(MRef::Obj(o)) => (o, b.full_name.clone(), Vec::new()),
+            Some(MRef::Scope(_)) => return None,
+            None => resolve_select(m, &b.full_name)?,
         };
-        let (flat, td, sig, net) = match &m.objs[o as usize].d {
-            OData::Var(v) => (v.flat.clone(), v.td, v.sig, v.net_type != 0),
-            OData::Param { flat, td, sig, .. } => (flat.clone(), *td, *sig, false),
-            _ => return None,
-        };
-        let t = m.tdescs[td as usize].clone();
-        if !t.unpacked.is_empty() {
-            return element_handle(m, sim, o, &flat, &t, &b.full_name, &[idx]);
-        }
-        // A bit of a packed vector.
-        let id = sig?;
-        let w = sim.signal_widths.get(id).copied().unwrap_or(0) as i64;
-        let phys = match t.packed.first() {
-            Some(&(l, r)) => {
-                let (lo, hi) = (l.min(r), l.max(r));
-                if idx < lo || idx > hi {
-                    return None;
-                }
-                // Scale by the inner dimensions' width.
-                let inner: i64 = t.packed[1..]
-                    .iter()
-                    .map(|(a, b)| (a - b).abs() + 1)
-                    .product::<i64>()
-                    .max(1);
-                if inner != 1 {
-                    return None;
-                }
-                if l >= r { idx - r } else { r - idx }
-            }
-            None if w > 0 && idx >= 0 && idx < w => idx,
-            None => return None,
-        };
-        let ty = if net { c::NET_BIT } else { c::REG_BIT };
-        let name = format!("{}[{}]", m.objs[o as usize].name, idx);
-        let full = format!("{}[{}]", b.full_name, idx);
-        let mut h = VpiHandle::signal(id, ty, &name, &full);
-        h.kind = VpiKind::Slice;
-        h.lsb = phys as u32;
-        h.width = 1;
-        Some(h)
+        indices.push(idx);
+        select_chain(m, sim, o, &base_full, &indices)
     })
     .flatten()
+}
+
+/// A bit or element name (`top.mem[1]`, `top.m2[1][0][3]`): its declared
+/// object, that object's full name, and the indices applied to it.
+fn resolve_select(m: &VpiModel, full: &str) -> Option<(u32, String, Vec<i64>)> {
+    let mut idx: Vec<i64> = Vec::new();
+    let mut s = full;
+    while let Some((base, i)) = split_select(s) {
+        idx.push(i);
+        s = base;
+        if let Some(&MRef::Obj(o)) = m.by_name.get(s) {
+            idx.reverse();
+            return Some((o, s.to_string(), idx));
+        }
+    }
+    None
+}
+
+/// Object `o` (full name `base_full`) with `indices` applied: an element or
+/// sub-array of an array, then at most one bit of the (element's) vector.
+fn select_chain(
+    m: &mut VpiModel,
+    sim: &mut Simulator,
+    o: u32,
+    base_full: &str,
+    indices: &[i64],
+) -> Option<VpiHandle> {
+    let (flat, td, sig, net) = match &m.objs[o as usize].d {
+        OData::Var(v) if v.member_of == NONE => (v.flat.clone(), v.td, v.sig, v.net_type != 0),
+        OData::Param { flat, td, sig, .. } => (flat.clone(), *td, *sig, false),
+        _ => return None,
+    };
+    let t = m.tdescs[td as usize].clone();
+    let nun = t.unpacked.len();
+    if indices.is_empty() {
+        return None;
+    }
+    if indices.len() <= nun {
+        return element_handle(m, sim, o, &flat, &t, base_full, indices);
+    }
+    if indices.len() != nun + 1 {
+        return None;
+    }
+    // A bit of a packed vector: the object's own, or its element's.
+    let (id, elem_full) = if nun == 0 {
+        (sig?, base_full.to_string())
+    } else {
+        let eh = element_handle(m, sim, o, &flat, &t, base_full, &indices[..nun])?;
+        if eh.kind != VpiKind::Signal {
+            return None;
+        }
+        (eh.signal_id, eh.full_name.clone())
+    };
+    let idx = indices[nun];
+    let w = sim.signal_widths.get(id).copied().unwrap_or(0) as i64;
+    let phys = match t.packed.first() {
+        Some(&(l, r)) => {
+            let (lo, hi) = (l.min(r), l.max(r));
+            if idx < lo || idx > hi || t.packed.len() > 1 {
+                return None;
+            }
+            if l >= r { idx - r } else { r - idx }
+        }
+        None if w > 1 && idx >= 0 && idx < w => idx,
+        None => return None,
+    };
+    let ty = if net { c::NET_BIT } else { c::REG_BIT };
+    let leaf = elem_full
+        .rsplit('.')
+        .next()
+        .unwrap_or(&elem_full)
+        .to_string();
+    let mut h = VpiHandle::signal(
+        id,
+        ty,
+        &format!("{}[{}]", leaf, idx),
+        &format!("{}[{}]", elem_full, idx),
+    );
+    h.kind = VpiKind::Slice;
+    h.lsb = phys as u32;
+    h.width = 1;
+    Some(h)
 }
 
 /// The element of array object `o` at `idx` (one index per dimension from
@@ -4459,23 +4708,18 @@ pub(super) fn handle_by_index(
     if let Some(r) = r {
         return Some(r.map(|h| h.into_raw()).unwrap_or(std::ptr::null_mut()));
     }
-    if matches!(h.kind, VpiKind::Memory | VpiKind::Signal) {
-        // A model array (or a sub-array of one).
-        let known = with_model(sim, |m, _| ident(m, h).is_some()).unwrap_or(false);
+    if matches!(h.kind, VpiKind::Memory | VpiKind::Signal | VpiKind::Slice) {
+        // A model array, a sub-array or element of one, or a vector.
+        let known = with_model(sim, |m, _| {
+            ident(m, h).is_some() || resolve_select(m, &h.full_name).is_some()
+        })
+        .unwrap_or(false);
         if known {
             return Some(
                 select(sim, h, index)
                     .map(|h| h.into_raw())
                     .unwrap_or(std::ptr::null_mut()),
             );
-        }
-        if let Some((base, _)) = split_select(&h.full_name) {
-            let _ = base;
-            // A sub-array handle made by `element_handle`.
-            let sub = format!("{}[{}]", h.full_name, index);
-            if let Some(p) = handle_by_name(sim, &sub, None) {
-                return Some(p);
-            }
         }
     }
     None
@@ -4506,33 +4750,37 @@ pub(super) fn handle(
             Some(r) => r,
             None => {
                 if matches!(h.kind, VpiKind::Slice | VpiKind::Signal | VpiKind::Memory) {
-                    if let Some((base, i)) = split_select(&h.full_name) {
-                        if let Some(&br) = m.by_name.get(base) {
-                            return match rel {
-                                c::PARENT => out(Some(ref_handle(m, sim, br))),
-                                c::INDEX => out(Some(int_const(i))),
-                                c::SCOPE => {
-                                    let s = m.scope_of_ref(br);
-                                    out((s != NONE).then(|| scope_handle(m, s)))
-                                }
-                                c::TYPESPEC => {
-                                    if let MRef::Obj(o) = br {
-                                        if let OData::Var(v) = &m.objs[o as usize].d {
-                                            let td = v.td;
-                                            let e = if td_is_array(m, td) {
-                                                m.elem_td(td)
-                                            } else {
-                                                td
-                                            };
-                                            let ts = m.typespec_obj(e);
-                                            return out(Some(plain_obj_handle(m, ts)));
-                                        }
+                    if let Some((o, base_full, ix)) = resolve_select(m, &h.full_name) {
+                        let last = *ix.last().unwrap_or(&0);
+                        return match rel {
+                            c::PARENT => out(if ix.len() == 1 {
+                                Some(obj_handle(m, sim, o))
+                            } else {
+                                select_chain(m, sim, o, &base_full, &ix[..ix.len() - 1])
+                            }),
+                            c::INDEX => out(Some(int_const(last))),
+                            c::SCOPE => {
+                                let s = m.objs[o as usize].scope;
+                                out((s != NONE).then(|| scope_handle(m, s)))
+                            }
+                            c::TYPESPEC => {
+                                let mut td = match &m.objs[o as usize].d {
+                                    OData::Var(v) => v.td,
+                                    OData::Param { td, .. } => *td,
+                                    _ => return out(None),
+                                };
+                                for _ in 0..ix.len() {
+                                    if !td_is_array(m, td) {
+                                        // A bit has no typespec of its own.
+                                        return out(None);
                                     }
-                                    out(None)
+                                    td = m.elem_td(td);
                                 }
-                                _ => None,
-                            };
-                        }
+                                let ts = m.typespec_obj(td);
+                                out(Some(plain_obj_handle(m, ts)))
+                            }
+                            _ => None,
+                        };
                     }
                 }
                 if h.kind == VpiKind::Obj && h.signal_id == usize::MAX {
@@ -4583,20 +4831,12 @@ pub(super) fn handle(
                 out((p != NONE).then(|| scope_handle(m, p)))
             }
             c::MODULE | c::INSTANCE => {
-                let mut s = match r {
+                // The instance around the object (for an instance, the one
+                // that instantiates it).
+                let s = match r {
                     MRef::Scope(s) => m.scopes[s as usize].parent,
                     MRef::Obj(o) => m.objs[o as usize].scope,
                 };
-                if let MRef::Scope(x) = r {
-                    // An instance's own module for vpiInstance of itself is its
-                    // parent; for other scopes, the enclosing instance.
-                    if !matches!(
-                        m.scopes[x as usize].kind,
-                        SKind::Module | SKind::Interface | SKind::Program | SKind::Package
-                    ) {
-                        s = m.scopes[x as usize].parent;
-                    }
-                }
                 let i = m.instance_of(s);
                 if i == NONE {
                     return out(None);
@@ -4787,7 +5027,11 @@ fn obj_rel(
                     _ => None,
                 },
                 OData::Prim { delay, .. } if rel == c::DELAY => Some(*delay),
-                OData::PrimTerm { expr, .. } | OData::PathTerm { expr, .. } if rel == c::EXPR => {
+                OData::PrimTerm { expr, .. }
+                | OData::PathTerm { expr, .. }
+                | OData::ModportIo { expr, .. }
+                    if rel == c::EXPR =>
+                {
                     Some(*expr)
                 }
                 OData::TchkTerm { expr, cond, .. } => match rel {
@@ -4962,7 +5206,8 @@ fn scope_iter(m: &mut VpiModel, sim: &mut Simulator, rel: c_int, s: u32) -> Opti
         | c::NAMED_EVENT_ARRAY
         | c::ALWAYS
         | c::INITIAL
-        | c::FINAL => objs_where(m, sim, &|_, ob| ob.type_code == rel),
+        | c::FINAL
+        | c::MODPORT => objs_where(m, sim, &|_, ob| ob.type_code == rel),
         // A specific variable or net type (vpiReg, vpiIntVar, vpiNetArray,
         // vpiRegArray/vpiArrayVar, vpiStructVar, ...).
         _ if type_name(rel).is_some() => objs_where(m, sim, &|_, ob| {
@@ -5078,7 +5323,12 @@ fn obj_iter(
                 _ => {}
             }
         }
-        c::IO_DECL => {}
+        c::IO_DECL => {
+            if let OData::Modport { ios } = &m.objs[o as usize].d {
+                let t = ios.clone();
+                v = t.into_iter().map(|x| obj_handle(m, sim, x)).collect();
+            }
+        }
         c::BIT | c::PORT_BIT | c::NET_BIT | c::REG_BIT => {
             // Bits of a vector port or variable.
             let (td, base, net, dir, sig) = match &m.objs[o as usize].d {
@@ -5233,6 +5483,9 @@ fn obj_iter(
             // (vpiPortInst, the high connection of a child instance's port)
             // or from inside (vpiPorts, the module's own port).
             let scope = m.objs[o as usize].scope;
+            if scope == NONE || !matches!(m.objs[o as usize].d, OData::Var(_)) {
+                return Some(v);
+            }
             let name = m.objs[o as usize].name.clone();
             let mut hits: Vec<u32> = Vec::new();
             if rel == c::PORTS {
@@ -5378,6 +5631,19 @@ fn op_type(e: &Expression) -> c_int {
 /// Integer properties. For a model scope or object every property is
 /// answered here (`vpiUndefined` when it does not apply); for other handles
 /// `None` leaves the call to the flat-table code.
+/// The properties answered without the simulator: the location of a
+/// `$systf` call, its constant arguments and an iterator (none the model
+/// knows), and those of the objects made on the fly.
+pub(super) fn get_static(prop: c_int, h: &VpiHandle) -> Option<c_int> {
+    if matches!(
+        h.kind,
+        VpiKind::SysTfCall | VpiKind::Constant | VpiKind::Iterator
+    ) {
+        return (prop == c::LINE_NO).then_some(0);
+    }
+    None
+}
+
 pub(super) fn get(sim: &mut Simulator, prop: c_int, h: &VpiHandle) -> Option<c_int> {
     // A constant made on the fly.
     if h.kind == VpiKind::Obj && h.signal_id == usize::MAX && h.type_code == c::RANGE {
@@ -5425,14 +5691,16 @@ pub(super) fn get(sim: &mut Simulator, prop: c_int, h: &VpiHandle) -> Option<c_i
 
 /// Bits and elements made by `select`: answered from their base object.
 fn bit_get(m: &VpiModel, sim: &Simulator, prop: c_int, h: &VpiHandle) -> Option<c_int> {
-    let (base, _) = split_select(&h.full_name)?;
-    let MRef::Obj(o) = *m
-        .by_name
-        .get(base)
-        .or_else(|| m.port_by_name.get(base).map(|_| &MRef::Obj(NONE)))?
-    else {
-        return None;
+    let (o, base) = match resolve_select(m, &h.full_name) {
+        Some((o, b, _)) => (o, b),
+        None => {
+            // A port bit: named after its port.
+            let (b, _) = split_select(&h.full_name)?;
+            m.port_by_name.get(b)?;
+            (NONE, b.to_string())
+        }
     };
+    let base = base.as_str();
     let (line, file_known) = if o == NONE {
         (0, false)
     } else {
@@ -5779,6 +6047,17 @@ fn obj_get(
                 c::SIZE => *width as c_int,
                 _ => c::UNDEFINED,
             },
+            OData::Modport { .. } => c::UNDEFINED,
+            OData::ModportIo { dir, expr } => match prop {
+                c::DIRECTION => *dir,
+                c::SIZE => {
+                    let e = *expr;
+                    eval_obj(m, sim, e)
+                        .map(|v| v.width as c_int)
+                        .unwrap_or(c::UNDEFINED)
+                }
+                _ => c::UNDEFINED,
+            },
             OData::Range { left, right } => match prop {
                 c::SIZE => ((left - right).unsigned_abs() + 1) as c_int,
                 _ => c::UNDEFINED,
@@ -5791,14 +6070,42 @@ fn obj_get(
 // vpi_get_str
 // ---------------------------------------------------------------------------
 
+/// String properties answered without the simulator: every type name, and
+/// the (absent) location of a `$systf` call, constant or iterator.
+pub(super) fn get_str_static(prop: c_int, h: &VpiHandle) -> Option<Option<String>> {
+    let unmodelled = matches!(
+        h.kind,
+        VpiKind::SysTfCall | VpiKind::Constant | VpiKind::Iterator
+    ) || (h.kind == VpiKind::Obj && h.signal_id == usize::MAX);
+    if !unmodelled {
+        return None;
+    }
+    match prop {
+        c::TYPE => Some(type_name(h.type_code).map(str::to_string)),
+        c::FILE | c::DEF_FILE | c::DEF_NAME => Some(None),
+        _ => None,
+    }
+}
+
 /// String properties. `Some(None)` answers NULL; `None` leaves the call to
 /// the flat-table code.
 pub(super) fn get_str(sim: &mut Simulator, prop: c_int, h: &VpiHandle) -> Option<Option<String>> {
-    if prop == c::TYPE {
-        return Some(type_name(h.type_code).map(str::to_string));
+    if let Some(r) = get_str_static(prop, h) {
+        return Some(r);
     }
     if h.kind == VpiKind::Obj && h.signal_id == usize::MAX {
         return Some(None);
+    }
+    if prop == c::TYPE {
+        // The declared type the model knows, else the handle's own.
+        let code = with_model(sim, |m, _| match ident(m, h) {
+            Some(MRef::Scope(s)) => Some(m.scopes[s as usize].type_code),
+            Some(MRef::Obj(o)) => Some(m.objs[o as usize].type_code),
+            None => None,
+        })
+        .flatten()
+        .unwrap_or(h.type_code);
+        return Some(type_name(code).map(str::to_string));
     }
     let owned = matches!(h.kind, VpiKind::Obj | VpiKind::Scope);
     let r = with_model(sim, |m, _| {
@@ -5807,8 +6114,8 @@ pub(super) fn get_str(sim: &mut Simulator, prop: c_int, h: &VpiHandle) -> Option
             Some(r) => r,
             None => {
                 // A bit or element: its base object's location.
-                let (base, _) = split_select(&h.full_name)?;
-                let r = *m.by_name.get(base)?;
+                let (o, _, _) = resolve_select(m, &h.full_name)?;
+                let r = MRef::Obj(o);
                 return match prop {
                     c::FILE => Some(match r {
                         MRef::Obj(o) => file_of(m, m.objs[o as usize].file),

@@ -197,7 +197,7 @@ module top;
   pair_t pr = 8'h3C;
   struct { int a; logic [3:0] b; } us;
   union packed { logic [7:0] x; logic [7:0] y; } un;
-  logic [7:0] mem [0:3];
+  logic [7:0] mem [0:3]; logic [3:0] m2 [2][3];
   wire [1:0] nets [2];
   int dyn [];
   int qu [$];
@@ -213,7 +213,7 @@ module top;
   dff_chk u_dff (.clk(clk), .d(lv[0]), .q());
   prog p_inst (.clk(clk));
   for (genvar g = 0; g < N; g++) begin : gl
-    logic [3:0] gsig;
+    logic [3:0] gsig; assign gsig = g + 1;
     leaf #(.W(4)) u_l (.clk(clk), .d(gsig), .q());
   end
   for (genvar k = 0; k < 2; k++) begin
@@ -238,7 +238,7 @@ module top;
     int local_i;
     local_i = 3;
     pkg_count = 11;
-    mem[1] = 8'h42; dyn = new[3]; dyn[2] = 7; qu = '{4, 5}; aa["k"] = 1;
+    mem[1] = 8'h42; dyn = new[3]; dyn[2] = 7; qu = '{4, 5}; aa["k"] = 1; m2[1][2] = 4'h9;
     fork : fk
       #1 li = 1;
     join_none
@@ -253,11 +253,13 @@ module top;
   always #1 clk = ~clk;
   final $display("done");
 endmodule
+bind dff_chk cell_buf u_bound (.y(), .a(d));
 "###;
 
-/// Scopes: instances of every kind, generate scopes and arrays, named
-/// blocks, tasks and functions, packages; their file, line, definition and
-/// relations; and names resolved absolutely, relatively and in packages.
+/// Scopes: instances of every kind (a `bind`-added one included), generate
+/// scopes and arrays, named blocks, tasks and functions, packages, modports;
+/// their file, line, definition and relations; and names resolved
+/// absolutely, relatively and in packages.
 const SCOPES_C: &str = r###"#include "common.h"
 static void scope_line(vpiHandle s) {
     vpi_printf("OM|scope %s type=%s name=%s def=%s file=%s line=%d deffile=%s defline=%d top=%d cell=%d\n",
@@ -285,6 +287,19 @@ static PLI_INT32 walk(PLI_BYTE8 *u) {
     list("top.taskfuncs", vpiTaskFunc, top);
     tree(top);
     tree(H("cfg_pkg"));
+    list("bif.modports", vpiModport, H("top.bif"));
+    vpiHandle mst = H("top.bif.mst");
+    vpiHandle it = vpi_iterate(vpiIODecl, mst), io;
+    while (it && (io = vpi_scan(it)))
+        vpi_printf("OM|modport io %s dir=%d expr=%s:%s parent=%s line=%d\n", fname(io), vpi_get(vpiDirection, io),
+                   fname(vpi_handle(vpiExpr, io)), tname(vpi_handle(vpiExpr, io)), fname(vpi_handle(vpiParent, io)),
+                   vpi_get(vpiLineNo, io));
+    vpiHandle ub = H("top.u_dff.u_bound");
+    vpi_printf("OM|bound %s def=%s line=%d scope=%s\n", fname(ub), S(vpi_get_str(vpiDefName, ub)), vpi_get(vpiLineNo, ub),
+               fname(vpi_handle(vpiScope, ub)));
+    it = vpi_iterate(vpiPort, ub);
+    while (it && (io = vpi_scan(it)))
+        vpi_printf("OM|bound port %s high=%s\n", fname(io), fname(vpi_handle(vpiHighConn, io)));
     vpiHandle ga = H("top.gl");
     vpi_printf("OM|genarray %s type=%s size=%d line=%d scope=%s\n", fname(ga), tname(ga), vpi_get(vpiSize, ga),
                vpi_get(vpiLineNo, ga), fname(vpi_handle(vpiScope, ga)));
@@ -350,6 +365,7 @@ fn design_walk_scopes_and_names() {
             "OM|scope top.u_leaf type=vpiModule name=u_leaf def=leaf file=top.sv line=77 deffile=top.sv defline=31 top=0 cell=0",
             "OM|scope top.u_cell type=vpiModule name=u_cell def=cell_buf file=top.sv line=78 deffile=top.sv defline=24 top=0 cell=1",
             "OM|scope top.u_dff type=vpiModule name=u_dff def=dff_chk file=top.sv line=79 deffile=top.sv defline=34 top=0 cell=0",
+            "OM|scope top.u_dff.u_bound type=vpiModule name=u_bound def=cell_buf file=top.sv line=122 deffile=top.sv defline=24 top=0 cell=1",
             "OM|scope top.p_inst type=vpiProgram name=p_inst def=prog file=top.sv line=80 deffile=top.sv defline=42 top=-1 cell=0",
             "OM|scope top.gl[0] type=vpiGenScope name=gl[0] def=- file=top.sv line=81 deffile=- defline=-1 top=-1 cell=-1",
             "OM|scope top.gl[0].u_l type=vpiModule name=u_l def=leaf file=top.sv line=83 deffile=top.sv defline=31 top=0 cell=0",
@@ -366,6 +382,13 @@ fn design_walk_scopes_and_names() {
             "OM|scope top.ablk type=vpiNamedBegin name=ablk def=- file=top.sv line=114 deffile=- defline=-1 top=-1 cell=-1",
             "OM|scope cfg_pkg:: type=vpiPackage name=cfg_pkg def=cfg_pkg file=top.sv line=2 deffile=top.sv defline=2 top=-1 cell=-1",
             "OM|scope cfg_pkg::twice type=vpiFunction name=twice def=- file=top.sv line=8 deffile=- defline=-1 top=-1 cell=-1",
+            "OM|bif.modports=mst:vpiModport",
+            "OM|modport io top.bif.mst.data dir=2 expr=top.bif.data:vpiReg parent=top.bif.mst line=13",
+            "OM|modport io top.bif.mst.valid dir=2 expr=top.bif.valid:vpiReg parent=top.bif.mst line=13",
+            "OM|modport io top.bif.mst.clk dir=1 expr=top.bif.clk:vpiNet parent=top.bif.mst line=13",
+            "OM|bound top.u_dff.u_bound def=cell_buf line=122 scope=top.u_dff",
+            "OM|bound port top.u_dff.u_bound.y high=NULL",
+            "OM|bound port top.u_dff.u_bound.a high=top.u_dff.d",
             "OM|genarray top.gl type=vpiGenScopeArray size=2 line=81 scope=top",
             "OM|gl.elements=gl[0]:vpiGenScope gl[1]:vpiGenScope",
             "OM|gl[1] byindex=top.gl[1] index=1 parent=top.gl scope=top arraymember=1 implicit=0",
@@ -399,7 +422,8 @@ fn design_walk_scopes_and_names() {
 /// Declared objects: the declared vpiType of every kind of variable, net,
 /// parameter and named event, their sizes, ranges, typespecs (enum
 /// constants, struct members, array element types), struct members, bits,
-/// array elements, values and the properties of each.
+/// elements of fixed, multi-dimensional, dynamic and queue arrays, values
+/// and the properties of each.
 const DECLS_C: &str = r###"#include "common.h"
 static void var_line(const char *n) {
     vpiHandle h = H(n);
@@ -469,6 +493,13 @@ static PLI_INT32 walk(PLI_BYTE8 *u) {
     ranges("lv", H("top.lv"));
     ranges("mem", H("top.mem"));
     ranges("nets", H("top.nets"));
+    ranges("m2", H("top.m2"));
+    vpiHandle m21 = vpi_handle_by_index(H("top.m2"), 1);
+    vpiHandle m212 = vpi_handle_by_index(m21, 2);
+    vpiHandle m2b = H("top.m2[1][2][3]");
+    vpi_printf("OM|m2 size=%d m2[1]=%s:%s:%d m2[1][2]=%s:%s:%d parent=%s bit=%s:%s:%d parent=%s\n", vpi_get(vpiSize, H("top.m2")),
+               fname(m21), tname(m21), vpi_get(vpiSize, m21), fname(m212), tname(m212), ival(m212),
+               fname(vpi_handle(vpiParent, m212)), fname(m2b), tname(m2b), ival(m2b), fname(vpi_handle(vpiParent, m2b)));
     ranges("dyn", H("top.dyn"));
     ranges("qu", H("top.qu"));
     list("dyn.elements", vpiReg, H("top.dyn"));
@@ -589,9 +620,9 @@ fn design_walk_declarations_types_values() {
             "OM|top.nets=w:vpiNet a_out:vpiNet u_out:vpiNet cb_y:vpiNet sw_out:vpiNet wa:vpiNet t1:vpiNet",
             "OM|top.netarrays=nets:vpiNetArray",
             "OM|top.regs=clk:vpiReg lv:vpiReg",
-            "OM|top.regarrays=mem:vpiRegArray dyn:vpiRegArray qu:vpiRegArray aa:vpiRegArray",
+            "OM|top.regarrays=mem:vpiRegArray m2:vpiRegArray dyn:vpiRegArray qu:vpiRegArray aa:vpiRegArray",
             "OM|top.memories=mem:vpiRegArray",
-            "OM|top.variables=clk:vpiReg lv:vpiReg b4:vpiBitVar i32:vpiIntegerVar iv:vpiIntVar by:vpiByteVar si:vpiShortIntVar li:vpiLongIntVar rv:vpiRealVar tv:vpiTimeVar s:vpiStringVar st:vpiEnumVar pr:vpiStructVar us:vpiStructVar un:vpiUnionVar mem:vpiRegArray dyn:vpiRegArray qu:vpiRegArray aa:vpiRegArray CI:vpiIntVar",
+            "OM|top.variables=clk:vpiReg lv:vpiReg b4:vpiBitVar i32:vpiIntegerVar iv:vpiIntVar by:vpiByteVar si:vpiShortIntVar li:vpiLongIntVar rv:vpiRealVar tv:vpiTimeVar s:vpiStringVar st:vpiEnumVar pr:vpiStructVar us:vpiStructVar un:vpiUnionVar mem:vpiRegArray m2:vpiRegArray dyn:vpiRegArray qu:vpiRegArray aa:vpiRegArray CI:vpiIntVar",
             "OM|top.intvars=iv:vpiIntVar CI:vpiIntVar",
             "OM|top.params=N:vpiParameter M:vpiParameter",
             "OM|top.events=ev:vpiNamedEvent",
@@ -606,6 +637,8 @@ fn design_walk_declarations_types_values() {
             "OM|ranges lv=[7:0]/8",
             "OM|ranges mem=[0:3]/4",
             "OM|ranges nets=[0:1]/2",
+            "OM|ranges m2=[0:1]/2 [0:2]/3",
+            "OM|m2 size=6 m2[1]=top.m2[1]:vpiRegArray:3 m2[1][2]=top.m2[1][2]:vpiReg:9 parent=top.m2[1] bit=top.m2[1][2][3]:vpiRegBit:1 parent=top.m2[1][2]",
             "OM|ranges dyn=[0:2]/3",
             "OM|ranges qu=[0:1]/2",
             "OM|dyn.elements=dyn[0]:vpiIntVar dyn[1]:vpiIntVar dyn[2]:vpiIntVar",
@@ -688,6 +721,15 @@ static PLI_INT32 walk(PLI_BYTE8 *u) {
                    vpi_get(vpiLineNo, o), vpi_get(vpiSize, o), vpi_get(vpiNetDeclAssign, o), fname(l), tname(l),
                    tname(r), ival(r), fname(vpi_handle(vpiParent, r)), ival(vpi_handle(vpiLeftRange, r)),
                    ival(vpi_handle(vpiRightRange, r)), tname(d), vpi_get(vpiConstType, d), ival(d));
+    }
+    it = vpi_iterate(vpiContAssign, H("top.gl[1]"));
+    while (it && (o = vpi_scan(it))) {
+        vpiHandle l = vpi_handle(vpiLhs, o), r = vpi_handle(vpiRhs, o);
+        vpi_printf("OM|gl[1] contassign line=%d lhs=%s:%d rhs=%s value=%d operands:", vpi_get(vpiLineNo, o), fname(l), ival(l),
+                   tname(r), ival(r));
+        vpiHandle oi = vpi_iterate(vpiOperand, r), op;
+        while (oi && (op = vpi_scan(oi))) vpi_printf(" %s:%s=%d", tname(op), S(vpi_get_str(vpiFullName, op)), ival(op));
+        vpi_printf(" optype=%d\n", vpi_get(vpiOpType, r));
     }
     /* primitives */
     it = vpi_iterate(vpiPrimitive, top);
@@ -785,6 +827,7 @@ fn design_walk_subroutines_processes_primitives_ports() {
             "OM|u_leaf.process=-:vpiAlways",
             "OM|p_inst.process=-:vpiInitial",
             "OM|contassign line=97 size=4 netdecl=0 lhs=top.w:vpiNet rhs=vpiPartSelect value=5 parent=top.lv left=3 right=0 delay=vpiConstant:1:2",
+            "OM|gl[1] contassign line=82 lhs=top.gl[1].gsig:2 rhs=vpiOperation value=2 operands: vpiConstant:-=1 vpiConstant:-=1 optype=24",
             "OM|prim top.g_and type=vpiGate def=and primtype=1 size=2 line=98",
             "OM|  term 0 dir=2 expr=vpiNet:top.a_out parent=top.g_and",
             "OM|  term 1 dir=1 expr=vpiBitSelect:top.lv parent=top.g_and",

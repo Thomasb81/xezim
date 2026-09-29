@@ -35,6 +35,7 @@
 #define vpiInterface         601
 #define vpiProgram           602
 #define vpiTypespec          605   /* also the vpi_handle relation */
+#define vpiModport           606   /* an interface's modport; vpiIODecl iterates its ports */
 #define vpiRefObj            608   /* a name the object model cannot resolve */
 #define vpiVarBit            vpiRegBit
 #define vpiArrayVar          vpiRegArray
