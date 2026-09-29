@@ -16,6 +16,7 @@ use crate::ast::stmt::*;
 use crate::ast::types::{DataType, IntegerAtomType, PortDirection};
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
+
 use fst_writer::{
     FstBodyWriter, FstHeaderWriter, FstScopeType, FstSignalId, FstSignalType, FstVarDirection,
     FstVarType,
@@ -79790,7 +79791,15 @@ impl Simulator {
     /// Emit `msg` once per distinct system-task `name` for the whole run.
     fn warn_system_task_once(&mut self, name: &str, msg: &str) {
         if self.warned_system_tasks.insert(name.to_string()) {
-            eprintln!("{}", msg);
+            // One write for the whole line: `eprintln!` sends the text and the
+            // newline separately, and `$display` output from the stdout writer
+            // thread can land between them when both streams go to one file
+            // (`> run.log 2>&1`), gluing a UVM line onto this note.
+            use std::io::Write;
+            let mut line = String::with_capacity(msg.len() + 1);
+            line.push_str(msg);
+            line.push('\n');
+            let _ = std::io::stderr().write_all(line.as_bytes());
         }
     }
 
