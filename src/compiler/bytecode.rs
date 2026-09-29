@@ -15390,6 +15390,238 @@ fn ts_mask(w: u32) -> u64 {
     if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
 }
 
+/// Sensitivity mask of bits `lo .. lo + n` of a `width`-bit signal. A
+/// signal of up to 64 bits maps bit for bit; a wider one maps mask bit `k`
+/// to the `2^s`-bit chunk starting at `k << s`, `s` the smallest shift that
+/// fits the signal in 64 chunks, so a span covers every chunk it touches.
+/// (Bits past chunk 63 — only out-of-range spans — all map to chunk 63,
+/// the same way for reads and writes.) An empty span claims the whole
+/// signal.
+#[inline(always)]
+pub fn sig_span_mask(width: u32, lo: u32, n: u32) -> u64 {
+    if n == 0 {
+        return u64::MAX;
+    }
+    let sh = sig_chunk_shift(width);
+    let first = (lo >> sh).min(63);
+    let last = (lo.saturating_add(n - 1) >> sh).min(63);
+    (u64::MAX >> (63 - last)) & (u64::MAX << first)
+}
+
+/// log2 of the chunk size `sig_span_mask` uses for a `width`-bit signal.
+#[inline(always)]
+pub fn sig_chunk_shift(width: u32) -> u32 {
+    if width <= 64 {
+        0
+    } else {
+        // ceil(log2(ceil(width / 64)))
+        let c = width.div_ceil(64);
+        32 - (c - 1).leading_zeros()
+    }
+}
+
+/// Bits read by a two-state stream, per signal, for bit-granular comb
+/// sensitivity: `(signal, mask)` with `sig_span_mask` chunks (`u64::MAX`
+/// for a whole-signal read), plus every signal the stream stores, once per
+/// store instruction. None when the stream holds anything whose reads are
+/// not a fixed set of bits: array elements, AST fallbacks, waits, coverage
+/// hits (an evaluation count is observable). The match is exhaustive on
+/// purpose — a new instruction must be classified before it compiles.
+pub fn ts_read_masks(insns: &[TsInsn], widths: &[u32]) -> Option<(Vec<(u32, u64)>, Vec<u32>)> {
+    let mut reads: Vec<(u32, u64)> = Vec::new();
+    let mut writes: Vec<u32> = Vec::new();
+    let wid = |sig: u32| widths.get(sig as usize).copied().unwrap_or(0);
+    let add = |reads: &mut Vec<(u32, u64)>, sig: u32, m: u64| {
+        if let Some(e) = reads.iter_mut().find(|e| e.0 == sig) {
+            e.1 |= m;
+        } else {
+            reads.push((sig, m));
+        }
+    };
+    // Low contiguous `mask` → its bit count (0 claims the whole signal).
+    let nbits = |mask: u64| 64 - mask.leading_zeros();
+    for i in insns {
+        match i {
+            TsInsn::LoadSig { sig, .. }
+            | TsInsn::LoadSigNot { sig, .. }
+            | TsInsn::LoadSigLogAnd { sig, .. }
+            | TsInsn::LoadSigBrNz { sig, .. }
+            | TsInsn::BrFalseLoadSig { sig, .. }
+            | TsInsn::LoadSigLogOr { sig, .. }
+            | TsInsn::LoadSigAnd { sig, .. }
+            | TsInsn::LoadSigRepl { sig, .. }
+            | TsInsn::WLoadSig { sig, .. }
+            | TsInsn::SigRangeDyn { sig, .. } => add(&mut reads, *sig, u64::MAX),
+            TsInsn::LoadSig2 { sig1, sig2, .. } => {
+                add(&mut reads, *sig1, u64::MAX);
+                add(&mut reads, *sig2, u64::MAX);
+            }
+            TsInsn::SigBit { sig, bit, .. }
+            | TsInsn::SigBitW { sig, bit, .. }
+            | TsInsn::SigBitNot { sig, bit, .. } => {
+                add(&mut reads, *sig, sig_span_mask(wid(*sig), *bit as u32, 1))
+            }
+            TsInsn::SigBit2 {
+                sig1,
+                bit1,
+                sig2,
+                bit2,
+                ..
+            } => {
+                add(
+                    &mut reads,
+                    *sig1,
+                    sig_span_mask(wid(*sig1), *bit1 as u32, 1),
+                );
+                add(
+                    &mut reads,
+                    *sig2,
+                    sig_span_mask(wid(*sig2), *bit2 as u32, 1),
+                );
+            }
+            TsInsn::SigRange { sig, lo, mask, .. }
+            | TsInsn::SigRangeAnd { sig, lo, mask, .. }
+            | TsInsn::SigRangeEq { sig, lo, mask, .. } => add(
+                &mut reads,
+                *sig,
+                sig_span_mask(wid(*sig), *lo as u32, nbits(*mask)),
+            ),
+            TsInsn::SigRangeW { sig, lo, w, .. } | TsInsn::WSigRange { sig, lo, w, .. } => add(
+                &mut reads,
+                *sig,
+                sig_span_mask(wid(*sig), *lo as u32, *w as u32),
+            ),
+            TsInsn::SigRangeEqC { sig, lo, w, .. } => add(
+                &mut reads,
+                *sig,
+                sig_span_mask(wid(*sig), *lo as u32, *w as u32),
+            ),
+            TsInsn::LoadSigSigRange {
+                sig,
+                sig2,
+                lo,
+                mask,
+                ..
+            } => {
+                add(&mut reads, *sig, u64::MAX);
+                add(
+                    &mut reads,
+                    *sig2,
+                    sig_span_mask(wid(*sig2), *lo as u32, nbits(*mask)),
+                );
+            }
+            TsInsn::BrSigFalse { sig, bit, .. } => {
+                let m = if *bit == u32::MAX {
+                    u64::MAX
+                } else {
+                    sig_span_mask(wid(*sig), *bit, 1)
+                };
+                add(&mut reads, *sig, m);
+            }
+            TsInsn::LogAndStore { sig, .. }
+            | TsInsn::AndRangeStore { sig, .. }
+            | TsInsn::LogOrStore { sig, .. }
+            | TsInsn::OrRangeStore { sig, .. }
+            | TsInsn::BitStoreNbaDyn { sig, .. }
+            | TsInsn::BitStoreDyn { sig, .. }
+            | TsInsn::RangeStoreDyn { sig, .. }
+            | TsInsn::RangeStoreNbaDyn { sig, .. }
+            | TsInsn::RangeFillXW { sig, .. }
+            | TsInsn::ConstStoreX { sig, .. }
+            | TsInsn::Store { sig, .. }
+            | TsInsn::StoreNba { sig, .. }
+            | TsInsn::ConstStoreNba { sig, .. }
+            | TsInsn::RangeStoreNba { sig, .. }
+            | TsInsn::RangeStore { sig, .. }
+            | TsInsn::RangeStoreW { sig, .. }
+            | TsInsn::RangeStoreNbaW { sig, .. }
+            | TsInsn::RangeFillW { sig, .. }
+            | TsInsn::RangeFillNbaW { sig, .. }
+            | TsInsn::WStore { sig, .. }
+            | TsInsn::WStoreNba { sig, .. }
+            | TsInsn::WRangeStore { sig, .. }
+            | TsInsn::WRangeStoreNba { sig, .. } => writes.push(*sig),
+            TsInsn::RangeStoreX(p) | TsInsn::RangeStoreXW(p) => writes.push(p.sig),
+            // A save snapshots a signal the stream is about to store, for
+            // the undo after a bail: not an input.
+            TsInsn::SaveSig { .. } | TsInsn::SaveSigW { .. } => {}
+            TsInsn::ElemLoad(..)
+            | TsInsn::WElemLoad(..)
+            | TsInsn::ElemStoreNba(..)
+            | TsInsn::ElemStoreNbaFromSig(..)
+            | TsInsn::ElemStore(..)
+            | TsInsn::NbaFromElem(..)
+            | TsInsn::WNbaFromElem(..)
+            | TsInsn::Fallback(..)
+            | TsInsn::WaitEdge { .. }
+            | TsInsn::WaitDelayRaw { .. }
+            | TsInsn::CovHit(..) => return None,
+            TsInsn::Const { .. }
+            | TsInsn::Bit { .. }
+            | TsInsn::Range { .. }
+            | TsInsn::Xor { .. }
+            | TsInsn::And { .. }
+            | TsInsn::Or { .. }
+            | TsInsn::Sel { .. }
+            | TsInsn::Not { .. }
+            | TsInsn::XorC { .. }
+            | TsInsn::EqC { .. }
+            | TsInsn::Add { .. }
+            | TsInsn::Sub { .. }
+            | TsInsn::Eq { .. }
+            | TsInsn::MaskEq { .. }
+            | TsInsn::Neq { .. }
+            | TsInsn::LogNotAnd { .. }
+            | TsInsn::LogNotLogAnd { .. }
+            | TsInsn::EqBrFalse { .. }
+            | TsInsn::ConstEq { .. }
+            | TsInsn::AndOr { .. }
+            | TsInsn::Lt { .. }
+            | TsInsn::CmpS { .. }
+            | TsInsn::BitDyn { .. }
+            | TsInsn::Leq { .. }
+            | TsInsn::Gt { .. }
+            | TsInsn::Geq { .. }
+            | TsInsn::LogNot { .. }
+            | TsInsn::LogAnd { .. }
+            | TsInsn::LogOr { .. }
+            | TsInsn::Concat { .. }
+            | TsInsn::Concat2 { .. }
+            | TsInsn::Concat3 { .. }
+            | TsInsn::Mask { .. }
+            | TsInsn::BrFalse { .. }
+            | TsInsn::BrNz { .. }
+            | TsInsn::Jmp { .. }
+            | TsInsn::CaseJmp { .. }
+            | TsInsn::CaseMaskJmp { .. }
+            | TsInsn::RedOr { .. }
+            | TsInsn::WRedOr { .. }
+            | TsInsn::WRedAnd { .. }
+            | TsInsn::RedAnd { .. }
+            | TsInsn::WSel { .. }
+            | TsInsn::WConst { .. }
+            | TsInsn::WXor { .. }
+            | TsInsn::WAnd { .. }
+            | TsInsn::WOr { .. }
+            | TsInsn::WNot { .. }
+            | TsInsn::WRange { .. }
+            | TsInsn::RangeFromW { .. }
+            | TsInsn::BitFromW { .. }
+            | TsInsn::WConcat { .. }
+            | TsInsn::WMask { .. }
+            | TsInsn::WFromN { .. }
+            | TsInsn::NFromW { .. }
+            | TsInsn::Mul { .. }
+            | TsInsn::AddC { .. }
+            | TsInsn::Shl { .. }
+            | TsInsn::Shr { .. }
+            | TsInsn::Repl { .. }
+            | TsInsn::WRepl { .. } => {}
+        }
+    }
+    Some((reads, writes))
+}
+
 thread_local! {
     /// Opcode the lowering was on when it gave up — the only way to answer
     /// "why is this block not an island?" on a design you cannot read.

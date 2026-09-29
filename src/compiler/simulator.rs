@@ -1053,6 +1053,14 @@ struct CombEntryCold {
 
 const PREPARED_COMB_MAGIC: &[u8; 8] = b"XZCMB009";
 
+/// One `comb_dep_edges` element: a dependent entry and the bits of the
+/// signal it reads (`bytecode::sig_span_mask` chunks; all ones = any bit).
+#[derive(Clone, Copy)]
+struct DepEdge {
+    mask: u64,
+    entry: u32,
+}
+
 #[derive(serde::Serialize)]
 struct PreparedCombCacheRef<'a> {
     signal_count: usize,
@@ -6877,6 +6885,26 @@ pub struct Simulator {
     /// simulator so a test can opt out before it builds one.
     proc_fsm_mode: u8,
     comb_dep_entries: Vec<u32>,
+    /// `comb_dep_entries` with bit-granular sensitivity, for the settle
+    /// loop: each dependent with the bits of the signal it reads. A write
+    /// inside the settle loop whose changed bits miss the mask does not
+    /// trigger that dependent — `assign lo = bus[3:0]` stays idle while
+    /// `bus[7:4]` moves. Empty until the first settle; entries narrow as
+    /// they lower two-state.
+    comb_dep_edges: Vec<DepEdge>,
+    /// Entries lowered since the masks were last refined.
+    bit_sens_pending: Vec<u32>,
+    /// XEZIM_BIT_SENS=0 turns the masks off (every dependent triggers).
+    bit_sens_on: bool,
+    /// Dirty records of the stores a two-state entry makes in the settle
+    /// loop (direct mode), with each store's changed bits (`u64::MAX` when
+    /// unknown): `ts_rec_n` records, the first in `ts_rec0` (most entries
+    /// store one signal), the rest in `ts_recs`. Kept apart from
+    /// `dirty_list` so every record carries its own mask; the settle loop
+    /// consumes them right after the entry.
+    ts_rec0: (usize, u64),
+    ts_rec_n: usize,
+    ts_recs: Vec<(usize, u64)>,
     /// Bitvec: dirty_signals[signal_id] = true if signal changed since last settle.
     dirty_signals: Vec<bool>,
     /// Explicit list of dirty signal IDs (maintained alongside dirty_signals bitvec)
@@ -10586,6 +10614,12 @@ impl Simulator {
                 _ => 2,
             },
             comb_dep_entries: Vec::new(),
+            comb_dep_edges: Vec::new(),
+            bit_sens_pending: Vec::new(),
+            bit_sens_on: !matches!(std::env::var("XEZIM_BIT_SENS").as_deref(), Ok("0")),
+            ts_rec0: (0, 0),
+            ts_rec_n: 0,
+            ts_recs: Vec::new(),
             dirty_signals: vec![false; num_signals],
             dirty_list: Vec::new(),
             dirty_any: false,
@@ -15433,6 +15467,8 @@ impl Simulator {
         let need_sdf = self.sdf_annotation.is_some() || use_specify;
         if need_sdf && self.sdf_delays.len() != self.signal_table.len() {
             self.sdf_delays.resize(self.signal_table.len(), 0);
+            // Gate read masks assume no delays (`comb_entry_read_masks`).
+            self.comb_dep_edges.clear();
         }
         // Signals whose delay came from SDF back-annotation. SDF is
         // authoritative: it REPLACES the specify path delay (SDF standard, and
@@ -23180,6 +23216,148 @@ impl Simulator {
         }
     }
 
+    /// Which bits of each signal comb entry `eidx` reads, as
+    /// `(signal, sig_span_mask)` pairs — None keeps every dependency edge of
+    /// the entry whole-signal. Only entries whose outputs are a pure
+    /// function of the bits they read qualify: fused gates (their operand
+    /// bits), and lowered compiled blocks whose stream reads no signal it
+    /// also writes (no state carried between evaluations) — an always
+    /// block additionally storing each signal at most once, so skipping an
+    /// evaluation cannot drop an intermediate value. A signal the entry
+    /// depends on but the stream never reads keeps a whole-signal edge.
+    fn comb_entry_read_masks(&self, eidx: usize) -> Option<Vec<(u32, u64)>> {
+        let entry = self.comb_entries.get(eidx)?;
+        if entry.has_unresolved_reads {
+            return None;
+        }
+        let widths = &self.signal_widths;
+        let mut out: Vec<(u32, u64)> = Vec::new();
+        let mut add_bit = |out: &mut Vec<(u32, u64)>, b: BitRef| {
+            let w = widths.get(b.sig_id as usize).copied().unwrap_or(0);
+            let m = super::bytecode::sig_span_mask(w, b.bit, 1);
+            if let Some(e) = out.iter_mut().find(|e| e.0 == b.sig_id) {
+                e.1 |= m;
+            } else {
+                out.push((b.sig_id, m));
+            }
+        };
+        let mut add_gate = |out: &mut Vec<(u32, u64)>, g: &FusedGate| match g {
+            FusedGate::Buf1 { src, .. } => add_bit(out, *src),
+            FusedGate::Bin2 { a, b, .. } => {
+                add_bit(out, *a);
+                add_bit(out, *b);
+            }
+            FusedGate::Mux2 { s, t, e, .. } => {
+                add_bit(out, *s);
+                add_bit(out, *t);
+                add_bit(out, *e);
+            }
+            FusedGate::UdpLut3 {
+                inputs,
+                input_count,
+                ..
+            } => {
+                for b in inputs.iter().take(*input_count as usize) {
+                    add_bit(out, *b);
+                }
+            }
+        };
+        // A delayed (SDF) gate re-schedules its output on every evaluation;
+        // keep such designs on whole-signal edges.
+        let gates_ok = self.sdf_delays.is_empty();
+        match &entry.item {
+            CombItem::FusedGate { op } if gates_ok => add_gate(&mut out, op),
+            CombItem::GateRegion { gates } if gates_ok => {
+                for g in gates.iter() {
+                    add_gate(&mut out, g);
+                }
+            }
+            CombItem::CompiledContAssign { .. } | CombItem::CompiledAlwaysBlock { .. } => {
+                let TsSlot::Yes(ts) = self.ts_comb.get(eidx)? else {
+                    return None;
+                };
+                let (reads, mut writes) = super::bytecode::ts_read_masks(&ts.insns, widths)?;
+                if reads.iter().any(|(s, _)| writes.contains(s)) {
+                    return None;
+                }
+                if matches!(entry.item, CombItem::CompiledAlwaysBlock { .. }) {
+                    writes.sort_unstable();
+                    if writes.windows(2).any(|w| w[0] == w[1]) {
+                        return None;
+                    }
+                }
+                out = reads;
+            }
+            _ => return None,
+        }
+        // Every signal the entry reads must also wake it. An
+        // `always @(s) y = s[0] ^ x;` reads `x` without being sensitive to
+        // it: a change of `s[7:1]` must still re-run it so `y` picks up the
+        // current `x`.
+        let rids = &entry.cold.read_signal_ids;
+        if out.iter().any(|(s, _)| !rids.contains(&(*s as usize))) {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Narrow the dependency edges of entry `eidx` to the bits it reads.
+    /// A signal's dependents are stored in ascending entry order.
+    fn bit_sens_patch(&mut self, eidx: usize) {
+        let Some(list) = self.comb_entry_read_masks(eidx) else {
+            return;
+        };
+        let e = eidx as u32;
+        for (sig, m) in list {
+            if m == u64::MAX {
+                continue;
+            }
+            let s = sig as usize;
+            if s + 1 >= self.comb_dep_offsets.len() {
+                continue;
+            }
+            let lo = self.comb_dep_offsets[s] as usize;
+            let hi = self.comb_dep_offsets[s + 1] as usize;
+            let deps = &self.comb_dep_entries[lo..hi];
+            let mut k = lo + deps.partition_point(|&d| d < e);
+            while k < hi && self.comb_dep_entries[k] == e {
+                self.comb_dep_edges[k].mask = m;
+                k += 1;
+            }
+        }
+    }
+
+    /// Bring `comb_dep_edges` up to date with the dependency table and the
+    /// entries lowered since the last settle. Runs outside the settle loop
+    /// (which moves the tables into locals).
+    fn bit_sens_refresh(&mut self) {
+        if self.comb_dep_edges.len() != self.comb_dep_entries.len() {
+            self.comb_dep_edges = self
+                .comb_dep_entries
+                .iter()
+                .map(|&e| DepEdge {
+                    mask: u64::MAX,
+                    entry: e,
+                })
+                .collect();
+            self.bit_sens_pending.clear();
+            if self.bit_sens_on {
+                for eidx in 0..self.comb_entries.len() {
+                    self.bit_sens_patch(eidx);
+                }
+            }
+        } else if !self.bit_sens_pending.is_empty() {
+            let pending = std::mem::take(&mut self.bit_sens_pending);
+            if self.bit_sens_on {
+                for &eidx in pending.iter() {
+                    self.bit_sens_patch(eidx as usize);
+                }
+            }
+            self.bit_sens_pending = pending;
+            self.bit_sens_pending.clear();
+        }
+    }
+
     /// Resolve the dispatch plan for a comb entry: two-state island if the
     /// block lowers, else the compiled native fn, else the interpreter.
     /// Mirrors the decision order of the unplanned dispatch exactly.
@@ -23228,6 +23406,7 @@ impl Simulator {
                             }
                             self.ts_hdr_tsx[eidx] = ts.tsx as u8;
                         }
+                        self.bit_sens_pending.push(eidx as u32);
                         TsSlot::Yes(std::sync::Arc::new(ts))
                     }
                     None => {
@@ -23660,6 +23839,9 @@ impl Simulator {
                 Some(ts) => TsSlot::Yes(std::sync::Arc::new(ts)),
                 None => TsSlot::No,
             };
+            if !edge && matches!(self.ts_comb[eidx], TsSlot::Yes(_)) {
+                self.bit_sens_pending.push(eidx as u32);
+            }
         }
         let slots = if edge { &self.ts_edge } else { &self.ts_comb };
         let TsSlot::Yes(ts) = &slots[eidx] else {
@@ -24096,9 +24278,7 @@ impl Simulator {
     fn ts_store_wide(&mut self, id: usize, v: &[u64]) {
         if self.signal_table[id].set_words(v) {
             if self.ts_direct_writes {
-                if self.dirty_list.last() != Some(&id) {
-                    self.dirty_list.push(id);
-                }
+                self.ts_direct_dirty(id, u64::MAX);
             } else if !self.dirty_signals[id] {
                 self.dirty_signals[id] = true;
                 self.dirty_list.push(id);
@@ -24117,9 +24297,7 @@ impl Simulator {
         }
         self.sync_mirror(id);
         if self.ts_direct_writes {
-            if self.dirty_list.last() != Some(&id) {
-                self.dirty_list.push(id);
-            }
+            self.ts_direct_dirty(id, u64::MAX);
         } else if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
@@ -26025,9 +26203,9 @@ impl Simulator {
         }
         self.sync_mirror(id);
         if self.ts_direct_writes {
-            if self.dirty_list.last() != Some(&id) {
-                self.dirty_list.push(id);
-            }
+            // Chunked by the declared width, as the readers' masks are.
+            let m = super::bytecode::sig_span_mask(self.signal_widths[id], lo, n as u32);
+            self.ts_direct_dirty(id, m);
         } else if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
@@ -26050,16 +26228,17 @@ impl Simulator {
         if new_v == base_v && new_x == base_x {
             return;
         }
+        // An inline (<= 64-bit) destination changed exactly these bits.
+        let mut chg = (new_v ^ base_v) | (new_x ^ base_x);
         if !entry.set_inline_bits(new_v, new_x) {
             let mut val = Value::from_inline(new_v, new_x, self.signal_widths[id]);
             val.is_signed = self.signal_signed[id];
             self.signal_table[id] = val;
+            chg = u64::MAX;
         }
         self.sync_mirror(id);
         if self.ts_direct_writes {
-            if self.dirty_list.last() != Some(&id) {
-                self.dirty_list.push(id);
-            }
+            self.ts_direct_dirty(id, chg);
         } else if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
@@ -26076,16 +26255,16 @@ impl Simulator {
         if v == dv && x == dx {
             return;
         }
+        let mut chg = (v ^ dv) | (x ^ dx);
         if !self.signal_table[id].set_inline_bits(v, x) {
             let mut val = Value::from_inline(v, x, self.signal_widths[id]);
             val.is_signed = self.signal_signed[id];
             self.signal_table[id] = val;
+            chg = u64::MAX;
         }
         self.sync_mirror(id);
         if self.ts_direct_writes {
-            if self.dirty_list.last() != Some(&id) {
-                self.dirty_list.push(id);
-            }
+            self.ts_direct_dirty(id, chg);
         } else if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
@@ -26122,9 +26301,7 @@ impl Simulator {
         }
         self.sync_mirror(id);
         if self.ts_direct_writes {
-            if self.dirty_list.last() != Some(&id) {
-                self.dirty_list.push(id);
-            }
+            self.ts_direct_dirty(id, u64::MAX);
         } else if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
@@ -26163,9 +26340,7 @@ impl Simulator {
                 if changed {
                     self.sync_mirror(id);
                     if self.ts_direct_writes {
-                        if self.dirty_list.last() != Some(&id) {
-                            self.dirty_list.push(id);
-                        }
+                        self.ts_direct_dirty(id, u64::MAX);
                     } else if !self.dirty_signals[id] {
                         self.dirty_signals[id] = true;
                         self.dirty_list.push(id);
@@ -26188,9 +26363,7 @@ impl Simulator {
             }
             self.sync_mirror(id);
             if self.ts_direct_writes {
-                if self.dirty_list.last() != Some(&id) {
-                    self.dirty_list.push(id);
-                }
+                self.ts_direct_dirty(id, u64::MAX);
             } else if !self.dirty_signals[id] {
                 self.dirty_signals[id] = true;
                 self.dirty_list.push(id);
@@ -26201,11 +26374,63 @@ impl Simulator {
         }
     }
 
+    /// Changed-bit mask (`bytecode::sig_span_mask`) of a one-bit write.
+    #[inline(always)]
+    fn bit_chg_mask(&self, sig: u32, bit: u32) -> u64 {
+        let w = self
+            .signal_widths
+            .get(sig as usize)
+            .copied()
+            .unwrap_or(u32::MAX);
+        super::bytecode::sig_span_mask(w, bit, 1)
+    }
+
+    /// Changed-bit mask of a `width`-bit write at bit `lo`.
+    #[inline(always)]
+    fn span_chg_mask(&self, sig: u32, lo: u32, width: u32) -> u64 {
+        let w = self
+            .signal_widths
+            .get(sig as usize)
+            .copied()
+            .unwrap_or(u32::MAX);
+        super::bytecode::sig_span_mask(w, lo, width)
+    }
+
+    /// Dirty record for a store made in direct mode (a two-state entry in
+    /// the settle loop), with the store's changed bits `m` for bit-granular
+    /// sensitivity (`u64::MAX` when unknown). Consecutive stores to one
+    /// signal share a record; the list only ever holds the current entry's
+    /// records (the settle loop drains it after each evaluation).
+    #[inline(always)]
+    fn ts_direct_dirty(&mut self, id: usize, m: u64) {
+        let n = self.ts_rec_n;
+        if n == 0 {
+            self.ts_rec0 = (id, m);
+            self.ts_rec_n = 1;
+            return;
+        }
+        let last = if n == 1 {
+            &mut self.ts_rec0
+        } else {
+            match self.ts_recs.last_mut() {
+                Some(l) => l,
+                None => &mut self.ts_rec0,
+            }
+        };
+        if last.0 == id {
+            last.1 |= m;
+        } else {
+            self.ts_recs.push((id, m));
+            self.ts_rec_n = n + 1;
+        }
+    }
+
     pub(crate) fn ts_store(&mut self, id: usize, v: u64, mask: u64) {
         debug_assert!(id < self.signal_table.len());
         let entry: &mut Value = unsafe { self.signal_table.get_unchecked_mut(id) };
         let (dv, dx) = entry.raw_bits();
         if v != (dv & mask) || (dx & mask) != 0 {
+            let mut chg = ((v ^ dv) | dx) & mask;
             if entry.set_inline_bits(v, 0) {
                 self.sync_mirror(id);
             } else {
@@ -26213,11 +26438,10 @@ impl Simulator {
                 val.is_signed = self.signal_signed[id];
                 self.signal_table[id] = val;
                 self.sync_mirror(id);
+                chg = u64::MAX;
             }
             if self.ts_direct_writes {
-                if self.dirty_list.last() != Some(&id) {
-                    self.dirty_list.push(id);
-                }
+                self.ts_direct_dirty(id, chg);
             } else if !self.dirty_signals[id] {
                 self.dirty_signals[id] = true;
                 self.dirty_list.push(id);
@@ -26320,9 +26544,7 @@ impl Simulator {
         }
         self.sync_mirror(id);
         if self.ts_direct_writes {
-            if self.dirty_list.last() != Some(&id) {
-                self.dirty_list.push(id);
-            }
+            self.ts_direct_dirty(id, u64::MAX);
         } else if !self.dirty_signals[id] {
             self.dirty_signals[id] = true;
             self.dirty_list.push(id);
@@ -33062,6 +33284,7 @@ impl Simulator {
         self.ts_comb.clear();
         self.comb_dep_offsets = cache.dep_offsets;
         self.comb_dep_entries = cache.dep_entries;
+        self.comb_dep_edges.clear();
         self.gate_lane_valid = false;
         self.comb_unresolved_idx = cache.unresolved_idx;
         self.comb_time0_idx = cache.time0_idx;
@@ -37064,6 +37287,7 @@ impl Simulator {
         }
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;
+        self.comb_dep_edges.clear();
         self.gate_lane_valid = false;
         // Co-activation census setup: predecessor CSR (entry -> writer
         // entries of its read signals, capped at 16 preds/entry). Built here
@@ -56712,6 +56936,11 @@ impl Simulator {
         if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
             self.build_gate_lane();
         }
+        if self.comb_dep_edges.len() != self.comb_dep_entries.len()
+            || !self.bit_sens_pending.is_empty()
+        {
+            self.bit_sens_refresh();
+        }
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
         }
@@ -56735,6 +56964,8 @@ impl Simulator {
         self.settle_entries_view = (entries.as_ptr(), entries.len());
         let dep_offsets = std::mem::take(&mut self.comb_dep_offsets);
         let dep_entries = std::mem::take(&mut self.comb_dep_entries);
+        let dep_edges = std::mem::take(&mut self.comb_dep_edges);
+        debug_assert_eq!(dep_edges.len(), dep_entries.len());
         let tree_sig = std::mem::take(&mut self.is_clock_tree_signal);
         let tree_entry = std::mem::take(&mut self.is_clock_tree_entry);
         let num_entries = entries.len();
@@ -56867,6 +57098,7 @@ impl Simulator {
             self.comb_entries = entries;
             self.comb_dep_offsets = dep_offsets;
             self.comb_dep_entries = dep_entries;
+            self.comb_dep_edges = dep_edges;
             self.is_clock_tree_signal = tree_sig;
             self.is_clock_tree_entry = tree_entry;
             self.settle_triggered = triggered;
@@ -57011,8 +57243,9 @@ impl Simulator {
         // than a method) so it can borrow the settle-local `dep_*`/worklist
         // vectors while the arms still hold `&mut self`.
         macro_rules! trigger_deps {
-            ($id:expr, $eidx:expr) => {{
+            ($id:expr, $eidx:expr, $chg:expr) => {{
                 let __tid: usize = $id;
+                let __chg: u64 = $chg;
                 n_writes += 1;
                 if __tid + 1 < dep_offsets.len() {
                     // SAFETY: `__tid + 1 < dep_offsets.len()` was just tested;
@@ -57025,8 +57258,15 @@ impl Simulator {
                     debug_assert!(__lo <= __hi && __hi <= dep_entries.len());
                     n_dep_edges += (__hi - __lo) as u64;
                     let __tree_clk = tree_sig.get(__tid).copied().unwrap_or(false);
-                    for &__dep_u32 in unsafe { dep_entries.get_unchecked(__lo..__hi) } {
-                        let __dep = __dep_u32 as usize;
+                    // SAFETY: `dep_edges` parallels `dep_entries`
+                    // (`bit_sens_refresh` sizes it before every settle).
+                    for __e in unsafe { dep_edges.get_unchecked(__lo..__hi) } {
+                        // Bit-granular sensitivity: this dependent reads
+                        // none of the bits that changed.
+                        if __e.mask & __chg == 0 {
+                            continue;
+                        }
+                        let __dep = __e.entry as usize;
                         if __tree_clk && tree_entry.get(__dep).copied().unwrap_or(false) {
                             continue;
                         }
@@ -57380,6 +57620,7 @@ impl Simulator {
                         {
                             let sp: *mut u8 = self as *mut Self as *mut u8;
                             let tp: *const u8 = self.signal_table.as_ptr() as *const u8;
+                            self.ts_rec_n = 0;
                             self.ts_direct_writes = true;
                             let rc = unsafe { f(sp, tp) };
                             self.ts_direct_writes = false;
@@ -57408,6 +57649,7 @@ impl Simulator {
                 if !ts_fast && !ts_native_bailed && self.proc_depth == 0 {
                     let arena_kind = self.ts_hdr.get(eidx).map_or(0, |h| h.kind());
                     if arena_kind != 0 {
+                        self.ts_rec_n = 0;
                         self.ts_direct_writes = true;
                         let ok = self.ts_guard_and_exec_arena(eidx);
                         self.ts_direct_writes = false;
@@ -57447,6 +57689,7 @@ impl Simulator {
                         }
                     } else if let Some(CombPlan::Ts(ts)) = self.comb_plan.get(eidx) {
                         let tp: *const super::bytecode::TwoStateBlock = std::sync::Arc::as_ptr(ts);
+                        self.ts_rec_n = 0;
                         self.ts_direct_writes = true;
                         self.ts_cur_eidx = eidx as u32;
                         let ok = self.ts_guard_and_exec(unsafe { &*tp });
@@ -57504,7 +57747,7 @@ impl Simulator {
                                         churn.push((*dst_id, eidx));
                                     }
                                     note_toggle!(*dst_id);
-                                    trigger_deps!(*dst_id, eidx);
+                                    trigger_deps!(*dst_id, eidx, (sv ^ dv) | (sx ^ dx));
                                 }
                             }
                             n_dc += 1;
@@ -57541,7 +57784,7 @@ impl Simulator {
                                     churn.push((dst_id, eidx));
                                 }
                                 note_toggle!(dst_id);
-                                trigger_deps!(dst_id, eidx);
+                                trigger_deps!(dst_id, eidx, (sv ^ dv) | (sx ^ dx));
                             }
                             n_dc += dst_ids.len() as u64;
                         }
@@ -57589,7 +57832,7 @@ impl Simulator {
                                         churn.push((*dst_id, eidx));
                                     }
                                     note_toggle!(*dst_id);
-                                    trigger_deps!(*dst_id, eidx);
+                                    trigger_deps!(*dst_id, eidx, (sv ^ dv) | (sx ^ dx));
                                     handled = true;
                                 }
                                 // If set_inline_bits returned false (Wide storage),
@@ -57611,7 +57854,7 @@ impl Simulator {
                                             churn.push((*dst_id, eidx));
                                         }
                                         note_toggle!(*dst_id);
-                                        trigger_deps!(*dst_id, eidx);
+                                        trigger_deps!(*dst_id, eidx, u64::MAX);
                                     }
                                 }
                             }
@@ -57795,7 +58038,7 @@ impl Simulator {
                                         churn.push((id, eidx));
                                     }
                                     note_toggle!(id);
-                                    trigger_deps!(id, eidx);
+                                    trigger_deps!(id, eidx, self.bit_chg_mask(dst.sig_id, dst.bit));
                                 }
                             }
                         }
@@ -57808,7 +58051,7 @@ impl Simulator {
                                     churn.push((id, eidx));
                                 }
                                 note_toggle!(id);
-                                trigger_deps!(id, eidx);
+                                trigger_deps!(id, eidx, self.bit_chg_mask(dst.sig_id, dst.bit));
                             }
                             n_dc += 1;
                         }
@@ -57821,7 +58064,11 @@ impl Simulator {
                                     churn.push((id, eidx));
                                 }
                                 note_toggle!(id);
-                                trigger_deps!(id, eidx);
+                                trigger_deps!(
+                                    id,
+                                    eidx,
+                                    self.span_chg_mask(dst.sig_id, dst.lo, width as u32)
+                                );
                             }
                             n_dc += width as u64;
                         }
@@ -57851,7 +58098,7 @@ impl Simulator {
                                             churn.push((id, eidx));
                                         }
                                         note_toggle!(id);
-                                        trigger_deps!(id, eidx);
+                                        trigger_deps!(id, eidx, self.bit_chg_mask(id as u32, 0));
                                     }
                                 }
                             } else {
@@ -57868,7 +58115,7 @@ impl Simulator {
                                             churn.push((id, eidx));
                                         }
                                         note_toggle!(id);
-                                        trigger_deps!(id, eidx);
+                                        trigger_deps!(id, eidx, self.bit_chg_mask(id as u32, 0));
                                     }
                                 }
                             }
@@ -57894,7 +58141,7 @@ impl Simulator {
                                         churn.push((id, eidx));
                                     }
                                     note_toggle!(id);
-                                    trigger_deps!(id, eidx);
+                                    trigger_deps!(id, eidx, self.bit_chg_mask(dst.sig_id, dst.bit));
                                 }
                             }
                             n_dc += dsts.len() as u64;
@@ -57915,7 +58162,11 @@ impl Simulator {
                                         churn.push((id, eidx));
                                     }
                                     note_toggle!(id);
-                                    trigger_deps!(id, eidx);
+                                    trigger_deps!(
+                                        id,
+                                        eidx,
+                                        self.bit_chg_mask(branch.dst.sig_id, branch.dst.bit)
+                                    );
                                 }
                             }
                             n_dc += branches.len() as u64;
@@ -57941,7 +58192,29 @@ impl Simulator {
                 // entry's evaluation trigger their dependents, which are
                 // appended to `settle_triggered_list` if not already fired.
                 // Topo-ordered entries → most dependents sit at higher tidx
-                // and will be reached before the outer iter boundary.
+                // and will be reached before the outer iter boundary. A
+                // two-state entry's stores come first, each record with its
+                // changed bits (`ts_direct_dirty`); every other write claims
+                // the whole signal.
+                let n_recs = self.ts_rec_n;
+                if n_recs != 0 {
+                    let (sig_id, chg) = self.ts_rec0;
+                    if capture_churn {
+                        churn.push((sig_id, eidx));
+                    }
+                    trigger_deps!(sig_id, eidx, chg);
+                    if n_recs > 1 {
+                        for ri in 0..self.ts_recs.len() {
+                            let (sig_id, chg) = self.ts_recs[ri];
+                            if capture_churn {
+                                churn.push((sig_id, eidx));
+                            }
+                            trigger_deps!(sig_id, eidx, chg);
+                        }
+                        self.ts_recs.clear();
+                    }
+                    self.ts_rec_n = 0;
+                }
                 let dirty_after = self.dirty_list.len();
                 if dirty_after > dirty_before {
                     if capture_churn {
@@ -57959,7 +58232,7 @@ impl Simulator {
                         if !ts_fast {
                             self.dirty_signals[sig_id] = false;
                         }
-                        trigger_deps!(sig_id, eidx);
+                        trigger_deps!(sig_id, eidx, u64::MAX);
                     }
                 }
             }
@@ -58008,6 +58281,7 @@ impl Simulator {
         self.comb_entries = entries;
         self.comb_dep_offsets = dep_offsets;
         self.comb_dep_entries = dep_entries;
+        self.comb_dep_edges = dep_edges;
         self.is_clock_tree_signal = tree_sig;
         self.is_clock_tree_entry = tree_entry;
         self.settle_inject_bits = inject_bits;
@@ -80188,6 +80462,8 @@ impl Simulator {
         if self.sdf_delays.len() != self.signal_table.len() {
             self.sdf_delays.resize(self.signal_table.len(), 0);
         }
+        // Gate read masks assume no delays (`comb_entry_read_masks`).
+        self.comb_dep_edges.clear();
         let Some(ann) = self.sdf_annotation.take() else {
             return;
         };
@@ -86586,9 +86862,7 @@ impl Simulator {
                 || self.comb_dep_offsets[id] != self.comb_dep_offsets[id + 1];
             if has_comb_deps {
                 if self.ts_direct_writes {
-                    if self.dirty_list.last() != Some(&id) {
-                        self.dirty_list.push(id);
-                    }
+                    self.ts_direct_dirty(id, u64::MAX);
                 } else if !self.dirty_signals[id] {
                     self.dirty_signals[id] = true;
                     self.dirty_list.push(id);
@@ -88003,9 +88277,7 @@ impl Simulator {
             || self.comb_dep_offsets[id] != self.comb_dep_offsets[id + 1];
         if has_comb_deps {
             if self.ts_direct_writes {
-                if self.dirty_list.last() != Some(&id) {
-                    self.dirty_list.push(id);
-                }
+                self.ts_direct_dirty(id, u64::MAX);
             } else if !self.dirty_signals[id] {
                 self.dirty_signals[id] = true;
                 self.dirty_list.push(id);

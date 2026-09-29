@@ -65,6 +65,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: trace block-local declaration binding",
     ),
     (
+        "XEZIM_BIT_SENS",
+        "Scheduling: bit-granular comb sensitivity (a write re-runs only readers of the changed bits); 0 disables",
+    ),
+    (
         "XEZIM_BM_CENSUS",
         "Census: print every builtin-method call as `[bm] <receiver> <method> this=<bool>` (aggregate with sort | uniq -c)",
     ),

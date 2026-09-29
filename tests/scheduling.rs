@@ -31,6 +31,8 @@ mod assoc_bracket_keys;
 mod audit_ports_disable_drivers;
 #[path = "scheduling/bare_clocking_event.rs"]
 mod bare_clocking_event;
+#[path = "scheduling/bit_sensitivity.rs"]
+mod bit_sensitivity;
 #[path = "scheduling/block_local_decl_ast_fallback.rs"]
 mod block_local_decl_ast_fallback;
 #[path = "scheduling/blocking_loop_break_continue.rs"]
