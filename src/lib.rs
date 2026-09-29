@@ -32,6 +32,32 @@ pub fn verbose() -> bool {
     VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `XEZIM_RSS_TRACE=1`: print the process's resident memory (current and
+/// high-water mark, from `/proc/self/status`) at a pipeline milestone. Peak
+/// RSS is a construction-time number on large designs, so attributing it
+/// needs the curve between phases, not just the final maximum.
+pub fn rss_trace(label: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("XEZIM_RSS_TRACE").is_some()) {
+        return;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |key: &str| -> u64 {
+        status
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    eprintln!(
+        "[RSS] {:<40} cur={:>6} MB  peak={:>6} MB",
+        label,
+        field("VmRSS:") / 1024,
+        field("VmHWM:") / 1024
+    );
+}
+
 pub mod benchw;
 pub mod compiler;
 pub mod env_vars;
@@ -986,6 +1012,7 @@ fn simulate_multi_inner(
 ) -> Result<compiler::Simulator, String> {
     let total_start = WallTimer::now();
     let compilation_start = WallTimer::now();
+    rss_trace("start");
     // IEEE 1800-2017 §9.4.5: the parser discards intra-assignment delays
     // (`lhs = #d rhs`); canonicalize them into a marker call the simulator
     // implements (see `intra_delay`) before parsing.
@@ -1030,6 +1057,7 @@ fn simulate_multi_inner(
         .and_then(|(config, key)| read_design_cache(config, key));
 
     let elab = if let Some(mut elab) = cached_elab {
+        drop(sources);
         // The artifact skips the (large) preprocessed texts; refill them from
         // the cache-key pass so runtime diagnostics keep `file:line`
         // resolution on cache hits. `source_files` / `src_file_of_module`
@@ -1070,10 +1098,15 @@ fn simulate_multi_inner(
             defines,
             pre.take(),
         )?;
+        rss_trace("parse+elaborate");
 
         // §18.5.1: recover any out-of-class constraint body that the class-table
         // repopulation in `inline_instantiations` dropped.
         reinstall_ooc_constraint_bodies(&sources, source_paths, include_dirs, defines, &mut elab);
+        // The rewritten source texts are dead from here on (the elaborated
+        // design keeps its own preprocessed copies for diagnostics); don't
+        // carry a second copy of the whole design through simulation.
+        drop(sources);
 
         // Second-pass `should_fail` lint (additive — reuses the elaboration above,
         // no extra cost; does not alter elaborate/simulate behavior). Rejecting
@@ -1092,8 +1125,13 @@ fn simulate_multi_inner(
         // static-init assignments before the AST is dropped (issue #26).
         defer_static_syscall_inits(&definitions, &mut elab);
 
-        // Drop the parsed AST before constructing runtime state.
+        // Drop the parsed AST before constructing runtime state, and hand
+        // its pages back at once: the allocator would otherwise keep them
+        // resident for its purge delay, right while `Simulator::new` makes
+        // its largest fresh allocations, and peak RSS would carry both.
         drop(definitions);
+        xezim_core::release_free_memory();
+        rss_trace("parsed AST dropped");
 
         if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
             // Pending rewrite contexts are intentionally omitted from the
@@ -1109,6 +1147,7 @@ fn simulate_multi_inner(
     };
 
     let mut sim = compiler::Simulator::new(elab, max_time);
+    rss_trace("simulator constructed");
     if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
         sim.set_prepared_comb_cache_path(Some(config.directory.join(format!("{}.xezcomb", key))));
     }
@@ -1147,6 +1186,7 @@ fn simulate_multi_inner(
         sim.sdf_annotation = Some(annotation);
     }
     sim.compile();
+    rss_trace("compiled");
     // A compile-time failure (e.g. §6.18 illegal non-class to class-handle
     // assignment) aborts before any block is scheduled; surface it as `Err` so
     // library callers see the compile error instead of a bogus run.
@@ -1266,6 +1306,14 @@ fn simulate_multi_inner(
 
     let simulation_start = WallTimer::now();
     sim.simulate();
+    rss_trace("simulated");
+    if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+        eprintln!(
+            "[MEM-CENSUS] end of run: runtime name->value map {} entries; {}",
+            sim.signals.len(),
+            sim.class_heap_census()
+        );
+    }
     chatter!(
         "[PHASE] simulation: {:.1}ms",
         simulation_start.elapsed().as_secs_f64() * 1000.0

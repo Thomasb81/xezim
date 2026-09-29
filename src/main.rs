@@ -3363,6 +3363,16 @@ suppressed but the explicit SDF annotation still applies."
         return 0;
     }
 
+    // The front-end pass's preprocessed texts are needed after the run only
+    // for `--dump-merged-sv`; the simulator preprocesses on its own. Don't
+    // keep a spare copy of the whole design resident through simulation.
+    let preprocessed_sources = if dump_merged_sv.is_some() {
+        preprocessed_sources
+    } else {
+        Vec::new()
+    };
+    drop(line_maps);
+
     match xezim::simulate_multi(
         &sources,
         max_time,

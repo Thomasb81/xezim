@@ -581,7 +581,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_PACKED_MEM",
-        "Memory: opt-in packed byte storage for large narrow arrays (0/1)",
+        "Memory: packed arena storage for large integral arrays (on; 0 turns it off)",
     ),
     (
         "XEZIM_PARALLEL_SERIALIZE",
@@ -752,6 +752,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "XEZIM_RESIZE_ELIDE",
         "Values: elide redundant resize operations (0/1)",
     ),
+    (
+        "XEZIM_RSS_TRACE",
+        "Memory: print resident/peak RSS at each pipeline and compile phase",
+    ),
     ("XEZIM_RS_STATS", "Print resize/copy statistics for Values"),
     (
         "XEZIM_SETTLE_LEVELS",
@@ -905,6 +909,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_VERIFY_INLINE_BITS",
         "JIT: shadow-verify the inline-bits mirror against Values",
+    ),
+    (
+        "XEZIM_VIRTUAL_NAME_MIN_CELLS",
+        "Names: arrays of at least this many cells get virtual element names (default 257; 0 = all)",
     ),
     (
         "XEZIM_WAITERS_FIRST",

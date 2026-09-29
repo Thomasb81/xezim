@@ -205,8 +205,8 @@ mod package_qualified_access_in_subroutine;
 mod package_reexport_explicit_import;
 #[path = "misc/package_scope_and_call_kind.rs"]
 mod package_scope_and_call_kind;
-#[path = "misc/packed_mem_range_store.rs"]
-mod packed_mem_range_store;
+#[path = "misc/packed_mem_arena.rs"]
+mod packed_mem_arena;
 #[path = "misc/param_class_cast_type_args.rs"]
 mod param_class_cast_type_args;
 #[path = "misc/param_pair_this_type_cast.rs"]
@@ -463,6 +463,8 @@ mod two_state_wide_reduction;
 mod udn_resolver_compiled;
 #[path = "misc/undeclared_in_subroutines.rs"]
 mod undeclared_in_subroutines;
+#[path = "misc/virtual_array_names.rs"]
+mod virtual_array_names;
 #[path = "misc/while_continue_final_iter.rs"]
 mod while_continue_final_iter;
 #[path = "misc/zero_width_select_unselected_generate.rs"]

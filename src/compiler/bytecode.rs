@@ -2,6 +2,7 @@
 //! Compiles AST expressions and statements into a flat instruction array
 //! that can be executed without pointer-chasing through Box<Expression> trees.
 
+use super::simulator::NameMap;
 use super::value::Value;
 use crate::ast::decl::{FunctionDeclaration, TaskDeclaration};
 use crate::ast::expr::*;
@@ -952,7 +953,7 @@ pub struct BytecodeCompiler<'a> {
     insns: Vec<Insn>,
     next_reg: u32,
     register_overflow: bool,
-    signal_name_to_id: &'a HashMap<Arc<str>, usize>,
+    signal_name_to_id: &'a NameMap,
     signal_signed: &'a [bool],
     signal_widths: &'a [u32],
     /// Per-signal `is_real`. Optional because only the simulator has it;
@@ -1183,7 +1184,7 @@ pub struct BytecodeCompiler<'a> {
 
 impl<'a> BytecodeCompiler<'a> {
     pub fn new(
-        signal_name_to_id: &'a HashMap<Arc<str>, usize>,
+        signal_name_to_id: &'a NameMap,
         signal_signed: &'a [bool],
         signal_widths: &'a [u32],
         arrays: &'a HashMap<String, (i64, i64, u32)>,
@@ -14226,7 +14227,7 @@ mod tests {
 
     #[test]
     fn generated_nonzero_outer_index_resolves_to_flattened_signal() {
-        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        let mut signals = NameMap::default();
         signals.insert(Arc::from("flat"), 0);
         let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
         let widths: HashMap<String, u32> = HashMap::default();
@@ -14240,7 +14241,7 @@ mod tests {
 
     #[test]
     fn genuine_array_shapes_do_not_resolve_as_flattened_signals() {
-        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        let mut signals = NameMap::default();
         signals.insert(Arc::from("flat"), 0);
         let widths: HashMap<String, u32> = HashMap::default();
         let expr = indexed_expr("flat", '1');
@@ -14266,7 +14267,7 @@ mod tests {
 
     #[test]
     fn constant_multi_dim_array_element_uses_scalar_bytecode() {
-        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        let mut signals = NameMap::default();
         signals.insert(Arc::from("m[1][0]"), 0);
         let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
         let widths: HashMap<String, u32> = HashMap::default();
@@ -14296,7 +14297,7 @@ mod tests {
 
     #[test]
     fn register_ids_do_not_wrap_at_u16_limit() {
-        let signals: HashMap<Arc<str>, usize> = HashMap::default();
+        let signals = NameMap::default();
         let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
         let widths: HashMap<String, u32> = HashMap::default();
         let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);

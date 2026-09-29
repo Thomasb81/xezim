@@ -1218,14 +1218,6 @@ impl Simulator {
                 return false;
             }
         };
-        let packed_cell = matches!(t.obj, HdlObj::Slot(id) if is_packed_id(id));
-        if force && packed_cell {
-            self.uvm_dpi_note(format!(
-                "{}(\"{}\"): a packed-arena memory cell (XEZIM_PACKED_MEM) cannot be forced",
-                c_name, path
-            ));
-            return false;
-        }
         if let Some(bits) = &t.bits {
             if force {
                 self.uvm_dpi_note(format!(
@@ -1245,7 +1237,7 @@ impl Simulator {
             // A second force replaces the first (§10.6.2): lift it so the
             // guarded write below lands, then re-arm with the new value.
             if let HdlObj::Slot(id) = t.obj {
-                self.forced_signals.remove(&id);
+                self.unforce_cell(id);
             }
             self.forced_names.remove(&t.key);
             let key = t.key.clone();
@@ -1255,8 +1247,7 @@ impl Simulator {
         if force {
             match t.obj {
                 HdlObj::Slot(id) => {
-                    let stored = self.signal_table[id].clone();
-                    self.forced_signals.insert(id, stored);
+                    self.force_cell(id, v);
                 }
                 HdlObj::Named(_) => {
                     self.forced_names.insert(t.key);
@@ -1287,7 +1278,6 @@ impl Simulator {
             return false;
         }
         let id = match t.obj {
-            HdlObj::Slot(id) if is_packed_id(id) => None,
             HdlObj::Slot(id) => Some(id),
             HdlObj::Named(_) => None,
         };
