@@ -3525,7 +3525,7 @@ struct ProcessContext {
     /// their own); element accesses on them are rewritten onto the actual.
     /// Pushed/popped in lockstep with `ref_binding_stack`.
     ref_identity_stack: Vec<Vec<String>>,
-    queue_frame_saves: Vec<HashMap<String, QueueLocalSave>>,
+    queue_frame_saves: Vec<Vec<(String, QueueLocalSave)>>,
     task_cleanup: Vec<TaskCleanup>,
     // Per-call-frame map of a local dynamic-array/queue/assoc LOCAL's bare
     // name to a process-unique storage key (e.g. `edges` -> `@edges#7`).
@@ -5483,7 +5483,7 @@ pub struct Simulator {
     /// push a frame; whenever a queue param is bound or a queue local is
     /// (re)declared, we snapshot the caller's `name.*`/`name[*]` signals into
     /// the top frame; on exit we restore them.
-    queue_frame_saves: Vec<HashMap<String, QueueLocalSave>>,
+    queue_frame_saves: Vec<Vec<(String, QueueLocalSave)>>,
     /// Per-call-frame rename map for local dynamic arrays/queues/assoc
     /// locals (bare name -> process-unique storage key). See
     /// `ProcessContext::local_dyn`.
@@ -6307,6 +6307,11 @@ pub struct Simulator {
     /// Emptied formal-metadata snapshot vectors of the class-method call path,
     /// reused across calls.
     formal_parts_pool: Vec<Vec<(usize, FormalMetaParts)>>,
+    /// Emptied `queue_frame_saves` / `local_dyn` frames and saved-name
+    /// buffers, reused by the next subroutine entry.
+    queue_save_pool: Vec<Vec<(String, QueueLocalSave)>>,
+    local_dyn_pool: Vec<Vec<(String, String)>>,
+    queue_name_pool: Vec<String>,
     /// Emptied `current_spec` save buffers (see `clone_spec_pooled`).
     spec_buf_pool: Vec<(String, String)>,
     /// Open class-method metadata saves, innermost last (see `MetaFrame`).
@@ -10404,6 +10409,9 @@ impl Simulator {
             prop_owner_index: std::cell::RefCell::new(HashMap::default()),
             prop_width_memo: std::cell::RefCell::new(HashMap::default()),
             formal_parts_pool: Vec::new(),
+            queue_save_pool: Vec::new(),
+            local_dyn_pool: Vec::new(),
+            queue_name_pool: Vec::new(),
             spec_buf_pool: Vec::new(),
             method_plans: std::cell::RefCell::new(HashMap::default()),
             meta_frames: Vec::new(),
@@ -95590,8 +95598,10 @@ impl Simulator {
 
     /// Push a fresh queue-local save frame on entry to a subroutine.
     fn push_queue_frame(&mut self) {
-        self.queue_frame_saves.push(HashMap::default());
-        self.local_dyn.push(Vec::new());
+        let saves = self.queue_save_pool.pop().unwrap_or_default();
+        self.queue_frame_saves.push(saves);
+        let dyns = self.local_dyn_pool.pop().unwrap_or_default();
+        self.local_dyn.push(dyns);
     }
 
     /// Look up the process-unique storage key for a local dynamic-array /
@@ -95651,7 +95661,11 @@ impl Simulator {
         }
         let id = self.next_dyn_id;
         self.next_dyn_id += 1;
-        let key = format!("@{}#{}", bare, id);
+        let mut key = String::with_capacity(bare.len() + 12);
+        key.push('@');
+        key.push_str(bare);
+        key.push('#');
+        Self::push_i64(&mut key, id as i64);
         let frame = self.local_dyn.last_mut().unwrap();
         if let Some(slot) = frame.iter_mut().find(|(k, _)| k == bare) {
             slot.1 = key.clone();
@@ -95731,10 +95745,12 @@ impl Simulator {
         if self.queue_frame_saves.is_empty() {
             return false;
         }
+        // A frame saves a handful of names: a linear scan (each name is
+        // restored on its own, so the save order is immaterial).
         if self
             .queue_frame_saves
             .last()
-            .map(|f| f.contains_key(name))
+            .map(|f| f.iter().any(|(n, _)| n == name))
             .unwrap_or(true)
         {
             return false;
@@ -95773,10 +95789,10 @@ impl Simulator {
                 width: self.widths.get(name).copied(),
             }
         };
-        self.queue_frame_saves
-            .last_mut()
-            .unwrap()
-            .insert(name.to_string(), save);
+        let mut key = self.queue_name_pool.pop().unwrap_or_default();
+        key.clear();
+        key.push_str(name);
+        self.queue_frame_saves.last_mut().unwrap().push((key, save));
         true
     }
 
@@ -95793,8 +95809,9 @@ impl Simulator {
         };
         // The popped frame is owned, so iterating it holds no borrow of
         // `self`.
+        let mut frame = frame;
         let mut size_key = std::mem::take(&mut self.queue_key_scratch);
-        for (name, save) in frame {
+        for (name, save) in frame.drain(..) {
             size_key.clear();
             size_key.push_str(&name);
             size_key.push_str(".size");
@@ -95845,21 +95862,34 @@ impl Simulator {
                 }
             }
             match width {
-                Some(w) => {
-                    self.widths.insert(name.clone(), w);
-                }
+                Some(w) => match self.widths.get_mut(name.as_str()) {
+                    Some(slot) => *slot = w,
+                    None => {
+                        self.widths.insert(name.clone(), w);
+                    }
+                },
                 None => {
                     self.widths.remove(&name);
                 }
             }
+            if self.queue_name_pool.len() < 64 {
+                self.queue_name_pool.push(name);
+            }
         }
         self.queue_key_scratch = size_key;
+        if self.queue_save_pool.len() < 64 && frame.capacity() <= 32 {
+            self.queue_save_pool.push(frame);
+        }
         // Drop this invocation's process-unique local dyn-array storage so
         // it doesn't leak across the whole simulation (each invocation got
         // its own `@name#id` keys).
-        if let Some(dyn_frame) = self.local_dyn.pop() {
+        if let Some(mut dyn_frame) = self.local_dyn.pop() {
             for (_bare, key) in &dyn_frame {
                 self.cleanup_dyn_storage(key);
+            }
+            if self.local_dyn_pool.len() < 64 && dyn_frame.capacity() <= 32 {
+                dyn_frame.clear();
+                self.local_dyn_pool.push(dyn_frame);
             }
         }
     }

@@ -200,3 +200,43 @@ endmodule
     assert_eq!(u(&sim, "r2"), 13);
     assert_eq!(u(&sim, "ok"), 7);
 }
+
+/// A caller's local queue survives callees that declare a same-named scalar
+/// and a local queue of their own, on every call (the per-call queue saves
+/// and per-call queue storage are restored and dropped at return).
+#[test]
+fn caller_queue_survives_same_named_callee_locals() {
+    const SRC: &str = "class c;
+  function int callee(int n);
+    int q;
+    int r[$];
+    q = n * 2;
+    r.push_back(q);
+    r.push_back(q + 1);
+    return r.size() + r[1];
+  endfunction
+  function int caller();
+    int q[$];
+    int r;
+    int acc;
+    q.push_back(5);
+    q.push_back(6);
+    r = 9;
+    acc = callee(10);
+    acc = acc + callee(20);
+    return acc * 100 + q.size() * 10 + q[1] + r;
+  endfunction
+endclass
+module tb;
+  int res1, res2;
+  initial begin
+    c o = new;
+    res1 = o.caller();
+    res2 = o.caller();
+  end
+endmodule
+";
+    let sim = simulate(SRC, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "res1"), 6635);
+    assert_eq!(u(&sim, "res2"), 6635);
+}
