@@ -44,6 +44,12 @@ and the development workflow are in [README.md](README.md).
   (#201)
 * `$display` output from a testbench that prints rarely appears as it is
   printed, not only at exit. (xezim-core #49)
+* A task enabled without parentheses through a hierarchical path or a
+  package scope (`u.t;`, `a.b.t;`, `pkg::t;`) is called. It used to be
+  dropped inside a task, so an `always` calling that task spun at time 0
+  and the run hung, and directly in an `always` it was rejected as having no
+  timing control. A three-level enable inside a task (`a.b.t();`) also kept
+  advancing time after `$finish`.
 * The one-time notes for ignored system tasks (such as `$dumpfile` without
   `--wave`) are written to stderr as one piece, so `$display` output going to
   the same file can no longer land inside one and hide a UVM message from log

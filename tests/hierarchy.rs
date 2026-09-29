@@ -121,6 +121,8 @@ mod packed_record_output_chain;
 mod param_typedef_instance_isolation;
 #[path = "hierarchy/parameter_override_identifiers.rs"]
 mod parameter_override_identifiers;
+#[path = "hierarchy/parenless_task_enables.rs"]
+mod parenless_task_enables;
 #[path = "hierarchy/pct_m_block_scope.rs"]
 mod pct_m_block_scope;
 #[path = "hierarchy/percent_m_declaring_scope.rs"]
