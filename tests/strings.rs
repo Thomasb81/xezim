@@ -97,6 +97,8 @@ mod system_task_gaps;
 mod vpi_callbacks;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
 mod vpi_mcd_and_time_queries;
+#[path = "strings/vpi_net_kinds.rs"]
+mod vpi_net_kinds;
 #[path = "strings/vpi_routines.rs"]
 mod vpi_routines;
 #[path = "strings/wide_string2num.rs"]

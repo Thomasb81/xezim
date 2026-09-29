@@ -27,10 +27,12 @@ static PLI_INT32 probe(PLI_BYTE8 *ud) {
   collect(vpiPort, top, buf, sizeof buf);
   CHECK(strcmp(buf, "clk_in:44:1:1,io_top:44:3:2,o_top:44:2:4") == 0, buf);
   /* the connected signals keep their own types and stay iterable as before */
+  /* §23.2.2.3: `input logic clk_in` is a net (the port kind of an input
+   * defaults to net); `output logic [3:0] o_top` is a variable. */
   collect(vpiNet, top, buf, sizeof buf);
-  CHECK(strstr(buf, "w:36:") != NULL, buf);
+  CHECK(strstr(buf, "w:36:") != NULL && strstr(buf, "clk_in:36:1:1") != NULL, buf);
   collect(vpiReg, top, buf, sizeof buf);
-  CHECK(strstr(buf, "clk_in:48:1:1") != NULL && strstr(buf, "o_top:48:2:4") != NULL, buf);
+  CHECK(strstr(buf, "clk_in") == NULL && strstr(buf, "o_top:48:2:4") != NULL, buf);
 
   vpiHandle ii = vpi_iterate(vpiModule, top), sub = vpi_scan(ii); vpi_free_object(ii);
   CHECK(sub != NULL, "sub-instance handle");
@@ -55,7 +57,7 @@ static PLI_INT32 probe(PLI_BYTE8 *ud) {
 
   /* by-name lookup still yields the signal object, which reports its port's direction */
   vpiHandle clk = vpi_handle_by_name("tb.u_sub.clk", NULL);
-  CHECK(clk && vpi_get(vpiType, clk) == vpiReg && vpi_get(vpiDirection, clk) == vpiInput, "by-name clk");
+  CHECK(clk && vpi_get(vpiType, clk) == vpiNet && vpi_get(vpiDirection, clk) == vpiInput, "by-name clk");
 
   vpi_printf(fails ? "VPI_PORTS: %d failure(s)\n" : "VPI_PORTS: all checks passed\n", fails);
   return 0;

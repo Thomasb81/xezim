@@ -47,6 +47,8 @@ mod specify_flags;
 mod specify_path_delays;
 #[path = "gates/streaming_op_compiles.rs"]
 mod streaming_op_compiles;
+#[path = "gates/submodule_gate_net_delays.rs"]
+mod submodule_gate_net_delays;
 #[path = "gates/timing_checks_kinds.rs"]
 mod timing_checks_kinds;
 #[path = "gates/timing_checks_notifier.rs"]

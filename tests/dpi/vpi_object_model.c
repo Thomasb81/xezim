@@ -94,9 +94,12 @@ static PLI_INT32 om_check(PLI_BYTE8 *user_data) {
     CHECK(parent && strcmp(vpi_get_str(vpiName, parent), "tb") == 0, "vpiScope of an instance is its parent");
 
     /* A sub-module's own objects, ports included (`clk` is a port of `sub`,
-     * and has its own signal in the instance's scope). */
+     * and has its own signal in the instance's scope). §23.2.2.3: the
+     * `input logic` ports are nets, the `output logic` port a variable. */
     collect(vpiReg, sub, buf, sizeof buf);
-    CHECK(strcmp(buf, "clk,i,o") == 0, "a sub-module's own objects");
+    CHECK(strcmp(buf, "o") == 0, "a sub-module's own variables");
+    collect(vpiNet, sub, buf, sizeof buf);
+    CHECK(strcmp(buf, "clk,i") == 0, "a sub-module's own nets");
 
     /* --- values --- */
     s_vpi_value v;
