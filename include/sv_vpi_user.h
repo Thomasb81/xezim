@@ -3,7 +3,7 @@
 
 /* Compatibility shim for the Accellera UVM reference implementation.
  *
- * Some UVM source files (`uvm_hdl_polling.c`, the VCS backend)
+ * Some UVM source files (`uvm_hdl_polling.c` and a vendor-specific backend)
  * `#include "sv_vpi_user.h"` directly. The full Accellera header
  * declares vpiTypes.h contents and the vlog_chk_error / io_printf
  * family of legacy PLI v1.0 helpers — xezim doesn't implement

@@ -6,7 +6,7 @@
 //! NBA posted before the `#0` is NOT yet visible when the continuation
 //! resumes — it commits afterwards, within the same time slot. This is
 //! the reference-simulator behavior xezim follows; a differing commercial
-//! camp (VCS / Riviera) applies the NBA region first and would show the
+//! camp (several commercial simulators) applies the NBA region first and would show the
 //! updated value at the `#0` resume.
 
 use xezim::simulate;

@@ -128,7 +128,7 @@ flows. Portable code should not rely on them.
 * **`$deposit(target, value)`** — sets `target` to `value` immediately *without*
   installing a persistent driver: the value holds until the next driver
   transaction overwrites it (on an undriven net it simply sticks). This is a
-  Verilog-XL/VCS system task, **not** in the LRM. xezim matches the vendor
+  system task from commercial simulators, **not** in the LRM. xezim matches their
   semantics — a variable keeps the deposited value, and a real driver on a net
   overrides a deposit on its next update.
 * Gate-level-simulation CLI flags — `+nospecify`, `+notimingcheck`,

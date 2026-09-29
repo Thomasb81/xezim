@@ -1,6 +1,6 @@
 //! `XEZIM_VCD_PARAM_AS_WIRE=1` emits VCD parameters as constant-valued `$var
 //! wire` instead of the (LRM-default) `$var parameter`, so viewers that shelve
-//! `$var parameter` separately (Verdi/nWave) still show them in the waveform
+//! `$var parameter` separately (some waveform viewers) still show them in the waveform
 //! pane. Values are dumped either way. Subprocess-based so the env var doesn't
 //! leak into the other (parallel) VCD tests.
 

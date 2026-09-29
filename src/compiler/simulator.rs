@@ -6192,7 +6192,7 @@ pub struct Simulator {
     /// SAME active pass (before `apply_nba`), so scheduling a `#0`
     /// continuation there made it resume BEFORE the NBA region committed —
     /// an NBA posted before the `#0` was invisible after it. Commercial
-    /// simulators (VCS / Riviera) all make an NBA posted before a
+    /// simulators all make an NBA posted before a
     /// `#0` visible after it, so entries parked here are promoted back into
     /// the event queue only at the END of the current tick, after
     /// `apply_nba` has run (see `promote_inactive_to_active`).
@@ -8811,7 +8811,7 @@ impl Simulator {
                 }
                 // XEZIM_INIT_ZERO=1: coerce all-X initial values to zero.
                 // Default (off) preserves Verilog 4-state semantics. Industry
-                // simulators offer the same knob (e.g. `+vcs+initreg=zero`).
+                // simulators offer the same knob as a register-init option.
                 // Needed for designs (like c910) that pump explicit `1'bx`
                 // through default arms and rely on hardware-side gating that
                 // doesn't model in 4-state RTL sim.
@@ -8960,7 +8960,7 @@ impl Simulator {
         // (the prior behavior) is insufficient.
         // Memory/array element init: cheap construction-time zeroing (arrays
         // are read via element ops that never edge-trigger, so coercion is
-        // sound here — the VCS `+vcs+initmem` analogue). Enabled by
+        // sound here — the analogue of commercial memory-init options). Enabled by
         // XEZIM_INIT_MEM=0 or the legacy XEZIM_INIT_ZERO=1 alias.
         let init_mem = std::env::var("XEZIM_INIT_MEM").ok().as_deref() == Some("0") || init_zero;
         let array_init = if init_mem { Value::zero } else { Value::new };
@@ -18556,8 +18556,8 @@ impl Simulator {
     /// invisible to the event system (no dirty marking, no X->0 transition,
     /// nets forced into unreachable states) — measured to distort c906
     /// firmware 1.64x and, after the Aug 2026 upstream event-semantics fixes,
-    /// to wedge it entirely. Industry precedent: VCS `+vcs+initreg`,
-    /// Xcelium `-init_reg` — registers only, nets derive by evaluation.
+    /// to wedge it entirely. Industry precedent: commercial register-init
+    /// options cover registers only; nets derive by evaluation.
     ///
     /// Selection: NBA targets of COMPILED edge blocks (the flop set), minus
     /// continuously-driven nets, minus anything already non-X. AST-only edge
@@ -41167,7 +41167,7 @@ impl Simulator {
     /// time. Called only AFTER `apply_nba` has committed this pass's NBA
     /// region, so when the caller's loop re-drains same-time events the
     /// promoted continuations observe post-NBA values — matching the
-    /// commercial consensus (VCS / Riviera): an NBA posted before
+    /// commercial consensus: an NBA posted before
     /// a `#0` is visible after it in the same time slot.
     fn promote_inactive_to_active(&mut self) -> bool {
         if self.inactive_queue.is_empty() {
@@ -48165,7 +48165,7 @@ impl Simulator {
                             // self.time would resume it in the same batch
                             // drain, BEFORE apply_nba — so an NBA posted
                             // before the `#0` would not be visible after it.
-                            // Commercial consensus (VCS/Riviera): it IS
+                            // Commercial consensus: it IS
                             // visible. Park here; run_one_tick promotes after
                             // the NBA region of this tick has been applied.
                             self.inactive_queue.push((pid, cont));
@@ -80126,7 +80126,7 @@ impl Simulator {
                     self.rng = SvRng::from_state_string(&v.to_string());
                 }
             }
-            // Verilog-XL/VCS `$deposit(target, value)`: set the target's value
+            // Non-standard `$deposit(target, value)`: set the target's value
             // immediately, WITHOUT a persistent driver — it holds until the
             // next driver transaction overwrites it (an undriven net keeps it).
             // A plain simulator write has exactly those semantics here: the
@@ -80389,9 +80389,9 @@ impl Simulator {
                     };
                 }
             }
-            // Verdi's FSDB dump tasks mapped onto xezim's native FST dump
+            // The FSDB dump tasks mapped onto xezim's native FST dump
             // machinery (FSDB is a proprietary format; FST is the closest
-            // compact binary equivalent and Verdi-class viewers read it).
+            // compact binary equivalent, and common waveform viewers read it).
             // The rewritten path swaps a .fsdb extension for .fst.
             "$fsdbDumpfile" => {
                 let path = args
@@ -80442,7 +80442,7 @@ impl Simulator {
                     self.fst_start_dump();
                 }
             }
-            // VCS's VPD (vcdplus) control tasks mapped onto the plain VCD
+            // The VPD (vcdplus) control tasks mapped onto the plain VCD
             // machinery: on first use starts a VCD dump of the whole design
             // into "vcdplus.vcd"; later calls resume/suspend like
             // $dumpon/$dumpoff.
@@ -80606,10 +80606,7 @@ impl Simulator {
             }
             "$key" | "$nokey" | "$log" | "$nolog" | "$input" | "$scope" | "$showscopes"
             | "$showvars" | "$list" => {
-                let msg = format!(
-                    "Warning: {} ignored — Verilog-XL interactive task not supported",
-                    name
-                );
+                let msg = format!("Warning: {} ignored — interactive task not supported", name);
                 self.warn_system_task_once(name, &msg);
             }
             // A `$name` a VPI module registered with `vpi_register_systf`.
@@ -90073,7 +90070,7 @@ impl Simulator {
             let width = self.lookup_signal_width(name).unwrap_or(1);
             let mut kind = self.dump_var_kind(name, tbl_id);
             // Parameters are dumped LRM-compliantly as `$var parameter` — but
-            // some viewers (Verdi/nWave) shelve those separately and never show
+            // some waveform viewers shelve those separately and never show
             // them in the waveform pane. `XEZIM_VCD_PARAM_AS_WIRE=1` emits them
             // as a constant-valued `wire` instead, so they trace like any other
             // signal (matching what the FST/FSDB path already does).

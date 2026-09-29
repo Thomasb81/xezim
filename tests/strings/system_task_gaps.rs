@@ -727,11 +727,12 @@ endmodule: tb
     assert_eq!(u(&sim, "done"), 1, "sim must run past $assertoff/$asserton");
 }
 
-/// Cadence/Xcelium SHM + SST2 waveform tasks take a SCOPE as first argument
+/// The SHM + SST2 waveform tasks take a SCOPE as first argument
 /// (`$shm_probe(testbench, "AC")`). Elaboration's identifier validation
 /// treated that scope as a value lookup and failed the whole testbench with
 /// "Undeclared identifier 'testbench'" — a field report from a real
-/// Xcelium-built verification environment. They must elaborate and no-op.
+/// verification environment written for another simulator. They must
+/// elaborate and no-op.
 #[test]
 fn shm_and_record_tasks_with_scope_args_elaborate() {
     let src = r#"

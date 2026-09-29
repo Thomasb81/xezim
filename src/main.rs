@@ -669,7 +669,7 @@ fn preprocess_sources(
 
 /// Expand `$VAR` and `${VAR}` style references against the process
 /// environment. Unknown variables expand to empty (matching the typical
-/// VCS / Xcelium / Verilator behaviour on `-f` filelists). Used so that
+/// behaviour of other simulators on `-f` filelists). Used so that
 /// command files like core-v-verif's `${DV_UVML_HRTBT_PATH}/pkg.flist`
 /// resolve without requiring callers to pre-substitute.
 fn expand_env_vars(s: &str) -> String {
@@ -1924,7 +1924,7 @@ fn run_main() -> i32 {
             }
             // Commercial GLS flags. `+nospecify` suppresses specify-block path
             // delays (zero-delay gate sim) and timing checks; `+notimingcheck(s)`
-            // only the timing checks. Xcelium's `-` spellings are accepted too.
+            // only the timing checks. The `-` spellings are accepted too.
             "+nospecify" | "-nospecify" => {
                 nospecify = true;
             }
@@ -1972,7 +1972,7 @@ fn run_main() -> i32 {
                 }
                 plusargs.push(arg.clone());
             }
-            // `-v <file>` — a library FILE (Verilog-XL/VCS semantics): its
+            // `-v <file>` — a library FILE (traditional library semantics): its
             // modules are compiled on demand to satisfy unresolved
             // instantiations and are never top-module candidates. The old
             // "verbose" meaning of -v (which controlled nothing) moved to

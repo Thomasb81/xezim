@@ -91,7 +91,7 @@ interface ifc_f;
 endinterface
 
 // f9: hierarchical member READ target. Fresh variable on purpose: c9's
-// golden write already landed in u.sv (xrun), so f9 must read an untouched
+// golden write already landed in u.sv (the reference simulator), so f9 must read an untouched
 // field-0 value to prove the read-side divert.
 module sub_r;
   import pk::*;
