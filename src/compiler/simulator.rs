@@ -10336,7 +10336,7 @@ impl Simulator {
         let mut last_parent: Option<Arc<str>> = None;
         for full_name in id_to_name
             .iter()
-            .map(|name| name.as_ref())
+            .map(|(_, name)| name.as_ref())
             .chain(module.arrays.keys().map(String::as_str))
             .chain(module.arrays_2d.keys().map(String::as_str))
             .chain(module.arrays_nd.keys().map(String::as_str))
