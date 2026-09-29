@@ -43074,6 +43074,11 @@ impl Simulator {
             let old_time = self.time;
             if next_time > self.time {
                 self.time = next_time;
+                // Lines printed near the end of a burst stay buffered until the
+                // next line; release them once they are stale (core #49).
+                if let Some(sink) = self.stdout_sink.as_mut() {
+                    sink.flush_if_stale();
+                }
                 self.stall_iters = 0;
                 self.stall_time = next_time;
                 self.stall_pid_hits.clear();
@@ -45163,6 +45168,9 @@ impl Simulator {
                     self.run_postponed_region();
                 }
                 self.time = nt;
+                if let Some(sink) = self.stdout_sink.as_mut() {
+                    sink.flush_if_stale();
+                }
             }
             // Commit delayed updates whose target time matches first —
             // their values must be visible to clock-fire / process eval
