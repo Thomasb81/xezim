@@ -24379,6 +24379,27 @@ impl Simulator {
         let insns_ptr = insns.as_ptr();
         let insns_len = insns.len();
         let mut pc = 0usize;
+        // Signal (value, x) planes for a load. The plane mirror exists only
+        // under XEZIM_INLINE_BITS / JIT runs; test for it once per block
+        // instead of per load (a load through `self` cannot be hoisted past
+        // the stores' `&mut self` calls). Signal ids come from the lowered
+        // stream, validated against the table at lowering, and the table
+        // never shrinks, so the index is unchecked (as in the store helpers).
+        let mirror = !self.signal_inline_bits.is_empty();
+        macro_rules! planes {
+            ($s:expr) => {{
+                let __s: usize = $s;
+                if mirror {
+                    match self.signal_inline_bits.get(__s) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[__s].raw_bits(),
+                    }
+                } else {
+                    debug_assert!(__s < self.signal_table.len());
+                    unsafe { self.signal_table.get_unchecked(__s) }.raw_bits()
+                }
+            }};
+        }
         macro_rules! bail {
             () => {{
                 return false;
@@ -24414,10 +24435,7 @@ impl Simulator {
                     // branch (raw_bits showed at 5% of settle post-PGO).
                     // The mirror is authoritative in JIT runs and absent in
                     // non-JIT runs (fall back).
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24425,20 +24443,14 @@ impl Simulator {
                 }
                 TsInsn::Const { d, v } => regs[*d as usize] = *v,
                 TsInsn::SigBit { d, sig, bit } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
                     regs[*d as usize] = (v >> bit) & 1;
                 }
                 TsInsn::SigRange { d, sig, lo, mask } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24561,10 +24573,7 @@ impl Simulator {
                     regs[*d as usize] = (regs[*s as usize] >> idx) & 1;
                 }
                 TsInsn::LoadSigNot { dl, d, sig } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24581,10 +24590,7 @@ impl Simulator {
                 } => {
                     let mask = if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 };
                     let mask = &mask;
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24593,10 +24599,7 @@ impl Simulator {
                     regs[*d as usize] = (rv == *k) as u64;
                 }
                 TsInsn::LoadSigLogAnd { dl, sig, d, a, b } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24635,10 +24638,7 @@ impl Simulator {
                     self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
                 }
                 TsInsn::SigBitNot { db, d, sig, bit } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24647,18 +24647,12 @@ impl Simulator {
                     regs[*d as usize] = (bv == 0) as u64;
                 }
                 TsInsn::LoadSig2 { d1, sig1, d2, sig2 } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig1 as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig1 as usize);
                     if x != 0 {
                         xbail!();
                     }
                     regs[*d1 as usize] = v;
-                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig2 as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig2 as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24672,28 +24666,19 @@ impl Simulator {
                     sig2,
                     bit2,
                 } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig1 as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig1 as usize);
                     if x != 0 {
                         xbail!();
                     }
                     regs[*d1 as usize] = (v >> bit1) & 1;
-                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig2 as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig2 as usize);
                     if x != 0 {
                         xbail!();
                     }
                     regs[*d2 as usize] = (v >> bit2) & 1;
                 }
                 TsInsn::LoadSigLogOr { dl, sig, d, a, b } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24701,10 +24686,7 @@ impl Simulator {
                     regs[*d as usize] = (regs[*a as usize] != 0 || regs[*b as usize] != 0) as u64;
                 }
                 TsInsn::LoadSigAnd { dl, sig, d, a, b } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24718,10 +24700,7 @@ impl Simulator {
                     w,
                     count,
                 } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24736,18 +24715,12 @@ impl Simulator {
                     lo,
                     mask,
                 } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
                     regs[*dl as usize] = v;
-                    let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig2 as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig2 as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24762,10 +24735,7 @@ impl Simulator {
                     a,
                     b,
                 } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24781,10 +24751,7 @@ impl Simulator {
                     a,
                     b,
                 } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24830,10 +24797,7 @@ impl Simulator {
                     self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
                 }
                 TsInsn::LoadSigBrNz { dl, sig, t } => {
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -24848,10 +24812,7 @@ impl Simulator {
                         pc = *t as usize;
                         continue;
                     }
-                    let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                        Some(sl) => (sl[0], sl[1]),
-                        None => self.signal_table[*sig as usize].raw_bits(),
-                    };
+                    let (v, x) = planes!(*sig as usize);
                     if x != 0 {
                         xbail!();
                     }
@@ -25404,6 +25365,27 @@ impl Simulator {
         // every operand access are provably redundant, so go through a raw
         // pointer (this loop is a quarter of a c906 run).
         let rp: *mut u64 = regs.as_mut_ptr();
+        // Signal (value, x) planes for a load. The plane mirror exists only
+        // under XEZIM_INLINE_BITS / JIT runs; test for it once per block
+        // instead of per load (a load through `self` cannot be hoisted past
+        // the stores' `&mut self` calls). Signal ids come from the lowered
+        // stream, validated against the table at lowering, and the table
+        // never shrinks, so the index is unchecked (as in the store helpers).
+        let mirror = !self.signal_inline_bits.is_empty();
+        macro_rules! planes {
+            ($s:expr) => {{
+                let __s: usize = $s;
+                if mirror {
+                    match self.signal_inline_bits.get(__s) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[__s].raw_bits(),
+                    }
+                } else {
+                    debug_assert!(__s < self.signal_table.len());
+                    unsafe { self.signal_table.get_unchecked(__s) }.raw_bits()
+                }
+            }};
+        }
         macro_rules! r {
             ($i:expr) => {
                 (*rp.add($i as usize))
@@ -25437,10 +25419,7 @@ impl Simulator {
                         // branch (raw_bits showed at 5% of settle post-PGO).
                         // The mirror is authoritative in JIT runs and absent in
                         // non-JIT runs (fall back).
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25448,20 +25427,14 @@ impl Simulator {
                     }
                     TsInsn::Const { d, v } => r!(*d) = *v,
                     TsInsn::SigBit { d, sig, bit } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
                         r!(*d) = (v >> bit) & 1;
                     }
                     TsInsn::SigRange { d, sig, lo, mask } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25578,10 +25551,7 @@ impl Simulator {
                         r!(*d) = (r!(*s) >> idx) & 1;
                     }
                     TsInsn::LoadSigNot { dl, d, sig } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25598,10 +25568,7 @@ impl Simulator {
                     } => {
                         let mask = if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 };
                         let mask = &mask;
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25610,10 +25577,7 @@ impl Simulator {
                         r!(*d) = (rv == *k) as u64;
                     }
                     TsInsn::LoadSigLogAnd { dl, sig, d, a, b } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25652,10 +25616,7 @@ impl Simulator {
                         self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
                     }
                     TsInsn::SigBitNot { db, d, sig, bit } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25664,18 +25625,12 @@ impl Simulator {
                         r!(*d) = (bv == 0) as u64;
                     }
                     TsInsn::LoadSig2 { d1, sig1, d2, sig2 } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig1 as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig1 as usize);
                         if x != 0 {
                             xbail!();
                         }
                         r!(*d1) = v;
-                        let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig2 as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig2 as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25689,28 +25644,19 @@ impl Simulator {
                         sig2,
                         bit2,
                     } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig1 as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig1 as usize);
                         if x != 0 {
                             xbail!();
                         }
                         r!(*d1) = (v >> bit1) & 1;
-                        let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig2 as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig2 as usize);
                         if x != 0 {
                             xbail!();
                         }
                         r!(*d2) = (v >> bit2) & 1;
                     }
                     TsInsn::LoadSigLogOr { dl, sig, d, a, b } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25718,10 +25664,7 @@ impl Simulator {
                         r!(*d) = (r!(*a) != 0 || r!(*b) != 0) as u64;
                     }
                     TsInsn::LoadSigAnd { dl, sig, d, a, b } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25735,10 +25678,7 @@ impl Simulator {
                         w,
                         count,
                     } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25753,18 +25693,12 @@ impl Simulator {
                         lo,
                         mask,
                     } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
                         r!(*dl) = v;
-                        let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig2 as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig2 as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25779,10 +25713,7 @@ impl Simulator {
                         a,
                         b,
                     } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -25798,10 +25729,7 @@ impl Simulator {
                         a,
                         b,
                     } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -26795,6 +26723,27 @@ impl Simulator {
         // `num_regs` and the file was just sized to it: every operand access
         // goes through a raw pointer, as in the straight-line executor.
         let rp: *mut u64 = regs.as_mut_ptr();
+        // Signal (value, x) planes for a load. The plane mirror exists only
+        // under XEZIM_INLINE_BITS / JIT runs; test for it once per block
+        // instead of per load (a load through `self` cannot be hoisted past
+        // the stores' `&mut self` calls). Signal ids come from the lowered
+        // stream, validated against the table at lowering, and the table
+        // never shrinks, so the index is unchecked (as in the store helpers).
+        let mirror = !self.signal_inline_bits.is_empty();
+        macro_rules! planes {
+            ($s:expr) => {{
+                let __s: usize = $s;
+                if mirror {
+                    match self.signal_inline_bits.get(__s) {
+                        Some(sl) => (sl[0], sl[1]),
+                        None => self.signal_table[__s].raw_bits(),
+                    }
+                } else {
+                    debug_assert!(__s < self.signal_table.len());
+                    unsafe { self.signal_table.get_unchecked(__s) }.raw_bits()
+                }
+            }};
+        }
         macro_rules! xbail {
             () => {{
                 self.ts_xread_bail = true;
@@ -26829,10 +26778,7 @@ impl Simulator {
                         // branch (raw_bits showed at 5% of settle post-PGO).
                         // The mirror is authoritative in JIT runs and absent in
                         // non-JIT runs (fall back).
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -26840,20 +26786,14 @@ impl Simulator {
                     }
                     TsInsn::Const { d, v } => (*rp.add(*d as usize)) = *v,
                     TsInsn::SigBit { d, sig, bit } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
                         (*rp.add(*d as usize)) = (v >> bit) & 1;
                     }
                     TsInsn::SigRange { d, sig, lo, mask } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -26982,10 +26922,7 @@ impl Simulator {
                         (*rp.add(*d as usize)) = ((*rp.add(*s as usize)) >> idx) & 1;
                     }
                     TsInsn::LoadSigNot { dl, d, sig } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27002,10 +26939,7 @@ impl Simulator {
                     } => {
                         let mask = if *w >= 64 { u64::MAX } else { (1u64 << *w) - 1 };
                         let mask = &mask;
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27014,10 +26948,7 @@ impl Simulator {
                         (*rp.add(*d as usize)) = (rv == *k) as u64;
                     }
                     TsInsn::LoadSigLogAnd { dl, sig, d, a, b } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27059,10 +26990,7 @@ impl Simulator {
                         self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
                     }
                     TsInsn::SigBitNot { db, d, sig, bit } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27071,18 +26999,12 @@ impl Simulator {
                         (*rp.add(*d as usize)) = (bv == 0) as u64;
                     }
                     TsInsn::LoadSig2 { d1, sig1, d2, sig2 } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig1 as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig1 as usize);
                         if x != 0 {
                             xbail!();
                         }
                         (*rp.add(*d1 as usize)) = v;
-                        let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig2 as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig2 as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27096,28 +27018,19 @@ impl Simulator {
                         sig2,
                         bit2,
                     } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig1 as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig1 as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig1 as usize);
                         if x != 0 {
                             xbail!();
                         }
                         (*rp.add(*d1 as usize)) = (v >> bit1) & 1;
-                        let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig2 as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig2 as usize);
                         if x != 0 {
                             xbail!();
                         }
                         (*rp.add(*d2 as usize)) = (v >> bit2) & 1;
                     }
                     TsInsn::LoadSigLogOr { dl, sig, d, a, b } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27126,10 +27039,7 @@ impl Simulator {
                             ((*rp.add(*a as usize)) != 0 || (*rp.add(*b as usize)) != 0) as u64;
                     }
                     TsInsn::LoadSigAnd { dl, sig, d, a, b } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27143,10 +27053,7 @@ impl Simulator {
                         w,
                         count,
                     } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27161,18 +27068,12 @@ impl Simulator {
                         lo,
                         mask,
                     } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
                         (*rp.add(*dl as usize)) = v;
-                        let (v, x) = match self.signal_inline_bits.get(*sig2 as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig2 as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig2 as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27187,10 +27088,7 @@ impl Simulator {
                         a,
                         b,
                     } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27206,10 +27104,7 @@ impl Simulator {
                         a,
                         b,
                     } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27258,10 +27153,7 @@ impl Simulator {
                         self.ts_range_store(*sig as usize, rv & mask, *lo, *hi);
                     }
                     TsInsn::LoadSigBrNz { dl, sig, t } => {
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
@@ -27276,10 +27168,7 @@ impl Simulator {
                             pc = *t as usize;
                             continue;
                         }
-                        let (v, x) = match self.signal_inline_bits.get(*sig as usize) {
-                            Some(sl) => (sl[0], sl[1]),
-                            None => self.signal_table[*sig as usize].raw_bits(),
-                        };
+                        let (v, x) = planes!(*sig as usize);
                         if x != 0 {
                             xbail!();
                         }
