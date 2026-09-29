@@ -821,6 +821,59 @@ fn reinstall_ooc_constraint_bodies(
     }
 }
 
+/// `XEZIM_MEM_CENSUS`: the elaborated design as elaboration hands it over —
+/// serialized size per field (a stand-in for heap size that ranks them) and
+/// the sizes of the AST node types that make up most of it.
+fn elab_census(elab: &elaborate::ElaboratedModule) {
+    fn ser<T: serde::Serialize>(v: &T) -> usize {
+        bincode::serialized_size(v).unwrap_or(0) as usize
+    }
+    let mut rows: Vec<(&str, usize)> = vec![
+        ("signals", ser(&elab.signals)),
+        ("always_blocks", ser(&elab.always_blocks)),
+        ("initial_blocks", ser(&elab.initial_blocks)),
+        ("continuous_assigns", ser(&elab.continuous_assigns)),
+        ("functions", ser(&elab.functions)),
+        ("tasks", ser(&elab.tasks)),
+        ("classes", ser(&elab.classes)),
+        ("var_decl_types", ser(&elab.var_decl_types)),
+        ("parameters", ser(&elab.parameters)),
+        ("instances", ser(&elab.instances)),
+        ("nets", ser(&elab.nets)),
+        ("port_aliases", ser(&elab.port_aliases)),
+        ("decl_sites", ser(&elab.decl_sites)),
+        ("source_texts", ser(&elab.source_texts)),
+        ("arrays", ser(&elab.arrays)),
+        ("two_state_signals", ser(&elab.two_state_signals)),
+    ];
+    rows.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+    eprintln!(
+        "[MEM-CENSUS] === elaborated design (serialized MB) — {} signals, {} always, {} pending always, {} pending initial, {} pending CA ===",
+        elab.signals.len(),
+        elab.always_blocks.len(),
+        elab.pending_always.len(),
+        elab.pending_initial.len(),
+        elab.pending_cont_assign.len()
+    );
+    for (name, b) in rows.iter().take(12) {
+        eprintln!("[MEM-CENSUS] {:>9.1} MB  {}", *b as f64 / 1048576.0, name);
+    }
+    use std::mem::size_of;
+    eprintln!(
+        "[MEM-CENSUS] node sizes: Expression={} ExprKind={} HierarchicalIdentifier={} HierPathSegment={} Identifier={} Statement={} StatementKind={} Span={} Signal={} Value={}",
+        size_of::<ast::expr::Expression>(),
+        size_of::<ast::expr::ExprKind>(),
+        size_of::<ast::expr::HierarchicalIdentifier>(),
+        size_of::<ast::expr::HierPathSegment>(),
+        size_of::<ast::Identifier>(),
+        size_of::<ast::stmt::Statement>(),
+        size_of::<ast::stmt::StatementKind>(),
+        size_of::<ast::Span>(),
+        size_of::<elaborate::Signal>(),
+        size_of::<xezim_core::Value>(),
+    );
+}
+
 /// Simulate a single source string.
 
 /// Realtime-clock stopwatch for HUMAN-FACING phase/profile reports.
@@ -1099,6 +1152,9 @@ fn simulate_multi_inner(
             pre.take(),
         )?;
         rss_trace("parse+elaborate");
+        if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+            elab_census(&elab);
+        }
 
         // §18.5.1: recover any out-of-class constraint body that the class-table
         // repopulation in `inline_instantiations` dropped.
