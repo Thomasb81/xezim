@@ -24215,7 +24215,6 @@ impl Simulator {
     /// `Vec` — the executor's cycles were dominated by those two misses.
     fn ts_guard_and_exec_arena(&mut self, eidx: usize) -> bool {
         let h = self.ts_hdr[eidx];
-        self.ts_cur_eidx = eidx as u32;
         self.ts_exec_aborted = false;
         self.ts_last_xbail = false;
         if self.warn_x {
@@ -56806,7 +56805,9 @@ impl Simulator {
             self.gate_ops.push(*op);
             let armed = self.armed_input_set(id);
             let edge = self.sig_to_edge_pos.get(id).is_some_and(|&p| p >= 0);
-            self.gate_obs.push((armed as u8) | ((edge as u8) << 1));
+            let wide = self.signal_widths.get(id).copied().unwrap_or(65) > 64;
+            self.gate_obs
+                .push((armed as u8) | ((edge as u8) << 1) | ((wide as u8) << 2));
         }
         self.gate_queued.clear();
         self.gate_queued.resize(self.gate_ops.len(), false);
@@ -57069,6 +57070,15 @@ impl Simulator {
             .get_or_init(|| std::env::var("XEZIM_INJECT_PREFETCH").ok().as_deref() != Some("0"));
         let mon_on = self.activity_mon;
         let trace_on = self.trace_always.is_some();
+        // Any per-evaluation diagnostic hook armed. All are construction-time
+        // or CLI modes, fixed for the settle, so a normal run tests one bool
+        // per evaluation instead of six.
+        let diag_on = self.trace_comb_paths
+            || self.coact_enabled
+            || prof_on
+            || mon_on
+            || trace_on
+            || self.profile_report;
         let warn_x_on = self.warn_x && self.time > 0;
         // Profiling counters accumulate in registers and fold back into `self`
         // once, instead of a read-modify-write per evaluation.
@@ -57446,59 +57456,61 @@ impl Simulator {
                 if _iteration > 0 {
                     n_repass += 1;
                 }
-                if self.trace_comb_paths {
-                    if eidx >= self.comb_eval_counts.len() {
-                        self.comb_eval_counts.resize(eidx + 1, [0; 2]);
-                        self.comb_eval_last_time.resize(eidx + 1, u64::MAX);
+                if diag_on {
+                    if self.trace_comb_paths {
+                        if eidx >= self.comb_eval_counts.len() {
+                            self.comb_eval_counts.resize(eidx + 1, [0; 2]);
+                            self.comb_eval_last_time.resize(eidx + 1, u64::MAX);
+                        }
+                        self.comb_eval_counts[eidx][0] += 1;
+                        if self.comb_eval_last_time[eidx] == self.time {
+                            self.comb_eval_counts[eidx][1] += 1;
+                        }
+                        self.comb_eval_last_time[eidx] = self.time;
                     }
-                    self.comb_eval_counts[eidx][0] += 1;
-                    if self.comb_eval_last_time[eidx] == self.time {
-                        self.comb_eval_counts[eidx][1] += 1;
+                    // Co-activation stamp: count, per predecessor edge, how often
+                    // this entry evaluates in the same TIME SLOT as that
+                    // predecessor. Opt-in; ~4 loads per eval when enabled.
+                    if self.coact_enabled {
+                        let now = self.time;
+                        let lo = self.coact_pred_off[eidx] as usize;
+                        let hi = self.coact_pred_off[eidx + 1] as usize;
+                        for k in lo..hi {
+                            let p = self.coact_pred_ent[k] as usize;
+                            if self.coact_epoch[p] == now {
+                                self.coact_edge_count[k] += 1;
+                            }
+                        }
+                        self.coact_epoch[eidx] = now;
                     }
-                    self.comb_eval_last_time[eidx] = self.time;
-                }
-                // Co-activation stamp: count, per predecessor edge, how often
-                // this entry evaluates in the same TIME SLOT as that
-                // predecessor. Opt-in; ~4 loads per eval when enabled.
-                if self.coact_enabled {
-                    let now = self.time;
-                    let lo = self.coact_pred_off[eidx] as usize;
-                    let hi = self.coact_pred_off[eidx + 1] as usize;
-                    for k in lo..hi {
-                        let p = self.coact_pred_ent[k] as usize;
-                        if self.coact_epoch[p] == now {
-                            self.coact_edge_count[k] += 1;
+                    // Which CombItem shapes actually dominate evaluation — the
+                    // number that says whether to attack the interpreter or the
+                    // worklist. Gated: `profile_timing` is already an opt-in slow
+                    // mode (it adds Instant::now() on these paths), so a normal
+                    // run does not pay for this match.
+                    if prof_on {
+                        // The per-shape histogram is derived from these counts
+                        // and each entry's static kind at report time.
+                        self.prof_entry_counts[eidx] += 1;
+                    }
+                    if mon_on {
+                        if let Some(slot) = self.activity_counts.get_mut(eidx) {
+                            *slot += 1;
                         }
                     }
-                    self.coact_epoch[eidx] = now;
-                }
-                // Which CombItem shapes actually dominate evaluation — the
-                // number that says whether to attack the interpreter or the
-                // worklist. Gated: `profile_timing` is already an opt-in slow
-                // mode (it adds Instant::now() on these paths), so a normal
-                // run does not pay for this match.
-                if prof_on {
-                    // The per-shape histogram is derived from these counts
-                    // and each entry's static kind at report time.
-                    self.prof_entry_counts[eidx] += 1;
-                }
-                if mon_on {
-                    if let Some(slot) = self.activity_counts.get_mut(eidx) {
-                        *slot += 1;
+                    if trace_on {
+                        let label = self.comb_entry_trace_label(eidx, &entries[eidx]);
+                        self.trace_always_fire(&label);
                     }
-                }
-                if trace_on {
-                    let label = self.comb_entry_trace_label(eidx, &entries[eidx]);
-                    self.trace_always_fire(&label);
-                }
-                // Profile report: two clock reads per evaluation made the
-                // settle 35% slower on gate-level designs; the sampler
-                // thread times what this one store publishes.
-                if self.profile_report {
-                    self.prof_cur.store(
-                        crate::compiler::prof_sampler::KIND_COMB | eidx as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    // Profile report: two clock reads per evaluation made the
+                    // settle 35% slower on gate-level designs; the sampler
+                    // thread times what this one store publishes.
+                    if self.profile_report {
+                        self.prof_cur.store(
+                            crate::compiler::prof_sampler::KIND_COMB | eidx as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                 }
                 // Plan-first fast path: an entry with a resolved two-state
                 // plan runs straight from the plan table — no `CombEntry`
@@ -58139,12 +58151,13 @@ impl Simulator {
             // tight loop. None of them feeds a comb entry, so nothing here
             // can trigger further work in this pass.
             if !gate_queue.is_empty() {
+                let slow = self.gate_lane_slow();
                 for qi in 0..gate_queue.len() {
                     let g = gate_queue[qi] as usize;
                     gate_queued[g] = false;
                     let (dst, new_bit) = self.fused_gate_eval(&self.gate_ops[g]);
                     let obs = self.gate_obs[g];
-                    if self.gate_lane_commit(dst, new_bit, obs) {
+                    if self.gate_lane_commit(dst, new_bit, obs, slow) {
                         n_writes += 1;
                     }
                 }
@@ -86456,16 +86469,24 @@ impl Simulator {
     /// (`obs` bits from `build_gate_lane`). Falls back to the generic commit
     /// when any global observer is active.
     #[inline(always)]
-    fn gate_lane_commit(&mut self, dst: BitRef, new_bit: u8, obs: u8) -> bool {
-        let id = dst.sig_id as usize;
-        let global = self.value_trace_ids.is_some()
+    /// Whether a gate-lane commit must take the full `fused_bit_commit`
+    /// path because a global observer is active. Nothing a lane commit does
+    /// changes any of these, so the lane tests it once per drain.
+    fn gate_lane_slow(&self) -> bool {
+        self.value_trace_ids.is_some()
             || self.dump_dirty_active
             || !self.active_force_exprs.is_empty()
             || !self.signal_inline_bits.is_empty()
             || (self.event_measure && !self.armed_edge)
             || !self.sdf_delays.is_empty()
-            || !self.signal_commit_plan.is_empty();
-        if global || self.signal_widths.get(id).copied().unwrap_or(65) > 64 {
+            || !self.signal_commit_plan.is_empty()
+    }
+
+    /// `obs`: bit 0 armed input, bit 1 edge signal, bit 2 destination wider
+    /// than 64 bits (`build_gate_lane`); `slow` is `gate_lane_slow()`.
+    fn gate_lane_commit(&mut self, dst: BitRef, new_bit: u8, obs: u8, slow: bool) -> bool {
+        let id = dst.sig_id as usize;
+        if slow || obs & 4 != 0 {
             let sdf_any = !self.sdf_delays.is_empty();
             return self.fused_bit_commit(dst, new_bit, sdf_any);
         }
