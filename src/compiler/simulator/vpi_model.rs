@@ -60,6 +60,25 @@ use libc::c_int;
 /// "No such index" for the `u32` links of the model.
 pub(super) const NONE: u32 = u32::MAX;
 
+// The model's maps key and value on types of their own. An instantiation the
+// simulator also uses (`HashMap<usize, u32>`, say) would gain call sites here,
+// and that alone changes how the optimizer inlines it into the simulator's hot
+// paths: 1% more instructions on a CoreMark run from two memo tables.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct AstKey(usize);
+#[derive(Clone, Copy)]
+pub(super) struct PortIdx(u32);
+#[derive(Clone, Copy)]
+struct FileIdx(u32);
+#[derive(Clone, Copy)]
+struct InstIdx(usize);
+#[derive(Clone, Default)]
+struct Names(Vec<String>);
+#[derive(Default)]
+struct ParamList(Vec<(String, Value)>);
+#[derive(Default)]
+struct Regions(Vec<(u32, u32)>);
+
 /// VPI numbers used by the object model (IEEE 1800-2017 Annex K and M). Kept
 /// apart from `super::vpi`, which holds the routines' own constants.
 #[allow(dead_code)]
@@ -692,11 +711,11 @@ pub(super) struct VpiModel {
     pub enums: Vec<EnumDesc>,
     pub structs: Vec<StructDesc>,
     pub files: Vec<String>,
-    file_ids: HashMap<String, u32>,
+    file_ids: HashMap<String, FileIdx>,
     /// VPI full name -> object.
     pub by_name: HashMap<String, MRef>,
     /// Port full name -> port object (a port shares its name with its net).
-    pub port_by_name: HashMap<String, u32>,
+    pub port_by_name: HashMap<String, PortIdx>,
     pub inst_scope: HashMap<isize, u32>,
     /// Top-level instances, then packages.
     pub tops: Vec<u32>,
@@ -741,12 +760,12 @@ pub(super) fn with_model<R>(
 
 impl VpiModel {
     fn intern_file(&mut self, f: &str) -> u32 {
-        if let Some(&i) = self.file_ids.get(f) {
+        if let Some(&FileIdx(i)) = self.file_ids.get(f) {
             return i;
         }
         self.files.push(f.to_string());
         let i = (self.files.len() - 1) as u32;
-        self.file_ids.insert(f.to_string(), i);
+        self.file_ids.insert(f.to_string(), FileIdx(i));
         i
     }
 
@@ -1125,17 +1144,17 @@ struct Builder<'a> {
     /// §23.11 `bind` directives, with their source file.
     binds: Vec<(&'a BindDirective, u32)>,
     typedefs: HashMap<String, (&'a TypedefDeclaration, u32)>,
-    inst_by_path: HashMap<&'a str, usize>,
+    inst_by_path: HashMap<&'a str, InstIdx>,
     attached: Vec<bool>,
     /// Parameters grouped by their flat scope prefix.
-    params_by_prefix: HashMap<String, Vec<(String, Value)>>,
+    params_by_prefix: HashMap<String, ParamList>,
     global_params: HashMap<String, Value>,
     adopted: HashSet<String>,
-    cell_regions: HashMap<String, Vec<(u32, u32)>>,
-    struct_memo: HashMap<usize, u32>,
-    enum_memo: HashMap<usize, u32>,
+    cell_regions: HashMap<String, Regions>,
+    struct_memo: HashMap<AstKey, u32>,
+    enum_memo: HashMap<AstKey, u32>,
     /// §6.10 implicit nets by the flat prefix of their scope.
-    implicit_by_prefix: HashMap<String, Vec<String>>,
+    implicit_by_prefix: HashMap<String, Names>,
     /// Byte offset of each line start, per source text (built on demand).
     line_starts: Vec<Option<Vec<usize>>>,
     /// Adopted library files: path, preprocessed text, and whether its
@@ -1284,7 +1303,7 @@ impl<'a> Builder<'a> {
             }
         }
         for (i, inst) in self.sim.module.instances.iter().enumerate() {
-            self.inst_by_path.insert(inst.path.as_str(), i);
+            self.inst_by_path.insert(inst.path.as_str(), InstIdx(i));
         }
         for (k, v) in self.sim.module.parameters.iter() {
             if k.contains("::") {
@@ -1303,6 +1322,7 @@ impl<'a> Builder<'a> {
             self.params_by_prefix
                 .entry(prefix.to_string())
                 .or_default()
+                .0
                 .push((leaf.to_string(), v.clone()));
         }
         for (_, mods) in xezim_core::adopted_lib_files() {
@@ -1316,13 +1336,14 @@ impl<'a> Builder<'a> {
             self.implicit_by_prefix
                 .entry(prefix.to_string())
                 .or_default()
+                .0
                 .push(leaf.to_string());
         }
     }
 
     /// §6.10 implicit nets of a scope: nets no declaration made.
     fn implicit_nets(&mut self, ctx: &Ctx) {
-        let Some(names) = self.implicit_by_prefix.get(&ctx.flat_prefix).cloned() else {
+        let Some(Names(names)) = self.implicit_by_prefix.get(&ctx.flat_prefix).cloned() else {
             return;
         };
         let full = self.m.scopes[ctx.scope as usize].full.clone();
@@ -1377,7 +1398,7 @@ impl<'a> Builder<'a> {
     /// Parameter values of the instance whose flat names start `prefix`.
     fn params_for(&self, prefix: &str) -> std::rc::Rc<HashMap<String, Value>> {
         let mut p = self.global_params.clone();
-        if let Some(own) = self.params_by_prefix.get(prefix) {
+        if let Some(ParamList(own)) = self.params_by_prefix.get(prefix) {
             for (k, v) in own {
                 p.insert(k.clone(), v.clone());
             }
@@ -1503,7 +1524,7 @@ impl<'a> Builder<'a> {
         // The parent: an instance by path, or the top.
         let parent_scope = if parent_path.is_empty() {
             self.m.tops.first().copied().unwrap_or(NONE)
-        } else if let Some(&pi) = self.inst_by_path.get(parent_path.as_str()) {
+        } else if let Some(&InstIdx(pi)) = self.inst_by_path.get(parent_path.as_str()) {
             self.attach_orphan(pi);
             self.m
                 .inst_scope
@@ -1801,7 +1822,7 @@ impl<'a> Builder<'a> {
         let regions = self.cell_regions.entry(path.clone()).or_insert_with(|| {
             let mut out = Vec::new();
             let Ok(text) = std::fs::read_to_string(&path) else {
-                return out;
+                return Regions(out);
             };
             let mut open: Option<u32> = None;
             for (i, l) in text.lines().enumerate() {
@@ -1817,9 +1838,9 @@ impl<'a> Builder<'a> {
             if let Some(s) = open {
                 out.push((s, u32::MAX));
             }
-            out
+            Regions(out)
         });
-        regions.iter().any(|&(a, b)| line > a && line < b)
+        regions.0.iter().any(|&(a, b)| line > a && line < b)
     }
 
     // --- scope items ---------------------------------------------------
@@ -2017,7 +2038,7 @@ impl<'a> Builder<'a> {
                 SimpleType::Event => mk(TKind::Event, false, Vec::new()),
             },
             DataType::Struct(su) => {
-                let key = su as *const _ as usize;
+                let key = AstKey(su as *const _ as usize);
                 let idx = match self.struct_memo.get(&key) {
                     Some(&i) => i,
                     None => {
@@ -2051,7 +2072,7 @@ impl<'a> Builder<'a> {
                 )
             }
             DataType::Enum(et) => {
-                let key = et as *const _ as usize;
+                let key = AstKey(et as *const _ as usize);
                 let idx = match self.enum_memo.get(&key) {
                     Some(&i) => i,
                     None => {
@@ -3142,7 +3163,7 @@ impl<'a> Builder<'a> {
                 .insert(format!("{}{}", ctx.flat_prefix, hi.name.name));
             let path = format!("{}{}", ctx.inst_prefix, hi.name.name);
             let mut found: Vec<(usize, String)> = Vec::new();
-            if let Some(&i) = self.inst_by_path.get(path.as_str()) {
+            if let Some(&InstIdx(i)) = self.inst_by_path.get(path.as_str()) {
                 found.push((i, path.clone()));
             } else if !hi.dimensions.is_empty() {
                 // An instance array: its elements `u[3]`, `u[2]`, ...
@@ -3151,7 +3172,7 @@ impl<'a> Builder<'a> {
                     .inst_by_path
                     .iter()
                     .filter(|(p, _)| p.starts_with(&pre) && !p[pre.len()..].contains('.'))
-                    .map(|(p, &i)| (i, p.to_string()))
+                    .map(|(p, &InstIdx(i))| (i, p.to_string()))
                     .collect();
                 v.sort_by_key(|(i, _)| *i);
                 found = v;
@@ -3273,7 +3294,7 @@ impl<'a> Builder<'a> {
                 false,
                 true,
             );
-            self.m.port_by_name.insert(full, po);
+            self.m.port_by_name.insert(full, PortIdx(po));
         }
     }
 
@@ -3392,7 +3413,7 @@ impl<'a> Builder<'a> {
             return ctx.params.clone();
         }
         let mut p = (*ctx.params).clone();
-        if let Some(own) = own {
+        if let Some(ParamList(own)) = own {
             for (k, v) in own {
                 p.insert(k.clone(), v.clone());
             }
@@ -4426,7 +4447,10 @@ fn ident(m: &VpiModel, h: &VpiHandle) -> Option<MRef> {
                 None
             }
         }
-        VpiKind::Port => m.port_by_name.get(&h.full_name).map(|&o| MRef::Obj(o)),
+        VpiKind::Port => m
+            .port_by_name
+            .get(&h.full_name)
+            .map(|&PortIdx(o)| MRef::Obj(o)),
         VpiKind::Signal | VpiKind::Memory | VpiKind::Slice => match m.by_name.get(&h.full_name) {
             Some(&MRef::Obj(o))
                 if matches!(m.objs[o as usize].d, OData::Var(_) | OData::Param { .. }) =>
@@ -5717,7 +5741,7 @@ fn bit_get(m: &VpiModel, sim: &Simulator, prop: c_int, h: &VpiHandle) -> Option<
         c::VECTOR if h.kind == VpiKind::Slice => 0,
         c::DIRECTION => h.direction,
         c::PORT_INDEX if h.type_code == c::PORT_BIT => match m.port_by_name.get(base) {
-            Some(&p) => match &m.objs[p as usize].d {
+            Some(&PortIdx(p)) => match &m.objs[p as usize].d {
                 OData::Port(pd) => pd.index as c_int,
                 _ => c::UNDEFINED,
             },
