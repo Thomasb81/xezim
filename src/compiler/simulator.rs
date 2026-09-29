@@ -76878,7 +76878,12 @@ impl Simulator {
                 } else {
                     default_v.clone()
                 };
-                self.widths.insert(d.name.name.clone(), w);
+                match self.widths.get_mut(d.name.name.as_str()) {
+                    Some(slot) => *slot = w,
+                    None => {
+                        self.widths.insert(d.name.name.clone(), w);
+                    }
+                }
                 // A local variable inside a method (which has a pushed
                 // call frame) must live in THAT frame, not the global
                 // signal table — otherwise a callee's local shadows and
@@ -77161,8 +77166,10 @@ impl Simulator {
                         || self.module.typedefs.contains_key(&tn)
                         || self.module.typedef_types.contains_key(&tn)
                     {
-                        self.var_typedef_types
-                            .insert(d.name.name.clone(), tn.clone());
+                        if self.var_typedef_types.get(d.name.name.as_str()) != Some(&tn) {
+                            self.var_typedef_types
+                                .insert(d.name.name.clone(), tn.clone());
+                        }
                         // Record the frame-scoped typedef too so a
                         // method-local enum type is resolvable without
                         // the flat `var_class_types`/`var_typedef_types`
@@ -100246,14 +100253,32 @@ impl Simulator {
     /// module scope).
     fn record_local_class_type(&mut self, name: &str, cls: &str) {
         if let Some((c, _)) = self.local_type_stack.last_mut() {
-            c.insert(name.to_string(), cls.to_string());
+            match c.get_mut(name) {
+                Some(v) if v.as_str() == cls => {}
+                Some(v) => {
+                    v.clear();
+                    v.push_str(cls);
+                }
+                None => {
+                    c.insert(name.to_string(), cls.to_string());
+                }
+            }
         }
     }
 
     /// See `local_type_stack`: typedef/enum flavor.
     fn record_local_typedef_type(&mut self, name: &str, tn: &str) {
         if let Some((_, t)) = self.local_type_stack.last_mut() {
-            t.insert(name.to_string(), tn.to_string());
+            match t.get_mut(name) {
+                Some(v) if v.as_str() == tn => {}
+                Some(v) => {
+                    v.clear();
+                    v.push_str(tn);
+                }
+                None => {
+                    t.insert(name.to_string(), tn.to_string());
+                }
+            }
         }
     }
 
