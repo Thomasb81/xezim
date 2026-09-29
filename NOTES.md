@@ -15,6 +15,39 @@ and the development workflow are in [README.md](README.md).
   step the child's counter. A bare name also no longer follows an earlier
   hierarchical reference such as `u.x = 1` down into that child. (#195, from
   PR #196 by Ganesh T S)
+* A member access through a struct no longer lands on an unrelated class
+  object whose handle number happens to equal the struct's value: the path is
+  chosen from the declared type. This covers struct variables, collections of
+  structs, hierarchical references, `ref` formals and part-selects, a
+  module-level struct holding a class handle, and class handles declared
+  through a typedef (including a parameterized one). (#193, from PR #194 by
+  Ganesh T S)
+* Members of a struct-typed class property resolve at any depth: indexed and
+  part-selected members, nested structs, and queue, dynamic and associative
+  array members, in methods and at module scope. (#197, from PR #198 by
+  Ganesh T S)
+* A class that extends a parameterized class without giving all its
+  parameters (`class d extends base;`) gets their declared defaults, in
+  functions and tasks alike. A type parameter used to read as a 1-bit
+  `logic`, so a UVM base test built this way created null objects and drove
+  nothing. (PR #199 by eenky)
+* `+incdir+` directories in a `-F` args file resolve against the file's own
+  directory first, so `+incdir+.` means that directory. (PR #200 by Francesco
+  Urbani)
+* `--dpi-lib` libraries are loaded into the global symbol scope, as the DPI
+  guide says, so one library can call another, in either command-line order.
+  A call into a second library used to end the run with `symbol lookup
+  error`. (#202)
+* A `--dpi-lib` library that cannot be loaded stops the run before it starts
+  (exit 1), and calling a DPI import that no loaded library defines is a
+  `Fatal`. Both used to continue, with the import returning 0, and exit 0.
+  (#201)
+* `$display` output from a testbench that prints rarely appears as it is
+  printed, not only at exit. (xezim-core #49)
+* The one-time notes for ignored system tasks (such as `$dumpfile` without
+  `--wave`) are written to stderr as one piece, so `$display` output going to
+  the same file can no longer land inside one and hide a UVM message from log
+  parsers.
 
 ### 0.11.0 — code coverage, reference-parity fixes, faster UVM (September 2026)
 
