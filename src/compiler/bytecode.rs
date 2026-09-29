@@ -862,6 +862,73 @@ fn cat_dot(scope: &str, name: &str) -> String {
     s
 }
 
+/// Per-register read counts over one instruction stream, kept in step with
+/// edits: "does any instruction outside these slots read `r`" becomes a
+/// count comparison instead of a scan of the whole block (the peephole
+/// passes ask it once per candidate, which made them quadratic).
+struct RegReaders {
+    reads: Vec<u32>,
+    fallbacks: u32,
+}
+
+impl RegReaders {
+    fn new(insns: &[Insn]) -> Self {
+        let mut rr = RegReaders {
+            reads: Vec::new(),
+            fallbacks: 0,
+        };
+        for insn in insns {
+            rr.add(insn);
+        }
+        rr
+    }
+
+    fn bump(&mut self, insn: &Insn, up: bool) {
+        let reads = &mut self.reads;
+        let exact = BytecodeCompiler::insn_read_regs(insn, &mut |r| {
+            let r = r as usize;
+            if r >= reads.len() {
+                reads.resize(r + 1, 0);
+            }
+            if up {
+                reads[r] += 1;
+            } else {
+                reads[r] -= 1;
+            }
+        });
+        if !exact {
+            if up {
+                self.fallbacks += 1;
+            } else {
+                self.fallbacks -= 1;
+            }
+        }
+    }
+
+    fn add(&mut self, insn: &Insn) {
+        self.bump(insn, true);
+    }
+
+    fn remove(&mut self, insn: &Insn) {
+        self.bump(insn, false);
+    }
+
+    /// `insns.iter().enumerate().any(|(k, x)| !skip.contains(&k) &&
+    /// BytecodeCompiler::insn_reads_reg(x, r))` for distinct `skip` slots.
+    fn read_outside(&self, insns: &[Insn], r: RegId, skip: &[usize]) -> bool {
+        let mut own = 0u32;
+        let mut own_fallbacks = 0u32;
+        for &k in skip {
+            if let Some(x) = insns.get(k) {
+                if !BytecodeCompiler::insn_read_regs(x, &mut |q| own += (q == r) as u32) {
+                    own_fallbacks += 1;
+                }
+            }
+        }
+        self.fallbacks > own_fallbacks || self.reads.get(r as usize).copied().unwrap_or(0) > own
+    }
+}
+
 thread_local! {
     static SCOPED_KEY_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
@@ -11628,18 +11695,30 @@ impl<'a> BytecodeCompiler<'a> {
     /// (pub(crate): the FSM native generator in `aot.rs` uses this to prove
     /// a Real tick literal feeds only a delay wait.)
     pub(crate) fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
+        let mut hit = false;
+        !Self::insn_read_regs(insn, &mut |x| hit |= x == r) || hit
+    }
+
+    /// Every register occurrence `insn` reads (one read twice is reported
+    /// twice). Returns `false` for the AST fallbacks, which may read any
+    /// register. `insn_reads_reg` is defined through this, so the two cannot
+    /// disagree.
+    pub(crate) fn insn_read_regs(insn: &Insn, f: &mut impl FnMut(RegId)) -> bool {
         match insn {
-            Insn::WaitDelayReg(d) => *d == r,
-            Insn::WaitEdge(..) | Insn::CovHit(..) => false,
-            Insn::CmpBranch(_, l, rr, _, _) => *l == r || *rr == r,
-            Insn::MoveResize(_, s, _) => *s == r,
-            Insn::CaseLut(_, src, _) => *src == r,
-            Insn::CaseJump(src, _) => *src == r,
-            Insn::CaseMaskJump(src, _) => *src == r,
-            Insn::Format(_, f) => f.args.contains(&r),
-            Insn::StrOp(_, _, args) => args.contains(&r),
-            Insn::BlockingAssignString(_, v) => *v == r,
-            Insn::LoadSignalRangeDyn(_, _, lo, _) => *lo == r,
+            Insn::WaitDelayReg(d) => f(*d),
+            Insn::WaitEdge(..) | Insn::CovHit(..) => {}
+            Insn::CmpBranch(_, l, rr, _, _) => {
+                f(*l);
+                f(*rr);
+            }
+            Insn::MoveResize(_, s, _) => f(*s),
+            Insn::CaseLut(_, src, _) => f(*src),
+            Insn::CaseJump(src, _) => f(*src),
+            Insn::CaseMaskJump(src, _) => f(*src),
+            Insn::Format(_, fs) => fs.args.iter().for_each(|&a| f(a)),
+            Insn::StrOp(_, _, args) => args.iter().for_each(|&a| f(a)),
+            Insn::BlockingAssignString(_, v) => f(*v),
+            Insn::LoadSignalRangeDyn(_, _, lo, _) => f(*lo),
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
             | Insn::LoadSignalSigned(..)
@@ -11651,10 +11730,10 @@ impl<'a> BytecodeCompiler<'a> {
             // Reads its index straight out of the signal table; no registers.
             | Insn::NbaAssignArrayRead(..)
             | Insn::Jump(..)
-            | Insn::Nop => false,
-            Insn::BranchUnlessZero(c, _) => *c == r,
+            | Insn::Nop => {}
+            Insn::BranchUnlessZero(c, _) => f(*c),
             // In-place mutators read their register.
-            Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) => *a == r,
+            Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) => f(*a),
             Insn::Pow(_, l, rr)
             | Insn::Add(_, l, rr)
             | Insn::Sub(_, l, rr)
@@ -11678,7 +11757,10 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::Geq(_, l, rr)
             | Insn::Shl(_, l, rr)
             | Insn::Shr(_, l, rr)
-            | Insn::AShr(_, l, rr) => *l == r || *rr == r,
+            | Insn::AShr(_, l, rr) => {
+                f(*l);
+                f(*rr);
+            }
             Insn::BitNot(_, s)
             | Insn::LogNot(_, s)
             | Insn::Negate(_, s)
@@ -11686,38 +11768,63 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::ReduceOr(_, s)
             | Insn::ReduceXor(_, s)
             | Insn::Move(_, s)
-            | Insn::Replicate(_, s, _) => *s == r,
+            | Insn::Replicate(_, s, _) => f(*s),
             // Its other operand is the embedded constant, not a register.
-            Insn::BinOpConst(_, s, _, _) => *s == r,
-            Insn::BinOpConstAdd2(a) => a.s1 == r || a.s2 == r,
-            Insn::BitSelect(_, b, i) => *b == r || *i == r,
-            Insn::BitSelectConst(_, b, _) => *b == r,
-            Insn::RangeSelect(_, b, l, rr) => *b == r || *l == r || *rr == r,
-            Insn::RangeSelectW(_, b, i, _, _) => *b == r || *i == r,
-            Insn::RangeSelectConst(_, b, _, _) => *b == r,
-            Insn::Concat(_, parts) => parts.contains(&r),
-            Insn::BranchIfFalse(c, _) => *c == r,
-            Insn::Select(_, c, t, e) => *c == r || *t == r || *e == r,
-            Insn::NbaAssign(_, v, _) | Insn::BlockingAssign(_, v, _) => *v == r,
-            Insn::NbaAssignRange(_, _, _, v) | Insn::BlockingAssignRange(_, _, _, v) => *v == r,
+            Insn::BinOpConst(_, s, _, _) => f(*s),
+            Insn::BinOpConstAdd2(a) => {
+                f(a.s1);
+                f(a.s2);
+            }
+            Insn::BitSelect(_, b, i) => {
+                f(*b);
+                f(*i);
+            }
+            Insn::BitSelectConst(_, b, _) => f(*b),
+            Insn::RangeSelect(_, b, l, rr) => {
+                f(*b);
+                f(*l);
+                f(*rr);
+            }
+            Insn::RangeSelectW(_, b, i, _, _) => {
+                f(*b);
+                f(*i);
+            }
+            Insn::RangeSelectConst(_, b, _, _) => f(*b),
+            Insn::Concat(_, parts) => parts.iter().for_each(|&a| f(a)),
+            Insn::BranchIfFalse(c, _) => f(*c),
+            Insn::Select(_, c, t, e) => {
+                f(*c);
+                f(*t);
+                f(*e);
+            }
+            Insn::NbaAssign(_, v, _) | Insn::BlockingAssign(_, v, _) => f(*v),
+            Insn::NbaAssignRange(_, _, _, v) | Insn::BlockingAssignRange(_, _, _, v) => f(*v),
             Insn::NbaAssignRangeDyn(_, h, l, v) | Insn::BlockingAssignRangeDyn(_, h, l, v) => {
-                *h == r || *l == r || *v == r
+                f(*h);
+                f(*l);
+                f(*v);
             }
             Insn::NbaAssignBitDyn(_, i, v) | Insn::BlockingAssignBitDyn(_, i, v) => {
-                *i == r || *v == r
+                f(*i);
+                f(*v);
             }
-            Insn::LoadArrayElem(_, _, i) => *i == r,
+            Insn::LoadArrayElem(_, _, i) => f(*i),
             Insn::NbaAssignArray(_, i, v, _) | Insn::BlockingAssignArray(_, i, v, _) => {
-                *i == r || *v == r
+                f(*i);
+                f(*v);
             }
             Insn::NbaAssignArrayRange(_, i, h, l, v)
             | Insn::BlockingAssignArrayRange(_, i, h, l, v) => {
-                *i == r || *h == r || *l == r || *v == r
+                f(*i);
+                f(*h);
+                f(*l);
+                f(*v);
             }
             // AST fallback can read anything through the interpreter.
-            Insn::StmtFallback(..) => true,
-            Insn::EvalExprFallback(..) => true,
+            Insn::StmtFallback(..) => return false,
+            Insn::EvalExprFallback(..) => return false,
         }
+        true
     }
 
     /// Peephole: fuse `LoadSignal(t, s); RangeSelectConst(d, t, l, r)` into
@@ -11775,6 +11882,7 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => {}
             }
         }
+        let mut rr = RegReaders::new(insns);
         // Second family: pairs whose fused form has NO destination register —
         // the first insn's register must simply be dead everywhere else.
         //   LoadConst K ; NbaAssign(sig, k, w)        → NbaAssignConst
@@ -11807,13 +11915,12 @@ impl<'a> BytecodeCompiler<'a> {
             };
             // The fused form never writes `dead_reg`, so ANY other read of it
             // in the block blocks the fusion (no d==t exemption here).
-            let consumed = insns
-                .iter()
-                .enumerate()
-                .any(|(j, x)| j != i && j != i + 1 && Self::insn_reads_reg(x, dead_reg));
-            if consumed {
+            if rr.read_outside(insns, dead_reg, &[i, i + 1]) {
                 continue;
             }
+            rr.remove(&insns[i]);
+            rr.remove(&insns[i + 1]);
+            rr.add(&repl);
             insns[i] = repl;
             insns[i + 1] = Insn::Nop;
         }
@@ -11850,14 +11957,15 @@ impl<'a> BytecodeCompiler<'a> {
                     continue;
                 }
                 // r1, r2 and d must be dead outside the quad.
-                let consumed = insns.iter().enumerate().any(|(x, ins)| {
-                    !(i..=i + 3).contains(&x)
-                        && (Self::insn_reads_reg(ins, r1)
-                            || Self::insn_reads_reg(ins, r2)
-                            || Self::insn_reads_reg(ins, d))
-                });
-                if consumed {
+                let quad = [i, i + 1, i + 2, i + 3];
+                if rr.read_outside(insns, r1, &quad)
+                    || rr.read_outside(insns, r2, &quad)
+                    || rr.read_outside(insns, d, &quad)
+                {
                     continue;
+                }
+                for k in quad {
+                    rr.remove(&insns[k]);
                 }
                 insns[i] = Insn::BranchIfSignalFalse(s1, t, u32::MAX);
                 insns[i + 1] = Insn::BranchIfSignalFalse(s2, t, u32::MAX);
@@ -11890,15 +11998,12 @@ impl<'a> BytecodeCompiler<'a> {
             // block (not just later pcs) so backward jumps can't smuggle a
             // read of `t` past a suffix-only check. d == t overwrites the
             // raw value in the same pair, making later reads safe.
-            if d != t {
-                let consumed = insns
-                    .iter()
-                    .enumerate()
-                    .any(|(j, x)| j != i && j != i + 1 && Self::insn_reads_reg(x, t));
-                if consumed {
-                    continue;
-                }
+            if d != t && rr.read_outside(insns, t, &[i, i + 1]) {
+                continue;
             }
+            rr.remove(&insns[i]);
+            rr.remove(&insns[i + 1]);
+            rr.add(&repl);
             insns[i] = repl;
             insns[i + 1] = Insn::Nop;
         }
@@ -11947,13 +12052,11 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // The fused form has no destination register, so ANY other read of
             // `d` in the block blocks the fusion.
-            let consumed = insns
-                .iter()
-                .enumerate()
-                .any(|(k, x)| k != i && k != j && Self::insn_reads_reg(x, d));
-            if consumed {
+            if rr.read_outside(insns, d, &[i, j]) {
                 continue;
             }
+            rr.remove(&insns[i]);
+            rr.remove(&insns[j]);
             insns[i] = Insn::BranchIfSignalFalse(sig, t, idx);
             insns[j] = Insn::Nop;
         }
@@ -13091,16 +13194,16 @@ impl<'a> BytecodeCompiler<'a> {
             return;
         }
         // Drop constant loads nothing reads (the folded chain's temporaries).
+        // A `LoadConst` and the `Nop` replacing it read no register, so the
+        // counts stay exact through the loop.
         let mut dead = 0usize;
+        let rr = RegReaders::new(insns);
         for i in 0..n {
             let Insn::LoadConst(d, _) = &insns[i] else {
                 continue;
             };
             let d = *d;
-            let read = insns
-                .iter()
-                .enumerate()
-                .any(|(j, other)| j != i && Self::insn_reads_reg(other, d));
+            let read = rr.read_outside(insns, d, &[i]);
             if !read {
                 insns[i] = Insn::Nop;
                 dead += 1;
@@ -13149,6 +13252,7 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => {}
             }
         }
+        let mut rr = RegReaders::new(insns);
         for i in 0..insns.len() - 1 {
             let Insn::LoadConst(c, _) = &insns[i] else {
                 continue;
@@ -13208,11 +13312,16 @@ impl<'a> BytecodeCompiler<'a> {
             if (i + 1..=j).any(|x| is_target[x]) {
                 continue;
             }
-            let consumed = insns.iter().enumerate().any(|(x, ins)| {
-                x != i && x != j && Some(x) != const_scrub && Self::insn_reads_reg(ins, c)
-            });
+            let consumed = match const_scrub {
+                Some(sj) => rr.read_outside(insns, c, &[i, j, sj]),
+                None => rr.read_outside(insns, c, &[i, j]),
+            };
             if consumed {
                 continue;
+            }
+            rr.remove(&insns[j]);
+            if let Some(sj) = const_scrub {
+                rr.remove(&insns[sj]);
             }
             // Take the boxed constant out of the `LoadConst` rather than
             // cloning a possibly-`Wide` `Value`.
@@ -13226,6 +13335,7 @@ impl<'a> BytecodeCompiler<'a> {
             // The fused op replaces the BINOP's slot so any surviving
             // `ClearSigned` of the left operand still runs first.
             insns[j] = Insn::BinOpConst(d, l, k, kind);
+            rr.add(&insns[j]);
             FUSED_BINOP_CONST[kind as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -14013,6 +14123,58 @@ impl<'a> BytecodeCompiler<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read counts the peephole passes use must answer exactly what a
+    /// scan of the block with `insn_reads_reg` answers, before and after
+    /// the edits they track.
+    #[test]
+    fn reg_readers_match_a_full_scan() {
+        let k = || Box::new(Value::from_u64(3, 8));
+        let fallback =
+            || Insn::EvalExprFallback(Box::new((Arc::new(ident_expr("x")), Arc::from(""))), 9, 8);
+        let mut insns = vec![
+            Insn::LoadConst(1, k()),
+            Insn::Add(2, 1, 1),
+            Insn::Select(3, 2, 1, 4),
+            Insn::Concat(5, Box::new(vec![1, 3, 3])),
+            Insn::BranchIfFalse(5, 0),
+            Insn::Move(6, 2),
+            Insn::Nop,
+        ];
+        let scan = |insns: &[Insn], r: RegId, skip: &[usize]| {
+            insns
+                .iter()
+                .enumerate()
+                .any(|(j, x)| !skip.contains(&j) && BytecodeCompiler::insn_reads_reg(x, r))
+        };
+        let skips: [&[usize]; 5] = [&[], &[0], &[1], &[1, 2], &[2, 3, 5]];
+        let check = |insns: &[Insn], rr: &RegReaders| {
+            for r in 0..12 {
+                for skip in skips {
+                    assert_eq!(
+                        rr.read_outside(insns, r, skip),
+                        scan(insns, r, skip),
+                        "r={r} skip={skip:?}"
+                    );
+                }
+            }
+        };
+        let mut rr = RegReaders::new(&insns);
+        check(&insns, &rr);
+        // Edit the way the passes do: remove the old form, add the new one.
+        rr.remove(&insns[1]);
+        insns[1] = Insn::BinOpConst(2, 4, k(), BinOpConstKind::Add);
+        rr.add(&insns[1]);
+        check(&insns, &rr);
+        // A fallback reads every register.
+        rr.remove(&insns[6]);
+        insns[6] = fallback();
+        rr.add(&insns[6]);
+        check(&insns, &rr);
+        rr.remove(&insns[6]);
+        insns[6] = Insn::Nop;
+        check(&insns, &rr);
+    }
 
     fn ident_expr(name: &str) -> Expression {
         let span = crate::ast::Span::dummy();
