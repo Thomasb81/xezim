@@ -3913,6 +3913,35 @@ fn const_handle(v: Value, const_type: c_int) -> VpiHandle {
     h
 }
 
+/// A range made on the fly (the current bounds of a dynamic array or queue):
+/// an `Obj` with no model object, `lsb`/`width` holding left/right.
+fn dyn_range_handle(left: i64, right: i64) -> VpiHandle {
+    let mut h = VpiHandle::signal(usize::MAX, c::RANGE, "", "");
+    h.kind = VpiKind::Obj;
+    h.lsb = left as i32 as u32;
+    h.width = right as i32 as u32;
+    h
+}
+
+/// Current `[0:size-1]` bounds of a variable whose outermost dimension is
+/// dynamic or a queue.
+fn dyn_bounds(m: &VpiModel, sim: &Simulator, o: u32) -> Option<(i64, i64)> {
+    let OData::Var(v) = &m.objs[o as usize].d else {
+        return None;
+    };
+    match m.tdescs[v.td as usize].unpacked.first() {
+        Some(UDim::Dynamic | UDim::Queue) => {
+            let n = sim
+                .signals
+                .get(&format!("{}.size", v.flat))
+                .and_then(|x| x.to_u64())
+                .unwrap_or(0) as i64;
+            Some((0, n - 1))
+        }
+        _ => None,
+    }
+}
+
 fn int_const(v: i64) -> VpiHandle {
     let mut val = Value::from_u64(v as u64, 32);
     val.is_signed = true;
@@ -4507,7 +4536,12 @@ pub(super) fn handle(
                     }
                 }
                 if h.kind == VpiKind::Obj && h.signal_id == usize::MAX {
-                    // A constant made on the fly has no relations.
+                    // A range made on the fly has its bounds; a constant has
+                    // no relations.
+                    if h.type_code == c::RANGE && (rel == c::LEFT_RANGE || rel == c::RIGHT_RANGE) {
+                        let v = if rel == c::LEFT_RANGE { h.lsb } else { h.width };
+                        return out(Some(int_const(v as i32 as i64)));
+                    }
                     return out(None);
                 }
                 return None;
@@ -4695,6 +4729,9 @@ fn obj_rel(
                 } else {
                     right
                 })));
+            }
+            if let Some((l, r)) = dyn_bounds(m, sim, o) {
+                return out(Some(int_const(if rel == c::LEFT_RANGE { l } else { r })));
             }
             let td = obj_td(m, o)?;
             let w = if matches!(h.kind, VpiKind::Signal | VpiKind::Port) {
@@ -4951,6 +4988,10 @@ fn obj_iter(
                 _ => return Some(v),
             };
             let t = m.tdescs[td as usize].clone();
+            if let Some((l, r)) = dyn_bounds(m, sim, o) {
+                v.push(dyn_range_handle(l, r));
+                return Some(v);
+            }
             let packed = t.unpacked.is_empty();
             let n = if packed {
                 t.packed.len()
@@ -5339,6 +5380,14 @@ fn op_type(e: &Expression) -> c_int {
 /// `None` leaves the call to the flat-table code.
 pub(super) fn get(sim: &mut Simulator, prop: c_int, h: &VpiHandle) -> Option<c_int> {
     // A constant made on the fly.
+    if h.kind == VpiKind::Obj && h.signal_id == usize::MAX && h.type_code == c::RANGE {
+        let (l, r) = (h.lsb as i32 as i64, h.width as i32 as i64);
+        return Some(match prop {
+            c::TYPE => c::RANGE,
+            c::SIZE => ((l - r).unsigned_abs() + 1) as c_int,
+            _ => c::UNDEFINED,
+        });
+    }
     if h.kind == VpiKind::Obj && h.signal_id == usize::MAX {
         let v = h.value.as_ref();
         return Some(match prop {
