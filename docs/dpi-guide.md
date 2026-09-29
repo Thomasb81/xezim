@@ -350,7 +350,7 @@ it only `dlopen`s).
 | `** Fatal: DPI import 'my_dpi_fn' has no implementation` | Imported name doesn't match exported name (C++ mangling, missing `extern "C"`, missing `SV_PUBLIC`), or the library was not passed | Wrap in `extern "C"`, mark `SV_PUBLIC`, ensure the `.c`/`.cc` actually compiles the symbol in |
 | `ImportError: …failed to run xezim: No such file or directory` from `cargo test` | The test harness uses `env!("CARGO_BIN_EXE_xezim")` — make sure the bin was built first | `cargo build --tests` then run; the env var is set at compile time |
 | Symbol resolves but the call returns garbage | ABI mismatch (e.g. `int` vs `int64_t`, `char*` lifetime) | DPI imports must match the C signature exactly; for `string` returns, the buffer must outlive the call site |
-| `failed to resolve path` from a VPI call | `vpi_handle_by_name` only knows what's been elaborated into a signal | Make sure the path matches an elaborated signal name; unpacked-struct member access needs the full dotted path |
+| `failed to resolve path` from a VPI call | `vpi_handle_by_name` found no object of that name | Use the full name from the top (`top.u_sub.gen[1].sig`), `pkg::name` for a package member, or pass a scope handle for a relative name; see "VPI object model" |
 
 Run xezim with `--sim_debug` for `[DEBUG]` lines that show symbol resolution,
 `vpi_handle_by_name` lookups, and the active DPI library list.
@@ -404,9 +404,11 @@ Each library's `vlog_startup_routines` entries run before simulation.
 - `vpiSysTfCall` / `vpiArgument` — a `$systf` reads its own arguments; a
   signal-backed argument is writable (so `output` args work), a literal is a
   read-only `vpiConstant`.
-- Design walk: `vpi_iterate`/`vpi_scan` over `vpiModule`, `vpiNet`, `vpiReg`,
-  `vpiVariables`, `vpiParameter`, `vpiMemory`; `vpi_handle_by_name`,
-  `vpi_get`, `vpi_get_str`, `vpi_get_value`/`vpi_put_value`.
+- Design walk: the whole elaborated design as the object model of IEEE
+  1800-2017 chapter 37 — see "VPI object model" below — through
+  `vpi_iterate`/`vpi_scan`, `vpi_handle`, `vpi_handle_by_name`,
+  `vpi_handle_by_index`, `vpi_get`, `vpi_get_str`,
+  `vpi_get_value`/`vpi_put_value`.
 - `vpi_control`: `vpiStop`/`vpiFinish` end the run once the calling routine
   returns; `vpiSetInteractiveScope` takes a module handle; `vpiReset` is
   refused (xezim cannot rewind a run).
@@ -498,10 +500,11 @@ hook.
 
 **Semantics notes:**
 
-- `vpi_iterate(vpiInternalScope, mod)` yields the module's child **scopes**,
-  per the standard — *not* its declared nets/variables (a common misuse in
-  the wild). Declared objects come from `vpiNet`/`vpiReg`/`vpiVariables`/
-  `vpiParameter`/`vpiMemory`.
+- `vpi_iterate(vpiInternalScope, mod)` yields the module's child **scopes**
+  (instances, generate scopes, named blocks, tasks and functions), per the
+  standard — *not* its declared nets/variables (a common misuse in the
+  wild). Declared objects come from `vpiNet`/`vpiReg`/`vpiVariables`/
+  `vpiParameter`/`vpiMemory` and the other relations below.
 - `vpi_handle(vpiScope, NULL)` returning the top module is an xezim extension
   (the standard route is `vpi_scan(vpi_iterate(vpiModule, NULL))`).
 - `compiletf` runs once per call instance, just before that instance's first
@@ -560,8 +563,150 @@ SystemVerilog thread, frame and class-object callback reasons of
 frame or class-object VPI objects, and `vpi_register_cb` rejects them.
 
 Worked examples: `tests/dpi/vpi_object_model.{c,sv}`,
-`tests/dpi/vpi_systf.{c,sv}`, and `tests/strings/vpi_routines.rs` (user data,
-systf info, arrays, delays and every value format).
+`tests/dpi/vpi_systf.{c,sv}`, `tests/strings/vpi_routines.rs` (user data,
+systf info, arrays, delays and every value format), and the design walks in
+`tests/strings/vpi_object_model_walk.rs`.
+
+### VPI object model
+
+xezim flattens the design at elaboration, so the object model is rebuilt the
+first time a VPI routine needs it: the preprocessed text of every source file
+(and of every `-v`/`-y` library file a definition was taken from) is parsed
+again, and each instance of the elaborated instance tree walks its
+definition — evaluating generate constructs with that instance's parameter
+values, as the elaborator did — recording its scopes and objects and the
+signal each declared object was elaborated to. Nothing is built or kept when
+no VPI or DPI code calls in. A design loaded from a compiled artifact (which
+carries no sources) has no object model; VPI then sees the instance tree and
+the signal table only, as before.
+
+**Scopes.** `vpi_iterate(vpiModule | vpiInstance | vpiInterface |
+vpiProgram | vpiPackage, NULL)` gives the design's roots: the top modules,
+programs and interfaces (several when there is more than one top), and for
+`vpiInstance` the packages after them. Below a scope, `vpiModule`,
+`vpiInterface`, `vpiProgram` and `vpiInstance` give its instances,
+`vpiGenScopeArray` its generate loops (whose `vpiGenScope` elements are
+`name[i]`), `vpiGenScope` its generate scopes, `vpiTaskFunc` its tasks and
+functions, and `vpiInternalScope` all of these plus named `begin`/`fork`
+blocks, in declaration order. An unnamed generate block is `genblk<n>`
+(§27.6) with `vpiImplicitDecl` 1. Objects inside a generate scope belong to
+that scope, not to the module around it.
+
+| Scope | `vpiType` | Properties |
+|-------|-----------|------------|
+| module / interface / program instance | `vpiModule`, `vpiInterface`, `vpiProgram` | `vpiDefName`, `vpiDefFile`, `vpiDefLineNo`, `vpiTopModule` (modules), `vpiTop`, `vpiCellInstance` (inside `` `celldefine``, or taken from a `-v`/`-y` library), `vpiTimeUnit`, `vpiTimePrecision` |
+| package | `vpiPackage` | full name `pkg::`; `vpiDefName`, `vpiDefFile`, `vpiDefLineNo`, `vpiTop` 1, `vpiUnit` 0, `vpiAutomatic` |
+| generate scope | `vpiGenScope` | `vpiArrayMember`, `vpiImplicitDecl`; `vpiIndex` (a constant) and `vpiParent` (the array) for a loop element |
+| generate scope array | `vpiGenScopeArray` | `vpiSize` (elements); `vpi_handle_by_index` selects one |
+| named block | `vpiNamedBegin`, `vpiNamedFork` | `vpiJoinType` (fork), `vpiAutomatic` |
+| task / function | `vpiTask`, `vpiFunction` | `vpiAutomatic`, `vpiVisibility` (`vpiPublicVis`), `vpiFuncType`, `vpiSize`, `vpiSigned` and `vpiTypespec` of the result; a DPI import has `vpiAccessType` `vpiDPIImportAcc`, `vpiDPIContext`, `vpiDPIPure`; `vpiIODecl` iterates the arguments (`vpiDirection`, `vpiSize`, ranges, `vpiTypespec`) |
+
+**Declared objects**, iterated from any scope: `vpiNet`, `vpiNetArray`,
+`vpiReg`, `vpiRegArray` (= `vpiArrayVar`), `vpiMemory` (one-dimensional
+arrays of `logic`/`reg`, the 1364 memories), `vpiVariables` (every
+variable), `vpiParameter`, `vpiNamedEvent`, `vpiNamedEventArray`, or any
+single variable type (`vpiIntVar`, `vpiStructVar`, ...). The type is the
+declared one, through typedefs:
+
+| Declaration | `vpiType` |
+|-------------|-----------|
+| `logic`/`reg` variable | `vpiReg` (= `vpiLogicVar`) |
+| `bit`, `integer`, `int`, `byte`, `shortint`, `longint`, `time`, `real`/`realtime`, `shortreal`, `string`, `chandle` | `vpiBitVar`, `vpiIntegerVar`, `vpiIntVar`, `vpiByteVar`, `vpiShortIntVar`, `vpiLongIntVar`, `vpiTimeVar`, `vpiRealVar`, `vpiShortRealVar`, `vpiStringVar`, `vpiChandleVar` |
+| enum / struct / union variable | `vpiEnumVar`, `vpiStructVar`, `vpiUnionVar` (a packed array of them: `vpiPackedArrayVar`); `vpiMember` iterates the members |
+| unpacked array (fixed, dynamic, queue, associative) | `vpiRegArray` (`vpiArrayVar`); `vpiArrayType`, `vpiIsMemory`; `vpi_handle_by_index`, and `vpiReg`/`vpiNet` iteration, give the elements |
+| net | `vpiNet` with `vpiNetType` (`vpiWire`, `vpiWand`, `vpiTri1`, ...); `vpiEnumNet`, `vpiStructNet`, `vpiIntegerNet`, `vpiTimeNet`, `vpiPackedArrayNet` for nets of those types; `vpiNetArray`; an implicit net has `vpiImplicitDecl` 1 |
+| parameter | `vpiParameter` with `vpiLocalParam` and `vpiConstType` |
+| `event` | `vpiNamedEvent` (named; it has no value) |
+
+Every net and variable answers `vpiSize` (bits; elements for an array;
+characters for a string), `vpiSigned`, `vpiScalar`/`vpiVector`, `vpiArray`,
+`vpiLineNo`, `vpiAutomatic`, `vpiVisibility`, `vpiConstantVariable`,
+`vpiDirection` (its port's, for a port's net or variable), and — like a
+parameter — the relations
+`vpiLeftRange`/`vpiRightRange` (constants: the outermost packed range, or
+the outermost unpacked range of an array), `vpiRange` (every packed range,
+or every unpacked range of an array), and `vpiTypespec`. A typespec
+(`vpiLogicTypespec`, `vpiIntTypespec`, `vpiEnumTypespec`, `vpiStructTypespec`,
+`vpiArrayTypespec`, ...) has `vpiName` (the typedef, if any), `vpiSize`,
+`vpiSigned`, `vpiPacked`, `vpiRange`; `vpiElemTypespec` of an array
+typespec, `vpiBaseTypespec` and `vpiEnumConst` (name and value) of an enum,
+and `vpiTypespecMember` of a struct or union. A vector's bits come from
+`vpi_iterate(vpiBit)` (also `vpiNetBit`/`vpiRegBit`) or by name
+(`top.w[3]`); each is a `vpiNetBit`/`vpiRegBit` with `vpiParent` and
+`vpiIndex`, readable and writable.
+
+**Processes and assignments.** `vpiProcess` iterates `vpiInitial`,
+`vpiAlways` (with `vpiAlwaysType`: `vpiAlways`, `vpiAlwaysComb`,
+`vpiAlwaysFF`, `vpiAlwaysLatch`) and `vpiFinal`. `vpiContAssign` iterates
+continuous assignments (`vpiNetDeclAssign` for a net declaration
+assignment) with `vpiLhs`, `vpiRhs` and `vpiDelay`. An expression handle is
+the object it names; a literal is a `vpiConstant` with `vpiConstType`; a
+select is a `vpiBitSelect`/`vpiPartSelect` (with `vpiParent`, `vpiIndex`,
+`vpiLeftRange`/`vpiRightRange`); anything else is a `vpiOperation` with
+`vpiOpType` and `vpiOperand`. Expressions are readable with
+`vpi_get_value`.
+
+**Primitives.** `vpiPrimitive` iterates `vpiGate`, `vpiSwitch` and `vpiUdp`
+instances (also iterable by those types): `vpiDefName` (`and`, or the UDP
+name), `vpiPrimType` (`vpiAndPrim`, ..., `vpiSeqPrim`/`vpiCombPrim` for a
+UDP), `vpiSize` (inputs), `vpiDelay`, and `vpiPrimTerm` terminals with
+`vpiTermIndex`, `vpiDirection`, `vpiExpr` and a value.
+
+**Specify.** `vpiModPath` iterates path declarations (`vpiModPathIn` /
+`vpiModPathOut` path terms with `vpiExpr` and `vpiDirection`, `vpiCondition`,
+`vpiModPathHasIfNone`); `vpiTchk` iterates timing checks (`vpiName` is the
+task name, `vpiTchkType`, `vpiTchkRefTerm` and `vpiTchkDataTerm` terms with
+`vpiEdge`, `vpiExpr` and `vpiCondition`, and `vpiTchkNotifier`).
+
+**Ports.** `vpiPort` iterates in port-list order with `vpiPortIndex`,
+`vpiDirection`, `vpiSize`, `vpiConnByName`, `vpiPortType` (`vpiPort`, or
+`vpiInterfacePort`/`vpiModportPort`), `vpiLowConn` (the net or variable
+inside) and `vpiHighConn` (the connected expression in the parent; NULL for
+a top-level or unconnected port). `vpiBit` iterates a vector port's
+`vpiPortBit`s. From a net or variable, `vpiPortInst` gives the child-instance
+ports it is connected to, and `vpiPorts` the ports it is the low connection
+of. §23.2.2.3 decides a port's kind: an `input`/`inout` declared without a
+net type or `var` is a net (so `input logic clk` is a `vpiNet`), an
+`output` with an explicit data type is a variable.
+
+**Relations upward.** `vpiScope` is the scope an object is declared in (for
+an instance, the scope that instantiates it: a generate scope, say);
+`vpiModule` the enclosing module instance (NULL inside an interface,
+program or package); `vpiInstance` the enclosing instance of any kind,
+package included; `vpiParent` the object an object belongs to — the array of
+a generate scope element, the struct of a member, the variable of a bit or
+array element, the primitive of a terminal — and otherwise the scope.
+
+**Names.** `vpiName`, `vpiFullName`, `vpiType` (the type's name), `vpiFile`
+and `vpiLineNo` work on every object, and `vpiDefName`/`vpiDefFile` on
+instances, packages and primitives; a string that does not exist (an unnamed
+process's name) is NULL. Full names are hierarchical from the top
+(`top.gl[1].u_l.d`); package members are `pkg::name` and the package itself
+`pkg::`. `vpi_handle_by_name` finds every named object by its full name, a
+bit or element (`top.w[3]`, `top.mem[1]`), and, with a scope handle, a name
+relative to that scope. An instance's `vpiFile`/`vpiLineNo` are where it is
+instantiated (for a top-level instance, its definition); every other object's
+are where it is declared. A location xezim cannot place — an object
+elaboration made up (an implicit net), or a library line changed by an
+`` `include`` — is `vpiLineNo` 0 and `vpiFile` NULL.
+
+**Values.** Nets, variables, parameters, members, bits, array elements,
+ports, primitive terminals and expressions have values. A variable declared
+in a named block, task or function is an object with a type, but its storage
+is private to the running process: `vpi_get_value` on it sets `vpiSuppressVal`
+and reports a `vpi_chk_error` error, as it does for a named event, a scope, a
+process and the other objects without a value. `vpi_put_value` rejects all of
+them the same way.
+
+**Not modelled** in the object model: statements (a process's `vpiStmt` is
+only its named block, when it is one), classes and their objects, clocking
+blocks, concurrent assertions, modports, `let` and `checker` declarations,
+typedef and import objects (`vpiTypedef`, `vpiImport`), `vpiDriver` and
+`vpiLoad`, attributes, `vpiParamAssign`/`vpiDefParam`, `vpiGenVar`,
+`vpiSpecParam`, array objects for instance and primitive arrays
+(`vpiModuleArray`, `vpiGateArray`, ...; their elements are there), the
+`$unit` package, and `vpiDecompile`.
+
 
 ---
 

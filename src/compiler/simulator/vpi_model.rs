@@ -680,6 +680,7 @@ pub(super) struct VpiModel {
     pub enums: Vec<EnumDesc>,
     pub structs: Vec<StructDesc>,
     pub files: Vec<String>,
+    file_ids: HashMap<String, u32>,
     /// VPI full name -> object.
     pub by_name: HashMap<String, MRef>,
     /// Port full name -> port object (a port shares its name with its net).
@@ -726,11 +727,13 @@ pub(super) fn with_model<R>(
 
 impl VpiModel {
     fn intern_file(&mut self, f: &str) -> u32 {
-        if let Some(i) = self.files.iter().position(|x| x == f) {
-            return i as u32;
+        if let Some(&i) = self.file_ids.get(f) {
+            return i;
         }
         self.files.push(f.to_string());
-        (self.files.len() - 1) as u32
+        let i = (self.files.len() - 1) as u32;
+        self.file_ids.insert(f.to_string(), i);
+        i
     }
 
     fn add_scope(&mut self, s: MScope) -> u32 {
@@ -1094,6 +1097,11 @@ struct Builder<'a> {
     enum_memo: HashMap<usize, u32>,
     /// §6.10 implicit nets by the flat prefix of their scope.
     implicit_by_prefix: HashMap<String, Vec<String>>,
+    /// Byte offset of each line start, per source text (built on demand).
+    line_starts: Vec<Option<Vec<usize>>>,
+    /// Adopted library files: path, preprocessed text, and whether its
+    /// lines are the file's own.
+    lib_texts: Vec<(String, String, bool)>,
     depth: u32,
 }
 
@@ -1105,14 +1113,26 @@ impl<'a> Builder<'a> {
         }
         // The same lexer and parser the compile ran, on the same text: the
         // spans index `source_texts[i]`, as the elaborated design's do.
-        let asts: Vec<crate::ast::SourceText> = texts
-            .iter()
-            .map(|t| {
-                let tokens = xezim_core::lexer::Lexer::new(t).tokenize();
-                let mut p = xezim_core::parse::Parser::new(tokens);
-                p.parse_source_text()
-            })
-            .collect();
+        let parse = |t: &str| {
+            let tokens = xezim_core::lexer::Lexer::new(t).tokenize();
+            let mut p = xezim_core::parse::Parser::new(tokens);
+            p.parse_source_text()
+        };
+        let mut asts: Vec<crate::ast::SourceText> = texts.iter().map(|t| parse(t)).collect();
+        // `-v`/`-y` library files the elaboration adopted definitions from
+        // are not among the sources: preprocess and parse them again. They
+        // follow the sources in file numbering.
+        let mut lib_texts: Vec<(String, String, bool)> = Vec::new();
+        for (path, _) in xezim_core::adopted_lib_files() {
+            if let Some(text) = xezim_core::preprocess_adopted_lib(&path) {
+                // Lines are exact only when preprocessing kept the line
+                // structure (no `include` spliced in).
+                let exact = std::fs::read_to_string(&path)
+                    .is_ok_and(|orig| orig.lines().count() == text.lines().count());
+                asts.push(parse(&text));
+                lib_texts.push((path.display().to_string(), text, exact));
+            }
+        }
         let mut b = Builder {
             sim,
             m: VpiModel {
@@ -1123,6 +1143,7 @@ impl<'a> Builder<'a> {
                 enums: Vec::new(),
                 structs: Vec::new(),
                 files: Vec::new(),
+                file_ids: HashMap::default(),
                 by_name: HashMap::default(),
                 port_by_name: HashMap::default(),
                 inst_scope: HashMap::default(),
@@ -1143,6 +1164,8 @@ impl<'a> Builder<'a> {
             struct_memo: HashMap::default(),
             enum_memo: HashMap::default(),
             implicit_by_prefix: HashMap::default(),
+            line_starts: vec![None; texts.len() + lib_texts.len()],
+            lib_texts,
             depth: 0,
         };
         b.index(&asts);
@@ -1319,14 +1342,52 @@ impl<'a> Builder<'a> {
         xezim_core::elaborate::const_eval_i64_with_params(e, Some(&ctx.params))
     }
 
-    /// `(file, line)` of a span in source file `file`.
+    /// `(file, line)` of a span in source file `file`, through the file's
+    /// line map (the `include`d file and line a span's text came from; for
+    /// macro text, the invocation). `(NONE, 0)` when it cannot be placed.
     fn loc(&mut self, span: Span, file: u32) -> (u32, u32) {
         if span.start == 0 && span.end == 0 {
             return (NONE, 0);
         }
-        match self.sim.span_file_and_line(span, Some(file)) {
-            Some((f, l)) => (self.m.intern_file(&f), l as u32),
-            None => (NONE, 0),
+        let sim = self.sim;
+        let fi = file as usize;
+        let nsrc = sim.module.source_texts.len();
+        let text: &str = match sim.module.source_texts.get(fi) {
+            Some(t) => t,
+            None => match self.lib_texts.get(fi - nsrc) {
+                Some((_, t, true)) => t,
+                _ => return (NONE, 0),
+            },
+        };
+        if span.start >= text.len() {
+            return (NONE, 0);
+        }
+        let starts = self.line_starts[fi].get_or_insert_with(|| {
+            let mut v = vec![0usize];
+            v.extend(
+                text.bytes()
+                    .enumerate()
+                    .filter(|&(_, b)| b == b'\n')
+                    .map(|(i, _)| i + 1),
+            );
+            v
+        });
+        let out = starts
+            .partition_point(|&s| s <= span.start)
+            .saturating_sub(1);
+        if fi >= nsrc {
+            let path = self.lib_texts[fi - nsrc].0.clone();
+            return (self.m.intern_file(&path), out as u32 + 1);
+        }
+        match sim.module.source_line_maps.get(fi).and_then(|m| m.as_ref()) {
+            Some(map) => match map.file_line(out) {
+                Some((f, l)) => (self.m.intern_file(f), l),
+                None => (NONE, 0),
+            },
+            None => match sim.module.source_files.get(fi).filter(|f| !f.is_empty()) {
+                Some(f) => (self.m.intern_file(f), out as u32 + 1),
+                None => (NONE, 0),
+            },
         }
     }
 
@@ -1740,13 +1801,19 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Flat prefix of the instance a walk is in.
+    fn inst_flat_prefix(&self, ctx: &Ctx) -> String {
+        match self.m.instance_of(ctx.scope) {
+            NONE => ctx.flat_prefix.clone(),
+            i => self.m.scopes[i as usize].flat_prefix.clone(),
+        }
+    }
+
     /// The placeholder signals of generate block names at this level.
     fn placeholder_labels(&mut self, labels: &[Option<&String>], ord: u32, ctx: &Ctx) {
         let mut names: Vec<String> = labels.iter().flatten().map(|l| (*l).clone()).collect();
         names.push(format!("genblk{}", ord));
-        let inst_prefix = self.m.scopes[self.m.instance_of(ctx.scope) as usize]
-            .flat_prefix
-            .clone();
+        let inst_prefix = self.inst_flat_prefix(ctx);
         for n in names {
             self.m
                 .placeholders
@@ -2980,9 +3047,7 @@ impl<'a> Builder<'a> {
             }
             return;
         }
-        let inst_prefix = self.m.scopes[self.m.instance_of(ctx.scope) as usize]
-            .flat_prefix
-            .clone();
+        let inst_prefix = self.inst_flat_prefix(ctx);
         for hi in &mi.instances {
             self.m
                 .placeholders
@@ -4417,7 +4482,10 @@ pub(super) fn handle(
                             return match rel {
                                 c::PARENT => out(Some(ref_handle(m, sim, br))),
                                 c::INDEX => out(Some(int_const(i))),
-                                c::SCOPE => out(Some(scope_handle(m, m.scope_of_ref(br)))),
+                                c::SCOPE => {
+                                    let s = m.scope_of_ref(br);
+                                    out((s != NONE).then(|| scope_handle(m, s)))
+                                }
                                 c::TYPESPEC => {
                                     if let MRef::Obj(o) = br {
                                         if let OData::Var(v) = &m.objs[o as usize].d {
