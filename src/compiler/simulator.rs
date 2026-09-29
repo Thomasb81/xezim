@@ -191,16 +191,19 @@ fn fnv_name(s: &str) -> u64 {
     h
 }
 
-/// class-perf pilot gate: `XEZIM_COMPILE_METHODS=1` enables class-function
-/// body bytecode compilation+execution. Default off, so every run keeps the
-/// proven AST interpreter (byte-identical); this is a correctness pilot for
-/// the member-addressed method VM, not yet a performance path.
+/// class-perf gate: class-function body bytecode compilation+execution is
+/// ON by default; set `XEZIM_COMPILE_METHODS=0` to force every run onto
+/// the proven AST interpreter. Tiering (see `method_tier_threshold`)
+/// keeps cold methods on the interpreter, so the default path only
+/// differs from the AST funnel for hot methods — and for those the
+/// compiled block is byte-identical by construction (all-or-nothing
+/// admission, no fallback mid-block).
 fn compiled_methods_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("XEZIM_COMPILE_METHODS")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 

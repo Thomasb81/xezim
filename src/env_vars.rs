@@ -210,7 +210,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_COMPILE_METHODS",
-        "class-perf: compile class-function method bodies to bytecode and execute them (0/1, default off; performance pilot)",
+        "class-perf: compile hot class-function method bodies to bytecode and execute them (0 disables, default on; see XEZIM_METHOD_TIER)",
     ),
     (
         "XEZIM_COMPILE_PHASES",
