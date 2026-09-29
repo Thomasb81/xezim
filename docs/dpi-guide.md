@@ -614,7 +614,7 @@ declared one, through typedefs:
 | `logic`/`reg` variable | `vpiReg` (= `vpiLogicVar`) |
 | `bit`, `integer`, `int`, `byte`, `shortint`, `longint`, `time`, `real`/`realtime`, `shortreal`, `string`, `chandle` | `vpiBitVar`, `vpiIntegerVar`, `vpiIntVar`, `vpiByteVar`, `vpiShortIntVar`, `vpiLongIntVar`, `vpiTimeVar`, `vpiRealVar`, `vpiShortRealVar`, `vpiStringVar`, `vpiChandleVar` |
 | enum / struct / union variable | `vpiEnumVar`, `vpiStructVar`, `vpiUnionVar` (a packed array of them: `vpiPackedArrayVar`); `vpiMember` iterates the members |
-| unpacked array (fixed, dynamic, queue, associative) | `vpiRegArray` (`vpiArrayVar`); `vpiArrayType`, `vpiIsMemory`; `vpi_handle_by_index`, and `vpiReg`/`vpiNet` iteration, give the elements |
+| unpacked array (fixed, dynamic, queue, associative) | `vpiRegArray` (`vpiArrayVar`); `vpiArrayType`, `vpiIsMemory`; `vpi_handle_by_index` gives an element (a sub-array of a multi-dimensional array), and `vpiReg`/`vpiNet` iteration the elements of the outermost dimension |
 | net | `vpiNet` with `vpiNetType` (`vpiWire`, `vpiWand`, `vpiTri1`, ...); `vpiEnumNet`, `vpiStructNet`, `vpiIntegerNet`, `vpiTimeNet`, `vpiPackedArrayNet` for nets of those types; `vpiNetArray`; an implicit net has `vpiImplicitDecl` 1 |
 | parameter | `vpiParameter` with `vpiLocalParam` and `vpiConstType` |
 | `event` | `vpiNamedEvent` (named; it has no value) |
@@ -625,8 +625,10 @@ characters for a string), `vpiSigned`, `vpiScalar`/`vpiVector`, `vpiArray`,
 `vpiDirection` (its port's, for a port's net or variable), and — like a
 parameter — the relations
 `vpiLeftRange`/`vpiRightRange` (constants: the outermost packed range, or
-the outermost unpacked range of an array), `vpiRange` (every packed range,
-or every unpacked range of an array), and `vpiTypespec`. A typespec
+the outermost unpacked range of an array — for a dynamic array or queue its
+current bounds `[0:size-1]`, for an associative array none), `vpiRange`
+(every packed range, or every unpacked range of an array), and
+`vpiTypespec`. A typespec
 (`vpiLogicTypespec`, `vpiIntTypespec`, `vpiEnumTypespec`, `vpiStructTypespec`,
 `vpiArrayTypespec`, ...) has `vpiName` (the typedef, if any), `vpiSize`,
 `vpiSigned`, `vpiPacked`, `vpiRange`; `vpiElemTypespec` of an array
@@ -641,8 +643,8 @@ and `vpiTypespecMember` of a struct or union. A vector's bits come from
 `vpiAlwaysFF`, `vpiAlwaysLatch`) and `vpiFinal`. `vpiContAssign` iterates
 continuous assignments (`vpiNetDeclAssign` for a net declaration
 assignment) with `vpiLhs`, `vpiRhs` and `vpiDelay`. An expression handle is
-the object it names; a literal is a `vpiConstant` with `vpiConstType`; a
-select is a `vpiBitSelect`/`vpiPartSelect` (with `vpiParent`, `vpiIndex`,
+the object it names; a literal, and a genvar inside its loop (the element's
+index), is a `vpiConstant` with `vpiConstType`; a select is a `vpiBitSelect`/`vpiPartSelect` (with `vpiParent`, `vpiIndex`,
 `vpiLeftRange`/`vpiRightRange`); anything else is a `vpiOperation` with
 `vpiOpType` and `vpiOperand`. Expressions are readable with
 `vpi_get_value`.
@@ -686,8 +688,9 @@ process's name) is NULL. Full names are hierarchical from the top
 `pkg::`. `vpi_handle_by_name` finds every named object by its full name, a
 bit or element (`top.w[3]`, `top.mem[1]`), and, with a scope handle, a name
 relative to that scope. An instance's `vpiFile`/`vpiLineNo` are where it is
-instantiated (for a top-level instance, its definition); every other object's
-are where it is declared. A location xezim cannot place — an object
+instantiated (the `bind` directive for an instance a `bind` adds; the
+definition for a top-level instance); every other object's are where it is
+declared. A location xezim cannot place — an object
 elaboration made up (an implicit net), or a library line changed by an
 `` `include`` — is `vpiLineNo` 0 and `vpiFile` NULL.
 
