@@ -367,6 +367,22 @@ fn configured_vpi_libs() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Open a `--dpi-lib` library with `RTLD_NOW | RTLD_GLOBAL` (see
+/// `load_dpi_libraries`).
+fn open_dpi_library(path: &str) -> Result<Library, libloading::Error> {
+    // SAFETY: loading a dynamic library runs its initializers; the handle is
+    // kept alive for the simulator's lifetime.
+    #[cfg(unix)]
+    {
+        use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
+        unsafe { UnixLibrary::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }.map(Library::from)
+    }
+    #[cfg(not(unix))]
+    {
+        unsafe { Library::new(path) }
+    }
+}
+
 fn configured_dpi_libs() -> Vec<String> {
     dpi_lib_paths()
         .lock()
@@ -12939,13 +12955,40 @@ impl Simulator {
         // subroutine. Loaded RTLD_GLOBAL so the user libs' RTLD_NOW resolution
         // of the exported names finds them.
         self.load_dpi_export_trampoline();
-        for path in configured_dpi_libs() {
-            // SAFETY: Loading a dynamic library is inherently unsafe; we keep
-            // each handle alive for the simulator lifetime.
-            match unsafe { Library::new(&path) } {
-                Ok(lib) => self.dpi_libraries.push(lib),
-                Err(e) => eprintln!("[DPI] failed to load '{}': {}", path, e),
+        // Each library is opened RTLD_NOW | RTLD_GLOBAL, so its symbols join
+        // the global scope and a later --dpi-lib can link against it (#202).
+        // A library that needs one listed after it fails its first attempt;
+        // the failures are retried while a pass still loads something, so the
+        // command-line order does not matter. Symbol lookup keeps that order.
+        let mut pending: Vec<(usize, String, String)> = configured_dpi_libs()
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (i, p, String::new()))
+            .collect();
+        let mut loaded: Vec<(usize, Library)> = Vec::new();
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut failed = Vec::new();
+            for (i, path, _) in pending {
+                match open_dpi_library(&path) {
+                    Ok(lib) => loaded.push((i, lib)),
+                    Err(e) => failed.push((i, path, e.to_string())),
+                }
             }
+            pending = failed;
+            if pending.len() == before {
+                break;
+            }
+        }
+        loaded.sort_by_key(|(i, _)| *i);
+        self.dpi_libraries
+            .extend(loaded.into_iter().map(|(_, lib)| lib));
+        // A library that cannot be loaded stops the run before it starts, as
+        // in the reference simulator (#201): continuing would turn every call
+        // into it into a silent no-op.
+        for (_, path, e) in pending {
+            self.compile_errors
+                .push(format!("--dpi-lib '{}' could not be loaded: {}", path, e));
         }
     }
 
@@ -13844,11 +13887,17 @@ impl Simulator {
         // Foreign code may read what the design wrote to a file.
         self.flush_file_writes();
         let Some(binding) = self.dpi_bindings.get(sv_name) else {
+            // Calling an import that no library implements is fatal, as in the
+            // reference simulator (#201): returning 0 let a run whose DPI
+            // layer never loaded finish and exit 0.
             if self.dpi_unresolved.insert(sv_name.to_string()) {
-                eprintln!(
-                    "[DPI] unresolved symbol '{}' (C name '{}')",
+                let msg = format!(
+                    "DPI import '{}' has no implementation: C function '{}' is not in any --dpi-lib library",
                     sv_name, spec.c_name
                 );
+                self.emit_severity_text("Fatal", &msg);
+                self.fatal_finish_number = Some(1);
+                self.finished = true;
             }
             ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
             return Some(Value::zero(32));

@@ -25,6 +25,8 @@ mod display_only_always;
 mod dpi_child_module_import;
 #[path = "strings/dpi_integration_tests.rs"]
 mod dpi_integration_tests;
+#[path = "strings/dpi_library_loading.rs"]
+mod dpi_library_loading;
 #[path = "strings/dpi_unit_scope.rs"]
 mod dpi_unit_scope;
 #[path = "strings/fixed_string_array_dims.rs"]

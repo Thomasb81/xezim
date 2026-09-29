@@ -301,10 +301,17 @@ xezim --dpi-lib /abs/path/to/libfoo.so [more --dpi-lib paths …] <sv files>
 ```
 
 * Repeatable: pass `--dpi-lib` once per shared library. Each is `dlopen`ed and
-  its symbols added to the same dlsym table.
+  its symbols added to the same dlsym table; when two libraries define the
+  same symbol, the one given first wins.
 * `RTLD_NOW | RTLD_GLOBAL` is used, so transitive deps must resolve at
   load time — set `LD_LIBRARY_PATH` if your `.so` has rpath-less deps, or
-  pass `-Wl,-rpath,$PREFIX/lib` at link time.
+  pass `-Wl,-rpath,$PREFIX/lib` at link time. Because the symbols are global,
+  one `--dpi-lib` library can call into another (a protocol library on top of
+  a bridge library, say), in either command-line order.
+* A library that cannot be loaded is an error: xezim prints why and exits 1
+  without simulating. Calling an imported function that no loaded library
+  defines is a `Fatal` that ends the run (exit 1); imports that are never
+  called need no implementation.
 * The SV file must `import "DPI-C" function …` (or include a `.svh` that does)
   for every symbol you call from SV. Symbols that exist in the `.so` but
   aren't imported are simply ignored — there's no eager validation.
@@ -334,8 +341,9 @@ it only `dlopen`s).
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `failed to load DPI library 'foo.so': …cannot open shared object…` | Runtime can't find a transitive dep | Add `-Wl,-rpath,<dir>` at link time, or set `LD_LIBRARY_PATH` |
-| `undefined symbol: my_dpi_fn` | Imported name doesn't match exported name (C++ mangling, missing `extern "C"`, missing `SV_PUBLIC`) | Wrap in `extern "C"`, mark `SV_PUBLIC`, ensure the `.c`/`.cc` actually compiles the symbol in |
+| `Error: --dpi-lib 'foo.so' could not be loaded: …cannot open shared object…` | Runtime can't find a transitive dep | Add `-Wl,-rpath,<dir>` at link time, or set `LD_LIBRARY_PATH` |
+| `Error: --dpi-lib 'foo.so' could not be loaded: …undefined symbol: bar` | `foo.so` calls `bar`, which no loaded library defines | Pass the library that defines `bar` with another `--dpi-lib` (any order), or link `foo.so` against it |
+| `** Fatal: DPI import 'my_dpi_fn' has no implementation` | Imported name doesn't match exported name (C++ mangling, missing `extern "C"`, missing `SV_PUBLIC`), or the library was not passed | Wrap in `extern "C"`, mark `SV_PUBLIC`, ensure the `.c`/`.cc` actually compiles the symbol in |
 | `ImportError: …failed to run xezim: No such file or directory` from `cargo test` | The test harness uses `env!("CARGO_BIN_EXE_xezim")` — make sure the bin was built first | `cargo build --tests` then run; the env var is set at compile time |
 | Symbol resolves but the call returns garbage | ABI mismatch (e.g. `int` vs `int64_t`, `char*` lifetime) | DPI imports must match the C signature exactly; for `string` returns, the buffer must outlive the call site |
 | `failed to resolve path` from a VPI call | `vpi_handle_by_name` only knows what's been elaborated into a signal | Make sure the path matches an elaborated signal name; unpacked-struct member access needs the full dotted path |
