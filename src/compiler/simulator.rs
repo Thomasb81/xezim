@@ -31336,19 +31336,37 @@ impl Simulator {
                         Value::zero(32)
                     } else if *bare != 0 {
                         // Bare receiver (`q.size()`): the receiver IS
-                        // `this`. Pass the bare collection NAME to the
-                        // builtin dispatcher — its §8.10 rewrite
-                        // (`instance_assoc_member`) re-runs with the live
-                        // `this_stack` and resolves the same store the AST
-                        // funnel uses, including param-bound collections and
-                        // per-spec static keys. The admitted methods all
-                        // return Some for a resolved collection name (the
-                        // delegate must be the exec_method_call for the
-                        // impossible user-method race).
+                        // `this`. Resolve the member's instance store FIRST
+                        // (`instance_assoc_member`, the same resolution the
+                        // AST funnel's `expr_assoc_name` does for a member
+                        // receiver) and hand the builtin dispatcher the
+                        // SCOPED name. Feeding the dispatcher the bare name
+                        // instead let its §8.10 rewrite consult
+                        // `dyn_name_lookup` first, so a same-named local of
+                        // an ENCLOSING interpreter frame (e.g. UVM report
+                        // hooks all declare `elements[$]`) hijacked the
+                        // member store and answered a foreign snapshot's
+                        // size. Scoped names contain `#`, so the rewrite
+                        // chain is skipped entirely — parity by delegation
+                        // to the exact store the funnel would use,
+                        // including param-bound collections and per-spec
+                        // static keys.
                         let m: &str = &method;
-                        match self.eval_builtin_method(member, m, &args) {
-                            Some(v) => v,
-                            None => self.exec_method_call(handle, m, &args),
+                        match self.instance_assoc_member(member) {
+                            Some(scoped) => {
+                                match self.eval_builtin_method(&scoped, m, &args) {
+                                    Some(v) => v,
+                                    None => self.exec_method_call(handle, m, &args),
+                                }
+                            }
+                            // Not a member collection of `this` (unreachable
+                            // for admitted shapes): keep the historic bare
+                            // delegation so behavior never changes for the
+                            // fallback.
+                            None => match self.eval_builtin_method(member, m, &args) {
+                                Some(v) => v,
+                                None => self.exec_method_call(handle, m, &args),
+                            },
                         }
                     } else {
                         // Dotted receiver (`obj.coll.meth()`): resolve the
