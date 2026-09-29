@@ -174,7 +174,14 @@ thread_local! {
 /// path takes at most one predicted branch.
 static CUR_METHOD_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SAMPLER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Planner split: 1 while the innermost method runs its COMPILED block,
+/// 0 while it runs the AST interpreter. Sampled alongside the hash so the
+/// histogram can answer "of the time spent in method X, how much is already
+/// bytecode" — the input that ranks admission-expansion rows by heat.
+static CUR_METHOD_COMPILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static METHOD_SAMPLES: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, u64>>> =
+    std::sync::OnceLock::new();
+static METHOD_SAMPLES_VM: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, u64>>> =
     std::sync::OnceLock::new();
 static METHOD_NAMES: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, String>>> =
     std::sync::OnceLock::new();
@@ -264,24 +271,27 @@ pub fn sampler_sample() {
     if h == 0 {
         return;
     }
-    *METHOD_SAMPLES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap()
-        .entry(h)
-        .or_insert(0) += 1;
+    let bucket = if CUR_METHOD_COMPILED.load(Ordering::Relaxed) {
+        METHOD_SAMPLES_VM.get_or_init(Default::default)
+    } else {
+        METHOD_SAMPLES.get_or_init(Default::default)
+    };
+    *bucket.lock().unwrap().entry(h).or_insert(0) += 1;
 }
 
 /// After the run, resolve hashes to names and print the histogram.
 pub fn sampler_report(top: usize) {
     let samples = METHOD_SAMPLES.get_or_init(Default::default).lock().unwrap();
+    let vm = METHOD_SAMPLES_VM.get_or_init(Default::default).lock().unwrap();
     let names = METHOD_NAMES.get_or_init(Default::default).lock().unwrap();
-    let mut v: Vec<(u64, u64)> = samples.iter().map(|(&k, &c)| (k, c)).collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut v: Vec<u64> = samples.keys().chain(vm.keys()).copied().collect();
+    v.sort_by_key(|&h| std::cmp::Reverse(samples.get(&h).copied().unwrap_or(0) + vm.get(&h).copied().unwrap_or(0)));
     eprintln!("===== METHOD SAMPLE HISTOGRAM (top {}) =====", top);
-    for (k, c) in v.iter().take(top) {
-        let name = names.get(&k).map(|s| s.as_str()).unwrap_or("?");
-        eprintln!("{:>10} samples  {}", c, name);
+    for k in v.iter().take(top) {
+        let ast = samples.get(k).copied().unwrap_or(0);
+        let bytecode = vm.get(k).copied().unwrap_or(0);
+        let name = names.get(k).map(|s| s.as_str()).unwrap_or("?");
+        eprintln!("{:>8} AST {:>8} VM  {}", ast, bytecode, name);
     }
 }
 
@@ -298,7 +308,13 @@ pub fn sampler_register_name(hash: u64, name: &str) {
 /// Clear state between simulator runs in the same process.
 pub fn sampler_reset() {
     SAMPLER_READY.store(false, Ordering::Relaxed);
+    CUR_METHOD_COMPILED.store(false, Ordering::Relaxed);
     METHOD_SAMPLES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .clear();
+    METHOD_SAMPLES_VM
         .get_or_init(Default::default)
         .lock()
         .unwrap()
@@ -44780,7 +44796,7 @@ impl Simulator {
             if let Ok(thr) = handle {
                 let _ = thr.join();
             }
-            sampler_report(30);
+            sampler_report(200);
         }
         if std::env::var_os("XEZIM_XZ_STATS").is_some() {
             // Sparse-X/Z opportunity: how many signals carry X/Z at sim end
@@ -133126,6 +133142,14 @@ impl Simulator {
                 } else {
                     None
                 };
+                // Planner split: publish whether THIS method's body runs as
+                // bytecode (true) or the AST interpreter (false), restored
+                // alongside _prev_meth above when the method returns.
+                let _prev_compiled = if SAMPLER_READY.load(Ordering::Relaxed) {
+                    Some(CUR_METHOD_COMPILED.swap(false, Ordering::Relaxed))
+                } else {
+                    None
+                };
                 // class-perf pilot: a fully-lowered Function body may run as
                 // bytecode instead of the AST interpreter. ALL-OR-NOTHING:
                 // `try_run_compiled_method` returns None unless every
@@ -133136,6 +133160,9 @@ impl Simulator {
                 // by default.
                 if let Some(cval) = compiled_methods_enabled().then(|| {
                     let fn_ret_name_owned = fn_ret_name.map(str::to_string);
+                    if SAMPLER_READY.load(Ordering::Relaxed) {
+                        CUR_METHOD_COMPILED.store(true, Ordering::Relaxed);
+                    }
                     self.try_run_compiled_method(
                         handle,
                         &cname,
@@ -133149,6 +133176,9 @@ impl Simulator {
                 }).flatten() {
                     self.return_value = Some(cval);
                 } else {
+                    if SAMPLER_READY.load(Ordering::Relaxed) {
+                        CUR_METHOD_COMPILED.store(false, Ordering::Relaxed);
+                    }
                 for stmt in body {
                     self.exec_statement(stmt);
                     if self.break_flag || self.return_flag {
@@ -133158,6 +133188,9 @@ impl Simulator {
                 } // end else: AST interpreter path
                 if let Some(prev) = _prev_meth {
                     CUR_METHOD_HASH.store(prev, Ordering::Relaxed);
+                }
+                if let Some(prev) = _prev_compiled {
+                    CUR_METHOD_COMPILED.store(prev, Ordering::Relaxed);
                 }
                 // Write back any static locals declared in this body before
                 // the locals frame is dropped.
