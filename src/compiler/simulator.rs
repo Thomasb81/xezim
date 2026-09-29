@@ -6277,6 +6277,8 @@ pub struct Simulator {
     /// See `nonvirtual_target_class`.
     #[allow(clippy::type_complexity)]
     nonvirtual_target_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<String>>>>,
+    /// `class_has_method` answers by class then method (see there).
+    has_method_cache: std::cell::RefCell<HashMap<String, HashMap<String, bool>>>,
     /// See `member_string_keyed_unbound`.
     #[allow(clippy::type_complexity)]
     string_keyed_member_cache: std::cell::RefCell<HashMap<String, HashMap<String, Option<bool>>>>,
@@ -10400,6 +10402,7 @@ impl Simulator {
             method_def_cache: std::cell::RefCell::new(HashMap::default()),
             string_keyed_member_cache: std::cell::RefCell::new(HashMap::default()),
             nonvirtual_target_cache: std::cell::RefCell::new(HashMap::default()),
+            has_method_cache: std::cell::RefCell::new(HashMap::default()),
             covergroup_leaf_names: std::cell::OnceCell::new(),
             class_string_props: std::cell::RefCell::new(HashMap::default()),
             class_enclosing_cache: std::cell::RefCell::new(HashMap::default()),
@@ -14680,6 +14683,8 @@ impl Simulator {
             }
         }
         self.sanitize_class_hierarchy();
+        // Answers memoized before the hierarchy was final do not hold.
+        self.has_method_cache.borrow_mut().clear();
         self.init_two_state_struct_members();
         // LRM §14.3 — populate clocking-block metadata: per-cb clock
         // signal + per-signal direction. `tick_clocking_blocks`
@@ -113151,6 +113156,26 @@ impl Simulator {
         if !self.class_member_names().methods.contains(name) {
             return false;
         }
+        // A function of the class tables alone (fixed once
+        // `sanitize_class_hierarchy` has run; `compile` clears this memo then).
+        if let Some(&hit) = self
+            .has_method_cache
+            .borrow()
+            .get(class_name)
+            .and_then(|m| m.get(name))
+        {
+            return hit;
+        }
+        let v = self.class_has_method_walk(class_name, name);
+        self.has_method_cache
+            .borrow_mut()
+            .entry(class_name.to_string())
+            .or_default()
+            .insert(name.to_string(), v);
+        v
+    }
+
+    fn class_has_method_walk(&self, class_name: &str, name: &str) -> bool {
         let mut cur: Option<&str> = Some(class_name);
         while let Some(cname) = cur {
             if let Some(cd) = self.module.classes.get(cname) {
