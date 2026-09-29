@@ -164,6 +164,9 @@ const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
+/// Internal task a waiter resumes to report that a wait made from the
+/// nested (C-called) path is over; see `run_nested_until`.
+const SYNC_WAKE_MARKER: &str = "$__xz_sync_wake";
 
 /// §21.2.1.7 `%m` bookkeeping: an `m_scope_stack` entry starting with
 /// `M_ROOT_MARK` carries the absolute declaring path of the running
@@ -6007,6 +6010,15 @@ pub struct Simulator {
     /// continuation `[stmt, stmts[i+1..]]` before calling `exec_statement`, and
     /// `exec_statement`'s Wait handler reads it to park the process.
     exec_park_cont: Option<ProcCont>,
+    /// Depth of DPI-exported subroutines running for a C caller. Their
+    /// statements run on the synchronous path and cannot park, so a wait
+    /// there runs the scheduler nested instead (`run_nested_until`).
+    dpi_export_depth: u32,
+    /// Wake markers fired by waiters registered from that nested path.
+    sync_wakes: HashSet<u64>,
+    next_sync_wake: u64,
+    /// File names of open multichannel descriptors (`vpi_mcd_name`).
+    mcd_names: HashMap<i32, String>,
     /// No-progress guard for the `foreach` replay fallback: how many times
     /// a given `(pid, statement offset)` has parked without the loop ever
     /// completing. That fallback restarts at index 0 on every resume, so a
@@ -10161,6 +10173,10 @@ impl Simulator {
             rs_return_flag: false,
             parked_from_exec: false,
             exec_park_cont: None,
+            dpi_export_depth: 0,
+            sync_wakes: HashSet::default(),
+            next_sync_wake: 0,
+            mcd_names: HashMap::default(),
             foreach_replay_parks: HashMap::default(),
             foreach_replay_limit: std::env::var("XEZIM_FOREACH_REPLAY_LIMIT")
                 .ok()
@@ -12451,6 +12467,14 @@ impl Simulator {
         } else {
             self.system_string_arg(&args[1])
         };
+        self.open_file_path(&path, mcd_mode, &mode)
+    }
+
+    /// `$fopen` on an evaluated path: a multichannel descriptor when
+    /// `mcd_mode`, else a file descriptor opened with `mode`. Shared with
+    /// `vpi_mcd_open`.
+    fn open_file_path(&mut self, path: &str, mcd_mode: bool, mode: &str) -> Value {
+        self.flush_file_writes();
         let mut opts = OpenOptions::new();
         let has_plus = mode.contains('+');
         if mode.contains('r') {
@@ -12468,8 +12492,8 @@ impl Simulator {
         if !mode.contains('r') && !mode.contains('w') && !mode.contains('a') {
             opts.read(true);
         }
-        let mut file = match opts.open(&path) {
-            Ok(f) => sv_file::SvFile::new(f, &path),
+        let mut file = match opts.open(path) {
+            Ok(f) => sv_file::SvFile::new(f, path),
             Err(_) => return Value::zero(32),
         };
         // A second handle on an open file: both write through, so their
@@ -12490,6 +12514,7 @@ impl Simulator {
                 Some(b) => {
                     self.file_handles.insert(b as i32, file);
                     self.file_eof.remove(&(b as i32));
+                    self.mcd_names.insert(b as i32, path.to_string());
                     Value::from_u64(1u64 << b, 32)
                 }
                 None => Value::zero(32), // too many open MCD channels
@@ -12518,6 +12543,13 @@ impl Simulator {
             return Value::zero(32);
         }
         let raw = self.eval_expr(&args[0]).to_i64().unwrap_or(0) as i32;
+        self.close_channels(raw);
+        Value::zero(32)
+    }
+
+    /// Close every file channel `raw` (MCD or FD) selects. Shared with
+    /// `vpi_mcd_close`.
+    fn close_channels(&mut self, raw: i32) {
         for k in self.resolve_output_keys(raw) {
             let ku = k as u32;
             // Never close the pre-opened STDIN/STDOUT/STDERR streams.
@@ -12528,8 +12560,8 @@ impl Simulator {
                 let _ = f.flush();
             }
             self.ungetc_buf.remove(&k);
+            self.mcd_names.remove(&k);
         }
-        Value::zero(32)
     }
 
     fn write_file_handle(&mut self, args: &[Expression], newline: bool) -> Value {
@@ -12550,13 +12582,20 @@ impl Simulator {
             payload.push('\n');
         }
         let nbytes = payload.len() as u64;
+        self.write_channels(raw, &payload);
+        Value::from_u64(nbytes, 32)
+    }
+
+    /// Write `payload` to every channel `raw` (MCD or FD) selects. Shared with
+    /// `vpi_mcd_printf`.
+    fn write_channels(&mut self, raw: i32, payload: &str) {
         for k in self.resolve_output_keys(raw) {
             let ku = k as u32;
             if ku == 0 || ku == 0x8000_0001 {
                 // stdout (MCD bit 0 sentinel, or FD STDOUT). Mirror
                 // $write/$display: record for the test harness too.
-                self.record_output(payload.clone());
-                self.stdout_write(&payload);
+                self.record_output(payload.to_string());
+                self.stdout_write(payload);
             } else if ku == 0x8000_0002 {
                 // FD STDERR
                 let mut e = std::io::stderr();
@@ -12568,11 +12607,35 @@ impl Simulator {
             }
             // else: closed/unknown fd (e.g. STDIN) → silently drop.
         }
-        Value::from_u64(nbytes, 32)
     }
 
     /// Write out every handle's buffered output. Called wherever the files may
     /// be looked at from outside their own handle (see `sv_file`).
+    /// `$fflush(raw)`: flush the channels `raw` selects, or every open file
+    /// and stdout when `raw` is 0. Shared with `vpi_mcd_flush`/`vpi_flush`.
+    fn flush_channels(&mut self, raw: i32) {
+        if raw == 0 {
+            // $fflush() / $fflush(0): flush every open file and stdout.
+            for f in self.file_handles.values_mut() {
+                let _ = f.flush();
+            }
+            self.file_writes_pending = false;
+            self.flush_stdout();
+        } else {
+            for k in self.resolve_output_keys(raw) {
+                let ku = k as u32;
+                if ku == 0 || ku == 0x8000_0001 {
+                    self.flush_stdout();
+                } else if ku == 0x8000_0002 {
+                    let mut err = std::io::stderr();
+                    let _ = err.flush();
+                } else if let Some(f) = self.file_handles.get_mut(&k) {
+                    let _ = f.flush();
+                }
+            }
+        }
+    }
+
     fn flush_file_writes(&mut self) {
         if !self.file_writes_pending {
             return;
@@ -13258,7 +13321,9 @@ impl Simulator {
             })
             .collect();
         if let Some(fd) = self.fn_decl_rc(&name) {
+            self.dpi_export_depth += 1;
             let r = self.exec_function_call(&fd, &arg_exprs);
+            self.dpi_export_depth -= 1;
             return match ret_kind {
                 DpiExpKind::Real => r.to_f64().to_bits() as i64,
                 DpiExpKind::Void => 0,
@@ -13266,7 +13331,9 @@ impl Simulator {
             };
         }
         if let Some(td) = self.module.tasks.get(&name).cloned() {
+            self.dpi_export_depth += 1;
             self.exec_task_call(&td, &arg_exprs);
+            self.dpi_export_depth -= 1;
             return 0;
         }
         0
@@ -41014,14 +41081,14 @@ impl Simulator {
             // untouched afterwards.
             let saved = self.take_process_context();
             self.restore_process_context(ctx);
-            let val = self.eval_expr(cond).is_true();
+            let val = self.wait_condition_true(cond);
             let ctx = self.take_process_context();
             self.process_contexts.insert(waiter_pid, ctx);
             self.restore_process_context(saved);
             val
         } else {
             let saved = self.snapshot_process_context();
-            let val = self.eval_expr(cond).is_true();
+            let val = self.wait_condition_true(cond);
             self.restore_process_context(saved);
             val
         };
@@ -45093,6 +45160,87 @@ impl Simulator {
         self.dump_write_changes();
     }
 
+    /// A fresh wake marker for a wait made from the nested path: its id, a pid
+    /// for the waiter to resume, and the statement that fires it.
+    fn new_sync_wake(&mut self) -> (u64, usize, Statement) {
+        let id = self.next_sync_wake;
+        self.next_sync_wake += 1;
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        let span = crate::ast::Span::dummy();
+        let arg = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: Some(64),
+                signed: false,
+                base: NumberBase::Decimal,
+                value: id.to_string(),
+                cached_val: Cell::new(Some((id, 0u64, 64u32))),
+            }),
+            span,
+        );
+        let stmt = Statement::new(
+            StatementKind::Expr(Expression::new(
+                ExprKind::SystemCall {
+                    name: SYNC_WAKE_MARKER.to_string(),
+                    args: vec![arg],
+                },
+                span,
+            )),
+            span,
+        );
+        (id, pid, stmt)
+    }
+
+    /// Run the scheduler, nested, until `done` holds, the run finishes, or
+    /// nothing is left to run. A task entered from C through a DPI export
+    /// waits this way: its caller is a native stack frame, so it cannot park
+    /// and resume like a process (#204). The synchronous `#delay` arm waits
+    /// the same way, through `run_events_until`.
+    fn run_nested_until(&mut self, mut done: impl FnMut(&mut Self) -> bool) {
+        let saved_hint = self.name_resolve_hint.borrow().clone();
+        if !self.in_edge_block {
+            self.apply_nba();
+        }
+        self.settle_combinatorial();
+        self.check_edges();
+        let _ = self.drain_edge_cascade(self.cascade_limit);
+        self.snapshot_edge_signals();
+        let mut stalled = 0u32;
+        while !self.finished && !done(self) {
+            let next = [
+                self.event_queue.next_time(),
+                self.clock_generators
+                    .iter()
+                    .map(|c| c.next_toggle_time)
+                    .min(),
+                self.next_delayed_time(),
+                self.next_timer_time(),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            let t = match next {
+                Some(t) => t,
+                None if !self.inactive_queue.is_empty() => self.time,
+                None => break,
+            };
+            if t > self.max_time {
+                break;
+            }
+            let before = self.time;
+            self.run_events_until(t);
+            if self.time == before {
+                stalled += 1;
+                if stalled > 100_000 {
+                    break;
+                }
+            } else {
+                stalled = 0;
+            }
+        }
+        *self.name_resolve_hint.borrow_mut() = saved_hint;
+    }
+
     fn run_events_until(&mut self, target: u64) {
         self.nested_run_epoch += 1;
         let saved_pid = self.current_pid;
@@ -48343,8 +48491,7 @@ impl Simulator {
                 stmt: body,
             } = &stmt.kind
             {
-                let cond_val = self.eval_expr(condition);
-                if cond_val.is_true() {
+                if self.wait_condition_true(condition) {
                     self.cond_progress = self.cond_progress.wrapping_add(1);
                     self.exec_statement(body);
                     i += 1;
@@ -77796,6 +77943,23 @@ impl Simulator {
                     // the forking process via a JoinWaiter. `join_none` continues.
                     // An empty fork has no children to wait for, so it must NOT
                     // suspend — a childless waiter is never re-checked.
+                    // A task entered from C (DPI export) cannot park: run the
+                    // scheduler until the join is satisfied, then carry on with
+                    // the statements after the fork (#204).
+                    JoinType::Join | JoinType::JoinAny
+                        if !child_set.is_empty() && self.dpi_export_depth > 0 =>
+                    {
+                        let (id, wpid, wake) = self.new_sync_wake();
+                        self.join_waiters.push(JoinWaiter {
+                            parent_pid: wpid,
+                            child_pids: child_set,
+                            join_type: *join_type,
+                            continuation: vec![wake].into(),
+                            finished_children: HashSet::default(),
+                            wait_fork: false,
+                        });
+                        self.run_nested_until(|sim| sim.sync_wakes.remove(&id));
+                    }
                     JoinType::Join | JoinType::JoinAny if !child_set.is_empty() => {
                         self.join_waiters.push(JoinWaiter {
                             parent_pid: self.current_pid,
@@ -77896,6 +78060,42 @@ impl Simulator {
                         // change itself.
                         self.run_postponed_region();
                         *self.name_resolve_hint.borrow_mut() = saved_hint_nested;
+                    }
+                    // A task entered from C (DPI export) cannot park: register
+                    // the waiter on a wake marker and run the scheduler until
+                    // the event fires; the body then runs below (#204).
+                    TimingControl::Event(e) if self.dpi_export_depth > 0 => {
+                        let (id, wpid, wake) = self.new_sync_wake();
+                        let mut key = None;
+                        if let Some(fname) = self.event_control_field_name(e) {
+                            key = self.resolve_this_event_field(&fname);
+                        }
+                        if key.is_none() {
+                            if let Some(expr) = Self::event_control_single_expr(e) {
+                                key = self.expr_handle_event_field(&expr);
+                                if key.is_none() {
+                                    key = self.expr_instance_event_field_general(&expr);
+                                }
+                            }
+                        }
+                        if let Some(key) = key {
+                            self.instance_event_waiters.push(InstanceEventWaiter {
+                                key,
+                                pid: wpid,
+                                continuation: vec![wake].into(),
+                            });
+                        } else {
+                            let sens = self.event_to_sens(e);
+                            let is_clk_ev = self.is_clocking_event(e);
+                            let w = self.make_event_waiter_kind(
+                                wpid,
+                                sens,
+                                vec![wake].into(),
+                                is_clk_ev,
+                            );
+                            self.event_waiters.push(w);
+                        }
+                        self.run_nested_until(|sim| sim.sync_wakes.remove(&id));
                     }
                     TimingControl::Event(e) => {
                         // Class-field named event parked from the synchronous
@@ -78246,7 +78446,15 @@ impl Simulator {
                 // whose remaining children are now all accounted for.
                 self.release_killed_from_join_waiters(&to_kill);
             }
-            StatementKind::WaitFork => {}
+            StatementKind::WaitFork => {
+                // §9.6.1 in a task entered from C (DPI export): the task cannot
+                // park, so wait here until every child of this process is done
+                // (#204). Elsewhere the suspend-aware runner handles it.
+                if self.dpi_export_depth > 0 {
+                    let me = self.current_pid;
+                    self.run_nested_until(|sim| !sim.process_parents.values().any(|&p| p == me));
+                }
+            }
             StatementKind::RsReturn => {
                 self.rs_return_flag = true;
                 self.break_flag = true;
@@ -78264,8 +78472,25 @@ impl Simulator {
                 }
             }
             StatementKind::Wait { condition, stmt } => {
-                if self.eval_expr(condition).is_true() {
+                if self.wait_condition_true(condition) {
                     self.exec_statement(stmt);
+                } else if self.dpi_export_depth > 0 {
+                    // A task entered from C (DPI export) cannot park: wait
+                    // here, running the scheduler until the condition holds
+                    // (#204). The waiter re-checks the condition when woken.
+                    let (id, wpid, wake) = self.new_sync_wake();
+                    let recheck = Statement::new(
+                        StatementKind::Wait {
+                            condition: condition.clone(),
+                            stmt: Box::new(wake),
+                        },
+                        crate::ast::Span::dummy(),
+                    );
+                    self.park_condition_waiter(wpid, vec![recheck].into(), condition);
+                    self.run_nested_until(|sim| sim.sync_wakes.remove(&id));
+                    if !self.finished {
+                        self.exec_statement(stmt);
+                    }
                 } else {
                     // IEEE 1800-2023 §9.7.4: `wait(cond)` must block when the
                     // condition is false. `exec_statement` is the synchronous
@@ -78846,6 +79071,22 @@ impl Simulator {
             return true;
         }
         false
+    }
+
+    /// Truth of a `wait` condition. A bare named-event operand (`wait(ev)`) is
+    /// true only in the time slot the event was triggered, like
+    /// `ev.triggered` (§15.5.3) — the reference simulator waits for each new
+    /// trigger. The event's stored value stays set after its first trigger, so
+    /// every later `wait(ev)` used to fall straight through.
+    fn wait_condition_true(&mut self, cond: &Expression) -> bool {
+        if matches!(cond.kind, ExprKind::Ident(_))
+            && (!self.module.events.is_empty() || !self.event_aliases.is_empty())
+        {
+            if let Some(t) = self.event_triggered_now(cond) {
+                return t;
+            }
+        }
+        self.eval_expr(cond).is_true()
     }
 
     /// §15.5.3 `.triggered` truth for an event reference (aliases chased,
@@ -79855,6 +80096,12 @@ impl Simulator {
     }
 
     fn exec_system_task(&mut self, name: &str, args: &[Expression]) {
+        if name == SYNC_WAKE_MARKER {
+            if let Some(id) = args.first().and_then(|a| self.eval_expr(a).to_u64()) {
+                self.sync_wakes.insert(id);
+            }
+            return;
+        }
         // §21.7: every waveform task is inert without `--wave`, which is what
         // makes the dump opt-in at model-compile time rather than triggered by
         // whatever the source happens to call.
@@ -80202,26 +80449,7 @@ impl Simulator {
                     .first()
                     .map(|a| self.eval_expr(a).to_i64().unwrap_or(0) as i32)
                     .unwrap_or(0);
-                if raw == 0 {
-                    // $fflush() / $fflush(0): flush every open file and stdout.
-                    for f in self.file_handles.values_mut() {
-                        let _ = f.flush();
-                    }
-                    self.file_writes_pending = false;
-                    self.flush_stdout();
-                } else {
-                    for k in self.resolve_output_keys(raw) {
-                        let ku = k as u32;
-                        if ku == 0 || ku == 0x8000_0001 {
-                            self.flush_stdout();
-                        } else if ku == 0x8000_0002 {
-                            let mut err = std::io::stderr();
-                            let _ = err.flush();
-                        } else if let Some(f) = self.file_handles.get_mut(&k) {
-                            let _ = f.flush();
-                        }
-                    }
-                }
+                self.flush_channels(raw);
             }
             "$fseek" => {
                 use std::io::{Seek, SeekFrom};
@@ -137427,10 +137655,24 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
     // how cocotb reported "simulator precision of 1e-1" and made every `Timer`
     // unrepresentable.
     if property == vpi::TIME_UNIT || property == vpi::TIME_PRECISION {
-        if let Some(exp) = try_active_sim("vpi_get", |sim| Self_secs_to_exp(sim.module.tick_s)) {
-            return exp;
-        }
-        return vpi::UNDEFINED;
+        // A module handle answers with that module's own timeunit /
+        // timeprecision (#206); NULL, or any other object, with the
+        // simulation's — the finest precision in the design.
+        let module_def = unsafe { vpi_deref(handle) }
+            .filter(|h| h.kind == VpiKind::Module)
+            .map(|h| h.def_name.clone());
+        let exp = try_active_sim("vpi_get", |sim| match &module_def {
+            Some(def) => {
+                let (unit, prec) = sim.reported_timescale_exp(def);
+                if property == vpi::TIME_UNIT {
+                    unit
+                } else {
+                    prec
+                }
+            }
+            None => Self_secs_to_exp(sim.module.tick_s),
+        });
+        return exp.unwrap_or(vpi::UNDEFINED);
     }
     let Some(h) = (unsafe { vpi_deref(handle) }) else {
         return vpi::UNDEFINED;
@@ -138459,6 +138701,229 @@ pub extern "C" fn svSetScope(scope: *mut libc::c_void) -> *mut libc::c_void {
     let prev = ACTIVE_SCOPE.with(|cell| cell.get());
     ACTIVE_SCOPE.with(|cell| cell.set(scope));
     prev
+}
+
+// --- svGetTime / svGetTimeUnit / svGetTimePrecision -------------------------
+//
+// The time queries for DPI code (#206). A scope naming a module definition or
+// an instance path answers with that module's timescale; NULL answers with the
+// simulation's (its finest precision). Exponents are powers of ten in seconds
+// (-9 = 1 ns), as `vpi_get(vpiTimeUnit, ...)` reports them.
+
+fn dpi_scope_timescale(sim: &Simulator, scope: *mut libc::c_void) -> (i32, i32) {
+    if scope.is_null() {
+        let exp = Self_secs_to_exp(sim.module.tick_s);
+        return (exp, exp);
+    }
+    let s = unsafe { &*(scope as *const DpiScope) };
+    let name = String::from_utf8_lossy(&s.name[..s.name_len]).into_owned();
+    let rel = vpi_strip_top(sim, &name);
+    let def = if rel.is_empty() || name == sim.module.name {
+        sim.module.name.clone()
+    } else if let Some(inst) = sim.module.instances.iter().find(|i| i.path == rel) {
+        inst.def_name.clone()
+    } else if sim.module.module_timescale_exp.contains_key(name.as_str()) {
+        name
+    } else {
+        sim.module.name.clone()
+    };
+    sim.reported_timescale_exp(&def)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn svGetTimeUnit(scope: *mut libc::c_void, time_unit: *mut i32) -> libc::c_int {
+    if time_unit.is_null() {
+        return -1;
+    }
+    match try_active_sim("svGetTimeUnit", |sim| dpi_scope_timescale(sim, scope).0) {
+        Some(u) => {
+            unsafe { *time_unit = u };
+            0
+        }
+        None => -1,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn svGetTimePrecision(
+    scope: *mut libc::c_void,
+    time_precision: *mut i32,
+) -> libc::c_int {
+    if time_precision.is_null() {
+        return -1;
+    }
+    match try_active_sim("svGetTimePrecision", |sim| {
+        dpi_scope_timescale(sim, scope).1
+    }) {
+        Some(p) => {
+            unsafe { *time_precision = p };
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Current simulation time. `time->type` selects the form: `vpiSimTime`
+/// fills `high`/`low` with simulation ticks, `vpiScaledRealTime` fills
+/// `real` in the scope's time unit.
+#[unsafe(no_mangle)]
+pub extern "C" fn svGetTime(scope: *mut libc::c_void, time: *mut s_vpi_time) -> libc::c_int {
+    if time.is_null() {
+        return -1;
+    }
+    let Some((ticks, tick_s, unit)) = try_active_sim("svGetTime", |sim| {
+        (
+            sim.time,
+            sim.module.tick_s,
+            dpi_scope_timescale(sim, scope).0,
+        )
+    }) else {
+        return -1;
+    };
+    let t = unsafe { &mut *time };
+    if t.type_ == vpi::SCALED_REAL_TIME {
+        t.real = ticks as f64 * tick_s / 10f64.powi(unit);
+    } else {
+        t.type_ = vpi::SIM_TIME;
+        t.high = (ticks >> 32) as u32;
+        t.low = (ticks & 0xFFFF_FFFF) as u32;
+    }
+    0
+}
+
+// --- Multichannel descriptors and output (#205) -----------------------------
+//
+// vpi_mcd_open/close/flush/name share the channel table `$fopen` uses, so a
+// descriptor opened from C can be written from SystemVerilog and the other way
+// round. vpi_mcd_printf is C-variadic, so it lives in vpi_printf_shim.c, which
+// formats the text and hands the file channels to xezim_vpi_mcd_write.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vpi_mcd_open(name: *const libc::c_char) -> u32 {
+    if name.is_null() {
+        return 0;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned();
+    try_active_sim("vpi_mcd_open", |sim| {
+        sim.open_file_path(&path, true, "w").to_u64().unwrap_or(0) as u32
+    })
+    .unwrap_or(0)
+}
+
+/// Closes the file channels in `mcd`; bit 0 (stdout) stays open. Returns 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn vpi_mcd_close(mcd: u32) -> u32 {
+    let files = mcd & !1;
+    if files == 0 {
+        return 0;
+    }
+    try_active_sim("vpi_mcd_close", |sim| {
+        sim.close_channels(files as i32);
+        0
+    })
+    .unwrap_or(mcd)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn vpi_mcd_flush(mcd: u32) -> libc::c_int {
+    if mcd == 0 {
+        return 0;
+    }
+    try_active_sim("vpi_mcd_flush", |sim| {
+        sim.flush_channels(mcd as i32);
+        0
+    })
+    .unwrap_or(1)
+}
+
+thread_local! {
+    static VPI_MCD_NAME: RefCell<std::ffi::CString> = RefCell::new(std::ffi::CString::default());
+}
+
+/// The file name behind the lowest channel set in `cd` ("stdout" for bit 0),
+/// or NULL for a channel that is not open. Valid until the next call.
+#[unsafe(no_mangle)]
+pub extern "C" fn vpi_mcd_name(cd: u32) -> *mut libc::c_char {
+    if cd == 0 {
+        return std::ptr::null_mut();
+    }
+    let bit = cd.trailing_zeros() as i32;
+    let name = if bit == 0 {
+        Some("stdout".to_string())
+    } else {
+        try_active_sim("vpi_mcd_name", |sim| sim.mcd_names.get(&bit).cloned()).flatten()
+    };
+    match name {
+        Some(n) => VPI_MCD_NAME.with(|c| {
+            *c.borrow_mut() = std::ffi::CString::new(n).unwrap_or_default();
+            c.borrow().as_ptr() as *mut libc::c_char
+        }),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Backend of `vpi_mcd_printf` for the file channels in `mcd` (the shim
+/// prints bit 0 itself, next to `vpi_printf`).
+#[unsafe(no_mangle)]
+pub extern "C" fn xezim_vpi_mcd_write(
+    mcd: u32,
+    buf: *const libc::c_char,
+    len: libc::c_int,
+) -> libc::c_int {
+    let files = mcd & !1;
+    if buf.is_null() || len <= 0 || files == 0 {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(buf as *const u8, len as usize) };
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    try_active_sim("vpi_mcd_printf", |sim| {
+        sim.write_channels(files as i32, &text);
+        len
+    })
+    .unwrap_or(0)
+}
+
+/// Flushes the simulator's output: stdout and every open file. Returns 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn vpi_flush() -> libc::c_int {
+    try_active_sim("vpi_flush", |sim| {
+        sim.flush_channels(0);
+        0
+    })
+    .unwrap_or(0)
+}
+
+/// 1 when both handles refer to the same object, else 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn vpi_compare_objects(a: *mut libc::c_void, b: *mut libc::c_void) -> libc::c_int {
+    if a.is_null() || b.is_null() {
+        return 0;
+    }
+    if a == b {
+        return 1;
+    }
+    let (Some(x), Some(y)) = (unsafe { vpi_deref(a) }, unsafe { vpi_deref(b) }) else {
+        return 0;
+    };
+    if x.kind == VpiKind::Iterator {
+        return 0;
+    }
+    i32::from(
+        x.kind == y.kind
+            && x.signal_id == y.signal_id
+            && x.inst_idx == y.inst_idx
+            && x.lsb == y.lsb
+            && x.width == y.width
+            && x.full_name == y.full_name,
+    )
+}
+
+/// `vpi_get` with a 64-bit result.
+#[unsafe(no_mangle)]
+pub extern "C" fn vpi_get64(property: libc::c_int, handle: *mut libc::c_void) -> i64 {
+    i64::from(vpi_get(property, handle))
 }
 
 // =========================================================================

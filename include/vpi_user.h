@@ -123,6 +123,8 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiFullName            3
 #define vpiSize                4
 #define vpiDefName             9   /* module definition name */
+#define vpiTimeUnit           11   /* module time unit; NULL: the simulation's */
+#define vpiTimePrecision      12   /* module time precision; NULL: the simulation's */
 #define vpiScalar             17
 #define vpiVector             18
 #define vpiDirection          20
@@ -265,6 +267,20 @@ PLI_BYTE8 *vpi_get_str(PLI_INT32 property, vpiHandle object);
 int vpi_printf(PLI_BYTE8 *format, ...);
 int vpi_vprintf(PLI_BYTE8 *format, va_list ap);
 int vpi_mcd_printf(PLI_UINT32 mcd, PLI_BYTE8 *format, ...);
+int vpi_mcd_vprintf(PLI_UINT32 mcd, PLI_BYTE8 *format, va_list ap);
+
+/* Multichannel descriptors, shared with $fopen: bit 0 is stdout, and each
+ * vpi_mcd_open (or one-argument $fopen) takes a free bit for a file opened
+ * for writing. vpi_mcd_open returns 0 when the file cannot be opened;
+ * vpi_mcd_close and vpi_mcd_flush return 0; vpi_mcd_name returns the file
+ * name ("stdout" for bit 0), or NULL for a channel that is not open. */
+PLI_UINT32 vpi_mcd_open(PLI_BYTE8 *name);
+PLI_UINT32 vpi_mcd_close(PLI_UINT32 mcd);
+PLI_INT32 vpi_mcd_flush(PLI_UINT32 mcd);
+PLI_BYTE8 *vpi_mcd_name(PLI_UINT32 cd);
+
+/* Flushes stdout and every open file. Returns 0. */
+PLI_INT32 vpi_flush(void);
 
 /* Register a system task or function. `tfname` must begin with '$', and
  * `type` must be vpiSysTask or vpiSysFunc. `compiletf` runs immediately
@@ -325,8 +341,13 @@ PLI_INT32 vpi_control(PLI_INT32 operation, ...);
 extern void (*vlog_startup_routines[])(void);
 
 /* Returns vpiUndefined (-1) for a property xezim does not model.
- * Supported: vpiType, vpiSize, vpiSigned, vpiScalar, vpiVector. */
+ * Supported: vpiType, vpiSize, vpiSigned, vpiScalar, vpiVector, and
+ * vpiTimeUnit / vpiTimePrecision (of a module, or of the simulation for NULL). */
 PLI_INT32 vpi_get(PLI_INT32 property, vpiHandle object);
+PLI_INT64 vpi_get64(PLI_INT32 property, vpiHandle object);
+
+/* 1 when both handles refer to the same object, else 0. */
+PLI_INT32 vpi_compare_objects(vpiHandle object1, vpiHandle object2);
 
 /* On success, fills *value_p in the requested format. On failure — a bad
  * handle, or a format xezim cannot supply — sets value_p->format to

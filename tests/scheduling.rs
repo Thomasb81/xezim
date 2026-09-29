@@ -197,6 +197,8 @@ mod vardelay_clock_period;
 mod wait_fork_immediate_children;
 #[path = "scheduling/wait_in_foreach_blocks.rs"]
 mod wait_in_foreach_blocks;
+#[path = "scheduling/wait_named_event_retrigger.rs"]
+mod wait_named_event_retrigger;
 #[path = "scheduling/wait_satisfaction_order.rs"]
 mod wait_satisfaction_order;
 #[path = "scheduling/waiter_edge_ordering.rs"]

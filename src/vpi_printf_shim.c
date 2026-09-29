@@ -9,6 +9,7 @@
  */
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 
 int vpi_vprintf(char *format, va_list ap) {
     int n = vprintf(format, ap);
@@ -25,13 +26,51 @@ int vpi_printf(char *format, ...) {
     return n;
 }
 
+/* vpi_mcd_printf / vpi_mcd_vprintf: bit 0 of the descriptor is stdout, printed
+ * here like vpi_printf; the other bits are files opened with vpi_mcd_open or
+ * $fopen, written by the Rust backend through the same channel table. */
+extern int xezim_vpi_mcd_write(unsigned int mcd, const char *buf, int len);
+
+int vpi_mcd_vprintf(unsigned int mcd, char *format, va_list ap) {
+    int n = 0;
+    if (mcd & 1u) {
+        va_list out;
+        va_copy(out, ap);
+        n = vprintf(format, out);
+        va_end(out);
+        fflush(stdout);
+    }
+    if (mcd & ~1u) {
+        char small[1024];
+        va_list sized;
+        va_copy(sized, ap);
+        int len = vsnprintf(small, sizeof small, format, sized);
+        va_end(sized);
+        if (len < 0)
+            return len;
+        if ((size_t)len < sizeof small) {
+            xezim_vpi_mcd_write(mcd, small, len);
+        } else {
+            char *big = malloc((size_t)len + 1);
+            if (!big)
+                return -1;
+            va_list again;
+            va_copy(again, ap);
+            vsnprintf(big, (size_t)len + 1, format, again);
+            va_end(again);
+            xezim_vpi_mcd_write(mcd, big, len);
+            free(big);
+        }
+        n = len;
+    }
+    return n;
+}
+
 int vpi_mcd_printf(unsigned int mcd, char *format, ...) {
-    (void)mcd;
     va_list ap;
     va_start(ap, format);
-    int n = vprintf(format, ap);
+    int n = vpi_mcd_vprintf(mcd, format, ap);
     va_end(ap);
-    fflush(stdout);
     return n;
 }
 

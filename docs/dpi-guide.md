@@ -312,6 +312,10 @@ xezim --dpi-lib /abs/path/to/libfoo.so [more --dpi-lib paths …] <sv files>
   without simulating. Calling an imported function that no loaded library
   defines is a `Fatal` that ends the run (exit 1); imports that are never
   called need no implementation.
+* An exported task (`export "DPI-C" task t;`) called from C returns only when
+  the task has finished: `#` delays, `wait(...)`, `@(...)`, `fork ... join`
+  and `wait fork` inside it all run to completion first, with the rest of the
+  simulation advancing meanwhile.
 * The SV file must `import "DPI-C" function …` (or include a `.svh` that does)
   for every symbol you call from SV. Symbols that exist in the `.so` but
   aren't imported are simply ignored — there's no eager validation.
@@ -398,7 +402,16 @@ Each library's `vlog_startup_routines` entries run before simulation.
 - Design walk: `vpi_iterate`/`vpi_scan` over `vpiModule`, `vpiNet`, `vpiReg`,
   `vpiVariables`, `vpiParameter`, `vpiMemory`; `vpi_handle_by_name`,
   `vpi_get`, `vpi_get_str`, `vpi_get_value`/`vpi_put_value`.
-- `vpi_control(vpiStop/vpiFinish)`, `vpi_chk_error`, `vpi_printf`.
+- `vpi_control(vpiStop/vpiFinish)`, `vpi_chk_error`, `vpi_printf`,
+  `vpi_flush`, `vpi_compare_objects`, `vpi_get64`.
+- Multichannel descriptors: `vpi_mcd_open`, `vpi_mcd_close`, `vpi_mcd_flush`,
+  `vpi_mcd_name`, `vpi_mcd_printf`/`vpi_mcd_vprintf`. They share the channel
+  table of `$fopen`, so a descriptor opened in C can be written from
+  SystemVerilog (`$fdisplay(mcd, ...)`) and the other way round.
+- Time queries: `vpi_get(vpiTimeUnit, h)` / `vpi_get(vpiTimePrecision, h)` give
+  a module's own timescale for a module handle and the simulation's for NULL,
+  as powers of ten in seconds (`-9` = 1 ns). From DPI code, `svGetTime`,
+  `svGetTimeUnit` and `svGetTimePrecision` answer the same for an `svScope`.
 
 **Semantics notes:**
 
@@ -412,7 +425,10 @@ Each library's `vlog_startup_routines` entries run before simulation.
 **Not implemented** (deliberately *not declared* in `include/vpi_user.h`, so a
 call is a compile error rather than a link surprise):
 `vpi_put_userdata`/`vpi_get_userdata`, `vpi_get_systf_info`,
-`vpi_handle_multi`, `vpiStrengthVal`, and the delay/timing relations.
+`vpi_handle_multi`, `vpi_handle_by_multi_index`,
+`vpi_get_value_array`/`vpi_put_value_array`,
+`vpi_get_delays`/`vpi_put_delays` (the delay/timing relations), and
+`vpiStrengthVal`.
 
 Worked examples: `tests/dpi/vpi_object_model.{c,sv}`,
 `tests/dpi/vpi_systf.{c,sv}`.

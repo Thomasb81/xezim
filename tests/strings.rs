@@ -23,6 +23,8 @@ mod compiled_sformatf_native;
 mod display_only_always;
 #[path = "strings/dpi_child_module_import.rs"]
 mod dpi_child_module_import;
+#[path = "strings/dpi_export_task_waits.rs"]
+mod dpi_export_task_waits;
 #[path = "strings/dpi_integration_tests.rs"]
 mod dpi_integration_tests;
 #[path = "strings/dpi_library_loading.rs"]
@@ -91,5 +93,7 @@ mod string_returning_fn_inline;
 mod struct_elem_string_member_format;
 #[path = "strings/system_task_gaps.rs"]
 mod system_task_gaps;
+#[path = "strings/vpi_mcd_and_time_queries.rs"]
+mod vpi_mcd_and_time_queries;
 #[path = "strings/wide_string2num.rs"]
 mod wide_string2num;
