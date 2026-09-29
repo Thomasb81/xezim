@@ -76760,6 +76760,9 @@ impl Simulator {
                             );
                             for mdecl in &m.declarators {
                                 let key = format!("{}.{}", prefix, mdecl.name.name);
+                                // The member keys are formal metadata too
+                                // (see `meta_note`).
+                                self.meta_note(&key);
                                 // Re-registration REPLACES: a later local
                                 // reusing the same `var.field` name must not
                                 // keep the earlier declaration's geometry
