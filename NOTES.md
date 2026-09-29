@@ -50,6 +50,22 @@ and the development workflow are in [README.md](README.md).
   and the run hung, and directly in an `always` it was rejected as having no
   timing control. A three-level enable inside a task (`a.b.t();`) also kept
   advancing time after `$finish`.
+* An exported task called from C returns only when it has finished:
+  `fork ... join`, `join_any`, `wait fork`, `wait(...)` and `@(...)` inside it
+  now wait, with the rest of the simulation running meanwhile. `fork ... join`
+  used to drop the rest of the task and return, and the others returned at
+  once. (#204)
+* `wait(ev)` on a named event waits for a new trigger every time. After the
+  event's first trigger it used to fall straight through.
+* VPI: `vpi_mcd_open`, `vpi_mcd_close`, `vpi_mcd_flush`, `vpi_mcd_name`,
+  `vpi_mcd_vprintf`, `vpi_flush`, `vpi_compare_objects` and `vpi_get64` are
+  available, and `vpi_mcd_printf` writes to files opened with `vpi_mcd_open`
+  or `$fopen` instead of only stdout. The DPI guide lists the VPI calls that
+  are still missing. (#205)
+* `vpi_get(vpiTimeUnit, ...)` and `vpi_get(vpiTimePrecision, ...)` return a
+  module's own timescale for a module handle (the two names are now defined in
+  `vpi_user.h`), and `svGetTime`, `svGetTimeUnit` and `svGetTimePrecision`
+  give the same answers from DPI code. (#206)
 * The one-time notes for ignored system tasks (such as `$dumpfile` without
   `--wave`) are written to stderr as one piece, so `$display` output going to
   the same file can no longer land inside one and hide a UVM message from log
