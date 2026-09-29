@@ -99,6 +99,8 @@ mod vpi_callbacks;
 mod vpi_mcd_and_time_queries;
 #[path = "strings/vpi_net_kinds.rs"]
 mod vpi_net_kinds;
+#[path = "strings/vpi_object_model_walk.rs"]
+mod vpi_object_model_walk;
 #[path = "strings/vpi_routines.rs"]
 mod vpi_routines;
 #[path = "strings/wide_string2num.rs"]

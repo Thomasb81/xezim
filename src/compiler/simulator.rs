@@ -2134,6 +2134,7 @@ mod ts_x;
 mod uvm_dpi;
 mod vpi_api;
 mod vpi_cb;
+mod vpi_model;
 pub(crate) use code_cov::{
     COND_FN as COV_COND_FN, HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id,
 };
@@ -138123,6 +138124,16 @@ enum VpiKind {
     /// A `vpi_register_cb` handle; `signal_id` holds the callback's id in
     /// `Simulator::vpi_cb` (see `vpi_cb.rs`).
     Callback,
+    /// A scope of the object model that is not an instance: a package, a
+    /// generate scope, a named block, a task or a function. `signal_id` is
+    /// its index in the model (see `vpi_model.rs`).
+    Scope,
+    /// Any other object of the object model: processes, continuous
+    /// assignments, primitives, ports without storage, expressions, ranges,
+    /// typespecs, ... `signal_id` is its index in the model; `usize::MAX`
+    /// marks a constant made on the fly (value in `value`, `vpiConstType`
+    /// in `lsb`).
+    Obj,
 }
 
 /// Wrapper for VPI handles stored as raw pointers.
@@ -138646,7 +138657,7 @@ pub extern "C" fn __xezim_dpi_export_dispatch(
 #[unsafe(no_mangle)]
 pub extern "C" fn vpi_handle_by_name(
     name: *mut libc::c_char,
-    _scope: *mut libc::c_void,
+    scope: *mut libc::c_void,
 ) -> *mut libc::c_void {
     if name.is_null() {
         return std::ptr::null_mut();
@@ -138657,6 +138668,11 @@ pub extern "C" fn vpi_handle_by_name(
         .to_string();
 
     try_active_sim("vpi_handle_by_name", |sim| {
+        // VPI object model (vpi_model.rs): every declared object, scope and
+        // generate block by its full name, or relative to `scope`.
+        if let Some(h) = vpi_model::handle_by_name(sim, &full_name, unsafe { vpi_deref(scope) }) {
+            return h;
+        }
         // The top module itself, and any instance in the hierarchy.
         let rel = vpi_strip_top(sim, &full_name);
         if rel.is_empty() {
@@ -138734,6 +138750,15 @@ pub extern "C" fn vpi_handle_by_index(
     let Some(h) = (unsafe { vpi_deref(handle) }) else {
         return std::ptr::null_mut();
     };
+    // VPI object model (vpi_model.rs): arrays, sub-arrays and generate
+    // scope arrays.
+    if let Some(r) = try_active_sim("vpi_handle_by_index", |sim| {
+        vpi_model::handle_by_index(sim, h, index as i64)
+    })
+    .flatten()
+    {
+        return r;
+    }
     if h.kind != VpiKind::Memory {
         return std::ptr::null_mut();
     }
@@ -138796,6 +138821,10 @@ pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mu
         return vpi_api::user_systf_of_call(refh);
     }
     try_active_sim("vpi_handle", |sim| {
+        // VPI object model (vpi_model.rs): the one-to-one relations.
+        if let Some(r) = vpi_model::handle(sim, type_, unsafe { vpi_deref(refh) }) {
+            return r;
+        }
         if type_ != vpi::SCOPE {
             return std::ptr::null_mut();
         }
@@ -138906,6 +138935,10 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
     }
     try_active_sim("vpi_iterate", |sim| {
         let scope_h = unsafe { vpi_deref(refh) };
+        // VPI object model (vpi_model.rs): the one-to-many relations.
+        if let Some(r) = vpi_model::iterate(sim, type_, scope_h) {
+            return r;
+        }
 
         // A NULL reference means "the whole design": the only top-level
         // module is the one we elaborated.
@@ -139097,6 +139130,20 @@ pub extern "C" fn vpi_get_str(
     let Some(h) = (unsafe { vpi_deref(handle) }) else {
         return std::ptr::null_mut();
     };
+    // VPI object model (vpi_model.rs): names, files and type names.
+    if !matches!(
+        h.kind,
+        VpiKind::SysTfCall | VpiKind::Constant | VpiKind::Iterator
+    ) {
+        if let Some(r) =
+            try_active_sim("vpi_get_str", |sim| vpi_model::get_str(sim, property, h)).flatten()
+        {
+            return match r {
+                Some(s) => vpi_model::str_result(&s),
+                None => std::ptr::null_mut(),
+            };
+        }
+    }
     let s = match property {
         vpi::NAME => h.name.clone(),
         vpi::FULL_NAME => h.full_name.clone(),
@@ -139437,6 +139484,17 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
     let Some(h) = (unsafe { vpi_deref(handle) }) else {
         return vpi::UNDEFINED;
     };
+    // VPI object model (vpi_model.rs): the properties of every object it
+    // knows, including the declared type.
+    if !matches!(
+        h.kind,
+        VpiKind::SysTfCall | VpiKind::Constant | VpiKind::Iterator
+    ) {
+        if let Some(v) = try_active_sim("vpi_get", |sim| vpi_model::get(sim, property, h)).flatten()
+        {
+            return v;
+        }
+    }
     if property == vpi::TYPE {
         return h.type_code;
     }
@@ -139540,6 +139598,12 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
         vp.format = vpi::SUPPRESS_VAL;
         return;
     };
+    // VPI object model (vpi_model.rs): expressions, constants, and the
+    // objects that have no value.
+    if matches!(h.kind, VpiKind::Obj | VpiKind::Scope) || h.type_code == vpi_model::c::NAMED_EVENT {
+        let _ = try_active_sim("vpi_get_value", |sim| vpi_model::get_value(sim, h, vp));
+        return;
+    }
     // A constant argument carries its own value and needs no simulator.
     if h.kind == VpiKind::Constant {
         let ok = match &h.value {
@@ -139782,6 +139846,10 @@ pub extern "C" fn vpi_put_value(
                 vpi::ERROR,
                 "vpi_put_value: a vpiConstant argument is read-only".into(),
             );
+            return std::ptr::null_mut();
+        }
+        // VPI object model (vpi_model.rs): objects with no writable value.
+        if vpi_model::put_value_rejected(h) {
             return std::ptr::null_mut();
         }
     }

@@ -7,7 +7,7 @@ module tb;
   logic             clk;
   logic [WIDTH-1:0] data;
   wire  [3:0]       w;
-  int               mem [0:3];
+  logic [31:0]      mem [0:3];
 
   struct packed { logic [7:0] r; logic [7:0] g; logic [7:0] b; } px;
 

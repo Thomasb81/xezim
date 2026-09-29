@@ -145,6 +145,218 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiMixedIO             4
 #define vpiNoDirection         5
 
+/* --- Object model (IEEE 1800-2017 chapter 37) --------------------------
+ * The elaborated design as VPI objects: scopes, declared objects, processes,
+ * continuous assignments, primitives, specify paths and timing checks, and
+ * their relations. docs/dpi-guide.md ("VPI object model") lists what each
+ * object answers. The SystemVerilog objects (packages, interfaces, programs,
+ * typespecs, ...) are in sv_vpi_user.h. */
+
+/* Object types. */
+#define vpiAlways              1   /* always procedure (see vpiAlwaysType) */
+#define vpiContAssign          8   /* continuous assignment */
+#define vpiFunction           20
+#define vpiGate               21   /* gate primitive instance */
+#define vpiInitial            24
+#define vpiIODecl             28   /* task/function argument */
+#define vpiModPath            31   /* specify path */
+#define vpiNamedBegin         33
+#define vpiNamedEvent         34   /* exists and is named; has no value */
+#define vpiNamedFork          35
+#define vpiOperation          39   /* an expression other than a name, literal or select */
+#define vpiPathTerm           43   /* terminal of a vpiModPath */
+#define vpiPrimTerm           46   /* terminal of a primitive */
+#define vpiSwitch             55   /* switch primitive instance */
+#define vpiTask               59
+#define vpiTchk               61   /* timing check */
+#define vpiTchkTerm           62   /* reference or data terminal of a vpiTchk */
+#define vpiUdp                65   /* user-defined primitive instance */
+#define vpiBitSelect         106
+#define vpiNetArray          114
+#define vpiRange             115
+#define vpiRegArray          116   /* array of variables; vpiArrayVar */
+#define vpiNamedEventArray   129
+#define vpiGenScopeArray     133
+#define vpiGenScope          134
+
+/* One-to-one relations (vpi_handle). */
+#define vpiCondition          71
+#define vpiDelay              72   /* the delay expression, where one is written */
+#define vpiHighConn           76
+#define vpiLhs                77
+#define vpiIndex              78
+#define vpiLeftRange          79
+#define vpiLowConn            80
+#define vpiParent             81
+#define vpiRhs                82
+#define vpiRightRange         83
+#define vpiTchkDataTerm       86
+#define vpiTchkNotifier       87
+#define vpiTchkRefTerm        88
+#define vpiExpr              102
+#define vpiStmt              104   /* a process's statement, when it is a named block */
+
+/* One-to-many relations (vpi_iterate). */
+#define vpiBit                90   /* bits of a vector port, net or variable */
+#define vpiModPathIn          95
+#define vpiModPathOut         96
+#define vpiOperand            97
+#define vpiPortInst           98   /* ports a net/variable connects to from above */
+#define vpiProcess            99
+#define vpiPrimitive         103
+#define vpiPorts             125   /* ports a net/variable is the low connection of */
+#define vpiTaskFunc          127
+
+/* Properties. vpiFile and vpiDefFile are vpi_get_str properties; an object
+ * whose source location is unknown reports vpiLineNo 0 and vpiFile NULL. */
+#define vpiFile                5
+#define vpiLineNo              6
+#define vpiTopModule           7
+#define vpiCellInstance        8
+#define vpiProtected          10
+#define vpiDefFile            15
+#define vpiDefLineNo          16
+#define vpiExplicitName       19
+#define vpiConnByName         21
+#define vpiNetType            22
+#define vpiImplicitDecl       26
+#define vpiArray              28
+#define vpiPortIndex          29
+#define vpiTermIndex          30
+#define vpiPrimType           33
+#define vpiEdge               36
+#define vpiTchkType           38
+#define vpiOpType             39
+#define vpiConstType          40
+#define vpiNetDeclAssign      43
+#define vpiAutomatic          50
+#define vpiResolvedNetType    61
+#define vpiLocalParam         70
+#define vpiModPathHasIfNone   71
+#define vpiIsMemory           73
+#define vpiIsProtected        74
+
+/* vpiNetType / vpiResolvedNetType values. */
+#define vpiWire                1
+#define vpiWand                2
+#define vpiWor                 3
+#define vpiTri                 4
+#define vpiTri0                5
+#define vpiTri1                6
+#define vpiTriReg              7
+#define vpiTriAnd              8
+#define vpiTriOr               9
+#define vpiSupply1            10
+#define vpiSupply0            11
+#define vpiNone               12   /* interconnect and wreal nets */
+#define vpiUwire              13
+
+/* vpiPrimType values. */
+#define vpiAndPrim             1
+#define vpiNandPrim            2
+#define vpiNorPrim             3
+#define vpiOrPrim              4
+#define vpiXorPrim             5
+#define vpiXnorPrim            6
+#define vpiBufPrim             7
+#define vpiNotPrim             8
+#define vpiBufif0Prim          9
+#define vpiBufif1Prim         10
+#define vpiNotif0Prim         11
+#define vpiNotif1Prim         12
+#define vpiNmosPrim           13
+#define vpiPmosPrim           14
+#define vpiCmosPrim           15
+#define vpiRnmosPrim          16
+#define vpiRpmosPrim          17
+#define vpiRcmosPrim          18
+#define vpiRtranPrim          19
+#define vpiRtranif0Prim       20
+#define vpiRtranif1Prim       21
+#define vpiTranPrim           22
+#define vpiTranif0Prim        23
+#define vpiTranif1Prim        24
+#define vpiPullupPrim         25
+#define vpiPulldownPrim       26
+#define vpiSeqPrim            27   /* sequential UDP */
+#define vpiCombPrim           28   /* combinational UDP */
+
+/* vpiEdge values (timing check terminals). */
+#define vpiNoEdge           0x00
+#define vpiEdge01           0x01
+#define vpiEdge10           0x02
+#define vpiEdge0x           0x04
+#define vpiEdgex1           0x08
+#define vpiEdge1x           0x10
+#define vpiEdgex0           0x20
+#define vpiPosedge          (vpiEdgex1 | vpiEdge01 | vpiEdge0x)
+#define vpiNegedge          (vpiEdgex0 | vpiEdge10 | vpiEdge1x)
+#define vpiAnyEdge          (vpiPosedge | vpiNegedge)
+
+/* vpiTchkType values. */
+#define vpiSetup               1
+#define vpiHold                2
+#define vpiPeriod              3
+#define vpiWidth               4
+#define vpiSkew                5
+#define vpiRecovery            6
+#define vpiNoChange            7
+#define vpiSetupHold           8
+#define vpiFullskew            9
+#define vpiRecrem             10
+#define vpiRemoval            11
+#define vpiTimeskew           12
+
+/* vpiOpType values. */
+#define vpiMinusOp             1
+#define vpiPlusOp              2
+#define vpiNotOp               3
+#define vpiBitNegOp            4
+#define vpiUnaryAndOp          5
+#define vpiUnaryNandOp         6
+#define vpiUnaryOrOp           7
+#define vpiUnaryNorOp          8
+#define vpiUnaryXorOp          9
+#define vpiUnaryXNorOp        10
+#define vpiSubOp              11
+#define vpiDivOp              12
+#define vpiModOp              13
+#define vpiEqOp               14
+#define vpiNeqOp              15
+#define vpiCaseEqOp           16
+#define vpiCaseNeqOp          17
+#define vpiGtOp               18
+#define vpiGeOp               19
+#define vpiLtOp               20
+#define vpiLeOp               21
+#define vpiLShiftOp           22
+#define vpiRShiftOp           23
+#define vpiAddOp              24
+#define vpiMultOp             25
+#define vpiLogAndOp           26
+#define vpiLogOrOp            27
+#define vpiBitAndOp           28
+#define vpiBitOrOp            29
+#define vpiBitXorOp           30
+#define vpiBitXNorOp          31
+#define vpiBitXnorOp          vpiBitXNorOp
+#define vpiConditionOp        32
+#define vpiConcatOp           33
+#define vpiMultiConcatOp      34
+#define vpiArithLShiftOp      41
+#define vpiArithRShiftOp      42
+#define vpiPowerOp            43
+
+/* vpiConstType values. */
+#define vpiDecConst            1
+#define vpiRealConst           2
+#define vpiBinaryConst         3
+#define vpiOctConst            4
+#define vpiHexConst            5
+#define vpiStringConst         6
+#define vpiIntConst            7
+#define vpiTimeConst           8
+
 /* --- vpi_time types --------------------------------------------------- */
 #define vpiScaledRealTime      1
 #define vpiSimTime             2
@@ -306,24 +518,28 @@ struct t_cb_data {
  * Implemented by xezim. Signatures match IEEE 1800-2017 Annex K exactly.
  * ------------------------------------------------------------------ */
 
-/* Resolve a hierarchical name. `scope` is ignored (xezim resolves against
- * the flat signal table); pass NULL. Returns NULL if the name does not
- * name a signal. Tries the full name, then each successively shorter
- * suffix, so "top.dut.sig", "dut.sig" and "sig" all resolve. */
+/* Resolve a hierarchical name: any object of the object model (instance,
+ * package, generate scope, named block, task, function, variable, net,
+ * parameter, named event, named primitive), an array element (`mem[1]`) or a
+ * bit of a vector (`w[3]`). With a scope handle the name is first taken
+ * relative to that scope. A package member is `pkg::name`. As a fallback,
+ * each successively shorter suffix of the name is tried against the signal
+ * table, so "top.dut.sig", "dut.sig" and "sig" all resolve. */
 vpiHandle vpi_handle_by_name(PLI_BYTE8 *name, vpiHandle scope);
 
-/* One-to-one traversal. Only vpiScope is modelled: the containing scope of
- * an object, or the parent of a module. As an xezim extension,
- * vpi_handle(vpiScope, NULL) returns the top module — the standard route is
- * vpi_scan(vpi_iterate(vpiModule, NULL)), but enough code spells it the
- * short way that supporting it is worth more than returning NULL. Any other
- * relation returns NULL. */
+/* One-to-one traversal: vpiScope, vpiParent, vpiModule, vpiInstance, and the
+ * object-model relations above (docs/dpi-guide.md, "VPI object model"). As an
+ * xezim extension, vpi_handle(vpiScope, NULL) returns the top module — the
+ * standard route is vpi_scan(vpi_iterate(vpiModule, NULL)), but enough code
+ * spells it the short way that supporting it is worth more than returning
+ * NULL. A relation the object does not have returns NULL. */
 vpiHandle vpi_handle(PLI_INT32 type, vpiHandle refHandle);
 
 /* One-to-many traversal. Returns NULL when the relation yields nothing.
- * Supported for a module reference: vpiModule and vpiInternalScope (child
- * instances), vpiNet, vpiReg, vpiVariables, vpiParameter, vpiMemory.
- * With a NULL reference, vpiModule yields the single top module. */
+ * From a NULL reference: vpiModule (top modules), vpiInstance (top-level
+ * instances, then packages), vpiInterface, vpiProgram, vpiPackage. From a
+ * scope and from the other objects: see docs/dpi-guide.md, "VPI object
+ * model". Iteration is in declaration order. */
 vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle refHandle);
 
 /* Hand out the next object. When the iterator is exhausted it returns NULL
@@ -334,9 +550,11 @@ vpiHandle vpi_scan(vpiHandle iterator);
 /* Select one word of a vpiMemory object. NULL if out of range. */
 vpiHandle vpi_handle_by_index(vpiHandle object, PLI_INT32 index);
 
-/* vpiName, vpiFullName, and vpiDefName (modules only). Returns NULL for any
- * other property. The string is simulator-owned and valid until the next
- * vpi_get_str call on this thread. */
+/* vpiName, vpiFullName, vpiType (the type's name), vpiFile, and vpiDefName /
+ * vpiDefFile (instances, packages and primitives). Returns NULL when the
+ * object has no such string (an unnamed process has no vpiName). The string
+ * is simulator-owned and stays valid across the next few vpi_get_str calls
+ * on this thread (a small rotating pool). */
 PLI_BYTE8 *vpi_get_str(PLI_INT32 property, vpiHandle object);
 
 /* Formatted output, interleaved with $display. */
@@ -442,9 +660,10 @@ PLI_INT32 vpi_control(PLI_INT32 operation, ...);
  * your VPI module; do not call it yourself. */
 extern void (*vlog_startup_routines[])(void);
 
-/* Returns vpiUndefined (-1) for a property xezim does not model.
- * Supported: vpiType, vpiSize, vpiSigned, vpiScalar, vpiVector, and
- * vpiTimeUnit / vpiTimePrecision (of a module, or of the simulation for NULL). */
+/* Returns vpiUndefined (-1) for a property the object does not have.
+ * vpiType, vpiSize, vpiSigned, vpiScalar, vpiVector, vpiTimeUnit /
+ * vpiTimePrecision (of a module, or of the simulation for NULL), and the
+ * object-model properties above (docs/dpi-guide.md, "VPI object model"). */
 PLI_INT32 vpi_get(PLI_INT32 property, vpiHandle object);
 PLI_INT64 vpi_get64(PLI_INT32 property, vpiHandle object);
 

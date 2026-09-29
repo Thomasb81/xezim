@@ -23,21 +23,21 @@ static PLI_INT32 probe(PLI_BYTE8 *ud) {
   vpiHandle mi = vpi_iterate(vpiModule, NULL), top = vpi_scan(mi); vpi_free_object(mi);
   CHECK(top != NULL, "top module handle");
 
-  /* name:type:direction:size — vpiPort=44, vpiInput=1, vpiOutput=2, vpiInout=3 */
+  /* name:type:direction:size — vpiPort=44, vpiInput=1, vpiOutput=2, vpiInout=3.
+   * Ports come in port-list order (vpiPortIndex 0, 1, 2). */
   collect(vpiPort, top, buf, sizeof buf);
-  CHECK(strcmp(buf, "clk_in:44:1:1,io_top:44:3:2,o_top:44:2:4") == 0, buf);
-  /* the connected signals keep their own types and stay iterable as before */
-  /* §23.2.2.3: `input logic clk_in` is a net (the port kind of an input
-   * defaults to net); `output logic [3:0] o_top` is a variable. */
+  CHECK(strcmp(buf, "clk_in:44:1:1,o_top:44:2:4,io_top:44:3:2") == 0, buf);
+  /* The connected objects keep their own types. §23.2.2.3: `input logic`
+   * (no net type, no `var`) is a net, `output logic` a variable. */
   collect(vpiNet, top, buf, sizeof buf);
   CHECK(strstr(buf, "w:36:") != NULL && strstr(buf, "clk_in:36:1:1") != NULL, buf);
   collect(vpiReg, top, buf, sizeof buf);
-  CHECK(strstr(buf, "clk_in") == NULL && strstr(buf, "o_top:48:2:4") != NULL, buf);
+  CHECK(strstr(buf, "o_top:48:2:4") != NULL && strstr(buf, "clk_in") == NULL, buf);
 
   vpiHandle ii = vpi_iterate(vpiModule, top), sub = vpi_scan(ii); vpi_free_object(ii);
   CHECK(sub != NULL, "sub-instance handle");
   collect(vpiPort, sub, buf, sizeof buf);
-  CHECK(strcmp(buf, "clk:44:1:1,i:44:1:4,io:44:3:2,o:44:2:4") == 0, buf);
+  CHECK(strcmp(buf, "clk:44:1:1,i:44:1:4,o:44:2:4,io:44:3:2") == 0, buf);
   collect(vpiReg, sub, buf, sizeof buf);
   CHECK(strstr(buf, "internal:48:5:4") != NULL, buf);   /* a plain variable: vpiNoDirection */
 
@@ -55,7 +55,7 @@ static PLI_INT32 probe(PLI_BYTE8 *ud) {
   }
   CHECK(seen_i, "port i found");
 
-  /* by-name lookup still yields the signal object, which reports its port's direction */
+  /* by-name lookup still yields the net, which reports its port's direction */
   vpiHandle clk = vpi_handle_by_name("tb.u_sub.clk", NULL);
   CHECK(clk && vpi_get(vpiType, clk) == vpiNet && vpi_get(vpiDirection, clk) == vpiInput, "by-name clk");
 
