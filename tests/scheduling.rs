@@ -79,6 +79,8 @@ mod disable_loop_label;
 mod edge_delivery;
 #[path = "scheduling/edge_event_lsb.rs"]
 mod edge_event_lsb;
+#[path = "scheduling/element_sensitivity_after_large_array.rs"]
+mod element_sensitivity_after_large_array;
 #[path = "scheduling/event_control_iff_guard.rs"]
 mod event_control_iff_guard;
 #[path = "scheduling/event_features_15_5.rs"]
