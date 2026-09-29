@@ -31357,6 +31357,23 @@ impl Simulator {
                         // Null receiver: the AST funnel falls through to
                         // `Value::zero(32)` (no storage, no fault).
                         Value::zero(32)
+                    } else if let Some(bare_name) =
+                        Self::split_local_coll_marker(member)
+                    {
+                        // Row 3: a LOCAL collection declared in this body
+                        // (the decl ran as a StmtFallback, registering the
+                        // per-call `@name#id` key in the current frame).
+                        // Resolve the store through the interpreter's own
+                        // rename map — innermost frame first, a same-named
+                        // `this` member is SHADOWED — and dispatch the
+                        // builtin on it. The key contains `#`, so the
+                        // builtin's bare-name rewrites never fire.
+                        let m: &str = &method;
+                        let store = self.local_coll_store(bare_name);
+                        match self.eval_builtin_method(&store, m, &args) {
+                            Some(v) => v,
+                            None => self.exec_method_call(handle, m, &args),
+                        }
                     } else if *bare != 0 {
                         // Bare receiver (`q.size()`): the receiver IS
                         // `this`. Resolve the member's instance store FIRST
@@ -31430,7 +31447,14 @@ impl Simulator {
                 // so dollar_bound is irrelevant).
                 Insn::LoadCollElem(dest, handle_reg, member, idx_reg) => {
                     let idx_val = self.vm_regs[*idx_reg as usize].clone();
-                    let store: Option<String> = if *handle_reg == 0 {
+                    let store: Option<String> = if let Some(bare_name) =
+                        Self::split_local_coll_marker(member)
+                    {
+                        // Row 3: local collection — the interpreter's
+                        // per-call `@name#id` store (innermost frame wins;
+                        // a same-named `this` member is shadowed).
+                        Some(self.local_coll_store(bare_name))
+                    } else if *handle_reg == 0 {
                         // Bare receiver: the collection is a member of
                         // `this` — the interpreter's own resolution chain
                         // (instance member, then static / param-bound
@@ -31475,7 +31499,14 @@ impl Simulator {
                 Insn::StoreCollElem(handle_reg, member, idx_reg, val_reg) => {
                     let idx_val = self.vm_regs[*idx_reg as usize].clone();
                     let val = self.vm_regs[*val_reg as usize].clone();
-                    let store: Option<String> = if *handle_reg == 0 {
+                    let store: Option<String> = if let Some(bare_name) =
+                        Self::split_local_coll_marker(member)
+                    {
+                        // Row 3: local collection — the interpreter's
+                        // per-call `@name#id` store (innermost frame wins;
+                        // a same-named `this` member is shadowed).
+                        Some(self.local_coll_store(bare_name))
+                    } else if *handle_reg == 0 {
                         self.instance_assoc_member(member)
                     } else {
                         let handle = self.vm_regs[*handle_reg as usize]
@@ -31630,7 +31661,14 @@ impl Simulator {
                 // key's loop-var Value is precomputed with the sync foreach
                 // arm's exact conversion so ForeachNext can only move it.
                 Insn::ForeachKeys(slot, handle_reg, member) => {
-                    let store: Option<String> = if *handle_reg == 0 {
+                    let store: Option<String> = if let Some(bare_name) =
+                        Self::split_local_coll_marker(member)
+                    {
+                        // Row 3: local collection — the interpreter's
+                        // per-call `@name#id` store (innermost frame wins;
+                        // a same-named `this` member is shadowed).
+                        Some(self.local_coll_store(bare_name))
+                    } else if *handle_reg == 0 {
                         self.instance_assoc_member(member)
                     } else {
                         let handle = self.vm_regs[*handle_reg as usize]
@@ -95647,6 +95685,24 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// class-perf row 3: split a `\u{1}`-marked LOCAL collection receiver
+    /// name (queue / dynamic array declared inside the running compiled
+    /// block). Returns the bare name. The marker is compiler-internal — it
+    /// cannot occur in user names — and never reaches the storage tables:
+    /// every runtime arm strips it before resolving the store.
+    fn split_local_coll_marker(marked: &str) -> Option<&str> {
+        marked.strip_prefix('\u{1}')
+    }
+
+    /// class-perf row 3: resolve the per-call storage key of a marked bare
+    /// LOCAL collection name through the interpreter's rename map
+    /// (innermost frame first) — the exact store the AST path resolves for
+    /// the same name. The bare-name fallback covers top-level frames and
+    /// the XEZIM_NO_DYN_RENAME kill-switch, where dyn storage is global.
+    fn local_coll_store(&self, bare: &str) -> String {
+        self.dyn_name_lookup(bare).unwrap_or(bare).to_string()
     }
 
     /// Mint a fresh process-unique storage key for a local dyn array `bare`

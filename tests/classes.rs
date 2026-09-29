@@ -118,6 +118,8 @@ mod compiled_method_coll_shadow;
 
 #[path = "classes/compiled_method_foreach.rs"]
 mod compiled_method_foreach;
+#[path = "classes/compiled_method_local_colls.rs"]
+mod compiled_method_local_colls;
 
 #[path = "classes/compiled_method_void.rs"]
 mod compiled_method_void;

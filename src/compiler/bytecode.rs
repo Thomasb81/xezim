@@ -1521,6 +1521,14 @@ pub struct BytecodeCompiler<'a> {
     /// bank — the registers have no runtime indexing — so any dynamic access
     /// fails the enclosing compile, which rolls back to the AST path.
     local_array_regs: HashMap<String, (RegId, u32, usize, i64)>,
+    /// class-perf row 3: bare names of LOCAL queue / dynamic-array
+    /// declarations compiled in this method body (delegated to the
+    /// interpreter via a StmtFallback of the declaration, so the per-call
+    /// `@name#id` storage and queue bookkeeping live in the interpreter's
+    /// own tables). Each use routes through `local_coll_key`'s `\x01`
+    /// marker so the runtime resolves the store via `dyn_name_lookup` —
+    /// the same precedence as the AST path for a bare local receiver.
+    local_coll_names: HashSet<String>,
     /// Packed-struct field layout of the CURRENT assignment's destination,
     /// installed by the assign arms around their rvalue compile so an
     /// `'{...}` assignment pattern can compile to a Concat. An assignment
@@ -1714,6 +1722,7 @@ impl<'a> BytecodeCompiler<'a> {
             pattern_layout: None,
             local_const_vars: HashMap::default(),
             local_array_regs: HashMap::default(),
+            local_coll_names: HashSet::default(),
             top_module_name: None,
             packed_elem_widths: None,
             assoc_elem_widths: None,
@@ -4068,8 +4077,9 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         // Resolve the receiver shape FIRST (pure, no emission), so a
-        // rejection leaves the insn stream untouched.
-        let (coll, bare): (&str, bool) = match &recv.kind {
+        // rejection leaves the insn stream untouched. (A row-3 local
+        // receiver is an OWNED marked key — `\x01name` — hence the Cow.)
+        let (coll, bare): (std::borrow::Cow<'_, str>, bool) = match &recv.kind {
             // `q.meth()` — the receiver IS `this.q`.
             crate::ast::expr::ExprKind::Ident(h)
                 if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
@@ -4082,7 +4092,15 @@ impl<'a> BytecodeCompiler<'a> {
                 if self.local_var_regs.contains_key(name) {
                     return None;
                 }
-                (name, true)
+                // Row 3: a LOCAL queue / dynamic array declared in this
+                // body — receiver marked so the runtime bare arm resolves
+                // the interpreter's per-call `@name#id` store instead of
+                // the `this` member (a same-named member is shadowed).
+                if self.local_coll_names.contains(name) {
+                    (std::borrow::Cow::Owned(Self::local_coll_key(name)), true)
+                } else {
+                    (std::borrow::Cow::Borrowed(name), true)
+                }
             }
             // `obj.coll.meth()` / `this.coll.meth()` — the receiver is the
             // collection `coll` on the object the base evaluates to.
@@ -4092,14 +4110,16 @@ impl<'a> BytecodeCompiler<'a> {
                 if self.method_handle_chain_class(inner).is_none() {
                     return None;
                 }
-                (member.name.as_str(), false)
+                (std::borrow::Cow::Borrowed(member.name.as_str()), false)
             }
             _ => return None,
         };
         // Instance collection (assoc/queue keys, statics excluded) — bare
         // receivers may additionally be a STATIC collection of the chain.
-        let admitted = self.coll_member_names.contains(coll)
-            || (bare && self.static_coll_member_names.contains(coll));
+        // A marked local receiver is always admitted (row 3).
+        let admitted = self.coll_member_names.contains(coll.as_ref())
+            || (bare && self.static_coll_member_names.contains(coll.as_ref()))
+            || Self::split_local_coll_key(coll.as_ref()).is_some();
         if !admitted {
             return None;
         }
@@ -4136,13 +4156,27 @@ impl<'a> BytecodeCompiler<'a> {
         self.emit(Insn::CallCollMethod(
             dest,
             handle_reg,
-            Box::new(NamePair(coll.into(), meth.into())),
+            Box::new(NamePair(coll.as_ref().into(), meth.into())),
             arg_start,
             n,
             bare as u8,
         ));
         self.emit_arg_slot_writeback(args, arg_start);
         Some(dest)
+    }
+
+    /// class-perf row 3: mark a bare name as a LOCAL collection receiver
+    /// (a queue / dynamic-array declaration compiled in this method). The
+    /// `\x01` prefix is an internal marker — it never appears in user
+    /// names — that the runtime elem/call arms strip before resolving the
+    /// interpreter's per-call `@name#id` storage key (`dyn_name_lookup`).
+    fn local_coll_key(name: &str) -> String {
+        format!("\u{1}{}", name)
+    }
+
+    /// Split a marked local-collection key back to the bare name.
+    fn split_local_coll_key(key: &str) -> Option<&str> {
+        key.strip_prefix('\u{1}')
     }
 
     /// Pure admission probe for member-collection ELEMENT access (Step
@@ -4167,6 +4201,14 @@ impl<'a> BytecodeCompiler<'a> {
                 // A block local or formal shadows the member collection.
                 if self.local_var_regs.contains_key(name) {
                     return None;
+                }
+                // Row 3: a LOCAL queue / dynamic array declared in this
+                // body — its storage is the interpreter's per-call
+                // `@name#id` key, so the marked name routes the elem
+                // read/write/foreach insns through `dyn_name_lookup` —
+                // the exact store and precedence the AST path uses.
+                if self.local_coll_names.contains(name) {
+                    return Some((Self::local_coll_key(name), true, None));
                 }
                 // BARE element access: the collision-excluded plan set (see
                 // `PreboundCompiledMethod::coll_elem_members`).
@@ -7718,17 +7760,66 @@ impl<'a> BytecodeCompiler<'a> {
             }
             StatementKind::VarDecl {
                 data_type,
+                lifetime,
                 declarators,
-                ..
             } => {
                 for decl in declarators {
                     if !decl.dimensions.is_empty() {
+                        // class-perf row 3: a LOCAL queue / dynamic array
+                        // (single queue / unsized unpacked dimension, no
+                        // initializer). Storage and every bit of queue
+                        // bookkeeping (the per-call `@name#id` key, the
+                        // arrays / dynamic_arrays / queue_vars / widths /
+                        // size-shadow / element-type registrations) live in
+                        // the interpreter; re-running the DECLARATION there
+                        // (a StmtFallback of the single-declarator statement
+                        // — `exec_stmt_var_decl` verbatim) keeps all those
+                        // table writes in one place, and the method's own
+                        // queue frame (pushed by the dispatch before the
+                        // block runs) scopes and cleans up the per-call key
+                        // on return. Every later use in this body resolves
+                        // the bare name through the interpreter's own
+                        // precedence (`dyn_name_lookup` → @key, marked via
+                        // `local_coll_names`), so ops are byte-identical to
+                        // the AST path. Decls WITH initializers keep the
+                        // VarDecl_array_init bail: the init lowering
+                        // (pattern spreads, element seeding) is deep and
+                        // stays interpreter-owned in this row.
+                        use crate::ast::types::UnpackedDimension as UD;
+                        if self.method_mode
+                            && decl.init.is_none()
+                            && decl.dimensions.len() == 1
+                            && matches!(
+                                decl.dimensions[0],
+                                UD::Queue { .. } | UD::Unsized(_)
+                            )
+                        {
+                            let synth = Statement::new(
+                                StatementKind::VarDecl {
+                                    data_type: data_type.clone(),
+                                    lifetime: lifetime.clone(),
+                                    declarators: vec![decl.clone()],
+                                },
+                                stmt.span,
+                            );
+                            // Direct emission — NOT emit_fallback: the decl
+                            // reads no registers (init is None), so neither
+                            // the decl_local_regs nor the loop-var hazard
+                            // applies; it must survive even where plain
+                            // fallbacks are barred.
+                            self.emit(Insn::StmtFallback(Box::new((
+                                Arc::new(synth),
+                                Arc::from("VarDecl_local_coll"),
+                            ))));
+                            self.local_coll_names
+                                .insert(decl.name.name.clone());
+                            continue;
+                        }
                         // One constant-bounded unpacked dimension, small: a
                         // register bank. (`logic [7:0] tmp [0:15]` in an
                         // inlined AES shift_rows / rcon table.) Every access
                         // must fold to a constant index or the enclosing
                         // compile fails and rolls back.
-                        use crate::ast::types::UnpackedDimension as UD;
                         let bounds = if decl.dimensions.len() == 1 {
                             match &decl.dimensions[0] {
                                 UD::Range { left, right, .. } => {
