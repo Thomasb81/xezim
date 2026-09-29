@@ -509,6 +509,89 @@ impl Simulator {
         }
     }
 
+    /// VPI `vpiTchk` objects: the number of timing checks.
+    pub(super) fn vpi_tchk_count(&self) -> usize {
+        self.timing_checks.len()
+    }
+
+    /// Check `i`'s system task name (`$setuphold`), instance scope and
+    /// module definition.
+    pub(super) fn vpi_tchk_ident(&self, i: usize) -> Option<(&str, &str, &str)> {
+        let rt = self.timing_checks.get(i)?;
+        Some((&rt.cold.name, &rt.cold.scope, &rt.cold.def_name))
+    }
+
+    /// Check `i`'s limits in source-argument order, as `vpi_get_delays`
+    /// reports them: the one limit of `$setup`/`$hold`/`$recovery`/
+    /// `$removal`/`$skew`/`$timeskew`/`$period`/`$width`, both limits of
+    /// `$setuphold`/`$recrem`/`$fullskew`, the two offsets of `$nochange`.
+    pub(super) fn vpi_tchk_limits(&self, i: usize) -> Option<Vec<i64>> {
+        let rt = self.timing_checks.get(i)?;
+        let name = rt.cold.name.as_str();
+        Some(match rt.kind {
+            TcKind::Window { setup, hold, .. } => match name {
+                "$setup" | "$removal" => vec![setup],
+                "$hold" | "$recovery" => vec![hold],
+                // $recrem(ref, data, recovery_limit, removal_limit): the
+                // recovery side is the one after the reference edge.
+                "$recrem" => vec![hold, setup],
+                _ => vec![setup, hold],
+            },
+            TcKind::Skew { limit }
+            | TcKind::TimeSkew { limit, .. }
+            | TcKind::Period { limit }
+            | TcKind::Width { limit, .. } => vec![limit],
+            TcKind::FullSkew { limit1, limit2, .. } => vec![limit1, limit2],
+            TcKind::Nochange { start, end } => vec![start, end],
+        })
+    }
+
+    /// `vpi_put_delays` on a `vpiTchk`: replace its limits (same order as
+    /// `vpi_tchk_limits`). A negative limit of a single-limit window check is
+    /// taken as 0, as it is when the check is built.
+    pub(super) fn vpi_set_tchk_limits(&mut self, i: usize, l: &[i64]) -> Result<(), String> {
+        let want = self
+            .vpi_tchk_limits(i)
+            .ok_or_else(|| "no such timing check".to_string())?
+            .len();
+        if l.len() != want {
+            return Err(format!(
+                "this timing check has {} limit(s), not {}",
+                want,
+                l.len()
+            ));
+        }
+        let rt = &mut self.timing_checks[i];
+        let name = rt.cold.name.clone();
+        match &mut rt.kind {
+            TcKind::Window { setup, hold, .. } => match name.as_str() {
+                "$setup" | "$removal" => *setup = l[0].max(0),
+                "$hold" | "$recovery" => *hold = l[0].max(0),
+                "$recrem" => {
+                    *hold = l[0];
+                    *setup = l[1];
+                }
+                _ => {
+                    *setup = l[0];
+                    *hold = l[1];
+                }
+            },
+            TcKind::Skew { limit }
+            | TcKind::TimeSkew { limit, .. }
+            | TcKind::Period { limit }
+            | TcKind::Width { limit, .. } => *limit = l[0],
+            TcKind::FullSkew { limit1, limit2, .. } => {
+                *limit1 = l[0];
+                *limit2 = l[1];
+            }
+            TcKind::Nochange { start, end } => {
+                *start = l[0];
+                *end = l[1];
+            }
+        }
+        Ok(())
+    }
+
     /// SDF TIMINGCHECK back-annotation: replace the limits of the matching
     /// checks. An entry matches by instance (scope, full path, or `*` with
     /// the cell type), check kind, port names, edges and `COND` text; one

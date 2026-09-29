@@ -92,3 +92,14 @@ int vpi_control(int operation, ...) {
     }
     return xezim_vpi_control(operation, arg);
 }
+
+/* vpi_handle_multi — IEEE 1800-2017 section 38.22. Variadic, so it lives here
+ * too. The one relation the standard defines through it, vpiInterModPath,
+ * takes exactly two reference handles (an output port and an input port), so
+ * only ref1 and ref2 are read: the standard gives no terminator by which a
+ * longer list could be found. */
+extern void *xezim_vpi_handle_multi(int type, void *ref1, void *ref2);
+
+void *vpi_handle_multi(int type, void *ref1, void *ref2, ...) {
+    return xezim_vpi_handle_multi(type, ref1, ref2);
+}

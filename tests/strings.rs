@@ -95,5 +95,7 @@ mod struct_elem_string_member_format;
 mod system_task_gaps;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
 mod vpi_mcd_and_time_queries;
+#[path = "strings/vpi_routines.rs"]
+mod vpi_routines;
 #[path = "strings/wide_string2num.rs"]
 mod wide_string2num;

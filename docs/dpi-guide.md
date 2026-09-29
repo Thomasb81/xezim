@@ -395,7 +395,12 @@ Each library's `vlog_startup_routines` entries run before simulation.
 - `vpi_register_systf` — both system **tasks** and system **functions**
   (`vpiSysFunc` returns what it deposits via `vpi_put_value` on its own call
   handle; `vpiSizedFunc` gets its width from `sizetf`). A registered name never
-  shadows an xezim builtin.
+  shadows an xezim builtin. It returns the registration's `vpiUserSystf`
+  object, which `vpi_get_systf_info` reads back; `vpi_handle(vpiUserSystf,
+  call)` and `vpi_iterate(vpiUserSystf, NULL)` reach the same objects.
+- Per-call user data: `vpi_put_userdata` / `vpi_get_userdata` on a call handle
+  attach data to that call **instance** — one call site in one module
+  instance — so it persists across every later call from the same place.
 - `vpiSysTfCall` / `vpiArgument` — a `$systf` reads its own arguments; a
   signal-backed argument is writable (so `output` args work), a literal is a
   read-only `vpiConstant`.
@@ -412,6 +417,25 @@ Each library's `vlog_startup_routines` entries run before simulation.
   a module's own timescale for a module handle and the simulation's for NULL,
   as powers of ten in seconds (`-9` = 1 ns). From DPI code, `svGetTime`,
   `svGetTimeUnit` and `svGetTimePrecision` answer the same for an `svScope`.
+- Every value format of `vpi_get_value` / `vpi_put_value`, including
+  `vpiStrengthVal`, `vpiTimeVal`, `vpiObjTypeVal`, `vpiShortIntVal`,
+  `vpiLongIntVal`, `vpiShortRealVal`, `vpiRawTwoStateVal` and
+  `vpiRawFourStateVal` (the header documents which union member each uses).
+- Arrays of any dimension: `vpi_handle_by_name` gives a `vpiMemory`
+  (one-dimensional) or `vpiRegArray` / `vpiNetArray` handle,
+  `vpi_handle_by_multi_index` / `vpi_handle_by_index` select sub-arrays,
+  elements, and part- and bit-selects through the packed dimensions, and
+  `vpi_get_value_array` /
+  `vpi_put_value_array` read and write whole sections in every array format,
+  honouring `vpiUserAllocFlag`, `vpiOneValue` and `vpiPropagateOff`.
+- Delays: `vpi_get_delays` / `vpi_put_delays` on nets (the delay of the
+  gate or continuous assignment driving them), module paths
+  (`vpi_iterate(vpiModPath, mod)`), timing checks (`vpi_iterate(vpiTchk,
+  mod)`, their limits) and intermodule paths
+  (`vpi_handle_multi(vpiInterModPath, outPort, inPort)`). A put changes the
+  delays the simulation uses from then on.
+- `vpi_get_data` / `vpi_put_data`: defined, and always fail (return 0 and
+  report through `vpi_chk_error`) — see below.
 
 **Semantics notes:**
 
@@ -421,17 +445,61 @@ Each library's `vlog_startup_routines` entries run before simulation.
   `vpiParameter`/`vpiMemory`.
 - `vpi_handle(vpiScope, NULL)` returning the top module is an xezim extension
   (the standard route is `vpi_scan(vpi_iterate(vpiModule, NULL))`).
+- `compiletf` runs once per call instance, just before that instance's first
+  `calltf` (xezim has no separate compile phase to run it in), so the usual
+  "allocate per-instance state in compiletf, keep it with
+  `vpi_put_userdata`" pattern works.
+- `vpiStrengthVal`: a variable always reads strong (§38.15); a net reads the
+  drive strength of the continuous assignment or gate driving it — the same
+  record `%v` displays — and strong when none was declared; `z` reads
+  `vpiHiZ`. xezim keeps no strength per value, so `vpi_put_value` with
+  `vpiStrengthVal` (legal only on a scalar) writes the logic value and checks,
+  but does not store, the strengths.
+- `vpiObjTypeVal` picks `vpiIntVal` for an integer-typed object of up to 32
+  bits, `vpiRealVal` for a real, `vpiTimeVal` for a time variable,
+  `vpiStringVal` for a string, `vpiScalarVal` for any other 1-bit object and
+  `vpiVectorVal` for any other vector (§38.15). A real object read in an
+  integer or string-of-digits format is rounded to an integer first; its
+  `vpiStringVal` is its decimal text. Octal and hex digits read `x`/`z` when
+  every bit of the digit is x/z, `X`/`Z` when only some are. `vpiIntVal`
+  sign-extends a signed object narrower than 32 bits.
+- `vpiShortIntVal`, `vpiLongIntVal`, `vpiShortRealVal` and the two raw formats
+  have no member of their own in `s_vpi_value`; xezim carries them in
+  `integer`, `misc` (-> `PLI_INT64`), `real` and `misc` (-> the raw bytes of
+  one array element) respectively, using the implementation-specific `misc`
+  field the standard provides for this.
+- Delays: xezim lowers every gate and continuous assignment onto the net it
+  drives and keeps no primitive or continuous-assignment objects, so their
+  delays are read — and, as an extension, written — through the driven net's
+  handle (1–3 delays: rise, fall, turn-off). A driver elaborated without a
+  delay is compiled into a form that cannot take one unless it is a plain
+  copy, a one-bit gate or an interpreted assignment; putting delays on such a
+  net is refused (reported through `vpi_chk_error`, nothing written), as is
+  a zero rise delay with a non-zero fall or turn-off delay. xezim keeps one
+  value per delay and has no separate pulse limits: `mtm_flag` reads the
+  value in all three slots (a put takes the active min:typ:max selection's),
+  and `pulsere_flag` reads the delay as the reject and error limits (a put
+  whose limits differ from its delay is refused). `append_flag` adds to the
+  current delays. A module path's `vpiFullName` is its output net's; a timing
+  check's is its scope plus the check's name.
+- `vpiInterModPath` delays live where SDF `INTERCONNECT` delays do, on the
+  input port's net. When elaboration collapsed the two ports into one net
+  there is no interconnect between them, and `vpi_handle_multi` returns NULL.
+  Only the first two reference handles of `vpi_handle_multi` are read: the
+  standard defines no other relation for it, nor a terminator for a longer
+  list.
+- `vpi_get_data` / `vpi_put_data` may only be called while a restart / save
+  is in progress (from `cbStartOfRestart`/`cbEndOfRestart` /
+  `cbStartOfSave`/`cbEndOfSave`). xezim has no `$save`/`$restart`, so neither
+  is ever in progress: both return 0 and report the error through
+  `vpi_chk_error`.
 
-**Not implemented** (deliberately *not declared* in `include/vpi_user.h`, so a
-call is a compile error rather than a link surprise):
-`vpi_put_userdata`/`vpi_get_userdata`, `vpi_get_systf_info`,
-`vpi_handle_multi`, `vpi_handle_by_multi_index`,
-`vpi_get_value_array`/`vpi_put_value_array`,
-`vpi_get_delays`/`vpi_put_delays` (the delay/timing relations), and
-`vpiStrengthVal`.
+**Not implemented:** nothing — every routine of IEEE 1800-2017 clause 38 is
+declared in `include/vpi_user.h` and implemented as described above.
 
 Worked examples: `tests/dpi/vpi_object_model.{c,sv}`,
-`tests/dpi/vpi_systf.{c,sv}`.
+`tests/dpi/vpi_systf.{c,sv}`, and `tests/strings/vpi_routines.rs` (user data,
+systf info, arrays, delays and every value format).
 
 ---
 

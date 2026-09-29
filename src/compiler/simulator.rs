@@ -2148,6 +2148,7 @@ mod sv_file;
 mod timing_checks;
 mod ts_x;
 mod uvm_dpi;
+mod vpi_api;
 pub(crate) use code_cov::{
     COND_FN as COV_COND_FN, HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id,
 };
@@ -66632,7 +66633,7 @@ impl Simulator {
             // Checked last so a builtin always wins.
             _ if vpi_systf_is_func(name) => {
                 let self_ptr = self as *mut Simulator;
-                vpi_call_systf(self_ptr, name, args).unwrap_or_else(|| Value::zero(32))
+                vpi_call_systf(self_ptr, name, args, expr.span).unwrap_or_else(|| Value::zero(32))
             }
             // §16.9.3 `$sampled(e)` outside a property: the value in the
             // current time step, which is the operand's current value.
@@ -80755,7 +80756,11 @@ impl Simulator {
 
     fn exec_expr_stmt(&mut self, expr: &Expression) {
         match &expr.kind {
-            ExprKind::SystemCall { name, args } => self.exec_system_task(name, args),
+            ExprKind::SystemCall { name, args } => {
+                // The call site, for a `$systf` registered by a VPI module.
+                vpi_api::set_task_call_span(expr.span);
+                self.exec_system_task(name, args)
+            }
             ExprKind::Ident(hier) => {
                 // §13.3: parens are optional on a task enable — try both the
                 // scope-resolved name and the RAW dotted path (an interface
@@ -81795,7 +81800,8 @@ impl Simulator {
             // Checked last so a builtin always wins.
             _ if vpi_systf_registered(name) => {
                 let self_ptr = self as *mut Simulator;
-                vpi_call_systf(self_ptr, name, args);
+                let span = vpi_api::take_task_call_span();
+                vpi_call_systf(self_ptr, name, args, span);
             }
             _ => {
                 self.warn_unknown_system_task(name, args);
@@ -138148,6 +138154,18 @@ enum VpiKind {
     /// walks its arguments; `vpi_put_value` on it sets a system function's
     /// return value.
     SysTfCall,
+    /// A system task or function registered with `vpi_register_systf`
+    /// (`vpiUserSystf`). `name` is its `$name`.
+    UserSystf,
+    /// A module path (`vpiModPath`): `signal_id` is its output net, `lsb`
+    /// the path's position among that net's paths.
+    ModPath,
+    /// A timing check (`vpiTchk`): `signal_id` indexes the simulator's
+    /// timing checks.
+    Tchk,
+    /// An intermodule path (`vpiInterModPath`): `signal_id` is the input
+    /// port's signal, `inst_idx` the output port's.
+    InterModPath,
 }
 
 /// Wrapper for VPI handles stored as raw pointers.
@@ -138291,6 +138309,9 @@ struct VpiSystfFrame {
     tf_type: libc::c_int,
     /// `sysfunctype`, for a function.
     func_type: libc::c_int,
+    /// The call site (see `vpi_api::systf_site`): what `vpi_put_userdata`
+    /// attaches to, carried by the call handle as its `signal_id`.
+    site: usize,
 }
 
 // Innermost frame last: a `$systf` may invoke another.
@@ -138641,7 +138662,7 @@ fn vpi_slice_of(sim: &Simulator, name: &str) -> Option<VpiHandle> {
 
 /// Read a slice out of its parent signal.
 fn vpi_slice_read(sim: &Simulator, h: &VpiHandle) -> Option<Value> {
-    let parent = sim.signal_table.get(h.signal_id)?;
+    let parent = &vpi_api::cell_value(sim, h.signal_id)?;
     let mut v = Value::zero(h.width);
     for i in 0..h.width as usize {
         v.set_bit_code(i, parent.get_bit_code(h.lsb as usize + i));
@@ -138651,7 +138672,7 @@ fn vpi_slice_read(sim: &Simulator, h: &VpiHandle) -> Option<Value> {
 
 /// Write a slice back into its parent signal.
 fn vpi_slice_write(sim: &Simulator, h: &VpiHandle, val: &Value) -> Option<Value> {
-    let mut parent = sim.signal_table.get(h.signal_id)?.clone();
+    let mut parent = vpi_api::cell_value(sim, h.signal_id)?;
     for i in 0..h.width as usize {
         parent.set_bit_code(h.lsb as usize + i, val.get_bit_code(i));
     }
@@ -138712,13 +138733,21 @@ pub extern "C" fn vpi_handle_by_name(
             // An instance's 1-bit placeholder signal must not be handed out
             // as a signal object.
             if !vpi_is_instance_name(sim, rest) {
+                // Arrays first: a continuous assignment that reads an element
+                // leaves a 1-bit placeholder signal under the array's own
+                // name, which must not shadow the array.
+                if let Some(h) = vpi_memory_of(sim, rest) {
+                    return h.into_raw();
+                }
+                // Multi-dimensional arrays, their sub-arrays, and elements
+                // of arrays too large to have named elements.
+                if let Some(h) = vpi_api::array_object_of(sim, rest) {
+                    return h.into_raw();
+                }
                 if let Some(&id) = sim.signal_name_to_id.get(rest) {
                     return new_vpi_handle(sim, rest, id);
                 }
                 if let Some(h) = vpi_slice_of(sim, rest) {
-                    return h.into_raw();
-                }
-                if let Some(h) = vpi_memory_of(sim, rest) {
                     return h.into_raw();
                 }
             }
@@ -138770,6 +138799,11 @@ pub extern "C" fn vpi_handle_by_index(
     if h.kind != VpiKind::Memory {
         return std::ptr::null_mut();
     }
+    // A multi-dimensional array (or a sub-array) indexes its leftmost
+    // remaining dimension, exactly as one index of vpi_handle_by_multi_index.
+    if let Some(r) = vpi_api::index_array_handle(h, index) {
+        return r;
+    }
     let full = h.full_name.clone();
     try_active_sim("vpi_handle_by_index", |sim| {
         let rel = vpi_strip_top(sim, &full).to_string();
@@ -138800,13 +138834,16 @@ pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mu
         return VPI_SYSTF_STACK.with(|st| {
             let st = st.borrow();
             match st.last() {
-                Some(f) => VpiHandle::systf_call(
-                    st.len() - 1,
-                    &f.name,
-                    f.tf_type == vpi::SYS_FUNC,
-                    f.ret_width,
-                )
-                .into_raw(),
+                Some(f) => {
+                    let mut h = VpiHandle::systf_call(
+                        st.len() - 1,
+                        &f.name,
+                        f.tf_type == vpi::SYS_FUNC,
+                        f.ret_width,
+                    );
+                    h.signal_id = f.site;
+                    h.into_raw()
+                }
                 None => {
                     vpi_error(
                         vpi::ERROR,
@@ -138816,6 +138853,9 @@ pub extern "C" fn vpi_handle(type_: libc::c_int, refh: *mut libc::c_void) -> *mu
                 }
             }
         });
+    }
+    if type_ == vpi_api::vc::USER_SYSTF {
+        return vpi_api::user_systf_of_call(refh);
     }
     try_active_sim("vpi_handle", |sim| {
         if type_ != vpi::SCOPE {
@@ -138906,6 +138946,9 @@ fn vpi_scope_members(sim: &Simulator, scope: &str) -> Vec<(String, usize)> {
 /// yields nothing, as the standard requires (callers test for it).
 #[unsafe(no_mangle)]
 pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *mut libc::c_void {
+    if let Some(it) = vpi_api::iterate_extra(type_, refh) {
+        return it;
+    }
     // The arguments of a $systf call. Handled before the design traversal
     // below because it needs no simulator, only the call frame.
     if type_ == vpi::ARGUMENT {
@@ -139196,9 +139239,10 @@ pub extern "C" fn vpi_register_systf(data: *mut s_vpi_systf_data) -> *mut libc::
         tf_type: d.type_,
         func_type: d.sysfunctype,
     };
-    VPI_SYSTFS.with(|m| m.borrow_mut().insert(name, entry));
-    // The returned handle is only compared against NULL in practice.
-    VpiHandle::signal(0, vpi::UNDEFINED, "", "").into_raw()
+    VPI_SYSTFS.with(|m| m.borrow_mut().insert(name.clone(), entry));
+    // The `vpiUserSystf` object: `vpi_get_systf_info` reads it back.
+    vpi_api::note_registered_systf(&name);
+    vpi_api::user_systf_handle(&name).into_raw()
 }
 
 /// Call a registered `$systf`. Returns false when `name` is not registered,
@@ -139225,8 +139269,16 @@ fn vpi_sysfunc_width(entry: &VpiSystf) -> u32 {
 ///
 /// Returns the function's return value; `None` for a task, or when `name` is
 /// not registered (so the caller can fall through to its own diagnostic).
-fn vpi_call_systf(sim: *mut Simulator, name: &str, args: &[Expression]) -> Option<Value> {
+fn vpi_call_systf(
+    sim: *mut Simulator,
+    name: &str,
+    args: &[Expression],
+    span: crate::ast::Span,
+) -> Option<Value> {
     let entry = VPI_SYSTFS.with(|m| m.borrow().get(name).copied())?;
+    // The call instance this invocation belongs to (its user data lives
+    // there, and its compiletf runs once).
+    let (site, first_call) = vpi_api::systf_site(unsafe { &*sim }, name, span);
 
     let is_func = entry.tf_type == vpi::SYS_FUNC;
     let ret_width = if is_func {
@@ -139250,6 +139302,7 @@ fn vpi_call_systf(sim: *mut Simulator, name: &str, args: &[Expression]) -> Optio
             ret_width,
             tf_type: entry.tf_type,
             func_type: entry.func_type,
+            site,
         })
     });
 
@@ -139257,7 +139310,9 @@ fn vpi_call_systf(sim: *mut Simulator, name: &str, args: &[Expression]) -> Optio
     // Foreign code may read what the design wrote to a file.
     unsafe { (*sim).flush_file_writes() };
     type TfFn = extern "C" fn(*mut libc::c_char) -> libc::c_int;
-    if entry.compiletf != 0 {
+    // compiletf runs once per call instance, just before that instance's
+    // first calltf: xezim has no separate compile phase to run it in.
+    if entry.compiletf != 0 && first_call {
         let f: TfFn = unsafe { std::mem::transmute(entry.compiletf as *const ()) };
         f(entry.user_data as *mut libc::c_char);
     }
@@ -139480,6 +139535,11 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
     if property == vpi::DIRECTION {
         return h.direction;
     }
+    // Properties of the objects `vpi_api` adds (systf, timing objects,
+    // packed-arena memory words).
+    if let Some(v) = vpi_api::get_property(property, h) {
+        return v;
+    }
     // vpiFuncType of a system function call is its `sysfunctype`.
     if h.kind == VpiKind::SysTfCall {
         return match property {
@@ -139593,7 +139653,14 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
     // Modules, memories, iterators and call handles have no readable value.
     if matches!(
         h.kind,
-        VpiKind::Module | VpiKind::Iterator | VpiKind::Memory | VpiKind::SysTfCall
+        VpiKind::Module
+            | VpiKind::Iterator
+            | VpiKind::Memory
+            | VpiKind::SysTfCall
+            | VpiKind::UserSystf
+            | VpiKind::ModPath
+            | VpiKind::Tchk
+            | VpiKind::InterModPath
     ) {
         vpi_error(
             vpi::ERROR,
@@ -139611,13 +139678,17 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
                 None => return false,
             }
         } else {
-            match sim.signal_table.get(sig_id) {
-                Some(v) => v.clone(),
+            match vpi_api::cell_value(sim, sig_id) {
+                Some(v) => v,
                 None => return false,
             }
         };
         let current_time = sim.time;
-        fill_vpi_value(&val, current_time, Some(h.type_code), vp)
+        // vpiStrengthVal reports the driving strength of a net.
+        vpi_api::set_strength_hint(sim, sig_id, h.type_code, vp.format);
+        let ok = fill_vpi_value(&val, current_time, Some(h.type_code), vp);
+        vpi_api::clear_strength_hint();
+        ok
     })
     .unwrap_or(false);
 
@@ -139646,28 +139717,33 @@ fn fill_vpi_value(
 ) -> bool {
     {
         // vpiObjTypeVal: the simulator picks the object's natural format
-        // and reports which one it chose in `format`.
+        // and reports which one it chose in `format` (§38.15).
         let mut format = vp.format;
         if format == vpi::OBJ_TYPE_VAL {
-            format = match obj_type_code {
-                // Preserve declaration-typed object flavor when known.
-                Some(vpi::STRING_VAR) => vpi::STRING_VAL,
-                Some(vpi::TIME_VAR) => vpi::TIME_VAL,
-                Some(vpi::REAL_VAR) | Some(vpi::SHORT_REAL_VAR) => vpi::REAL_VAL,
-                Some(vpi::BIT_VAR) if val.width <= 1 => vpi::SCALAR_VAL,
-                _ if val.is_real => vpi::REAL_VAL,
-                _ if val.width <= 32 => vpi::INT_VAL,
-                _ => vpi::VECTOR_VAL,
-            };
+            format = vpi_api::obj_type_format(val, obj_type_code);
             vp.format = format;
         }
+        // §38.15: a real object is converted to an integer, rounded as
+        // §6.12.2 specifies, for every format but vpiRealVal and vpiStringVal.
+        let rounded;
+        let val = if val.is_real && !vpi_api::format_keeps_real(format) {
+            rounded = vpi_api::real_to_integer(val);
+            &rounded
+        } else {
+            val
+        };
 
         match format {
             vpi::INT_VAL => {
-                // PLI_INT32: the low 32 bits, X/Z read as 0. Callers that
-                // need the full width must use vpiVectorVal; vpiSize tells
-                // them whether they do.
-                vp.value.integer = (val.to_u64().unwrap_or(0) & 0xFFFF_FFFF) as u32 as libc::c_int;
+                // PLI_INT32: the low 32 bits, X/Z read as 0, a signed value
+                // sign-extended. Callers that need the full width must use
+                // vpiVectorVal; vpiSize tells them whether they do.
+                let n = if val.is_signed {
+                    val.to_i64().unwrap_or(0) as u64
+                } else {
+                    val.to_u64().unwrap_or(0)
+                };
+                vp.value.integer = (n & 0xFFFF_FFFF) as u32 as libc::c_int;
             }
             vpi::REAL_VAL => vp.value.real = val.to_f64(),
             vpi::SCALAR_VAL => {
@@ -139687,9 +139763,12 @@ fn fill_vpi_value(
                 vp.value.vector = ptr;
             }
             vpi::BIN_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 1)),
-            vpi::OCT_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 3)),
-            vpi::HEX_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_radix_string(val, 4)),
+            vpi::OCT_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_api::radix_string_xz(val, 3)),
+            vpi::HEX_STR_VAL => vp.value.str = vpi_str_scratch(&vpi_api::radix_string_xz(val, 4)),
             vpi::DEC_STR_VAL => vp.value.str = vpi_str_scratch(&val.to_dec_string()),
+            vpi::STRING_VAL if val.is_real => {
+                vp.value.str = vpi_str_scratch(&vpi_api::real_string(val.to_f64()))
+            }
             vpi::STRING_VAL => vp.value.str = vpi_str_scratch(&val.to_sv_string()),
             vpi::TIME_VAL => {
                 let t = val.to_u64().unwrap_or(0);
@@ -139711,7 +139790,9 @@ fn fill_vpi_value(
                 vp.value.time = ptr;
             }
             vpi::SUPPRESS_VAL => {} // caller explicitly wants no value
-            _ => return false,      // vpiStrengthVal and anything unknown
+            // vpiStrengthVal, the short/long/shortreal formats and the raw
+            // formats; false for anything unknown.
+            other => return vpi_api::fill_extra_format(val, obj_type_code, other, vp),
         }
         true
     }
@@ -139744,7 +139825,10 @@ fn dispatch_vpi_cb(
         (vpi::CB_VALUE_CHANGE, Some(v)) => {
             let obj_type_code =
                 unsafe { vpi_deref(cb.obj as *mut libc::c_void).map(|h| h.type_code) };
-            fill_vpi_value(v, current_time, obj_type_code, &mut value)
+            vpi_api::set_strength_hint_raw(sim_ptr, cb.signal_id, obj_type_code, value.format);
+            let ok = fill_vpi_value(v, current_time, obj_type_code, &mut value);
+            vpi_api::clear_strength_hint();
+            ok
         }
         _ => false,
     };
@@ -139871,7 +139955,21 @@ pub extern "C" fn vpi_put_value(
             return std::ptr::null_mut();
         }
         let sig_id = h.signal_id;
+        if matches!(
+            h.kind,
+            VpiKind::UserSystf | VpiKind::ModPath | VpiKind::Tchk | VpiKind::InterModPath
+        ) {
+            vpi_error(
+                vpi::ERROR,
+                "vpi_put_value: this object has no value; ignored".into(),
+            );
+            return std::ptr::null_mut();
+        }
 
+        if flags == vpi::RELEASE_FLAG && is_packed_id(sig_id) {
+            // Nothing can force a packed-arena word, so there is nothing to release.
+            return std::ptr::null_mut();
+        }
         if flags == vpi::RELEASE_FLAG {
             // Release: remove from forced_signals and trigger settle
             sim.forced_signals.remove(&sig_id);
@@ -139901,9 +139999,9 @@ pub extern "C" fn vpi_put_value(
         let w = if h.kind == VpiKind::Slice {
             h.width
         } else {
-            sim.signal_widths.get(sig_id).copied().unwrap_or(32)
+            vpi_api::cell_width(sim, sig_id).unwrap_or(32)
         };
-        let is_signed = sim.signal_signed.get(sig_id).copied().unwrap_or(false);
+        let is_signed = vpi_api::cell_signed(sim, sig_id);
         let vp = unsafe { &*value_p };
 
         // A format we cannot decode writes NOTHING. The old code fell
@@ -139922,8 +140020,9 @@ pub extern "C" fn vpi_put_value(
             vpi::SCALAR_VAL => {
                 let mut v = Value::zero(w);
                 let code = match unsafe { vp.value.scalar } {
-                    vpi::SCALAR_0 => 0,
-                    vpi::SCALAR_1 => 1,
+                    // vpiL / vpiH are the weak 0 / 1 levels.
+                    vpi::SCALAR_0 | vpi_api::vc::SCALAR_L => 0,
+                    vpi::SCALAR_1 | vpi_api::vc::SCALAR_H => 1,
                     vpi::SCALAR_X => 2,
                     vpi::SCALAR_Z => 3,
                     other => {
@@ -140020,17 +140119,22 @@ pub extern "C" fn vpi_put_value(
                 v.is_signed = is_signed;
                 v
             }
-            other => {
-                vpi_error(
-                    vpi::ERROR,
-                    format!(
-                        "vpi_put_value: unsupported format {} (nothing written)",
-                        other
-                    ),
-                );
-                return std::ptr::null_mut();
-            }
+            // vpiTimeVal, vpiStrengthVal, the short/long/shortreal formats and
+            // the raw formats.
+            other => match vpi_api::decode_extra_put(vp, other, w, is_signed) {
+                Ok(v) => v,
+                Err(msg) => {
+                    vpi_error(
+                        vpi::ERROR,
+                        format!("vpi_put_value: {} (nothing written)", msg),
+                    );
+                    return std::ptr::null_mut();
+                }
+            },
         };
+        // §6.12.2: an integral value put to a real object converts to real, a
+        // real one put to an integral object rounds to an integer.
+        let value = vpi_api::fit_put_value(sim, h, value, w, is_signed);
 
         // Splice a slice back into its parent before it hits the signal table.
         let value = if h.kind == VpiKind::Slice {
@@ -140041,6 +140145,19 @@ pub extern "C" fn vpi_put_value(
         } else {
             value
         };
+
+        // A word of a packed-arena memory has no signal-table slot.
+        if is_packed_id(sig_id) {
+            if flags == vpi::FORCE_FLAG {
+                vpi_error(
+                    vpi::ERROR,
+                    "vpi_put_value: an element of a packed-arena memory cannot be forced".into(),
+                );
+            } else {
+                sim.cell_write(sig_id, &value);
+            }
+            return std::ptr::null_mut();
+        }
 
         // For force: write value first, THEN add to forced_signals
         if flags == vpi::FORCE_FLAG {

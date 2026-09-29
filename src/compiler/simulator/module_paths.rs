@@ -68,6 +68,36 @@ impl ModulePaths {
     pub(super) fn stamp(&mut self, slot: u32, now: u64) {
         self.srcs[slot as usize].last = now;
     }
+
+    /// VPI `vpiModPath` objects: every path-delayed net with the number of
+    /// paths leading into it.
+    pub(super) fn vpi_nets(&self) -> Vec<(usize, usize)> {
+        self.dst
+            .iter()
+            .map(|(&id, &k)| (id, self.tables[k].len()))
+            .collect()
+    }
+
+    /// The twelve transition delays of path `i` into net `id`.
+    pub(super) fn vpi_delays(&self, id: usize, i: usize) -> Option<[u64; 12]> {
+        let k = self.table_of(id)?;
+        self.tables[k].get(i).map(|p| p.delays)
+    }
+
+    /// `vpi_put_delays` on a `vpiModPath`: the delays the next change of the
+    /// net schedules with.
+    pub(super) fn vpi_set_delays(&mut self, id: usize, i: usize, d: [u64; 12]) -> bool {
+        let Some(k) = self.table_of(id) else {
+            return false;
+        };
+        match self.tables[k].get_mut(i) {
+            Some(p) => {
+                p.delays = d;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// §30.4.4.1: a condition that is x or z enables its path, so the path is
