@@ -122,6 +122,8 @@ mod compiled_method_super;
 mod compiled_method_static_scope;
 #[path = "classes/compiled_method_statics.rs"]
 mod compiled_method_statics;
+#[path = "classes/compiled_method_pcache.rs"]
+mod compiled_method_pcache;
 #[path = "classes/compiled_method_tiering.rs"]
 mod compiled_method_tiering;
 #[path = "classes/compiled_method_cast.rs"]

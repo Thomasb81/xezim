@@ -528,6 +528,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Memory: per-array cell census sizing the packed word-storage opportunity",
     ),
     (
+        "XEZIM_METHOD_CACHE",
+        "class-perf: persistent compiled-method cache dir (1 = default location, unset = off)",
+    ),
+    (
         "XEZIM_METHOD_PROFILE",
         "class-perf: sample class-method execution (in-process sampling profiler)",
     ),

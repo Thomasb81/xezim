@@ -221,6 +221,40 @@ fn method_tier_threshold() -> u32 {
             .unwrap_or(100)
     })
 }
+
+/// Compiler salt for the persistent compiled-method cache (XEZIM_METHOD_CACHE).
+/// Bump on ANY change that can alter the compiled instructions or the
+/// admit/decline decision for the same source text — admission inputs,
+/// lowering, register allocation, block layout. Stale entries with an old
+/// salt hash to different keys and are simply recompiled; the safety net is
+/// the suite-level ON == OFF parity run against a warm cache.
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3031;
+
+/// Cache directory for the persistent compiled-method cache, from
+/// XEZIM_METHOD_CACHE. Unset: disabled. "0" or empty: disabled. "1":
+/// <XDG_CACHE_HOME or ~/.cache>/xezim/method-cache. Any other value: that
+/// literal path. The directory is created lazily on the first WRITE (a
+/// read-only run must not fail or litter just because the env var is set).
+fn method_cache_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let raw = std::env::var("XEZIM_METHOD_CACHE").ok()?;
+        if raw.is_empty() || raw == "0" {
+            return None;
+        }
+        if raw != "1" {
+            return Some(std::path::PathBuf::from(raw));
+        }
+        let base = std::env::var_os("XDG_CACHE_HOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+            })?;
+        Some(base.join("xezim").join("method-cache"))
+    })
+    .as_deref()
+}
 /// Sampler thread: read the hot thread's current hash and bump.
 pub fn sampler_sample() {
     let h = CUR_METHOD_HASH.load(Ordering::Relaxed);
@@ -133843,6 +133877,110 @@ impl Simulator {
     /// formals, no string/collection result, and a body `compile_class_method`
     /// fully lowers. The block only reads `this` members (heap) plus seeded
     /// formal/this registers — byte-identical to the AST path by construction.
+    /// Content key for the persistent compiled-method cache: a hash over
+    /// everything the compiled lowering of THIS (class, method, widths)
+    /// depends on that lives outside the cache entry itself:
+    /// - the compiler salt (bumped on any compiler change),
+    /// - the FULL Debug dump of the class chain (each class's members,
+    ///   typedefs, method set, and every other declaration the admission
+    ///   walks read),
+    /// - the method name and the formal/result width vector (the memory
+    ///   cache key),
+    /// - the module-scope typedef aliases that can name a class
+    ///   (scope_static_receivers) and the class/module-signal NAME CLASHES
+    ///   that remove receivers — both tiny sets, included so an unrelated
+    ///   design that agrees where it matters still shares UVM entries.
+    /// A design change that alters any of these hashes to a different key
+    /// and recompiles; hash collisions are astronomically unlikely
+    /// (DefaultHasher, 64-bit) and covered by the suite parity safety net.
+    fn persisted_method_key(
+        &self,
+        cname: &str,
+        method_name: &str,
+        formal_widths: &[u32],
+        result_width: u32,
+    ) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        METHOD_CACHE_COMPILER_SALT.hash(&mut h);
+        let mut cur = cname.to_string();
+        let mut depth = 0usize;
+        while let Some(cd) = self.module.classes.get(&cur) {
+            cur.hash(&mut h);
+            format!("{:?}", cd).hash(&mut h);
+            match cd.extends.clone() {
+                Some(parent) => {
+                    depth += 1;
+                    if depth >= 64 {
+                        break;
+                    }
+                    cur = parent;
+                }
+                None => break,
+            }
+        }
+        method_name.hash(&mut h);
+        formal_widths.hash(&mut h);
+        result_width.hash(&mut h);
+        let mut aliases: Vec<&str> = self
+            .module
+            .typedef_types
+            .iter()
+            .filter(|(_, t)| {
+                matches!(t, crate::ast::types::DataType::TypeReference { .. })
+            })
+            .map(|(n, _)| n.as_str())
+            .collect();
+        aliases.sort_unstable();
+        aliases.hash(&mut h);
+        let mut clashes: Vec<&str> = self
+            .module
+            .classes
+            .keys()
+            .filter(|n| self.signal_name_to_id.contains_key(n.as_str()))
+            .map(|n| n.as_str())
+            .collect();
+        clashes.sort_unstable();
+        clashes.hash(&mut h);
+        h.finish()
+    }
+
+    /// Disk probe for one method-cache entry. Any error (missing file,
+    /// truncated/garbage payload, deserialization mismatch after a compiler
+    /// change) is a MISS: the caller recompiles and overwrites.
+    fn load_persisted_method(&self, key: u64) -> Option<super::bytecode::PersistedMethodOutcome> {
+        let dir = method_cache_dir()?;
+        let bytes = std::fs::read(dir.join(format!("m{:016x}.bin", key))).ok()?;
+        bincode::deserialize(&bytes).ok()
+    }
+
+    /// Best-effort atomic store (tmp file + rename; the pid suffix keeps
+    /// concurrent workers from clobbering each other's tmp files). A failed
+    /// write NEVER fails the simulation — the next run just recompiles.
+    fn store_persisted_method(
+        &self,
+        key: u64,
+        outcome: &super::bytecode::PersistedMethodOutcome,
+    ) {
+        let Some(dir) = method_cache_dir() else {
+            return;
+        };
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let Ok(bytes) = bincode::serialize(outcome) else {
+            return;
+        };
+        let tmp = dir.join(format!("m{:016x}.tmp.{}", key, std::process::id()));
+        let path = dir.join(format!("m{:016x}.bin", key));
+        if std::fs::write(&tmp, &bytes)
+            .and_then(|_| std::fs::rename(&tmp, &path))
+            .is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
     fn try_run_compiled_method(
         &mut self,
         handle: usize,
@@ -134106,7 +134244,45 @@ impl Simulator {
             Some(super::bytecode::CompiledMethodOutcome::Nil) => {
                 return None;
             }
-            None => {
+            None => 'disk: {
+                // Persistent method cache (XEZIM_METHOD_CACHE): probe disk
+                // BEFORE the admission walks and compilation — a warm run
+                // must pay neither. The disk key is content-based (class
+                // chain + widths + salt), not the elaboration-local memory
+                // key. A miss falls through to compile-and-store below; a
+                // garbage/corrupt payload is just a miss.
+                let disk_key = method_cache_dir().map(|_| {
+                    self.persisted_method_key(cname, method_name, &pre.formal_widths, result_width)
+                });
+                if let Some(k) = disk_key {
+                    match self.load_persisted_method(k) {
+                        Some(super::bytecode::PersistedMethodOutcome::Block {
+                            block,
+                            this_reg,
+                            result_reg,
+                        }) => {
+                            let entry = super::bytecode::CompiledMethodEntry {
+                                block: std::rc::Rc::new(block),
+                                this_reg,
+                                result_reg,
+                            };
+                            let rc = std::rc::Rc::new(entry);
+                            self.compiled_method_block_cache.insert(
+                                key,
+                                super::bytecode::CompiledMethodOutcome::Block(rc.clone()),
+                            );
+                            break 'disk rc;
+                        }
+                        Some(super::bytecode::PersistedMethodOutcome::Nil) => {
+                            self.compiled_method_block_cache.insert(
+                                key,
+                                super::bytecode::CompiledMethodOutcome::Nil,
+                            );
+                            return None;
+                        }
+                        None => {} // miss: compile below
+                    }
+                }
                 // Compile all-or-nothing. On any lowering failure, none the
                 // key (so it is not retried per call) and fall to AST.
                 let mut shadow_names = self.class_scoping_shadow_names(cname);
@@ -134378,6 +134554,12 @@ impl Simulator {
                         key,
                         super::bytecode::CompiledMethodOutcome::Nil,
                     );
+                    if let Some(k) = disk_key {
+                        self.store_persisted_method(
+                            k,
+                            &super::bytecode::PersistedMethodOutcome::Nil,
+                        );
+                    }
                     return None;
                 };
                 let uses_this = |i: &super::bytecode::Insn| {
@@ -134398,7 +134580,32 @@ impl Simulator {
                         key,
                         super::bytecode::CompiledMethodOutcome::Nil,
                     );
+                    if let Some(k) = disk_key {
+                        self.store_persisted_method(
+                            k,
+                            &super::bytecode::PersistedMethodOutcome::Nil,
+                        );
+                    }
                     return None;
+                }
+                // Persist the compiled block for future runs. Blocks that
+                // embed SigIds never persist (signal ids are per-design);
+                // everything else in a block is name-keyed and content-
+                // stable across designs that hash to the same key. The
+                // `result_reg.is_some()` guard mirrors the `?` below: a
+                // block this run declines to use is not persisted either,
+                // so warm runs make exactly the decisions cold runs do.
+                if let (Some(k), Some(rreg)) = (disk_key, result_reg) {
+                    if !block.carries_sig_id() {
+                        self.store_persisted_method(
+                            k,
+                            &super::bytecode::PersistedMethodOutcome::Block {
+                                block: block.clone(),
+                                this_reg,
+                                result_reg: rreg,
+                            },
+                        );
+                    }
                 }
                 let entry = super::bytecode::CompiledMethodEntry {
                     block: std::rc::Rc::new(block),

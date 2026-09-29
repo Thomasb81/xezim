@@ -871,6 +871,61 @@ pub enum CompiledMethodOutcome {
     Nil,
 }
 
+/// class-perf persistent cache (XEZIM_METHOD_CACHE): the disk form of one
+/// compiled class-method outcome — the Rc-free mirror of
+/// `CompiledMethodOutcome`, bincode-serialized under a content key in the
+/// method-cache directory. Loaded on the memory-cache miss path right
+/// before re-running admission/compilation, so a warm run pays neither.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum PersistedMethodOutcome {
+    Block {
+        block: CompiledBlock,
+        this_reg: RegId,
+        result_reg: RegId,
+    },
+    /// Negative outcome: this method declines compilation. Persisted so a
+    /// warm run skips the admission walk too.
+    Nil,
+}
+
+impl CompiledBlock {
+    /// True when any instruction embeds a `SigId`. Signal ids are stable
+    /// only within one elaboration of one design, so a method block that
+    /// carries them is NEVER written to the persistent method cache (a hit
+    /// from another design would read a different signal). The match is
+    /// exhaustive over `Insn`: a new signal-carrying variant must be listed
+    /// here or the write guard silently stops covering it.
+    pub fn carries_sig_id(&self) -> bool {
+        self.instructions.iter().any(|i| i.carries_sig_id())
+    }
+}
+
+impl Insn {
+    fn carries_sig_id(&self) -> bool {
+        use Insn::*;
+        matches!(
+            self,
+            LoadSignal(..)
+                | LoadSignalSigned(..)
+                | BlockingAssignString(..)
+                | NbaAssign(..)
+                | NbaAssignRange(..)
+                | NbaAssignRangeDyn(..)
+                | NbaAssignBitDyn(..)
+                | BlockingAssign(..)
+                | BlockingAssignRange(..)
+                | BlockingAssignRangeDyn(..)
+                | BlockingAssignBitDyn(..)
+                | LoadSignalRange(..)
+                | LoadSignalRangeDyn(..)
+                | LoadSignalBit(..)
+                | NbaAssignConst(..)
+                | BranchIfSignalFalse(..)
+                | NbaAssignArrayRead(..)
+        )
+    }
+}
+
 impl Insn {
     /// Region fusion (`build_comb_entries`): shift every register operand by
     /// `rb` and every branch target by `ib` so one member block can be
