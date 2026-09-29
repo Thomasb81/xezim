@@ -848,6 +848,16 @@ pub(super) struct PreboundCompiledMethod {
     /// behavior.) Element reads/writes only — CALLS stay admitted for the
     /// name (the AST call funnel is class-first too).
     pub coll_elem_members: std::rc::Rc<HashSet<String>>,
+    /// class-perf row 2: names of NON-INPUT formals (output / inout / ref —
+    /// the interpreter's `output_bindings` copy-out set) admitted to the
+    /// compiled path as plain scalars (integral / string / enum / class
+    /// handle, no dimensions). After `exec_insns` the runtime copies these
+    /// formals' registers back into the bound locals frame so the
+    /// interpreter epilogue's write-back to the caller's actual observes
+    /// the body's final values, exactly like the AST path's frame locals.
+    /// Identity-bound aggregates (ref queues/arrays/structs) are NOT here
+    /// — they still decline.
+    pub writeback_formals: std::rc::Rc<Vec<String>>,
 }
 
 /// class-perf Step 4b: a cached, fully-lowered class-FUNCTION body plus the
@@ -3797,6 +3807,30 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_var_regs.get(&seg.name.name).copied()
     }
 
+    /// class-perf row 2 (non-input formals): after a call whose args were
+    /// marshalled into contiguous fresh slots, copy each slot that a bare
+    /// register-backed LOCAL was marshalled from back into that local.
+    /// For an input formal the slot still holds the marshalled value (a
+    /// callee cannot touch the caller's register file), so the Move is
+    /// value-neutral; for a non-input (output/inout/ref) formal the
+    /// runtime's arg-temp drain writes the callee's final value into the
+    /// slot and this Move lands it in the local — the same write the AST
+    /// path performs on the actual after the epilogue.
+    fn emit_arg_slot_writeback(&mut self, args: &[Expression], arg_start: RegId) {
+        for (i, a) in args.iter().enumerate() {
+            let ExprKind::Ident(h) = &a.kind else {
+                continue;
+            };
+            let Some((src, _)) = self.local_var_reg_of(h) else {
+                continue;
+            };
+            let slot = (arg_start as usize + i) as RegId;
+            if slot != src {
+                self.emit(Insn::Move(src, slot));
+            }
+        }
+    }
+
     /// class-perf method-mode: when `base` denotes the receiving object
     /// (`this`) or a method-local CLASS HANDLE, return the VM register whose
     /// value is that object's heap handle — the base register for
@@ -4107,6 +4141,7 @@ impl<'a> BytecodeCompiler<'a> {
             n,
             bare as u8,
         ));
+        self.emit_arg_slot_writeback(args, arg_start);
         Some(dest)
     }
 
@@ -10978,6 +11013,7 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
+                        self.emit_arg_slot_writeback(args, arg_start);
                         return Some(dest);
                     }
                     self.insns.truncate(call_start);
@@ -11055,6 +11091,7 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
+                        self.emit_arg_slot_writeback(args, arg_start);
                         return Some(dest);
                     }
                     self.insns.truncate(call_start);
@@ -11141,6 +11178,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 arg_start,
                                 n,
                             ));
+                            self.emit_arg_slot_writeback(args, arg_start);
                             return Some(dest);
                         }
                         self.emit(Insn::CallMethod(
@@ -11150,6 +11188,7 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
+                        self.emit_arg_slot_writeback(args, arg_start);
                         return Some(dest);
                     }
                     self.insns.truncate(call_start);
@@ -11251,6 +11290,7 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
+                        self.emit_arg_slot_writeback(args, arg_start);
                         return Some(dest);
                     }
                     self.insns.truncate(call_start);
@@ -14039,6 +14079,7 @@ impl<'a> BytecodeCompiler<'a> {
         static_coll_member_names: &HashSet<String>,
         coll_elem_members: &HashSet<String>,
         string_formals: &HashSet<String>,
+        writeback_formals: &[String],
         result: Option<(&str, u32, bool, bool)>,
         body: &[&crate::ast::stmt::Statement],
     ) -> Option<(CompiledBlock, RegId, Option<RegId>, Option<RegId>)> {
@@ -14234,6 +14275,20 @@ impl<'a> BytecodeCompiler<'a> {
         // before the block ends.
         if let Some(r) = result_reg {
             self.emit(Insn::Move(r, r));
+        }
+        // class-perf row 2: the same OBSERVABLE-EXPORT trick for NON-INPUT
+        // (output / inout / ref) formals — the runtime reads their registers
+        // after `exec_insns` returns (copying them into the locals frame so
+        // the interpreter epilogue's write-back reaches the caller's
+        // actuals). Without a trailing self-read the copy-forwarding
+        // peephole sees a body-final store to such a formal as dead (`r = 7`
+        // in `f(output int r)` compiled to nothing) and the caller observes
+        // the stale entry value. The marker sits after the common exit so
+        // every fall-through/`return` path executes it.
+        for name in writeback_formals {
+            if let Some(&(fr, _)) = self.local_var_regs.get(name) {
+                self.emit(Insn::Move(fr, fr));
+            }
         }
 
         let block = self.finish();
@@ -16994,7 +17049,7 @@ mod tests {
         let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -17058,7 +17113,7 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body);
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -17097,7 +17152,7 @@ mod tests {
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), Some(("f", 32, false, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );

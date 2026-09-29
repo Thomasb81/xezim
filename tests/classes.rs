@@ -105,6 +105,10 @@ mod compiled_method_string_forms;
 
 #[path = "classes/compiled_method_string_members.rs"]
 mod compiled_method_string_members;
+#[path = "classes/compiled_method_enum_formals.rs"]
+mod compiled_method_enum_formals;
+#[path = "classes/compiled_method_ref_formals.rs"]
+mod compiled_method_ref_formals;
 #[path = "classes/compiled_method_collection_calls.rs"]
 mod compiled_method_collection_calls;
 #[path = "classes/compiled_method_coll_elems.rs"]

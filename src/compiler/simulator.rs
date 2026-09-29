@@ -31202,23 +31202,34 @@ impl Simulator {
                         .to_u64()
                         .unwrap_or(0) as usize;
                     let base = *arg_start as usize;
-                    let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
-                    for i in 0..*n_args as usize {
-                        argvals.push(self.vm_regs.get(base + i).cloned().unwrap_or(Value::zero(32)));
-                    }
-                    // Hand the runtime arg VALUES to the interpreter's method
-                    // dispatcher as constant-expressions (an integer/real literal
-                    // whose cached bits round-trip exactly), so every callee-
-                    // binding feature (normalize_call_args, defaults, ref /
-                    // output write-backs, __vif_local__) runs untouched. A
-                    // compiled callee re-enters try_run_compiled_method, which
-                    // swaps `self.vm_regs` out and back, so our caller regs
-                    // below survive the nested VM.
-                    let args: Vec<Expression> = argvals
-                        .iter()
-                        .map(|v| self.value_method_arg_expr(v))
-                        .collect();
+                    let n = *n_args as usize;
+                    // class-perf row 2: resolve the callee once more for the
+                    // write-back temp set. A wrong guess here (ctor-stack
+                    // dispatch edge) merely keeps the constant wrapper —
+                    // the historic behavior — never a wrong write-back.
+                    let callee_class = self
+                        .heap
+                        .get(handle)
+                        .and_then(|i| i.as_ref().map(|inst| inst.class_name.clone()));
+                    let (args, temps) = match callee_class {
+                        Some(cn) => self.vm_args_with_writeback(&cn, method, base, n),
+                        None => {
+                            let mut a = Vec::with_capacity(n);
+                            for i in 0..n {
+                                let v = self
+                                    .vm_regs
+                                    .get(base + i)
+                                    .cloned()
+                                    .unwrap_or_else(|| Value::zero(32));
+                                a.push(self.value_method_arg_expr(&v));
+                            }
+                            (a, false)
+                        }
+                    };
                     let result = self.exec_method_call(handle, method, &args);
+                    if temps {
+                        self.vm_drain_arg_temps(base, n);
+                    }
                     self.vm_regs[*dest as usize] = result;
                     local_count += 1;
                 }
@@ -31228,19 +31239,13 @@ impl Simulator {
                         .to_u64()
                         .unwrap_or(0) as usize;
                     let base = *arg_start as usize;
-                    let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
-                    for i in 0..*n_args as usize {
-                        argvals.push(self.vm_regs.get(base + i).cloned().unwrap_or(Value::zero(32)));
-                    }
-                    // Value-const actuals, exactly like CallMethod. The
-                    // start class was baked at compile time (§8.15 super /
-                    // §8.20 non-virtual bare call): run the body via the
-                    // hierarchy walk from that class — non-virtual, ctor
-                    // chaining included.
-                    let args: Vec<Expression> = argvals
-                        .iter()
-                        .map(|v| self.value_method_arg_expr(v))
-                        .collect();
+                    let n = *n_args as usize;
+                    // Value-const actuals + row-2 write-back temps, exactly
+                    // like CallMethod. The start class was baked at compile
+                    // time (§8.15 super / §8.20 non-virtual bare call): run
+                    // the body via the hierarchy walk from that class —
+                    // non-virtual, ctor chaining included.
+                    let (args, temps) = self.vm_args_with_writeback(start_class, method, base, n);
                     let result = if handle == 0 {
                         // Null receiver (unreachable for instance frames;
                         // a static frame never lowers a scoped call).
@@ -31248,6 +31253,9 @@ impl Simulator {
                     } else {
                         self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
                     };
+                    if temps {
+                        self.vm_drain_arg_temps(base, n);
+                    }
                     self.vm_regs[*dest as usize] = result;
                     local_count += 1;
                 }
@@ -31258,17 +31266,14 @@ impl Simulator {
                     // (type-param binding, embedded spec, class name, typedef
                     // aliases), exactly the AST member-call path.
                     let base = *arg_start as usize;
-                    let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
-                    for i in 0..*n_args as usize {
-                        argvals.push(self.vm_regs.get(base + i).cloned().unwrap_or(Value::zero(32)));
-                    }
-                    let args: Vec<Expression> = argvals
-                        .iter()
-                        .map(|v| self.value_method_arg_expr(v))
-                        .collect();
+                    let n = *n_args as usize;
+                    let (args, temps) = self.vm_args_with_writeback(recv, method, base, n);
                     let v = self
                         .exec_class_scope_static_call(recv, method, &args)
                         .unwrap_or_else(|| Value::zero(32));
+                    if temps {
+                        self.vm_drain_arg_temps(base, n);
+                    }
                     self.vm_regs[*dest as usize] = v;
                     local_count += 1;
                 }
@@ -31321,18 +31326,33 @@ impl Simulator {
                         .to_u64()
                         .unwrap_or(0) as usize;
                     let base = *arg_start as usize;
-                    let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
-                    for i in 0..*n_args as usize {
-                        argvals.push(self.vm_regs.get(base + i).cloned().unwrap_or(Value::zero(32)));
-                    }
-                    // Value-const actuals, exactly like CallMethod: the
+                    let n = *n_args as usize;
+                    // Value-const actuals + row-2 write-back temps (the
                     // builtin arms read/eval them through the ordinary
-                    // expression paths (§7.10.2.3 queue append, §15.5.5 event
-                    // keys, string keys — all carried).
-                    let args: Vec<Expression> = argvals
-                        .iter()
-                        .map(|v| self.value_method_arg_expr(v))
-                        .collect();
+                    // expression paths — §7.10.2.3 queue append, §15.5.5
+                    // event keys, string keys — all carried).
+                    let callee_class = self
+                        .heap
+                        .get(handle)
+                        .and_then(|i| i.as_ref().map(|inst| inst.class_name.clone()));
+                    let (mut args, mut temps) = (Vec::with_capacity(n), false);
+                    match callee_class {
+                        Some(cn) => {
+                            let (a, t) = self.vm_args_with_writeback(&cn, method, base, n);
+                            args = a;
+                            temps = t;
+                        }
+                        None => {
+                            for i in 0..n {
+                                let v = self
+                                    .vm_regs
+                                    .get(base + i)
+                                    .cloned()
+                                    .unwrap_or_else(|| Value::zero(32));
+                                args.push(self.value_method_arg_expr(&v));
+                            }
+                        }
+                    }
                     let result = if handle == 0 {
                         // Null receiver: the AST funnel falls through to
                         // `Value::zero(32)` (no storage, no fault).
@@ -31392,6 +31412,9 @@ impl Simulator {
                             None => self.exec_method_call(handle, m, &args),
                         }
                     };
+                    if temps {
+                        self.vm_drain_arg_temps(base, n);
+                    }
                     self.vm_regs[*dest as usize] = result;
                     local_count += 1;
                 }
@@ -134091,13 +134114,32 @@ impl Simulator {
                 // `function void ...` body with no result cell. Keep AST.
                 self.compiled_method_skip.insert((cid, mid));
                 return None;
-            }; // Reject ref/output/inout formals (write-back semantics the compiled
-            // path does not implement yet).
+            }; // class-perf row 2: NON-INPUT formals (output / inout / ref) are
+            // admitted as plain scalars (integral / string / enum / class
+            // handle, `dimensions.is_empty()`): the interpreter implements
+            // exactly these as copy-in/copy-out through `output_bindings`
+            // (bind the actual's entry value, `assign_value` the frame local
+            // back on return), and the compiled path mirrors that — seed the
+            // register from the frame, copy it back at exit so the epilogue
+            // write-back runs unchanged. Identity-bound aggregates (ref
+            // queues/arrays/structs, and anything with dimensions) keep
+            // declining: their alias semantics cannot be mirrored by a
+            // register.
+            let mut writeback_formals: Vec<String> = Vec::new();
             for port in ports {
-                if port.direction != PortDirection::Input {
+                if port.direction == PortDirection::Input {
+                    continue;
+                }
+                let shape_ok = port.dimensions.is_empty()
+                    && (self.typeref_names_class(&port.data_type)
+                        || Self::is_string_data_type(&port.data_type)
+                        || self.enum_type_info(&port.data_type).is_some()
+                        || self.scalar_formal_integral(&port.data_type).is_some());
+                if !shape_ok {
                     self.compiled_method_skip.insert((cid, mid));
                     return None;
                 }
+                writeback_formals.push(port.name.name.clone());
             }
             // Step 9e: a VOID function (`function void f();` — DataType::
             // Void) or a CONSTRUCTOR (`function new(...)` — parsed as
@@ -134169,6 +134211,18 @@ impl Simulator {
                     0 // class handle formal; width irrelevant (heap member access)
                 } else if is_string {
                     0 // string formal; raw byte-vector actual, keep source width
+                } else if self.enum_type_info(&port.data_type).is_some() {
+                    // An ENUM formal (uvm_severity-style typedef). The
+                    // interpreter's TypeReference binding branch never
+                    // width-adapts one (`scalar_formal_integral` fails, the
+                    // actual keeps the caller's width; only signedness may
+                    // be stamped via type_is_signed_concrete), and it
+                    // records the enum typedef so runtime name/%p lookups
+                    // work — all of that happens in the binding loop BEFORE
+                    // this method runs, so the register just needs to keep
+                    // the frame-bound value: seed width 0 (keep source),
+                    // exactly like a string formal but scalar-typed.
+                    0
                 } else {
                     // Scalar-integral GATE (bail to AST if not): the type must be
                     // a compile-able integer vector/atom. (String formals are
@@ -134231,6 +134285,7 @@ impl Simulator {
                     .class_static_coll_member_names(cname)),
                 coll_elem_members: std::rc::Rc::new(self
                     .class_coll_elem_member_names(cname)),
+                writeback_formals: std::rc::Rc::new(writeback_formals),
                 static_result_width,
                 result_signed,
                 param_able_result,
@@ -134548,6 +134603,7 @@ impl Simulator {
                                 &pre.static_coll_members,
                                 &pre.coll_elem_members,
                                 &pre.string_formals,
+                                &pre.writeback_formals,
                                 Some((
                                     &pre.fn_ret_name,
                                     result_width,
@@ -134741,6 +134797,33 @@ impl Simulator {
             .get(result_reg as usize)
             .cloned()
             .unwrap_or_else(|| Value::zero(32));
+        // class-perf row 2: copy non-INPUT formal registers back into the
+        // bound locals frame BEFORE restoring the caller's register file,
+        // so the interpreter's epilogue write-back (output_bindings snapshot
+        // -> `assign_value` to the caller's actual) observes the body's
+        // final values — exactly what the AST path's frame locals hold at
+        // its own epilogue. Register width mirrors the AST path: stores in
+        // the block resized to the same formal width the interpreter's
+        // assignments would use, and w=0 (string/enum/class) formals keep
+        // the register's raw value.
+        if !pre.writeback_formals.is_empty() {
+            let mut outs: Vec<(String, Value)> = Vec::new();
+            for (i, port) in ports.iter().enumerate() {
+                if pre.writeback_formals.iter().any(|n| n == &port.name.name) {
+                    let reg = this_reg as usize + 1usize + i;
+                    if let Some(v) = self.vm_regs.get(reg).cloned() {
+                        outs.push((port.name.name.clone(), v));
+                    }
+                }
+            }
+            if !outs.is_empty()
+                && let Some(fr) = self.local_stack.last_mut()
+            {
+                for (n, v) in outs {
+                    fr.insert(n, v);
+                }
+            }
+        }
         // Restore the CALLER's register file now that we're done with ours.
         self.vm_regs = saved_vm_regs;
         // Restore the caller's foreach key arena (swap-in above cleared the
@@ -134809,6 +134892,128 @@ impl Simulator {
         match &expr.kind {
             ExprKind::Ident(hier) => self.resolve_hier_name(hier).into_owned(),
             _ => "expr".to_string(),
+        }
+    }
+
+    /// class-perf row 2: argument positions of `class_name::method` whose
+    /// formals are NON-INPUT plain scalars (output / inout / ref; integral,
+    /// string, enum or class-handle typed, no dimensions) — exactly the set
+    /// the compiled CALLEE path now admits. Used by the VM's call handlers
+    /// to bind those actuals as frame temps instead of constants so the
+    /// interpreter's write-back reaches the caller's arg registers.
+    fn vm_writeback_scalar_positions(&self, class_name: &str, method: &str) -> Vec<usize> {
+        let Some((_, md)) = self.method_defining_class(class_name, method) else {
+            return Vec::new();
+        };
+        let crate::ast::decl::ClassMethodKind::Function(f) = &md.kind else {
+            return Vec::new();
+        };
+        let mut pos = Vec::new();
+        for (i, port) in f.ports.iter().enumerate() {
+            if port.direction == PortDirection::Input || !port.dimensions.is_empty() {
+                continue;
+            }
+            let ok = self.typeref_names_class(&port.data_type)
+                || Self::is_string_data_type(&port.data_type)
+                || self.enum_type_info(&port.data_type).is_some()
+                || self.scalar_formal_integral(&port.data_type).is_some();
+            if ok {
+                pos.push(i);
+            }
+        }
+        pos
+    }
+
+    /// class-perf row 2: build the actual-expressions for a VM method call.
+    /// Default is the historic value-wrapper constant. For argument
+    /// positions whose formal is a non-INPUT plain scalar, the actual is
+    /// instead a frame TEMP `\0vmargN` (a name no SystemVerilog identifier
+    /// can collide with) inserted into the CURRENT — the compiled caller's
+    /// — locals frame holding the register's value: the interpreter's
+    /// binding loop evaluates the Ident (exact Value, like any local), and
+    /// its epilogue `assign_value` writes the temp (frame-local store,
+    /// resized to the temp's seeded width — the caller local's width).
+    /// Non-scalar shapes (queues/arrays/structs, identity-bound semantics)
+    /// keep the constant wrapper, byte-identical to the old behavior.
+    fn vm_args_with_writeback(
+        &mut self,
+        class_name: &str,
+        method: &str,
+        base: usize,
+        n: usize,
+    ) -> (Vec<Expression>, bool) {
+        let pos = self.vm_writeback_scalar_positions(class_name, method);
+        if pos.is_empty() || self.local_stack.is_empty() {
+            let mut args = Vec::with_capacity(n);
+            for i in 0..n {
+                let v = self
+                    .vm_regs
+                    .get(base + i)
+                    .cloned()
+                    .unwrap_or_else(|| Value::zero(32));
+                args.push(self.value_method_arg_expr(&v));
+            }
+            return (args, false);
+        }
+        let mut args = Vec::with_capacity(n);
+        let mut any_temp = false;
+        for i in 0..n {
+            let v = self
+                .vm_regs
+                .get(base + i)
+                .cloned()
+                .unwrap_or_else(|| Value::zero(32));
+            if pos.contains(&i) {
+                let name = format!("\u{0}vmarg{i}");
+                let span = crate::ast::Span::dummy();
+                let expr = Expression::new(
+                    ExprKind::Ident(HierarchicalIdentifier {
+                        root: None,
+                        path: vec![HierPathSegment {
+                            name: crate::ast::Identifier {
+                                name: name.clone(),
+                                span,
+                            },
+                            selects: Vec::new(),
+                        }],
+                        span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    }),
+                    span,
+                );
+                if let Some(fr) = self.local_stack.last_mut() {
+                    fr.insert(name, v);
+                    any_temp = true;
+                    args.push(expr);
+                    continue;
+                }
+            }
+            args.push(self.value_method_arg_expr(&v));
+        }
+        (args, any_temp)
+    }
+
+    /// class-perf row 2: after a VM call whose actuals included frame temps,
+    /// copy each temp's final value back into its arg register (any change
+    /// can only come from the interpreter's non-input write-back — input
+    /// formals are callee-frame locals and cannot touch the caller's temp)
+    /// and remove the temps from the frame.
+    fn vm_drain_arg_temps(&mut self, base: usize, n: usize) {
+        if self.local_stack.is_empty() {
+            return;
+        }
+        for i in 0..n {
+            let name = format!("\u{0}vmarg{i}");
+            let picked = self
+                .local_stack
+                .last_mut()
+                .and_then(|fr| fr.remove(&name));
+            if let Some(v) = picked {
+                if let Some(slot) = self.vm_regs.get_mut(base + i) {
+                    *slot = v;
+                }
+            }
         }
     }
 
