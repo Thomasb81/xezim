@@ -215,20 +215,25 @@ fn compiled_methods_enabled() -> bool {
 }
 
 /// class-perf tiering: with the gate on, a method body is compiled only
-/// once it has been CALLED at least this many times (`XEZIM_METHOD_TIER`;
-/// default 100). Cold methods — the bulk of any UVM run — never pay
-/// admission or compilation and stay on the AST interpreter; hot ones
-/// converge to the compiled block after a bounded warmup. `0` restores
-/// compile-on-first-call (the pilot behavior the compiled_method_* tests
-/// pin). The interpreter frames below the threshold are bit-identical to
-/// a gate-OFF run, so tiering cannot change observable behavior.
+/// once it has been CALLED at least this many times (`XEZIM_METHOD_TIER`).
+/// The default is calibrated to the suite economics measured in
+/// class_perf_plan.md: a UVM-suite test process compiles ~148
+/// distinct methods at a threshold of 100 — mostly ones that never repay
+/// their admission+compile cost in a seconds-long run — taxing EVERY
+/// median test by 7–15 % wall. At 100 000 calls the same tests measured
+/// indistinguishable from gate-OFF (tier bookkeeping itself is free),
+/// while genuinely hot methods in long runs still converge to bytecode
+/// after a bounded warmup. `0` restores compile-on-first-call (the pilot
+/// behavior the compiled_method_* tests pin). The interpreter frames
+/// below the threshold are bit-identical to a gate-OFF run, so tiering
+/// cannot change observable behavior.
 fn method_tier_threshold() -> u32 {
     static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
         std::env::var("XEZIM_METHOD_TIER")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(100)
+            .unwrap_or(100_000)
     })
 }
 
@@ -6295,7 +6300,7 @@ pub struct Simulator {
     /// call below the tier threshold, then never touched again (the
     /// compiled path above the threshold is counter-free, so a hot method
     /// pays zero map traffic once compiled).
-    compiled_method_call_counts: HashMap<(u32, u32), u32>,
+    compiled_method_call_counts: HashMap<u64, u32>,
    /// `resolve_typeref_class_name` memo: name -> scope -> class ctx -> (class-table size, answer).
     #[allow(clippy::type_complexity)]
     typeref_class_memo: std::cell::RefCell<
@@ -133159,7 +133164,6 @@ impl Simulator {
                 // the same heap / register file the AST path uses). Gated off
                 // by default.
                 if let Some(cval) = compiled_methods_enabled().then(|| {
-                    let fn_ret_name_owned = fn_ret_name.map(str::to_string);
                     if SAMPLER_READY.load(Ordering::Relaxed) {
                         CUR_METHOD_COMPILED.store(true, Ordering::Relaxed);
                     }
@@ -133169,7 +133173,7 @@ impl Simulator {
                         method_name,
                         ports,
                         body,
-                        &fn_ret_name_owned,
+                        fn_ret_name,
                         ret_is_string,
                         &method.kind,
                     )
@@ -134121,13 +134125,37 @@ impl Simulator {
         method_name: &str,
         ports: &[crate::ast::decl::FunctionPort],
         body: &[crate::ast::stmt::Statement],
-        fn_ret_name: &Option<String>,
+        fn_ret_name: Option<&str>,
         ret_is_string: bool,
         kind: &crate::ast::decl::ClassMethodKind,
     ) -> Option<Value> {
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::PortDirection;
         use super::bytecode::BytecodeCompiler;
+        // COLD-PATH FIRST (class-perf P0): a u32-id interner lookup keyed by
+        // String hashing ran on EVERY method call — two HashMap gets + a
+        // `to_string` per call — which on call-heavy UVM workloads (hier-gen
+        // makes 1.6M method calls) cost ~100 ns each before the tier gate
+        // could even reject the call. The tier counter is therefore keyed by
+        // a 64-bit hash of (class, method) computed inline (no table, no
+        // allocation): the interner and the Option<String> formal-name copy
+        // below run only once a method has actually crossed the threshold.
+        // A hash collision can only shift WHEN a method starts counting
+        // toward its threshold — the compiled block itself is admitted and
+        // verified per method as always — so this is purely a tiering-rate
+        // approximation, never a correctness input.
+        let tier = method_tier_threshold();
+        let cold_key = fnv_name(cname).rotate_left(32) ^ fnv_name(method_name);
+        if tier > 0 {
+            let calls = self
+                .compiled_method_call_counts
+                .entry(cold_key)
+                .or_insert(0);
+            if *calls < tier {
+                *calls += 1;
+                return None;
+            }
+        }
         // Intern the (class, method) identity ONCE; it keys both the fast
         // decision cache (this method) and the compiled-block cache (below).
         // Cheap-u32-ids, NOT String keys (the #2 lesson).
@@ -134161,23 +134189,6 @@ impl Simulator {
         if self.compiled_method_skip.contains(&(cid, mid)) {
             return None;
         }
-        // Tiering: bump the call counter until the method proves itself
-        // hot. Every call below the threshold runs the AST interpreter
-        // verbatim (gate-OFF frames), so cold methods pay neither
-        // admission nor compilation; once the threshold is passed the
-        // counter is never touched again and the path below is
-        // counter-free.
-        let tier = method_tier_threshold();
-        if tier > 0 {
-            let calls = self
-                .compiled_method_call_counts
-                .entry((cid, mid))
-                .or_insert(0);
-            if *calls < tier {
-                *calls += 1;
-                return None;
-            }
-        }
         // Step 7b: PREBOUND gate. Everything between the skip cache and the
         // block cache is a pure function of the class declaration + module
         // scope, so it runs once per (cid, mid) at plan creation. The only
@@ -134198,7 +134209,7 @@ impl Simulator {
             // only services interpreter concat writes — the block computes
             // the identical bytes in-register.)
             let is_string_result = ret_is_string;
-            let Some(rname) = fn_ret_name.as_ref() else {
+            let Some(rname) = fn_ret_name.map(str::to_string) else {
                 // No implicit return-variable name: the method is a plain
                 // `function void ...` body with no result cell. Keep AST.
                 self.compiled_method_skip.insert((cid, mid));

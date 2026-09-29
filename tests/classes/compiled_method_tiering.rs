@@ -1,5 +1,8 @@
 //! class-perf tiering: with the gate on, a method body compiles only after
-//! `XEZIM_METHOD_TIER` calls (default 100). Below the threshold every call
+//! `XEZIM_METHOD_TIER` calls (the product default is a much larger,
+//! economics-calibrated value — see `method_tier_threshold` in the
+//! simulator; the boundary arm below pins its own threshold so its
+//! coverage never depends on that default). Below the threshold every call
 //! runs the AST interpreter with gate-OFF frames; above it the compiled
 //! block takes over. The ON==OFF byte-for-byte contract must therefore hold
 //! ACROSS the tier boundary: a hot method must observe its own state
@@ -94,9 +97,11 @@ fn tiering_boundary_is_invisible() {
     // Sanity: the model actually exercises the >1100 clamp.
     assert!(want_hits == 750, "model must make 750 step() calls");
 
-    // Default tier (100): the first 100 step() calls interpret, the
-    // remaining 650 run compiled — the boundary fires mid-run.
+    // Pinned tier 100 (not the product default): the first 100 step()
+    // calls interpret, the remaining 650 run compiled — the boundary
+    // fires mid-run.
     gate_on();
+    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "100") };
     let a = run();
     assert_eq!(a, (want_total as u64, want_hits as u64, want_acc as u64));
 
