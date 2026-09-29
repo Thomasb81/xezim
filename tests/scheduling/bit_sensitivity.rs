@@ -241,3 +241,42 @@ endmodule
     let (lines, _, _) = both("stateful", src, 39);
     assert!(lines.iter().any(|l| l.starts_with("RES cnt=")), "{lines:?}");
 }
+
+/// A plain `always` block's variable written by another process: the block
+/// must keep re-running on every change of what it is sensitive to, so it
+/// overwrites the foreign value exactly when it always did (`q` returns to
+/// `a[0]` when `a[1]` moves; with a bit mask it kept the foreign value in 11
+/// of the 29 checks), and the `always_comb` beside it still skips changes of
+/// bits it does not read.
+#[test]
+fn plain_always_output_with_another_writer() {
+    let src = r#"
+module tb;
+  reg clk = 0;
+  integer i = 0;
+  reg [7:0] cnt = 0;
+  // Comb-driven, so its changes reach the readers through the settle
+  // loop, where the masks apply.
+  wire [7:0] a;
+  assign a = cnt ^ 8'h00;
+  reg q;
+  logic r;
+  always @* q = a[0];
+  always_comb r = a[0] ^ a[7];
+  always @(posedge clk) begin
+    i <= i + 1;
+    cnt <= cnt + 8'd2;
+    if (i % 4 == 1) cnt[0] <= ~cnt[0];
+  end
+  always @(negedge clk) begin
+    $display("OK %0t a=%h q=%b r=%b", $time, a, q, r);
+    if (i % 5 == 2) q = ~q;
+  end
+  initial begin
+    repeat (60) #5 clk = ~clk;
+    $finish;
+  end
+endmodule
+"#;
+    both("plain_always_other_writer", src, 29);
+}

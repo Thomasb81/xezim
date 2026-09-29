@@ -23220,11 +23220,16 @@ impl Simulator {
     /// `(signal, sig_span_mask)` pairs — None keeps every dependency edge of
     /// the entry whole-signal. Only entries whose outputs are a pure
     /// function of the bits they read qualify: fused gates (their operand
-    /// bits), and lowered compiled blocks whose stream reads no signal it
-    /// also writes (no state carried between evaluations) — an always
-    /// block additionally storing each signal at most once, so skipping an
-    /// evaluation cannot drop an intermediate value. A signal the entry
-    /// depends on but the stream never reads keeps a whole-signal edge.
+    /// bits), and lowered continuous assignments and `always_comb` /
+    /// `always_latch` blocks whose stream reads no signal it also writes
+    /// (no state carried between evaluations) — a block additionally
+    /// storing each signal at most once, so skipping an evaluation cannot
+    /// drop an intermediate value. A plain `always` block never qualifies:
+    /// its variables may have other writers (an `initial` block, a
+    /// testbench task), and a skipped re-evaluation would leave such a
+    /// write in place where the block used to overwrite it. A signal the
+    /// entry depends on but the stream never reads keeps a whole-signal
+    /// edge.
     fn comb_entry_read_masks(&self, eidx: usize) -> Option<Vec<(u32, u64)>> {
         let entry = self.comb_entries.get(eidx)?;
         if entry.has_unresolved_reads {
@@ -23272,6 +23277,10 @@ impl Simulator {
                     add_gate(&mut out, g);
                 }
             }
+            CombItem::CompiledAlwaysBlock {
+                is_always_comb: false,
+                ..
+            } => return None,
             CombItem::CompiledContAssign { .. } | CombItem::CompiledAlwaysBlock { .. } => {
                 let TsSlot::Yes(ts) = self.ts_comb.get(eidx)? else {
                     return None;
