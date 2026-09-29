@@ -407,8 +407,13 @@ Each library's `vlog_startup_routines` entries run before simulation.
 - Design walk: `vpi_iterate`/`vpi_scan` over `vpiModule`, `vpiNet`, `vpiReg`,
   `vpiVariables`, `vpiParameter`, `vpiMemory`; `vpi_handle_by_name`,
   `vpi_get`, `vpi_get_str`, `vpi_get_value`/`vpi_put_value`.
-- `vpi_control(vpiStop/vpiFinish)`, `vpi_chk_error`, `vpi_printf`,
-  `vpi_flush`, `vpi_compare_objects`, `vpi_get64`.
+- `vpi_control`: `vpiStop`/`vpiFinish` end the run once the calling routine
+  returns; `vpiSetInteractiveScope` takes a module handle; `vpiReset` is
+  refused (xezim cannot rewind a run).
+- `vpi_chk_error`, `vpi_printf`, `vpi_flush`, `vpi_compare_objects`,
+  `vpi_get64`.
+- Callbacks: `vpi_register_cb` for every reason of IEEE 1800-2017 §38.36
+  (see below), `vpi_get_cb_info`, `vpi_remove_cb`.
 - Multichannel descriptors: `vpi_mcd_open`, `vpi_mcd_close`, `vpi_mcd_flush`,
   `vpi_mcd_name`, `vpi_mcd_printf`/`vpi_mcd_vprintf`. They share the channel
   table of `$fopen`, so a descriptor opened in C can be written from
@@ -436,6 +441,60 @@ Each library's `vlog_startup_routines` entries run before simulation.
   delays the simulation uses from then on.
 - `vpi_get_data` / `vpi_put_data`: defined, and always fail (return 0 and
   report through `vpi_chk_error`) — see below.
+
+**Callbacks** (`vpi_register_cb`, §38.36). The routine receives a fresh
+`s_cb_data`: `obj` and `user_data` as registered, `time` the current time in
+the registered `time->type` (`vpiSimTime` when `time` was NULL), and `value`
+always a valid pointer (`vpiSuppressVal` when there is nothing to report).
+The returned handle is a `vpiCallback` object; `vpi_free_object` releases the
+handle but leaves the callback registered, `vpi_remove_cb` removes the
+callback and frees the handle — from inside any callback, its own included.
+`vpi_get_cb_info` returns the registration data. `$display` output written
+before a callback runs appears before the routine's `vpi_printf` output.
+
+| Reason | Fires | Notes |
+|---|---|---|
+| `cbNextSimTime` | first thing in the next time step | one-shot; `time` value ignored |
+| `cbAtStartOfSimTime` | before any event of the given **absolute** time | one-shot |
+| `cbAfterDelay` | with the first events of now + delay | one-shot |
+| `cbNBASynch` | before the NBA region of now + delay | one-shot |
+| `cbReadWriteSynch` | after the NBA region of now + delay, once no process of that step is left to run | one-shot |
+| `cbAtEndOfSimTime` | after every other region of the given **absolute** time | one-shot |
+| `cbReadOnlySynch` | last in the time step of now + delay; `vpi_put_value` is refused | one-shot |
+| `cbValueChange` | after each change of a net, variable, part-select, port or memory (`index` = the word) | once per change, whichever path made it |
+| `cbForce` / `cbAssign` | after `force` / `assign`, or `vpi_put_value(vpiForceFlag)` | obj = the object, or NULL for all |
+| `cbRelease` / `cbDeassign` | once the released object has been re-driven | `value` = the value after release |
+| `cbDisable` | after a `disable` terminates the named block, fork or task around a `$systf` call | obj = that call's `vpiSysTfCall` handle |
+| `cbStmt` | before each interpreted statement a process of the given module instance runs | obj = a module handle |
+| `cbEndOfCompile`, `cbStartOfSimulation` | before time 0, in that order | |
+| `cbEndOfSimulation` | after the last time step, before `final` blocks | |
+| `cbError` | after each run-time error: `$error`, `$fatal`, a reported timing violation, an illegal bin | `vpi_chk_error` reports it inside the routine |
+| `cbPLIError` | after each VPI routine error | `vpi_chk_error` reports it inside the routine, and still to the caller after |
+| `cbTchkViolation` | on each timing-check violation | obj NULL; `value` = the violation text (`vpiStringVal`) |
+| `cbSignal` | when SIGINT/SIGTERM stops the run | `index` = the signal number |
+| `cbUnresolvedSystf` | the first time an unknown `$name` is called | `value->value.str` = the name; registering it with `vpi_register_systf` in the routine makes the call go to it |
+| `cbEnterInteractive` | when `$stop` or `vpi_control(vpiStop)` ends the run, before `cbEndOfSimulation` | xezim has no interactive mode: `$stop` ends the run like `$finish` |
+| `cbInteractiveScopeChange` | on `vpi_control(vpiSetInteractiveScope, scope)` | obj = the scope |
+| `cbExitInteractive`, `cbStartOfSave`, `cbEndOfSave`, `cbStartOfRestart`, `cbEndOfRestart`, `cbStartOfReset`, `cbEndOfReset` | never | accepted; xezim has no interactive mode, save/restart or `$reset` |
+
+Within one time step the simulation-time reasons run in the order of the
+table. A value written from any of them except `cbReadOnlySynch` opens a
+fresh delta in the same step, so edge-sensitive processes see it; a pending
+one holds the scheduler at its time even when no HDL event is due there.
+The time of `cbAfterDelay`, `cbNBASynch`, `cbReadWriteSynch` and
+`cbReadOnlySynch` is a delay (a NULL `time` is a zero delay); that of
+`cbAtStartOfSimTime`/`cbAtEndOfSimTime` is absolute, and a time already begun
+is refused. `vpiScaledRealTime` is in the time unit of `obj` when that is a
+module, else in simulation ticks.
+
+xezim has no statement objects, so `cbStmt` takes a scope and reports that
+scope as `obj`, and `cbForce`/`cbRelease`/`cbAssign`/`cbDeassign` registered
+with a NULL `obj` report the affected net or variable (a handle valid only
+during the routine) where the standard names the statement. `cbStmt` covers
+statements the interpreter runs; statements of processes compiled to
+bytecode or native code (most `always` blocks) are not reported. A run with
+no callback registered pays nothing for any of this beyond one flag test per
+hook.
 
 **Semantics notes:**
 
@@ -494,8 +553,11 @@ Each library's `vlog_startup_routines` entries run before simulation.
   is ever in progress: both return 0 and report the error through
   `vpi_chk_error`.
 
-**Not implemented:** nothing — every routine of IEEE 1800-2017 clause 38 is
-declared in `include/vpi_user.h` and implemented as described above.
+**Not implemented:** every routine of IEEE 1800-2017 clause 38 is declared in
+`include/vpi_user.h` and implemented as described above. The one gap is the
+SystemVerilog thread, frame and class-object callback reasons of
+`sv_vpi_user.h` (`cbStartOfThread` … `cbEndOfObject`): xezim has no thread,
+frame or class-object VPI objects, and `vpi_register_cb` rejects them.
 
 Worked examples: `tests/dpi/vpi_object_model.{c,sv}`,
 `tests/dpi/vpi_systf.{c,sv}`, and `tests/strings/vpi_routines.rs` (user data,

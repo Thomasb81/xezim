@@ -1197,6 +1197,7 @@ impl Simulator {
 
     /// Report a violation and toggle the check's notifier.
     fn timing_violation(&mut self, idx: usize, check: String) {
+        let mut reported: Option<String> = None;
         if !NO_TCHK_MSG.load(std::sync::atomic::Ordering::Relaxed) {
             let rt = &self.timing_checks[idx];
             let line = format!(
@@ -1213,6 +1214,21 @@ impl Simulator {
             self.error_count = self.error_count.saturating_add(1);
             self.record_output(line.clone());
             self.stdout_writeln(&line);
+            reported = Some(line);
+        }
+        // §38.36.3 cbTchkViolation for every violation; cbError when it was
+        // reported as a run-time error.
+        if self.vpi_cb_mask != 0 {
+            if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_TCHK_VIOLATION) != 0 {
+                let text = format!(
+                    "{} violation in {}",
+                    check, self.timing_checks[idx].cold.path
+                );
+                self.vpi_notify_tchk(&text);
+            }
+            if let Some(line) = reported {
+                self.vpi_notify_error(&line);
+            }
         }
         if NO_NOTIFIER.load(std::sync::atomic::Ordering::Relaxed) {
             return;

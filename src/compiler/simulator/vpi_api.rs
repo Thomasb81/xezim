@@ -450,7 +450,7 @@ pub(super) fn get_property(property: c_int, h: &VpiHandle) -> Option<c_int> {
 /// that is neither.
 pub(super) fn cell_value(sim: &Simulator, id: usize) -> Option<Value> {
     if is_packed_id(id) {
-        (id - PACKED_BASE < sim.packed.vals.len()).then(|| sim.packed.read(id))
+        sim.packed.locate(id).is_some().then(|| sim.packed.read(id))
     } else {
         sim.signal_table.get(id).cloned()
     }
@@ -458,7 +458,10 @@ pub(super) fn cell_value(sim: &Simulator, id: usize) -> Option<Value> {
 
 pub(super) fn cell_width(sim: &Simulator, id: usize) -> Option<u32> {
     if is_packed_id(id) {
-        (id - PACKED_BASE < sim.packed.vals.len()).then(|| sim.packed.width(id))
+        sim.packed
+            .locate(id)
+            .is_some()
+            .then(|| sim.packed.width(id))
     } else {
         sim.signal_widths.get(id).copied()
     }
@@ -478,8 +481,8 @@ fn cell_real(sim: &Simulator, id: usize) -> bool {
 
 fn cell_two_state(sim: &Simulator, id: usize) -> bool {
     if is_packed_id(id) {
-        let o = id - PACKED_BASE;
-        sim.packed.w.get(o).is_some_and(|m| m & 0x40 != 0)
+        // A two-state element stores no x/z plane.
+        sim.packed.locate(id).is_some_and(|(seg, _)| seg.xmask == 0)
     } else {
         sim.signal_two_state.get(id).copied().unwrap_or(false)
     }
@@ -583,6 +586,47 @@ pub(super) fn set_strength_hint_raw(
         let sim = unsafe { &*sim };
         STRENGTH_HINT.with(|c| c.set(type_code.and_then(|t| signal_strengths(sim, id, t))));
     }
+}
+
+/// `set_strength_hint` for a callback's object handle.
+pub(super) fn set_strength_hint_for_obj(
+    sim: &Simulator,
+    obj: *mut libc::c_void,
+    type_code: Option<c_int>,
+    format: c_int,
+) {
+    if format != vc::STRENGTH_VAL {
+        return;
+    }
+    let id = unsafe { super::vpi_deref(obj) }.map(|h| h.signal_id);
+    STRENGTH_HINT.with(|c| {
+        c.set(match (id, type_code) {
+            (Some(id), Some(t)) => signal_strengths(sim, id, t),
+            _ => None,
+        })
+    });
+}
+
+/// Copy the payload a `fill_extra_format` value points at into `keep` and
+/// repoint the value there, so a callback's data survives the routine's own
+/// `vpi_get_value` calls, which reuse the scratch buffers.
+pub(super) fn own_extra_payload(width: u32, vp: &mut s_vpi_value, keep: &mut Vec<u64>) {
+    let w = width.max(1) as usize;
+    let bytes = match vp.format {
+        vc::STRENGTH_VAL => w * std::mem::size_of::<s_vpi_strengthval>(),
+        vc::LONG_INT_VAL => 8,
+        vc::RAW_TWO_STATE_VAL => w.div_ceil(8),
+        vc::RAW_FOUR_STATE_VAL => 2 * w.div_ceil(8),
+        _ => return,
+    };
+    let src = unsafe { vp.value.misc } as *const u8;
+    if src.is_null() {
+        return;
+    }
+    keep.clear();
+    keep.resize(bytes.div_ceil(8), 0);
+    unsafe { std::ptr::copy_nonoverlapping(src, keep.as_mut_ptr() as *mut u8, bytes) };
+    vp.value.misc = keep.as_mut_ptr() as *mut libc::c_char;
 }
 
 pub(super) fn clear_strength_hint() {

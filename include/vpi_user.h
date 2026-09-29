@@ -15,7 +15,9 @@
  * failure we want, rather than a link-time surprise or a stub that
  * silently returns nothing. Every routine of IEEE 1800-2017 clause 38 is
  * declared; vpi_get_data / vpi_put_data are defined but always fail,
- * because xezim has no $save / $restart (see their declarations).
+ * because xezim has no $save / $restart (see their declarations). The
+ * SystemVerilog thread, frame and class-object callback reasons
+ * (cbStartOfThread..cbEndOfObject) are rejected by vpi_register_cb.
  *
  * A VPI module is loaded with `--vpi-lib <so>` (or `-m`), after which its
  * `vlog_startup_routines` run once, before simulation. VPI is also callable
@@ -60,6 +62,7 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiConstant            7   /* a literal / computed argument value */
 #define vpiSysFuncCall        56
 #define vpiSysTaskCall        57
+#define vpiCallback          107   /* a vpi_register_cb handle */
 
 /* Traversal relations. */
 #define vpiScope              84   /* containing scope */
@@ -151,6 +154,7 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiStop               66   /* ends the run, like $stop */
 #define vpiFinish             67   /* ends the run, like $finish */
 #define vpiReset              68   /* NOT supported: xezim cannot rewind */
+#define vpiSetInteractiveScope 69  /* accepts a module handle */
 
 /* --- vpi_chk_error severity levels and states ------------------------- */
 #define vpiNotice              1
@@ -162,16 +166,41 @@ typedef PLI_UINT32 *vpiHandle;
 #define vpiPLI                 2
 #define vpiRun                 3
 
-/* --- callback reasons (Table 38-49) ----------------------------------- */
+/* --- callback reasons (IEEE 1800-2017 section 38.36) ------------------ */
+/* Simulation events */
 #define cbValueChange          1
+#define cbStmt                 2
+#define cbForce                3
+#define cbRelease              4
+/* Simulation time */
+#define cbAtStartOfSimTime     5
 #define cbReadWriteSynch       6
 #define cbReadOnlySynch        7
 #define cbNextSimTime          8
 #define cbAfterDelay           9
+/* Actions */
+#define cbEndOfCompile        10
 #define cbStartOfSimulation   11
 #define cbEndOfSimulation     12
-#define cbStartOfReset        19
-#define cbEndOfReset          20
+#define cbError               13
+#define cbTchkViolation       14
+#define cbStartOfSave         15   /* accepted, never fires: no save/restart */
+#define cbEndOfSave           16   /* accepted, never fires */
+#define cbStartOfRestart      17   /* accepted, never fires */
+#define cbEndOfRestart        18   /* accepted, never fires */
+#define cbStartOfReset        19   /* accepted, never fires: no $reset */
+#define cbEndOfReset          20   /* accepted, never fires */
+#define cbEnterInteractive    21   /* $stop / vpi_control(vpiStop) */
+#define cbExitInteractive     22   /* accepted, never fires */
+#define cbInteractiveScopeChange 23 /* vpi_control(vpiSetInteractiveScope) */
+#define cbUnresolvedSystf     24
+#define cbAssign              25
+#define cbDeassign            26
+#define cbDisable             27
+#define cbPLIError            28
+#define cbSignal              29
+#define cbNBASynch            30
+#define cbAtEndOfSimTime      31
 
 /* s_vpi_vecval — 4-state vector element (IEEE 1800-2017 §38.10.1).
  * Layout-compatible with svLogicVecVal (§35.5.5), so UVM's HDL backdoor
@@ -399,8 +428,12 @@ typedef struct t_vpi_error_info {
  * asked — most of them cannot report failure any other way. */
 PLI_INT32 vpi_chk_error(p_vpi_error_info error_info_p);
 
-/* vpiStop and vpiFinish end the run, like $stop / $finish; both accept the
- * usual diagnostic-level argument, which xezim ignores. vpiReset is rejected.
+/* vpiStop and vpiFinish end the run once the calling routine returns, like
+ * $stop / $finish; both accept the usual diagnostic-level argument, which
+ * xezim ignores. xezim has no interactive mode, so vpiStop (like $stop) ends
+ * the run too, and is reported through cbEnterInteractive.
+ * vpiSetInteractiveScope takes a module handle and fires
+ * cbInteractiveScopeChange with it. vpiReset is rejected: xezim cannot rewind.
  * Returns 1 on success, 0 on failure (see vpi_chk_error). */
 PLI_INT32 vpi_control(PLI_INT32 operation, ...);
 
@@ -460,24 +493,68 @@ PLI_INT32 vpi_free_object(vpiHandle object);
 PLI_INT32 vpi_release_handle(vpiHandle object);
 PLI_INT32 vpi_get_vlog_info(p_vpi_vlog_info vlog_info_p);
 
-/* Only cbValueChange, cbReadWriteSynch, cbReadOnlySynch, cbNextSimTime,
- * cbAfterDelay, cbStartOfSimulation, cbEndOfSimulation, and cbStartOfReset
- * are dispatched. Any other reason is rejected with a NULL return rather
- * than silently accepted.
+/* Registers a callback (IEEE 1800-2017 section 38.36) and returns a
+ * vpiCallback handle, or NULL with a vpi_chk_error diagnostic. Every reason
+ * above is accepted. The data passed to the routine is a fresh s_cb_data:
+ * obj is the handle registered (or as noted), user_data as registered, time
+ * the current time in the registered time->type (vpiSimTime when time was
+ * NULL), and value is always a valid pointer (vpiSuppressVal when there is
+ * nothing to report). The handle stays valid until vpi_remove_cb or
+ * vpi_free_object; freeing it does NOT remove the callback.
  *
- * cbAfterDelay takes its delay from cb_data_p->time, RELATIVE to now, and
- * counts as pending simulation work — a testbench driven only from VPI
- * timers keeps running rather than ending at time 0. cbReadWriteSynch and
- * cbReadOnlySynch are one-shot end-of-time-step callbacks; writes applied
- * from a cbReadWriteSynch open a fresh delta in the same slot, so a clock
- * driven there triggers edge-sensitive blocks normally. When a
- * cbValueChange fires, cb_data_p->obj, ->time and ->value are populated;
- * ->value uses the format of the value struct supplied at registration
- * (vpiIntVal if none was given). */
+ * Simulation time (one-shot; removed once fired). The time of
+ * cbAtStartOfSimTime / cbAtEndOfSimTime is ABSOLUTE; that of cbAfterDelay,
+ * cbNBASynch, cbReadWriteSynch and cbReadOnlySynch is a delay from now (a NULL
+ * time is a zero delay); cbNextSimTime ignores the time value. vpiScaledRealTime
+ * is in the time unit of obj (a module), else in simulation ticks. Any of them
+ * holds the scheduler at its time even when no HDL event is due there. Within
+ * a time step they run in this order:
+ *   cbNextSimTime, cbAtStartOfSimTime   before any event of the step
+ *   cbAfterDelay                        with the step's first events
+ *   cbNBASynch                          before the NBA region
+ *   cbReadWriteSynch                    after the NBA region, once no
+ *                                       process of the step is left to run
+ *   cbAtEndOfSimTime                    after every other region
+ *   cbReadOnlySynch                     last; vpi_put_value is refused
+ * A value written from any of them but cbReadOnlySynch opens a fresh delta
+ * in the same step, so edge-sensitive processes see it.
+ *
+ * Simulation events (fire until removed). cbValueChange takes a net,
+ * variable, part-select, port or memory (index = the word that changed) and
+ * fires once per change, whichever path made it; value is in the registered
+ * value->format (vpiIntVal if value was NULL; vpiSuppressVal for none).
+ * cbForce/cbRelease (nets and variables) and cbAssign/cbDeassign (variables)
+ * take a net/variable or NULL for all; they fire after the SystemVerilog
+ * statement or the vpi_put_value vpiForceFlag/vpiReleaseFlag has taken
+ * effect, cbRelease/cbDeassign once the object has been re-driven. value is
+ * the object's resulting value. xezim has no statement objects, so obj is the
+ * affected net/variable (a handle valid only during the call when NULL was
+ * registered). cbDisable takes the vpiSysTfCall handle of a running $systf;
+ * it fires after a `disable` of a named block, fork or task that encloses the
+ * call terminates it. cbStmt takes a module handle and fires before each
+ * statement that a process of that instance executes in the interpreter
+ * (statements compiled to native or bytecode form are not reported); obj is
+ * the module handle.
+ *
+ * Actions. cbEndOfCompile then cbStartOfSimulation, before time 0;
+ * cbEndOfSimulation after the last time step (preceded by cbEnterInteractive
+ * when $stop or vpi_control(vpiStop) ended the run). cbError on each run-time
+ * error ($error, $fatal, a reported timing violation, an illegal bin),
+ * cbPLIError on each VPI routine error; inside either, vpi_chk_error reports
+ * the error. cbTchkViolation on each timing-check violation (obj NULL, value
+ * the violation text as vpiStringVal). cbSignal when SIGINT/SIGTERM stops the
+ * run (index = the signal number). cbUnresolvedSystf the first time an
+ * unknown $name is called (value->value.str = the name); if the routine
+ * registers it with vpi_register_systf, the call goes to it. */
 vpiHandle vpi_register_cb(p_cb_data cb_data_p);
-/* Fills `cb_data_p` from a callback object returned by vpi_register_cb.
- * Returns 1 on success, 0 on failure. */
+/* Fills `cb_data_p` with the registration data: time and value point at
+ * simulator-owned copies of what was registered (NULL if nothing was).
+ * Returns 1, or 0 when the handle is not a registered callback (including a
+ * one-shot that has fired). */
 PLI_INT32 vpi_get_cb_info(vpiHandle cb_obj, p_cb_data cb_data_p);
+/* Removes the callback and frees its handle; allowed from any callback
+ * routine, the callback's own included. Returns 1, or 0 for a handle that is
+ * not a callback. */
 PLI_INT32 vpi_remove_cb(vpiHandle cb_obj);
 
 /* --- Arrays (IEEE 1800-2017 sections 38.16, 38.20, 38.35) ------------- */

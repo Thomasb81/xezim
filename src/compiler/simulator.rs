@@ -680,32 +680,16 @@ macro_rules! write_sig {
                     $self.edge_exec_wrote.push(__ep as usize);
                 }
             }
-            // Fire any registered cbValueChange callbacks. The dispatch lives
-            // inside the macro so every write path (blocking assigns,
-            // NBA writes, force updates, settle loops, initial block
-            // writes) sees it. The HashMap lookup is O(1) and the
-            // empty-list fast path costs one branch.
-            //
-            // Snapshot the callback list in its own scope so the
-            // borrow of `$self.dpi_value_change_cbs` ends before we
-            // re-borrow `$self` for the raw pointer cast. Some
-            // macro-expansion contexts (e.g. clock-generators loop)
-            // already hold an active self-borrow that would conflict
-            // with a second borrow.
-            let __maybe_cbs: Option<Vec<DpiCbHandle>> = {
-                let __list = $self.dpi_value_change_cbs.get(&__wsig_id);
-                __list.filter(|v| !v.is_empty()).cloned()
-            };
-            if let Some(__cbs) = __maybe_cbs {
-                // Each of these is a read of a DISTINCT field, so they
-                // coexist with whatever mutable field-borrow the expansion
-                // site already holds. Re-borrowing `$self` whole would not.
-                let __sim_ptr: *mut Simulator = $self.vpi_self_ptr;
-                let __now: u64 = $self.time;
-                let __val: Option<Value> = $self.signal_table.get(__wsig_id).cloned();
-                for __cb in &__cbs {
-                    dispatch_vpi_cb(__sim_ptr, __now, __val.clone(), __cb, vpi::CB_VALUE_CHANGE);
-                }
+            // §38.36.1 cbValueChange: report the change right away, in the
+            // region of the write. One emptiness check while nothing is
+            // watched. Writes that bypass this macro are caught by the poll
+            // at the end of each settle and delta (`vpi_cb::vpi_checkpoint`).
+            // The dispatcher takes the raw self-pointer: this macro expands
+            // under live borrows of other fields.
+            if !$self.dpi_value_change_cbs.is_empty()
+                && $self.dpi_value_change_cbs.contains_key(&__wsig_id)
+            {
+                vpi_cb::vpi_vc_written($self.vpi_self_ptr, __wsig_id);
             }
         }
     }};
@@ -2149,6 +2133,7 @@ mod timing_checks;
 mod ts_x;
 mod uvm_dpi;
 mod vpi_api;
+mod vpi_cb;
 pub(crate) use code_cov::{
     COND_FN as COV_COND_FN, HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id,
 };
@@ -7594,12 +7579,13 @@ pub struct Simulator {
     /// Each value is a `Box<DpiScope>` raw pointer handed out to C code
     /// via `svGetScopeFromName` and recovered in `svGetNameFromScope`.
     dpi_scopes: HashMap<String, *mut libc::c_void>,
-    /// Registered value-change callbacks per signal id. Triggered from
-    /// `after_signal_write` whenever a signal value differs from its
-    /// previous inline-bits snapshot.
     prof_psettle_calls: u64,
     prof_psettle_deferred: u64,
-    dpi_value_change_cbs: HashMap<usize, Vec<DpiCbHandle>>,
+    /// cbValueChange index (§38.36.1): watched signal id -> ids of the
+    /// callbacks watching it. Consulted on every `write_sig!`, so it is a
+    /// flat field (one emptiness check while nothing is watched); the rest of
+    /// the callback state lives in `vpi_cb`.
+    dpi_value_change_cbs: HashMap<usize, Vec<u64>>,
     /// Every collection/array member name declared by ANY class — the cheap
     /// pre-filter for chained-handle member resolution (see
     /// `instance_assoc_member`). Built once on first use.
@@ -7615,27 +7601,19 @@ pub struct Simulator {
     /// g[i-1][j][k]` over a 4x4x4 grid in [1:2000]) is solved greedily in
     /// index order rather than exhausting the range by luck.
     rand_tight_mode: bool,
-    /// Registered cbNextSimTime callbacks with their registration time.
-    /// Each is one-shot and fires when simulation time advances.
-    dpi_next_time_cbs: Vec<(DpiCbHandle, u64)>,
-    /// §38.36 cbAfterDelay: one-shot callbacks paired with the ABSOLUTE
-    /// tick they are due at. This is what backs cocotb's `Timer`, so the
-    /// scheduler must also treat a pending entry as future work — a
-    /// cocotb-only testbench has no HDL events of its own and would
-    /// otherwise finish at time 0.
-    dpi_after_delay_cbs: Vec<(DpiCbHandle, u64)>,
-    /// §38.36 cbReadWriteSynch: end of the current time step, writes still
-    /// permitted. cocotb's `ReadWrite` trigger.
-    dpi_rw_synch_cbs: Vec<DpiCbHandle>,
-    /// §38.36 cbReadOnlySynch: postponed region, no writes. cocotb's
-    /// `ReadOnly` trigger.
-    dpi_ro_synch_cbs: Vec<DpiCbHandle>,
-    /// Registered start-of-reset callbacks. Fired at simulation start.
-    dpi_reset_cbs: Vec<DpiCbHandle>,
-    /// Registered start-of-simulation callbacks. Fired once at sim start.
-    dpi_start_sim_cbs: Vec<DpiCbHandle>,
-    /// Registered end-of-simulation callbacks. Fired once when the event loop ends.
-    dpi_end_sim_cbs: Vec<DpiCbHandle>,
+    /// VPI callback registry (§38.36, `vpi_cb.rs`). Untouched unless a VPI
+    /// client registers callbacks.
+    vpi_cb: Box<vpi_cb::VpiCbState>,
+    /// Bit `r` set while a callback of reason `r` is registered (plus
+    /// `vpi_cb::MASK_PENDING`): the gate every callback hook tests first, so
+    /// a run without VPI callbacks pays one load and branch per hook site.
+    vpi_cb_mask: u64,
+    /// Time of the last slot whose start (cbNextSimTime, cbAtStartOfSimTime)
+    /// has been processed; u64::MAX before the first.
+    vpi_slot_started: u64,
+    /// `$display` output written since the stdout sink was last synced, so a
+    /// VPI callback's own output can be ordered after it cheaply.
+    stdout_unsynced: bool,
     /// Self-pointer, installed once at the top of `simulate()`. The
     /// `write_sig!` macro needs a `*mut Simulator` to hand the VPI
     /// callback dispatcher, but it expands in contexts that already hold
@@ -7644,12 +7622,6 @@ pub struct Simulator {
     /// macro used to install a NULL `ACTIVE_SIMULATOR`, so a callback that
     /// called back into VPI aborted the process.
     vpi_self_ptr: *mut Simulator,
-    /// Callback cursor for the per-callback iteration loop
-    /// (`vpi_register_cb` may also be called with `cbValueChange` to
-    /// mark a scope's reset triggers; we keep a flag set for that).
-    dpi_pending_reset_fired: bool,
-    dpi_pending_start_sim_fired: bool,
-    dpi_pending_end_sim_fired: bool,
     /// Open file handles for $fopen/$fwrite/$fclose, keyed by an internal
     /// channel id derived from the MCD/FD value (see `resolve_channel_key`):
     /// MCD channels use their bit number (1..=30), FD channels use the raw FD
@@ -11255,17 +11227,11 @@ impl Simulator {
             chained_coll_member_names: std::cell::OnceCell::new(),
             elem_inside_hint: Vec::new(),
             rand_tight_mode: false,
-            dpi_next_time_cbs: Vec::new(),
-            dpi_after_delay_cbs: Vec::new(),
-            dpi_rw_synch_cbs: Vec::new(),
-            dpi_ro_synch_cbs: Vec::new(),
-            dpi_reset_cbs: Vec::new(),
-            dpi_start_sim_cbs: Vec::new(),
-            dpi_end_sim_cbs: Vec::new(),
+            vpi_cb: Box::default(),
+            vpi_cb_mask: 0,
+            vpi_slot_started: u64::MAX,
+            stdout_unsynced: false,
             vpi_self_ptr: std::ptr::null_mut(),
-            dpi_pending_reset_fired: false,
-            dpi_pending_start_sim_fired: false,
-            dpi_pending_end_sim_fired: false,
             file_handles: HashMap::default(),
             file_writes_pending: false,
             file_eof: HashSet::default(),
@@ -11564,13 +11530,6 @@ impl Simulator {
         self.dpi_value_change_cbs.values().map(|v| v.len()).sum()
     }
 
-    /// Return the count of registered start-of-reset callbacks.
-    /// Test-only — used by the `dpi_uvm_test` integration test.
-    #[doc(hidden)]
-    pub fn dpi_reset_cb_count(&self) -> usize {
-        self.dpi_reset_cbs.len()
-    }
-
     /// Return the count of cached DPI scopes.
     /// Test-only — used by the `dpi_uvm_test` integration test.
     #[doc(hidden)]
@@ -11581,13 +11540,12 @@ impl Simulator {
 
 impl Drop for Simulator {
     /// Release heap allocations that aren't tracked by Rust's lifetime
-    /// machinery: the raw pointers we hand out via `vpi_handle_by_name`
-    /// (`Box<VpiHandle>`), `svGetScopeFromName` (`Box<DpiScope>`), and
-    /// `vpi_register_cb` (`Box<DpiCbHandle>`).
+    /// machinery: the `Box<DpiScope>` pointers `svGetScopeFromName` hands out.
     ///
-    /// `dpi_scopes`, `dpi_value_change_cbs`, and `dpi_reset_cbs` each
-    /// own `Box`-es that were leaked to the C side. Drop them here so
-    /// the simulator's exit doesn't leak them per-test.
+    /// `dpi_scopes` owns `Box`-es that were leaked to the C side. Drop them
+    /// here so the simulator's exit doesn't leak them per-test. (Callback
+    /// handles belong to the client, which frees them with `vpi_remove_cb`
+    /// or `vpi_free_object`; the registry itself is plain owned data.)
     fn drop(&mut self) {
         // Scope handles
         for (_name, ptr) in self.dpi_scopes.drain() {
@@ -11597,21 +11555,6 @@ impl Drop for Simulator {
                 }
             }
         }
-        // Per-signal value-change callbacks (Vec<Box> values; the inner
-        // Boxes were never `into_raw`-ed for the individual elements
-        // because we cloned the struct into the Vec, so the Vec's own
-        // Drop handles them — we just need to drain the map).
-        for (_sig_id, mut cbs) in self.dpi_value_change_cbs.drain() {
-            cbs.clear();
-        }
-        // Reset callbacks
-        self.dpi_next_time_cbs.clear();
-        self.dpi_after_delay_cbs.clear();
-        self.dpi_rw_synch_cbs.clear();
-        self.dpi_ro_synch_cbs.clear();
-        self.dpi_reset_cbs.clear();
-        self.dpi_start_sim_cbs.clear();
-        self.dpi_end_sim_cbs.clear();
     }
 }
 
@@ -12702,6 +12645,7 @@ impl Simulator {
 
     #[inline]
     fn stdout_write(&mut self, s: &str) {
+        self.stdout_unsynced = true;
         let threaded = self.stdout_threaded();
         let sink = self.stdout_sink.get_or_insert_with(|| {
             if threaded {
@@ -12715,6 +12659,7 @@ impl Simulator {
 
     #[inline]
     fn stdout_writeln(&mut self, s: &str) {
+        self.stdout_unsynced = true;
         let threaded = self.stdout_threaded();
         let sink = self.stdout_sink.get_or_insert_with(|| {
             if threaded {
@@ -19586,25 +19531,12 @@ impl Simulator {
         let prev_global =
             GLOBAL_ACTIVE_SIMULATOR.swap(self_ptr, std::sync::atomic::Ordering::AcqRel);
         self.vpi_self_ptr = self_ptr;
-        // Fire cbStartOfSimulation callbacks exactly once at simulation start.
-        if !self.dpi_start_sim_cbs.is_empty() && !self.dpi_pending_start_sim_fired {
-            let self_ptr = self as *mut Simulator;
-            let now = self.time;
-            for cb in &self.dpi_start_sim_cbs.clone() {
-                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_START_OF_SIMULATION);
-            }
-            self.dpi_pending_start_sim_fired = true;
-        }
-        // Fire cbStartOfReset callbacks exactly once at simulation
-        // start; we expose it because the `vpi_register_cb(..., cbStartOfReset, ...)`
-        // registration call expects a fire at simulation time 0.
-        if !self.dpi_reset_cbs.is_empty() && !self.dpi_pending_reset_fired {
-            let self_ptr = self as *mut Simulator;
-            let now = self.time;
-            for cb in &self.dpi_reset_cbs.clone() {
-                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_START_OF_RESET);
-            }
-            self.dpi_pending_reset_fired = true;
+        // §38.36.3 cbEndOfCompile, then cbStartOfSimulation, once each. The
+        // model was built before the VPI startup routines ran, so both come
+        // here, before the time-0 slot. (cbStartOfReset/cbEndOfReset never
+        // fire: xezim has no `$reset`.)
+        if self.vpi_cb_mask != 0 {
+            self.vpi_start_of_simulation();
         }
         if !self.wake_rank_built {
             self.build_sig_wake_rank();
@@ -19624,15 +19556,11 @@ impl Simulator {
         {
             self.time = self.max_time;
         }
-        // Fire cbEndOfSimulation callbacks exactly once after the event loop
-        // terminates, before `final` blocks execute.
-        if !self.dpi_end_sim_cbs.is_empty() && !self.dpi_pending_end_sim_fired {
-            let self_ptr = self as *mut Simulator;
-            let now = self.time;
-            for cb in &self.dpi_end_sim_cbs.clone() {
-                dispatch_vpi_cb(self_ptr, now, None, cb, vpi::CB_END_OF_SIMULATION);
-            }
-            self.dpi_pending_end_sim_fired = true;
+        // cbEndOfSimulation, once, after the event loop terminates and before
+        // `final` blocks execute; preceded by cbEnterInteractive when `$stop`
+        // ended the run.
+        if self.vpi_cb_mask != 0 {
+            self.vpi_end_of_simulation();
         }
         // LRM §9.2.3 — `final` procedures run after the event loop terminates
         // but BEFORE any trace flush. May not contain time-consuming
@@ -43165,6 +43093,16 @@ impl Simulator {
         // so `always @(posedge clk)` compared 1 against 1 and saw no edge — a
         // cocotb-driven DUT sat at x forever while level-sensitive
         // `always @(clk)` blocks worked fine.
+        //
+        // The slot's start callbacks (cbNextSimTime, cbAtStartOfSimTime) come
+        // first, in the first delta of the time, at the same point for the
+        // same reason.
+        if self.vpi_slot_started != self.time {
+            if self.vpi_cb_mask & vpi_cb::MASK_SLOT_START != 0 && self.vpi_slot_start() {
+                self.dirty_any = true;
+            }
+            self.vpi_slot_started = self.time;
+        }
         if self.fire_due_after_delay_cbs() {
             self.dirty_any = true;
         }
@@ -43341,6 +43279,10 @@ impl Simulator {
         let _t = profile_timing.then(std::time::Instant::now);
         // §4.5: inactive (`#0`) continuations run before this slot's NBAs.
         self.drain_inactive_pre_nba();
+        // §38.36.2 cbNBASynch: the Pre-NBA region.
+        if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_NBA_SYNCH) != 0 {
+            self.vpi_nba_synch();
+        }
         if !self.nba_fast.is_empty()
             || !self.nba_queue.is_empty()
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
@@ -43893,6 +43835,9 @@ impl Simulator {
                     "[xezim] interrupted at time {} — finalizing waveform dumps",
                     self.time
                 );
+                if self.vpi_cb_mask != 0 {
+                    self.vpi_notify_signal();
+                }
                 self.finished = true;
                 break;
             }
@@ -43907,12 +43852,18 @@ impl Simulator {
                 && self.delayed_updates.is_empty()
                 && self.delayed_nba.is_empty()
                 && !has_reactive
-                // A pending cbAfterDelay is real future work even when the HDL
-                // side is idle — a cocotb testbench drives everything from VPI
-                // timers, so without this the run ends at time 0 and every
-                // `Timer` reports as never set up.
-                && self.dpi_after_delay_cbs.is_empty()
+                // A pending VPI timer (cbAfterDelay, a future cbReadWriteSynch,
+                // ...) is real future work even when the HDL side is idle — a
+                // cocotb testbench drives everything from VPI timers, so
+                // without this the run ends at time 0 and every `Timer`
+                // reports as never set up.
+                && !self.vpi_timed_future()
             {
+                // The slot still ends: its cbAtEndOfSimTime/cbReadOnlySynch
+                // run, and may schedule more.
+                if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
+                    continue;
+                }
                 break;
             }
             // Deadlock: only waiters remain but nothing can ever wake them.
@@ -43923,8 +43874,11 @@ impl Simulator {
                 && !has_clocks
                 && self.delayed_updates.is_empty()
                 && self.delayed_nba.is_empty()
-                && self.dpi_after_delay_cbs.is_empty()
+                && !self.vpi_timed_future()
             {
+                if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
+                    continue;
+                }
                 break;
             }
 
@@ -43967,6 +43921,9 @@ impl Simulator {
             });
 
             if next_time > self.max_time {
+                if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
+                    continue;
+                }
                 if !self.finished
                     && !RUN_LENGTH_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
                 {
@@ -43985,7 +43942,12 @@ impl Simulator {
                 self.mature_deferred_asserts();
                 continue;
             }
-            let old_time = self.time;
+            // §38.36.2: the slot ends — cbAtEndOfSimTime, cbReadOnlySynch —
+            // before time moves. A routine may add work to this slot or an
+            // earlier timer, so look again when any ran.
+            if next_time > self.time && self.vpi_cb_mask != 0 && self.vpi_slot_end() {
+                continue;
+            }
             if next_time > self.time {
                 self.time = next_time;
                 // Lines printed near the end of a burst stay buffered until the
@@ -44034,18 +43996,6 @@ impl Simulator {
                     self.report_zero_delay_stall(None);
                     self.finished = true;
                     break;
-                }
-            }
-            if self.time > old_time && !self.dpi_next_time_cbs.is_empty() {
-                let self_ptr = self as *mut Simulator;
-                let now = self.time;
-                let mut pending = std::mem::take(&mut self.dpi_next_time_cbs);
-                for (cb, reg_time) in pending.drain(..) {
-                    if now > reg_time {
-                        dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_NEXT_SIM_TIME);
-                    } else {
-                        self.dpi_next_time_cbs.push((cb, reg_time));
-                    }
                 }
             }
 
@@ -46131,6 +46081,9 @@ impl Simulator {
                     "[xezim] interrupted at time {} — finalizing waveform dumps",
                     self.time
                 );
+                if self.vpi_cb_mask != 0 {
+                    self.vpi_notify_signal();
+                }
                 self.finished = true;
                 break;
             }
@@ -46154,7 +46107,13 @@ impl Simulator {
                 Some(t) if t <= target => t,
                 _ => break,
             };
+            let mut vpi_fired = false;
             if nt > self.time {
+                // §38.36.2: the slot's cbAtEndOfSimTime / cbReadOnlySynch run
+                // before time moves; look again if any did.
+                if self.vpi_cb_mask != 0 && self.vpi_slot_end() {
+                    continue;
+                }
                 // Leaving this timestamp — close out its postponed region
                 // before the clock moves, so $monitor and the dump report it
                 // at the time it actually happened.
@@ -46165,6 +46124,13 @@ impl Simulator {
                 self.time = nt;
                 if let Some(sink) = self.stdout_sink.as_mut() {
                     sink.flush_if_stale();
+                }
+                if self.vpi_slot_started != self.time {
+                    if self.vpi_cb_mask & vpi_cb::MASK_SLOT_START != 0 && self.vpi_slot_start() {
+                        self.dirty_any = true;
+                        vpi_fired = true;
+                    }
+                    self.vpi_slot_started = self.time;
                 }
             }
             // Commit delayed updates whose target time matches first —
@@ -46205,6 +46171,10 @@ impl Simulator {
                 }
                 continue;
             }
+            // §38.36.2 cbNBASynch: the Pre-NBA region.
+            if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_NBA_SYNCH) != 0 {
+                self.vpi_nba_synch();
+            }
             if !self.nba_fast.is_empty()
             || !self.nba_queue.is_empty()
             // §15.5.2: a bare `->>` (deferred trigger) must flush with the NBA
@@ -46223,7 +46193,7 @@ impl Simulator {
             // edge triggers so always_ff blocks fire within this delay
             // window, then re-snapshot for the next iter.
             self.fire_timing_timers();
-            let vpi_fired = self.fire_due_after_delay_cbs();
+            vpi_fired |= self.fire_due_after_delay_cbs();
             if vpi_fired {
                 self.dirty_any = true;
                 self.settle_combinatorial();
@@ -48205,6 +48175,11 @@ impl Simulator {
                     i += 1;
                     continue;
                 }
+            }
+            // §38.36.1 cbStmt: statements this loop runs itself are reported
+            // here (see `vpi_stmt_hook`).
+            if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_STMT) != 0 {
+                self.vpi_stmt_hook(stmt, true);
             }
 
             // Expand SeqBlocks: flatten begin/end so that timing controls and waits
@@ -52077,16 +52052,8 @@ impl Simulator {
         }
     }
 
-    /// Earliest pending `cbAfterDelay` fire time. Folded into the scheduler's
-    /// next-time choice so a VPI timer counts as future work: a cocotb-only
-    /// testbench drives no HDL events, and without this the run ended at time
-    /// 0 with every `Timer` still outstanding.
-    fn next_vpi_cb_time(&self) -> Option<u64> {
-        self.dpi_after_delay_cbs.iter().map(|(_, t)| *t).min()
-    }
-
-    /// Next scheduler-visible timer: a `cbAfterDelay` or a time-based
-    /// timing-check deadline.
+    /// Next scheduler-visible timer: a VPI simulation-time callback (see
+    /// `next_vpi_cb_time`) or a time-based timing-check deadline.
     fn next_timer_time(&self) -> Option<u64> {
         match (self.next_vpi_cb_time(), self.next_timing_timer()) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -52094,66 +52061,15 @@ impl Simulator {
         }
     }
 
-    /// Fire every `cbAfterDelay` now due. One-shot per §38.36 — each is removed
-    /// before its routine runs, so a callback that re-registers (which cocotb
-    /// does on every `Timer`) queues a fresh entry instead of re-firing this one.
-    fn fire_due_after_delay_cbs(&mut self) -> bool {
-        if self.dpi_after_delay_cbs.is_empty() {
-            return false;
-        }
-        let now = self.time;
-        if !self.dpi_after_delay_cbs.iter().any(|(_, t)| *t <= now) {
-            return false;
-        }
-        let mut due: Vec<DpiCbHandle> = Vec::new();
-        self.dpi_after_delay_cbs.retain(|(cb, t)| {
-            if *t <= now {
-                due.push(*cb);
-                false
-            } else {
-                true
-            }
-        });
-        let self_ptr = self as *mut Simulator;
-        let fired = !due.is_empty();
-        for cb in due {
-            dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_AFTER_DELAY);
-        }
-        fired
-    }
-
-    /// End-of-time-step VPI synchronization callbacks (§38.36). Both are
-    /// one-shot. cbReadWriteSynch runs first, while writes are still legal;
-    /// cbReadOnlySynch runs in the postponed region. These back cocotb's
-    /// `ReadWrite` and `ReadOnly` triggers.
+    /// End of a delta: the VPI work that belongs there (`vpi_tick_end`) —
+    /// cbReadWriteSynch, which is where a VPI client applies its QUEUED
+    /// signal writes (cocotb drives clocks and resets from there, not from
+    /// the `Timer` callback itself), plus value changes made by paths that
+    /// bypass `write_sig!` and deferred release/disable notifications.
+    /// cbReadOnlySynch belongs to the end of the whole slot (`vpi_slot_end`).
     fn fire_vpi_synch_cbs(&mut self) {
-        if !self.dpi_rw_synch_cbs.is_empty() {
-            let now = self.time;
-            let self_ptr = self as *mut Simulator;
-            for cb in std::mem::take(&mut self.dpi_rw_synch_cbs) {
-                dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_READ_WRITE_SYNCH);
-            }
-            // cbReadWriteSynch is where a VPI client applies its QUEUED signal
-            // writes — cocotb drives clocks and resets from here, not from the
-            // `Timer` callback itself. Writes landing after this slot's edge
-            // detection were invisible: the next slot's snapshot absorbed them
-            // as the new baseline, so `always @(posedge clk)` compared 1 to 1
-            // and a cocotb-clocked DUT never advanced. Open a fresh delta in
-            // this slot so they are evaluated like any other active-region
-            // write.
-            if self.dirty_any {
-                self.settle_combinatorial();
-            }
-            self.check_edges();
-            let _ = self.drain_edge_cascade(self.cascade_limit);
-            self.snapshot_edge_signals();
-        }
-        if !self.dpi_ro_synch_cbs.is_empty() {
-            let now = self.time;
-            let self_ptr = self as *mut Simulator;
-            for cb in std::mem::take(&mut self.dpi_ro_synch_cbs) {
-                dispatch_vpi_cb(self_ptr, now, None, &cb, vpi::CB_READ_ONLY_SYNCH);
-            }
+        if self.vpi_cb_mask != 0 {
+            self.vpi_tick_end();
         }
     }
 
@@ -56032,6 +55948,12 @@ impl Simulator {
         }
         if !self.active_force_exprs.is_empty() {
             self.refresh_active_forces();
+        }
+        // §38.36.1: continuous assignments settle without `write_sig!`, so
+        // watched values are compared here; releases are reported once the
+        // released net has been re-driven.
+        if self.vpi_cb_mask != 0 {
+            self.vpi_checkpoint();
         }
     }
 
@@ -66641,6 +66563,14 @@ impl Simulator {
                 .first()
                 .map(|a| self.eval_expr(a))
                 .unwrap_or(Value::zero(32)),
+            // §38.36.3 cbUnresolvedSystf may register the name.
+            _ if self.vpi_cb_mask != 0
+                && self.vpi_resolve_unknown_systf(name)
+                && vpi_systf_is_func(name) =>
+            {
+                let self_ptr = self as *mut Simulator;
+                vpi_call_systf(self_ptr, name, args, expr.span).unwrap_or_else(|| Value::zero(32))
+            }
             _ => {
                 self.warn_unknown_system_task(name, args);
                 Value::zero(32)
@@ -77984,6 +77914,10 @@ impl Simulator {
         {
             return;
         }
+        // §38.36.1 cbStmt, before the statement runs (interpreted code only).
+        if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_STMT) != 0 {
+            self.vpi_stmt_hook(stmt, false);
+        }
         match &stmt.kind {
             StatementKind::Null => {}
             StatementKind::ScopePop => {
@@ -79257,6 +79191,10 @@ impl Simulator {
                 self.return_flag = true;
             }
             StatementKind::Disable(name) => {
+                // §38.36.1 cbDisable, reported once the disable took effect.
+                if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_DISABLE) != 0 {
+                    self.vpi_note_disable(&name.name);
+                }
                 // IEEE 1800-2017 §9.6.2. `disable_target` was set but never
                 // read: the only effect was `break_flag`, a GLOBAL flag. So a
                 // `disable` broke the innermost loop instead of terminating the
@@ -79693,6 +79631,7 @@ impl Simulator {
                     // targets.
                     let v = self.eval_expr(rvalue);
                     let target = self.force_target(lvalue);
+                    let vpi_target = target.as_ref().map(|(_, id)| *id);
                     // A second force/assign on an already-overridden target
                     // REPLACES the previous override (§10.6.1/§10.6.2), so
                     // lift the old one first — the guarded write paths would
@@ -79717,6 +79656,16 @@ impl Simulator {
                         // degrade to a plain write, as before.
                         None => {}
                     }
+                    // §38.36.1 cbForce / cbAssign, after the override took hold.
+                    if let Some(sig) = vpi_target {
+                        if self.vpi_cb_mask != 0 {
+                            let reason = match pc {
+                                ProceduralContinuous::Force { .. } => vpi_cb::CB_FORCE,
+                                _ => vpi_cb::CB_ASSIGN,
+                            };
+                            self.vpi_notify_override(reason, sig);
+                        }
+                    }
                 }
                 ProceduralContinuous::Release(lvalue) | ProceduralContinuous::Deassign(lvalue) => {
                     // LRM §10.6.2 `release`: a VARIABLE keeps the forced
@@ -79728,6 +79677,17 @@ impl Simulator {
                     // §10.6.1 `deassign` likewise retains the last value.
                     let target = self.force_target(lvalue);
                     self.release_override(target.as_ref().map(|(n, id)| (n.as_str(), *id)));
+                    // §38.36.1 cbRelease / cbDeassign, reported once the
+                    // released net has been re-driven.
+                    if let Some((_, sig)) = target {
+                        if self.vpi_cb_mask != 0 {
+                            let reason = match pc {
+                                ProceduralContinuous::Release(_) => vpi_cb::CB_RELEASE,
+                                _ => vpi_cb::CB_DEASSIGN,
+                            };
+                            self.vpi_queue_release(reason, sig);
+                        }
+                    }
                 }
             },
             StatementKind::RandCase { items } => {
@@ -81366,6 +81326,11 @@ impl Simulator {
             // initial blocks run in the reactive region of the same event
             // loop), so plain `$finish` semantics are the accurate mapping.
             "$finish" | "$stop" | "$exit" => {
+                // xezim has no interactive mode: `$stop` ends the run like
+                // `$finish`, reported to VPI as cbEnterInteractive.
+                if name == "$stop" && self.vpi_cb_mask != 0 {
+                    self.vpi_note_stop();
+                }
                 if std::env::var("XEZIM_TRACE_FINISH").is_ok() {
                     let bt = std::backtrace::Backtrace::force_capture();
                     eprintln!(
@@ -81803,6 +81768,12 @@ impl Simulator {
                 let span = vpi_api::take_task_call_span();
                 vpi_call_systf(self_ptr, name, args, span);
             }
+            // §38.36.3 cbUnresolvedSystf may register the name.
+            _ if self.vpi_cb_mask != 0 && self.vpi_resolve_unknown_systf(name) => {
+                let self_ptr = self as *mut Simulator;
+                let span = vpi_api::take_task_call_span();
+                vpi_call_systf(self_ptr, name, args, span);
+            }
             _ => {
                 self.warn_unknown_system_task(name, args);
             }
@@ -81875,6 +81846,12 @@ impl Simulator {
         self.record_output(ctx.clone());
         self.stdout_writeln(&line);
         self.stdout_writeln(&ctx);
+        // §20.10: `$error` / `$fatal` are run-time errors — §38.36.3 cbError.
+        if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_ERROR) != 0
+            && matches!(severity, "Error" | "Fatal")
+        {
+            self.vpi_notify_error(&line);
+        }
     }
 
     /// Write a §20.15 status code to output argument `idx` (if present). The
@@ -88012,24 +87989,6 @@ impl Simulator {
         // invoked from NBA writeback / vpi_put_value paths that have
         // already passed through write_sig! — firing here would cause
         // double-counting on those paths.
-    }
-
-    /// Fire every registered `cbValueChange` callback for the given
-    /// signal id. Called from the `write_sig!` macro so all writes
-    /// (blocking assigns, NBA, force updates, settle loops, initial
-    /// block writes) dispatch the same way. The HashMap lookup is
-    /// O(1) and the empty-list fast path costs one branch.
-    fn fire_value_change_callbacks(&mut self, id: usize) {
-        let cbs = match self.dpi_value_change_cbs.get(&id) {
-            Some(v) if !v.is_empty() => v.clone(),
-            _ => return,
-        };
-        let self_ptr = self as *mut Simulator;
-        let now = self.time;
-        let val = self.signal_table.get(id).cloned();
-        for cb in &cbs {
-            dispatch_vpi_cb(self_ptr, now, val.clone(), cb, vpi::CB_VALUE_CHANGE);
-        }
     }
 
     /// O1 (event-driven-edge) MEASUREMENT setup. Builds per-edge-block static
@@ -137897,11 +137856,6 @@ thread_local! {
         std::cell::RefCell::new((0, vec![Vec::new(); 8]));
     static VPI_TIME_SCRATCH: std::cell::RefCell<s_vpi_time> =
         const { std::cell::RefCell::new(s_vpi_time { type_: 2, high: 0, low: 0, real: 0.0 }) };
-    // Storage returned from vpi_get_cb_info for cb_data_p->value/time.
-    static VPI_CB_INFO_VALUE_SCRATCH: std::cell::RefCell<s_vpi_value> =
-        const { std::cell::RefCell::new(s_vpi_value { format: 13, value: s_vpi_value_union { integer: 0 } }) };
-    static VPI_CB_INFO_TIME_SCRATCH: std::cell::RefCell<s_vpi_time> =
-        const { std::cell::RefCell::new(s_vpi_time { type_: 3, high: 0, low: 0, real: 0.0 }) };
 }
 
 /// `Value` bit code (0=0, 1=1, 2=X, 3=Z) -> one `(aval, bval)` bit pair.
@@ -138166,6 +138120,9 @@ enum VpiKind {
     /// An intermodule path (`vpiInterModPath`): `signal_id` is the input
     /// port's signal, `inst_idx` the output port's.
     InterModPath,
+    /// A `vpi_register_cb` handle; `signal_id` holds the callback's id in
+    /// `Simulator::vpi_cb` (see `vpi_cb.rs`).
+    Callback,
 }
 
 /// Wrapper for VPI handles stored as raw pointers.
@@ -138331,6 +138288,10 @@ thread_local! {
 fn vpi_error(level: libc::c_int, msg: String) {
     eprintln!("[VPI] {}", msg);
     VPI_LAST_ERROR.with(|c| *c.borrow_mut() = Some((level, msg)));
+    // §38.36.3 cbPLIError.
+    if level >= vpi::ERROR {
+        vpi_cb::vpi_notify_pli_error();
+    }
 }
 
 /// A `$systf` registered from a VPI module via `vpi_register_systf`.
@@ -138410,29 +138371,6 @@ pub struct s_vpi_vlog_info {
 struct DpiScope {
     name: [u8; 256],
     name_len: usize,
-}
-
-/// Opaque VPI callback handle. Everything the dispatcher needs to rebuild
-/// a conforming `s_cb_data` when the trigger fires.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct DpiCbHandle {
-    cb_type: libc::c_int,
-    /// Signal id this callback watches (cbValueChange only). 0 for
-    /// non-signal callbacks like cbStartOfReset.
-    signal_id: usize,
-    /// The C function pointer invoked on the trigger. Stored as `usize`
-    /// because `extern "C" fn(...)` is non-`Send` and would prevent the
-    /// containing struct from living in a HashMap.
-    cb_routine: usize,
-    /// User-supplied data passed to the callback as `cb_data_p->user_data`.
-    user_data: usize,
-    /// The `obj` handle supplied at registration, passed back on each
-    /// fire as `cb_data_p->obj` (§38.7 requires it).
-    obj: usize,
-    /// Format of the value struct supplied at registration, used to fill
-    /// `cb_data_p->value`. `vpiIntVal` when the caller supplied none.
-    value_format: libc::c_int,
 }
 
 /// Execute a closure with access to the active simulator.
@@ -139146,6 +139084,7 @@ fn vpi_type_name(code: libc::c_int) -> Option<&'static str> {
         vpi::STRUCT_VAR => "vpiStructVar",
         vpi::UNION_VAR => "vpiUnionVar",
         vpi::BIT_VAR => "vpiBitVar",
+        vpi_cb::VPI_CALLBACK => "vpiCallback",
         _ => return None,
     })
 }
@@ -139405,37 +139344,6 @@ fn vpi_err_scratch(s: &str) -> *mut libc::c_char {
     })
 }
 
-/// Backend for `vpi_control`, which is C-variadic and therefore lives in
-/// `src/vpi_printf_shim.c`. `arg` is the `$finish`/`$stop` diagnostic level.
-///
-/// Only vpiStop and vpiFinish do anything: both end the run, exactly as the
-/// corresponding system tasks do. vpiReset is rejected rather than silently
-/// ignored — xezim cannot rewind a simulation.
-#[unsafe(no_mangle)]
-pub extern "C" fn xezim_vpi_control(operation: libc::c_int, _arg: libc::c_int) -> libc::c_int {
-    match operation {
-        vpi::STOP | vpi::FINISH => try_active_sim("vpi_control", |sim| {
-            sim.finished = true;
-            1
-        })
-        .unwrap_or(0),
-        vpi::RESET => {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_control(vpiReset): xezim cannot reset a running simulation".into(),
-            );
-            0
-        }
-        other => {
-            vpi_error(
-                vpi::ERROR,
-                format!("vpi_control: operation {} not supported", other),
-            );
-            0
-        }
-    }
-}
-
 /// Load each `--vpi-lib` and run its `vlog_startup_routines`, the standard
 /// entry point for a VPI module (IEEE 1800-2017 §38.2).
 pub fn vpi_run_startup_routines(libs: &mut Vec<Library>, paths: &[String]) {
@@ -139568,7 +139476,7 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
         };
     }
     match h.kind {
-        VpiKind::Module | VpiKind::Iterator => return vpi::UNDEFINED,
+        VpiKind::Module | VpiKind::Iterator | VpiKind::Callback => return vpi::UNDEFINED,
         // vpiSize of a memory is its number of words; of a slice, its bits.
         VpiKind::Memory | VpiKind::Slice if property == vpi::SIZE => return h.width as libc::c_int,
         _ => {}
@@ -139661,6 +139569,7 @@ pub extern "C" fn vpi_get_value(handle: *mut libc::c_void, value_p: *mut s_vpi_v
             | VpiKind::ModPath
             | VpiKind::Tchk
             | VpiKind::InterModPath
+            | VpiKind::Callback
     ) {
         vpi_error(
             vpi::ERROR,
@@ -139798,71 +139707,6 @@ fn fill_vpi_value(
     }
 }
 
-/// Invoke one registered C callback with a conforming `s_cb_data`.
-///
-/// `obj`, `time` and `value` are all populated: the standard requires it
-/// for `cbValueChange`, and a callback that dereferences `cb_data_p->value`
-/// used to segfault because xezim passed null for every one of them.
-///
-/// `ACTIVE_SIMULATOR` is set before the call so the callback may itself
-/// call back into VPI. It used to be cleared to null here, which meant any
-/// such re-entry aborted the process.
-fn dispatch_vpi_cb(
-    sim_ptr: *mut Simulator,
-    current_time: u64,
-    signal_val: Option<Value>,
-    cb: &DpiCbHandle,
-    reason: libc::c_int,
-) {
-    let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
-    ACTIVE_SIMULATOR.with(|cell| cell.set(sim_ptr));
-
-    let mut value = s_vpi_value {
-        format: cb.value_format,
-        value: s_vpi_value_union { integer: 0 },
-    };
-    let filled = match (reason, &signal_val) {
-        (vpi::CB_VALUE_CHANGE, Some(v)) => {
-            let obj_type_code =
-                unsafe { vpi_deref(cb.obj as *mut libc::c_void).map(|h| h.type_code) };
-            vpi_api::set_strength_hint_raw(sim_ptr, cb.signal_id, obj_type_code, value.format);
-            let ok = fill_vpi_value(v, current_time, obj_type_code, &mut value);
-            vpi_api::clear_strength_hint();
-            ok
-        }
-        _ => false,
-    };
-    if !filled {
-        value.format = vpi::SUPPRESS_VAL;
-    }
-
-    let mut time = s_vpi_time {
-        type_: vpi::SIM_TIME,
-        high: (current_time >> 32) as u32,
-        low: (current_time & 0xFFFF_FFFF) as u32,
-        real: current_time as f64,
-    };
-
-    let cb_data = s_cb_data {
-        reason,
-        cb_rtn: std::ptr::null_mut(),
-        obj: cb.obj as *mut libc::c_void,
-        time: &mut time,
-        value: &mut value,
-        index: 0,
-        user_data: cb.user_data as *mut libc::c_void,
-    };
-
-    if !sim_ptr.is_null() {
-        // Foreign code may read what the design wrote to a file.
-        unsafe { (*sim_ptr).flush_file_writes() };
-    }
-    type CbFn = extern "C" fn(*mut s_cb_data);
-    let cb_fn: CbFn = unsafe { std::mem::transmute(cb.cb_routine as *const ()) };
-    cb_fn(&cb_data as *const s_cb_data as *mut s_cb_data);
-    ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
-}
-
 /// Write a signal value via VPI (supports force/release).
 #[unsafe(no_mangle)]
 pub extern "C" fn vpi_put_value(
@@ -139946,11 +139790,20 @@ pub extern "C" fn vpi_put_value(
         let h = unsafe { &*(handle as *const VpiHandle) };
         if matches!(
             h.kind,
-            VpiKind::Module | VpiKind::Iterator | VpiKind::Memory
+            VpiKind::Module | VpiKind::Iterator | VpiKind::Memory | VpiKind::Callback
         ) {
             vpi_error(
                 vpi::ERROR,
                 "vpi_put_value: this object has no value; ignored".into(),
+            );
+            return std::ptr::null_mut();
+        }
+        // §38.36.2: nothing may be written from a cbReadOnlySynch routine.
+        if sim.vpi_in_read_only() {
+            vpi_error(
+                vpi::ERROR,
+                "vpi_put_value: writes are not allowed in the read-only synch region; ignored"
+                    .into(),
             );
             return std::ptr::null_mut();
         }
@@ -139971,6 +139824,10 @@ pub extern "C" fn vpi_put_value(
             return std::ptr::null_mut();
         }
         if flags == vpi::RELEASE_FLAG {
+            // §38.36.1 cbRelease, once the net has been re-driven.
+            if sim.vpi_cb_mask != 0 {
+                sim.vpi_queue_release(vpi_cb::CB_RELEASE, Some(sig_id));
+            }
             // Release: remove from forced_signals and trigger settle
             sim.forced_signals.remove(&sig_id);
             // Re-evaluate the continuous drivers of the released net.
@@ -140176,6 +140033,10 @@ pub extern "C" fn vpi_put_value(
             }
             // Now mark as forced (after the write succeeded)
             sim.forced_signals.insert(sig_id, value);
+            // §38.36.1 cbForce.
+            if sim.vpi_cb_mask != 0 {
+                sim.vpi_notify_override(vpi_cb::CB_FORCE, Some(sig_id));
+            }
         } else {
             // Normal write - write_sig! will skip if signal is forced
             write_sig!(sim, sig_id, value);
@@ -140271,248 +140132,6 @@ pub extern "C" fn vpi_get_vlog_info(info_p: *mut s_vpi_vlog_info) -> libc::c_int
 #[unsafe(no_mangle)]
 pub extern "C" fn vpi_release_handle(handle: *mut libc::c_void) -> libc::c_int {
     vpi_free_object(handle)
-}
-
-// --- vpi_register_cb ---------------------------------------------------------
-//
-// Registers a VPI callback. The minimum UVM-1.2/1800.2-2017 surface
-// accepts `cbValueChange` (1), `cbNextSimTime` (8),
-// `cbStartOfSimulation` (11), `cbEndOfSimulation` (12), and
-// `cbStartOfReset` (19). Other reasons are rejected.
-//
-// Returns a non-null opaque handle on success, null on failure. The
-// returned handle must be freed by `vpi_remove_cb` (which is itself
-// implemented as `vpi_free_object` internally — we leak the `DpiCbHandle`
-// Box from the Rust side).
-#[unsafe(no_mangle)]
-pub extern "C" fn vpi_register_cb(cb_p: *mut s_cb_data) -> *mut libc::c_void {
-    if cb_p.is_null() {
-        return std::ptr::null_mut();
-    }
-    let cb_data = unsafe { &*cb_p };
-    let reason = cb_data.reason;
-    let user_data = cb_data.user_data as usize;
-    let cb_routine = cb_data.cb_rtn as usize;
-
-    // The signal being watched (cbValueChange only). For other reasons
-    // we record 0 — those callbacks fire once per simulator session
-    // regardless of the target.
-    let signal_id = match unsafe { vpi_deref(cb_data.obj) } {
-        Some(h) if h.kind == VpiKind::Signal => h.signal_id,
-        Some(_) => {
-            vpi_error(
-                vpi::ERROR,
-                "vpi_register_cb: obj is not a signal (not registered)".into(),
-            );
-            return std::ptr::null_mut();
-        }
-        None => 0,
-    };
-    // The format the caller wants `cb_data_p->value` filled in on each
-    // fire. `vpiIntVal` when no value struct was supplied.
-    let value_format = if cb_data.value.is_null() {
-        vpi::INT_VAL
-    } else {
-        unsafe { (*cb_data.value).format }
-    };
-
-    // Reject a reason we will never dispatch rather than handing back a
-    // handle that quietly never fires.
-    if reason != vpi::CB_VALUE_CHANGE
-        && reason != vpi::CB_NEXT_SIM_TIME
-        && reason != vpi::CB_AFTER_DELAY
-        && reason != vpi::CB_READ_WRITE_SYNCH
-        && reason != vpi::CB_READ_ONLY_SYNCH
-        && reason != vpi::CB_START_OF_RESET
-        && reason != vpi::CB_START_OF_SIMULATION
-        && reason != vpi::CB_END_OF_SIMULATION
-    {
-        vpi_error(
-            vpi::ERROR,
-            format!(
-                "vpi_register_cb: unsupported reason {} (not registered)",
-                reason
-            ),
-        );
-        return std::ptr::null_mut();
-    }
-    if reason == vpi::CB_VALUE_CHANGE && cb_data.obj.is_null() {
-        vpi_error(
-            vpi::ERROR,
-            "vpi_register_cb: cbValueChange with a null obj (not registered)".into(),
-        );
-        return std::ptr::null_mut();
-    }
-
-    let handle = Box::into_raw(Box::new(DpiCbHandle {
-        cb_type: reason,
-        signal_id,
-        cb_routine,
-        user_data,
-        obj: cb_data.obj as usize,
-        value_format,
-    }));
-
-    let registered = try_active_sim("vpi_register_cb", |sim| {
-        match reason {
-            vpi::CB_VALUE_CHANGE => {
-                sim.dpi_value_change_cbs
-                    .entry(signal_id)
-                    .or_default()
-                    .push(unsafe { *handle });
-            }
-            vpi::CB_NEXT_SIM_TIME => sim.dpi_next_time_cbs.push((unsafe { *handle }, sim.time)),
-            vpi::CB_AFTER_DELAY => {
-                // §38.36: the delay is RELATIVE to now, in the units named
-                // by `time->type`. vpiSimTime is a 64-bit tick count split
-                // across high/low; vpiScaledRealTime is a double in the
-                // object's timeunit, which for a NULL obj is the global one
-                // — the same base `self.time` counts in, so no rescale.
-                let delay = if cb_data.time.is_null() {
-                    0u64
-                } else {
-                    let t = unsafe { &*cb_data.time };
-                    if t.type_ == vpi::SCALED_REAL_TIME {
-                        if t.real > 0.0 { t.real as u64 } else { 0 }
-                    } else {
-                        ((t.high as u64) << 32) | (t.low as u64)
-                    }
-                };
-                sim.dpi_after_delay_cbs
-                    .push((unsafe { *handle }, sim.time.saturating_add(delay)));
-            }
-            vpi::CB_READ_WRITE_SYNCH => sim.dpi_rw_synch_cbs.push(unsafe { *handle }),
-            vpi::CB_READ_ONLY_SYNCH => sim.dpi_ro_synch_cbs.push(unsafe { *handle }),
-            vpi::CB_START_OF_RESET => sim.dpi_reset_cbs.push(unsafe { *handle }),
-            vpi::CB_START_OF_SIMULATION => sim.dpi_start_sim_cbs.push(unsafe { *handle }),
-            vpi::CB_END_OF_SIMULATION => sim.dpi_end_sim_cbs.push(unsafe { *handle }),
-            _ => {}
-        }
-        true
-    })
-    .unwrap_or(false);
-
-    if !registered {
-        drop(unsafe { Box::from_raw(handle) });
-        return std::ptr::null_mut();
-    }
-
-    handle as *mut libc::c_void
-}
-
-// --- vpi_get_cb_info --------------------------------------------------------
-//
-// Returns callback registration information for a handle returned by
-// `vpi_register_cb`. Mirrors the fields xezim stores internally.
-#[unsafe(no_mangle)]
-pub extern "C" fn vpi_get_cb_info(
-    cb_obj: *mut libc::c_void,
-    cb_data_p: *mut s_cb_data,
-) -> libc::c_int {
-    if cb_obj.is_null() || cb_data_p.is_null() {
-        return 0;
-    }
-
-    let cb = unsafe { &*(cb_obj as *const DpiCbHandle) };
-    let out = unsafe { &mut *cb_data_p };
-
-    out.reason = cb.cb_type;
-    out.cb_rtn = cb.cb_routine as *mut libc::c_void;
-    out.obj = cb.obj as *mut libc::c_void;
-    out.index = 0;
-    out.user_data = cb.user_data as *mut libc::c_void;
-
-    if cb.cb_type == vpi::CB_VALUE_CHANGE {
-        let vp = VPI_CB_INFO_VALUE_SCRATCH.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            slot.format = cb.value_format;
-            slot.value = s_vpi_value_union { integer: 0 };
-            cell.as_ptr()
-        });
-        let tp = VPI_CB_INFO_TIME_SCRATCH.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            *slot = s_vpi_time {
-                type_: vpi::SUPPRESS_TIME,
-                high: 0,
-                low: 0,
-                real: 0.0,
-            };
-            cell.as_ptr()
-        });
-        out.value = vp;
-        out.time = tp;
-    } else {
-        out.value = std::ptr::null_mut();
-        out.time = std::ptr::null_mut();
-    }
-
-    1
-}
-
-// --- vpi_remove_cb -----------------------------------------------------------
-//
-// Deregisters a callback previously registered via `vpi_register_cb`.
-//
-// Removal scans the per-signal value-change lists and the reset-callback
-// vec. Order is not preserved. The callback Box is reclaimed here — we don't leak.
-#[unsafe(no_mangle)]
-pub extern "C" fn vpi_remove_cb(cb: *mut libc::c_void) -> libc::c_int {
-    if cb.is_null() {
-        return 0;
-    }
-    let removed = unsafe { Box::from_raw(cb as *mut DpiCbHandle) };
-    let signal_id = removed.signal_id;
-    let cb_type = removed.cb_type;
-
-    let mut rc = 0;
-    try_active_sim("vpi_remove_cb", |sim| match cb_type {
-        vpi::CB_VALUE_CHANGE => {
-            if let Some(list) = sim.dpi_value_change_cbs.get_mut(&signal_id) {
-                list.retain(|cb| {
-                    cb.cb_routine != removed.cb_routine || cb.user_data != removed.user_data
-                });
-                rc = 1;
-            }
-        }
-        vpi::CB_NEXT_SIM_TIME => {
-            let before = sim.dpi_next_time_cbs.len();
-            sim.dpi_next_time_cbs.retain(|(cb, _)| {
-                cb.cb_routine != removed.cb_routine || cb.user_data != removed.user_data
-            });
-            if sim.dpi_next_time_cbs.len() != before {
-                rc = 1;
-            }
-        }
-        vpi::CB_START_OF_RESET => {
-            let before = sim.dpi_reset_cbs.len();
-            sim.dpi_reset_cbs.retain(|cb| {
-                cb.cb_routine != removed.cb_routine || cb.user_data != removed.user_data
-            });
-            if sim.dpi_reset_cbs.len() != before {
-                rc = 1;
-            }
-        }
-        vpi::CB_START_OF_SIMULATION => {
-            let before = sim.dpi_start_sim_cbs.len();
-            sim.dpi_start_sim_cbs.retain(|cb| {
-                cb.cb_routine != removed.cb_routine || cb.user_data != removed.user_data
-            });
-            if sim.dpi_start_sim_cbs.len() != before {
-                rc = 1;
-            }
-        }
-        vpi::CB_END_OF_SIMULATION => {
-            let before = sim.dpi_end_sim_cbs.len();
-            sim.dpi_end_sim_cbs.retain(|cb| {
-                cb.cb_routine != removed.cb_routine || cb.user_data != removed.user_data
-            });
-            if sim.dpi_end_sim_cbs.len() != before {
-                rc = 1;
-            }
-        }
-        _ => {}
-    });
-    rc
 }
 
 // --- svDpiVersion -----------------------------------------------------------
