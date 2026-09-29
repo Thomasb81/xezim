@@ -238,7 +238,7 @@ module top;
     int local_i;
     local_i = 3;
     pkg_count = 11;
-    mem[1] = 8'h42;
+    mem[1] = 8'h42; dyn = new[3]; dyn[2] = 7; qu = '{4, 5}; aa["k"] = 1;
     fork : fk
       #1 li = 1;
     join_none
@@ -469,6 +469,13 @@ static PLI_INT32 walk(PLI_BYTE8 *u) {
     ranges("lv", H("top.lv"));
     ranges("mem", H("top.mem"));
     ranges("nets", H("top.nets"));
+    ranges("dyn", H("top.dyn"));
+    ranges("qu", H("top.qu"));
+    list("dyn.elements", vpiReg, H("top.dyn"));
+    vpi_printf("OM|dyn size=%d dyn[2]=%d qu size=%d qu[1]=%d qu[2]=%s aa size=%d aa.left=%s\n", vpi_get(vpiSize, H("top.dyn")),
+               ival(vpi_handle_by_index(H("top.dyn"), 2)), vpi_get(vpiSize, H("top.qu")),
+               ival(vpi_handle_by_index(H("top.qu"), 1)), fname(vpi_handle_by_index(H("top.qu"), 2)),
+               vpi_get(vpiSize, H("top.aa")), fname(vpi_handle(vpiLeftRange, H("top.aa"))));
     vpiHandle mts = vpi_handle(vpiTypespec, H("top.mem"));
     vpiHandle ets = vpi_handle(vpiElemTypespec, mts);
     vpi_printf("OM|mem typespec=%s size=%d arraytype=%d elem=%s elemsize=%d\n", tname(mts), vpi_get(vpiSize, mts),
@@ -561,9 +568,9 @@ fn design_walk_declarations_types_values() {
             "OM|var top.un type=vpiUnionVar size=8 signed=0 vector=1 scalar=0 array=0 range=[7:0] ts=vpiUnionTypespec:- line=65 file=top.sv",
             "OM|var top.mem type=vpiRegArray size=4 signed=0 vector=0 scalar=0 array=1 range=[0:3] ts=vpiArrayTypespec:- line=66 file=top.sv",
             "OM|var top.nets type=vpiNetArray size=2 signed=0 vector=0 scalar=0 array=1 range=[0:1] ts=vpiArrayTypespec:- line=67 file=top.sv",
-            "OM|var top.dyn type=vpiRegArray size=0 signed=1 vector=0 scalar=0 array=1 range=- ts=vpiArrayTypespec:- line=68 file=top.sv",
-            "OM|var top.qu type=vpiRegArray size=0 signed=1 vector=0 scalar=0 array=1 range=- ts=vpiArrayTypespec:- line=69 file=top.sv",
-            "OM|var top.aa type=vpiRegArray size=0 signed=1 vector=0 scalar=0 array=1 range=- ts=vpiArrayTypespec:- line=70 file=top.sv",
+            "OM|var top.dyn type=vpiRegArray size=3 signed=1 vector=0 scalar=0 array=1 range=[0:2] ts=vpiArrayTypespec:- line=68 file=top.sv",
+            "OM|var top.qu type=vpiRegArray size=2 signed=1 vector=0 scalar=0 array=1 range=[0:1] ts=vpiArrayTypespec:- line=69 file=top.sv",
+            "OM|var top.aa type=vpiRegArray size=1 signed=1 vector=0 scalar=0 array=1 range=- ts=vpiArrayTypespec:- line=70 file=top.sv",
             "OM|var top.CI type=vpiIntVar size=32 signed=1 vector=1 scalar=0 array=0 range=[31:0] ts=vpiIntTypespec:- line=71 file=top.sv",
             "OM|var top.ev type=vpiNamedEvent size=-1 signed=0 vector=0 scalar=0 array=0 range=- ts=vpiEventTypespec:- line=72 file=top.sv",
             "OM|var top.wa type=vpiNet size=1 signed=0 vector=0 scalar=1 array=0 range=- ts=vpiLogicTypespec:- line=74 file=top.sv",
@@ -599,6 +606,10 @@ fn design_walk_declarations_types_values() {
             "OM|ranges lv=[7:0]/8",
             "OM|ranges mem=[0:3]/4",
             "OM|ranges nets=[0:1]/2",
+            "OM|ranges dyn=[0:2]/3",
+            "OM|ranges qu=[0:1]/2",
+            "OM|dyn.elements=dyn[0]:vpiIntVar dyn[1]:vpiIntVar dyn[2]:vpiIntVar",
+            "OM|dyn size=3 dyn[2]=7 qu size=2 qu[1]=5 qu[2]=NULL aa size=1 aa.left=NULL",
             "OM|mem typespec=vpiArrayTypespec size=4 arraytype=1 elem=vpiLogicTypespec elemsize=8",
             "OM|ranges mem.ts=[0:3]/4",
             "OM|ranges mem.elem=[7:0]/8",
