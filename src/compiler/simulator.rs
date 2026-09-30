@@ -816,6 +816,44 @@ enum CombItem {
     TimingCheck {
         idx: usize,
     },
+    /// A `FusedGate` AND/OR (NAND/NOR) whose high-fanout input is ignored
+    /// while the other input holds the controlling value: the gate is
+    /// `ctl_gates[slot]` (see `CtlGate`). Made from `FusedGate` entries at
+    /// the first settle, never before the prepared-comb cache is written.
+    CtlGate {
+        slot: u32,
+    },
+}
+
+/// Controlling-value skip for one two-input AND/OR gate (`CombItem::CtlGate`).
+///
+/// `wl = clk & rs` cannot change while `rs` is 0, however `clk` toggles, so
+/// the gate's dependency edges from `clk` (the high-fanout input) carry mask
+/// 0 while `rs` sits at the controlling value (0 for AND/NAND, 1 for
+/// OR/NOR) and the static mask otherwise. Every evaluation of the gate
+/// recomputes that mask from the controlling input's value it read, so:
+/// - a zero mask always means the controlling input held the controlling
+///   value at the gate's last evaluation, and the output already equals the
+///   forced result (x AND 0 = 0; x and z never control);
+/// - the controlling input's own edge is never masked, so its change always
+///   re-evaluates the gate, which restores the mask with the current value
+///   of the masked input in hand (same-delta changes of both inputs are
+///   read together).
+#[derive(Clone, Copy, Debug)]
+struct CtlGate {
+    /// The gate (`FusedGate::Bin2` with `GateBin::And` / `GateBin::Or`).
+    op: FusedGate,
+    /// The input whose controlling value masks the other one.
+    other: BitRef,
+    /// The masked (high-fanout) input's signal.
+    hot: u32,
+    /// `comb_dep_edges[pos..pos + npos]`: the edges from `hot` to the gate.
+    pos: u32,
+    npos: u32,
+    /// Their static (bit-sensitivity) mask, restored when not controlled.
+    smask: u64,
+    /// Controlling bit code: 0 for AND/NAND, 1 for OR/NOR.
+    ctl: u8,
 }
 
 /// Per-instance runtime state for a §29 UDP. Terminals are resolved to single
@@ -7230,6 +7268,21 @@ pub struct Simulator {
     bit_sens_pending: Vec<u32>,
     /// XEZIM_BIT_SENS=0 turns the masks off (every dependent triggers).
     bit_sens_on: bool,
+    /// Controlling-value skip (`CtlGate`): the gates, indexed by the
+    /// `CombItem::CtlGate` slot. Rebuilt with the dependency edges.
+    ctl_gates: Vec<CtlGate>,
+    /// Per signal: some dependency edge from it may be masked by a
+    /// `CtlGate`, so the settle's dirty seed must test the edge masks.
+    /// Empty when no gate qualifies.
+    ctl_sig: Vec<bool>,
+    /// `(destination signal, slot)` of every `CtlGate`, sorted: an external
+    /// write to a destination (a deposit) must re-arm its gate.
+    ctl_dsts: Vec<(u32, u32)>,
+    /// Slots re-armed while the settle held the dependency edges.
+    ctl_rearm_pending: Vec<u32>,
+    /// XEZIM_CTL_MASK=0, or a settle mode that evaluates entries outside the
+    /// canonical loop (partitioned / level-BSP), turns the skip off.
+    ctl_on: bool,
     /// Dirty records of the stores a two-state entry makes in the settle
     /// loop (direct mode), with each store's changed bits (`u64::MAX` when
     /// unknown): `ts_rec_n` records, the first in `ts_rec0` (most entries
@@ -11420,6 +11473,15 @@ impl Simulator {
             comb_dep_edges: Vec::new(),
             bit_sens_pending: Vec::new(),
             bit_sens_on: !matches!(std::env::var("XEZIM_BIT_SENS").as_deref(), Ok("0")),
+            ctl_gates: Vec::new(),
+            ctl_sig: Vec::new(),
+            ctl_dsts: Vec::new(),
+            ctl_rearm_pending: Vec::new(),
+            ctl_on: !matches!(std::env::var("XEZIM_CTL_MASK").as_deref(), Ok("0"))
+                && std::env::var_os("XEZIM_BSP_SETTLE").is_none()
+                && std::env::var_os("XEZIM_BSP_SHADOW").is_none()
+                && std::env::var("XEZIM_PERLP_SETTLE").ok().as_deref() != Some("1")
+                && std::env::var("XEZIM_PERLP_SHADOW").ok().as_deref() != Some("1"),
             ts_rec0: (0, 0),
             ts_rec_n: 0,
             ts_recs: Vec::new(),
@@ -17123,7 +17185,8 @@ impl Simulator {
                 | CombItem::TimingCheck { .. }
                 | CombItem::GateRegion { .. }
                 | CombItem::VectorGate { .. }
-                | CombItem::ScatterGate { .. } => {}
+                | CombItem::ScatterGate { .. }
+                | CombItem::CtlGate { .. } => {}
             }
             if e.has_unresolved_reads {
                 unresolved += 1;
@@ -17811,7 +17874,8 @@ impl Simulator {
             // Serial-only in v1: fall back to the full-simulator path.
             CombItem::GateRegion { .. }
             | CombItem::VectorGate { .. }
-            | CombItem::ScatterGate { .. } => false,
+            | CombItem::ScatterGate { .. }
+            | CombItem::CtlGate { .. } => false,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 // LRM §9.3.1: skip if the destination is forced
                 if self.forced_signals.is_empty() || !self.forced_signals.contains_key(dst_id) {
@@ -17971,7 +18035,8 @@ impl Simulator {
             CombItem::Udp { .. } | CombItem::UdpBatch { .. } | CombItem::TimingCheck { .. } => true,
             CombItem::GateRegion { .. }
             | CombItem::VectorGate { .. }
-            | CombItem::ScatterGate { .. } => false,
+            | CombItem::ScatterGate { .. }
+            | CombItem::CtlGate { .. } => false,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 let (mut sv, mut sx) = view[*src_id].raw_bits();
                 // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).
@@ -19030,6 +19095,9 @@ impl Simulator {
                     }
                 }
                 CombItem::FusedGate { op } => SendCombItem::Fused(*op),
+                CombItem::CtlGate { slot } => {
+                    SendCombItem::Fused(self.ctl_gates[*slot as usize].op)
+                }
                 CombItem::FusedBufFanout { src, dsts, invert } => SendCombItem::FusedBufFanout {
                     src: *src,
                     dsts: dsts.clone(),
@@ -22264,7 +22332,7 @@ impl Simulator {
             CombItem::FastDirectFanout { .. } => 3,
             CombItem::FusedBufFanout { .. } => 4,
             CombItem::FusedAndFanout { .. } => 5,
-            CombItem::FusedGate { .. } => 6,
+            CombItem::FusedGate { .. } | CombItem::CtlGate { .. } => 6,
             CombItem::Udp { .. } => 7,
             CombItem::CompiledContAssign { .. } => 8,
             CombItem::CompiledAlwaysBlock { .. } => 9,
@@ -22675,7 +22743,7 @@ impl Simulator {
         let ranges: Vec<(HashMap<usize, (u32, u32)>, Vec<(usize, u32, u32)>)> = self
             .comb_entries
             .iter()
-            .map(Self::comb_entry_bit_ranges)
+            .map(|e| Self::comb_entry_bit_ranges(e, &self.ctl_gates))
             .collect();
         // A tree net is a generator, or a single-writer net whose writer is a
         // fused gate / direct copy with EXACTLY ONE tree-net input (the rest
@@ -23085,11 +23153,17 @@ impl Simulator {
         };
         let list: Vec<usize> = list.clone();
         let sdf_any = !self.sdf_delays.is_empty();
+        if !self.ctl_rearm_pending.is_empty() {
+            for s in std::mem::take(&mut self.ctl_rearm_pending) {
+                self.ctl_rearm(s);
+            }
+        }
         for e in list {
             self.prof_clock_tree_evals += 1;
             if !matches!(
                 self.comb_entries[e].item,
                 CombItem::FusedGate { .. }
+                    | CombItem::CtlGate { .. }
                     | CombItem::DirectCopy { .. }
                     | CombItem::FastDirectCopy { .. }
             ) {
@@ -23139,6 +23213,29 @@ impl Simulator {
                         None
                     }
                 }
+                CombItem::CtlGate { slot } => {
+                    let slot = *slot;
+                    // Masked AND still controlled: the output already holds
+                    // the controlled value (its settle evaluation masked it,
+                    // and no evaluation or deposit has re-armed it since),
+                    // so evaluating would commit nothing. The live test
+                    // covers a controlling input written but not yet
+                    // settled, which this eager pass must still see.
+                    let g = self.ctl_gates[slot as usize];
+                    let masked = self
+                        .comb_dep_edges
+                        .get(g.pos as usize)
+                        .is_some_and(|d| d.mask == 0);
+                    if masked
+                        && self.signal_table[g.other.sig_id as usize]
+                            .get_bit_code(g.other.bit as usize)
+                            == g.ctl
+                    {
+                        None
+                    } else {
+                        self.ctl_gate_exec_self(slot).map(|d| d.sig_id as usize)
+                    }
+                }
                 CombItem::DirectCopy { dst_id, .. } | CombItem::FastDirectCopy { dst_id, .. } => {
                     let dst = *dst_id;
                     let Some(&src) = self.comb_entries[e].cold.read_signal_ids.first() else {
@@ -23182,6 +23279,7 @@ impl Simulator {
     /// instruction forms); everything else is whole-signal.
     fn comb_entry_bit_ranges(
         entry: &CombEntry,
+        ctl_gates: &[CtlGate],
     ) -> (HashMap<usize, (u32, u32)>, Vec<(usize, u32, u32)>) {
         use super::bytecode::Insn;
         let whole = (0u32, u32::MAX);
@@ -23200,7 +23298,18 @@ impl Simulator {
             e.1 = e.1.max(hi);
         };
         let mut ranged = true;
-        match &entry.item {
+        let ctl_item;
+        let item = match &entry.item {
+            CombItem::CtlGate { slot } => match ctl_gates.get(*slot as usize) {
+                Some(g) => {
+                    ctl_item = CombItem::FusedGate { op: g.op };
+                    &ctl_item
+                }
+                None => &entry.item,
+            },
+            item => item,
+        };
+        match item {
             CombItem::FusedGate { op } => match op {
                 FusedGate::Buf1 { dst, src, .. } => {
                     add(&mut r, src.sig_id as usize, src.bit, src.bit);
@@ -24247,6 +24356,9 @@ impl Simulator {
         let gates_ok = self.sdf_delays.is_empty();
         match &entry.item {
             CombItem::FusedGate { op } if gates_ok => add_gate(&mut out, op),
+            CombItem::CtlGate { slot } if gates_ok => {
+                add_gate(&mut out, &self.ctl_gates.get(*slot as usize)?.op)
+            }
             CombItem::GateRegion { gates } if gates_ok => {
                 for g in gates.iter() {
                     add_gate(&mut out, g);
@@ -24316,6 +24428,9 @@ impl Simulator {
     /// (which moves the tables into locals).
     fn bit_sens_refresh(&mut self) {
         if self.comb_dep_edges.len() != self.comb_dep_entries.len() {
+            // The edge positions and static masks the gates hold are about
+            // to be rebuilt: turn them back into plain gates first.
+            self.ctl_revert();
             self.comb_dep_edges = self
                 .comb_dep_entries
                 .iter()
@@ -24330,6 +24445,7 @@ impl Simulator {
                     self.bit_sens_patch(eidx);
                 }
             }
+            self.ctl_build();
         } else if !self.bit_sens_pending.is_empty() {
             let pending = std::mem::take(&mut self.bit_sens_pending);
             if self.bit_sens_on {
@@ -24339,6 +24455,266 @@ impl Simulator {
             }
             self.bit_sens_pending = pending;
             self.bit_sens_pending.clear();
+        }
+    }
+
+    /// Turn every `CombItem::CtlGate` back into its `FusedGate` and restore
+    /// the static masks of the edges it held (when they are still in place).
+    fn ctl_revert(&mut self) {
+        if self.ctl_gates.is_empty() {
+            return;
+        }
+        for e in self.comb_entries.iter_mut() {
+            if let CombItem::CtlGate { slot } = e.item {
+                e.item = CombItem::FusedGate {
+                    op: self.ctl_gates[slot as usize].op,
+                };
+            }
+        }
+        if self.comb_dep_edges.len() == self.comb_dep_entries.len() {
+            for g in &self.ctl_gates {
+                let (lo, hi) = (g.pos as usize, (g.pos + g.npos) as usize);
+                if let Some(edges) = self.comb_dep_edges.get_mut(lo..hi) {
+                    for e in edges {
+                        e.mask = g.smask;
+                    }
+                }
+            }
+        }
+        self.ctl_gates.clear();
+        self.ctl_sig.clear();
+        self.ctl_dsts.clear();
+        self.ctl_rearm_pending.clear();
+        self.gate_lane_valid = false;
+    }
+
+    /// Pick the controlling-value gates (`CtlGate`) once the dependency
+    /// edges carry their static masks: every two-input AND/OR fused gate
+    /// (NAND/NOR included) with two distinct input signals, one of which
+    /// fans out to at least `CTL_MIN_FANOUT` comb entries (a clock or other
+    /// broadcast net: the input whose toggles are worth skipping).
+    ///
+    /// Not with SDF delays (a delayed gate re-schedules on every
+    /// evaluation) or under the settle modes that evaluate entries outside
+    /// the canonical loop (`ctl_on`).
+    fn ctl_build(&mut self) {
+        const CTL_MIN_FANOUT: u32 = 64;
+        debug_assert!(self.ctl_gates.is_empty());
+        if !self.ctl_on || !self.sdf_delays.is_empty() || self.perlp_settle.is_some() {
+            return;
+        }
+        let n = self.comb_entries.len();
+        let nsig = self.comb_dep_offsets.len().saturating_sub(1);
+        let offs = &self.comb_dep_offsets;
+        let fanout = |s: u32| -> u32 {
+            let s = s as usize;
+            if s < nsig { offs[s + 1] - offs[s] } else { 0 }
+        };
+        // A hot signal's dirty seed treats a zero mask as "masked", so none
+        // of its edges may carry a static zero.
+        let mut hot_ok: HashMap<u32, bool> = HashMap::default();
+        let mut picked: Vec<(usize, CtlGate)> = Vec::new();
+        for (eidx, entry) in self.comb_entries.iter().enumerate() {
+            let CombItem::FusedGate { op } = &entry.item else {
+                continue;
+            };
+            let FusedGate::Bin2 {
+                dst, a, b, op: gop, ..
+            } = *op
+            else {
+                continue;
+            };
+            let ctl = match gop {
+                GateBin::And => 0u8,
+                GateBin::Or => 1u8,
+                GateBin::Xor => continue,
+            };
+            if a.sig_id == b.sig_id || dst.sig_id == a.sig_id || dst.sig_id == b.sig_id {
+                continue;
+            }
+            let (fa, fb) = (fanout(a.sig_id), fanout(b.sig_id));
+            if fa.max(fb) < CTL_MIN_FANOUT {
+                continue;
+            }
+            // Only a declared net: nothing but its drivers, a force or a
+            // deposit (all re-arming, see `ctl_note_external_write`) can
+            // write it. A variable could also take a procedural write that
+            // a masked gate would no longer overwrite.
+            if !self
+                .name_opt(dst.sig_id as usize)
+                .is_some_and(|n| self.module.nets.contains(n))
+            {
+                continue;
+            }
+            let (hot, other) = if fa >= fb { (a, b) } else { (b, a) };
+            let e = eidx as u32;
+            let edge_range = |sig: u32| -> (usize, usize) {
+                let s = sig as usize;
+                let (lo, hi) = (offs[s] as usize, offs[s + 1] as usize);
+                let deps = &self.comb_dep_entries[lo..hi];
+                let k = lo + deps.partition_point(|&d| d < e);
+                let mut k2 = k;
+                while k2 < hi && self.comb_dep_entries[k2] == e {
+                    k2 += 1;
+                }
+                (k, k2)
+            };
+            let (k, k2) = edge_range(hot.sig_id);
+            // The controlling input must wake the gate (its edge is never
+            // masked): that evaluation is what restores the mask.
+            let (ok_lo, ok_hi) = edge_range(other.sig_id);
+            if k == k2 || ok_lo == ok_hi || fanout(other.sig_id) == 0 {
+                continue;
+            }
+            let smask = self.comb_dep_edges[k].mask;
+            if smask == 0 || self.comb_dep_edges[k..k2].iter().any(|d| d.mask != smask) {
+                continue;
+            }
+            let ok = *hot_ok.entry(hot.sig_id).or_insert_with(|| {
+                let s = hot.sig_id as usize;
+                self.comb_dep_edges[offs[s] as usize..offs[s + 1] as usize]
+                    .iter()
+                    .all(|d| d.mask != 0)
+            });
+            if !ok {
+                continue;
+            }
+            picked.push((
+                eidx,
+                CtlGate {
+                    op: *op,
+                    other,
+                    hot: hot.sig_id,
+                    pos: k as u32,
+                    npos: (k2 - k) as u32,
+                    smask,
+                    ctl,
+                },
+            ));
+        }
+        if picked.is_empty() {
+            return;
+        }
+        self.ctl_sig = vec![false; nsig];
+        for (eidx, g) in picked {
+            let slot = self.ctl_gates.len() as u32;
+            self.ctl_sig[g.hot as usize] = true;
+            let dst = match g.op {
+                FusedGate::Bin2 { dst, .. } => dst.sig_id,
+                _ => unreachable!(),
+            };
+            self.ctl_dsts.push((dst, slot));
+            self.ctl_gates.push(g);
+            self.comb_entries[eidx].item = CombItem::CtlGate { slot };
+        }
+        self.ctl_dsts.sort_unstable();
+        self.gate_lane_valid = false;
+        sim_dbg_eprintln!(
+            "[CTL-MASK] {} gates skip their high-fanout input while controlled",
+            self.ctl_gates.len()
+        );
+    }
+
+    /// Evaluate `CtlGate` `slot` and set the mask of its high-fanout edges
+    /// from the controlling input it just read. `edges` is the dependency
+    /// edge table (the settle's local, or `comb_dep_edges`). Returns the
+    /// destination when the commit changed it.
+    #[inline(never)]
+    fn ctl_gate_exec(&mut self, slot: u32, edges: &mut [DepEdge]) -> Option<BitRef> {
+        let g = self.ctl_gates[slot as usize];
+        let (dst, new_bit) = self.fused_gate_eval(&g.op);
+        let o = self.signal_table[g.other.sig_id as usize].get_bit_code(g.other.bit as usize);
+        let m = if o == g.ctl { 0 } else { g.smask };
+        let (lo, hi) = (g.pos as usize, (g.pos + g.npos) as usize);
+        if let Some(es) = edges.get_mut(lo..hi) {
+            for e in es {
+                e.mask = m;
+            }
+        }
+        let sdf_any = !self.sdf_delays.is_empty();
+        if self.fused_bit_commit(dst, new_bit, sdf_any) {
+            Some(dst)
+        } else {
+            None
+        }
+    }
+
+    /// `ctl_gate_exec` outside the settle loop (which holds the edges).
+    fn ctl_gate_exec_self(&mut self, slot: u32) -> Option<BitRef> {
+        let mut edges = std::mem::take(&mut self.comb_dep_edges);
+        let r = if edges.len() == self.comb_dep_entries.len() {
+            self.ctl_gate_exec(slot, &mut edges)
+        } else {
+            // No edges to update (none yet, or the settle holds them). The
+            // mask stays as the last settle evaluation left it: a change of
+            // the controlling input since then has woken the gate through
+            // its own (never masked) edge, and that evaluation fixes it.
+            self.ctl_gate_exec(slot, &mut [])
+        };
+        self.comb_dep_edges = edges;
+        r
+    }
+
+    /// The fused gate behind a gate entry (`FusedGate` or `CtlGate`).
+    fn comb_item_gate<'a>(&'a self, item: &'a CombItem) -> Option<&'a FusedGate> {
+        match item {
+            CombItem::FusedGate { op } => Some(op),
+            CombItem::CtlGate { slot } => self.ctl_gates.get(*slot as usize).map(|g| &g.op),
+            _ => None,
+        }
+    }
+
+    /// An external write (deposit) to signal `id`: a `CtlGate` driving it
+    /// must see its high-fanout input again, so the next toggle re-evaluates
+    /// the gate and overwrites the deposit exactly as an unmasked gate does.
+    fn ctl_note_external_write(&mut self, id: usize) {
+        if self.ctl_dsts.is_empty() {
+            return;
+        }
+        let id = id as u32;
+        let start = self.ctl_dsts.partition_point(|&(d, _)| d < id);
+        let slots: Vec<u32> = self.ctl_dsts[start..]
+            .iter()
+            .take_while(|&&(d, _)| d == id)
+            .map(|&(_, s)| s)
+            .collect();
+        if self.comb_dep_edges.len() == self.comb_dep_entries.len() && !self.settling {
+            for s in slots {
+                self.ctl_rearm(s);
+            }
+        } else {
+            self.ctl_rearm_pending.extend(slots);
+        }
+    }
+
+    /// `$deposit(target, ...)`: re-arm the gates driving the target's
+    /// signal, or every gate when the target does not resolve statically.
+    fn ctl_note_deposit(&mut self, target: &Expression) {
+        if self.ctl_dsts.is_empty() {
+            return;
+        }
+        let mut root = target;
+        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &root.kind {
+            root = expr;
+        }
+        match self.get_lhs_signal_id(root) {
+            Some(id) => self.ctl_note_external_write(id),
+            None => {
+                let all: Vec<u32> = self.ctl_dsts.iter().map(|&(d, _)| d).collect();
+                for d in all {
+                    self.ctl_note_external_write(d as usize);
+                }
+            }
+        }
+    }
+
+    fn ctl_rearm(&mut self, slot: u32) {
+        let g = self.ctl_gates[slot as usize];
+        let (lo, hi) = (g.pos as usize, (g.pos + g.npos) as usize);
+        if let Some(es) = self.comb_dep_edges.get_mut(lo..hi) {
+            for e in es {
+                e.mask = g.smask;
+            }
         }
     }
 
@@ -27107,7 +27483,19 @@ impl Simulator {
     /// ≤64-bit planes `(v, x)` over bits [hi:lo], then the same write
     /// bookkeeping as the inline stores. Untouched bits keep their value
     /// and X.
+    /// §6.11.1/§10.7: a two-state destination drops x/z on every write
+    /// (x/z bits read 0), as the four-state VM's stores do.
+    #[inline(always)]
+    pub(crate) fn ts_scrub_two_state(&self, id: usize, v: u64, x: u64) -> (u64, u64) {
+        if x != 0 && self.signal_two_state.get(id).copied().unwrap_or(false) {
+            (v & !x, 0)
+        } else {
+            (v, x)
+        }
+    }
+
     fn ts_wide_range_store(&mut self, id: usize, lo: u32, hi: u32, v: u64, x: u64) {
+        let (v, x) = self.ts_scrub_two_state(id, v, x);
         let n = (hi - lo + 1) as usize;
         if !self.signal_table[id].splice_bits64(lo as usize, v, x, n) {
             return;
@@ -27133,6 +27521,7 @@ impl Simulator {
         // the block was lowered: one unchecked entry reference replaces the
         // three bounds checks this helper paid per store.
         debug_assert!(id < self.signal_table.len());
+        let (v, x) = self.ts_scrub_two_state(id, v, x);
         let entry: &mut Value = unsafe { self.signal_table.get_unchecked_mut(id) };
         let (base_v, base_x) = entry.raw_bits();
         let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, x, lo, hi);
@@ -27162,6 +27551,7 @@ impl Simulator {
     /// Whole-signal blocking store of a folded 4-state constant. Mirrors
     /// `ts_store`'s bookkeeping but carries an x/z plane.
     pub(crate) fn ts_store_xz(&mut self, id: usize, v: u64, x: u64) {
+        let (v, x) = self.ts_scrub_two_state(id, v, x);
         let (dv, dx) = self.signal_table[id].raw_bits();
         if v == dv && x == dx {
             return;
@@ -27195,6 +27585,9 @@ impl Simulator {
     /// `sig[hi:lo] = {N{1'bx}}` / `{N{1'bz}}` on a wide signal: both planes
     /// filled, 64 bits at a time.
     fn ts_wide_range_fill_xz(&mut self, id: usize, lo: u32, hi: u32, vbit: u8) {
+        if self.signal_two_state.get(id).copied().unwrap_or(false) {
+            return self.ts_wide_range_fill(id, lo, hi, 0);
+        }
         let fill_v = if vbit != 0 { u64::MAX } else { 0 };
         let mut pos = lo as usize;
         let end = hi as usize + 1;
@@ -47263,7 +47656,9 @@ impl Simulator {
                         };
                         self.name_for_id(branch.dst.sig_id as usize)
                     }
-                    CombItem::ContAssign { .. } | CombItem::CompiledContAssign { .. } => {
+                    CombItem::ContAssign { .. }
+                    | CombItem::CompiledContAssign { .. }
+                    | CombItem::CtlGate { .. } => {
                         if let Some(&id) = entry.cold.write_signal_ids.first() {
                             self.name_for_id(id)
                         } else {
@@ -48062,17 +48457,17 @@ impl Simulator {
         let mut pending = std::mem::take(&mut self.deferred_comb);
         for (eidx, snap) in pending.iter() {
             let eidx = *eidx;
-            // Clone only the uncommon replayed entry. Keeping the canonical
-            // table installed lets a blocking write settle recursively.
-            let Some(entry) = self.comb_entries.get(eidx).cloned() else {
-                continue;
-            };
             let clobbered = snap
                 .iter()
                 .any(|(id, v)| self.signal_table.get(*id).is_some_and(|cur| cur != v));
             if !clobbered {
                 continue;
             }
+            // Clone only the uncommon replayed entry. Keeping the canonical
+            // table installed lets a blocking write settle recursively.
+            let Some(entry) = self.comb_entries.get(eidx).cloned() else {
+                continue;
+            };
             match &entry.item {
                 CombItem::AlwaysBlock { .. } => self.eval_ast_comb_entry(&entry),
                 CombItem::CompiledAlwaysBlock { compiled, .. } => {
@@ -58588,6 +58983,11 @@ impl Simulator {
             CombItem::FusedGate { op } => {
                 self.exec_fused_gate(op);
             }
+            CombItem::CtlGate { slot } => {
+                if let Some(dst) = self.ctl_gate_exec_self(*slot) {
+                    self.mark_dirty_id(dst.sig_id as usize);
+                }
+            }
             CombItem::VectorGate { op } => {
                 self.exec_vector_gate(op);
             }
@@ -59036,13 +59436,20 @@ impl Simulator {
         self.settling = true;
         self.settle_calls += 1;
 
-        if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
-            self.build_gate_lane();
-        }
+        // Edges first: picking the controlling-value gates changes which
+        // entries the gate lane may take.
         if self.comb_dep_edges.len() != self.comb_dep_entries.len()
             || !self.bit_sens_pending.is_empty()
         {
             self.bit_sens_refresh();
+        }
+        if !self.ctl_rearm_pending.is_empty() {
+            for s in std::mem::take(&mut self.ctl_rearm_pending) {
+                self.ctl_rearm(s);
+            }
+        }
+        if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
+            self.build_gate_lane();
         }
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
@@ -59067,7 +59474,7 @@ impl Simulator {
         self.settle_entries_view = (entries.as_ptr(), entries.len());
         let dep_offsets = std::mem::take(&mut self.comb_dep_offsets);
         let dep_entries = std::mem::take(&mut self.comb_dep_entries);
-        let dep_edges = std::mem::take(&mut self.comb_dep_edges);
+        let mut dep_edges = std::mem::take(&mut self.comb_dep_edges);
         debug_assert_eq!(dep_edges.len(), dep_entries.len());
         let tree_sig = std::mem::take(&mut self.is_clock_tree_signal);
         let tree_entry = std::mem::take(&mut self.is_clock_tree_entry);
@@ -59134,18 +59541,30 @@ impl Simulator {
                     let lo = dep_offsets[id] as usize;
                     let hi = dep_offsets[id + 1] as usize;
                     let tree_clk = tree_sig.get(id).copied().unwrap_or(false);
-                    for &eidx_u32 in &dep_entries[lo..hi] {
-                        let eidx = eidx_u32 as usize;
+                    let mut seed = |eidx: usize| {
                         if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
-                            continue;
+                            return;
                         }
                         // the eager clock-tree pass already evaluated these
                         if tree_clk && tree_entry.get(eidx).copied().unwrap_or(false) {
-                            continue;
+                            return;
                         }
                         if !triggered[eidx] {
                             triggered[eidx] = true;
                             next_list.push(eidx);
+                        }
+                    };
+                    if self.ctl_sig.get(id).copied().unwrap_or(false) {
+                        // A controlled `CtlGate` has masked this edge
+                        // (static masks are never zero on such a signal).
+                        for e in &dep_edges[lo..hi] {
+                            if e.mask != 0 {
+                                seed(e.entry as usize);
+                            }
+                        }
+                    } else {
+                        for &eidx_u32 in &dep_entries[lo..hi] {
+                            seed(eidx_u32 as usize);
                         }
                     }
                 }
@@ -60169,6 +60588,17 @@ impl Simulator {
                             let (dst, new_bit) = self.fused_gate_eval(op);
                             let sdf_any = !self.sdf_delays.is_empty();
                             if self.fused_bit_commit(dst, new_bit, sdf_any) {
+                                let id = dst.sig_id as usize;
+                                if capture_churn {
+                                    churn.push((id, eidx));
+                                }
+                                note_toggle!(id);
+                                trigger_deps!(id, eidx, self.bit_chg_mask(dst.sig_id, dst.bit));
+                            }
+                            n_dc += 1;
+                        }
+                        CombItem::CtlGate { slot } => {
+                            if let Some(dst) = self.ctl_gate_exec(*slot, &mut dep_edges) {
                                 let id = dst.sig_id as usize;
                                 if capture_churn {
                                     churn.push((id, eidx));
@@ -81810,6 +82240,10 @@ impl Simulator {
                         self.forced_names.remove(name);
                     }
                     self.assign_value(lvalue, &v);
+                    // A net's gate must see the override (and, for a shape
+                    // degraded to a plain write, overwrite it on the next
+                    // input change exactly as before).
+                    self.ctl_note_deposit(lvalue);
                     match target {
                         Some((ref name, Some(id))) => {
                             self.force_cell(id, v);
@@ -83465,6 +83899,7 @@ impl Simulator {
                         v = v.resize(w);
                     }
                     self.assign_value(&args[0], &v);
+                    self.ctl_note_deposit(&args[0]);
                 } else {
                     eprintln!(
                         "Warning: $deposit expects (target, value) — got {} args",
@@ -89770,6 +90205,7 @@ impl Simulator {
                         }
                     }
                     CombItem::FusedGate { .. }
+                    | CombItem::CtlGate { .. }
                     | CombItem::FusedBufFanout { .. }
                     | CombItem::FusedAndFanout { .. }
                     | CombItem::GateRegion { .. }
@@ -144029,6 +144465,7 @@ pub extern "C" fn vpi_put_value(
                 }
                 sim.after_signal_write(sig_id);
             }
+            sim.ctl_note_external_write(sig_id);
             // Now mark as forced (after the write succeeded)
             sim.forced_signals.insert(sig_id, value);
             // §38.36.1 cbForce.
@@ -144038,6 +144475,7 @@ pub extern "C" fn vpi_put_value(
         } else {
             // Normal write - write_sig! will skip if signal is forced
             write_sig!(sim, sig_id, value);
+            sim.ctl_note_external_write(sig_id);
             // A VPI deposit is an EXTERNAL write: no HDL driver stands behind
             // it, so nothing else marks the signal dirty or re-snapshots it for
             // edge detection. Without this a cocotb-driven clock landed in the

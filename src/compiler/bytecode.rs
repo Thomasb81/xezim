@@ -4990,6 +4990,563 @@ impl<'a> BytecodeCompiler<'a> {
         true
     }
 
+    /// `for (k = K0; cond(k); k = k ± d) acc = acc | e(k);` (or `&`): the
+    /// accumulate-over-a-range loop RTL writes as an OR (AND) tree over an
+    /// unpacked array, `acc = acc | row_out[k]`. With a constant trip count
+    /// it compiles straight-line: `k` a compile-time constant per trip,
+    /// `acc` carried in one register, then one store of `acc` and the stores
+    /// that leave `k` where the loop leaves it. The rolled loop paid two
+    /// signal stores (each noting the write for propagation), a compare and
+    /// a branch per trip.
+    ///
+    /// Exact. The loop is atomic (no timing control, call or fallback) and
+    /// the emitted `e` reads neither `acc` nor `k`'s storage, so the only
+    /// trace of the intermediate stores is their change marks. OR (AND)
+    /// only sets (clears) bits along the way, so the union of those marks
+    /// is `start ^ final`, exactly what the single store marks, and a
+    /// two-state `acc`'s x-to-0 conversion per store commutes with the
+    /// chain. `k` walks a constant sequence; its union of changes `u` is
+    /// replayed by storing `K0`, `K0 ^ u`, then the exit value.
+    fn try_reduce_loop(
+        &mut self,
+        init: &[ForInit],
+        condition: Option<&Expression>,
+        step: &[Expression],
+        body: &Statement,
+    ) -> bool {
+        const MAX_TRIPS: usize = 1024;
+        let (Some(cond), [step]) = (condition, step) else {
+            return false;
+        };
+        let mut stmt = body;
+        while let StatementKind::SeqBlock { stmts, .. } = &stmt.kind {
+            let [one] = stmts.as_slice() else {
+                return false;
+            };
+            stmt = one;
+        }
+        let StatementKind::BlockingAssign { lvalue, rvalue } = &stmt.kind else {
+            return false;
+        };
+        if Self::is_intra_timing_marker(rvalue) {
+            return false;
+        }
+        let ExprKind::Ident(acc_h) = &lvalue.kind else {
+            return false;
+        };
+        if acc_h.path.iter().any(|s| !s.selects.is_empty()) {
+            return false;
+        }
+        let Some(acc_id) = self.lookup_signal_id(acc_h) else {
+            return false;
+        };
+        fn strip(e: &Expression) -> &Expression {
+            let mut e = e;
+            while let ExprKind::Paren(i) = &e.kind {
+                e = i;
+            }
+            e
+        }
+        fn leaf(h: &HierarchicalIdentifier) -> &str {
+            let n = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            n.rsplit('.').next().unwrap_or(n)
+        }
+        let ExprKind::Binary { op, left, right } = &strip(rvalue).kind else {
+            return false;
+        };
+        if !matches!(op, BinaryOp::BitOr | BinaryOp::BitAnd) {
+            return false;
+        }
+        let op = op.clone();
+        let is_acc = |this: &Self, e: &Expression| {
+            matches!(&strip(e).kind, ExprKind::Ident(h)
+                if h.path.iter().all(|s| s.selects.is_empty())
+                    && this.lookup_signal_id(h) == Some(acc_id))
+        };
+        let (acc_expr, e) = if is_acc(self, left) {
+            (&**left, &**right)
+        } else if is_acc(self, right) {
+            (&**right, &**left)
+        } else {
+            return false;
+        };
+        // The loop variable: a signal (`integer k` at module scope) or a
+        // `for (int k = ...)` local.
+        let [fi] = init else {
+            return false;
+        };
+        let (k_leaf, k_sig, k_init, k_w, k_signed): (
+            String,
+            Option<(usize, &Expression)>,
+            _,
+            u32,
+            bool,
+        ) = match fi {
+            ForInit::Assign {
+                lvalue: kl,
+                rvalue: kr,
+            } => {
+                let ExprKind::Ident(kh) = &kl.kind else {
+                    return false;
+                };
+                if kh.path.iter().any(|s| !s.selects.is_empty()) {
+                    return false;
+                }
+                let Some(kid) = self.lookup_signal_id(kh) else {
+                    return false;
+                };
+                let w = self.infer_lhs_width(kl);
+                (
+                    leaf(kh).to_string(),
+                    Some((kid, kl)),
+                    kr,
+                    w,
+                    self.signal_signed[kid],
+                )
+            }
+            ForInit::VarDecl {
+                data_type,
+                name,
+                init,
+            } => {
+                use crate::ast::types::{DataType as FDt, IntegerAtomType as FIat, Signing as FSg};
+                let signed = match data_type {
+                    FDt::IntegerAtom { kind, signing, .. } => {
+                        !matches!(signing, Some(FSg::Unsigned)) && !matches!(kind, FIat::Time)
+                    }
+                    FDt::IntegerVector { signing, .. } => matches!(signing, Some(FSg::Signed)),
+                    _ => return false,
+                };
+                (
+                    name.name.clone(),
+                    None,
+                    init,
+                    self.decl_width(data_type),
+                    signed,
+                )
+            }
+        };
+        if k_leaf.is_empty() || k_w == 0 || k_w > 32 || k_sig.is_some_and(|(kid, _)| kid == acc_id)
+        {
+            return false;
+        }
+        let acc_leaf = leaf(acc_h).to_string();
+        // Every spelling of `k` the loop uses, to bind as a constant; `e`
+        // must be side-effect free and must not name `acc` at all.
+        fn scan(
+            e: &Expression,
+            k_leaf: &str,
+            acc_leaf: Option<&str>,
+            names: &mut Vec<String>,
+        ) -> bool {
+            match &e.kind {
+                ExprKind::Number(_) => true,
+                ExprKind::Ident(h) => {
+                    let lf = leaf(h);
+                    if acc_leaf == Some(lf) {
+                        return false;
+                    }
+                    if lf == k_leaf {
+                        if h.root.is_some() || h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                            return false;
+                        }
+                        let n = &h.path[0].name.name;
+                        if !names.contains(n) {
+                            names.push(n.clone());
+                        }
+                    }
+                    h.path
+                        .iter()
+                        .all(|s| s.selects.iter().all(|x| scan(x, k_leaf, acc_leaf, names)))
+                }
+                ExprKind::Paren(i) => scan(i, k_leaf, acc_leaf, names),
+                ExprKind::Index { expr, index } => {
+                    scan(expr, k_leaf, acc_leaf, names) && scan(index, k_leaf, acc_leaf, names)
+                }
+                ExprKind::RangeSelect {
+                    expr, left, right, ..
+                } => {
+                    scan(expr, k_leaf, acc_leaf, names)
+                        && scan(left, k_leaf, acc_leaf, names)
+                        && scan(right, k_leaf, acc_leaf, names)
+                }
+                ExprKind::Unary { op, operand } => {
+                    !matches!(
+                        op,
+                        UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
+                    ) && scan(operand, k_leaf, acc_leaf, names)
+                }
+                ExprKind::Binary { left, right, .. } => {
+                    scan(left, k_leaf, acc_leaf, names) && scan(right, k_leaf, acc_leaf, names)
+                }
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => {
+                    scan(condition, k_leaf, acc_leaf, names)
+                        && scan(then_expr, k_leaf, acc_leaf, names)
+                        && scan(else_expr, k_leaf, acc_leaf, names)
+                }
+                ExprKind::Concatenation(v) => v.iter().all(|x| scan(x, k_leaf, acc_leaf, names)),
+                ExprKind::Replication { count, exprs } => {
+                    scan(count, k_leaf, acc_leaf, names)
+                        && exprs.iter().all(|x| scan(x, k_leaf, acc_leaf, names))
+                }
+                _ => false,
+            }
+        }
+        let mut names: Vec<String> = Vec::new();
+        if !scan(e, &k_leaf, Some(&acc_leaf), &mut names) || !scan(cond, &k_leaf, None, &mut names)
+        {
+            return false;
+        }
+        // Step: `k++` / `k--` / `k = k ± C` (the parser's `k += C`).
+        let delta: i64 = match &step.kind {
+            ExprKind::Unary { op, operand } => {
+                let ExprKind::Ident(h) = &operand.kind else {
+                    return false;
+                };
+                if leaf(h) != k_leaf {
+                    return false;
+                }
+                match op {
+                    UnaryOp::PostIncr | UnaryOp::PreIncr => 1,
+                    UnaryOp::PostDecr | UnaryOp::PreDecr => -1,
+                    _ => return false,
+                }
+            }
+            ExprKind::AssignExpr { lvalue, rvalue } => {
+                let (ExprKind::Ident(lh), ExprKind::Binary { op, left, right }) =
+                    (&lvalue.kind, &rvalue.kind)
+                else {
+                    return false;
+                };
+                let ExprKind::Ident(rh) = &left.kind else {
+                    return false;
+                };
+                if leaf(lh) != k_leaf || leaf(rh) != k_leaf {
+                    return false;
+                }
+                let Some(c) = self.fold_const(right).and_then(|v| v.to_u64()) else {
+                    return false;
+                };
+                if c == 0 || c > u32::MAX as u64 {
+                    return false;
+                }
+                match op {
+                    BinaryOp::Add => c as i64,
+                    BinaryOp::Sub => -(c as i64),
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        // A value of `k` as its declared type holds it.
+        let kmask: u64 = (1u64 << k_w) - 1;
+        let norm = |v: i64| -> i64 {
+            let u = (v as u64) & kmask;
+            if k_signed && (u >> (k_w - 1)) & 1 == 1 {
+                (u | !kmask) as i64
+            } else {
+                u as i64
+            }
+        };
+        let kval = |v: i64| -> Value {
+            let mut x = Value::from_u64((v as u64) & kmask, k_w);
+            x.is_signed = k_signed;
+            x
+        };
+        let Some(k0) =
+            self.fold_const(k_init)
+                .and_then(|v| if v.has_xz() { None } else { v.to_u64() })
+        else {
+            return false;
+        };
+        let saved: Vec<(String, Option<Value>)> = names
+            .iter()
+            .map(|n| (n.clone(), self.local_const_vars.get(n).cloned()))
+            .collect();
+        let restore = |this: &mut Self| {
+            for (n, v) in &saved {
+                match v {
+                    Some(v) => this.local_const_vars.insert(n.clone(), v.clone()),
+                    None => this.local_const_vars.remove(n),
+                };
+            }
+        };
+        let bind = |this: &mut Self, v: i64| {
+            for n in &names {
+                this.local_const_vars.insert(n.clone(), kval(v));
+            }
+        };
+        // Trip values, folded exactly as the loop would test them.
+        let mut vals: Vec<i64> = Vec::new();
+        let mut cur = norm(k0 as i64);
+        loop {
+            bind(self, cur);
+            let c = match self.fold_const(cond) {
+                Some(v) if !v.has_xz() => v.is_true(),
+                _ => {
+                    restore(self);
+                    return false;
+                }
+            };
+            if !c {
+                break;
+            }
+            vals.push(cur);
+            if vals.len() > MAX_TRIPS {
+                restore(self);
+                return false;
+            }
+            cur = norm(cur.wrapping_add(delta));
+        }
+        let start = self.insns.len();
+        let start_reg = self.next_reg;
+        let ok = self.emit_reduce_loop(
+            lvalue, acc_expr, e, &op, acc_id, k_sig, k_init, k_w, &vals, cur, &names, &kval,
+        );
+        restore(self);
+        if !ok {
+            self.insns.truncate(start);
+            self.next_reg = start_reg;
+        }
+        ok
+    }
+
+    /// Emission half of `try_reduce_loop` (false: roll back).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_reduce_loop(
+        &mut self,
+        lvalue: &Expression,
+        acc_expr: &Expression,
+        e: &Expression,
+        op: &BinaryOp,
+        acc_id: usize,
+        k_sig: Option<(usize, &Expression)>,
+        k_init: &Expression,
+        k_w: u32,
+        vals: &[i64],
+        k_end: i64,
+        names: &[String],
+        kval: &dyn Fn(i64) -> Value,
+    ) -> bool {
+        // `k = K0`, compiled exactly as the loop's init.
+        if let Some((_, kl)) = k_sig {
+            let w = self.infer_lhs_width(kl);
+            let Some(r) = self.compile_expr(k_init, w) else {
+                return false;
+            };
+            if w > 0 {
+                self.emit(Insn::Resize(r, w));
+            }
+            if !self.compile_blocking_target(kl, r, w) {
+                return false;
+            }
+        }
+        if !vals.is_empty() {
+            // Per trip exactly the body's `acc OP e` (the Binary arm: both
+            // operands scrubbed / resized to the statement width), with the
+            // left operand the carried register instead of a reload.
+            let width = self.infer_lhs_width(lvalue);
+            let ls = self.expr_signedness(acc_expr);
+            let rs = self.expr_signedness(e);
+            let unsigned = ls == Some(false) || rs == Some(false);
+            let scrub_acc = width > 0 && unsigned && !self.operand_scrub_is_noop(acc_expr);
+            let scrub_e = width > 0 && unsigned && !self.operand_scrub_is_noop(e);
+            let Some(a) = self.compile_expr(acc_expr, width) else {
+                return false;
+            };
+            let trip_reg = self.next_reg;
+            let mut peak_reg = trip_reg;
+            let k_id = k_sig.map(|(kid, _)| kid);
+            for &v in vals {
+                for n in names {
+                    self.local_const_vars.insert(n.clone(), kval(v));
+                }
+                let e_start = self.insns.len();
+                let Some(r) = self.compile_expr(e, width) else {
+                    return false;
+                };
+                if !Self::reduce_operand_ok(&self.insns[e_start..], k_id, acc_id) {
+                    return false;
+                }
+                self.fold_const_elem_loads(e_start);
+                if width > 0 {
+                    if scrub_acc {
+                        self.emit(Insn::ClearSigned(a));
+                    }
+                    if scrub_e {
+                        self.emit(Insn::ClearSigned(r));
+                    }
+                    self.emit(Insn::Resize(a, width));
+                    self.emit(Insn::Resize(r, width));
+                }
+                self.emit(match op {
+                    BinaryOp::BitOr => Insn::BitOr(a, a, r),
+                    _ => Insn::BitAnd(a, a, r),
+                });
+                if width > 0 {
+                    self.emit(Insn::Resize(a, width));
+                }
+                // The trip's temporaries are dead: the next trip reuses them
+                // at the same widths (the block's register count is the peak).
+                peak_reg = peak_reg.max(self.next_reg);
+                self.next_reg = trip_reg;
+            }
+            self.next_reg = peak_reg;
+            if self.register_overflow || !self.compile_blocking_target(lvalue, a, width) {
+                return false;
+            }
+        }
+        // Leave `k` at the exit value, marking the union of its changes.
+        if let (Some((_, kl)), false) = (k_sig, vals.is_empty()) {
+            let kmask: u64 = (1u64 << k_w) - 1;
+            let mut u = 0u64;
+            for (i, &v) in vals.iter().enumerate() {
+                let next = vals.get(i + 1).copied().unwrap_or(k_end);
+                u |= ((v ^ next) as u64) & kmask;
+            }
+            let k0 = (vals[0] as u64) & kmask;
+            let kend = (k_end as u64) & kmask;
+            let mut seq: Vec<i64> = Vec::new();
+            if u != k0 ^ kend {
+                seq.push((k0 ^ u) as i64);
+            }
+            seq.push(k_end);
+            let w = self.infer_lhs_width(kl);
+            for v in seq {
+                let r = self.alloc_reg();
+                self.emit(Insn::LoadConst(r, Box::new(kval(v))));
+                if w > 0 {
+                    self.emit(Insn::Resize(r, w));
+                }
+                if !self.compile_blocking_target(kl, r, w) {
+                    return false;
+                }
+            }
+        }
+        !self.register_overflow
+    }
+
+    /// In `insns[from..]`, a dense-array element read whose index register
+    /// holds an in-range constant (an unrolled trip's `arr[k]`) becomes a
+    /// plain load of the element's signal, and the index constant a `Nop`
+    /// when nothing else reads it.
+    fn fold_const_elem_loads(&mut self, from: usize) {
+        let n = self.insns.len();
+        for i in from..n {
+            let Insn::LoadArrayElem(d, arr, ri) = &self.insns[i] else {
+                continue;
+            };
+            let (d, ri) = (*d, *ri);
+            let ArrayOperand::Dense {
+                first_id, lo, hi, ..
+            } = &**arr
+            else {
+                continue;
+            };
+            let (first_id, lo, hi) = (*first_id, *lo, *hi);
+            // The index's one definition, in this range, before the read.
+            let defs: Vec<usize> = (from..i)
+                .filter(|&j| {
+                    let i = &self.insns[j];
+                    Self::dest_reg(i).or_else(|| Self::in_place_reg(i)) == Some(ri)
+                })
+                .collect();
+            let [j] = defs.as_slice() else {
+                continue;
+            };
+            let Insn::LoadConst(_, v) = &self.insns[*j] else {
+                continue;
+            };
+            if v.has_xz() || v.is_real {
+                continue;
+            }
+            let Some(idx) = v
+                .to_u64()
+                .filter(|&x| x <= i64::MAX as u64)
+                .map(|x| x as i64)
+            else {
+                continue;
+            };
+            // A signed index constant with the top bit set is negative.
+            if v.is_signed && v.width > 0 && v.width < 64 && (idx >> (v.width - 1)) & 1 == 1 {
+                continue;
+            }
+            if idx < lo
+                || idx > hi
+                || hi < lo
+                || first_id + ((hi - lo) as usize) >= self.signal_widths.len()
+            {
+                continue;
+            }
+            let eid = first_id + (idx - lo) as usize;
+            self.insns[i] = Insn::LoadSignal(d, eid as SigId);
+            let used = (from..n).any(|m| m != *j && Self::insn_reads_reg(&self.insns[m], ri));
+            if !used {
+                self.insns[*j] = Insn::Nop;
+            }
+        }
+    }
+
+    /// `try_reduce_loop`'s check on one trip's compiled operand: pure
+    /// straight-line arithmetic that reads neither `acc` nor the loop
+    /// variable's storage.
+    fn reduce_operand_ok(insns: &[Insn], k_id: Option<usize>, acc_id: usize) -> bool {
+        let hit = |s: SigId| s as usize == acc_id || Some(s as usize) == k_id;
+        insns.iter().all(|i| match i {
+            Insn::LoadSignal(_, s)
+            | Insn::LoadSignalSigned(_, s)
+            | Insn::LoadSignalRange(_, s, ..)
+            | Insn::LoadSignalRangeDyn(_, s, ..)
+            | Insn::LoadSignalBit(_, s, _) => !hit(*s),
+            Insn::LoadConst(..)
+            | Insn::LoadArrayElem(..)
+            | Insn::Resize(..)
+            | Insn::MoveResize(..)
+            | Insn::Move(..)
+            | Insn::SetSigned(..)
+            | Insn::ClearSigned(..)
+            | Insn::Add(..)
+            | Insn::Sub(..)
+            | Insn::Mul(..)
+            | Insn::BitAnd(..)
+            | Insn::BitOr(..)
+            | Insn::BitXor(..)
+            | Insn::BitXnor(..)
+            | Insn::LogAnd(..)
+            | Insn::LogOr(..)
+            | Insn::Eq(..)
+            | Insn::Neq(..)
+            | Insn::CaseEq(..)
+            | Insn::Lt(..)
+            | Insn::Leq(..)
+            | Insn::Gt(..)
+            | Insn::Geq(..)
+            | Insn::Shl(..)
+            | Insn::Shr(..)
+            | Insn::AShr(..)
+            | Insn::BitNot(..)
+            | Insn::LogNot(..)
+            | Insn::Negate(..)
+            | Insn::ReduceAnd(..)
+            | Insn::ReduceOr(..)
+            | Insn::ReduceXor(..)
+            | Insn::BitSelect(..)
+            | Insn::BitSelectConst(..)
+            | Insn::RangeSelect(..)
+            | Insn::RangeSelectW(..)
+            | Insn::RangeSelectConst(..)
+            | Insn::Concat(..)
+            | Insn::Replicate(..)
+            | Insn::Select(..)
+            | Insn::BinOpConst(..) => true,
+            _ => false,
+        })
+    }
+
     /// Fold `e` to a compile-time constant, consulting unrolled loop vars.
     /// Conservative: 4-state-clean integers only.
     fn fold_const(&mut self, e: &Expression) -> Option<Value> {
@@ -7545,6 +8102,9 @@ impl<'a> BytecodeCompiler<'a> {
                 step,
                 body,
             } => {
+                if self.try_reduce_loop(init, condition.as_ref(), step, body) {
+                    return true;
+                }
                 let (vector_plans, vectorized_body) =
                     match self.full_range_nba_copy_plan(init, condition.as_ref(), step, body) {
                         Some((plans, pruned)) => (plans, Some(pruned)),
