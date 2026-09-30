@@ -81,6 +81,56 @@ and the development workflow are in [README.md](README.md).
   `--wave`) are written to stderr as one piece, so `$display` output going to
   the same file can no longer land inside one and hide a UVM message from log
   parsers.
+* Continuous assigns to a bit or part of an unpacked-array element
+  (`assign r[i][j] = ...`, `.out(r[i][j])`) drive the array inside
+  instantiated modules. They used to be dropped silently there, which left
+  the c906 interrupt controller's gated clocks dead. Writes to a bit of a
+  2-D or deeper array element (`m[i][j][k] = ...`) are no longer dropped
+  either, at the top level or in procedural code.
+* A net delay (`wire #2 w;`, `#(rise, fall, off)`, `#(P)`) delays every
+  driver of the net: separate assigns, ports, gates and UDPs. It acts after
+  the drivers' own delays and after resolution, bit by bit on a vector. A
+  declaration assignment's delay stays that assignment's own. A port bound to
+  a net takes the external net's delay. Each of several drivers on one net
+  keeps its own delay, and driven `tri0`/`tri1` nets start at x.
+* An undriven output port with no data type (`output o`, `output [3:0] o`,
+  non-ANSI `output o;`) floats at z. It used to start at x.
+* `@(mem[5])`, `@(mem[i])` and `@(posedge mem[i][0])` on a large memory wake,
+  in `always` blocks and in procedural waits alike, and continuous assigns and
+  `always_comb` blocks reading an element follow writes to it. The event was
+  dropped. An event on a select (`v[3]`, `v[5:4]`, `m[i]`) is an event on the
+  selected value: edges are judged on the selected bit, and a changed index
+  re-selects the element. `posedge v[P-1]` with a parameter index watches the
+  right bit.
+* A class parameter default is evaluated in the class's own scope, so
+  `int D = W*2` and `type U = T` follow the parameters before them in every
+  specialization, including typedefs, extends clauses, parameterized
+  subclasses and static calls. Specializations that differ only in defaulted
+  parameters share statics. Named class parameter assignment (`C #(.W(5))`)
+  binds by name, `$typename` lists every parameter, and a class variable
+  declared in an instantiated module keeps its specialization.
+* A virtual interface reached through any receiver works: class-handle chains
+  (`cfg.vif`, `a.cfg.vif`, `this.cfg.vif`), local and formal handles,
+  module-scope chains, inherited, parameterized, static and typedef'd
+  properties, and vif arrays and queues. This holds for reads, writes,
+  nonblocking writes, `@(...)`, `wait(...)`, clocking blocks, interface task
+  and function calls, and binding. They used to read 0 or x, drop writes and
+  never wake. `@(vif.cb)` in a class method resumes after the clocking block
+  samples. (From PR #207 by eenky)
+* A call in receiver position (`get_obj().x`, `q.pop_front().addr`) runs
+  once. It used to run up to 12 times, and `q.pop_front().addr` drained the
+  queue.
+* Unpacked-struct members with two or more unpacked dimensions
+  (`bit [7:0] m [2][2]`) survive whole-struct copies (module, block-local,
+  nested, array, queue and associative-array elements, class properties),
+  struct formals of every direction, function returns, assignment patterns and
+  `%p`. Only the first dimension used to be seen, so the member read as x
+  or 0. A nonblocking whole-struct assignment `b <= a` updates every member;
+  it used to get even scalar members wrong. Struct input ports and struct
+  continuous assigns carry array members, patterns and `%p` follow a
+  descending dimension's declared order, 2-state array members default to 0,
+  `num()` on an associative array of structs counts keys, and
+  `$size`/`$bits` work on a member sub-array such as `s.mm[1]`.
 
 **Performance**
 
