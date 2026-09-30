@@ -588,12 +588,12 @@ primitive u_and(out, a, b);
     ? 0 : 0;
   endtable
 endprimitive
-module cellm(input a, input b, output y);
-  u_and g(y, a, b);
+module cellm(input i0, input i1, output y);
+  u_and g(y, i0, i1);
 endmodule
 module top;
   reg p = 0, q = 1; wire y;
-  cellm u(.a(p), .b(q), .y(y));
+  cellm u(.i0(p), .i1(q), .y(y));
   initial begin #1 p = 1; #1 $display("T|udp %b", y); end
 endmodule
 "#;
