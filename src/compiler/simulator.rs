@@ -133706,6 +133706,15 @@ impl Simulator {
             if self.module.classes.contains_key(&tn.name.name) {
                 return Some(tn.name.name.clone());
             }
+            // class-perf P2: a PACKAGE-qualified class handle type
+            // (`uvm_pkg::uvm_report_object` — the report macros' local
+            // `_local_report_object_` declaration) resolves by its
+            // rightmost segment against the class table.
+            if let Some((_, base)) = tn.name.name.rsplit_once("::") {
+                if self.module.classes.contains_key(base) {
+                    return Some(base.to_string());
+                }
+            }
             match self.module.typedef_types.get(&tn.name.name) {
                 Some(next) => cur = next,
                 None => return None,
@@ -133788,6 +133797,23 @@ impl Simulator {
                     // visible to element-typed logic.
                     if let Some(t) = self.typeref_class_name(dt) {
                         members.entry(p.clone()).or_insert(t);
+                    }
+                }
+                // class-perf P2: METHOD return classes join the same
+                // per-class map (a property of the same name wins via
+                // or_insert): a dispatch chain may continue through a
+                // method RESULT — `uvm_get_report_object().
+                // uvm_get_report_object().get_report_...` (the report
+                // macros' default RO). Tasks and non-class returns stay
+                // out; parameterized specializations are not plain class
+                // names and typeref_class_name declines them.
+                for (m, cm) in c.methods.iter() {
+                    if let crate::ast::decl::ClassMethodKind::Function(f) = &cm.kind {
+                        if let Some(t) = self.typeref_class_name(&f.return_type) {
+                            if !t.contains('#') {
+                                members.entry(m.clone()).or_insert(t);
+                            }
+                        }
                     }
                 }
                 match &c.extends {

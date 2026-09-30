@@ -4021,6 +4021,47 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 None
             }
+            // class-perf P2: a CALL result is typed when its callee
+            // resolves to a known class return:
+            //   * a method on a typed receiver chain — `g().self().lvl(x)`,
+            //     the report macros' `uvm_get_report_object().
+            //     uvm_get_report_object()` (the method's declared return
+            //     class, from the plan's per-class member map);
+            //   * a free function with a plain class return type
+            //     (`uvm_get_report_object()`).
+            crate::ast::expr::ExprKind::Call { func, .. } => {
+                if let crate::ast::expr::ExprKind::MemberAccess { expr: base, member } = &func.kind
+                {
+                    let cur = self.method_handle_chain_class(base)?;
+                    if cur == UNTYPED {
+                        return None;
+                    }
+                    if self.coll_member_names.contains(member.name.as_str()) {
+                        return None;
+                    }
+                    return self
+                        .handle_member_types?
+                        .get(&cur)?
+                        .get(member.name.as_str())
+                        .cloned();
+                }
+                let crate::ast::expr::ExprKind::Ident(h) = &func.kind else {
+                    return None;
+                };
+                if h.root.is_some() || h.path.is_empty() || h.path.last().unwrap().selects.is_empty() == false {
+                    return None;
+                }
+                // Package-qualified spellings (`uvm_pkg::uvm_get_report_object()`)
+                // resolve by leaf against the plan's function table.
+                let fname = h.path.last().unwrap().name.name.as_str();
+                let fd = self.functions.as_ref()?.get(fname)?;
+                if let crate::ast::types::DataType::TypeReference { name: tn, .. } = &fd.return_type
+                    && !tn.name.name.contains('#')
+                {
+                    return Some(tn.name.name.clone());
+                }
+                None
+            }
             crate::ast::expr::ExprKind::MemberAccess { expr: inner, member } => {
                 let cur = self.method_handle_chain_class(inner)?;
                 if cur == UNTYPED {
