@@ -91016,7 +91016,8 @@ impl Simulator {
             !(name.is_empty()
                 || enum_lits.contains(name)
                 || scope_names.contains(name)
-                || expanded_bases.contains(name))
+                || expanded_bases.contains(name)
+                || xezim_core::elaborate::is_delay_stage_net(name))
                 && Self::dump_name_selected(name, filters.as_deref(), depth)
         };
         for name in stored() {
@@ -138933,7 +138934,10 @@ fn vpi_scope_members(sim: &Simulator, scope: &str) -> Vec<(String, usize)> {
         };
         // Array words (`mem[0]`) are reached through their vpiMemory parent,
         // and an instance placeholder is not a signal.
-        if leaf.contains('[') || vpi_is_instance_name(sim, name) {
+        if leaf.contains('[')
+            || vpi_is_instance_name(sim, name)
+            || xezim_core::elaborate::is_delay_stage_net(name)
+        {
             continue;
         }
         out.push((name.to_string(), id));
