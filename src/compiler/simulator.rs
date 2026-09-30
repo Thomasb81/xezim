@@ -96988,7 +96988,12 @@ impl Simulator {
         let mut v = match self.signals.get(name).cloned() {
             Some(v) => v,
             None => {
-                let alt = strip_genblk_segments(name)?;
+                let Some(alt) = strip_genblk_segments(name) else {
+                    // A name read at run time that nothing holds: an input
+                    // port net left out as unobserved would have held it.
+                    self.signal_name_to_id.check_miss(name);
+                    return None;
+                };
                 return self.get_signal_value_by_name(&alt);
             }
         };

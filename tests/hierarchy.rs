@@ -43,6 +43,8 @@ mod dump_merged_sv_adopted_primary;
 mod dump_merged_sv_library_dedup;
 #[path = "hierarchy/dump_merged_sv_top_pruning.rs"]
 mod dump_merged_sv_top_pruning;
+#[path = "hierarchy/expression_port_actuals.rs"]
+mod expression_port_actuals;
 #[path = "hierarchy/final_blocks_hierarchy.rs"]
 mod final_blocks_hierarchy;
 #[path = "hierarchy/flat_actual_struct_port.rs"]

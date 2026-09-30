@@ -273,7 +273,9 @@ module top;
 endmodule
 "#;
     let (n, _) = check("scope", src, &[], &["T|top.u_s 1 b", "T|top.u_t 0 a"]);
-    assert_eq!(n, 4);
+    // `.a(~x)` computes, so that port keeps its net (see
+    // expression_port_actuals.rs); the three renames go.
+    assert_eq!(n, 3);
 }
 
 /// A class declared inside the child is not rewritten into the instance, a

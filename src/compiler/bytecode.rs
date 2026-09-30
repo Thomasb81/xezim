@@ -5137,9 +5137,15 @@ impl<'a> BytecodeCompiler<'a> {
         let rooted = hier.root.is_some();
         if !raw.contains('.') && !rooted {
             if let Some(scope) = &self.scope_hint {
-                if let Some(id) =
-                    with_dotted(scope, raw, |k| self.signal_name_to_id.get(k).copied())
-                {
+                if let Some(id) = with_dotted(scope, raw, |k| {
+                    let id = self.signal_name_to_id.get(k).copied();
+                    if id.is_none() {
+                        // The instance's own port net, left out as
+                        // unobserved, would have been found right here.
+                        self.signal_name_to_id.check_miss(k);
+                    }
+                    id
+                }) {
                     return Some(id);
                 }
             }
@@ -5175,6 +5181,7 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
         }
+        self.signal_name_to_id.check_miss(raw);
         None
     }
 

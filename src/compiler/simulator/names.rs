@@ -170,32 +170,48 @@ impl NameMap {
     pub fn get(&self, name: &str) -> Option<&usize> {
         match self.map.get(name) {
             Some(id) => Some(id),
-            None => match self.virtual_id(name) {
-                Some(id) => Some(&self.identity[id]),
-                None => {
-                    if self.elided.is_some() {
-                        self.elided_miss(name);
-                    }
-                    None
+            None => {
+                let v = self.virtual_id(name).map(|id| &self.identity[id]);
+                if v.is_none() {
+                    self.audit_miss(name);
                 }
-            },
+                v
+            }
         }
     }
 
     #[inline(always)]
     pub fn contains_key(&self, name: &str) -> bool {
         let hit = self.map.contains_key(name) || self.virtual_id(name).is_some();
-        if !hit && self.elided.is_some() {
-            self.elided_miss(name);
+        if !hit {
+            self.audit_miss(name);
         }
         hit
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut usize> {
-        if self.elided.is_some() && !self.map.contains_key(name) {
-            self.elided_miss(name);
+        if !self.map.contains_key(name) {
+            self.audit_miss(name);
         }
         self.map.get_mut(name)
+    }
+
+    /// Every failed lookup is checked against the elided port nets only in
+    /// an `elide-audit` build: the check on this path cost 0.2% on a UVM
+    /// run. Release builds check the resolution points that can plausibly
+    /// reach a port net by name (see [`NameMap::check_miss`]).
+    #[inline(always)]
+    fn audit_miss(&self, _name: &str) {
+        #[cfg(feature = "elide-audit")]
+        self.check_miss(_name);
+    }
+
+    /// Report `name` if it is an elided port net; for a lookup that missed.
+    #[inline(always)]
+    pub fn check_miss(&self, name: &str) {
+        if self.elided.is_some() {
+            self.elided_miss(name);
+        }
     }
 
     /// Install the elided port nets (see [`ElidedPorts`]).
