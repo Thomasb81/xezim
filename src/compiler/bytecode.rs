@@ -7773,6 +7773,16 @@ impl<'a> BytecodeCompiler<'a> {
                     let lw = self.expr_max_width(left);
                     let rw = self.expr_max_width(right);
                     lw.max(rw)
+                } else if matches!(op, BinaryOp::Div | BinaryOp::Mod) {
+                    // §11.6.1 Table 11-21: `/` and `%` size BOTH operands to
+                    // max(L(i), L(j)) and the context — the right operand's
+                    // width counts too. Taking only the left's let a narrow
+                    // dividend narrow the divisor: `x % (n < 32 ? n : 32)`
+                    // with a 5-bit `x` compiled the ternary at 5 bits, so the
+                    // divisor 32 became 0 and the index read x.
+                    ctx_width
+                        .max(self.lrm_self_width(left))
+                        .max(self.lrm_self_width(right))
                 } else if widens_operands {
                     ctx_width.max(self.expr_max_width(left))
                 } else {
