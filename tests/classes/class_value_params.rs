@@ -41,10 +41,9 @@ module tb;
 endmodule
 "#;
 
-/// Named specialization `#(.W(32), .D(5))`: the parser flattens named args
-/// to a positional list (names dropped), so the simulator recovers the named
-/// form structurally per §8.26 (all-named or all-positional) and pairs value
-/// exprs with VALUE parameters in declaration order.
+/// Named specialization `#(.W(32), .D(5))`: each value binds to the
+/// parameter it names. Out-of-order named lists are covered by
+/// `class_param_default_scope::named_parameter_assignment_binds_by_name`.
 const NAMED: &str = r#"
 module tb;
   class Param #(type T = int, int W = 8, int D = 3);
@@ -58,9 +57,6 @@ module tb;
     p32 = new();
     c = p32.wd();      // 32 + 5
     w64 = new();
-    // Known limitation (documented in class_param_arg_map): named args of
-    // the SAME kind out of declaration order mis-bind, so only in-order
-    // named lists are asserted here.
     w = w64.w_only() * 100 + w64.wd();  // 64*100 + (64+3)
   end
 endmodule

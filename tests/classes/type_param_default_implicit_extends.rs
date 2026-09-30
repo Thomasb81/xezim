@@ -114,7 +114,6 @@ fn leaf_specializations_see_type_and_value_parameters() {
 
 /// §6.20.2: a default may name an earlier parameter; `D = W*2` follows `W`.
 #[test]
-#[ignore = "known gap: a parameter default that depends on another parameter reads x"]
 fn dependent_parameter_default_follows_the_specialization() {
     let o = leaves();
     for line in [
@@ -132,7 +131,6 @@ fn dependent_parameter_default_follows_the_specialization() {
 /// A parameterized class that extends `pbase` without arguments still gets
 /// `T` = `int`.
 #[test]
-#[ignore = "known gap: a parameterized derived class sees the base type parameter as logic"]
 fn parameterized_leaf_keeps_the_base_type_default() {
     let o = leaves();
     for path in ["F", "T"] {

@@ -94435,6 +94435,16 @@ impl Simulator {
             // (`P#(bit [7:0]) x;`) arrives as a TypeLiteral.
             ExprKind::TypeLiteral(dt) => crate::elaborate::data_type_to_spec_fragment(dt),
             ExprKind::StringLiteral(s) => Some(format!("\"{}\"", s)),
+            // A named assignment keeps its name (`.W(5)`); the class's
+            // `canonicalize_spec_sig` moves it to that parameter's slot.
+            ExprKind::NamedArg {
+                name,
+                expr: Some(x),
+            } => Some(format!(
+                ".{}({})",
+                name.name,
+                self.expr_to_spec_fragment(x)?
+            )),
             ExprKind::Number(NumberLiteral::Integer { value, .. }) => Some(value.clone()),
             ExprKind::Number(NumberLiteral::Real(r)) => Some(format!("{}", r)),
             ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) => Some(c.to_string()),
@@ -109451,6 +109461,130 @@ impl Simulator {
         None
     }
 
+    /// §8.25 / A.4.1.1: `class d extends base #(.W(X));` names the parameters it
+    /// sets. Every walk over `extends_type_args` / `extends_args` reads them
+    /// by POSITION in the base's `param_order`, so place each named value at
+    /// its parameter's slot once, here: a named list used to bind `.W(X)` to
+    /// the base's first parameter. A slot the list does not name keeps the
+    /// base's default (§6.20.2), folded against the slots before it; a
+    /// trailing one is left off. Both lists come out aligned.
+    fn place_named_extends_args(&mut self, cname: &str) {
+        let Some(cd) = self.module.classes.get(cname) else {
+            return;
+        };
+        if !cd
+            .extends_type_args
+            .iter()
+            .any(|a| Self::named_spec_arg(a).is_some())
+        {
+            return;
+        }
+        let Some(pcd) = cd
+            .extends
+            .as_deref()
+            .and_then(|p| self.module.classes.get(p))
+        else {
+            return;
+        };
+        // A.4.1.1: a list is all-named or all-ordered.
+        if !cd
+            .extends_type_args
+            .iter()
+            .all(|a| Self::named_spec_arg(a).is_some())
+        {
+            return;
+        }
+        let order = &pcd.param_order;
+        let mut texts: Vec<Option<String>> = vec![None; order.len()];
+        for a in &cd.extends_type_args {
+            if let Some((n, v)) = Self::named_spec_arg(a) {
+                if let Some(i) = order.iter().position(|p| p == n) {
+                    texts[i] = Some(v.to_string());
+                }
+            }
+        }
+        let mut exprs: Vec<Option<Expression>> = vec![None; order.len()];
+        for e in &cd.extends_args {
+            if let ExprKind::NamedArg {
+                name,
+                expr: Some(x),
+            } = &e.kind
+            {
+                if let Some(i) = order.iter().position(|p| *p == name.name) {
+                    exprs[i] = Some((**x).clone());
+                }
+            }
+        }
+        let used = texts.iter().rposition(|t| t.is_some()).map_or(0, |i| i + 1);
+        let ident = |name: &str| {
+            Expression::new(
+                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                    root: None,
+                    path: vec![crate::ast::expr::HierPathSegment {
+                        name: crate::ast::Identifier {
+                            name: name.to_string(),
+                            span: crate::ast::Span::dummy(),
+                        },
+                        selects: Vec::new(),
+                    }],
+                    span: crate::ast::Span::dummy(),
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                }),
+                crate::ast::Span::dummy(),
+            )
+        };
+        let mut new_texts: Vec<String> = Vec::with_capacity(used);
+        let mut new_exprs: Vec<Expression> = Vec::with_capacity(used);
+        for i in 0..used {
+            let (t, e) = match (texts[i].take(), exprs[i].take()) {
+                (Some(t), e) => {
+                    let e = e.unwrap_or_else(|| ident(&t));
+                    (t, e)
+                }
+                (None, _) => {
+                    let t = self
+                        .param_default_fragment(pcd, i, &new_texts)
+                        .unwrap_or_else(|| order[i].clone());
+                    let (neg, body) = match t.strip_prefix('-') {
+                        Some(b) => (true, b),
+                        None => (false, t.as_str()),
+                    };
+                    let e = match Self::parse_spec_number(body) {
+                        Some(n) => {
+                            let lit =
+                                Expression::new(ExprKind::Number(n), crate::ast::Span::dummy());
+                            if neg {
+                                Expression::new(
+                                    ExprKind::Unary {
+                                        op: UnaryOp::Minus,
+                                        operand: Box::new(lit),
+                                    },
+                                    crate::ast::Span::dummy(),
+                                )
+                            } else {
+                                lit
+                            }
+                        }
+                        None => ident(&t),
+                    };
+                    (t, e)
+                }
+            };
+            new_texts.push(t);
+            new_exprs.push(e);
+        }
+        if let Some(cd) = self
+            .module
+            .classes
+            .get_mut(cname)
+            .map(std::sync::Arc::make_mut)
+        {
+            cd.extends_type_args = new_texts;
+            cd.extends_args = new_exprs;
+        }
+    }
+
     /// Break any cycle in the class `extends` graph. A self- or mutually-
     /// referential `extends` (which can arise from a parameterized class
     /// whose base resolves to the same name) would make every ancestor-
@@ -109522,6 +109656,9 @@ impl Simulator {
                     }
                 }
             }
+        }
+        for cname in &names {
+            self.place_named_extends_args(cname);
         }
         for start in names {
             let mut seen: HashSet<String> = HashSet::default();
@@ -109762,59 +109899,92 @@ impl Simulator {
             }
             let cd = self.module.classes.get(&cur)?;
             let parent = cd.extends.clone()?;
-            // Resolve extends args using current bindings.
-            let parent_args: Vec<String> = cd
-                .extends_args
-                .iter()
-                .map(|e| {
-                    if let crate::ast::expr::ExprKind::Ident(h) = &e.kind {
-                        if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                            let nm = &h.path[0].name.name;
-                            if let Some(v) = bindings.get(nm) {
-                                return v.clone();
-                            }
-                            // The extends arg is a type/value param of THIS
-                            // class that was NOT provided in the leaf
-                            // specialization (it took its DEFAULT). Substitute
-                            // the default so the ancestor signature matches
-                            // the one a directly-named specialization would
-                            // produce. Without this, a defaulted type param
-                            // leaks its bare parameter identifier name
-                            // into the ancestor sig, yielding a static
-                            // key that no writer ever used — so inherited
-                            // statics read as default/uninitialized.
-                            // IEEE 1800-2023 §6.20.2.
-                            if let Some((_, frag)) =
-                                cd.type_param_defaults.iter().find(|(n, _)| n == nm)
-                            {
-                                return frag.clone();
-                            }
-                            if let Some((_, Some(init))) =
-                                cd.param_defaults.iter().find(|(n, _)| n == nm)
-                            {
-                                if let Some(frag) = self.expr_to_spec_fragment(init) {
-                                    return frag;
-                                }
-                            }
-                            return nm.clone();
+            // Resolve extends args using current bindings. A bare name is a
+            // parameter of THIS class: its binding, or — when the leaf
+            // specialization did not provide it — its DEFAULT, so the
+            // ancestor signature matches the one a directly-named
+            // specialization would produce. Without this, a defaulted type
+            // param leaks its bare parameter identifier name into the
+            // ancestor sig, yielding a static key that no writer ever used —
+            // so inherited statics read as default/uninitialized. IEEE
+            // 1800-2023 §6.20.2 — and the default is evaluated against the
+            // parameters before it (`int D = W*2` follows this
+            // specialization's W).
+            let name_arg = |nm: &str| -> String {
+                if let Some(v) = bindings.get(nm) {
+                    return v.clone();
+                }
+                if let Some(i) = cd.param_order.iter().position(|p| p == nm) {
+                    let mut bound: Vec<String> = Vec::with_capacity(i);
+                    for (j, p) in cd.param_order[..i].iter().enumerate() {
+                        match bindings
+                            .get(p)
+                            .cloned()
+                            .or_else(|| self.param_default_fragment(cd, j, &bound))
+                        {
+                            Some(v) => bound.push(v),
+                            None => break,
                         }
                     }
-                    // An EXPRESSION extends-arg (`extends Base#(N * 3)`)
-                    // must be evaluated with this class's bindings — the
-                    // raw fragment "N*3" matches no registered spec and
-                    // the ancestor silently fell back to its defaults.
-                    let mut ptab: HashMap<String, Value> = HashMap::default();
-                    for (k, v) in &bindings {
-                        if let Ok(n) = v.parse::<i64>() {
-                            ptab.insert(k.clone(), Value::from_u64(n as u64, 32));
+                    if let Some(d) = self.param_default_fragment(cd, i, &bound) {
+                        return d;
+                    }
+                }
+                if let Some((_, frag)) = cd.type_param_defaults.iter().find(|(n, _)| n == nm) {
+                    return frag.clone();
+                }
+                if let Some((_, Some(init))) = cd.param_defaults.iter().find(|(n, _)| n == nm) {
+                    if let Some(frag) = self.expr_to_spec_fragment(init) {
+                        return frag;
+                    }
+                }
+                nm.to_string()
+            };
+            let parent_args: Vec<String> = if cd.extends_args.len() == cd.extends_type_args.len() {
+                cd.extends_args
+                    .iter()
+                    .map(|e| {
+                        if let crate::ast::expr::ExprKind::Ident(h) = &e.kind {
+                            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                                return name_arg(&h.path[0].name.name);
+                            }
                         }
-                    }
-                    if let Some(n) = super::elaborate::const_eval_i64_with_params(e, Some(&ptab)) {
-                        return n.to_string();
-                    }
-                    self.expr_to_spec_fragment(e).unwrap_or_default()
-                })
-                .collect();
+                        // An EXPRESSION extends-arg (`extends Base#(N * 3)`)
+                        // must be evaluated with this class's bindings — the
+                        // raw fragment "N*3" matches no registered spec and
+                        // the ancestor silently fell back to its defaults.
+                        let mut ptab: HashMap<String, Value> = HashMap::default();
+                        for (k, v) in &bindings {
+                            if let Ok(n) = v.parse::<i64>() {
+                                ptab.insert(k.clone(), Value::from_u64(n as u64, 32));
+                            }
+                        }
+                        if let Some(n) =
+                            super::elaborate::const_eval_i64_with_params(e, Some(&ptab))
+                        {
+                            return n.to_string();
+                        }
+                        self.expr_to_spec_fragment(e).unwrap_or_default()
+                    })
+                    .collect()
+            } else {
+                // A type argument written as a keyword type (`#(byte, 4)`) is
+                // no expression, so `extends_args` skips it and every later
+                // argument would shift one slot left; the textual list keeps
+                // every position.
+                cd.extends_type_args
+                    .iter()
+                    .map(|t| {
+                        let t = t.trim();
+                        let is_name = t
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                            && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                        if is_name { name_arg(t) } else { t.to_string() }
+                    })
+                    .collect()
+            };
             if parent == ancestor_class {
                 return Some(parent_args.join(","));
             }
@@ -109951,6 +110121,179 @@ impl Simulator {
         }
     }
 
+    /// IEEE 1800-2017 §6.20.2: the DECLARED DEFAULT of parameter
+    /// `param_order[i]` of class `cd`, rendered as a specialization fragment
+    /// and evaluated in the scope of the parameters before it — `bound[j]` is
+    /// the fragment already bound to `param_order[j]`.
+    ///
+    /// A default may name an earlier parameter (`int D = W*2`, `type RSP =
+    /// REQ`). Taken verbatim, the fragment named the parameter instead of its
+    /// value in THIS specialization: a slot no lookup could bind (`D` read
+    /// x), and a signature unlike the explicit spelling of the same
+    /// specialization, so the two kept separate statics (§8.25). Returns
+    /// None when the default cannot be reduced to a constant here; the
+    /// runtime then evaluates it with the specialization active.
+    fn param_default_fragment(
+        &self,
+        cd: &crate::compiler::elaborate::ElaboratedClass,
+        i: usize,
+        bound: &[String],
+    ) -> Option<String> {
+        let order = &cd.param_order;
+        let pname = order.get(i)?;
+        let earlier = &order[..i.min(bound.len())];
+        let bound_of = |nm: &str| {
+            earlier
+                .iter()
+                .position(|p| p == nm)
+                .map(|j| bound[j].trim().to_string())
+        };
+        if let Some((_, d)) = cd.type_param_defaults.iter().find(|(n, _)| n == pname) {
+            let d = d.trim();
+            if let Some(v) = bound_of(d) {
+                return Some(v);
+            }
+            // A specialized default (`type B = box#(T)`) follows the earlier
+            // parameters it names.
+            let mut out = d.to_string();
+            if d.contains('#') {
+                for (j, p) in earlier.iter().enumerate() {
+                    out = Self::replace_ident_token(&out, p, bound[j].trim());
+                }
+            }
+            return Some(out);
+        }
+        let init = cd
+            .param_defaults
+            .iter()
+            .find(|(n, _)| n == pname)?
+            .1
+            .as_ref()?;
+        match &init.kind {
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) => {
+                return self.expr_to_spec_fragment(init);
+            }
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let nm = &h.path[0].name.name;
+                if let Some(v) = bound_of(nm) {
+                    return Some(v);
+                }
+                // Not a parameter of this class (an enum member, a package
+                // constant): the name itself, resolved downstream.
+                if !order.contains(nm) {
+                    return self.expr_to_spec_fragment(init);
+                }
+                return None;
+            }
+            _ => {}
+        }
+        // An expression default (`W*2`, `A * pk::P`): fold it with the earlier
+        // parameters bound. Only an integral parameter folds to an integer.
+        let integral = match cd.property_types.get(pname) {
+            Some(DataType::IntegerAtom { .. })
+            | Some(DataType::IntegerVector { .. })
+            | Some(DataType::Implicit { .. })
+            | None => true,
+            Some(_) => false,
+        };
+        if !integral {
+            return None;
+        }
+        let mut ptab: HashMap<String, Value> = HashMap::default();
+        if !self.bind_default_operands(init, earlier, bound, &mut ptab) {
+            return None;
+        }
+        super::elaborate::const_eval_i64_with_params(init, Some(&ptab)).map(|n| n.to_string())
+    }
+
+    /// The operands of a parameter default `e` for constant folding, keyed as
+    /// `const_eval_i64_with_params` looks them up: the earlier parameters
+    /// (from their bound fragments) and package-qualified parameters. False
+    /// when `e` reads anything else — a later parameter, a type parameter, a
+    /// bare outer name — so the fold never falls back to an unrelated
+    /// same-named constant of some other scope.
+    fn bind_default_operands(
+        &self,
+        e: &Expression,
+        earlier: &[String],
+        bound: &[String],
+        ptab: &mut HashMap<String, Value>,
+    ) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) => true,
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
+                self.bind_default_operands(x, earlier, bound, ptab)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.bind_default_operands(left, earlier, bound, ptab)
+                    && self.bind_default_operands(right, earlier, bound, ptab)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.bind_default_operands(condition, earlier, bound, ptab)
+                    && self.bind_default_operands(then_expr, earlier, bound, ptab)
+                    && self.bind_default_operands(else_expr, earlier, bound, ptab)
+            }
+            ExprKind::SystemCall { name, args } if name == "$clog2" => args
+                .iter()
+                .all(|a| self.bind_default_operands(a, earlier, bound, ptab)),
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                match h.path.as_slice() {
+                    [seg] => {
+                        let nm = &seg.name.name;
+                        let Some(j) = earlier.iter().position(|p| p == nm) else {
+                            return false;
+                        };
+                        let t = bound[j].trim();
+                        let (neg, body) = match t.strip_prefix('-') {
+                            Some(b) => (true, b),
+                            None => (false, t),
+                        };
+                        let Some(lit) = Self::parse_spec_number(body) else {
+                            return false;
+                        };
+                        let lit = Expression::new(ExprKind::Number(lit), crate::ast::Span::dummy());
+                        let Some(n) = super::elaborate::const_eval_i64_with_params(&lit, None)
+                        else {
+                            return false;
+                        };
+                        let n = if neg { n.wrapping_neg() } else { n };
+                        ptab.insert(nm.clone(), Value::from_u64(n as u64, 64));
+                        true
+                    }
+                    [pkg, seg] => {
+                        let key = format!("{}::{}", pkg.name.name, seg.name.name);
+                        match self.module.parameters.get(&key) {
+                            Some(v) => {
+                                ptab.insert(key, v.clone());
+                                true
+                            }
+                            None => false,
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// A named specialization argument `.NAME(value)` split into its name and
+    /// (trimmed) value text; None for a positional fragment.
+    fn named_spec_arg(frag: &str) -> Option<(&str, &str)> {
+        let rest = frag.trim().strip_prefix('.')?;
+        let open = rest.find('(')?;
+        let name = rest[..open].trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        let value = rest[open + 1..].trim_end().strip_suffix(')')?;
+        Some((name, value.trim()))
+    }
+
     fn canonicalize_spec_sig(&self, class_name: &str, sig: &str) -> String {
         // The class's parameter lists are read in place: every call below
         // takes `&self`.
@@ -109958,8 +110301,6 @@ impl Simulator {
             return sig.to_string();
         };
         let order = &cd.param_order;
-        let tp_defaults = &cd.type_param_defaults;
-        let v_defaults = &cd.param_defaults;
         if order.is_empty() {
             return sig.to_string();
         }
@@ -109967,61 +110308,61 @@ impl Simulator {
             .into_iter()
             .map(|s| s.trim().to_string())
             .collect();
-        // Resolve each provided fragment: if it is the bare name of the
-        // parameter at its own position and that param has a default,
-        // substitute the default.
-        for i in 0..frags.len() {
-            if let Some(pname) = order.get(i) {
-                if frags[i] == *pname {
-                    if let Some((_, d)) = tp_defaults.iter().find(|(n, _)| n == pname) {
-                        frags[i] = d.clone();
-                    } else if let Some((_, Some(init))) =
-                        v_defaults.iter().find(|(n, _)| n == pname)
-                    {
-                        if let Some(d) = self.expr_to_spec_fragment(init) {
-                            frags[i] = d;
+        // §8.25 named assignments (`.W(5)`) bind by NAME: move each to its
+        // parameter's slot. A slot no argument names keeps its default,
+        // spelled as the parameter's own name for the loop below to fill; a
+        // trailing one is simply dropped.
+        if frags.iter().any(|f| Self::named_spec_arg(f).is_some()) {
+            let mut slots: Vec<Option<String>> = vec![None; order.len()];
+            for (k, f) in frags.iter().enumerate() {
+                match Self::named_spec_arg(f) {
+                    Some((n, v)) => {
+                        if let Some(i) = order.iter().position(|p| p == n) {
+                            slots[i] = (!v.is_empty()).then(|| v.to_string());
+                        }
+                    }
+                    None => {
+                        if let Some(s) = slots.get_mut(k) {
+                            *s = Some(f.clone());
                         }
                     }
                 }
             }
+            let used = slots.iter().rposition(|s| s.is_some()).map_or(0, |i| i + 1);
+            frags = slots
+                .into_iter()
+                .take(used)
+                .enumerate()
+                .map(|(i, s)| s.unwrap_or_else(|| order[i].clone()))
+                .collect();
         }
-        // Pad missing trailing positions with their defaults. A default that
-        // is the bare name of an EARLIER parameter (`#(type REQ=uvm_sequence_item,
-        // type RSP=REQ)` specialized as `Class#(simple_item)`) must resolve that
-        // name to the already-bound leaf (`simple_item`), not the literal
-        // parameter name `REQ` — else the write `simple_item,REQ` keys a
-        // different per-spec static cell than the reads, which rebind the
-        // whole chain (`simple_item,simple_item`). QV: this is how UVM's
+        // Resolve each provided fragment: if it is the bare name of the
+        // parameter at its own position and that param has a default,
+        // substitute the default.
+        for i in 0..frags.len() {
+            if order.get(i).is_some_and(|p| frags[i] == *p) {
+                if let Some(d) = self.param_default_fragment(cd, i, &frags[..i]) {
+                    frags[i] = d;
+                }
+            }
+        }
+        // Pad missing trailing positions with their defaults, each evaluated
+        // in the scope of the parameters before it (§6.20.2). A default that
+        // names an EARLIER parameter (`#(type REQ=uvm_sequence_item, type
+        // RSP=REQ)` specialized as `Class#(simple_item)`, or `int D = W*2`)
+        // must follow that parameter's binding here — else the partial
+        // spelling keys a different per-spec static cell than the full one
+        // (`simple_item,REQ` against `simple_item,simple_item`), although
+        // §8.25 makes them one specialization. This is how UVM's
         // `uvm_sequence_library#(REQ,RSP=REQ)` keeps its static
         // `m_typewide_sequences` shared whether reached via `Lib::add_...`
         // (partial `#(simple_item)`) or via a derived subclass of the full
         // specialization.
         while frags.len() < order.len() {
-            let i = frags.len();
-            if let Some(pname) = order.get(i) {
-                let mut filled = false;
-                if let Some((_, d)) = tp_defaults.iter().find(|(n, _)| n == pname) {
-                    // If the default references an earlier bound param, use
-                    // that param's already-resolved leaf value.
-                    if let Some(j) = order.iter().position(|p| p == d) {
-                        if let Some(v) = frags.get(j).cloned() {
-                            frags.push(v);
-                            filled = true;
-                        }
-                    }
-                    if !filled {
-                        frags.push(d.clone());
-                        continue;
-                    }
-                }
-                if let Some((_, Some(init))) = v_defaults.iter().find(|(n, _)| n == pname) {
-                    if let Some(d) = self.expr_to_spec_fragment(init) {
-                        frags.push(d);
-                        continue;
-                    }
-                }
+            match self.param_default_fragment(cd, frags.len(), &frags) {
+                Some(d) => frags.push(d),
+                None => break, // no reducible default here — leave partial
             }
-            break; // no default for this position — stop (leave partial)
         }
         let canon_frags: Vec<String> = frags
             .iter()
@@ -110237,29 +110578,30 @@ impl Simulator {
                 };
                 let mut next: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
+                // The parent's bindings in declaration order, as long as they
+                // run unbroken: the scope a later default is evaluated in.
+                let mut bound: Vec<String> = Vec::with_capacity(order.len());
                 for (i, pname) in order.iter().enumerate() {
-                    if let Some(arg) = cd.extends_type_args.get(i) {
+                    let v = if let Some(arg) = cd.extends_type_args.get(i) {
                         let a = arg.trim();
-                        let resolved = carried.get(a).cloned().unwrap_or_else(|| a.to_string());
-                        next.insert(pname.clone(), resolved);
-                    } else if let Some((_, frag)) =
-                        pcd.type_param_defaults.iter().find(|(n, _)| n == pname)
-                    {
+                        Some(carried.get(a).cloned().unwrap_or_else(|| a.to_string()))
+                    } else {
                         // IEEE 1800-2023 §6.20.2: an extends clause that omits a
-                        // parameter leaves it at its DECLARED DEFAULT. Without
-                        // this the parameter's bare NAME leaked into the
+                        // parameter leaves it at its DECLARED DEFAULT, evaluated
+                        // against the parameters before it (`int D = W*2`).
+                        // Without this the parameter's bare NAME leaked into the
                         // specialization signature (`pbase#(T)`), and resolving
                         // `T` in that spec failed — a type parameter read as
                         // `logic`. That is the `class d extends pbase;` shape
                         // (`class base_test extends base_test_param;`), where the
                         // derived class silently lost every defaulted parameter.
-                        next.insert(pname.clone(), frag.trim().to_string());
-                    } else if let Some((_, Some(init))) =
-                        pcd.param_defaults.iter().find(|(n, _)| n == pname)
-                    {
-                        if let Some(frag) = self.expr_to_spec_fragment(init) {
-                            next.insert(pname.clone(), frag);
+                        self.param_default_fragment(pcd, i, &bound)
+                    };
+                    if let Some(v) = v {
+                        if bound.len() == i {
+                            bound.push(v.clone());
                         }
+                        next.insert(pname.clone(), v);
                     }
                 }
                 carried = next;
@@ -110282,28 +110624,30 @@ impl Simulator {
             cd.param_order.clone()
         };
         let mut out: Vec<String> = Vec::with_capacity(order.len());
-        for p in order.iter() {
+        for (i, p) in order.iter().enumerate() {
             if let Some(v) = carried.get(p) {
                 out.push(v.clone());
                 continue;
             }
             // A parameter the extends chain never supplied is using its
-            // DECLARED DEFAULT (§6.20.2) — use the default fragment, not the
-            // parameter's own bare name. The bare name produced a spec key
-            // like `pbase#(T)` that no resolution could bind, so a type
-            // parameter in the method body fell back to `logic`.
-            if let Some((_, frag)) = cd.type_param_defaults.iter().find(|(n, _)| n == p) {
-                let frag = frag.trim();
-                if !frag.is_empty() {
-                    out.push(frag.to_string());
-                    continue;
-                }
-            }
-            if let Some((_, Some(init))) = cd.param_defaults.iter().find(|(n, _)| n == p) {
-                if let Some(frag) = self.expr_to_spec_fragment(init) {
-                    out.push(frag);
-                    continue;
-                }
+            // DECLARED DEFAULT (§6.20.2), evaluated against the parameters
+            // before it — not the parameter's own bare name. The bare name
+            // produced a spec key like `pbase#(T)` that no resolution could
+            // bind, so a type parameter in the method body fell back to
+            // `logic` and a dependent value default (`D = W*2`) read x.
+            if let Some(d) = self
+                .param_default_fragment(cd, i, &out)
+                .or_else(|| {
+                    // A cache without `param_order`: type defaults only.
+                    cd.type_param_defaults
+                        .iter()
+                        .find(|(n, _)| n == p)
+                        .map(|(_, d)| d.trim().to_string())
+                })
+                .filter(|d| !d.is_empty())
+            {
+                out.push(d);
+                continue;
             }
             out.push(p.clone());
         }
@@ -110462,6 +110806,30 @@ impl Simulator {
 
     /// Read a static class property, lazily seeding its shared cell from
     /// the declaring class's initial value on first access.
+    /// For a class that is NOT parameterized itself, the specialization of
+    /// its nearest parameterized ancestor it extends (`class d extends
+    /// base #(int, 3);` gives `(base, "int,3,6")`): the scope its inherited
+    /// parameters take their values from. None for a parameterized class or
+    /// a chain without parameters.
+    fn inherited_param_spec(&self, class_name: &str) -> Option<(String, String)> {
+        if self.class_is_parameterized(class_name) {
+            return None;
+        }
+        let mut cur = self.get_class_def(class_name)?.extends.as_deref();
+        let mut guard = 0;
+        while let Some(anc) = cur {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            if self.class_is_parameterized(anc) {
+                return self.static_receiver_spec(class_name, anc);
+            }
+            cur = self.get_class_def(anc)?.extends.as_deref();
+        }
+        None
+    }
+
     fn class_static_get(&mut self, start_class: &str, prop: &str) -> Option<Value> {
         let key = self.static_prop_key(start_class, prop)?;
         if !self.class_statics.contains_key(&key) {
@@ -110517,6 +110885,31 @@ impl Simulator {
                         let v = self.eval_expr(&e);
                         self.this_stack.pop();
                         self.class_context_stack.pop();
+                        Some(v)
+                    } else if let Some((pd, spec)) = pd_expr
+                        .filter(|e| {
+                            !matches!(e.kind, ExprKind::Number(_) | ExprKind::StringLiteral(_))
+                        })
+                        .and_then(|pd| Some((pd, self.inherited_param_spec(decl_class)?)))
+                    {
+                        // §6.20.2: a class-body localparam of a class that is
+                        // not parameterized itself but inherits parameters
+                        // (`class d extends base #(int, 3); localparam int L =
+                        // D + 1;`) was elaborated without the inherited
+                        // values in scope. Evaluate it with the base
+                        // specialization this class extends active.
+                        self.class_statics
+                            .insert(key.clone(), sig_val.clone().unwrap());
+                        let saved_spec = std::mem::replace(&mut self.current_spec, Some(spec));
+                        let frame = self.take_pooled_frame();
+                        self.class_context_stack.push(Some(decl_class.to_string()));
+                        self.this_stack.push(None);
+                        self.push_local_frame(frame);
+                        let v = self.eval_expr(&pd);
+                        self.pop_local_frame();
+                        self.this_stack.pop();
+                        self.class_context_stack.pop();
+                        self.current_spec = saved_spec;
                         Some(v)
                     } else {
                         sig_val
@@ -124062,16 +124455,14 @@ impl Simulator {
     /// Map a specialization's `#(...)` argument list onto the class's
     /// parameters by NAME (§8.25). Positional lists map by slot in
     /// `param_order` (type and value parameters interleave in declaration
-    /// order). The parser flattens named connections (`.W(32)`) into the
-    /// same positional expression list with the names dropped, so the named
-    /// form is recovered structurally: §8.26 requires a list to be all-named
-    /// or all-positional, so if any slot is kind-inconsistent (a value
-    /// expression on a TYPE-parameter slot, or a definite type name on a
-    /// value-parameter slot) the list must have been named — pair type-name
-    /// args with TYPE params and value exprs with VALUE params, each in
-    /// declaration order. Known limitation: named args of the SAME kind
-    /// given out of declaration order (e.g. `#(.D(5), .W(32))`) mis-bind,
-    /// because the AST no longer carries the names.
+    /// order). A named connection (`.W(32)`) arrives as a `NamedArg` and
+    /// binds by its name. A list whose names were dropped (a cache written
+    /// before the parser kept them) is recovered structurally: A.4.1.1 requires
+    /// a list to be all-named or all-positional, so if any slot is
+    /// kind-inconsistent (a value expression on a TYPE-parameter slot, or a
+    /// definite type name on a value-parameter slot) the list must have been
+    /// named — pair type-name args with TYPE params and value exprs with
+    /// VALUE params, each in declaration order.
     fn class_param_arg_map(
         &self,
         class_def: &crate::compiler::elaborate::ElaboratedClass,
@@ -124095,6 +124486,31 @@ impl Simulator {
         } else {
             &class_def.param_order
         };
+        // §8.25 named assignments (`#(.W(5))`) carry their parameter's name:
+        // bind each by that name, whatever its position.
+        if ta
+            .iter()
+            .any(|a| matches!(a.kind, ExprKind::NamedArg { .. }))
+        {
+            let mut map: HashMap<String, Expression> = HashMap::default();
+            for (i, arg) in ta.iter().enumerate() {
+                match &arg.kind {
+                    ExprKind::NamedArg { name, expr } => {
+                        if let Some(x) = expr {
+                            if order.iter().any(|p| *p == name.name) {
+                                map.insert(name.name.clone(), (**x).clone());
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(p) = order.get(i) {
+                            map.insert(p.clone(), arg.clone());
+                        }
+                    }
+                }
+            }
+            return map;
+        }
         let is_type_param = |n: &str| class_def.type_param_names.iter().any(|t| t == n);
         // Kind-consistency scan: positional unless some slot mismatches.
         let mut positional = true;
@@ -124377,8 +124793,34 @@ impl Simulator {
         // split would break on commas inside a string literal or a nested
         // call), then evaluate the fragment at `name`'s position.
         let frags = Self::split_spec_args(&sig);
-        let frag = frags.get(idx)?;
-        self.eval_spec_arg_fragment(frag)
+        // A slot spelled as the parameter's own name is one a named list
+        // left at its default (see `canonicalize_spec_sig`).
+        if let Some(frag) = frags.get(idx).filter(|f| f.trim() != name) {
+            return self.eval_spec_arg_fragment(frag);
+        }
+        // §6.20.2: the specialization leaves `name` at a default that could
+        // not be folded into its signature (`int W = $bits(U)`) — evaluate
+        // the default here, with this specialization active, so it follows
+        // the parameters before it.
+        let init = self
+            .module
+            .classes
+            .get(&base)?
+            .param_defaults
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, e)| e.clone())?;
+        // The class's scope only: no caller local or `this` member of the
+        // same name may answer for an earlier parameter.
+        let frame = self.take_pooled_frame();
+        self.class_context_stack.push(Some(base.clone()));
+        self.this_stack.push(None);
+        self.push_local_frame(frame);
+        let v = self.eval_expr(&init);
+        self.pop_local_frame();
+        self.this_stack.pop();
+        self.class_context_stack.pop();
+        Some(v)
     }
 
     /// Fragment `idx` of `split_spec_args(sig)`, borrowed: the same
@@ -124689,6 +125131,23 @@ impl Simulator {
                             // class name like `uvm_registry_object_creator`)
                             if arg != "<unknown>" {
                                 return Some(arg.to_string());
+                            }
+                        } else {
+                            // §6.20.3: the extends clause omits `tn`, so the
+                            // ancestor's specialization uses its DECLARED
+                            // DEFAULT there — `class d #(int X) extends
+                            // pbase;` still sees `pbase`'s `T = int`. The
+                            // default may follow an earlier parameter
+                            // (`type U = T`), so derive the ancestor's whole
+                            // specialization and read `tn`'s slot from it.
+                            if let Some(asig) = self.ancestor_spec(base, sig, &ancestor) {
+                                let asig = self.canonicalize_spec_sig(&ancestor, &asig);
+                                if let Some(v) = Self::spec_arg_at(&asig, idx) {
+                                    let v = v.trim();
+                                    if !v.is_empty() {
+                                        return Some(v.to_string());
+                                    }
+                                }
                             }
                         }
                         break;
@@ -125001,6 +125460,63 @@ impl Simulator {
         None
     }
 
+    /// IEEE 1800-2017 §6.20.2 / §8.25: the value of the declared default `e`
+    /// of a parameter of `chain[0]` (the declaring class, `chain[1..]` its
+    /// ancestors) for an object under construction. A default belongs to the
+    /// CLASS's scope, where the parameters before it are visible with the
+    /// values THIS specialization bound (`int D = W*2`) — not to the `new`
+    /// call site, where `W` read x or, worse, a same-named parameter of the
+    /// calling module.
+    fn eval_param_default(
+        &mut self,
+        e: &Expression,
+        chain: &[std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>],
+        instance: &ClassInstance,
+        leaf_spec: &Option<(String, String)>,
+    ) -> Value {
+        let Some(decl) = chain.first() else {
+            return self.eval_expr(e);
+        };
+        // The parameters bound so far on this chain, the declaring class's
+        // shadowing its ancestors'.
+        let mut frame = self.take_pooled_frame();
+        for c in chain {
+            for (pn, _) in &c.param_defaults {
+                if let Some(v) = instance.properties.get(pn) {
+                    frame.entry(pn.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        // A type parameter in the default (`int W = $bits(U)`) resolves
+        // through the declaring class's specialization.
+        let leaf = instance.class_name.as_str();
+        let leaf_spec = leaf_spec
+            .clone()
+            .or_else(|| self.current_spec.clone().filter(|(b, _)| b == leaf));
+        let spec = if decl.name == leaf {
+            leaf_spec
+        } else if let Some((_, lsig)) = leaf_spec {
+            self.ancestor_spec(leaf, &lsig, &decl.name).map(|s| {
+                (
+                    decl.name.clone(),
+                    self.canonicalize_spec_sig(&decl.name, &s),
+                )
+            })
+        } else {
+            self.static_receiver_spec(leaf, &decl.name)
+        };
+        let saved_spec = std::mem::replace(&mut self.current_spec, spec);
+        self.class_context_stack.push(Some(decl.name.clone()));
+        self.this_stack.push(None);
+        self.push_local_frame(frame);
+        let v = self.eval_expr(e);
+        self.pop_local_frame();
+        self.this_stack.pop();
+        self.class_context_stack.pop();
+        self.current_spec = saved_spec;
+        v
+    }
+
     fn instantiate_class_with_type_args(
         &mut self,
         class_def: &crate::compiler::elaborate::ElaboratedClass,
@@ -125132,10 +125648,18 @@ impl Simulator {
         let ancestor_value_args: HashMap<String, HashMap<String, Value>> = {
             let mut leaf_params: HashMap<String, Value> = HashMap::default();
             for (pname, pdefault) in class_def.param_defaults.iter() {
-                if let Some(e) = arg_map.get(pname).cloned().or_else(|| pdefault.clone()) {
-                    if let Some(v) = crate::elaborate::const_eval_i64_with_params(&e, None) {
-                        leaf_params.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                // An actual argument belongs to the specialization site's
+                // scope; a default to the class's, where the parameters
+                // before it are visible (§6.20.2, `int B = A*2`).
+                let v = match (arg_map.get(pname), pdefault) {
+                    (Some(e), _) => crate::elaborate::const_eval_i64_with_params(e, None),
+                    (None, Some(e)) => {
+                        crate::elaborate::const_eval_i64_with_params(e, Some(&leaf_params))
                     }
+                    (None, None) => None,
+                };
+                if let Some(v) = v {
+                    leaf_params.insert(pname.clone(), Value::from_u64(v as u64, 32));
                 }
             }
             let mut out: HashMap<String, HashMap<String, Value>> = HashMap::default();
@@ -125283,13 +125807,20 @@ impl Simulator {
                         continue;
                     }
                 }
-                let expr_opt: Option<Expression> = if is_leaf {
-                    arg_map.get(pname).cloned().or_else(|| pdefault.clone())
-                } else {
-                    pdefault.clone()
-                };
-                if let Some(e) = expr_opt {
-                    let v = self.eval_expr(&e);
+                if let Some(a) = arg_map.get(pname).filter(|_| is_leaf) {
+                    let v = self.eval_expr(a);
+                    instance.properties.insert(pname.clone(), v);
+                } else if let Some(e) = pdefault {
+                    let v = if matches!(e.kind, ExprKind::Number(_) | ExprKind::StringLiteral(_)) {
+                        self.eval_expr(e)
+                    } else {
+                        self.eval_param_default(
+                            e,
+                            &classes_to_init[ci..],
+                            &instance,
+                            &computed_spec,
+                        )
+                    };
                     instance.properties.insert(pname.clone(), v);
                 }
             }
@@ -136928,10 +137459,53 @@ impl Simulator {
     /// argument renders as `class <name>` (recursive) and a value argument
     /// as its literal.
     fn format_class_typename(&mut self, base: &str, type_args: &[Expression]) -> String {
-        let parts: Vec<String> = type_args
+        if !type_args
             .iter()
-            .map(|a| self.format_typename_arg(a))
-            .collect();
+            .any(|a| matches!(a.kind, ExprKind::NamedArg { .. }))
+        {
+            let parts: Vec<String> = type_args
+                .iter()
+                .map(|a| self.format_typename_arg(a))
+                .collect();
+            return self.class_typename_with_args(base, parts);
+        }
+        // §8.25 named arguments render at their parameters' slots; a slot
+        // the list leaves out shows its default.
+        let order: Vec<String> = self
+            .module
+            .classes
+            .get(base)
+            .map(|cd| cd.param_order.clone())
+            .unwrap_or_default();
+        let mut slots: Vec<Option<&Expression>> = vec![None; order.len()];
+        for (k, a) in type_args.iter().enumerate() {
+            match &a.kind {
+                ExprKind::NamedArg { name, expr } => {
+                    if let (Some(i), Some(x)) =
+                        (order.iter().position(|p| *p == name.name), expr.as_deref())
+                    {
+                        slots[i] = Some(x);
+                    }
+                }
+                _ => {
+                    if let Some(s) = slots.get_mut(k) {
+                        *s = Some(a);
+                    }
+                }
+            }
+        }
+        let used = slots.iter().rposition(|s| s.is_some()).map_or(0, |i| i + 1);
+        let mut parts: Vec<String> = Vec::with_capacity(order.len());
+        for slot in slots.iter().take(used) {
+            let p = match slot {
+                Some(x) => self.format_typename_arg(x),
+                None => match self.typename_default_part(base, parts.len(), &parts) {
+                    Some(p) => p,
+                    None => break,
+                },
+            };
+            parts.push(p);
+        }
         self.class_typename_with_args(base, parts)
     }
 
@@ -136940,30 +137514,47 @@ impl Simulator {
     /// their declared defaults.
     fn class_typename_with_args(&self, base: &str, mut parts: Vec<String>) -> String {
         let head = self.class_typename_head(base);
-        if let Some(cd) = self.module.classes.get(base) {
-            for name in cd.param_order.iter().skip(parts.len()) {
-                if let Some((_, t)) = cd.type_param_defaults.iter().find(|(n, _)| n == name) {
-                    let t: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-                    parts.push(self.format_typename_text_one(&t));
-                } else if cd.type_param_names.contains(name) {
-                    parts.push("int".to_string());
-                } else if let Some(v) = cd
-                    .param_defaults
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .and_then(|(_, e)| e.as_ref())
-                    .and_then(|e| super::elaborate::const_eval_i64_with_params(e, None))
-                {
-                    parts.push(v.to_string());
-                } else {
-                    break;
-                }
-            }
+        while let Some(p) = self.typename_default_part(base, parts.len(), &parts) {
+            parts.push(p);
         }
         if parts.is_empty() {
             return head;
         }
         format!("{} #({})", head, parts.join(", "))
+    }
+
+    /// The `$typename` rendering of parameter `i` of `base` left at its
+    /// declared default, `parts` holding the renderings of the parameters
+    /// before it. A default naming an earlier parameter (`type U = T`,
+    /// `int D = W*2`) follows that parameter's value (§6.20.2). None past
+    /// the last parameter, or for a default that cannot be rendered.
+    fn typename_default_part(&self, base: &str, i: usize, parts: &[String]) -> Option<String> {
+        let cd = self.module.classes.get(base)?;
+        let name = cd.param_order.get(i)?;
+        if let Some((_, t)) = cd.type_param_defaults.iter().find(|(n, _)| n == name) {
+            let t: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+            if let Some(j) = cd.param_order[..i.min(parts.len())]
+                .iter()
+                .position(|p| *p == t)
+            {
+                return Some(parts[j].clone());
+            }
+            return Some(self.format_typename_text_one(&t));
+        }
+        if cd.type_param_names.contains(name) {
+            return Some("int".to_string());
+        }
+        let init = cd
+            .param_defaults
+            .iter()
+            .find(|(n, _)| n == name)
+            .and_then(|(_, e)| e.as_ref())?;
+        match &init.kind {
+            ExprKind::Number(_) => {
+                super::elaborate::const_eval_i64_with_params(init, None).map(|v| v.to_string())
+            }
+            _ => self.param_default_fragment(cd, i, parts),
+        }
     }
 
     /// `class <name>` for `$typename`, qualified by the declaring package
@@ -137046,6 +137637,7 @@ impl Simulator {
                 }
             }
             ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.clone(),
+            ExprKind::StringLiteral(s) => format!("\"{}\"", s),
             // A package-qualified class (`p::C`).
             ExprKind::Ident(hier)
                 if hier.path.len() >= 2

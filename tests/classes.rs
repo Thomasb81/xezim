@@ -27,6 +27,8 @@ mod class_formal_typedef_widen;
 mod class_interface_same_name;
 #[path = "classes/class_member_name_clash.rs"]
 mod class_member_name_clash;
+#[path = "classes/class_param_default_scope.rs"]
+mod class_param_default_scope;
 #[path = "classes/class_queue_struct_member_arrays.rs"]
 mod class_queue_struct_member_arrays;
 #[path = "classes/class_struct_collection_elements.rs"]
