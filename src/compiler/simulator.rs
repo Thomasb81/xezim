@@ -34619,8 +34619,18 @@ impl Simulator {
         // net (see `alias_pairs`).
         //
         // Only all-z signals are touched, so a net given a real initial value
-        // (supply0/1, and the tri0/tri1 pull) keeps it.
+        // (supply0/1) keeps it. A tri0/tri1 net is no different from a wire
+        // here: its pull is only the weak fallback where no driver drives, so
+        // with a driver it is x as well until that driver resolves (measured
+        // on the reference: `tri0 t; assign #2 t = a;` reads x until t=2).
         let cont_driven: Vec<usize> = self.cont_driven.iter().copied().collect();
+        let has_pulled = self.module.resolved_net_kinds.values().any(|k| {
+            matches!(
+                k,
+                xezim_core::elaborate::ResolvedNetKind::Tri0
+                    | xezim_core::elaborate::ResolvedNetKind::Tri1
+            )
+        });
         for id in cont_driven {
             if self.signal_real[id] {
                 continue;
@@ -34631,7 +34641,19 @@ impl Simulator {
             }
             let cur = &self.signal_table[id];
             let all_z = (0..w as usize).all(|i| cur.get_bit(i) == LogicBit::Z);
-            if all_z {
+            let pulled = has_pulled
+                && !all_z
+                && self
+                    .name_opt(id)
+                    .and_then(|n| self.module.resolved_net_kinds.get(n))
+                    .is_some_and(|k| {
+                        matches!(
+                            k,
+                            xezim_core::elaborate::ResolvedNetKind::Tri0
+                                | xezim_core::elaborate::ResolvedNetKind::Tri1
+                        )
+                    });
+            if all_z || pulled {
                 let mut v = Value::new(w); // all-x
                 v.is_signed = self.signal_signed[id];
                 self.signal_table[id] = v;
