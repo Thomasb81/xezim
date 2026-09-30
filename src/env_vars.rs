@@ -359,6 +359,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Report each construct handed to the AST interpreter: reason, source byte span, scope",
     ),
     (
+        "XEZIM_FAST_CALLS",
+        "Compiled methods: set to 0 to disable direct VM-to-VM dispatch of compiled calls",
+    ),
+    (
         "XEZIM_FOLD_CONST_REGS",
         "Bytecode: set to 0 to disable register constant propagation (constant add chains, static bit indexes)",
     ),

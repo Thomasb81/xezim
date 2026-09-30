@@ -98,6 +98,8 @@ mod class_field_named_event;
 mod class_handle_return_preservation;
 #[path = "classes/compiled_method_class_return.rs"]
 mod compiled_method_class_return;
+#[path = "classes/compiled_method_fast_call.rs"]
+mod compiled_method_fast_call;
 #[path = "classes/compiled_method_step6_surface.rs"]
 mod compiled_method_step6_surface;
 #[path = "classes/compiled_method_string_forms.rs"]

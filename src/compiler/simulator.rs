@@ -245,6 +245,57 @@ fn method_tier_threshold() -> u32 {
 /// the suite-level ON == OFF parity run against a warm cache.
 const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3031;
 
+/// class-perf P3: direct-call eligibility for a compiled (cid, mid).
+#[derive(Clone)]
+enum FastCallState {
+    /// Not yet decided (no map entry): the plan or compiled block may not
+    /// exist yet — the call runs the interpreter route, which builds them;
+    /// re-probed on the next direct-call attempt. The variant exists to
+    /// document the tri-state; insertion sites use absence instead.
+    #[allow(dead_code)]
+    Pending,
+    /// Never direct-callable (shape or body reasons); permanent.
+    Never,
+    /// Direct-callable — run `entry.block` in place.
+    Entry(std::rc::Rc<FastCallEntry>),
+}
+
+/// class-perf P3: everything a direct VM->VM `CallMethod` needs to run a
+/// compiled callee without materializing args or re-entering the
+/// interpreter's binding loop. Mirrors `try_run_compiled_method`'s seeding
+/// and result clamping, but sources formals from the CALLER's argument
+/// registers.
+struct FastCallEntry {
+    block: std::rc::Rc<super::bytecode::CompiledBlock>,
+    defining_class: Box<str>,
+    this_reg: super::bytecode::RegId,
+    result_reg: super::bytecode::RegId,
+    /// Per formal: (name, resize width (0 = keep source), optional
+    /// signedness stamp) — replicates the interpreter binding loop's
+    /// coercion. The frame copy keeps interpreter re-entries (nested call
+    /// write-back temps, `\0vmargN` seeding) seeing the same values the
+    /// AST path would have bound.
+    coerce: Vec<(Box<str>, u32, Option<bool>)>,
+    /// Seed for a void/class result cell the body never writes (the
+    /// interpreter's implicit-return init, computed from the return type).
+    seed: Value,
+    result_width: u32,
+    result_signed: bool,
+    is_class_result: bool,
+    is_void_result: bool,
+}
+
+/// class-perf P3: is the direct VM->VM dispatch enabled? (XEZIM_FAST_CALLS=0
+/// disables — an A/B switch for debugging.)
+fn fast_calls_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XEZIM_FAST_CALLS")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true)
+    })
+}
+
 /// Cache directory for the persistent compiled-method cache, from
 /// XEZIM_METHOD_CACHE. Unset: disabled. "0" or empty: disabled. "1":
 /// <XDG_CACHE_HOME or ~/.cache>/xezim/method-cache. Any other value: that
@@ -6301,6 +6352,13 @@ pub struct Simulator {
     /// compiled path above the threshold is counter-free, so a hot method
     /// pays zero map traffic once compiled).
     compiled_method_call_counts: HashMap<u64, u32>,
+    /// class-perf P3: direct VM->VM dispatch entries for `CallMethod`,
+    /// keyed (cid, mid) of the DEFINING class. `Pending` re-probes after
+    /// the plan / block caches fill; `Never` is a permanent decline
+    /// (param-dependent shape, writeback formals, fallback-heavy body);
+    /// `Entry` runs the callee's block in-place with a fresh register
+    /// file, skipping arg materialization + interpreter binding.
+    compiled_fast_calls: HashMap<(u32, u32), FastCallState>,
    /// `resolve_typeref_class_name` memo: name -> scope -> class ctx -> (class-table size, answer).
     #[allow(clippy::type_complexity)]
     typeref_class_memo: std::cell::RefCell<
@@ -10368,6 +10426,7 @@ impl Simulator {
             compiled_method_plans: HashMap::default(),
             compiled_method_skip: HashSet::default(),
             compiled_method_call_counts: HashMap::default(),
+            compiled_fast_calls: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
@@ -31231,6 +31290,16 @@ impl Simulator {
                         .unwrap_or(0) as usize;
                     let base = *arg_start as usize;
                     let n = *n_args as usize;
+                    // class-perf P3: direct VM->VM dispatch when the callee
+                    // itself has a compiled fast-call entry — skips arg
+                    // materialization (the sized-hex round-trip) and the
+                    // interpreter's binding loop. Guards inside return
+                    // None for every shape the interpreter handles
+                    // specially; the historic path below is unchanged.
+                    if let Some(v) = self.vm_try_direct_call(handle, method, base, n) {
+                        self.vm_regs[*dest as usize] = v;
+                        local_count += 1;
+                    } else {
                     // class-perf row 2: resolve the callee once more for the
                     // write-back temp set. A wrong guess here (ctor-stack
                     // dispatch edge) merely keeps the constant wrapper —
@@ -31260,6 +31329,7 @@ impl Simulator {
                     }
                     self.vm_regs[*dest as usize] = result;
                     local_count += 1;
+                    }
                 }
                 Insn::CallScopedMethod(dest, this_reg, names, arg_start, n_args) => {
                     let (start_class, method) = (names.0.as_ref(), names.1.as_ref());
@@ -135286,6 +135356,367 @@ impl Simulator {
         }
         if !pre.is_class_result && !pre.is_void_result && !result.is_real {
             result.is_signed = pre.result_signed;
+        }
+        Some(result)
+    }
+
+    /// class-perf P3: build (or permanently decline) the direct-call entry
+    /// for `dclass.method`, from the cached plan + compiled block. Returns
+    /// the entry when direct-callable. Pure lookup + a one-time insn scan;
+    /// the result is memoized in `compiled_fast_calls`.
+    fn vm_fast_entry_for(
+        &mut self,
+        dclass: &str,
+        method: &str,
+        mdef: &std::sync::Arc<crate::ast::decl::ClassMethod>,
+    ) -> Option<std::rc::Rc<FastCallEntry>> {
+        use super::bytecode::Insn;
+        let crate::ast::decl::ClassMethodKind::Function(f) = &mdef.kind else {
+            // Tasks / pure-virtual prototypes never have a compiled plan;
+            // no memoization needed — the plan lookup below will keep
+            // returning None.
+            return None;
+        };
+        let body: &[crate::ast::stmt::Statement] = &f.items;
+        let ids = &self.compiled_class_method_ids;
+        let (cid, mid) = match (ids.get(dclass), ids.get(method)) {
+            (Some(&c), Some(&m)) => (c, m),
+            _ => return None, // never interned: never compiled
+        };
+        if let Some(state) = self.compiled_fast_calls.get(&(cid, mid)) {
+            return match state {
+                FastCallState::Entry(rc) => Some(rc.clone()),
+                FastCallState::Never => None,
+                FastCallState::Pending => None, // re-probed below
+            };
+        }
+        let never = |sim: &mut Self| {
+            sim.compiled_fast_calls
+                .insert((cid, mid), FastCallState::Never);
+        };
+        let Some(pre) = self.compiled_method_plans.get(&(cid, mid)).cloned() else {
+            return None; // no plan yet: this call goes the interpreter route
+        };
+        // Shape guards (permanent): non-input formals need the interpreter's
+        // write-back epilogue; a param-bounded return needs the instance's
+        // param scope; parameterized defining classes need spec-static
+        // seeding; static methods dispatch through exec_static_method.
+        if !pre.writeback_formals.is_empty()
+            || pre.param_able_result
+            || self.class_is_parameterized(dclass)
+            || self.is_static_method(dclass, method)
+        {
+            never(self);
+            return None;
+        }
+        let key = (
+            cid,
+            mid,
+            pre.formal_widths.clone(),
+            pre.static_result_width,
+        );
+        let Some(super::bytecode::CompiledMethodOutcome::Block(rc_entry)) =
+            self.compiled_method_block_cache.get(&key).cloned()
+        else {
+            return None; // block not compiled yet (Pending)
+        };
+        // Body guards (permanent): a `static` local needs the §6.21
+        // static-local sync frame the fast path does not open.
+        let body_has_static_local = body.iter().any(|st| {
+            fn has_static(st: &crate::ast::stmt::Statement) -> bool {
+                if let crate::ast::stmt::StatementKind::VarDecl {
+                    lifetime: Some(crate::ast::types::Lifetime::Static),
+                    declarators,
+                    ..
+                } = &st.kind
+                    && !declarators.is_empty()
+                {
+                    return true;
+                }
+                Simulator::sub_stmts(st).into_iter().any(has_static)
+            }
+            has_static(st)
+        });
+        if body_has_static_local {
+            never(self);
+            return None;
+        }
+        // Instruction guards (permanent): the block must be frame-free —
+        // no interpreter re-entry that resolves NAMES against the binding
+        // loop's frames (EvalExprFallback/StmtFallback would read formals
+        // the fast path never records into `var_class_types`/
+        // `class_of_var`-style metadata), no process-local loads, and no
+        // `$cast` (its runtime type check reads the binding loop's
+        // per-formal class/enum recordings).
+        let block = rc_entry.block.clone();
+        let has_forbidden = block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Insn::EvalExprFallback(..)
+                    | Insn::StmtFallback(..)
+                    | Insn::LoadProcessLocal(..)
+                    | Insn::Cast(..)
+            )
+        });
+        if has_forbidden {
+            never(self);
+            return None;
+        }
+        // Per-formal coercion, replicating the interpreter's binding loop
+        // (see exec_method_in_class_hierarchy): class/string formals bind
+        // as passed; an integral TypeReference typedef resizes and stamps;
+        // a concrete-signed type-param/enum formal keeps the caller's width
+        // but stamps signed; IntegerAtom / literal-packed formals resize to
+        // the declared width and stamp; other packed formals keep width.
+        use crate::ast::types::DataType as DT;
+        let mut coerce: Vec<(Box<str>, u32, Option<bool>)> = Vec::with_capacity(f.ports.len());
+        for port in f.ports.iter() {
+            let dt = &port.data_type;
+            let c = if self.typeref_names_class(dt) || Self::is_string_data_type(dt) {
+                (0, None)
+            } else if matches!(dt, DT::TypeReference { .. }) {
+                if let Some((pw, signed)) = self.scalar_formal_integral(dt) {
+                    (pw, Some(signed))
+                } else if self.type_is_signed_concrete(dt) {
+                    (0, Some(true))
+                } else {
+                    (0, None)
+                }
+            } else if matches!(dt, DT::IntegerAtom { .. }) || Self::packed_dims_are_literal(dt) {
+                let pw = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                (pw.max(1), Some(super::elaborate::is_type_signed(dt)))
+            } else if super::elaborate::is_type_signed(dt) {
+                (0, Some(true))
+            } else {
+                (0, None)
+            };
+            coerce.push((port.name.name.clone().into_boxed_str(), c.0, c.1));
+        }
+        // The interpreter's implicit-return-cell init (see the binding
+        // loop): string -> empty string; real -> 0.0; two-state -> zero;
+        // otherwise a 4-state x of the declared width (a class/
+        // TypeReference return resolves to width 0 -> 1).
+        let seed = if Self::is_string_data_type(&pre.return_type) {
+            Value::from_string("")
+        } else {
+            let rw = super::elaborate::resolve_type_width(
+                &pre.return_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            if super::elaborate::is_type_real(&pre.return_type) {
+                Value::from_f64(0.0)
+            } else if super::elaborate::is_type_two_state(&pre.return_type) {
+                Value::zero(rw)
+            } else {
+                Value::new(rw)
+            }
+        };
+        let entry = std::rc::Rc::new(FastCallEntry {
+            block,
+            defining_class: dclass.to_string().into_boxed_str(),
+            this_reg: rc_entry.this_reg,
+            result_reg: rc_entry.result_reg,
+            coerce,
+            seed,
+            result_width: pre.static_result_width,
+            result_signed: pre.result_signed,
+            is_class_result: pre.is_class_result,
+            is_void_result: pre.is_void_result,
+        });
+        self.compiled_fast_calls
+            .insert((cid, mid), FastCallState::Entry(entry.clone()));
+        Some(entry)
+    }
+
+    /// class-perf P3: direct VM->VM dispatch for `CallMethod` — run a
+    /// compiled callee's block in place, seeding its registers from the
+    /// CALLER's argument registers instead of materializing sized-hex
+    /// constant Expressions and re-entering the interpreter's binding
+    /// loop. `None` = not eligible (guards below); the caller then runs
+    /// the historic interpreter path, byte-identical.
+    ///
+    /// Guards, each mirroring an `exec_method_call` behavior the fast path
+    /// cannot reproduce: constructor-time binding (ctor stack), process /
+    /// mailbox / semaphore / randomize built-in interception, static
+    /// methods (exec_static_method dispatch), parameterized defining
+    /// classes (spec-static seeding), arity mismatch (default-formal
+    /// binding via normalize_call_args), real actuals (real->int
+    /// coercion in the binding loop), and the tier threshold (the same
+    /// counter `try_run_compiled_method` bumps).
+    fn vm_try_direct_call(
+        &mut self,
+        handle: usize,
+        method: &str,
+        arg_base: usize,
+        n: usize,
+    ) -> Option<Value> {
+        use super::bytecode::Insn;
+        if !fast_calls_enabled() || handle == 0 || method == "new" {
+            return None;
+        }
+        // Built-in interception set (exec_method_call's early arms). Names
+        // are rare in compiled callees; anything matched keeps the
+        // interpreter route.
+        if matches!(
+            method,
+            "srandom"
+                | "get_randstate"
+                | "set_randstate"
+                | "randomize"
+                | "kill"
+                | "await"
+                | "suspend"
+                | "resume"
+                | "status"
+        ) {
+            return None;
+        }
+        if self.mailboxes.contains_key(&handle) || self.semaphores.contains_key(&handle) {
+            return None;
+        }
+        // §8.25 ctor-time binding: while `new` of this handle runs, calls on
+        // it bind in the constructing class's chain.
+        if let Some((ch, _)) = self.ctor_class_stack.last()
+            && *ch == handle
+        {
+            return None;
+        }
+        let Some(Some(inst)) = self.heap.get(handle) else {
+            return None;
+        };
+        let leaf = inst.class_name.clone();
+        if Self::proc_handle_to_pid(handle as u64).is_some() {
+            return None;
+        }
+        let Some((dclass, mdef)) = self.method_defining_class(&leaf, method) else {
+            return None;
+        };
+        if self.is_static_method(&leaf, method) {
+            return None;
+        }
+        // Same tier counter `try_run_compiled_method` bumps: the fast path
+        // may only run a callee that has already crossed the threshold.
+        let tier = method_tier_threshold();
+        if tier > 0 {
+            let cold_key = fnv_name(&dclass).rotate_left(32) ^ fnv_name(method);
+            let calls = self
+                .compiled_method_call_counts
+                .entry(cold_key)
+                .or_insert(0);
+            if *calls < tier {
+                *calls += 1;
+                return None;
+            }
+        }
+        let Some(entry) = self.vm_fast_entry_for(&dclass, method, &mdef) else {
+            return None;
+        };
+        // Arity must match exactly — fewer actuals mean default-formal
+        // binding, which only the interpreter path performs.
+        if n != entry.coerce.len() {
+            return None;
+        }
+        // Coerce the caller's argument registers (mirrors the binding
+        // loop); a real actual needs real->int coercion — keep the
+        // interpreter route.
+        let mut args: Vec<Value> = Vec::with_capacity(n);
+        for (i, (_, w, sgn)) in entry.coerce.iter().enumerate() {
+            let Some(src) = self.vm_regs.get(arg_base + i) else {
+                return None;
+            };
+            if src.is_real {
+                return None;
+            }
+            let mut v = src.clone();
+            if *w > 0 && v.width != *w {
+                v = v.resize_for_assign(*w);
+            }
+            if let Some(s) = sgn {
+                v.is_signed = *s;
+            }
+            args.push(v);
+        }
+        // --- every guard passed; state changes from here on ---
+        self.push_queue_frame();
+        self.this_stack.push(Some(handle));
+        self.class_context_stack.push(Some(dclass));
+        let mut locals = self.take_pooled_frame();
+        for ((name, _, _), v) in entry.coerce.iter().zip(args.iter()) {
+            locals.insert(name.to_string(), v.clone());
+        }
+        self.push_local_frame(locals);
+        self.method_local_base.push(self.local_stack.len() - 1);
+        self.local_iface_aliases.push(HashMap::default());
+        let saved_m_scope = std::mem::take(&mut self.m_scope_stack);
+        let saved_break = self.break_flag;
+        let saved_continue = self.continue_flag;
+        let saved_return = self.return_flag;
+        let _prev_meth = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
+            sampler_register_name(fnv_name(method), method);
+            Some(CUR_METHOD_HASH.swap(fnv_name(method), std::sync::atomic::Ordering::Relaxed))
+        } else {
+            None
+        };
+        let _prev_compiled = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(CUR_METHOD_COMPILED.swap(true, std::sync::atomic::Ordering::Relaxed))
+        } else {
+            None
+        };
+        // Fresh register file for the callee (the caller's is swapped out,
+        // exactly like `try_run_compiled_method`).
+        let caller_regs = std::mem::take(&mut self.vm_regs);
+        let saved_foreach_arena = std::mem::take(&mut self.foreach_arena);
+        let mut regs = vec![Value::zero(1); entry.block.num_regs as usize];
+        regs[entry.this_reg as usize] = Value::from_u64(handle as u64, 32);
+        for (i, v) in args.into_iter().enumerate() {
+            let reg = entry.this_reg as usize + 1 + i;
+            if reg < entry.block.num_regs as usize {
+                regs[reg] = v;
+            }
+        }
+        if (entry.is_void_result || entry.is_class_result)
+            && (entry.result_reg as usize) < entry.block.num_regs as usize
+        {
+            regs[entry.result_reg as usize] = entry.seed.clone();
+        }
+        self.vm_regs = regs;
+        self.exec_insns(&entry.block.instructions);
+        let result = self
+            .vm_regs
+            .get(entry.result_reg as usize)
+            .cloned()
+            .unwrap_or_else(|| Value::zero(32));
+        self.vm_regs = caller_regs;
+        self.foreach_arena = saved_foreach_arena;
+        if let Some(prev) = _prev_meth {
+            CUR_METHOD_HASH.store(prev, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(prev) = _prev_compiled {
+            CUR_METHOD_COMPILED.store(prev, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.m_scope_stack = saved_m_scope;
+        self.break_flag = saved_break;
+        self.continue_flag = saved_continue;
+        self.return_flag = saved_return;
+        self.method_local_base.pop();
+        self.pop_local_frame();
+        self.local_iface_aliases.pop();
+        self.class_context_stack.pop();
+        self.this_stack.pop();
+        self.pop_and_restore_queue_frame();
+        // Result clamping mirrors `try_run_compiled_method`'s tail.
+        let mut result = result;
+        if entry.result_width > 0 && result.width != entry.result_width {
+            result = result.resize_for_assign(entry.result_width);
+        }
+        if !entry.is_class_result && !entry.is_void_result && !result.is_real {
+            result.is_signed = entry.result_signed;
         }
         Some(result)
     }
