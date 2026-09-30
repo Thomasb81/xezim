@@ -15362,7 +15362,11 @@ mod tests {
     #[test]
     fn two_state_lowering_refuses_a_fallback_that_carries_locals() {
         let block = |fb: Insn| CompiledBlock {
-            instructions: vec![Insn::LoadConst(0, Box::new(Value::from_u64(3, 8))), fb],
+            instructions: vec![
+                Insn::LoadConst(0, Box::new(Value::from_u64(3, 8))),
+                fb,
+                Insn::NbaAssign(0, 0, 8),
+            ],
             num_regs: 1,
             has_fallback: true,
             nba_dup_targets: false,
