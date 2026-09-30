@@ -614,3 +614,39 @@ endmodule
         "{o:?}"
     );
 }
+
+/// The stage nets that carry a net delay (a driver side, per-bit stages, a
+/// delayed driver's own net) are not design objects: a dump lists the
+/// design's nets only.
+#[test]
+fn net_delay_stages_stay_out_of_dumps() {
+    xezim::compiler::simulator::set_wave_enabled(true);
+    let mut path = std::env::temp_dir();
+    path.push(format!("xezim_net_delay_stages_{}.vcd", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let src = r#"
+module top;
+  logic a = 0, b = 0;
+  logic [1:0] v = 0;
+  wire [1:0] #2 wv; assign wv = v;
+  wire #2 w2; assign #1 w2 = a; assign w2 = b;
+  initial begin
+    $dumpfile("{VCD}");
+    $dumpvars(0, top);
+    #10 a = 1; v = 2'b01;
+    #10 $finish;
+  end
+endmodule
+"#
+    .replace("{VCD}", path.to_str().unwrap());
+    simulate(&src, 1000).expect("simulate failed");
+    let vcd = std::fs::read_to_string(&path).expect("no VCD written");
+    let _ = std::fs::remove_file(&path);
+    let mut vars: Vec<&str> = vcd
+        .lines()
+        .filter(|l| l.starts_with("$var"))
+        .filter_map(|l| l.split_whitespace().nth(4))
+        .collect();
+    vars.sort();
+    assert_eq!(vars, ["a", "b", "v", "w2", "wv"], "{vcd}");
+}
