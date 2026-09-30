@@ -52093,6 +52093,17 @@ impl Simulator {
         self.delayed_updates.retain(|(_, sid, _)| *sid != id);
     }
 
+    /// §10.3.3 inertial delay: is an update of `id` to exactly `val` already
+    /// in flight? A delayed driver whose operands moved but whose result did
+    /// not (`c ^ d` through `10 -> 00 -> 11`) is not a new transition: the
+    /// update keeps its time. Rescheduling it pushed the change a whole delay
+    /// later for every such re-evaluation.
+    fn delayed_update_pending_is(&self, id: usize, val: &Value) -> bool {
+        self.delayed_updates
+            .iter()
+            .any(|(_, sid, v)| *sid == id && v == val)
+    }
+
     /// Schedule a delayed signal update with an explicit delay (inertial delay model).
     fn schedule_delayed_with_delay(&mut self, id: usize, val: Value, delay: u64) {
         // §30.4 path-delayed net: the module paths pick the delay.
@@ -52167,12 +52178,22 @@ impl Simulator {
         sel_val: &Value,
         delay: u64,
     ) {
-        let mut merged = self
+        let pending = self
             .delayed_updates
             .iter()
             .find(|(_, sid, _)| *sid == id)
-            .map(|(_, _, v)| v.clone())
-            .unwrap_or_else(|| self.signal_table[id].clone());
+            .map(|(_, _, v)| v.clone());
+        let in_flight = pending.is_some();
+        let mut merged = pending.unwrap_or_else(|| self.signal_table[id].clone());
+        // The slice already holds these bits in the pending update: nothing
+        // new to schedule, and the update keeps its time (see
+        // `delayed_update_pending_is`).
+        if in_flight
+            && (0..sel_w as usize)
+                .all(|i| merged.get_bit_code(lo as usize + i) == sel_val.get_bit_code(i))
+        {
+            return;
+        }
         for i in 0..sel_w as usize {
             merged.set_bit_code(lo as usize + i, sel_val.get_bit_code(i));
         }
@@ -55632,7 +55653,9 @@ impl Simulator {
             if delay > 0 {
                 if let Some(id) = lhs_id {
                     if self.signal_table[id] != val {
-                        self.schedule_delayed_with_delay(id, val, delay);
+                        if !self.delayed_update_pending_is(id, &val) {
+                            self.schedule_delayed_with_delay(id, val, delay);
+                        }
                     } else {
                         self.cancel_delayed(id);
                     }
@@ -56721,7 +56744,9 @@ impl Simulator {
                 if delay > 0 {
                     if let Some(id) = lhs_id {
                         if self.signal_table[id] != val {
-                            self.schedule_delayed_with_delay(id, val, delay);
+                            if !self.delayed_update_pending_is(id, &val) {
+                                self.schedule_delayed_with_delay(id, val, delay);
+                            }
                         } else {
                             self.cancel_delayed(id);
                         }
