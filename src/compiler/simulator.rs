@@ -1539,6 +1539,11 @@ struct SensitivityId {
     /// Scheduling depth of the NAME this term was written with (see
     /// `Simulator::sig_wake_rank`); orders same-pass waiter wakeups.
     wake_rank: u8,
+    /// §9.4.2: an unpacked-array CELL that `value_of` selects through a
+    /// runtime index (`@(mem[i])`), found by evaluating the index when the
+    /// waiter armed. Re-resolved whenever an operand moves without firing,
+    /// so the wait follows the index to the element it selects now.
+    cell: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1693,6 +1698,20 @@ struct EventWaiter {
     /// `waiters_first` in check_edges_inner); only clocking waiters are
     /// deferred past the NBA commit.
     is_clocking: bool,
+    /// Set only for a waiter with expression terms (`SensitivityId::value_of`).
+    value_ctx: Option<Box<WaiterValueCtx>>,
+}
+
+/// §9.4.2: how a waiter re-evaluates its expression terms after it armed.
+#[derive(Debug, Clone)]
+struct WaiterValueCtx {
+    /// The name-resolution scope the waiting process armed in. The drain runs
+    /// outside that process, and a bare `mem[i]` in a sub-module instance
+    /// must still read that instance's `mem` and `i`.
+    scope: Option<String>,
+    /// Some term selects an unpacked-array cell (`@(mem[i])`): the cells are
+    /// looked up again whenever an operand moves (see `SensitivityId::cell`).
+    cells: bool,
 }
 
 /// A process parked on a CLASS-FIELD named event (`event m_event` inside a
@@ -3895,6 +3914,34 @@ fn resolve_array_elem_id(
         return None;
     }
     Some(first_id + (idx - lo) as usize)
+}
+
+/// §9.4.2 Table 9-2 edge test on the LSB of a raw (v, x) pair — the same
+/// rule `Simulator::edge_fires_prev` applies to a signal; `AnyEdge` is any
+/// change of the low 64 bits.
+#[inline]
+fn lsb_edge_fires(edge: EdgeKind, pv: u64, px: u64, cv: u64, cx: u64) -> bool {
+    let cb_one = (cv & 1) == 1 && (cx & 1) == 0;
+    let cb_zero = (cv & 1) == 0 && (cx & 1) == 0;
+    let pb_one = (pv & 1) == 1 && (px & 1) == 0;
+    let pb_zero = (pv & 1) == 0 && (px & 1) == 0;
+    match edge {
+        EdgeKind::Posedge => !pb_one && cb_one,
+        EdgeKind::Negedge => !pb_zero && cb_zero,
+        EdgeKind::AnyEdge => cv != pv || cx != px,
+        EdgeKind::LsbEdge => (!pb_one && cb_one) || (!pb_zero && cb_zero),
+    }
+}
+
+/// §9.4.2: did an event expression's VALUE produce `edge` going from `prev`
+/// to `cur`? A level event is any change; an edge is judged on the LSB.
+fn value_event_fires(edge: EdgeKind, prev: &Value, cur: &Value) -> bool {
+    if edge == EdgeKind::AnyEdge {
+        return cur != prev;
+    }
+    let (pv, px) = prev.raw_bits();
+    let (cv, cx) = cur.raw_bits();
+    lsb_edge_fires(edge, pv, px, cv, cx)
 }
 
 /// Packed word storage for large memories (on by default;
@@ -8501,23 +8548,60 @@ impl Simulator {
     /// operands (ordinary comb entry), so edge timing is unchanged. Only
     /// constant indices rewrite; anything else keeps the old behavior.
     fn rewrite_edge_select_sensitivities(module: &mut ElaboratedModule) {
-        fn const_index(e: &Expression) -> Option<i64> {
+        // A literal, or a parameter expression (`v[W-1]`: an elaboration-time
+        // constant, §6.20) under `+ - *`.
+        fn const_index(
+            e: &Expression,
+            params: &HashMap<String, Value>,
+            scope: &str,
+        ) -> Option<i64> {
             match &e.kind {
                 ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
                     value.replace('_', "").parse::<i64>().ok()
                 }
-                ExprKind::Paren(inner) => const_index(inner),
+                ExprKind::Paren(inner) => const_index(inner, params, scope),
+                ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+                    let raw = h
+                        .path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    let v = (!scope.is_empty())
+                        .then(|| params.get(&format!("{}.{}", scope, raw)))
+                        .flatten()
+                        .or_else(|| params.get(&raw))?;
+                    if v.has_xz() {
+                        return None;
+                    }
+                    i64::try_from(v.to_u64()?).ok()
+                }
+                ExprKind::Binary { op, left, right } => {
+                    let l = const_index(left, params, scope)?;
+                    let r = const_index(right, params, scope)?;
+                    match op {
+                        BinaryOp::Add => l.checked_add(r),
+                        BinaryOp::Sub => l.checked_sub(r),
+                        BinaryOp::Mul => l.checked_mul(r),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         }
         // Peel an Index chain down to its base Ident; indices returned
         // OUTERMOST-LAST (declaration order).
-        fn peel<'a>(mut e: &'a Expression, idxs: &mut Vec<i64>) -> Option<String> {
+        fn peel<'a>(
+            mut e: &'a Expression,
+            idxs: &mut Vec<i64>,
+            params: &HashMap<String, Value>,
+            scope: &str,
+        ) -> Option<String> {
             loop {
                 match &e.kind {
                     ExprKind::Paren(inner) => e = inner,
                     ExprKind::Index { expr, index } => {
-                        idxs.push(const_index(index)?);
+                        idxs.push(const_index(index, params, scope)?);
                         e = expr;
                     }
                     ExprKind::Ident(h) => {
@@ -8564,6 +8648,7 @@ impl Simulator {
         for p in pending {
             module.always_blocks.push(p.materialize());
         }
+        let params = &module.parameters;
         for ab in &mut module.always_blocks {
             let StatementKind::TimingControl {
                 control: TimingControl::Event(EventControl::EventExpr(exprs)),
@@ -8584,7 +8669,7 @@ impl Simulator {
                     continue;
                 }
                 let mut idxs: Vec<i64> = Vec::new();
-                let Some(base) = peel(&ee.expr, &mut idxs) else {
+                let Some(base) = peel(&ee.expr, &mut idxs, params, &ab.scope) else {
                     if dbg {
                         eprintln!(
                             "[EDGESEL] scope='{}' peel failed: {:?}",
@@ -10231,15 +10316,14 @@ impl Simulator {
         // initializer-driven transitions.
         // prev_val/prev_xz only need to cover NAMED signal_ids (i.e.
         // those reachable via signal_name_to_id, which is the only
-        // sensitivity-registration path). Unnamed large-array elements
-        // never appear in edge_signal_ids or event_waiters'
-        // resolved_sensitivities (those are populated via name lookup),
-        // so allocating prev_{val,xz} to id_to_name.len() instead of
-        // signal_table.len() saves 16 B × num_skipped (~528 MB on
-        // c910 — 33 M skipped large-array elements). Reads / writes
-        // already go through `&mut self.prev_val/[id]` only for ids in
-        // edge_signal_ids or event_waiters, all bounded by id_to_name.len().
-        let named_count = id_to_name.legacy_len();
+        // edge-block registration path). The cells of an unnamed bulk
+        // memory never become edge signals, and a waiter on one compares
+        // against its own captured value, so sizing prev_{val,xz} to the
+        // named-id bound instead of signal_table.len() saves 16 B per
+        // trailing bulk cell. It must be the bound, not the name COUNT: a
+        // bulk memory sorting before a named array pushes that array's ids
+        // past the count.
+        let named_count = id_to_name.named_id_bound();
         let phase_prev = std::time::Instant::now();
         let prev_val: Vec<u64> = vec![0u64; named_count];
         let mut prev_xz: Vec<u64> = vec![0u64; named_count];
@@ -16019,7 +16103,7 @@ impl Simulator {
         let mut edge_sens: Vec<(String, usize)> = Vec::new();
         for block in self.edge_blocks.iter() {
             for sens in &block.resolved_sensitivities {
-                if sens.signal_id < self.id_to_name.legacy_len() {
+                if sens.signal_id < self.id_to_name.named_id_bound() {
                     edge_sens.push((self.name_for_id(sens.signal_id).to_string(), sens.signal_id));
                 }
             }
@@ -20260,7 +20344,7 @@ impl Simulator {
     /// yield the pair for `v`; a non-constant index (`@(v[i])`) yields nothing,
     /// so those keep whole-signal sensitivity — that block also needs to wake
     /// when the INDEX moves.
-    fn const_bitselect_event_terms(&self, stmt: &Statement) -> Vec<(usize, u32)> {
+    fn const_bitselect_event_terms(&self, stmt: &Statement, scope: &str) -> Vec<(usize, u32)> {
         let mut out: Vec<(usize, u32)> = Vec::new();
         let control = match &stmt.kind {
             StatementKind::TimingControl { control, .. } => Some(control),
@@ -20293,7 +20377,10 @@ impl Simulator {
             {
                 continue;
             }
-            let Some(bit) = Self::try_const_u64(index).and_then(|b| u32::try_from(b).ok()) else {
+            let Some(bit) = self
+                .event_const_index(index, scope)
+                .and_then(|b| u32::try_from(b).ok())
+            else {
                 continue;
             };
             let raw = Self::resolve_hier_name_static(h, &self.module);
@@ -20772,11 +20859,16 @@ impl Simulator {
                 // last operand keeps the identical value and the identical
                 // evaluation for the blocks that reach it; the test is pure
                 // (`&self` + `&ab` only), so skipping it changes nothing else.
+                // A listed memory cell without an element name
+                // (`always @(big[i])` on a large memory) has no dependency
+                // edge the comb path could wake on; such a block runs as a
+                // process below.
                 if all_level
                     && !has_named_event
                     && !self_ref
                     && !self.stmt_is_blocking(&body)
                     && !self.stmt_calls_blocking_task(&body, &ab.scope, 3)
+                    && !sens.iter().any(|s| self.sens_unnamed_cell(s))
                     && (
                         // Index-dependent / select / concat sensitivity: the
                         // list does not name everything that may trigger the
@@ -20852,6 +20944,26 @@ impl Simulator {
                         scope: ab.scope,
                     });
                 }
+                if self.event_needs_value_waiter(&sens, &ab.scope) {
+                    if self.try_register_proc_fsm(&ab.stmt, &ab.scope, true, "always block") {
+                        return None;
+                    }
+                    let forever_stmt = Statement::new(
+                        StatementKind::Forever {
+                            body: Box::new(ab.stmt.clone()),
+                        },
+                        ab.stmt.span,
+                    );
+                    let pid = self.next_pid;
+                    self.next_pid += 1;
+                    if !ab.scope.is_empty() {
+                        self.process_scope_hint.insert(pid, ab.scope.clone());
+                    }
+                    self.process_origin
+                        .insert(pid, (ab.stmt.span, "always block"));
+                    self.event_queue.schedule(0, pid, vec![forever_stmt].into());
+                    return None;
+                }
                 let mut dropped_terms: Vec<String> = Vec::new();
                 let resolved: Vec<SensitivityId> = sens
                     .iter()
@@ -20863,6 +20975,7 @@ impl Simulator {
                                 iff: s.iff.clone(),
                                 value_of: None,
                                 wake_rank: 0,
+                                cell: false,
                             });
                         }
                         if let Some(stripped) = s.signal_name.strip_prefix(&top_prefix) {
@@ -20873,6 +20986,7 @@ impl Simulator {
                                     iff: s.iff.clone(),
                                     value_of: None,
                                     wake_rank: 0,
+                                    cell: false,
                                 });
                             }
                         }
@@ -20888,6 +21002,7 @@ impl Simulator {
                                     iff: s.iff.clone(),
                                     value_of: None,
                                     wake_rank: 0,
+                                    cell: false,
                                 });
                             }
                         }
@@ -20923,7 +21038,7 @@ impl Simulator {
                 // any bit of `v`. `check_edges_inner` narrows the wake to this
                 // bit; terms whose index is not a constant keep the (safe,
                 // superset) whole-signal behaviour.
-                for (sid, bit) in self.const_bitselect_event_terms(&ab.stmt) {
+                for (sid, bit) in self.const_bitselect_event_terms(&ab.stmt, &ab.scope) {
                     self.bitsel_edge_sens.insert((sid, block_idx), bit);
                     let (w, b) = (sid >> 6, sid & 63);
                     if w >= self.bitsel_sid_bits.len() {
@@ -34901,7 +35016,15 @@ impl Simulator {
                 // those cases; it causes the block to fire every settle iteration
                 // and can produce infinite settle loops when the block itself
                 // writes temporary variables (loop indices, scratch regs).
-                let has_unresolved_reads = false;
+                // The exception is a read of a memory cell stored without an
+                // element name (packed arena, unnamed bulk array): it changes
+                // at run time but no dependency edge can name it, so the block
+                // re-evaluates on every settle — the way a continuous assign
+                // reading one is tracked (§10.3; `packed_store` keeps such
+                // settles running).
+                let has_unresolved_reads = sens_reads
+                    .iter()
+                    .any(|r| self.read_names_unnamed_cell(r, scope_hint.as_deref(), &ab.scope));
                 // Try bytecode-compiling the comb always block. On success
                 // the settle path skips exec_statement entirely and runs
                 // the flat Insn stream via exec_insns.
@@ -39420,6 +39543,39 @@ impl Simulator {
         Some(names)
     }
 
+    /// Is comb read `r` (an element name as `collect_stmt_reads` spells it,
+    /// `mem[5]` / `mem[1][2]`) a cell of a memory stored without element
+    /// names — the packed arena's, or an unnamed bulk array's? Tried bare,
+    /// then under the block's scopes.
+    fn read_names_unnamed_cell(&self, r: &str, scope_hint: Option<&str>, scope: &str) -> bool {
+        if !r.ends_with(']') {
+            return false;
+        }
+        let mut cands: Vec<std::borrow::Cow<'_, str>> = vec![std::borrow::Cow::Borrowed(r)];
+        if let Some(sc) = scope_hint {
+            cands.push(format!("{}.{}", sc, r).into());
+        }
+        if !scope.is_empty() && Some(scope) != scope_hint {
+            cands.push(format!("{}.{}", scope, r).into());
+        }
+        for c in &cands {
+            if self.signal_name_to_id.contains_key(c) {
+                return false;
+            }
+            let mut base: &str = c;
+            while let Some(p) = base.rfind('[') {
+                base = &base[..p];
+                if self.array_first_id.contains_key(base) {
+                    return self.array_has_unnamed_cells(base);
+                }
+                if !base.ends_with(']') {
+                    break;
+                }
+            }
+        }
+        false
+    }
+
     /// Resolve a collected READ name to a signal id, falling back to
     /// stripping trailing member segments.
     ///
@@ -40791,6 +40947,181 @@ impl Simulator {
         None
     }
 
+    /// Does event expression `e` select (an index or a part-select) anywhere
+    /// outside a call?
+    fn event_expr_selects(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => true,
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => Self::event_expr_selects(x),
+            ExprKind::Binary { left, right, .. } => {
+                Self::event_expr_selects(left) || Self::event_expr_selects(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::event_expr_selects(condition)
+                    || Self::event_expr_selects(then_expr)
+                    || Self::event_expr_selects(else_expr)
+            }
+            ExprKind::Concatenation(parts) => parts.iter().any(Self::event_expr_selects),
+            _ => false,
+        }
+    }
+
+    /// Every identifier a select expression reads, index and bound
+    /// expressions included.
+    fn collect_select_operands<'a>(e: &'a Expression, out: &mut Vec<&'a HierarchicalIdentifier>) {
+        match &e.kind {
+            ExprKind::Ident(h) => out.push(h),
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
+                Self::collect_select_operands(x, out)
+            }
+            ExprKind::Index { expr, index } => {
+                Self::collect_select_operands(expr, out);
+                Self::collect_select_operands(index, out);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::collect_select_operands(expr, out);
+                Self::collect_select_operands(left, out);
+                Self::collect_select_operands(right, out);
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_select_operands(left, out);
+                Self::collect_select_operands(right, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::collect_select_operands(condition, out);
+                Self::collect_select_operands(then_expr, out);
+                Self::collect_select_operands(else_expr, out);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    Self::collect_select_operands(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The value of an elaboration-time constant select index in an event
+    /// term: literals and parameters under `+ - *` (`v[W-1]`). None for
+    /// anything that can change at run time.
+    fn event_const_index(&self, e: &Expression, scope: &str) -> Option<i64> {
+        match &e.kind {
+            ExprKind::Paren(x) => self.event_const_index(x, scope),
+            ExprKind::Number(_) => Self::try_const_u64(e).and_then(|v| i64::try_from(v).ok()),
+            ExprKind::Ident(h) => self
+                .event_param_value(h, scope)
+                .and_then(|v| if v.has_xz() { None } else { v.to_u64() })
+                .and_then(|v| i64::try_from(v).ok()),
+            ExprKind::Binary { op, left, right } => {
+                let l = self.event_const_index(left, scope)?;
+                let r = self.event_const_index(right, scope)?;
+                match op {
+                    BinaryOp::Add => l.checked_add(r),
+                    BinaryOp::Sub => l.checked_sub(r),
+                    BinaryOp::Mul => l.checked_mul(r),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The value of parameter `h` as an event expression names it (bare
+    /// under the block's scope, or already qualified).
+    fn event_param_value(&self, h: &HierarchicalIdentifier, scope: &str) -> Option<&Value> {
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let raw = h
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        if !scope.is_empty() {
+            if let Some(v) = self.module.parameters.get(&format!("{}.{}", scope, raw)) {
+                return Some(v);
+            }
+        }
+        self.module.parameters.get(&raw).or_else(|| {
+            self.module
+                .parameters
+                .get(self.resolve_hier_name(h).as_ref())
+        })
+    }
+
+    /// §9.4.2: must an always block with this event list run as a process
+    /// (a waiter that evaluates the event expressions) rather than as an
+    /// edge block? An edge block watches whole signals, narrowed at most to
+    /// one constant bit (`@(posedge v[3])`, see
+    /// `const_bitselect_event_terms`). A term that selects through a runtime
+    /// index (`@(mem[i])`, `@(posedge v[i])`), selects a part or a bit of an
+    /// array element (`@(mem[3][1])`), or names an element of a memory
+    /// stored without element names (`@(big[5])`: no signal slot, no edge
+    /// snapshot) has nothing an edge block can watch.
+    fn event_needs_value_waiter(&self, sens: &[Sensitivity], scope: &str) -> bool {
+        sens.iter().any(|s| {
+            let name = s.signal_name.as_str();
+            if self.signal_name_to_id.contains_key(name) {
+                let Some(e) = &s.value_of else {
+                    return false;
+                };
+                if !Self::event_expr_selects(e) {
+                    return false;
+                }
+                // The one select shape an edge block narrows exactly.
+                let mut e = e;
+                while let ExprKind::Paren(inner) = &e.kind {
+                    e = inner;
+                }
+                return !matches!(
+                    &e.kind,
+                    ExprKind::Index { expr, index }
+                        if matches!(expr.kind, ExprKind::Ident(_))
+                            && self.event_const_index(index, scope).is_some()
+                );
+            }
+            self.sens_unnamed_cell(s) || (s.value_of.is_some() && self.unpacked_dims_of(name) > 0)
+        })
+    }
+
+    /// Does event term `s` watch a memory cell that has no per-element name —
+    /// a packed-arena cell or an unnamed bulk array's (`@(big[5])`, or the
+    /// `cell` placeholder of `@(big[i])`)? No signal-id dependency or edge
+    /// snapshot covers such a cell; only a waiter polling it can see it move.
+    fn sens_unnamed_cell(&self, s: &Sensitivity) -> bool {
+        let name = s.signal_name.as_str();
+        if self.signal_name_to_id.contains_key(name) {
+            return false;
+        }
+        if resolve_array_elem_id(name, &self.array_first_id).is_some() {
+            return true;
+        }
+        s.value_of.is_some() && self.array_has_unnamed_cells(name)
+    }
+
+    /// Are the cells of the 1-D array `base` stored without names (in the
+    /// packed arena, or as an unnamed bulk array)?
+    fn array_has_unnamed_cells(&self, base: &str) -> bool {
+        let Some(&(first, lo, _)) = self.array_first_id.get(base) else {
+            return false;
+        };
+        is_packed_id(first)
+            || !self
+                .signal_name_to_id
+                .contains_key(format!("{}[{}]", base, lo).as_str())
+    }
+
     fn event_to_sens(&self, event: &EventControl) -> Vec<Sensitivity> {
         // Walk past Paren / RangeSelect / BitSelect / Concatenation wrappers
         // to find the underlying Ident(s). For E902 etc. that use
@@ -40904,10 +41235,47 @@ impl Simulator {
                             }
                         }
                     }
+                    // §9.4.2: an event expression that SELECTS — a bit or part
+                    // of a vector (`@(posedge v[3])`), an unpacked-array
+                    // element through a runtime index (`@(mem[i])`), a bit of
+                    // an element (`@(negedge mem[3][1])`) — is an event on the
+                    // VALUE of that expression. Its terms are every operand it
+                    // reads, the indices included (a change of `i` re-selects),
+                    // plus a `cell` placeholder per unpacked array it selects
+                    // from: an element has no name of its own here, so the
+                    // waiter looks the cell up when it arms (see
+                    // `resolve_cell_terms`). Every term then carries the
+                    // expression (`value_of`), and the edge applies to the
+                    // expression's value, not to a whole operand.
+                    // Not inside a class method: there the operands are
+                    // reached through handles (`vif.data[0]`), which only
+                    // the waiting process can evaluate.
+                    let selects = Self::event_expr_selects(&ee.expr)
+                        && self.this_stack.last().copied().flatten().is_none();
                     let mut idents = Vec::new();
-                    collect_ident_names(&ee.expr, &mut idents);
+                    if selects {
+                        Self::collect_select_operands(&ee.expr, &mut idents);
+                    } else {
+                        collect_ident_names(&ee.expr, &mut idents);
+                    }
                     let term_start = out.len();
                     for &h in &idents {
+                        if selects {
+                            // A parameter in an index (`v[W-1]`) never changes.
+                            if self.event_param_value(h, "").is_some() {
+                                continue;
+                            }
+                            let bn = self.resolve_hier_name(h);
+                            if self.unpacked_dims_of(&bn) > 0 {
+                                out.push(Sensitivity {
+                                    signal_name: bn.into_owned(),
+                                    edge,
+                                    iff: ee.iff.clone(),
+                                    value_of: Some(ee.expr.clone()),
+                                });
+                                continue;
+                            }
+                        }
                         // LRM §14.3: `@(cb)` naming a clocking block means the
                         // block's clock event (`@(posedge clk)`), not a signal
                         // literally called `cb`. Without this substitution the
@@ -41021,14 +41389,30 @@ impl Simulator {
                     // VALUE change, not on any operand write — attach the
                     // term expression so the wake path can compare against
                     // the armed value (guard_prev).
-                    if matches!(
-                        &ee.expr.kind,
-                        ExprKind::Binary { .. }
-                            | ExprKind::Unary { .. }
-                            | ExprKind::Conditional { .. }
-                    ) {
+                    if selects
+                        || matches!(
+                            &ee.expr.kind,
+                            ExprKind::Binary { .. }
+                                | ExprKind::Unary { .. }
+                                | ExprKind::Conditional { .. }
+                        )
+                    {
                         for sens in out.iter_mut().skip(term_start) {
                             sens.value_of = Some(ee.expr.clone());
+                        }
+                    }
+                    if selects {
+                        // `mem[i] ^ mem[i+1]` names `mem` and `i` twice.
+                        let mut k = term_start;
+                        while k < out.len() {
+                            if out[term_start..k]
+                                .iter()
+                                .any(|o| o.signal_name == out[k].signal_name)
+                            {
+                                out.remove(k);
+                            } else {
+                                k += 1;
+                            }
                         }
                     }
                     // P6: `@(posedge vif.clk)` — a virtual-interface member is a
@@ -41337,14 +41721,15 @@ impl Simulator {
             let mut sens_desc: Vec<String> = Vec::new();
             for (k, sid) in w.resolved_sensitivities.iter().enumerate() {
                 let edge = sid.edge.print_str();
-                let cur = self.signal_table[sid.signal_id].raw_bits();
+                let cur = self.term_raw_bits(sid.signal_id);
                 let armed = w.arm_bits.get(k).copied().unwrap_or((0, 0));
                 let moved = if cur == armed {
                     "UNCHANGED since parked"
                 } else {
                     "has changed"
                 };
-                let code = self.signal_table[sid.signal_id].get_bit_code(0);
+                // LSB code: 0, 1, x (v=0), z (v=1) as `get_bit_code` spells it.
+                let code = ((cur.1 & 1) << 1) | (cur.0 & 1);
                 sens_desc.push(format!(
                     "{}{} (now {}, {})",
                     edge,
@@ -41389,7 +41774,9 @@ impl Simulator {
                 .resolved_sensitivities
                 .iter()
                 .zip(w.arm_bits.iter())
-                .filter(|&(ref sid, &armed)| self.signal_table[sid.signal_id].raw_bits() == armed)
+                .filter(|&(ref sid, &armed)| {
+                    !is_packed_id(sid.signal_id) && self.term_raw_bits(sid.signal_id) == armed
+                })
                 .map(|(sid, _)| sid.signal_id)
                 .collect();
             let mut visited = std::collections::HashSet::new();
@@ -41447,17 +41834,55 @@ impl Simulator {
     fn resolve_sens_ids(&self, sens: &[Sensitivity]) -> Vec<SensitivityId> {
         sens.iter()
             .filter_map(|s| {
-                self.signal_name_to_id
-                    .get(s.signal_name.as_str())
-                    .map(|&id| SensitivityId {
+                let name = s.signal_name.as_str();
+                if let Some(&id) = self.signal_name_to_id.get(name) {
+                    return Some(SensitivityId {
                         signal_id: id,
                         edge: s.edge,
                         iff: s.iff.clone(),
                         value_of: s.value_of.clone(),
-                        wake_rank: self.wake_rank_of(s.signal_name.as_str(), id),
-                    })
+                        wake_rank: self.wake_rank_of(name, id),
+                        cell: false,
+                    });
+                }
+                self.resolve_sens_cell(s)
             })
             .collect()
+    }
+
+    /// A waiter term naming no stored signal that is still an array cell
+    /// (§9.4.2): an element of an array stored without per-element names
+    /// (a large memory, `@(mem[5])`), or an array a select expression reads
+    /// through a runtime index (`@(mem[i])`) — the latter a `cell`
+    /// placeholder that `resolve_cell_terms` replaces when the waiter arms.
+    #[cold]
+    #[inline(never)]
+    fn resolve_sens_cell(&self, s: &Sensitivity) -> Option<SensitivityId> {
+        let name = s.signal_name.as_str();
+        let (id, cell) = match resolve_array_elem_id(name, &self.array_first_id) {
+            Some(id) => (id, false),
+            None if s.value_of.is_some() && self.unpacked_dims_of(name) > 0 => (
+                self.array_first_id
+                    .get(name)
+                    .map_or(0, |&(first, _, _)| first),
+                true,
+            ),
+            None => return None,
+        };
+        Some(SensitivityId {
+            signal_id: id,
+            edge: s.edge,
+            iff: s.iff.clone(),
+            value_of: s.value_of.clone(),
+            wake_rank: 0,
+            cell,
+        })
+    }
+
+    /// Does waiter term `s` resolve to something a waiter can watch?
+    fn sens_term_resolves(&self, s: &Sensitivity) -> bool {
+        self.signal_name_to_id.contains_key(s.signal_name.as_str())
+            || self.resolve_sens_cell(s).is_some()
     }
 
     /// Scheduling depth of a waiter term: a port name collapsed onto its
@@ -41479,10 +41904,33 @@ impl Simulator {
     fn make_event_waiter_resolved(
         &mut self,
         pid: usize,
-        resolved: Vec<SensitivityId>,
+        mut resolved: Vec<SensitivityId>,
         continuation: ProcCont,
         is_clocking: bool,
     ) -> EventWaiter {
+        // §9.4.2 expression terms (`@(mem[i])`, `@(posedge v[3])`): remember
+        // the scope they resolve in, and watch each unpacked-array cell they
+        // select as its index stands now.
+        let value_ctx = if resolved.iter().any(|s| s.value_of.is_some()) {
+            if self.local_stack.last().is_some_and(|m| !m.is_empty()) {
+                self.freeze_value_terms(&mut resolved);
+            }
+            let cells = resolved.iter().any(|s| {
+                s.cell
+                    || s.value_of
+                        .as_ref()
+                        .is_some_and(|e| self.expr_selects_array_cell(e))
+            });
+            if cells {
+                self.resolve_cell_terms(&mut resolved);
+            }
+            Some(Box::new(WaiterValueCtx {
+                scope: self.name_resolve_hint.borrow().clone(),
+                cells,
+            }))
+        } else {
+            None
+        };
         // §9.4.2 value guard: capture each non-trivial term's value at arm.
         let guard_prev: Vec<Option<Value>> = resolved
             .iter()
@@ -41495,7 +41943,7 @@ impl Simulator {
         // firing loop in `check_edges_inner`.
         let arm_bits: Vec<(u64, u64)> = resolved
             .iter()
-            .map(|sid| self.signal_table[sid.signal_id].raw_bits())
+            .map(|sid| self.term_raw_bits(sid.signal_id))
             .collect();
         // `sens` (Vec<Sensitivity>) is consumed for resolution and dropped;
         // EventWaiter only carries the resolved IDs from here on.
@@ -41505,17 +41953,11 @@ impl Simulator {
         // `captured_prev` field doc for the NBA reasoning).
         let captured_prev: Vec<(u64, u64)> = resolved
             .iter()
-            .map(|s| self.signal_table[s.signal_id].raw_bits())
+            .map(|s| self.term_raw_bits(s.signal_id))
             .collect();
         let captured_prev_wide: Vec<Option<Value>> = resolved
             .iter()
-            .map(|s| {
-                if self.signal_widths[s.signal_id] > 64 {
-                    Some(self.signal_table[s.signal_id].clone())
-                } else {
-                    None
-                }
-            })
+            .map(|s| self.term_wide_value(s.signal_id))
             .collect();
         EventWaiter {
             pid,
@@ -41528,6 +41970,361 @@ impl Simulator {
             guard_prev,
             remaining_events: 1,
             is_clocking,
+            value_ctx,
+        }
+    }
+
+    /// §9.4.2: the drain evaluates a waiter's expression terms outside the
+    /// waiting process, where its subroutine frame (a task formal, an
+    /// automatic loop variable: `@(mem[k])`) is not visible — or another
+    /// process's frame is. Such a name cannot change while its process
+    /// waits, so replace it by its value now.
+    fn freeze_value_terms(&mut self, terms: &mut [SensitivityId]) {
+        let mut frozen: Vec<(crate::ast::Span, Option<Expression>)> = Vec::new();
+        for t in terms.iter_mut() {
+            let Some(span) = t.value_of.as_ref().map(|e| e.span) else {
+                continue;
+            };
+            let f = match frozen.iter().find(|(sp, _)| *sp == span) {
+                Some((_, f)) => f.clone(),
+                None => {
+                    let e = t.value_of.as_ref().unwrap();
+                    let f = if self.expr_reads_frame_local(e) {
+                        let mut c = e.clone();
+                        self.freeze_frame_locals(&mut c);
+                        Some(c)
+                    } else {
+                        None
+                    };
+                    frozen.push((span, f.clone()));
+                    f
+                }
+            };
+            if let Some(f) = f {
+                t.value_of = Some(f);
+            }
+        }
+    }
+
+    fn expr_reads_frame_local(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => self.frame_bound_bare_name(h).is_some(),
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
+                self.expr_reads_frame_local(x)
+            }
+            ExprKind::Index { expr, index } => {
+                self.expr_reads_frame_local(expr) || self.expr_reads_frame_local(index)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.expr_reads_frame_local(expr)
+                    || self.expr_reads_frame_local(left)
+                    || self.expr_reads_frame_local(right)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_reads_frame_local(left) || self.expr_reads_frame_local(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_reads_frame_local(condition)
+                    || self.expr_reads_frame_local(then_expr)
+                    || self.expr_reads_frame_local(else_expr)
+            }
+            ExprKind::Concatenation(parts) => parts.iter().any(|p| self.expr_reads_frame_local(p)),
+            _ => false,
+        }
+    }
+
+    fn freeze_frame_locals(&mut self, e: &mut Expression) {
+        if let ExprKind::Ident(h) = &e.kind {
+            if self.frame_bound_bare_name(h).is_some() {
+                let v = self.eval_expr(e);
+                let lit = if v.is_real {
+                    NumberLiteral::Real(v.to_f64())
+                } else {
+                    NumberLiteral::Integer {
+                        size: Some(v.width.max(1)),
+                        signed: v.is_signed,
+                        base: NumberBase::Binary,
+                        value: v.to_bin(),
+                        cached_val: Cell::new(None),
+                    }
+                };
+                *e = Expression::new(ExprKind::Number(lit), e.span);
+            }
+            return;
+        }
+        match &mut e.kind {
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => self.freeze_frame_locals(x),
+            ExprKind::Index { expr, index } => {
+                self.freeze_frame_locals(expr);
+                self.freeze_frame_locals(index);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.freeze_frame_locals(expr);
+                self.freeze_frame_locals(left);
+                self.freeze_frame_locals(right);
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.freeze_frame_locals(left);
+                self.freeze_frame_locals(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.freeze_frame_locals(condition);
+                self.freeze_frame_locals(then_expr);
+                self.freeze_frame_locals(else_expr);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    self.freeze_frame_locals(p);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Current raw (v, x) of a waiter term's signal: a `signal_table` slot,
+    /// or a packed-arena cell (a large memory's element, see `PackedMem`).
+    #[inline]
+    fn term_raw_bits(&self, id: usize) -> (u64, u64) {
+        if is_packed_id(id) {
+            let (v, x, _) = self.packed.raw(id);
+            (v, x)
+        } else {
+            self.signal_table[id].raw_bits()
+        }
+    }
+
+    /// The full value of a waiter term wider than 64 bits (arena cells are
+    /// at most 64 bits wide).
+    #[inline]
+    fn term_wide_value(&self, id: usize) -> Option<Value> {
+        if !is_packed_id(id) && self.signal_widths[id] > 64 {
+            Some(self.signal_table[id].clone())
+        } else {
+            None
+        }
+    }
+
+    /// Did waiter term `sid` see an edge since `(pv, px)` / `pw`? A term
+    /// with an expression (`value_of`) only asks whether its operand moved
+    /// at all: the edge itself is judged on the expression's value.
+    #[inline]
+    fn term_fires(&self, sid: &SensitivityId, pv: u64, px: u64, pw: Option<&Value>) -> bool {
+        let edge = if sid.value_of.is_some() {
+            EdgeKind::AnyEdge
+        } else {
+            sid.edge
+        };
+        if is_packed_id(sid.signal_id) {
+            let (cv, cx) = self.term_raw_bits(sid.signal_id);
+            return lsb_edge_fires(edge, pv, px, cv, cx);
+        }
+        self.edge_fires_prev(sid.signal_id, edge, pv, px, pw)
+    }
+
+    /// Number of unpacked dimensions of the array named `bn` (0 when it is
+    /// not a fixed-size unpacked array: a vector, a collection, unknown).
+    fn unpacked_dims_of(&self, bn: &str) -> usize {
+        if self.module.queue_vars.contains(bn)
+            || self.module.dynamic_arrays.contains(bn)
+            || self.module.associative_arrays.contains_key(bn)
+        {
+            return 0;
+        }
+        if let Some((dims, _)) = self.module.arrays_nd.get(bn) {
+            return dims.len();
+        }
+        if self.module.arrays_2d.contains_key(bn) {
+            return 2;
+        }
+        if self.module.arrays.contains_key(bn) || self.array_first_id.contains_key(bn) {
+            return 1;
+        }
+        0
+    }
+
+    /// `base[i0][i1]...` as (base, indices root-first), when `e` is a chain
+    /// of index selects on a plain identifier.
+    fn index_chain(e: &Expression) -> Option<(&HierarchicalIdentifier, Vec<&Expression>)> {
+        let mut idx: Vec<&Expression> = Vec::new();
+        let mut cur = e;
+        let h = loop {
+            match &cur.kind {
+                ExprKind::Index { expr, index } => {
+                    idx.push(index);
+                    cur = expr;
+                }
+                ExprKind::Ident(h) => break h,
+                _ => return None,
+            }
+        };
+        idx.reverse();
+        Some((h, idx))
+    }
+
+    /// Does `e` select an element of an unpacked array (at any depth)?
+    fn expr_selects_array_cell(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                if let Some((h, idx)) = Self::index_chain(e) {
+                    let d = self.unpacked_dims_of(&self.resolve_hier_name(h));
+                    if d > 0 && idx.len() >= d {
+                        return true;
+                    }
+                }
+                self.expr_selects_array_cell(expr) || self.expr_selects_array_cell(index)
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.expr_selects_array_cell(expr)
+                    || self.expr_selects_array_cell(left)
+                    || self.expr_selects_array_cell(right)
+            }
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
+                self.expr_selects_array_cell(x)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_selects_array_cell(left) || self.expr_selects_array_cell(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_selects_array_cell(condition)
+                    || self.expr_selects_array_cell(then_expr)
+                    || self.expr_selects_array_cell(else_expr)
+            }
+            ExprKind::Concatenation(parts) => parts.iter().any(|p| self.expr_selects_array_cell(p)),
+            _ => false,
+        }
+    }
+
+    /// Push the id of every unpacked-array cell `e` selects, each index
+    /// evaluated now. An x/z or out-of-range index selects no cell (§7.4.6).
+    fn collect_selected_cells(&mut self, e: &Expression, out: &mut Vec<usize>) {
+        match &e.kind {
+            ExprKind::Index { expr, index } => {
+                if let Some((h, idx)) = Self::index_chain(e) {
+                    let bn = self.resolve_hier_name(h).into_owned();
+                    let d = self.unpacked_dims_of(&bn);
+                    if d > 0 && idx.len() >= d {
+                        let mut name = bn;
+                        let mut ok = true;
+                        for ix in &idx[..d] {
+                            match self.eval_expr(ix).to_index() {
+                                Some(v) => {
+                                    use std::fmt::Write as _;
+                                    let _ = write!(name, "[{}]", v);
+                                }
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
+                            if let Some(id) = self.resolve_signal_id(&name) {
+                                if !out.contains(&id) {
+                                    out.push(id);
+                                }
+                            }
+                        }
+                        for ix in idx {
+                            self.collect_selected_cells(ix, out);
+                        }
+                        return;
+                    }
+                }
+                self.collect_selected_cells(expr, out);
+                self.collect_selected_cells(index, out);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.collect_selected_cells(expr, out);
+                self.collect_selected_cells(left, out);
+                self.collect_selected_cells(right, out);
+            }
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => {
+                self.collect_selected_cells(x, out)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.collect_selected_cells(left, out);
+                self.collect_selected_cells(right, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.collect_selected_cells(condition, out);
+                self.collect_selected_cells(then_expr, out);
+                self.collect_selected_cells(else_expr, out);
+            }
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    self.collect_selected_cells(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// §9.4.2: replace a waiter's `cell` terms with the unpacked-array cells
+    /// its expression terms select NOW. `@(mem[i])` watches `i` and the one
+    /// element `mem[i]` names; when `i` moves, the element does too.
+    fn resolve_cell_terms(&mut self, terms: &mut Vec<SensitivityId>) {
+        // One source per distinct event expression (all terms of one
+        // expression carry the same one).
+        let mut sources: Vec<SensitivityId> = Vec::new();
+        for t in terms.iter() {
+            let Some(e) = &t.value_of else { continue };
+            if sources
+                .iter()
+                .any(|s| s.value_of.as_ref().is_some_and(|se| se.span == e.span))
+            {
+                continue;
+            }
+            if t.cell || self.expr_selects_array_cell(e) {
+                sources.push(t.clone());
+            }
+        }
+        terms.retain(|t| !t.cell);
+        let mut cells: Vec<usize> = Vec::new();
+        for src in sources {
+            let Some(e) = src.value_of.clone() else {
+                continue;
+            };
+            cells.clear();
+            self.collect_selected_cells(&e, &mut cells);
+            for &id in &cells {
+                if terms.iter().any(|t| {
+                    t.signal_id == id && t.value_of.as_ref().is_some_and(|te| te.span == e.span)
+                }) {
+                    continue;
+                }
+                terms.push(SensitivityId {
+                    signal_id: id,
+                    edge: src.edge,
+                    iff: src.iff.clone(),
+                    value_of: Some(e.clone()),
+                    wake_rank: src.wake_rank,
+                    cell: true,
+                });
+            }
         }
     }
 
@@ -43679,10 +44476,8 @@ impl Simulator {
                         .iter()
                         .map(|s| s.signal_id)
                         .collect();
-                    let cur_bits: Vec<(u64, u64)> = cur_sigs
-                        .iter()
-                        .map(|&id| self.signal_table[id].raw_bits())
-                        .collect();
+                    let cur_bits: Vec<(u64, u64)> =
+                        cur_sigs.iter().map(|&id| self.term_raw_bits(id)).collect();
                     // A live clock periodically returns to the same value, so
                     // comparing sampled bits alone false-positives on a healthy
                     // toggling clock whenever the 1024-iter sampling aligns with
@@ -43776,10 +44571,11 @@ impl Simulator {
                 // signals never moved is the signature of a dead-clock hang.
                 if let Some(w) = self.event_waiters.iter().min_by_key(|w| w.parked_time) {
                     let age = self.time.saturating_sub(w.parked_time);
-                    let all_dead =
-                        w.resolved_sensitivities.iter().zip(w.arm_bits.iter()).all(
-                            |(sid, &armed)| self.signal_table[sid.signal_id].raw_bits() == armed,
-                        );
+                    let all_dead = w
+                        .resolved_sensitivities
+                        .iter()
+                        .zip(w.arm_bits.iter())
+                        .all(|(sid, &armed)| self.term_raw_bits(sid.signal_id) == armed);
                     let first_sig = w
                         .resolved_sensitivities
                         .first()
@@ -49307,9 +50103,7 @@ impl Simulator {
                                     }
                                 }
                             }
-                            let has_real = sens.iter().any(|s| {
-                                self.signal_name_to_id.contains_key(s.signal_name.as_str())
-                            });
+                            let has_real = sens.iter().any(|s| self.sens_term_resolves(s));
                             if has_real {
                                 {
                                     let w = self.make_event_waiter_kind(pid, sens, cont, is_clk_ev);
@@ -49506,9 +50300,7 @@ impl Simulator {
                             && !self.is_clocking_event(event)
                         {
                             let sens = self.event_to_sens(event);
-                            let has_real = sens.iter().any(|s| {
-                                self.signal_name_to_id.contains_key(s.signal_name.as_str())
-                            });
+                            let has_real = sens.iter().any(|s| self.sens_term_resolves(s));
                             if !sens.is_empty() && has_real {
                                 let mut waiter = self.make_event_waiter(
                                     pid,
@@ -52411,6 +53203,12 @@ impl Simulator {
         for i in 0..self.event_waiters.len() {
             for j in 0..self.event_waiters[i].resolved_sensitivities.len() {
                 let sid = self.event_waiters[i].resolved_sensitivities[j].signal_id;
+                // A cell of a memory stored without element names (arena or
+                // bulk) has no edge snapshot; its waiter compares against
+                // its own `captured_prev`.
+                if sid >= self.prev_val.len() {
+                    continue;
+                }
                 snap_one(
                     sid,
                     &self.signal_table,
@@ -53105,12 +53903,18 @@ impl Simulator {
         waiters.retain_mut(|waiter| {
             let mut triggered = false;
             let mut rank = 0u8;
+            let mut moved = false;
+            let saved_hint = waiter
+                .value_ctx
+                .as_ref()
+                .map(|c| self.name_resolve_hint.replace(c.scope.clone()));
             for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
                 let (pv, px) = waiter.captured_prev[i];
                 let pw = waiter.captured_prev_wide[i].as_ref();
-                if !self.edge_fires_prev(sid.signal_id, sid.edge, pv, px, pw) {
+                if !self.term_fires(sid, pv, px, pw) {
                     continue;
                 }
+                moved = true;
                 // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
                 // guard `g` holds at edge time. A false guard re-arms the
                 // waiter (it stays in event_waiters for the next edge)
@@ -53123,12 +53927,14 @@ impl Simulator {
                 };
                 // §9.4.2: a non-trivial event expression fires only when its
                 // VALUE changed since arm — `a=2;b=1` leaving `a+b` at 3 is
-                // not an event, however many operands moved.
+                // not an event, however many operands moved — and an edge
+                // (`@(posedge v[3])`) is judged on that value's LSB.
                 let value_ok = match (&sid.value_of, waiter.guard_prev.get(i)) {
                     (Some(e), Some(Some(prev))) => {
                         let e = e.clone();
                         let prev = prev.clone();
-                        self.eval_expr(&e) != prev
+                        let cur = self.eval_expr(&e);
+                        value_event_fires(sid.edge, &prev, &cur)
                     }
                     _ => true,
                 };
@@ -53142,7 +53948,7 @@ impl Simulator {
                 waiter.remaining_events -= 1;
                 triggered = false;
             }
-            if triggered {
+            let keep = if triggered {
                 sim_dbg_eprintln!(
                     "[DEBUG] waiter for process {} triggered at time {}",
                     waiter.pid,
@@ -53188,15 +53994,23 @@ impl Simulator {
                 // at arm time captured_prev already equals current), while
                 // catching cross-tick transitions through the target level.
                 for (i, sid) in waiter.resolved_sensitivities.iter().enumerate() {
-                    let (cv, cx) = self.signal_table[sid.signal_id].raw_bits();
-                    waiter.captured_prev[i] = (cv, cx);
-                    if self.signal_widths[sid.signal_id] > 64 {
-                        waiter.captured_prev_wide[i] =
-                            Some(self.signal_table[sid.signal_id].clone());
+                    waiter.captured_prev[i] = self.term_raw_bits(sid.signal_id);
+                    if let Some(v) = self.term_wide_value(sid.signal_id) {
+                        waiter.captured_prev_wide[i] = Some(v);
                     }
                 }
+                // An operand moved but no expression term fired: re-baseline
+                // the expression values (an edge may arrive in steps), and
+                // follow a moved index to the cell it selects now.
+                if moved && waiter.value_ctx.is_some() {
+                    self.rebase_value_terms(waiter);
+                }
                 true
+            };
+            if let Some(h) = saved_hint {
+                *self.name_resolve_hint.borrow_mut() = h;
             }
+            keep
         });
         self.event_waiters = waiters;
         // Within-region process resumption order is LRM-indeterminate
@@ -53214,6 +54028,49 @@ impl Simulator {
             self.order_wakeups_by_rank(&mut triggered_conts, ranks);
         }
         triggered_conts
+    }
+
+    /// §9.4.2: an operand of `w`'s expression terms moved without an event.
+    /// Take the expressions' current values as the new baseline (an edge on
+    /// the value may arrive in several steps) and, when they select array
+    /// cells through an index, watch the cells the indices name now — the
+    /// index expression is re-evaluated, so `@(mem[i])` follows `i`.
+    /// Runs with the waiter's scope as the resolution hint.
+    fn rebase_value_terms(&mut self, w: &mut EventWaiter) {
+        if w.value_ctx.as_ref().is_some_and(|c| c.cells) {
+            let mut terms = std::mem::take(&mut w.resolved_sensitivities);
+            // `resolve_cell_terms` keeps the other terms in place and puts
+            // the cells after them.
+            let fixed = terms.iter().take_while(|t| !t.cell).count();
+            self.resolve_cell_terms(&mut terms);
+            w.captured_prev.truncate(fixed);
+            w.captured_prev_wide.truncate(fixed);
+            w.arm_bits.truncate(fixed);
+            w.guard_prev.truncate(fixed);
+            for t in &terms[fixed..] {
+                let bits = self.term_raw_bits(t.signal_id);
+                w.captured_prev.push(bits);
+                w.arm_bits.push(bits);
+                w.captured_prev_wide.push(self.term_wide_value(t.signal_id));
+                w.guard_prev.push(None);
+            }
+            w.resolved_sensitivities = terms;
+        }
+        let mut last: Option<(crate::ast::Span, Value)> = None;
+        for i in 0..w.resolved_sensitivities.len() {
+            let Some(e) = w.resolved_sensitivities[i].value_of.as_ref() else {
+                continue;
+            };
+            let v = match &last {
+                Some((sp, v)) if *sp == e.span => v.clone(),
+                _ => {
+                    let v = self.eval_expr(e);
+                    last = Some((e.span, v.clone()));
+                    v
+                }
+            };
+            w.guard_prev[i] = Some(v);
+        }
     }
 
     /// Stable sort of one drain's wakeups (already LIFO) by `ranks`, their
@@ -57933,6 +58790,15 @@ impl Simulator {
                             .iter()
                             .map(|&id| id as u32),
                     );
+                    // An entry with no resolvable read (one reading only
+                    // memory cells without element names) has no id to
+                    // re-dirty: an out-of-range marker still makes the next
+                    // full settle run, which seeds every unresolved entry.
+                    if entries[eidx].has_unresolved_reads
+                        && entries[eidx].cold.read_signal_ids.is_empty()
+                    {
+                        self.deferred_proc_entries.push(u32::MAX);
+                    }
                     continue;
                 }
                 evaluated_any = true;
@@ -88837,6 +89703,18 @@ impl Simulator {
         false
     }
 
+    /// A cell without a name (a bulk memory's) has no dependency edge: its
+    /// readers are entries with unresolved reads, which re-evaluate on every
+    /// settle — so its write must still make one run, as `packed_store` does
+    /// for an arena cell.
+    #[cold]
+    #[inline(never)]
+    fn note_unnamed_cell_write(&mut self, id: usize) {
+        if !self.ts_direct_writes && self.id_to_name.is_unnamed(id) {
+            self.dirty_any = true;
+        }
+    }
+
     /// Mark a signal as dirty by ID.
     #[inline]
     fn mark_dirty_id(&mut self, id: usize) {
@@ -88852,6 +89730,8 @@ impl Simulator {
             if !self.ts_direct_writes {
                 self.dirty_any = true;
             }
+        } else if !self.comb_unresolved_idx.is_empty() {
+            self.note_unnamed_cell_write(id);
         }
         if self.activity_mon {
             if self.signal_toggle_counts.len() != self.signal_table.len() {
@@ -122509,6 +123389,7 @@ impl Simulator {
                     iff: s.iff.clone(),
                     value_of: None,
                     wake_rank: 0,
+                    cell: false,
                 });
             }
             if !resolved.is_empty() {

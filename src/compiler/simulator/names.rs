@@ -268,6 +268,12 @@ pub struct IdNames {
     /// Stored names plus VIRTUAL gap cells: the number of names the table
     /// held when every virtual element name was stored (see `legacy_len`).
     legacy: usize,
+    /// One past the last id with a stored or virtual name (see
+    /// `named_id_bound`).
+    named_end: usize,
+    /// Id ranges `[start, end)` with no name at all, stored or virtual (the
+    /// cells of a bulk memory), ascending and merged.
+    unnamed: Vec<(usize, usize)>,
 }
 
 impl IdNames {
@@ -283,6 +289,7 @@ impl IdNames {
         self.names.push(name);
         self.total += 1;
         self.legacy += 1;
+        self.named_end = self.total;
     }
 
     /// The next `n` ids have no stored name; `virtual_names` when they are
@@ -298,7 +305,27 @@ impl IdNames {
             Some(g) if g.0 + g.1 == self.total => g.1 += n,
             _ => self.gaps.push((self.total, n, self.names.len())),
         }
+        let start = self.total;
         self.total += n;
+        if virtual_names {
+            self.named_end = self.total;
+        } else {
+            match self.unnamed.last_mut() {
+                Some(r) if r.1 == start => r.1 = self.total,
+                _ => self.unnamed.push((start, self.total)),
+            }
+        }
+    }
+
+    /// Does `id` have no name at all, stored or virtual — a bulk memory's
+    /// cell, which no name-keyed dependency can reach?
+    #[inline]
+    pub fn is_unnamed(&self, id: usize) -> bool {
+        if self.unnamed.is_empty() {
+            return false;
+        }
+        let k = self.unnamed.partition_point(|r| r.0 <= id);
+        k > 0 && id < self.unnamed[k - 1].1
     }
 
     pub fn reserve(&mut self, n: usize) {
@@ -323,6 +350,15 @@ impl IdNames {
     /// had when element names were stored (a count, not an id bound).
     pub fn legacy_len(&self) -> usize {
         self.legacy
+    }
+
+    /// Bound on every id a NAME can resolve to: one past the last id with a
+    /// stored or virtual name. Only the cells of unnamed bulk memories lie
+    /// beyond it — and, when such a memory sorts before a named array, in
+    /// the middle of it too, which is why `legacy_len` (a count) is no id
+    /// bound.
+    pub fn named_id_bound(&self) -> usize {
+        self.named_end
     }
 
     /// The stored name of `id`; None for a gap id or an id past the end.
@@ -416,6 +452,7 @@ mod tests {
         n.push(Arc::from("c"));
         assert_eq!(n.len(), 9);
         assert_eq!(n.legacy_len(), 3 + 3 + 1);
+        assert_eq!(n.named_id_bound(), 9, "c follows the bulk gap");
         assert_eq!(n.get(0).map(|s| &**s), Some("a"));
         assert!(n.get(1).is_none() && n.get(3).is_none());
         assert_eq!(n.get(4).map(|s| &**s), Some("b"));
@@ -424,5 +461,14 @@ mod tests {
         assert!(n.get(9).is_none());
         let ids: Vec<(usize, &str)> = n.iter().map(|(i, s)| (i, &**s)).collect();
         assert_eq!(ids, vec![(0, "a"), (4, "b"), (8, "c")]);
+        // A trailing bulk memory holds no named id.
+        n.push_gap(4, false);
+        assert_eq!((n.len(), n.named_id_bound()), (13, 9));
+        let unnamed: Vec<usize> = (0..14).filter(|&i| n.is_unnamed(i)).collect();
+        assert_eq!(
+            unnamed,
+            [5, 6, 9, 10, 11, 12],
+            "bulk gaps only, not virtual ones"
+        );
     }
 }
