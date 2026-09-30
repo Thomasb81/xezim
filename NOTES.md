@@ -131,6 +131,11 @@ and the development workflow are in [README.md](README.md).
   descending dimension's declared order, 2-state array members default to 0,
   `num()` on an associative array of structs counts keys, and
   `$size`/`$bits` work on a member sub-array such as `s.mm[1]`.
+* A UVM DPI library built from `include/uvm_dpi_xezim.cc` loads. The UVM
+  sources it compiles call the SV export `m__uvm_report_dpi`, and built as
+  C++ that call was mangled, so `--dpi-lib` stopped with `undefined symbol`.
+  The driver now gives everything C linkage, as the reference `uvm_dpi.cc`
+  does, and also builds as C. (#208)
 
 **Performance**
 

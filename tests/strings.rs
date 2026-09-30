@@ -93,6 +93,8 @@ mod string_returning_fn_inline;
 mod struct_elem_string_member_format;
 #[path = "strings/system_task_gaps.rs"]
 mod system_task_gaps;
+#[path = "strings/uvm_dpi_driver_linkage.rs"]
+mod uvm_dpi_driver_linkage;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]

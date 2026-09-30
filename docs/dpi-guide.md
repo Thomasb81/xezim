@@ -142,72 +142,50 @@ to compile the same source against an optional real backend (Spike's
 
 ## Multi-file libraries — the UVM DPI case
 
-Accellera's UVM reference (`uvm-core/src/dpi/`) is shipped as a bag of `.c` and
-`.cc` files plus a single `.svh` for the SV-side imports. There is no Makefile
-in the upstream kit — the consumer compiles them. The recipe is just:
+You don't need a library to run UVM. xezim provides UVM's DPI-C helpers
+natively: regex matching, command-line processing and `uvm_hdl_*` backdoor
+access. So a UVM testbench runs the same with or without `-DUVM_NO_DPI`. Build
+Accellera's C code yourself only when you want that implementation itself, or
+a base for your own DPI extensions that follow the UVM header conventions.
+
+Accellera's UVM reference (`src/dpi/` in the 1800.2 release kits and in
+`uvm-core`) ships as a set of `.c` and `.cc` files plus the SV-side imports.
+Its own driver, `uvm_dpi.cc`, `#include`s every source inside one
+`extern "C"` block. That C linkage matters: SV binds DPI imports and exports by
+their C names. The sources reference an SV export, `m__uvm_report_dpi`, through
+a plain `extern` declaration, so compiled as C++ outside such a block that
+reference is mangled, and the library cannot be loaded (`undefined symbol:
+_Z17m__uvm_report_dpi...`).
+
+`uvm_dpi.cc` can't be used as is: it also `#include`s `uvm_hdl.c`, whose
+per-simulator `#ifdef` chain ends in `#error "hdl vendor backend is missing"`
+unless a proprietary vendor header is present. Use `include/uvm_dpi_xezim.cc`
+instead. It mirrors `uvm_dpi.cc`'s include chain and C linkage, skips
+`uvm_hdl.c`, and implements the `uvm_hdl_*` surface itself per IEEE
+1800.2-2017 Annex C (return 1 on success, 0 on failure). It uses only
+`vpi_handle_by_name`, `vpi_get_value` and `vpi_put_value`: no vendor
+extensions, no VHPI. The simulator-specific `uvm_is_vhdl_path` and
+`uvm_register_*_vhdl` helpers are not part of IEEE 1800.2 and are not provided.
 
 ```bash
-# All C files compile as C, all .cc files as C++.
-# Link them all into one .so.
-
-cc  -shared -fPIC -I path/to/xezim/include \
-    uvm_common.c uvm_hdl.c uvm_svcmd_dpi.c uvm_hdl_polling.c \
-    -c -o uvm_c.o
-
-g++ -shared -fPIC -std=c++17 -fno-inline -I path/to/xezim/include \
-    -I path/to/uvm-core/src/dpi \
-    uvm_dpi.cc uvm_regex.cc \
-    -c -o uvm_cc.o    # only if you don't use uvm_dpi.cc's own #include chain
-
-# Single shared library
-g++ -shared -fPIC \
-    uvm_c.o uvm_cc.o \
-    -o libuvm_dpi.so
+g++ -shared -fPIC -std=c++17 -Wno-format-security \
+    -I path/to/xezim/include -I path/to/uvm/src/dpi \
+    path/to/xezim/include/uvm_dpi_xezim.cc \
+    -o uvm.so
+xezim ... --dpi-lib uvm.so
 ```
 
-> **Practical note:** `uvm_dpi.cc` already `#include`s every `.c` and `.cc` source
-> from `uvm-core/src/dpi/` inside its own `extern "C" { … }` block. The catch is
-> that `uvm_dpi.cc` unconditionally `#include "uvm_hdl.c"`, and that file has a
-> per-simulator `#ifdef` chain (ending in `#else #error "hdl vendor backend
-> is missing"`) that requires a proprietary vendor header. xezim doesn't
-> ship those vendor headers because none of them are open source.
->
-> Use `include/uvm_dpi_xezim.cc` instead — a single driver that mirrors
-> `uvm_dpi.cc`'s include chain but skips `uvm_hdl.c` and provides the
-> `uvm_hdl_*` surface itself per IEEE 1800.2-2017 Annex C (return 1 on
-> success, 0 on failure). It uses only standard `vpi_handle_by_name` +
-> `vpi_get_value` + `vpi_put_value` — no vendor extensions, no VHPI, no
-> M-HPI. The simulator-specific `uvm_is_vhdl_path` and `uvm_register_*_vhdl` helpers are
-> NOT part of IEEE 1800.2 and are intentionally not provided.
->
-> ```bash
-> g++ -shared -fPIC -std=c++17 -Wno-format-security \
->     -I path/to/xezim/include -I path/to/uvm-core/src/dpi \
->     path/to/xezim/include/uvm_dpi_xezim.cc \
->     -o uvm.so
-> ```
->
-> Or use the shipped wrapper from inside any directory:
->
-> ```bash
-> /path/to/xezim/scripts/build_uvm_so.sh
-> ```
->
-> Override paths via env vars: `UVM=…` `XEZIM_INCLUDE=…` `OUT=…`. The script
-> auto-detects the canonical xezim/uvm-core layout but accepts any layout.
->
-> The `-Wno-format-security` flag silences a long-standing warning from
-> `uvm_hdl_polling.c` lines 526/533/534 where the Accellera UVM reference
-> uses `sprintf(buf, str, name)` with a non-literal "format" string.
-> That's technically UB if `str`/`name` ever contains `%`, but patching
-> it in upstream `uvm-core` would be reverted on the next submodule
-> update. Every commercial simulator's UVM build applies the same
-> suppression.
->
-> xezim ships with `-DUVM_NO_DPI` so the UVM SV source itself never calls into
-> this `.so` (UVM reporting / cmdline is serviced by the Rust core), but having
-> the library available is useful for *your own* DPI extensions that piggy-back
-> on the UVM header conventions.
+- Add `-DXEZIM_UVM_POLLING=1` for a 2020 kit, to include its
+  `uvm_hdl_polling.c`; 1800.2-2017 doesn't ship that file.
+- The driver also builds as C: `gcc -x c -shared -fPIC ...` with the same
+  flags otherwise.
+- `-Wno-format-security` silences a warning from `uvm_hdl_polling.c`, which
+  passes a non-literal format string to `sprintf`. The fix belongs upstream.
+
+`scripts/build_uvm_dpi.sh` (a wrapper around `scripts/Makefile`) downloads the
+1800.2-2017-1.0 and 2020.3.1 release kits and builds both libraries, as
+`uvm-2017-1.0.so` and `uvm-2020.3.1.so` in the xezim directory. Set `CXX` or
+`CXXFLAGS` to override the compiler or add flags.
 
 ---
 
@@ -721,7 +699,7 @@ header.
 * [`../dpi/spike/README.md`](../dpi/spike/README.md) — worked example with a real
   external library (Spike / riscv-isa-sim), including stub-mode and real-mode
   builds.
-* [`uvm-guide.md`](uvm-guide.md) — running UVM testbenches on xezim (the
-  `-DUVM_NO_DPI` flag there means the UVM library itself doesn't call into
-  a DPI `.so`; your own DPI extensions still can).
+* [`uvm-guide.md`](uvm-guide.md) — running UVM testbenches on xezim. With
+  `-DUVM_NO_DPI` the UVM library makes no DPI calls; without it, xezim serves
+  UVM's DPI-C helpers natively. Your own DPI extensions work either way.
 * [`../tests/dpi/`](../tests/dpi/) — the canonical one-`.c`-per-test pairs.
