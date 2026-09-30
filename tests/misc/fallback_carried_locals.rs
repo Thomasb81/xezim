@@ -476,3 +476,67 @@ endmodule
         &["T| log_n=2", "T| strobe x=4", "T| log_n=4", "T| strobe x=4"],
     );
 }
+
+#[test]
+fn real_locals_written_inside_interpreted_statements_stay_real() {
+    // `r = k` with an integral `k` inside a statement the interpreter runs:
+    // the carried `real` local converts, so `r / 2` is a real division —
+    // and so does a task's own `real` local on the interpreter path.
+    let src = r#"
+module sub (input logic clk);
+  int aa [int];
+  initial begin aa[3] = 30; aa[5] = 50; end
+  task automatic half(input int v, output real h);
+    real t;
+    foreach (aa[k]) if (k == v) begin t = k; h = t / 2; end
+  endtask
+  always @(posedge clk) begin
+    real r, q;
+    int n;
+    r = 1.5;
+    n = 0;
+    foreach (aa[k]) begin r = k; q = r / 2; n = n + 1; end
+    half(5, q);
+    $display("T| r=%0.2f q=%0.2f n=%0d", r, q, n);
+  end
+endmodule
+module tb;
+  logic clk = 0;
+  sub u (.clk(clk));
+  initial begin
+    #5 clk = 1; #5 clk = 0;
+    #1 $finish;
+  end
+endmodule
+"#;
+    expect(src, 1_000_000, &["T| r=5.00 q=2.50 n=2"]);
+}
+
+#[test]
+fn interpreted_task_calls_convert_integral_actuals_to_real_formals() {
+    // §13.3.1 on the interpreter's task path, which the compiled inline
+    // already honours: `addhalf(5, 1)` binds `dt` to 5.0.
+    let src = r#"
+module tb;
+  real acc = 0.0;
+  task automatic addhalf(input real dt, input int k);
+    acc = acc + dt / 2;
+    $display("T| %m dt=%0.2f half=%0.2f k=%0d acc=%0.2f", dt, dt / 2, k, acc);
+  endtask
+  initial begin
+    addhalf(5, 1);
+    addhalf(-3, 2);
+    addhalf(2.5, 3);
+  end
+endmodule
+"#;
+    expect(
+        src,
+        100,
+        &[
+            "T| tb.addhalf dt=5.00 half=2.50 k=1 acc=2.50",
+            "T| tb.addhalf dt=-3.00 half=-1.50 k=2 acc=1.00",
+            "T| tb.addhalf dt=2.50 half=1.25 k=3 acc=2.25",
+        ],
+    );
+}

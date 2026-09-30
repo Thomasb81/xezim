@@ -63137,7 +63137,17 @@ impl Simulator {
                             // text).
                             let is_str = self.string_signals.contains(name.as_str())
                                 || self.p_local_is_string(name);
-                            let fitted = if !val.is_real && !is_str {
+                            let fitted = if !val.is_real
+                                && !is_str
+                                && self.local_stack[last_idx]
+                                    .get(name)
+                                    .is_some_and(|p| p.is_real)
+                            {
+                                // §6.12.2: an integral value assigned to a REAL
+                                // local converts; stored as integral bits, a
+                                // `real t; t = k; h = t / 2;` divided as integers.
+                                Value::from_f64(val.to_f64())
+                            } else if !val.is_real && !is_str {
                                 if let Some(&target_w) = self.widths.get(name) {
                                     let mut f = if val.width != target_w {
                                         val.resize_for_assign(target_w)
@@ -124532,6 +124542,14 @@ impl Simulator {
                             &port.data_type,
                             &self.module.typedef_types,
                         );
+                    } else if super::elaborate::is_type_real(&port.data_type) {
+                        // §13.3.1: an integral actual CONVERTS to a real
+                        // formal (the function path and the compiled inline
+                        // both do); bound as integral bits, `dt / 2` divided
+                        // as integers.
+                        if !val.is_real {
+                            val = Value::from_f64(val.to_f64());
+                        }
                     } else if self.type_is_signed_concrete(&port.data_type) {
                         val.is_signed = true;
                     }
