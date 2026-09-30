@@ -76888,7 +76888,7 @@ impl Simulator {
                     }
                     self.auto_loop_vars.truncate(fe_auto_len);
                     self.restore_loop_vars(&fe_saved);
-                    if !self.return_flag {
+                    if !self.return_flag && self.disable_target.is_none() {
                         self.break_flag = false;
                     }
                     return;
@@ -76919,7 +76919,7 @@ impl Simulator {
                             self.exec_foreach_nested(&dims[..1], vars, body, None);
                             self.auto_loop_vars.truncate(fe_auto_len);
                             self.restore_loop_vars(&fe_saved);
-                            if !self.return_flag {
+                            if !self.return_flag && self.disable_target.is_none() {
                                 self.break_flag = false;
                             }
                             return;
@@ -76978,7 +76978,7 @@ impl Simulator {
                         }
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
-                        if !self.return_flag {
+                        if !self.return_flag && self.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         return;
@@ -77087,8 +77087,12 @@ impl Simulator {
                 self.restore_loop_vars(&fe_saved);
                 // A `break` inside the loop consumed the loop exit.
                 // Only a `return` (return_flag) should propagate to
-                // the enclosing function body (IEEE 1800-2023 §12.8).
-                if !self.return_flag {
+                // the enclosing function body (IEEE 1800-2023 §12.8) —
+                // and a `disable` (§9.6.2), which unwinds to the block or
+                // task it names: consuming it as a `break` finished the
+                // disabled task's remaining statements and left the target
+                // set for an unrelated later loop to trip over.
+                if !self.return_flag && self.disable_target.is_none() {
                     self.break_flag = false;
                 }
                 return;
@@ -77280,7 +77284,7 @@ impl Simulator {
                         self.exec_foreach_nested_dir(&dims, vars, body, None, Some(&descs));
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
-                        if !self.return_flag {
+                        if !self.return_flag && self.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         return;
@@ -77304,7 +77308,7 @@ impl Simulator {
                         self.exec_foreach_nested(&dims[..1], vars, body, None);
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
-                        if !self.return_flag {
+                        if !self.return_flag && self.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         return;
@@ -77398,7 +77402,7 @@ impl Simulator {
                         );
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
-                        if !self.return_flag {
+                        if !self.return_flag && self.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         return;
@@ -77475,7 +77479,7 @@ impl Simulator {
                         }
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
-                        if !self.return_flag {
+                        if !self.return_flag && self.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         return;
@@ -77730,7 +77734,7 @@ impl Simulator {
         }
         self.auto_loop_vars.truncate(fe_auto_len);
         self.restore_loop_vars(&fe_saved);
-        if !self.return_flag {
+        if !self.return_flag && self.disable_target.is_none() {
             self.break_flag = false;
         }
     }
@@ -123564,8 +123568,12 @@ impl Simulator {
         self.close_decl_shadow_frame();
         // §9.6.2: `disable <task>` terminates this invocation and no more —
         // the caller resumes. Clear the unwind signal here, or it would leak
-        // out and keep later loops from clearing `break_flag`.
-        if self.disable_target.as_deref() == Some(td.name.name.name.as_str()) {
+        // out and keep later loops from clearing `break_flag`. An instance's
+        // task is registered under its qualified name (`u0.early`) while the
+        // body's `disable early` names the leaf.
+        let tname = td.name.name.name.as_str();
+        let tleaf = tname.rsplit('.').next().unwrap_or(tname);
+        if matches!(self.disable_target.as_deref(), Some(t) if t == tname || t == tleaf) {
             self.disable_target = None;
             self.break_flag = false;
         }

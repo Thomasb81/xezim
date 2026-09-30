@@ -83,6 +83,8 @@ mod delay_precision;
 mod dep_reg_entry_synth;
 #[path = "misc/deposit_task.rs"]
 mod deposit_task;
+#[path = "misc/disable_task_inside_foreach.rs"]
+mod disable_task_inside_foreach;
 #[path = "misc/duplicate_decl_locations.rs"]
 mod duplicate_decl_locations;
 #[path = "misc/elaboration_runaway_guards.rs"]
