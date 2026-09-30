@@ -573,3 +573,30 @@ endmodule
     // and package code.
     assert_eq!(n, 2);
 }
+
+/// §29: a UDP instance's terminals are resolved in the enclosing module's
+/// own names, not through the port substitution — they read the port net.
+/// A module instantiating a UDP keeps its ports.
+#[test]
+fn udp_terminals_keep_ports() {
+    let src = r#"
+primitive u_and(out, a, b);
+  output out; input a, b;
+  table
+    1 1 : 1;
+    0 ? : 0;
+    ? 0 : 0;
+  endtable
+endprimitive
+module cellm(input a, input b, output y);
+  u_and g(y, a, b);
+endmodule
+module top;
+  reg p = 0, q = 1; wire y;
+  cellm u(.a(p), .b(q), .y(y));
+  initial begin #1 p = 1; #1 $display("T|udp %b", y); end
+endmodule
+"#;
+    let (n, _) = check("udp", src, &[], &["T|udp 1"]);
+    assert_eq!(n, 0);
+}
