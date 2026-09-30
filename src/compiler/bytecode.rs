@@ -461,6 +461,11 @@ pub enum Insn {
     /// interpreter-owned. (dest, this_reg, start_class, method, arg_start,
     /// n_args)
     CallScopedMethod(RegId, RegId, Box<NamePair>, RegId, u32),
+    /// class-perf P2: call a FREE FUNCTION (module/package scope) from a
+    /// compiled class method — dest = f(regs[a..a+n]). The body executes
+    /// via the interpreter's `exec_function_call` (identical semantics to
+    /// the AST path); only positional `input`-only formals are admitted.
+    CallFreeFunction(RegId, Box<Name>, RegId, u32),
 
     /// class-perf Step 9g: read a STATIC class property (§8.19) by its
     /// bare name — the resolution walk (and per-specialization keying)
@@ -1117,7 +1122,8 @@ impl Insn {
             | CallScopedMethod(..)
             | StoreClassStatic(..)
             | ConstructObject(..)
-            | CallStaticScoped(..) => return false,
+            | CallStaticScoped(..)
+            | CallFreeFunction(..) => return false,
         }
         true
     }
@@ -1184,6 +1190,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::StoreClassMember(..) => "StoreCls",
         Insn::CallMethod(..) => "CallM,",
         Insn::CallScopedMethod(..) => "CallScp,",
+        Insn::CallFreeFunction(..) => "CallFre,",
         Insn::LoadClassStatic(..) => "LoadSta,",
         Insn::StoreClassStatic(..) => "StorSta,",
         Insn::ConstructObject(..) => "NewObj,",
@@ -1305,6 +1312,17 @@ pub struct BytecodeCompiler<'a> {
     /// `.member` on them lowers to a heap access. Scalar formals/locals are
     /// already in `local_var_regs`; only class-typed ones need this set.
     method_handle_names: std::collections::HashSet<String>,
+    /// class-perf P2 (typed handle roots): local/formal name -> declared
+    /// class; resolves dispatch chains rooted at handle locals statically.
+    method_handle_local_types: HashMap<String, String>,
+    /// class-perf P2: method names returning `string` in every declaring
+    /// class — string-concat operand typing for method-call operands.
+    method_string_ret_names: HashSet<String>,
+    /// class-perf P2: package-scope enum constants `pkg::NAME` -> value,
+    /// for `uvm_pkg::UVM_NONE`-style report-macro arguments. Width>64
+    /// entries are omitted (those decline to the AST, which reads the
+    /// full Value from the parameter table).
+    pkg_enum_consts: HashMap<String, (u64, u32)>,
     /// Names declared as members/statics by the method's class OR any
     /// ENCLOSING class (so a nested method can lexically reach an outer
     /// static). In method mode a BARE Ident matching one of these names must
@@ -1678,6 +1696,9 @@ impl<'a> BytecodeCompiler<'a> {
             method_mode: false,
             method_this_reg: None,
             method_handle_names: std::collections::HashSet::default(),
+            method_handle_local_types: HashMap::default(),
+            method_string_ret_names: HashSet::default(),
+            pkg_enum_consts: HashMap::default(),
             class_shadow_names: HashSet::default(),
             bare_member_names: HashSet::default(),
             member_class_names: HashSet::default(),
@@ -3962,9 +3983,16 @@ impl<'a> BytecodeCompiler<'a> {
                     && h.path[0].selects.is_empty() =>
             {
                 let name = h.path[0].name.name.as_str();
-                // Handle locals/formals/result: a legal single-hop root of
-                // unknown type (the plan carries names, not declared
-                // classes).
+                // Handle locals/formals/result: a legal single-hop root.
+                // class-perf P2: when the plan carried a DECLARED class for
+                // the root (handle formal or class-typed local), chains
+                // through it resolve STATICALLY — `sched.m_parent.get()`
+                // walks `sched` -> its class -> `m_parent` -> that class.
+                // Without a declared type the root stays UNTYPED and a
+                // chain through it declines (conservative, as before).
+                if let Some(cls) = self.method_handle_local_types.get(name) {
+                    return Some(cls.clone());
+                }
                 if self.method_handle_names.contains(name) {
                     return Some(UNTYPED.to_string());
                 }
@@ -5109,6 +5137,16 @@ impl<'a> BytecodeCompiler<'a> {
                 if self.local_var_is_string.contains(&raw) {
                     return true;
                 }
+                // class-perf P2: a bare STRING MEMBER read is a string
+                // operand in method mode (`{"top.", nm}`).
+                if self.method_mode
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && self.string_member_names.contains(raw.as_str())
+                {
+                    return true;
+                }
                 let leaf = h.path.last().map(|p| p.name.name.as_str()).unwrap_or("");
                 self.string_signals
                     .is_some_and(|ss| ss.contains(&raw) || ss.contains(leaf))
@@ -5117,6 +5155,29 @@ impl<'a> BytecodeCompiler<'a> {
                 !parts.is_empty() && parts.iter().all(|p| self.expr_is_string_static(p))
             }
             ExprKind::Call { func, .. } => {
+                // class-perf P2: a CLASS-METHOD call whose method name
+                // unanimously returns string (`obj.get_full_name()`,
+                // bare `get_name()`, `this.get_name()`) is a string
+                // operand. Name-global unanimity can never mistype a
+                // non-string callee (a colliding non-string declaration
+                // keeps the name out of the set and this arm declined).
+                if self.method_mode {
+                    let mname: Option<&str> = match &func.kind {
+                        ExprKind::Ident(h) if h.path.len() >= 2 => {
+                            h.path.last().map(|s| s.name.name.as_str())
+                        }
+                        ExprKind::Ident(h) if h.path.len() == 1 => {
+                            Some(h.path[0].name.name.as_str())
+                        }
+                        ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+                        _ => None,
+                    };
+                    if let Some(m) = mname
+                        && self.method_string_ret_names.contains(m)
+                    {
+                        return true;
+                    }
+                }
                 let ExprKind::Ident(h) = &func.kind else {
                     return false;
                 };
@@ -8319,6 +8380,42 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::BlockingAssign(as_sig_id(sig_id), result, w));
                             return true;
                         }
+                        // class-perf P2: statement-position ++ on a register-
+                        // backed method target (class member via any handle
+                        // chain, block local, formal) — read, +1, store
+                        // through the ordinary assignment machinery. The
+                        // POST forms discard the value in statement
+                        // position, so one lowering serves all four ops.
+                        if self.method_mode {
+                            // Width 0 = a self-determined member/static store
+                            // (the heap truncates at the declared width —
+                            // `++cnt` on a 4-bit member wraps exactly like
+                            // `cnt = cnt + 1`, verified against the AST
+                            // interpreter); Resize only for width>0 targets.
+                            let width = self.infer_lhs_width(operand);
+                            let start = self.insns.len();
+                            let start_reg = self.next_reg;
+                            let lowered = (|| {
+                                let r = self.compile_expr(operand, width)?;
+                                let one = self.alloc_reg();
+                                self.emit(Insn::LoadConst(
+                                    one,
+                                    Box::new(Value::from_u64(1, if width > 0 { width } else { 32 })),
+                                ));
+                                let result = self.alloc_reg();
+                                self.emit(Insn::Add(result, r, one));
+                                if width > 0 {
+                                    self.emit(Insn::Resize(result, width));
+                                }
+                                self.compile_blocking_target(operand, result, width)
+                                    .then_some(())
+                            })();
+                            if lowered == Some(()) {
+                                return true;
+                            }
+                            self.insns.truncate(start);
+                            self.next_reg = start_reg;
+                        }
                         self.bail("Expr_PreIncr");
                         return self.emit_fallback(stmt);
                     }
@@ -8341,6 +8438,38 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::Resize(result, w));
                             self.emit(Insn::BlockingAssign(as_sig_id(sig_id), result, w));
                             return true;
+                        }
+                        // class-perf P2: the -- mirror of the ++ lowering above
+                        // (statement position, register-backed targets).
+                        if self.method_mode {
+                            // Width 0 = a self-determined member/static store
+                            // (the heap truncates at the declared width —
+                            // `++cnt` on a 4-bit member wraps exactly like
+                            // `cnt = cnt + 1`, verified against the AST
+                            // interpreter); Resize only for width>0 targets.
+                            let width = self.infer_lhs_width(operand);
+                            let start = self.insns.len();
+                            let start_reg = self.next_reg;
+                            let lowered = (|| {
+                                let r = self.compile_expr(operand, width)?;
+                                let one = self.alloc_reg();
+                                self.emit(Insn::LoadConst(
+                                    one,
+                                    Box::new(Value::from_u64(1, if width > 0 { width } else { 32 })),
+                                ));
+                                let result = self.alloc_reg();
+                                self.emit(Insn::Sub(result, r, one));
+                                if width > 0 {
+                                    self.emit(Insn::Resize(result, width));
+                                }
+                                self.compile_blocking_target(operand, result, width)
+                                    .then_some(())
+                            })();
+                            if lowered == Some(()) {
+                                return true;
+                            }
+                            self.insns.truncate(start);
+                            self.next_reg = start_reg;
                         }
                         self.bail("Expr_PreDecr");
                         return self.emit_fallback(stmt);
@@ -9225,6 +9354,28 @@ impl<'a> BytecodeCompiler<'a> {
                     if v.is_real {
                         let r = self.alloc_reg();
                         self.emit(Insn::LoadConst(r, Box::new(v)));
+                        return Some(r);
+                    }
+                }
+                // class-perf P2: a PACKAGE-scope enum constant
+                // (`uvm_pkg::UVM_NONE` in a report-macro argument) folds
+                // to a literal — the same table the interpreter's
+                // `package_enum_member` reads.
+                if self.method_mode
+                    && hier.root.is_none()
+                    && hier.path.len() == 2
+                    && hier.path.iter().all(|seg| seg.selects.is_empty())
+                {
+                    let key = format!(
+                        "{}::{}",
+                        hier.path[0].name.name, hier.path[1].name.name
+                    );
+                    if let Some(&(val, width)) = self.pkg_enum_consts.get(&key) {
+                        let r = self.alloc_reg();
+                        self.emit(Insn::LoadConst(
+                            r,
+                            Box::new(Value::from_u64(val, width.max(1))),
+                        ));
                         return Some(r);
                     }
                 }
@@ -10924,6 +11075,28 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 self.insns.truncate(direct_start);
                 self.next_reg = direct_reg;
+                // class-perf P2: a PACKAGE-scope enum constant parsed as
+                // MemberAccess (`pk::LOW` in an argument). Same fold as the
+                // 2-segment Ident form; a 3D base (queue element
+                // member-of-member) must NOT be caught by this (base is a
+                // lone Ident there only when it's a name, which a package
+                // never is — hence root.is_none + single bare segment).
+                if self.method_mode
+                    && let ExprKind::Ident(h) = &base.kind
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                {
+                    let key = format!("{}::{}", h.path[0].name.name, member.name);
+                    if let Some(&(val, width)) = self.pkg_enum_consts.get(&key) {
+                        let r = self.alloc_reg();
+                        self.emit(Insn::LoadConst(
+                            r,
+                            Box::new(Value::from_u64(val, width.max(1))),
+                        ));
+                        return Some(r);
+                    }
+                }
                 if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "Expr_MemberAccess") {
                     return Some(r);
                 }
@@ -11286,6 +11459,69 @@ impl<'a> BytecodeCompiler<'a> {
                     self.next_reg = call_next;
                     self.bail("Expr_Call_bare_method");
                     return None;
+                }
+                // class-perf P2: a FREE-FUNCTION call — bare callee in the
+                // function table that is NOT a class method (§8.23: class
+                // scope shadows, and that branch above already declined),
+                // not shadowed by a local/member read, with positional
+                // args and `input`-only formals. The value round-trip
+                // cannot write back, so any potentially-assignable formal
+                // direction declines (same discipline as CallStaticScoped).
+                if self.method_mode
+                    && let ExprKind::Ident(h) = &func.kind
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && let Some(fd) = self
+                        .functions
+                        .and_then(|f| f.get(h.path[0].name.name.as_str()))
+                    && fd.ports.len() == args.len()
+                    && fd.ports.iter().all(|p| {
+                        matches!(p.direction, crate::ast::types::PortDirection::Input)
+                    })
+                    && !args.iter().any(|a| {
+                        matches!(a.kind, ExprKind::NamedArg { .. })
+                    })
+                {
+                    let name = h.path[0].name.name.clone();
+                    let call_start = self.insns.len();
+                    let call_next = self.next_reg;
+                    let mut ok = true;
+                    let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+                    for a in args {
+                        match self.compile_expr(a, 0) {
+                            Some(r) => arg_values.push(r),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        let dest = self.alloc_reg();
+                        let n = arg_values.len() as u32;
+                        // Contiguous arg slots (same reservation discipline
+                        // as the bare-call form above).
+                        let arg_start = self.alloc_reg();
+                        for _ in 1..arg_values.len() {
+                            self.alloc_reg();
+                        }
+                        for (i, &v) in arg_values.iter().enumerate() {
+                            let slot = (arg_start as usize + i) as RegId;
+                            if slot != v {
+                                self.emit(Insn::Move(slot, v));
+                            }
+                        }
+                        self.emit(Insn::CallFreeFunction(
+                            dest,
+                            Box::new(Name(name.into_boxed_str())),
+                            arg_start,
+                            n,
+                        ));
+                        return Some(dest);
+                    }
+                    self.insns.truncate(call_start);
+                    self.next_reg = call_next;
                 }
                 // class-perf Step 9h: a CLASS-SCOPE static call —
                 // `Cls.m(args)` / `alias.m(args)` / `Tparam.m(args)` where
@@ -14159,6 +14395,10 @@ impl<'a> BytecodeCompiler<'a> {
         class_const_names: &HashSet<String>,
         new_type_map: &HashMap<String, String>,
         scope_static_receivers: &HashSet<String>,
+        handle_local_types: &HashMap<String, String>,
+        string_method_names: &HashSet<String>,
+        functions: &'a HashMap<String, FunctionDeclaration>,
+        pkg_enum_consts: &HashMap<String, (u64, u32)>,
         method_class: &str,
         handle_member_types: &'a HashMap<String, HashMap<String, String>>,
         class_shadow_names: &HashSet<String>,
@@ -14250,6 +14490,15 @@ impl<'a> BytecodeCompiler<'a> {
         self.super_method_names = super_method_names.clone();
         self.method_class_parent = method_class_parent.clone();
         self.static_bare_targets = static_bare_targets.clone();
+        // class-perf P2 (typed handle roots): declared class per handle
+        // formal / class-typed local, consulted by
+        // `method_handle_chain_class` so `sched.m_parent.get_pt()` admits.
+        self.method_handle_local_types = handle_local_types.clone();
+        self.method_string_ret_names = string_method_names.clone();
+        // class-perf P2: the free-function table, for CallFreeFunction
+        // lowering and string-return typing of free callees.
+        self.functions = Some(functions);
+        self.pkg_enum_consts = pkg_enum_consts.clone();
         self.static_member_names = static_member_names.clone();
         self.class_const_names = class_const_names.clone();
         self.new_type_map = new_type_map.clone();
@@ -14318,12 +14567,29 @@ impl<'a> BytecodeCompiler<'a> {
         }
 
         if !ok {
+            // Census aid: XEZIM_FALLBACK_SITES=1 — the per-site tracer only
+            // covers emit_fallback; method-mode arms that return false
+            // directly (all-or-nothing) surface here instead.
+            if std::env::var("XEZIM_FALLBACK_SITES")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "[FALLBACK] compile-fail reason={} scope={}",
+                    self.bail_reason.unwrap_or("?"),
+                    self.scope_hint.as_deref().unwrap_or("-")
+                );
+            }
             // Roll back everything; leave the compiler in non-method mode.
             self.insns.truncate(start_len);
             self.next_reg = start_reg;
             self.method_mode = false;
             self.method_this_reg = None;
             self.method_handle_names.clear();
+            self.method_handle_local_types.clear();
+            self.method_string_ret_names.clear();
+            self.pkg_enum_consts.clear();
+            self.functions = None;
             self.method_class = None;
             self.handle_member_types = None;
             self.class_method_names.clear();
@@ -14449,6 +14715,10 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // Step 9h: a class-scope static call reads its arg range only.
             Insn::CallStaticScoped(_, _, a, n) => {
+                (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+            }
+            // class-perf P2: a free-function call reads its arg range only.
+            Insn::CallFreeFunction(_, _, a, n) => {
                 (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
             }
             // Step 9g: a static-property READ has no register inputs.
@@ -16190,6 +16460,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // return width follows its runtime type) — bare dest store.
                 Insn::CallMethod(d, ..) => store(&mut rw, *d, None),
                 Insn::CallScopedMethod(d, ..) => store(&mut rw, *d, None),
+                Insn::CallFreeFunction(d, ..) => store(&mut rw, *d, None),
                 Insn::LoadClassStatic(d, ..) => store(&mut rw, *d, None),
                 // Step 9g: static store defines no SSA value; a fresh
                 // object handle has runtime-determined width (bare store).
@@ -17139,8 +17410,9 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
+        let empty_fns: HashMap<String, FunctionDeclaration> = HashMap::default();
         let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body);
+            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &empty_fns, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body);
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -17204,7 +17476,8 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body);
+        let empty_fns: HashMap<String, FunctionDeclaration> = HashMap::default();
+        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &empty_fns, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body);
         let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
@@ -17241,9 +17514,10 @@ mod tests {
         let shadow: HashSet<String> = ["os".to_string()].into_iter().collect();
         let mut compiler =
             BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
+        let empty_fns: HashMap<String, FunctionDeclaration> = HashMap::default();
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body)
+                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &empty_fns, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body)
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );

@@ -6616,6 +6616,10 @@ pub struct Simulator {
     /// the run. Hand out a refcounted handle instead; the deep copy happens
     /// once per function, then it is a refcount bump.
     fn_decl_cache: HashMap<String, std::rc::Rc<FunctionDeclaration>>,
+    /// class-perf P2: one-shot Rc snapshot of `module.functions` for the
+    /// method compiler (free-function calls). Built lazily on the first
+    /// class-method compile; cloned per call site by Rc only.
+    free_fn_table: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,
     /// Memoized answer to "is this module-scope function side-effect free?",
     /// used to decide whether a call may be skipped when its result provably
     /// cannot affect the expression. Conservative: anything the walker does
@@ -10453,6 +10457,7 @@ impl Simulator {
             fst_path: None,
             cast_widths,
             fn_decl_cache: HashMap::default(),
+            free_fn_table: None,
             fn_pure_cache: HashMap::default(),
             elem_dotted_bases: RefCell::new(None),
             fst_trace: Vec::new(),
@@ -28803,6 +28808,7 @@ impl Simulator {
                 Insn::CallMethod(..)
                 | Insn::CallScopedMethod(..)
                 | Insn::CallStaticScoped(..)
+                | Insn::CallFreeFunction(..)
                 | Insn::LoadClassStatic(..)
                 | Insn::StoreClassStatic(..)
                 | Insn::ConstructObject(..) => {
@@ -29583,6 +29589,7 @@ impl Simulator {
                 Insn::CallMethod(..)
                 | Insn::CallScopedMethod(..)
                 | Insn::CallStaticScoped(..)
+                | Insn::CallFreeFunction(..)
                 | Insn::LoadClassStatic(..)
                 | Insn::StoreClassStatic(..)
                 | Insn::ConstructObject(..) => {
@@ -31277,6 +31284,29 @@ impl Simulator {
                     if temps {
                         self.vm_drain_arg_temps(base, n);
                     }
+                    self.vm_regs[*dest as usize] = result;
+                    local_count += 1;
+                }
+                Insn::CallFreeFunction(dest, fname, arg_start, n_args) => {
+                    let base = *arg_start as usize;
+                    let n = *n_args as usize;
+                    // The callee resolves from the SAME table the compiler
+                    // admitted it from; a vanishing entry (module swap)
+                    // yields a benign zero like every other missing fn.
+                    let fd = self.fn_decl_rc(&fname.0);
+                    let mut args = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let v = self
+                            .vm_regs
+                            .get(base + i)
+                            .cloned()
+                            .unwrap_or_else(|| Value::zero(32));
+                        args.push(self.value_method_arg_expr(&v));
+                    }
+                    let result = match fd {
+                        Some(fd) => self.exec_function_call(&fd, &args),
+                        None => Value::zero(32),
+                    };
                     self.vm_regs[*dest as usize] = result;
                     local_count += 1;
                 }
@@ -45184,6 +45214,7 @@ impl Simulator {
             Insn::StoreClassStatic(..) => "StoreClassStatic",
             Insn::ConstructObject(..) => "ConstructObject",
             Insn::CallStaticScoped(..) => "CallStaticScoped",
+            Insn::CallFreeFunction(..) => "CallFreeFunction",
             Insn::CallCollMethod(..) => "CallCollMethod",
             Insn::LoadCollElem(..) => "LoadCollElem",
             Insn::StoreCollElem(..) => "StoreCollElem",
@@ -133679,6 +133710,47 @@ impl Simulator {
     /// members of other classes (`cnt` is inner's assoc, invisible in
     /// outer's shadow sets), lowering to a garbage LoadClassMember handle —
     /// the heartbeat regression (`uvm_heartbeat::remove` never deleted mc1).
+    /// class-perf P2: method names whose return type is `string` in EVERY
+    /// class that declares them (unanimous, name-global). Lets the bytecode
+    /// compiler type `obj.get_full_name()` as a string CONCAT operand
+    /// without per-receiver type knowledge. A name declared anywhere with a
+    /// non-string return (or as a task, which has none) stays OUT — unknown,
+    /// conservative, never a wrong byte-level join. Covers in-class
+    /// prototypes (extern bodies match them) at any virtual level; nested
+    /// classes are not walked (none in the UVM library).
+    fn class_unanimous_string_methods(&self) -> HashSet<String> {
+        use crate::ast::types::DataType as DT;
+        use crate::ast::types::SimpleType;
+        let mut rets: HashMap<String, bool> = HashMap::default();
+        for (_, cd) in self.module.classes.iter() {
+            for (_, m) in cd.methods.iter() {
+                let (name, is_str) = match &m.kind {
+                    crate::ast::decl::ClassMethodKind::Function(f)
+                    | crate::ast::decl::ClassMethodKind::Extern(f) => (
+                        f.name.name.name.clone(),
+                        matches!(
+                            &f.return_type,
+                            DT::Simple {
+                                kind: SimpleType::String,
+                                ..
+                            }
+                        ),
+                    ),
+                    // Task or pure-virtual prototype: a task has no return
+                    // value, disqualify the name outright.
+                    crate::ast::decl::ClassMethodKind::Task(t) => {
+                        (t.name.name.name.clone(), false)
+                    }
+                    crate::ast::decl::ClassMethodKind::PureVirtual(f) => {
+                        (f.name.name.name.clone(), false)
+                    }
+                };
+                rets.entry(name).and_modify(|v| *v &= is_str).or_insert(is_str);
+            }
+        }
+        rets.into_iter().filter(|(_, v)| *v).map(|(k, _)| k).collect()
+    }
+
     fn class_handle_member_types(&self) -> HashMap<String, HashMap<String, String>> {
         let mut out: HashMap<String, HashMap<String, String>> = HashMap::default();
         for (cn, _) in self.module.classes.iter() {
@@ -133768,25 +133840,96 @@ impl Simulator {
     /// A class-typed local holds a heap HANDLE in a VM register — like a
     /// class formal — so `.member` on it lowers to a heap access.
     fn class_typed_local_names(&self, body: &[Statement]) -> HashSet<String> {
-        fn walk(stmts: &[Statement], sim: &Simulator, out: &mut HashSet<String>) {
-            for st in stmts {
-                match &st.kind {
-                    crate::ast::stmt::StatementKind::VarDecl { data_type, declarators, .. } => {
-                        if sim.typeref_names_class(data_type) {
-                            for d in declarators {
-                                out.insert(d.name.name.clone());
-                            }
-                        }
-                    }
-                    crate::ast::stmt::StatementKind::SeqBlock { stmts, .. } => {
-                        walk(stmts, sim, out)
-                    }
-                    _ => {}
+        self.class_typed_local_types(body)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect()
+    }
+
+    /// class-perf P2: child statements of `st`, for full-body walks
+    /// (foreach loop-var typing walks into if/else/case/loop bodies the
+    /// same as the VarDecl walk above).
+    fn sub_stmts(st: &Statement) -> Vec<&Statement> {
+        use crate::ast::stmt::StatementKind as SK;
+        let mut out: Vec<&Statement> = Vec::new();
+        match &st.kind {
+            SK::If { then_stmt, else_stmt, .. } => {
+                out.push(then_stmt);
+                if let Some(e) = else_stmt {
+                    out.push(e);
                 }
             }
+            SK::Case { items, .. } => out.extend(items.iter().map(|it| &it.stmt)),
+            SK::For { body, .. }
+            | SK::Foreach { body, .. }
+            | SK::ForeachTail { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body, .. }
+            | SK::ForeverTail { body, .. }
+            | SK::TimingControl { stmt: body, .. }
+            | SK::Wait { stmt: body, .. } => out.push(body),
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                out.extend(stmts.iter())
+            }
+            _ => {}
         }
-        let mut out = HashSet::default();
-        walk(body, self, &mut out);
+        out
+    }
+
+    /// class-perf P2 (typed handle roots): the declared CLASS of each
+    /// class-typed body local (`Node n;` -> `Node`), declaration order,
+    /// outer scopes first (`entry().or_insert` mirrors shadowing). Feeds
+    /// `method_handle_chain_class` so dispatch chains rooted at a LOCAL
+    /// resolve statically instead of declining as untyped roots, and the
+    /// `lhs = new` target map (`ctxt = new;` inside `else begin…end`,
+    /// uvm_objection::m_drop). VarDecls at ANY statement nesting depth
+    /// count (if/else/case/loop/timing-control bodies included).
+    fn class_typed_local_types(&self, body: &[Statement]) -> Vec<(String, String)> {
+        fn walk(st: &Statement, sim: &Simulator, out: &mut Vec<(String, String)>) {
+            use crate::ast::stmt::StatementKind as SK;
+            match &st.kind {
+                SK::VarDecl { data_type, declarators, .. } => {
+                    if let Some(cls) = sim.typeref_class_name(data_type) {
+                        for d in declarators {
+                            out.push((d.name.name.clone(), cls.clone()));
+                        }
+                    }
+                }
+                SK::If { then_stmt, else_stmt, .. } => {
+                    walk(then_stmt, sim, out);
+                    if let Some(e) = else_stmt {
+                        walk(e, sim, out);
+                    }
+                }
+                SK::Case { items, .. } => {
+                    for it in items {
+                        walk(&it.stmt, sim, out);
+                    }
+                }
+                SK::For { body, .. }
+                | SK::Foreach { body, .. }
+                | SK::ForeachTail { body, .. }
+                | SK::While { body, .. }
+                | SK::DoWhile { body, .. }
+                | SK::Repeat { body, .. }
+                | SK::Forever { body, .. }
+                | SK::ForeverTail { body, .. }
+                | SK::TimingControl { stmt: body, .. }
+                | SK::Wait { stmt: body, .. } => walk(body, sim, out),
+                SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                    for s in stmts {
+                        walk(s, sim, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for st in body {
+            walk(st, self, &mut out);
+        }
         out
     }
 
@@ -134132,6 +134275,8 @@ impl Simulator {
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::PortDirection;
         use super::bytecode::BytecodeCompiler;
+        if std::env::var("XEZIM_FALLBACK_SITES").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) && (method_name.contains("m_drop") || method_name.contains("get_schedule")) {
+        }
         // COLD-PATH FIRST (class-perf P0): a u32-id interner lookup keyed by
         // String hashing ran on EVERY method call — two HashMap gets + a
         // `to_string` per call — which on call-heavy UVM workloads (hier-gen
@@ -134197,7 +134342,22 @@ impl Simulator {
         let pre = if let Some(p) = self.compiled_method_plans.get(&(cid, mid)) {
             p.clone()
         } else {
+            // Census aid: XEZIM_FALLBACK_SITES=1 also prints PLAN-phase
+            // declines (these never reach BytecodeCompiler's tracer), so a
+            // hot decliner can be attributed by method name.
+            let trace_decline = |reason: &str| -> bool {
+                std::env::var("XEZIM_FALLBACK_SITES")
+                    .map(|v| v != "0" && !v.is_empty())
+                    .unwrap_or(false)
+                    && {
+                        eprintln!(
+                            "[FALLBACK] plan-decline reason={reason} scope={cname}.{method_name}"
+                        );
+                        true
+                    }
+            };
             let ClassMethodKind::Function(_f) = kind else {
+                trace_decline("task");
                 self.compiled_method_skip.insert((cid, mid));
                 return None; // Tasks keep waits/scheduling on the AST interpreter.
             };
@@ -134212,6 +134372,7 @@ impl Simulator {
             let Some(rname) = fn_ret_name.map(str::to_string) else {
                 // No implicit return-variable name: the method is a plain
                 // `function void ...` body with no result cell. Keep AST.
+                trace_decline("no_result_cell");
                 self.compiled_method_skip.insert((cid, mid));
                 return None;
             }; // class-perf row 2: NON-INPUT formals (output / inout / ref) are
@@ -134236,6 +134397,7 @@ impl Simulator {
                         || self.enum_type_info(&port.data_type).is_some()
                         || self.scalar_formal_integral(&port.data_type).is_some());
                 if !shape_ok {
+                    trace_decline("noninput_formal_shape");
                     self.compiled_method_skip.insert((cid, mid));
                     return None;
                 }
@@ -134283,6 +134445,7 @@ impl Simulator {
                 // type. The Return handler resizes to it like any scalar.
                 pair
             } else {
+                trace_decline("ret_type");
                 self.compiled_method_skip.insert((cid, mid));
                 return None;
             };
@@ -134332,6 +134495,7 @@ impl Simulator {
                         // real/enum/collection formal: AST — memoize the skip
                         // (the decision is instance-independent: the declared
                         // formal type cannot change per instance).
+                        trace_decline("formal_type");
                         self.compiled_method_skip.insert((cid, mid));
                         return None;
                     };
@@ -134482,6 +134646,24 @@ impl Simulator {
                 // registers; the compiler needs their names (it cannot see
                 // the class table).
                 let class_locals = self.class_typed_local_names(body);
+                // class-perf P2 (typed handle roots): declared class per
+                // handle FORMAL and class-typed body LOCAL, so a dispatch
+                // chain rooted at one (`sched.m_parent.get_phase_type()` —
+                // uvm_phase::get_schedule) resolves STATICALLY instead of
+                // refusing as an untyped root. Per-method and instance-
+                // independent (declared types only), like every plan input.
+                let mut handle_local_types = {
+                    let mut m: HashMap<String, String> = HashMap::default();
+                    for port in ports {
+                        if let Some(cls) = self.typeref_class_name(&port.data_type) {
+                            m.insert(port.name.name.clone(), cls);
+                        }
+                    }
+                    for (n, t) in self.class_typed_local_types(body) {
+                        m.entry(n).or_insert(t);
+                    }
+                    m
+                };
                 // Step 9e: method-name admission set for bare this-bounded
                 // calls.
                 let method_name_set = self.class_method_name_set(cname);
@@ -134577,7 +134759,115 @@ impl Simulator {
                 }
                 // Step 9e: typed handle-chain admission inputs — the
                 // method's own class and every class's handle-member types.
+                // class-perf P2: flat `pkg::name` -> (value,width) snapshot
+                // of the package enum table (report-macro constants).
+                let pkg_enum_consts: HashMap<String, (u64, u32)> = self
+                    .module
+                    .package_enum_members
+                    .iter()
+                    .flat_map(|(pkg, members)| {
+                        members.iter().filter(|(_, (_, w))| *w <= 64).map(
+                            move |(m, (v, w))| (format!("{}::{}", pkg, m), (*v, *w)),
+                        )
+                    })
+                    .collect();
+                // class-perf P2: Rc snapshot of the free-function table
+                // (lazy, shared across every method compile).
+                let free_fn_table = self.free_fn_table.clone().unwrap_or_else(|| {
+                    let rc = std::rc::Rc::new(self.module.functions.clone());
+                    self.free_fn_table = Some(rc.clone());
+                    rc
+                });
                 let handle_member_types = self.class_handle_member_types();
+                // class-perf P2: FOREACH loop variables over a collection
+                // MEMBER whose element is a class handle (`foreach
+                // (m_successors[succ])` — uvm_phase::m_find_successor_by_name)
+                // get the element class, so `succ.get_schedule()` chains
+                // resolve statically. Uses the same element-class entries
+                // the Step 9e map feeds; collections over LOCALS stay
+                // untyped (declined). Walk at any nesting depth.
+                {
+                    let member_elem_classes: &HashMap<String, String> =
+                        handle_member_types.get(cname).unwrap_or_else(|| {
+                            static EMPTY: std::sync::OnceLock<HashMap<String, String>> =
+                                std::sync::OnceLock::new();
+                            EMPTY.get_or_init(HashMap::default)
+                        });
+                    fn member_assoc_key_class(
+                        sim: &Simulator,
+                        cname: &str,
+                        member: &str,
+                    ) -> Option<String> {
+                        // A member declared with a TYPEDEF'd assoc type
+                        // (`typedef bit edges_t[uvm_phase];` + `edges_t
+                        // m_successors;`): the foreach loop var iterates the
+                        // KEYS, whose class the typedef's unpacked dim
+                        // records. Walk the chain leaf-first.
+                        let mut cur = Some(cname.to_string());
+                        let mut seen = HashSet::default();
+                        while let Some(cn) = cur {
+                            if !seen.insert(cn.clone()) {
+                                break;
+                            }
+                            let cd = sim.module.classes.get(&cn)?;
+                            if let Some(dt) = cd.property_types.get(member)
+                                && let crate::ast::types::DataType::TypeReference { name: tn, .. } =
+                                    dt
+                                && let Some(dims) =
+                                    sim.module.typedef_unpacked_dims.get(&tn.name.name)
+                                && let [crate::ast::types::UnpackedDimension::Associative {
+                                    data_type: Some(key),
+                                    ..
+                                }] = dims.as_slice()
+                            {
+                                return sim.typeref_class_name(key);
+                            }
+                            cur = cd.extends.clone();
+                        }
+                        None
+                    }
+                    fn walk_foreach(
+                        st: &Statement,
+                        member_elem_classes: &HashMap<String, String>,
+                        m: &mut HashMap<String, String>,
+                        sim: &Simulator,
+                        cname: &str,
+                    ) {
+                        use crate::ast::stmt::StatementKind as SK;
+                        if let SK::Foreach { array, vars, .. } = &st.kind {
+                            if let ExprKind::Ident(h) = &array.kind
+                                && h.root.is_none()
+                                && h.path.len() == 1
+                                && h.path[0].selects.is_empty()
+                            {
+                                let elem_or_key = member_elem_classes
+                                    .get(h.path[0].name.name.as_str())
+                                    .cloned()
+                                    .or_else(|| {
+                                        member_assoc_key_class(
+                                            sim,
+                                            cname,
+                                            &h.path[0].name.name,
+                                        )
+                                    });
+                                if let Some(cls) = elem_or_key
+                                    && let Some(Some(v)) = vars.first()
+                                {
+                                    m.entry(v.name.clone()).or_insert_with(|| cls);
+                                }
+                            }
+                        }
+                        for sub in Simulator::sub_stmts(st) {
+                            walk_foreach(sub, member_elem_classes, m, sim, cname);
+                        }
+                    }
+                    for st in body {
+                        walk_foreach(st, member_elem_classes, &mut handle_local_types, self, cname);
+                    }
+                }
+                // class-perf P2: unanimous string-returning method names
+                // (string concat operand typing).
+                let string_method_names = self.class_unanimous_string_methods();
                 // Step 9g: DECLARED class types of bare lvalues — locals
                 // (from the method body's own VarDecls), static members,
                 // and instance members of the enclosing chain — filtered
@@ -134616,16 +134906,12 @@ impl Simulator {
                         }
                     }
                 }
-                for st in body.iter() {
-                    if let StatementKind::VarDecl { declarators, data_type, .. } = &st.kind {
-                        for d in declarators {
-                            if let Some(t) = self
-                                .typeref_class_name(data_type)
-                                .filter(|t| !self.class_is_parameterized(t))
-                            {
-                                new_type_map.insert(d.name.name.clone(), t);
-                            }
-                        }
+                // Step 9g locals: VarDecls at ANY nesting depth (a
+                // `ctxt = new;` inside `else begin…end` — uvm_objection::
+                // m_drop — has the same declared class as a top-level one).
+                for (n, t) in self.class_typed_local_types(body) {
+                    if !self.class_is_parameterized(&t) {
+                        new_type_map.entry(n).or_insert(t);
                     }
                 }
                 // Step 9h: receiver names admitted for CLASS-SCOPE static
@@ -134677,6 +134963,9 @@ impl Simulator {
                         &self.module.arrays,
                         &self.widths,
                     );
+                    if std::env::var_os("XEZIM_FALLBACK_SITES").is_some() {
+                        compiler.scope_hint = Some(format!("{}.{}", cname, method_name));
+                    }
                     let body_refs: Vec<&crate::ast::stmt::Statement> = body.iter().collect();
                     let compiler_outcome =
                         compiler
@@ -134692,6 +134981,10 @@ impl Simulator {
                                 &const_names,
                                 &new_type_map,
                                 &scope_static_receivers,
+                                &handle_local_types,
+                                &string_method_names,
+                                &free_fn_table,
+                                &pkg_enum_consts,
                                 cname,
                                 &handle_member_types,
                                 &shadow_names,
@@ -134797,6 +135090,21 @@ impl Simulator {
         let block = &entry.block;
         let this_reg = entry.this_reg;
         let result_reg = entry.result_reg;
+        if std::env::var("XEZIM_FALLBACK_SITES")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+        {
+            use std::sync::OnceLock;
+            static SEEN: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+                OnceLock::new();
+            let key = format!("{}.{}", cname, method_name);
+            SEEN
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap()
+                .insert(key.clone())
+                .then(|| eprintln!("[FALLBACK] runs-compiled scope={key}"));
+        }
         // Swap OUT whatever registers the CALLER's VM is using so this
         // method's execution gets a fresh file and a nested compiled method
         // (a `CallMethod` re-entering exec_method_call above) can never
