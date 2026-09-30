@@ -63117,7 +63117,9 @@ impl Simulator {
                     // Check local stack
                     if !self.local_stack.is_empty() {
                         let last_idx = self.local_stack.len() - 1;
-                        if self.local_stack[last_idx].contains_key(name) {
+                        if let Some(prev_is_real) =
+                            self.local_stack[last_idx].get(name).map(|p| p.is_real)
+                        {
                             // §10.7: on assignment to a sized local, resize
                             // the RHS to the local's DECLARED width so a
                             // narrow signed literal sign-extends (e.g.
@@ -63137,12 +63139,7 @@ impl Simulator {
                             // text).
                             let is_str = self.string_signals.contains(name.as_str())
                                 || self.p_local_is_string(name);
-                            let fitted = if !val.is_real
-                                && !is_str
-                                && self.local_stack[last_idx]
-                                    .get(name)
-                                    .is_some_and(|p| p.is_real)
-                            {
+                            let fitted = if prev_is_real && !val.is_real && !is_str {
                                 // §6.12.2: an integral value assigned to a REAL
                                 // local converts; stored as integral bits, a
                                 // `real t; t = k; h = t / 2;` divided as integers.
@@ -63166,12 +63163,7 @@ impl Simulator {
                                 } else {
                                     val.clone()
                                 }
-                            } else if val.is_real
-                                && !is_str
-                                && self.local_stack[last_idx]
-                                    .get(name)
-                                    .is_some_and(|p| !p.is_real)
-                            {
+                            } else if val.is_real && !is_str && !prev_is_real {
                                 // §6.12.2: a real assigned to an INTEGRAL local
                                 // rounds to the local's type — the module-variable
                                 // path did, the frame local kept the real, so an
