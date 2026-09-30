@@ -35,6 +35,8 @@ mod fst_time_table_breakeven;
 mod interrupt_finalizes_dumps;
 #[path = "gates/nameless_udp_instance.rs"]
 mod nameless_udp_instance;
+#[path = "gates/net_declaration_delay.rs"]
+mod net_declaration_delay;
 #[path = "gates/opt_pass_equivalence.rs"]
 mod opt_pass_equivalence;
 #[path = "gates/packed_member_nba_compiles.rs"]

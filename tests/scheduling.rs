@@ -121,6 +121,8 @@ mod intra_assignment_delay;
 mod intra_assignment_event_identifier;
 #[path = "scheduling/ivtest_always_cluster.rs"]
 mod ivtest_always_cluster;
+#[path = "scheduling/large_array_element_events.rs"]
+mod large_array_element_events;
 #[path = "scheduling/local_arrays_and_edge_always.rs"]
 mod local_arrays_and_edge_always;
 #[path = "scheduling/loop_control_and_oob_index.rs"]

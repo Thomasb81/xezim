@@ -103,5 +103,7 @@ mod vpi_net_kinds;
 mod vpi_object_model_walk;
 #[path = "strings/vpi_routines.rs"]
 mod vpi_routines;
+#[path = "strings/vpi_typed_port_kinds.rs"]
+mod vpi_typed_port_kinds;
 #[path = "strings/wide_string2num.rs"]
 mod wide_string2num;

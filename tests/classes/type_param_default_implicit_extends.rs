@@ -65,3 +65,78 @@ endmodule
     assert!(o.iter().any(|l| l == "TP|f 16 4"), "explicit/func: {o:?}");
     assert!(o.iter().any(|l| l == "TP|t 16 4"), "explicit/task: {o:?}");
 }
+
+const LEAVES: &str = r#"
+class pbase #(type T = int, int W = 8, int D = W*2);
+  virtual function void show_f(string who); $display("T|%s F %0d %0d %0d", who, $bits(T), W, D); endfunction
+  virtual task show_t(string who); $display("T|%s T %0d %0d %0d", who, $bits(T), W, D); endtask
+endclass
+class dimp extends pbase; endclass
+class dpar #(int X = 1) extends pbase; endclass
+class dmid extends pbase #(bit [15:0]); endclass
+class dmid2 extends pbase #(byte, 4); endclass
+class dgrand extends dimp; endclass
+module tb;
+  dimp a; dpar b; dmid c; dmid2 e; dgrand g;
+  initial begin
+    a = new; b = new; c = new; e = new; g = new;
+    a.show_f("imp"); a.show_t("imp");
+    b.show_f("par"); b.show_t("par");
+    c.show_f("mid"); c.show_t("mid");
+    e.show_f("mid2"); e.show_t("mid2");
+    g.show_f("grand"); g.show_t("grand");
+  end
+endmodule
+"#;
+
+fn leaves() -> Vec<String> {
+    let sim = xezim::simulate(LEAVES, 10).expect("simulate");
+    sim.output.iter().map(|o| o.message.clone()).collect()
+}
+
+/// The first two parameters through an implicit, explicit, partial and
+/// grandchild specialization, on both method paths.
+#[test]
+fn leaf_specializations_see_type_and_value_parameters() {
+    let o = leaves();
+    for (who, bits, w) in [
+        ("imp", 32, 8),
+        ("mid", 16, 8),
+        ("mid2", 8, 4),
+        ("grand", 32, 8),
+    ] {
+        for path in ["F", "T"] {
+            let want = format!("T|{who} {path} {bits} {w} ");
+            assert!(o.iter().any(|l| l.starts_with(&want)), "{want}: {o:?}");
+        }
+    }
+}
+
+/// §6.20.2: a default may name an earlier parameter; `D = W*2` follows `W`.
+#[test]
+#[ignore = "known gap: a parameter default that depends on another parameter reads x"]
+fn dependent_parameter_default_follows_the_specialization() {
+    let o = leaves();
+    for line in [
+        "T|imp F 32 8 16",
+        "T|imp T 32 8 16",
+        "T|mid F 16 8 16",
+        "T|mid2 F 8 4 8",
+        "T|mid2 T 8 4 8",
+        "T|grand T 32 8 16",
+    ] {
+        assert!(o.iter().any(|l| l == line), "missing `{line}`: {o:?}");
+    }
+}
+
+/// A parameterized class that extends `pbase` without arguments still gets
+/// `T` = `int`.
+#[test]
+#[ignore = "known gap: a parameterized derived class sees the base type parameter as logic"]
+fn parameterized_leaf_keeps_the_base_type_default() {
+    let o = leaves();
+    for path in ["F", "T"] {
+        let want = format!("T|par {path} 32 8 ");
+        assert!(o.iter().any(|l| l.starts_with(&want)), "{want}: {o:?}");
+    }
+}
