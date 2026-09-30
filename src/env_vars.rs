@@ -65,6 +65,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: trace block-local declaration binding",
     ),
     (
+        "XEZIM_BIT_SENS",
+        "Scheduling: bit-granular comb sensitivity (a write re-runs only readers of the changed bits); 0 disables",
+    ),
+    (
         "XEZIM_BM_CENSUS",
         "Census: print every builtin-method call as `[bm] <receiver> <method> this=<bool>` (aggregate with sort | uniq -c)",
     ),
@@ -355,6 +359,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: trace named-event trigger/wait matching",
     ),
     (
+        "XEZIM_EXIT_AFTER_COMPILE",
+        "Profiling: exit right after elaboration and compile, before simulation time 0",
+    ),
+    (
         "XEZIM_FALLBACK_SITES",
         "Report each construct handed to the AST interpreter: reason, source byte span, scope",
     ),
@@ -593,7 +601,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_PACKED_MEM",
-        "Memory: opt-in packed byte storage for large narrow arrays (0/1)",
+        "Memory: packed arena storage for large integral arrays (on; 0 turns it off)",
     ),
     (
         "XEZIM_PARALLEL_SERIALIZE",
@@ -764,6 +772,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "XEZIM_RESIZE_ELIDE",
         "Values: elide redundant resize operations (0/1)",
     ),
+    (
+        "XEZIM_RSS_TRACE",
+        "Memory: print resident/peak RSS at each pipeline and compile phase",
+    ),
     ("XEZIM_RS_STATS", "Print resize/copy statistics for Values"),
     (
         "XEZIM_SETTLE_LEVELS",
@@ -917,6 +929,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_VERIFY_INLINE_BITS",
         "JIT: shadow-verify the inline-bits mirror against Values",
+    ),
+    (
+        "XEZIM_VIRTUAL_NAME_MIN_CELLS",
+        "Names: arrays of at least this many cells get virtual element names (default 257; 0 = all)",
     ),
     (
         "XEZIM_WAITERS_FIRST",

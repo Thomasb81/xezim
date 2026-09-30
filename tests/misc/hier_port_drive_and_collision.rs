@@ -36,11 +36,7 @@ fn run(name: &str, src: &str) -> String {
     text
 }
 
-#[test]
-fn hierarchical_assign_drives_deep_input_through_unconnected_ports() {
-    let text = run(
-        "hier_drive",
-        r#"package pkt_defs;
+const HIER_DRIVE_SRC: &str = r#"package pkt_defs;
    typedef struct packed {
       logic [7:0]  payload;
       logic        strobe;
@@ -126,9 +122,30 @@ module tb_top;
       $finish;
    end
 endmodule
-"#,
-    );
+"#;
+
+#[test]
+fn hierarchical_assign_drives_deep_input_through_unconnected_ports() {
+    let text = run("hier_drive", HIER_DRIVE_SRC);
     assert!(text.contains("TEST_PASS"), "hierarchical drive:\n{text}");
+}
+
+/// The same drive onto ports declared as NETS (`input wire logic clk_i`).
+/// The multi-driver net fold counted the hierarchical assign and the port's
+/// connect assign as two drivers of one net and merged them on a single
+/// level of the alias chain, so the flop, reading another level, never
+/// clocked. §23.2.2.3 makes the `input logic` ports above nets too.
+#[test]
+fn hierarchical_assign_drives_deep_wire_input_through_unconnected_ports() {
+    let src = HIER_DRIVE_SRC
+        .replace("input  logic clk_i", "input  wire logic clk_i")
+        .replace("input  logic srst_i", "input  wire logic srst_i");
+    assert!(src.contains("input  wire logic clk_i"));
+    let text = run("hier_drive_wire", &src);
+    assert!(
+        text.contains("TEST_PASS"),
+        "hierarchical drive (wire ports):\n{text}"
+    );
 }
 
 #[test]

@@ -101,6 +101,17 @@ DPI_CONTEXT const char *svGetNameFromScope(svScope scope);
 DPI_CONTEXT svScope svGetScope(void);
 DPI_CONTEXT svScope svSetScope(svScope scope);
 
+/* Simulation time for DPI code. A scope naming a module or instance answers
+ * with that module's timescale; NULL answers with the simulation's (its
+ * finest precision). Units are powers of ten in seconds (-9 = 1 ns).
+ * svGetTime fills `high`/`low` with simulation ticks when time->type is
+ * vpiSimTime, or `real` in the scope's time unit when it is
+ * vpiScaledRealTime. Each returns 0, or -1 on a NULL output pointer. */
+typedef s_vpi_time svTimeVal;
+DPI_CONTEXT int svGetTime(const svScope scope, svTimeVal *time);
+DPI_CONTEXT int svGetTimeUnit(const svScope scope, int32_t *time_unit);
+DPI_CONTEXT int svGetTimePrecision(const svScope scope, int32_t *time_precision);
+
 /* Compatibility marker for tools that test which DPI standard we
  * expose. The 1800-2005 value 0 is the UVM-required minimum. */
 #ifndef DPI_COMPATIBILITY_VERSION_1800_2005

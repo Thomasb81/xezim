@@ -4,7 +4,7 @@
 /* Minimal veriuser.h stub for compiling the Accellera UVM reference
  * implementation against xezim.
  *
- * The original Verilog-XL `veriuser.h` declares the TF (task/function)
+ * The traditional `veriuser.h` declares the TF (task/function)
  * and acc_ (access) PLI interfaces that legacy simulators expose.
  * xezim does NOT implement the TF / acc_ PLI v1.0 surface; UVM 1.2
  * still `#include "veriuser.h"` for a handful of constant definitions

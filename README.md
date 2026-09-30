@@ -27,13 +27,12 @@ The simulator is being developed incrementally, starting from simple combination
 Current capabilities include:
 
 * IEEE 1800-2023 grammar by default (`--sv2017` opts back to the earlier edition)
-* SystemVerilog module parsing
-* Signal and net representation
-* Continuous assignments
-* Basic expression evaluation
-* Combinational logic simulation
-* Sequential simulation infrastructure
-* Test execution framework
+* Event-driven simulation of RTL and gate-level netlists — continuous
+  assignments, procedural blocks and the IEEE 1800 scheduling regions, UDPs and
+  drive strengths, specify-block delays and timing checks, and SDF
+  back-annotation (`--sdf`)
+* Classes, constrained randomization, covergroups and concurrent assertions
+  (SVA) — the base the UVM support below runs on
 * Waveform / trace dumps (**`--wave`**, off by default) — VCD
   (`$dumpfile`/`$dumpvars`; IEEE 1800-2017 §21.7, and matches Verilator/Icarus
   in GTKWave), **FST** (`--fst`, GTKWave's binary format, written on a
@@ -50,7 +49,9 @@ Current capabilities include:
   objection-driven termination → report summary. The reference testbench
   (GettingVerilatorStartedWithUVM) reaches exact Verilator parity on the 2017
   library and runs green on 2020.3.1, and 32/35 UVM 1800.2-2017 example
-  testbenches pass. Multiple top
+  testbenches pass. The mbits-mirafra AVIP base tests for axi4, apb, i3c, spi
+  and axi4Lite print the same UVM messages as a commercial reference
+  simulator. Multiple top
   modules (`-s hdl_top -s hvl_top`) and virtual-interface `config_db` are supported.
   See [docs/uvm-guide.md](docs/uvm-guide.md).
 * **UVM's DPI-C library, built in** — compile UVM without `-DUVM_NO_DPI` and its
@@ -127,7 +128,7 @@ flows. Portable code should not rely on them.
 * **`$deposit(target, value)`** — sets `target` to `value` immediately *without*
   installing a persistent driver: the value holds until the next driver
   transaction overwrites it (on an undriven net it simply sticks). This is a
-  Verilog-XL/VCS system task, **not** in the LRM. xezim matches the vendor
+  system task from commercial simulators, **not** in the LRM. xezim matches their
   semantics — a variable keeps the deposited value, and a real driver on a net
   overrides a deposit on its next update.
 * Gate-level-simulation CLI flags — `+nospecify`, `+notimingcheck`,
@@ -137,10 +138,51 @@ flows. Portable code should not rely on them.
 
 ---
 
+# Performance
+
+Whole-run wall-clock time on one machine (Intel Core i7-9800X, 6 cores,
+Linux): xezim 0.11 as a plain release build, against a commercial reference
+simulator in its optimized mode (no debug visibility). Both simulators produce
+the same results on every row.
+
+| Workload | xezim 0.11 | Reference simulator |
+|---|---|---|
+| XuanTie C906 SoC, CoreMark ×1 (295,294 cycles) | 91 s | 82 s, 44 s of it simulating |
+| XuanTie C910 dual-core SoC, memcpy ×200, cold start | 118 s, about 18 s of it compiling | 136 s, 97 s of it simulating |
+| AXI4 AVIP, UVM base test | 5.8 s | 97 s, 51 s of it simulating |
+| Peak memory, C906 CoreMark | 2.6 GB (0.9 GB with `XEZIM_PACKED_MEM=1`) | 57 MB |
+
+What the table shows:
+
+* **xezim starts fast.** It compiles and elaborates the 468-file C910 in
+  about 18 s, and a short UVM test finishes long before the reference has
+  started simulating. Test suites made of many short runs favour xezim.
+* **On long runs the reference's kernel is faster.** Its simulation phase is
+  about 2× faster on the C906. The gap is widest on UVM throughput: a sequence
+  item costs xezim about 9 M host instructions against about 120 K for the
+  reference, so long UVM runs still favour the reference. 0.11 cut xezim's
+  cost per item by about 60%, and this is where the current work goes.
+* **Memory is the other gap.** Most of the C906 figure is its large on-chip
+  RAMs; `XEZIM_PACKED_MEM=1` stores byte-wide memories compactly at the same
+  speed.
+
+To get the most out of a build, use the [profile-guided
+build](#profile-guided-build-recommended-for-release) (up to 14.5% fewer
+instructions when trained on your own workload) and keep the [warm design
+cache](#warm-design-cache) on. [Native compilation](#native-compilation) pays
+on designs with few, very hot blocks (Ibex CoreMark −23%) and is a net loss on
+large SoCs, so measure it on yours.
+
+# Conformance
+
+On the [sv-tests](https://github.com/chipsalliance/sv-tests) suite, xezim
+0.11.0 passes 4,722 of 4,770 tests (99.0%). Its own regression suite is
+described under [Test Suite](#test-suite).
+
 # Release notes
 
-Per-release change lists, the verified-workload table and the compliance
-results live in [NOTES.md](NOTES.md).
+Per-release change lists and earlier workload measurements live in
+[NOTES.md](NOTES.md).
 
 # Development workflow
 
@@ -271,11 +313,30 @@ means your local checkout is active).
 
 ## Test Suite
 
-~2,370 integration tests run in CI, each in **both** execution modes — the
-bytecode interpreter (`cargo test`) and the JIT (`cargo test --features jit`).
-A large share are differential tests whose expected values were measured on a
-commercial reference simulator; their doc comments cite the LRM section and
-the measured behavior.
+The suite has **3,152 tests**: 3,110 integration tests in ten suites plus 42
+unit tests (as of 0.11; 9 more are marked `#[ignore]`). Each suite is one test
+binary, `tests/<suite>.rs`, with its cases in `tests/<suite>/`:
+
+| Suite | Tests | Covers |
+|---|---:|---|
+| `classes` | 460 | classes, UVM, randomization, covergroups |
+| `collections` | 155 | queues, dynamic and associative arrays, array methods |
+| `gates` | 122 | gate primitives, UDPs, drive strengths, waveform dumps |
+| `hierarchy` | 246 | instances, ports, interfaces, binds, hierarchical references |
+| `misc` | 1,009 | CLI, lint, elaboration, assignments and other cases |
+| `perf` | 35 | deterministic work counters that catch performance regressions |
+| `scheduling` | 432 | event regions, sensitivity, timing, assertions |
+| `strings` | 152 | strings, formatting, DPI |
+| `types` | 495 | data types, widths, selects, operators |
+| `upf` | 4 | power intent (`--upf`) |
+
+The xezim-core repo has its own 144 tests for the parser and elaboration.
+
+CI runs the suite twice: in a default build (`cargo test`) and in a build with
+the JIT compiled in (`cargo test --features jit`). JIT execution itself is
+switched on at run time with `XEZIM_JIT=1`. A large share are differential
+tests whose expected values were measured on a commercial reference simulator;
+their doc comments cite the LRM section and the measured behavior.
 
 **Credit:**
 All `pr*.v` tests were taken from the **Icarus Verilog test suite**.
@@ -401,6 +462,7 @@ Selected env knobs (off by default unless noted):
 | `XEZIM_NO_NATIVE_CACHE=1` | Disable the persistent native-library cache (`~/.cache/xezim/native`) |
 | `XEZIM_REGIONS=1` | Fuse dependency-connected compiled combinational entries into region blocks (experimental; currently net-negative on the benchmark set) |
 | `XEZIM_STUCK_CLOCK=1` | Flag a process parked on a clock/reset that never changes while the design keeps churning edges (`abort` variant for CI) |
+| `XEZIM_PACKED_MEM=1` | Store large byte-wide memories in a compact arena (C906: 2.6 GB → 0.9 GB peak memory, same speed) |
 | `XEZIM_INIT_ZERO=1` | Coerce X-initialized signals/arrays to 0 (required for some C910/C906 workloads, e.g. cmark) |
 | `XEZIM_PROGRESS=N` | Emit a `[PROGRESS]` line every N wall-seconds (sim_time, iters, edges_fired, nba_q) |
 | `XEZIM_CACHE_DIR=<dir>` | Override the elaborated-design cache directory |
@@ -440,7 +502,7 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `<top> …`, `work.<top>` | A bare design-unit name that is not an existing file names a top module, same as `-s <top>`. Several give several tops. `<lib>.<top>` works for `work` and libraries named by an earlier `-work`/`-L`/`-lib` |
 | `+define+A+B=1`, `+incdir+d1+d2` | Several macros / directories in one flag (as before) |
 | `-f <file>`, `-file <file>` | Args file; relative file names resolve as given, else against the args file's directory |
-| `-F <file>` | Same as `-f`, and `+incdir+` directories inside it resolve the same way |
+| `-F <file>` | Same as `-f`, except that `+incdir+` directories inside it resolve against the args file's directory first, so `+incdir+.` names the file's own directory |
 | `-do "<cmds>"`, `-do <file>` | A subset of the command language: `run -all` (until `$finish` or no events remain), `run <n><unit>` (`fs`…`sec`; several `run`s add up; the run ends at that time, which `final` blocks and the closing line report), `quit`/`exit` (`-f`, `-force`), `do <file>`, separated by `;` or newlines, `#` comments. `log`, `add wave`, `coverage save` and `coverage report` are accepted with one warning each and do nothing. Any other command is an error. A script that quits before any `run` only elaborates. `--max-time` stays a hard cap |
 | `-gNAME=VAL` | Sets the default of parameter `NAME` in every module, interface or program that declares it overridable (a `string` parameter takes an unquoted value as text); a value given at an instantiation or by `defparam` still wins. Parameters in generate blocks, and body `parameter`s of a module that has a parameter port list, are local and not reached. `-g/<top>/NAME=VAL` limits it to module `<top>`; deeper paths are ignored with a warning. A name no module declares is warned about and ignored |
 | `-GNAME=VAL` | Like `-g`, and it also replaces values given at instantiations and by `defparam` |

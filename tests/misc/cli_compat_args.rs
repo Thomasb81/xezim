@@ -341,6 +341,25 @@ fn defines_incdirs_and_args_files() {
     assert_eq!(ok_stdout(&d, &["-file", "files.f"]), native);
 }
 
+/// `+incdir+.` in a `-F` file elsewhere is the file's own directory. `.`
+/// always exists relative to the working directory too, which used to win,
+/// so every include below the file's directory was lost.
+#[test]
+fn dash_f_incdir_dot_is_the_args_files_directory() {
+    let d = scratch("incdir_dot");
+    std::fs::create_dir_all(d.join("dv/inc")).unwrap();
+    std::fs::create_dir_all(d.join("dv/tb")).unwrap();
+    std::fs::write(d.join("dv/inc/val.svh"), "`define VAL 42\n").unwrap();
+    std::fs::write(
+        d.join("dv/tb/tb.sv"),
+        "`include \"inc/val.svh\"\nmodule tb; initial $display(\"VAL=%0d\", `VAL); endmodule\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("dv/files.f"), "+incdir+.\ntb/tb.sv\n").unwrap();
+    let out = ok_stdout(&d, &["-F", "dv/files.f"]);
+    assert!(out.contains("VAL=42"), "{}", out);
+}
+
 const TOPS: &str = "\
 module tb #(parameter int W = 4, parameter string S = \"def\") ();
   sub u_dflt();

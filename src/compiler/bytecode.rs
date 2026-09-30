@@ -2,6 +2,7 @@
 //! Compiles AST expressions and statements into a flat instruction array
 //! that can be executed without pointer-chasing through Box<Expression> trees.
 
+use super::simulator::NameMap;
 use super::value::Value;
 use crate::ast::decl::{FunctionDeclaration, TaskDeclaration};
 use crate::ast::expr::*;
@@ -1257,11 +1258,107 @@ struct LocalArrayBind {
     is_real: bool,
 }
 
+/// `format!("{}.{}", scope, name)` without the formatting machinery: the
+/// compiler builds one such scoped key per identifier lookup.
+fn cat_dot(scope: &str, name: &str) -> String {
+    let mut s = String::with_capacity(scope.len() + 1 + name.len());
+    s.push_str(scope);
+    s.push('.');
+    s.push_str(name);
+    s
+}
+
+/// Per-register read counts over one instruction stream, kept in step with
+/// edits: "does any instruction outside these slots read `r`" becomes a
+/// count comparison instead of a scan of the whole block (the peephole
+/// passes ask it once per candidate, which made them quadratic).
+struct RegReaders {
+    reads: Vec<u32>,
+    fallbacks: u32,
+}
+
+impl RegReaders {
+    fn new(insns: &[Insn]) -> Self {
+        let mut rr = RegReaders {
+            reads: Vec::new(),
+            fallbacks: 0,
+        };
+        for insn in insns {
+            rr.add(insn);
+        }
+        rr
+    }
+
+    fn bump(&mut self, insn: &Insn, up: bool) {
+        let reads = &mut self.reads;
+        let exact = BytecodeCompiler::insn_read_regs(insn, &mut |r| {
+            let r = r as usize;
+            if r >= reads.len() {
+                reads.resize(r + 1, 0);
+            }
+            if up {
+                reads[r] += 1;
+            } else {
+                reads[r] -= 1;
+            }
+        });
+        if !exact {
+            if up {
+                self.fallbacks += 1;
+            } else {
+                self.fallbacks -= 1;
+            }
+        }
+    }
+
+    fn add(&mut self, insn: &Insn) {
+        self.bump(insn, true);
+    }
+
+    fn remove(&mut self, insn: &Insn) {
+        self.bump(insn, false);
+    }
+
+    /// `insns.iter().enumerate().any(|(k, x)| !skip.contains(&k) &&
+    /// BytecodeCompiler::insn_reads_reg(x, r))` for distinct `skip` slots.
+    fn read_outside(&self, insns: &[Insn], r: RegId, skip: &[usize]) -> bool {
+        let mut own = 0u32;
+        let mut own_fallbacks = 0u32;
+        for &k in skip {
+            if let Some(x) = insns.get(k) {
+                if !BytecodeCompiler::insn_read_regs(x, &mut |q| own += (q == r) as u32) {
+                    own_fallbacks += 1;
+                }
+            }
+        }
+        self.fallbacks > own_fallbacks || self.reads.get(r as usize).copied().unwrap_or(0) > own
+    }
+}
+
+thread_local! {
+    static SCOPED_KEY_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Run `f` on `scope.name` without allocating it: the key is built in a
+/// reused buffer (a nested use falls back to a fresh string).
+fn with_dotted<R>(scope: &str, name: &str, f: impl FnOnce(&str) -> R) -> R {
+    SCOPED_KEY_BUF.with(|b| match b.try_borrow_mut() {
+        Ok(mut buf) => {
+            buf.clear();
+            buf.push_str(scope);
+            buf.push('.');
+            buf.push_str(name);
+            f(&buf)
+        }
+        Err(_) => f(&cat_dot(scope, name)),
+    })
+}
+
 pub struct BytecodeCompiler<'a> {
     insns: Vec<Insn>,
     next_reg: u32,
     register_overflow: bool,
-    signal_name_to_id: &'a HashMap<Arc<str>, usize>,
+    signal_name_to_id: &'a NameMap,
     signal_signed: &'a [bool],
     signal_widths: &'a [u32],
     /// Per-signal `is_real`. Optional because only the simulator has it;
@@ -1673,7 +1770,7 @@ pub struct BytecodeCompiler<'a> {
 
 impl<'a> BytecodeCompiler<'a> {
     pub fn new(
-        signal_name_to_id: &'a HashMap<Arc<str>, usize>,
+        signal_name_to_id: &'a NameMap,
         signal_signed: &'a [bool],
         signal_widths: &'a [u32],
         arrays: &'a HashMap<String, (i64, i64, u32)>,
@@ -1854,7 +1951,7 @@ impl<'a> BytecodeCompiler<'a> {
         if !raw.contains('.')
             && let Some(scope) = &self.scope_hint
         {
-            candidates.push(format!("{}.{}", scope, raw));
+            candidates.push(cat_dot(scope, &raw));
         }
         if let Some(leaf) = hier.path.last() {
             candidates.push(leaf.name.name.clone());
@@ -2151,7 +2248,7 @@ impl<'a> BytecodeCompiler<'a> {
             return true;
         }
         if let Some(scope) = &self.scope_hint {
-            let qual = format!("{}.{}", scope, raw);
+            let qual = cat_dot(scope, &raw);
             if d.contains(&qual) || q.contains(&qual) {
                 return true;
             }
@@ -2216,12 +2313,12 @@ impl<'a> BytecodeCompiler<'a> {
         let Some(m) = self.assoc_arrays else {
             return false;
         };
-        let raw = Self::hier_raw_name(hier);
-        if m.contains_key(&raw) {
+        let raw = Self::hier_raw_cow(hier);
+        if m.contains_key(raw.as_ref()) {
             return true;
         }
         if let Some(scope) = &self.scope_hint {
-            if m.contains_key(&format!("{}.{}", scope, raw)) {
+            if with_dotted(scope, &raw, |k| m.contains_key(k)) {
                 return true;
             }
         }
@@ -2248,13 +2345,13 @@ impl<'a> BytecodeCompiler<'a> {
     /// reference) must never match an unrelated same-named declaration
     /// elsewhere in the design (see `packed_elem_width_of`).
     fn packed_full_dims_of(&self, hier: &HierarchicalIdentifier) -> Option<&'a Vec<(i64, i64)>> {
-        let raw = Self::hier_raw_name(hier);
+        let raw = Self::hier_raw_cow(hier);
         let m = self.packed_full_dims?;
-        m.get(raw.as_str())
+        m.get(raw.as_ref())
             .or_else(|| {
                 self.scope_hint
                     .as_ref()
-                    .and_then(|sc| m.get(format!("{}.{}", sc, raw).as_str()))
+                    .and_then(|sc| with_dotted(sc, &raw, |k| m.get(k)))
             })
             .or_else(|| {
                 if hier.path.len() != 1 {
@@ -4619,7 +4716,7 @@ impl<'a> BytecodeCompiler<'a> {
             .map(|s| (raw.clone(), *s))
             .or_else(|| {
                 self.scope_hint.as_ref().and_then(|sc| {
-                    let q = format!("{}.{}", sc, raw);
+                    let q = cat_dot(sc, &raw);
                     arrays_2d.get(q.as_str()).map(|s| (q, *s))
                 })
             })?;
@@ -5552,12 +5649,29 @@ impl<'a> BytecodeCompiler<'a> {
         self.insns.push(insn);
     }
 
+    /// `hier_raw_name`, borrowed when the path has a single segment.
+    fn hier_raw_cow(hier: &HierarchicalIdentifier) -> std::borrow::Cow<'_, str> {
+        match hier.path.as_slice() {
+            [one] => std::borrow::Cow::Borrowed(one.name.name.as_str()),
+            _ => std::borrow::Cow::Owned(Self::hier_raw_name(hier)),
+        }
+    }
+
     fn hier_raw_name(hier: &HierarchicalIdentifier) -> String {
-        hier.path
-            .iter()
-            .map(|s| s.name.name.as_str())
-            .collect::<Vec<_>>()
-            .join(".")
+        match hier.path.as_slice() {
+            [one] => one.name.name.clone(),
+            path => {
+                let len = path.iter().map(|s| s.name.name.len() + 1).sum::<usize>();
+                let mut out = String::with_capacity(len.saturating_sub(1));
+                for (i, seg) in path.iter().enumerate() {
+                    if i > 0 {
+                        out.push('.');
+                    }
+                    out.push_str(&seg.name.name);
+                }
+                out
+            }
+        }
     }
 
     /// §7.2.1: `base.member` where `base` resolves to a packed-struct SIGNAL
@@ -5586,7 +5700,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let raw = Self::hier_raw_name(h);
         if let Some(scope) = &self.scope_hint {
-            let q = format!("{}.{}", scope, raw);
+            let q = cat_dot(scope, &raw);
             if let Some(l) = fields_tbl.get(&q) {
                 return Some(l.clone());
             }
@@ -6567,11 +6681,12 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn lookup_signal_id(&self, hier: &HierarchicalIdentifier) -> Option<usize> {
-        let raw = Self::hier_raw_name(hier);
+        let raw = Self::hier_raw_cow(hier);
+        let raw: &str = &raw;
         // Targeted override for for-loop variables — see for_loop_var_ids
         // doc + compile_for's comment for the c910 motivation.
         if !self.for_loop_var_ids.is_empty() && hier.path.len() == 1 && !raw.contains('.') {
-            if let Some(&id) = self.for_loop_var_ids.get(&raw) {
+            if let Some(&id) = self.for_loop_var_ids.get(raw) {
                 return Some(id);
             }
         }
@@ -6585,19 +6700,21 @@ impl<'a> BytecodeCompiler<'a> {
         let rooted = hier.root.is_some();
         if !raw.contains('.') && !rooted {
             if let Some(scope) = &self.scope_hint {
-                let qualified = format!("{}.{}", scope, raw);
-                if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
+                if let Some(id) =
+                    with_dotted(scope, raw, |k| self.signal_name_to_id.get(k).copied())
+                {
                     return Some(id);
                 }
             }
         }
-        if let Some(&id) = self.signal_name_to_id.get(raw.as_str()) {
+        if let Some(&id) = self.signal_name_to_id.get(raw) {
             return Some(id);
         }
         if !rooted {
             if let Some(scope) = &self.scope_hint {
-                let qualified = format!("{}.{}", scope, raw);
-                if let Some(&id) = self.signal_name_to_id.get(qualified.as_str()) {
+                if let Some(id) =
+                    with_dotted(scope, raw, |k| self.signal_name_to_id.get(k).copied())
+                {
                     return Some(id);
                 }
             }
@@ -6612,8 +6729,10 @@ impl<'a> BytecodeCompiler<'a> {
         // refs whose absolute path was baked in by xezim's port-rewriting
         // (top-level instances have no prefix in signal_name_to_id).
         if let Some(top) = &self.top_module_name {
-            let with_dot = format!("{}.", top);
-            if let Some(stripped) = raw.strip_prefix(&with_dot) {
+            if let Some(stripped) = raw
+                .strip_prefix(top.as_str())
+                .and_then(|rest| rest.strip_prefix('.'))
+            {
                 if let Some(&id) = self.signal_name_to_id.get(stripped) {
                     return Some(id);
                 }
@@ -6635,23 +6754,24 @@ impl<'a> BytecodeCompiler<'a> {
     /// same-named parameter of another scope.
     fn param_twin_value(&self, hier: &HierarchicalIdentifier, id: usize) -> Option<Value> {
         let params = self.params?;
-        let raw = Self::hier_raw_name(hier);
-        let mut keys: Vec<String> = Vec::with_capacity(3);
+        let raw = Self::hier_raw_cow(hier);
+        // The exact keys, in order: scope-qualified, raw, bare single
+        // segment. The first one naming signal `id` decides.
+        let check = |k: &str| -> Option<Option<Value>> {
+            (self.signal_name_to_id.get(k).copied() == Some(id))
+                .then(|| params.get(k).filter(|v| !v.is_real).cloned())
+        };
         if let Some(scope) = &self.scope_hint {
-            keys.push(format!("{}.{}", scope, raw));
+            if let Some(r) = with_dotted(scope, &raw, check) {
+                return r;
+            }
         }
-        keys.push(raw.clone());
+        if let Some(r) = check(&raw) {
+            return r;
+        }
         if hier.path.len() == 1 {
-            keys.push(hier.path[0].name.name.clone());
-        }
-        for k in keys {
-            if self.signal_name_to_id.get(k.as_str()).copied() == Some(id) {
-                if let Some(v) = params.get(k.as_str()) {
-                    if !v.is_real {
-                        return Some(v.clone());
-                    }
-                }
-                return None;
+            if let Some(r) = check(&hier.path[0].name.name) {
+                return r;
             }
         }
         None
@@ -6659,14 +6779,14 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn lookup_param_value(&self, hier: &HierarchicalIdentifier) -> Option<Value> {
         let params = self.params?;
-        let raw = Self::hier_raw_name(hier);
-        if let Some(v) = params.get(&raw) {
+        let raw = Self::hier_raw_cow(hier);
+        let raw: &str = &raw;
+        if let Some(v) = params.get(raw) {
             return Some(v.clone());
         }
         if let Some(scope) = &self.scope_hint {
-            let q = format!("{}.{}", scope, raw);
-            if let Some(v) = params.get(&q) {
-                return Some(v.clone());
+            if let Some(v) = with_dotted(scope, raw, |k| params.get(k).cloned()) {
+                return Some(v);
             }
         }
         if hier.path.len() == 1 {
@@ -6685,13 +6805,13 @@ impl<'a> BytecodeCompiler<'a> {
                 && raw.ends_with(name)
                 && (raw.len() == name.len() || raw.as_bytes()[raw.len() - name.len() - 1] == b'.');
             let key_has_raw_suffix = name.len() >= raw.len()
-                && name.ends_with(raw.as_str())
+                && name.ends_with(raw)
                 && (name.len() == raw.len() || name.as_bytes()[name.len() - raw.len() - 1] == b'.');
             raw_has_key_suffix || key_has_raw_suffix
         };
         let mut found: Option<&Value> = None;
         if let Some(idx) = self.param_leaf_idx {
-            let leaf = raw.rsplit('.').next().unwrap_or(raw.as_str());
+            let leaf = raw.rsplit('.').next().unwrap_or(raw);
             for name in idx.get(leaf).map(|v| v.as_slice()).unwrap_or(&[]) {
                 if is_match(name) {
                     if found.is_some() {
@@ -6854,7 +6974,7 @@ impl<'a> BytecodeCompiler<'a> {
             return true;
         }
         if let Some(scope) = &self.scope_hint {
-            if set.contains(format!("{}.{}", scope, raw).as_str()) {
+            if set.contains(cat_dot(scope, &raw).as_str()) {
                 return true;
             }
         }
@@ -7099,17 +7219,17 @@ impl<'a> BytecodeCompiler<'a> {
     }
 
     fn packed_elem_width_of(&self, hier: &HierarchicalIdentifier) -> Option<u32> {
-        let raw = Self::hier_raw_name(hier);
+        let raw = Self::hier_raw_cow(hier);
         self.packed_elem_widths
             .and_then(|m| {
-                m.get(raw.as_str())
+                m.get(raw.as_ref())
                     .copied()
                     // Inside an inlined instance the name is spelled bare
                     // while the table holds it under the instance path.
                     .or_else(|| {
                         self.scope_hint
                             .as_ref()
-                            .and_then(|sc| m.get(format!("{}.{}", sc, raw).as_str()).copied())
+                            .and_then(|sc| with_dotted(sc, &raw, |k| m.get(k).copied()))
                     })
                     // The bare-leaf fallback is for a SINGLE-segment name only.
                     // Applying it to `inp.sram_renA` (a packed-struct member
@@ -7420,7 +7540,7 @@ impl<'a> BytecodeCompiler<'a> {
             return dense(&raw).then_some(raw);
         }
         if let Some(scope) = &self.scope_hint {
-            let qualified = format!("{}.{}", scope, raw);
+            let qualified = cat_dot(scope, &raw);
             if self.arrays.contains_key(&qualified) {
                 return dense(&qualified).then_some(qualified);
             }
@@ -12757,6 +12877,92 @@ impl<'a> BytecodeCompiler<'a> {
         false
     }
 
+    /// `arr[i][j] = v` on a 1-D unpacked array, or `m[i][j][k] = v` on a
+    /// 2-D/N-D one with constant array indices: a store into ONE BIT of one
+    /// element (§7.4.2: every element is a packed vector of its own, and the
+    /// trailing select addresses a bit inside it, §11.5.1). A 1-D element
+    /// takes the store the `arr[i][j:j]` part-select arm emits; a
+    /// constant N-D element names its own signal. `elem` is the element
+    /// reference, `bit` the trailing select.
+    ///
+    /// Only a CONSTANT bit of a plain vector element is handled: a multi-D
+    /// packed element's trailing index selects a slice, and a string's
+    /// selects a character. `None` leaves every other shape to the caller.
+    /// Label-mapped elements (ascending or non-zero-based) never get here:
+    /// `sel_base_needs_ast` sends them to the interpreter first.
+    fn compile_unpacked_elem_bit_store(
+        &mut self,
+        elem: &Expression,
+        bit: &Expression,
+        val_reg: RegId,
+    ) -> Option<bool> {
+        let target = self.plain_unpacked_elem(elem)?;
+        let b = u32::try_from(self.eval_const_bound(bit)?).ok()?;
+        match target {
+            Ok(name) => {
+                let ExprKind::Index {
+                    index: elem_idx, ..
+                } = &elem.kind
+                else {
+                    return None;
+                };
+                let Some(idx_reg) = self.compile_expr(elem_idx, 0) else {
+                    return Some(false);
+                };
+                let b_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(
+                    b_reg,
+                    Box::new(Value::from_u64(b as u64, 32)),
+                ));
+                let array = self.array_operand(name);
+                self.emit(Insn::BlockingAssignArrayRange(
+                    array, idx_reg, b_reg, b_reg, val_reg,
+                ));
+            }
+            Err(id) => {
+                if b >= self.signal_widths[id] {
+                    return None;
+                }
+                let resized = self.alloc_reg();
+                self.emit(Insn::Move(resized, val_reg));
+                self.emit(Insn::Resize(resized, 1));
+                self.emit(Insn::BlockingAssignRange(as_sig_id(id), b, b, resized));
+            }
+        }
+        Some(true)
+    }
+
+    /// Is `elem` one element of an unpacked array whose elements are plain
+    /// vectors, so that one more index selects a single BIT (§11.5.1)?
+    /// `Ok(array)` for an element of a 1-D array (any index), `Err(id)` for a
+    /// 2-D/N-D element named by constant indices (its own signal). A
+    /// multi-D packed element (the index selects a slice) and a string (a
+    /// character) are not.
+    fn plain_unpacked_elem(&self, elem: &Expression) -> Option<Result<String, usize>> {
+        let ExprKind::Index { expr: arr_expr, .. } = &elem.kind else {
+            return None;
+        };
+        let mut root = arr_expr.as_ref();
+        while let ExprKind::Index { expr, .. } = &root.kind {
+            root = expr;
+        }
+        let ExprKind::Ident(root_hier) = &root.kind else {
+            return None;
+        };
+        if self.is_packed_multi_dim(root_hier)
+            || self
+                .packed_full_dims_of(root_hier)
+                .is_some_and(|d| d.len() > 1)
+            || self.signal_is_string_name(root_hier)
+        {
+            return None;
+        }
+        if let ExprKind::Ident(ah) = &arr_expr.kind {
+            return self.lookup_array_name(ah).map(Ok);
+        }
+        self.const_multi_dim_array_elem_signal_id(elem).map(Err)
+    }
+
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
         // class-perf method-mode: `this.<member> = e` / `<classlocal>.<member> = e`
         // is an OBJECT-field store off the heap.
@@ -13176,6 +13382,9 @@ impl<'a> BytecodeCompiler<'a> {
                         return true;
                     }
                 }
+                if let Some(done) = self.compile_unpacked_elem_bit_store(expr, index, val_reg) {
+                    return done;
+                }
                 if self.try_packed_path_blocking(lhs, val_reg) {
                     return true;
                 }
@@ -13425,6 +13634,36 @@ impl<'a> BytecodeCompiler<'a> {
                         let resized = self.alloc_reg();
                         self.emit(Insn::Move(resized, val_reg));
                         self.emit(Insn::Resize(resized, range_w));
+                        self.emit(Insn::BlockingAssignRange(as_sig_id(id), hi, lo, resized));
+                        return true;
+                    }
+                }
+                // `m[i][j][hi:lo] = v`: a part of one constant element of a
+                // 2-D/N-D unpacked array, which is a signal of its own.
+                if let Some(Err(id)) = self.plain_unpacked_elem(expr) {
+                    let bounds = match kind {
+                        RangeKind::Constant => self
+                            .eval_const_bound(left)
+                            .zip(self.eval_const_bound(right))
+                            .filter(|(l, r)| l >= r),
+                        RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                            let w = self.eval_const_expr(right).filter(|&w| w > 0);
+                            self.eval_const_bound(left).zip(w).map(|(b, w)| {
+                                if *kind == RangeKind::IndexedUp {
+                                    (b + w as i64 - 1, b)
+                                } else {
+                                    (b, b - w as i64 + 1)
+                                }
+                            })
+                        }
+                    };
+                    if let Some((hi, lo)) =
+                        bounds.filter(|&(hi, lo)| lo >= 0 && hi < self.signal_widths[id] as i64)
+                    {
+                        let (hi, lo) = (hi as u32, lo as u32);
+                        let resized = self.alloc_reg();
+                        self.emit(Insn::Move(resized, val_reg));
+                        self.emit(Insn::Resize(resized, hi - lo + 1));
                         self.emit(Insn::BlockingAssignRange(as_sig_id(id), hi, lo, resized));
                         return true;
                     }
@@ -13682,6 +13921,10 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                     // Not an array — bit-select on a plain packed signal; width = 1.
+                    1
+                } else if self.plain_unpacked_elem(expr).is_some() {
+                    // A bit of one unpacked-array element (`arr[i][j]`): the
+                    // context width of its RHS is 1 (§11.6.1), not 32.
                     1
                 } else {
                     32
@@ -14003,6 +14246,14 @@ impl<'a> BytecodeCompiler<'a> {
                 // per literal string, deduped with the elaboration/AST sites.
                 crate::compiler::elaborate::warn_unsized_decimal_wrap(*size, base, value);
                 let mut v = Value::from_str_radix(value, r, w);
+                // Same inline cache the AST evaluator keeps on this node: a
+                // literal in a declared range is re-evaluated for every
+                // reference to the signal.
+                if w <= 64 {
+                    if let Some((vb, xz)) = v.inline_bits() {
+                        cached_val.set(Some((vb, xz, w)));
+                    }
+                }
                 v.is_signed = *signed;
                 v.is_fill = xz_fill;
                 Some(v)
@@ -14900,21 +15151,30 @@ impl<'a> BytecodeCompiler<'a> {
     /// (pub(crate): the FSM native generator in `aot.rs` uses this to prove
     /// a Real tick literal feeds only a delay wait.)
     pub(crate) fn insn_reads_reg(insn: &Insn, r: RegId) -> bool {
-        // Step 9g insns: LoadClassStatic writes dest and reads nothing;
-        // StoreClassStatic reads src; ConstructObject reads its arg range
-        // (mirrors the CallMethod arms above).
+        let mut hit = false;
+        !Self::insn_read_regs(insn, &mut |x| hit |= x == r) || hit
+    }
+
+    /// Every register occurrence `insn` reads (one read twice is reported
+    /// twice). Returns `false` for the AST fallbacks, which may read any
+    /// register. `insn_reads_reg` is defined through this, so the two cannot
+    /// disagree.
+    pub(crate) fn insn_read_regs(insn: &Insn, f: &mut impl FnMut(RegId)) -> bool {
         match insn {
-            Insn::WaitDelayReg(d) => *d == r,
-            Insn::WaitEdge(..) | Insn::CovHit(..) => false,
-            Insn::CmpBranch(_, l, rr, _, _) => *l == r || *rr == r,
-            Insn::MoveResize(_, s, _) => *s == r,
-            Insn::CaseLut(_, src, _) => *src == r,
-            Insn::CaseJump(src, _) => *src == r,
-            Insn::CaseMaskJump(src, _) => *src == r,
-            Insn::Format(_, f) => f.args.contains(&r),
-            Insn::StrOp(_, _, args) => args.contains(&r),
-            Insn::BlockingAssignString(_, v) => *v == r,
-            Insn::LoadSignalRangeDyn(_, _, lo, _) => *lo == r,
+            Insn::WaitDelayReg(d) => f(*d),
+            Insn::WaitEdge(..) | Insn::CovHit(..) => {}
+            Insn::CmpBranch(_, l, rr, _, _) => {
+                f(*l);
+                f(*rr);
+            }
+            Insn::MoveResize(_, s, _) => f(*s),
+            Insn::CaseLut(_, src, _) => f(*src),
+            Insn::CaseJump(src, _) => f(*src),
+            Insn::CaseMaskJump(src, _) => f(*src),
+            Insn::Format(_, fs) => fs.args.iter().for_each(|&a| f(a)),
+            Insn::StrOp(_, _, args) => args.iter().for_each(|&a| f(a)),
+            Insn::BlockingAssignString(_, v) => f(*v),
+            Insn::LoadSignalRangeDyn(_, _, lo, _) => f(*lo),
             Insn::LoadConst(..)
             | Insn::LoadSignal(..)
             | Insn::LoadSignalSigned(..)
@@ -14926,57 +15186,82 @@ impl<'a> BytecodeCompiler<'a> {
             // Reads its index straight out of the signal table; no registers.
             | Insn::NbaAssignArrayRead(..)
             | Insn::Jump(..)
-            | Insn::Nop => false,
-            Insn::BranchUnlessZero(c, _) => *c == r,
+            | Insn::Nop => {}
+            Insn::BranchUnlessZero(c, _) => f(*c),
             // In-place mutators read their register.
-            Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) => *a == r,
+            Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) => f(*a),
             // Class-member access: Load reads the handle; Store reads the
             // handle AND the stored value register.
-            Insn::LoadClassMember(_, h, _) => *h == r,
-            Insn::StoreClassMember(h, v, _) => *h == r || *v == r,
+            Insn::LoadClassMember(_, h, _) => f(*h),
+            Insn::StoreClassMember(h, v, _) => {
+                f(*h);
+                f(*v);
+            }
             Insn::CallMethod(_, h, _, a, n) => {
-                *h == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+                f(*h);
+                for x in (*a as usize..*a as usize + *n as usize) {
+                    f(x as RegId);
+                }
             }
             Insn::CallScopedMethod(_, t, _, a, n) => {
-                *t == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+                f(*t);
+                for x in (*a as usize..*a as usize + *n as usize) {
+                    f(x as RegId);
+                }
             }
             Insn::ConstructObject(_, _, a, n) => {
-                (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+                for x in (*a as usize..*a as usize + *n as usize) {
+                    f(x as RegId);
+                }
             }
             // Step 9h: a class-scope static call reads its arg range only.
             Insn::CallStaticScoped(_, _, a, n) => {
-                (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+                for x in (*a as usize..*a as usize + *n as usize) {
+                    f(x as RegId);
+                }
             }
             // class-perf P2: a free-function call reads its arg range only.
             Insn::CallFreeFunction(_, _, a, n) => {
-                (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+                for x in (*a as usize..*a as usize + *n as usize) {
+                    f(x as RegId);
+                }
             }
             // Step 9g: a static-property READ has no register inputs.
-            Insn::LoadClassStatic(..) => false,
-            Insn::StoreClassStatic(_, src) => *src == r,
+            Insn::LoadClassStatic(..) => {}
+            Insn::StoreClassStatic(_, src) => f(*src),
             Insn::CallCollMethod(_, h, _, a, n, _) => {
-                *h == r || (*a as usize..*a as usize + *n as usize).contains(&(r as usize))
+                f(*h);
+                for x in (*a as usize..*a as usize + *n as usize) {
+                    f(x as RegId);
+                }
             }
             // Collection element access: Load reads handle + index; Store
             // reads handle + index + value.
-            Insn::LoadCollElem(_, h, _, i) => *h == r || *i == r,
-            Insn::StoreCollElem(h, _, i, v) => *h == r || *i == r || *v == r,
+            Insn::LoadCollElem(_, h, _, i) => {
+                f(*h);
+                f(*i);
+            }
+            Insn::StoreCollElem(h, _, i, v) => {
+                f(*h);
+                f(*i);
+                f(*v);
+            }
             // Compiled foreach: ForeachKeys reads only the handle;
             // ForeachNext WRITES its var register (and the ok flag) — the
             // liveness check must not fuse away its load.
-            Insn::ForeachKeys(_, h, _) => *h == r,
-            Insn::ForeachNext(..) => false,
+            Insn::ForeachKeys(_, h, _) => f(*h),
+            Insn::ForeachNext(..) => {}
             // `$cast`: reads the source (and, for the register route, the
             // dest slot's current value for the width fit); the Member route
             // also reads the base handle.
             Insn::Cast(c, s, ..) => {
                 let (dest, s) = (&c.dest, s);
-                *s == r
-                    || match dest {
-                        CastDest::Reg(d) => *d == r,
-                        CastDest::Member(h, _) => *h == r,
-                        CastDest::Scope => false,
-                    }
+                f(*s);
+                match dest {
+                    CastDest::Reg(d) => f(*d),
+                    CastDest::Member(h, _) => f(*h),
+                    CastDest::Scope => {}
+                }
             }
             Insn::Pow(_, l, rr)
             | Insn::Add(_, l, rr)
@@ -15001,7 +15286,10 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::Geq(_, l, rr)
             | Insn::Shl(_, l, rr)
             | Insn::Shr(_, l, rr)
-            | Insn::AShr(_, l, rr) => *l == r || *rr == r,
+            | Insn::AShr(_, l, rr) => {
+                f(*l);
+                f(*rr);
+            }
             Insn::BitNot(_, s)
             | Insn::LogNot(_, s)
             | Insn::Negate(_, s)
@@ -15009,38 +15297,63 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::ReduceOr(_, s)
             | Insn::ReduceXor(_, s)
             | Insn::Move(_, s)
-            | Insn::Replicate(_, s, _) => *s == r,
+            | Insn::Replicate(_, s, _) => f(*s),
             // Its other operand is the embedded constant, not a register.
-            Insn::BinOpConst(_, s, _, _) => *s == r,
-            Insn::BinOpConstAdd2(a) => a.s1 == r || a.s2 == r,
-            Insn::BitSelect(_, b, i) => *b == r || *i == r,
-            Insn::BitSelectConst(_, b, _) => *b == r,
-            Insn::RangeSelect(_, b, l, rr) => *b == r || *l == r || *rr == r,
-            Insn::RangeSelectW(_, b, i, _, _) => *b == r || *i == r,
-            Insn::RangeSelectConst(_, b, _, _) => *b == r,
-            Insn::Concat(_, parts) => parts.contains(&r),
-            Insn::BranchIfFalse(c, _) => *c == r,
-            Insn::Select(_, c, t, e) => *c == r || *t == r || *e == r,
-            Insn::NbaAssign(_, v, _) | Insn::BlockingAssign(_, v, _) => *v == r,
-            Insn::NbaAssignRange(_, _, _, v) | Insn::BlockingAssignRange(_, _, _, v) => *v == r,
+            Insn::BinOpConst(_, s, _, _) => f(*s),
+            Insn::BinOpConstAdd2(a) => {
+                f(a.s1);
+                f(a.s2);
+            }
+            Insn::BitSelect(_, b, i) => {
+                f(*b);
+                f(*i);
+            }
+            Insn::BitSelectConst(_, b, _) => f(*b),
+            Insn::RangeSelect(_, b, l, rr) => {
+                f(*b);
+                f(*l);
+                f(*rr);
+            }
+            Insn::RangeSelectW(_, b, i, _, _) => {
+                f(*b);
+                f(*i);
+            }
+            Insn::RangeSelectConst(_, b, _, _) => f(*b),
+            Insn::Concat(_, parts) => parts.iter().for_each(|&a| f(a)),
+            Insn::BranchIfFalse(c, _) => f(*c),
+            Insn::Select(_, c, t, e) => {
+                f(*c);
+                f(*t);
+                f(*e);
+            }
+            Insn::NbaAssign(_, v, _) | Insn::BlockingAssign(_, v, _) => f(*v),
+            Insn::NbaAssignRange(_, _, _, v) | Insn::BlockingAssignRange(_, _, _, v) => f(*v),
             Insn::NbaAssignRangeDyn(_, h, l, v) | Insn::BlockingAssignRangeDyn(_, h, l, v) => {
-                *h == r || *l == r || *v == r
+                f(*h);
+                f(*l);
+                f(*v);
             }
             Insn::NbaAssignBitDyn(_, i, v) | Insn::BlockingAssignBitDyn(_, i, v) => {
-                *i == r || *v == r
+                f(*i);
+                f(*v);
             }
-            Insn::LoadArrayElem(_, _, i) => *i == r,
+            Insn::LoadArrayElem(_, _, i) => f(*i),
             Insn::NbaAssignArray(_, i, v, _) | Insn::BlockingAssignArray(_, i, v, _) => {
-                *i == r || *v == r
+                f(*i);
+                f(*v);
             }
             Insn::NbaAssignArrayRange(_, i, h, l, v)
             | Insn::BlockingAssignArrayRange(_, i, h, l, v) => {
-                *i == r || *h == r || *l == r || *v == r
+                f(*i);
+                f(*h);
+                f(*l);
+                f(*v);
             }
             // AST fallback can read anything through the interpreter.
-            Insn::StmtFallback(..) => true,
-            Insn::EvalExprFallback(..) => true,
+            Insn::StmtFallback(..) => return false,
+            Insn::EvalExprFallback(..) => return false,
         }
+        true
     }
 
     /// Peephole: fuse `LoadSignal(t, s); RangeSelectConst(d, t, l, r)` into
@@ -15098,6 +15411,7 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => {}
             }
         }
+        let mut rr = RegReaders::new(insns);
         // Second family: pairs whose fused form has NO destination register —
         // the first insn's register must simply be dead everywhere else.
         //   LoadConst K ; NbaAssign(sig, k, w)        → NbaAssignConst
@@ -15130,13 +15444,12 @@ impl<'a> BytecodeCompiler<'a> {
             };
             // The fused form never writes `dead_reg`, so ANY other read of it
             // in the block blocks the fusion (no d==t exemption here).
-            let consumed = insns
-                .iter()
-                .enumerate()
-                .any(|(j, x)| j != i && j != i + 1 && Self::insn_reads_reg(x, dead_reg));
-            if consumed {
+            if rr.read_outside(insns, dead_reg, &[i, i + 1]) {
                 continue;
             }
+            rr.remove(&insns[i]);
+            rr.remove(&insns[i + 1]);
+            rr.add(&repl);
             insns[i] = repl;
             insns[i + 1] = Insn::Nop;
         }
@@ -15173,14 +15486,15 @@ impl<'a> BytecodeCompiler<'a> {
                     continue;
                 }
                 // r1, r2 and d must be dead outside the quad.
-                let consumed = insns.iter().enumerate().any(|(x, ins)| {
-                    !(i..=i + 3).contains(&x)
-                        && (Self::insn_reads_reg(ins, r1)
-                            || Self::insn_reads_reg(ins, r2)
-                            || Self::insn_reads_reg(ins, d))
-                });
-                if consumed {
+                let quad = [i, i + 1, i + 2, i + 3];
+                if rr.read_outside(insns, r1, &quad)
+                    || rr.read_outside(insns, r2, &quad)
+                    || rr.read_outside(insns, d, &quad)
+                {
                     continue;
+                }
+                for k in quad {
+                    rr.remove(&insns[k]);
                 }
                 insns[i] = Insn::BranchIfSignalFalse(s1, t, u32::MAX);
                 insns[i + 1] = Insn::BranchIfSignalFalse(s2, t, u32::MAX);
@@ -15213,15 +15527,12 @@ impl<'a> BytecodeCompiler<'a> {
             // block (not just later pcs) so backward jumps can't smuggle a
             // read of `t` past a suffix-only check. d == t overwrites the
             // raw value in the same pair, making later reads safe.
-            if d != t {
-                let consumed = insns
-                    .iter()
-                    .enumerate()
-                    .any(|(j, x)| j != i && j != i + 1 && Self::insn_reads_reg(x, t));
-                if consumed {
-                    continue;
-                }
+            if d != t && rr.read_outside(insns, t, &[i, i + 1]) {
+                continue;
             }
+            rr.remove(&insns[i]);
+            rr.remove(&insns[i + 1]);
+            rr.add(&repl);
             insns[i] = repl;
             insns[i + 1] = Insn::Nop;
         }
@@ -15270,13 +15581,11 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // The fused form has no destination register, so ANY other read of
             // `d` in the block blocks the fusion.
-            let consumed = insns
-                .iter()
-                .enumerate()
-                .any(|(k, x)| k != i && k != j && Self::insn_reads_reg(x, d));
-            if consumed {
+            if rr.read_outside(insns, d, &[i, j]) {
                 continue;
             }
+            rr.remove(&insns[i]);
+            rr.remove(&insns[j]);
             insns[i] = Insn::BranchIfSignalFalse(sig, t, idx);
             insns[j] = Insn::Nop;
         }
@@ -16414,16 +16723,16 @@ impl<'a> BytecodeCompiler<'a> {
             return;
         }
         // Drop constant loads nothing reads (the folded chain's temporaries).
+        // A `LoadConst` and the `Nop` replacing it read no register, so the
+        // counts stay exact through the loop.
         let mut dead = 0usize;
+        let rr = RegReaders::new(insns);
         for i in 0..n {
             let Insn::LoadConst(d, _) = &insns[i] else {
                 continue;
             };
             let d = *d;
-            let read = insns
-                .iter()
-                .enumerate()
-                .any(|(j, other)| j != i && Self::insn_reads_reg(other, d));
+            let read = rr.read_outside(insns, d, &[i]);
             if !read {
                 insns[i] = Insn::Nop;
                 dead += 1;
@@ -16472,6 +16781,7 @@ impl<'a> BytecodeCompiler<'a> {
                 _ => {}
             }
         }
+        let mut rr = RegReaders::new(insns);
         for i in 0..insns.len() - 1 {
             let Insn::LoadConst(c, _) = &insns[i] else {
                 continue;
@@ -16531,11 +16841,16 @@ impl<'a> BytecodeCompiler<'a> {
             if (i + 1..=j).any(|x| is_target[x]) {
                 continue;
             }
-            let consumed = insns.iter().enumerate().any(|(x, ins)| {
-                x != i && x != j && Some(x) != const_scrub && Self::insn_reads_reg(ins, c)
-            });
+            let consumed = match const_scrub {
+                Some(sj) => rr.read_outside(insns, c, &[i, j, sj]),
+                None => rr.read_outside(insns, c, &[i, j]),
+            };
             if consumed {
                 continue;
+            }
+            rr.remove(&insns[j]);
+            if let Some(sj) = const_scrub {
+                rr.remove(&insns[sj]);
             }
             // Take the boxed constant out of the `LoadConst` rather than
             // cloning a possibly-`Wide` `Value`.
@@ -16549,6 +16864,7 @@ impl<'a> BytecodeCompiler<'a> {
             // The fused op replaces the BINOP's slot so any surviving
             // `ClearSigned` of the left operand still runs first.
             insns[j] = Insn::BinOpConst(d, l, k, kind);
+            rr.add(&insns[j]);
             FUSED_BINOP_CONST[kind as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
@@ -17380,6 +17696,58 @@ impl<'a> BytecodeCompiler<'a> {
 mod tests {
     use super::*;
 
+    /// The read counts the peephole passes use must answer exactly what a
+    /// scan of the block with `insn_reads_reg` answers, before and after
+    /// the edits they track.
+    #[test]
+    fn reg_readers_match_a_full_scan() {
+        let k = || Box::new(Value::from_u64(3, 8));
+        let fallback =
+            || Insn::EvalExprFallback(Box::new((Arc::new(ident_expr("x")), Arc::from(""))), 9, 8);
+        let mut insns = vec![
+            Insn::LoadConst(1, k()),
+            Insn::Add(2, 1, 1),
+            Insn::Select(3, 2, 1, 4),
+            Insn::Concat(5, Box::new(vec![1, 3, 3])),
+            Insn::BranchIfFalse(5, 0),
+            Insn::Move(6, 2),
+            Insn::Nop,
+        ];
+        let scan = |insns: &[Insn], r: RegId, skip: &[usize]| {
+            insns
+                .iter()
+                .enumerate()
+                .any(|(j, x)| !skip.contains(&j) && BytecodeCompiler::insn_reads_reg(x, r))
+        };
+        let skips: [&[usize]; 5] = [&[], &[0], &[1], &[1, 2], &[2, 3, 5]];
+        let check = |insns: &[Insn], rr: &RegReaders| {
+            for r in 0..12 {
+                for skip in skips {
+                    assert_eq!(
+                        rr.read_outside(insns, r, skip),
+                        scan(insns, r, skip),
+                        "r={r} skip={skip:?}"
+                    );
+                }
+            }
+        };
+        let mut rr = RegReaders::new(&insns);
+        check(&insns, &rr);
+        // Edit the way the passes do: remove the old form, add the new one.
+        rr.remove(&insns[1]);
+        insns[1] = Insn::BinOpConst(2, 4, k(), BinOpConstKind::Add);
+        rr.add(&insns[1]);
+        check(&insns, &rr);
+        // A fallback reads every register.
+        rr.remove(&insns[6]);
+        insns[6] = fallback();
+        rr.add(&insns[6]);
+        check(&insns, &rr);
+        rr.remove(&insns[6]);
+        insns[6] = Insn::Nop;
+        check(&insns, &rr);
+    }
+
     fn ident_expr(name: &str) -> Expression {
         let span = crate::ast::Span::dummy();
         Expression::new(
@@ -17430,7 +17798,7 @@ mod tests {
 
     #[test]
     fn generated_nonzero_outer_index_resolves_to_flattened_signal() {
-        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        let mut signals = NameMap::default();
         signals.insert(Arc::from("flat"), 0);
         let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
         let widths: HashMap<String, u32> = HashMap::default();
@@ -17444,7 +17812,7 @@ mod tests {
 
     #[test]
     fn genuine_array_shapes_do_not_resolve_as_flattened_signals() {
-        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        let mut signals = NameMap::default();
         signals.insert(Arc::from("flat"), 0);
         let widths: HashMap<String, u32> = HashMap::default();
         let expr = indexed_expr("flat", '1');
@@ -17470,7 +17838,7 @@ mod tests {
 
     #[test]
     fn constant_multi_dim_array_element_uses_scalar_bytecode() {
-        let mut signals: HashMap<Arc<str>, usize> = HashMap::default();
+        let mut signals = NameMap::default();
         signals.insert(Arc::from("m[1][0]"), 0);
         let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
         let widths: HashMap<String, u32> = HashMap::default();
@@ -17500,7 +17868,7 @@ mod tests {
 
     #[test]
     fn register_ids_do_not_wrap_at_u16_limit() {
-        let signals: HashMap<Arc<str>, usize> = HashMap::default();
+        let signals = NameMap::default();
         let arrays: HashMap<String, (i64, i64, u32)> = HashMap::default();
         let widths: HashMap<String, u32> = HashMap::default();
         let mut compiler = BytecodeCompiler::new(&signals, &[], &[], &arrays, &widths);
@@ -17633,7 +18001,7 @@ mod tests {
         let stmt_ret = Statement::new(StatementKind::Return(Some(this_member("acc"))), span());
         let body: Vec<&Statement> = vec![&stmt_store, &stmt_ret];
 
-        let sigmap: HashMap<Arc<str>, usize> = Default::default();
+        let sigmap: NameMap = Default::default();
         let sig_signed: Vec<bool> = Vec::new();
         let sig_w: Vec<u32> = Vec::new();
         let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
@@ -17699,7 +18067,7 @@ mod tests {
         let stmt_ret = Statement::new(StatementKind::Return(Some(call)), span());
         let body: Vec<&Statement> = vec![&stmt_ret];
 
-        let sigmap: HashMap<Arc<str>, usize> = Default::default();
+        let sigmap: NameMap = Default::default();
         let sig_signed: Vec<bool> = Vec::new();
         let sig_w: Vec<u32> = Vec::new();
         let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
@@ -17733,7 +18101,7 @@ mod tests {
         );
         let body: Vec<&Statement> = vec![&stmt_ret];
 
-        let sigmap: HashMap<Arc<str>, usize> = Default::default();
+        let sigmap: NameMap = Default::default();
         let sig_signed: Vec<bool> = Vec::new();
         let sig_w: Vec<u32> = Vec::new();
         let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
@@ -18754,6 +19122,238 @@ pub fn tsx_insn_ok(i: &TsInsn) -> bool {
 
 fn ts_mask(w: u32) -> u64 {
     if w >= 64 { u64::MAX } else { (1u64 << w) - 1 }
+}
+
+/// Sensitivity mask of bits `lo .. lo + n` of a `width`-bit signal. A
+/// signal of up to 64 bits maps bit for bit; a wider one maps mask bit `k`
+/// to the `2^s`-bit chunk starting at `k << s`, `s` the smallest shift that
+/// fits the signal in 64 chunks, so a span covers every chunk it touches.
+/// (Bits past chunk 63 — only out-of-range spans — all map to chunk 63,
+/// the same way for reads and writes.) An empty span claims the whole
+/// signal.
+#[inline(always)]
+pub fn sig_span_mask(width: u32, lo: u32, n: u32) -> u64 {
+    if n == 0 {
+        return u64::MAX;
+    }
+    let sh = sig_chunk_shift(width);
+    let first = (lo >> sh).min(63);
+    let last = (lo.saturating_add(n - 1) >> sh).min(63);
+    (u64::MAX >> (63 - last)) & (u64::MAX << first)
+}
+
+/// log2 of the chunk size `sig_span_mask` uses for a `width`-bit signal.
+#[inline(always)]
+pub fn sig_chunk_shift(width: u32) -> u32 {
+    if width <= 64 {
+        0
+    } else {
+        // ceil(log2(ceil(width / 64)))
+        let c = width.div_ceil(64);
+        32 - (c - 1).leading_zeros()
+    }
+}
+
+/// Bits read by a two-state stream, per signal, for bit-granular comb
+/// sensitivity: `(signal, mask)` with `sig_span_mask` chunks (`u64::MAX`
+/// for a whole-signal read), plus every signal the stream stores, once per
+/// store instruction. None when the stream holds anything whose reads are
+/// not a fixed set of bits: array elements, AST fallbacks, waits, coverage
+/// hits (an evaluation count is observable). The match is exhaustive on
+/// purpose — a new instruction must be classified before it compiles.
+pub fn ts_read_masks(insns: &[TsInsn], widths: &[u32]) -> Option<(Vec<(u32, u64)>, Vec<u32>)> {
+    let mut reads: Vec<(u32, u64)> = Vec::new();
+    let mut writes: Vec<u32> = Vec::new();
+    let wid = |sig: u32| widths.get(sig as usize).copied().unwrap_or(0);
+    let add = |reads: &mut Vec<(u32, u64)>, sig: u32, m: u64| {
+        if let Some(e) = reads.iter_mut().find(|e| e.0 == sig) {
+            e.1 |= m;
+        } else {
+            reads.push((sig, m));
+        }
+    };
+    // Low contiguous `mask` → its bit count (0 claims the whole signal).
+    let nbits = |mask: u64| 64 - mask.leading_zeros();
+    for i in insns {
+        match i {
+            TsInsn::LoadSig { sig, .. }
+            | TsInsn::LoadSigNot { sig, .. }
+            | TsInsn::LoadSigLogAnd { sig, .. }
+            | TsInsn::LoadSigBrNz { sig, .. }
+            | TsInsn::BrFalseLoadSig { sig, .. }
+            | TsInsn::LoadSigLogOr { sig, .. }
+            | TsInsn::LoadSigAnd { sig, .. }
+            | TsInsn::LoadSigRepl { sig, .. }
+            | TsInsn::WLoadSig { sig, .. }
+            | TsInsn::SigRangeDyn { sig, .. } => add(&mut reads, *sig, u64::MAX),
+            TsInsn::LoadSig2 { sig1, sig2, .. } => {
+                add(&mut reads, *sig1, u64::MAX);
+                add(&mut reads, *sig2, u64::MAX);
+            }
+            TsInsn::SigBit { sig, bit, .. }
+            | TsInsn::SigBitW { sig, bit, .. }
+            | TsInsn::SigBitNot { sig, bit, .. } => {
+                add(&mut reads, *sig, sig_span_mask(wid(*sig), *bit as u32, 1))
+            }
+            TsInsn::SigBit2 {
+                sig1,
+                bit1,
+                sig2,
+                bit2,
+                ..
+            } => {
+                add(
+                    &mut reads,
+                    *sig1,
+                    sig_span_mask(wid(*sig1), *bit1 as u32, 1),
+                );
+                add(
+                    &mut reads,
+                    *sig2,
+                    sig_span_mask(wid(*sig2), *bit2 as u32, 1),
+                );
+            }
+            TsInsn::SigRange { sig, lo, mask, .. }
+            | TsInsn::SigRangeAnd { sig, lo, mask, .. }
+            | TsInsn::SigRangeEq { sig, lo, mask, .. } => add(
+                &mut reads,
+                *sig,
+                sig_span_mask(wid(*sig), *lo as u32, nbits(*mask)),
+            ),
+            TsInsn::SigRangeW { sig, lo, w, .. } | TsInsn::WSigRange { sig, lo, w, .. } => add(
+                &mut reads,
+                *sig,
+                sig_span_mask(wid(*sig), *lo as u32, *w as u32),
+            ),
+            TsInsn::SigRangeEqC { sig, lo, w, .. } => add(
+                &mut reads,
+                *sig,
+                sig_span_mask(wid(*sig), *lo as u32, *w as u32),
+            ),
+            TsInsn::LoadSigSigRange {
+                sig,
+                sig2,
+                lo,
+                mask,
+                ..
+            } => {
+                add(&mut reads, *sig, u64::MAX);
+                add(
+                    &mut reads,
+                    *sig2,
+                    sig_span_mask(wid(*sig2), *lo as u32, nbits(*mask)),
+                );
+            }
+            TsInsn::BrSigFalse { sig, bit, .. } => {
+                let m = if *bit == u32::MAX {
+                    u64::MAX
+                } else {
+                    sig_span_mask(wid(*sig), *bit, 1)
+                };
+                add(&mut reads, *sig, m);
+            }
+            TsInsn::LogAndStore { sig, .. }
+            | TsInsn::AndRangeStore { sig, .. }
+            | TsInsn::LogOrStore { sig, .. }
+            | TsInsn::OrRangeStore { sig, .. }
+            | TsInsn::BitStoreNbaDyn { sig, .. }
+            | TsInsn::BitStoreDyn { sig, .. }
+            | TsInsn::RangeStoreDyn { sig, .. }
+            | TsInsn::RangeStoreNbaDyn { sig, .. }
+            | TsInsn::RangeFillXW { sig, .. }
+            | TsInsn::ConstStoreX { sig, .. }
+            | TsInsn::Store { sig, .. }
+            | TsInsn::StoreNba { sig, .. }
+            | TsInsn::ConstStoreNba { sig, .. }
+            | TsInsn::RangeStoreNba { sig, .. }
+            | TsInsn::RangeStore { sig, .. }
+            | TsInsn::RangeStoreW { sig, .. }
+            | TsInsn::RangeStoreNbaW { sig, .. }
+            | TsInsn::RangeFillW { sig, .. }
+            | TsInsn::RangeFillNbaW { sig, .. }
+            | TsInsn::WStore { sig, .. }
+            | TsInsn::WStoreNba { sig, .. }
+            | TsInsn::WRangeStore { sig, .. }
+            | TsInsn::WRangeStoreNba { sig, .. } => writes.push(*sig),
+            TsInsn::RangeStoreX(p) | TsInsn::RangeStoreXW(p) => writes.push(p.sig),
+            // A save snapshots a signal the stream is about to store, for
+            // the undo after a bail: not an input.
+            TsInsn::SaveSig { .. } | TsInsn::SaveSigW { .. } => {}
+            TsInsn::ElemLoad(..)
+            | TsInsn::WElemLoad(..)
+            | TsInsn::ElemStoreNba(..)
+            | TsInsn::ElemStoreNbaFromSig(..)
+            | TsInsn::ElemStore(..)
+            | TsInsn::NbaFromElem(..)
+            | TsInsn::WNbaFromElem(..)
+            | TsInsn::Fallback(..)
+            | TsInsn::WaitEdge { .. }
+            | TsInsn::WaitDelayRaw { .. }
+            | TsInsn::CovHit(..) => return None,
+            TsInsn::Const { .. }
+            | TsInsn::Bit { .. }
+            | TsInsn::Range { .. }
+            | TsInsn::Xor { .. }
+            | TsInsn::And { .. }
+            | TsInsn::Or { .. }
+            | TsInsn::Sel { .. }
+            | TsInsn::Not { .. }
+            | TsInsn::XorC { .. }
+            | TsInsn::EqC { .. }
+            | TsInsn::Add { .. }
+            | TsInsn::Sub { .. }
+            | TsInsn::Eq { .. }
+            | TsInsn::MaskEq { .. }
+            | TsInsn::Neq { .. }
+            | TsInsn::LogNotAnd { .. }
+            | TsInsn::LogNotLogAnd { .. }
+            | TsInsn::EqBrFalse { .. }
+            | TsInsn::ConstEq { .. }
+            | TsInsn::AndOr { .. }
+            | TsInsn::Lt { .. }
+            | TsInsn::CmpS { .. }
+            | TsInsn::BitDyn { .. }
+            | TsInsn::Leq { .. }
+            | TsInsn::Gt { .. }
+            | TsInsn::Geq { .. }
+            | TsInsn::LogNot { .. }
+            | TsInsn::LogAnd { .. }
+            | TsInsn::LogOr { .. }
+            | TsInsn::Concat { .. }
+            | TsInsn::Concat2 { .. }
+            | TsInsn::Concat3 { .. }
+            | TsInsn::Mask { .. }
+            | TsInsn::BrFalse { .. }
+            | TsInsn::BrNz { .. }
+            | TsInsn::Jmp { .. }
+            | TsInsn::CaseJmp { .. }
+            | TsInsn::CaseMaskJmp { .. }
+            | TsInsn::RedOr { .. }
+            | TsInsn::WRedOr { .. }
+            | TsInsn::WRedAnd { .. }
+            | TsInsn::RedAnd { .. }
+            | TsInsn::WSel { .. }
+            | TsInsn::WConst { .. }
+            | TsInsn::WXor { .. }
+            | TsInsn::WAnd { .. }
+            | TsInsn::WOr { .. }
+            | TsInsn::WNot { .. }
+            | TsInsn::WRange { .. }
+            | TsInsn::RangeFromW { .. }
+            | TsInsn::BitFromW { .. }
+            | TsInsn::WConcat { .. }
+            | TsInsn::WMask { .. }
+            | TsInsn::WFromN { .. }
+            | TsInsn::NFromW { .. }
+            | TsInsn::Mul { .. }
+            | TsInsn::AddC { .. }
+            | TsInsn::Shl { .. }
+            | TsInsn::Shr { .. }
+            | TsInsn::Repl { .. }
+            | TsInsn::WRepl { .. } => {}
+        }
+    }
+    Some((reads, writes))
 }
 
 thread_local! {

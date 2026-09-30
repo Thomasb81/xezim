@@ -27,6 +27,8 @@ mod class_formal_typedef_widen;
 mod class_interface_same_name;
 #[path = "classes/class_member_name_clash.rs"]
 mod class_member_name_clash;
+#[path = "classes/class_param_default_scope.rs"]
+mod class_param_default_scope;
 #[path = "classes/class_queue_struct_member_arrays.rs"]
 mod class_queue_struct_member_arrays;
 #[path = "classes/class_struct_collection_elements.rs"]
@@ -73,6 +75,8 @@ mod struct_member_class_handle_new;
 mod this_collection_struct_members;
 #[path = "classes/this_super_member.rs"]
 mod this_super_member;
+#[path = "classes/type_param_default_implicit_extends.rs"]
+mod type_param_default_implicit_extends;
 #[path = "classes/type_param_formal_stale_local.rs"]
 mod type_param_formal_stale_local;
 #[path = "classes/typename_p_subroutine_locals.rs"]
@@ -389,6 +393,10 @@ mod class_localparam_array;
 mod class_method_sibling_instance_oomr;
 #[path = "classes/class_randomize_multidim.rs"]
 mod class_randomize_multidim;
+#[path = "classes/cls_agg_members_in_struct.rs"]
+mod cls_agg_members_in_struct;
+#[path = "classes/cls_agg_members_matrix.rs"]
+mod cls_agg_members_matrix;
 #[path = "classes/condition_waiter_yields_to_inactive.rs"]
 mod condition_waiter_yields_to_inactive;
 #[path = "classes/covergroup_bin_arithmetic.rs"]
@@ -399,12 +407,18 @@ mod enum_local_shadows_flat_maps;
 mod field_init_once_in_order;
 #[path = "classes/handle_chain_read_in_instance_task.rs"]
 mod handle_chain_read_in_instance_task;
+#[path = "classes/heap_id_collision_member_access.rs"]
+mod heap_id_collision_member_access;
+#[path = "classes/id_collision_in_heap.rs"]
+mod id_collision_in_heap;
 #[path = "classes/implication_joint_distribution.rs"]
 mod implication_joint_distribution;
 #[path = "classes/member_collection_runtime_class.rs"]
 mod member_collection_runtime_class;
 #[path = "classes/member_visibility_local_protected.rs"]
 mod member_visibility_local_protected;
+#[path = "classes/method_call_plans.rs"]
+mod method_call_plans;
 #[path = "classes/method_int_formal_zero_extends.rs"]
 mod method_int_formal_zero_extends;
 #[path = "classes/method_local_base_per_process.rs"]
@@ -421,6 +435,8 @@ mod parked_task_local_vif_alias;
 mod randomize_joint_constraints;
 #[path = "classes/randomize_obj_array_property.rs"]
 mod randomize_obj_array_property;
+#[path = "classes/receiver_call_evaluated_once.rs"]
+mod receiver_call_evaluated_once;
 #[path = "classes/ref_formal_shadows_property.rs"]
 mod ref_formal_shadows_property;
 #[path = "classes/sqr_zero_time_loop.rs"]
@@ -437,8 +453,14 @@ mod struct_prop_whole_copy;
 mod type_param_replication_localparam;
 #[path = "classes/typedef_receiver_static_task.rs"]
 mod typedef_receiver_static_task;
+#[path = "classes/vif_member_read_nested_receiver.rs"]
+mod vif_member_read_nested_receiver;
 #[path = "classes/vif_property_named_like_instance.rs"]
 mod vif_property_named_like_instance;
+#[path = "classes/vif_receiver_neighbor_shapes.rs"]
+mod vif_receiver_neighbor_shapes;
+#[path = "classes/vif_receiver_operation_matrix.rs"]
+mod vif_receiver_operation_matrix;
 #[path = "classes/vif_resource_db_shape.rs"]
 mod vif_resource_db_shape;
 #[path = "classes/vif_static_roundtrip.rs"]

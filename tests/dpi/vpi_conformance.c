@@ -89,14 +89,15 @@ int vc_get_value(void) {
     vpi_get_value(h, &v);
     CHECK(strcmp(v.value.str, "02215125715") == 0, "vpiOctStrVal");
 
-    /* vpiObjTypeVal: the simulator picks, and reports what it picked. */
+    /* vpiObjTypeVal: the simulator picks, and reports what it picked —
+     * §38.15 gives a vector (this is a logic [31:0]) vpiVectorVal. */
     v.format = vpiObjTypeVal;
     vpi_get_value(h, &v);
-    CHECK(v.format == vpiIntVal, "vpiObjTypeVal on a 32-bit signal picks vpiIntVal");
+    CHECK(v.format == vpiVectorVal, "vpiObjTypeVal on a 32-bit vector picks vpiVectorVal");
 
     /* An unsupported format must set vpiSuppressVal, not leave the union
      * untouched while claiming nothing went wrong. */
-    v.format = vpiStrengthVal;
+    v.format = 99; /* no such format */
     vpi_get_value(h, &v);
     CHECK(v.format == vpiSuppressVal, "an unsupported format reports vpiSuppressVal");
     vpi_free_object(h);
@@ -183,7 +184,7 @@ int vc_put_xz(void) {
 
     /* An undecodable format must write NOTHING. tb.untouched stays 8'hA5. */
     h = vpi_handle_by_name("tb.untouched", NULL);
-    vs.format = vpiStrengthVal;
+    vs.format = 99; /* no such format */
     vpi_put_value(h, &vs, NULL, vpiNoDelay);
     vpi_free_object(h);
     return 0;

@@ -23,8 +23,12 @@ mod compiled_sformatf_native;
 mod display_only_always;
 #[path = "strings/dpi_child_module_import.rs"]
 mod dpi_child_module_import;
+#[path = "strings/dpi_export_task_waits.rs"]
+mod dpi_export_task_waits;
 #[path = "strings/dpi_integration_tests.rs"]
 mod dpi_integration_tests;
+#[path = "strings/dpi_library_loading.rs"]
+mod dpi_library_loading;
 #[path = "strings/dpi_unit_scope.rs"]
 mod dpi_unit_scope;
 #[path = "strings/fixed_string_array_dims.rs"]
@@ -89,5 +93,19 @@ mod string_returning_fn_inline;
 mod struct_elem_string_member_format;
 #[path = "strings/system_task_gaps.rs"]
 mod system_task_gaps;
+#[path = "strings/uvm_dpi_driver_linkage.rs"]
+mod uvm_dpi_driver_linkage;
+#[path = "strings/vpi_callbacks.rs"]
+mod vpi_callbacks;
+#[path = "strings/vpi_mcd_and_time_queries.rs"]
+mod vpi_mcd_and_time_queries;
+#[path = "strings/vpi_net_kinds.rs"]
+mod vpi_net_kinds;
+#[path = "strings/vpi_object_model_walk.rs"]
+mod vpi_object_model_walk;
+#[path = "strings/vpi_routines.rs"]
+mod vpi_routines;
+#[path = "strings/vpi_typed_port_kinds.rs"]
+mod vpi_typed_port_kinds;
 #[path = "strings/wide_string2num.rs"]
 mod wide_string2num;

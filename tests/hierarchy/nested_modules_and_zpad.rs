@@ -116,7 +116,7 @@ endmodule
 /// The production shape that settled the §23.3.3.6 choice: a testbench tying
 /// unused DUT input ports to narrow sized constants (`.vld_p1(1'b0)` on a
 /// 2-bit port). The z upper bit crossed a CDC as X and stalled the DUT's
-/// write path. Nine-case matrix from the report, xrun-validated.
+/// write path. Nine-case matrix from the report, validated on a commercial simulator.
 #[test]
 fn narrow_constants_and_vars_zero_extend_on_input_ports() {
     let src = r#"

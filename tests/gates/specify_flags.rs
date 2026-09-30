@@ -2,7 +2,7 @@
 //! module path delays (zero-delay GLS) and timing checks;
 //! `+notimingcheck`/`+notimingchecks` suppress only the §31 timing checks;
 //! `+no_notifier` / `+no_tchk_msg` keep one of a violation's two effects.
-//! Xcelium's `-` spellings are accepted too. CLI-level tests because the
+//! The `-` spellings are accepted too. CLI-level tests because the
 //! switches are process-globals set by argument parsing.
 
 use std::path::PathBuf;
@@ -70,7 +70,7 @@ fn specify_path_delay_applies_by_default() {
     );
 }
 
-/// `+nospecify` (and Xcelium's `-nospecify`): zero-delay — y flips immediately.
+/// `+nospecify` (and `-nospecify`): zero-delay — y flips immediately.
 #[test]
 fn nospecify_suppresses_path_delays() {
     for flag in ["+nospecify", "-nospecify"] {

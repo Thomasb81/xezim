@@ -32,6 +32,32 @@ pub fn verbose() -> bool {
     VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `XEZIM_RSS_TRACE=1`: print the process's resident memory (current and
+/// high-water mark, from `/proc/self/status`) at a pipeline milestone. Peak
+/// RSS is a construction-time number on large designs, so attributing it
+/// needs the curve between phases, not just the final maximum.
+pub fn rss_trace(label: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("XEZIM_RSS_TRACE").is_some()) {
+        return;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |key: &str| -> u64 {
+        status
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    eprintln!(
+        "[RSS] {:<40} cur={:>6} MB  peak={:>6} MB",
+        label,
+        field("VmRSS:") / 1024,
+        field("VmHWM:") / 1024
+    );
+}
+
 pub mod benchw;
 pub mod compiler;
 pub mod env_vars;
@@ -51,6 +77,31 @@ pub use xezim_core::{
     set_implicit_net_warn, set_library_cli, set_module_timescale_cli, set_strict_top, sv_parser,
     tokenize_file, write_compiled,
 };
+
+static PREPROCESSED_STASH: std::sync::Mutex<Option<xezim_core::PreprocessedSources>> =
+    std::sync::Mutex::new(None);
+
+/// Hand a finished preprocessing pass over the design to the next
+/// `simulate_multi` call, which reuses it when its inputs match exactly
+/// (otherwise it preprocesses afresh).
+pub fn stash_preprocessed(pre: xezim_core::PreprocessedSources) {
+    if let Ok(mut slot) = PREPROCESSED_STASH.lock() {
+        *slot = Some(pre);
+    }
+}
+
+fn take_preprocessed(
+    sources: &[String],
+    source_paths: &[String],
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+) -> Option<xezim_core::PreprocessedSources> {
+    PREPROCESSED_STASH
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .filter(|p| p.matches(sources, source_paths, include_dirs, defines))
+}
 
 /// Content-addressed cache for elaborated designs. The payload uses the
 /// versioned `.xezbc` format, so cache hits skip parsing and elaboration while
@@ -126,6 +177,7 @@ fn design_cache_key(
     top_module_name: Option<&str>,
     include_dirs: &[String],
     defines: &[(String, Option<String>)],
+    pre: Option<&xezim_core::PreprocessedSources>,
 ) -> (
     String,
     Vec<String>,
@@ -177,14 +229,23 @@ fn design_cache_key(
     // `begin_top_level_file` matches the parse-time preprocessor state.
     let mut preprocessed_texts: Vec<String> = Vec::with_capacity(sources.len());
     let mut line_maps = Vec::with_capacity(sources.len());
-    for (idx, source) in sources.iter().enumerate() {
-        let source_path = source_paths.get(idx).map(std::path::PathBuf::from);
-        hash.text(source_paths.get(idx).map_or("", String::as_str));
-        pp.begin_top_level_file();
-        let text = pp.preprocess_file(source, source_path.as_deref());
-        hash.text(&text);
-        preprocessed_texts.push(text);
-        line_maps.push(pp.take_line_map());
+    if let Some(pre) = pre {
+        // Same text a fresh pass would produce (`matches` checked the
+        // inputs); the caller keeps ownership for elaboration.
+        for (idx, text) in pre.texts.iter().enumerate() {
+            hash.text(source_paths.get(idx).map_or("", String::as_str));
+            hash.text(text);
+        }
+    } else {
+        for (idx, source) in sources.iter().enumerate() {
+            let source_path = source_paths.get(idx).map(std::path::PathBuf::from);
+            hash.text(source_paths.get(idx).map_or("", String::as_str));
+            pp.begin_top_level_file();
+            let text = pp.preprocess_file(source, source_path.as_deref());
+            hash.text(&text);
+            preprocessed_texts.push(text);
+            line_maps.push(pp.take_line_map());
+        }
     }
 
     let mut dependencies = config.dependency_files.clone();
@@ -286,6 +347,7 @@ mod design_cache_tests {
             top,
             &["include".to_string()],
             &[("FEATURE".to_string(), Some("1".to_string()))],
+            None,
         )
         .0
     }
@@ -365,6 +427,7 @@ mod design_cache_tests {
             Some("top"),
             &[include_dir.clone()],
             &[],
+            None,
         );
         std::fs::write(&header, "`define WIDTH 16\n").unwrap();
         let after = design_cache_key(
@@ -374,6 +437,7 @@ mod design_cache_tests {
             Some("top"),
             &[include_dir],
             &[],
+            None,
         );
         let _ = std::fs::remove_dir_all(dir);
         assert_ne!((before.0, before.1), (after.0, after.1));
@@ -757,6 +821,59 @@ fn reinstall_ooc_constraint_bodies(
     }
 }
 
+/// `XEZIM_MEM_CENSUS`: the elaborated design as elaboration hands it over —
+/// serialized size per field (a stand-in for heap size that ranks them) and
+/// the sizes of the AST node types that make up most of it.
+fn elab_census(elab: &elaborate::ElaboratedModule) {
+    fn ser<T: serde::Serialize>(v: &T) -> usize {
+        bincode::serialized_size(v).unwrap_or(0) as usize
+    }
+    let mut rows: Vec<(&str, usize)> = vec![
+        ("signals", ser(&elab.signals)),
+        ("always_blocks", ser(&elab.always_blocks)),
+        ("initial_blocks", ser(&elab.initial_blocks)),
+        ("continuous_assigns", ser(&elab.continuous_assigns)),
+        ("functions", ser(&elab.functions)),
+        ("tasks", ser(&elab.tasks)),
+        ("classes", ser(&elab.classes)),
+        ("var_decl_types", ser(&elab.var_decl_types)),
+        ("parameters", ser(&elab.parameters)),
+        ("instances", ser(&elab.instances)),
+        ("nets", ser(&elab.nets)),
+        ("port_aliases", ser(&elab.port_aliases)),
+        ("decl_sites", ser(&elab.decl_sites)),
+        ("source_texts", ser(&elab.source_texts)),
+        ("arrays", ser(&elab.arrays)),
+        ("two_state_signals", ser(&elab.two_state_signals)),
+    ];
+    rows.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+    eprintln!(
+        "[MEM-CENSUS] === elaborated design (serialized MB) — {} signals, {} always, {} pending always, {} pending initial, {} pending CA ===",
+        elab.signals.len(),
+        elab.always_blocks.len(),
+        elab.pending_always.len(),
+        elab.pending_initial.len(),
+        elab.pending_cont_assign.len()
+    );
+    for (name, b) in rows.iter().take(12) {
+        eprintln!("[MEM-CENSUS] {:>9.1} MB  {}", *b as f64 / 1048576.0, name);
+    }
+    use std::mem::size_of;
+    eprintln!(
+        "[MEM-CENSUS] node sizes: Expression={} ExprKind={} HierarchicalIdentifier={} HierPathSegment={} Identifier={} Statement={} StatementKind={} Span={} Signal={} Value={}",
+        size_of::<ast::expr::Expression>(),
+        size_of::<ast::expr::ExprKind>(),
+        size_of::<ast::expr::HierarchicalIdentifier>(),
+        size_of::<ast::expr::HierPathSegment>(),
+        size_of::<ast::Identifier>(),
+        size_of::<ast::stmt::Statement>(),
+        size_of::<ast::stmt::StatementKind>(),
+        size_of::<ast::Span>(),
+        size_of::<elaborate::Signal>(),
+        size_of::<xezim_core::Value>(),
+    );
+}
+
 /// Simulate a single source string.
 
 /// Realtime-clock stopwatch for HUMAN-FACING phase/profile reports.
@@ -948,14 +1065,29 @@ fn simulate_multi_inner(
 ) -> Result<compiler::Simulator, String> {
     let total_start = WallTimer::now();
     let compilation_start = WallTimer::now();
+    rss_trace("start");
     // IEEE 1800-2017 §9.4.5: the parser discards intra-assignment delays
     // (`lhs = #d rhs`); canonicalize them into a marker call the simulator
     // implements (see `intra_delay`) before parsing.
+    let raw_sources = sources;
     let sources: Vec<String> = sources
         .iter()
         .map(|s| intra_delay::rewrite_intra_assignment_delays(s))
         .collect();
+    // The driver's own preprocessing pass (main.rs), reusable when the
+    // rewrite above left every source untouched.
+    let mut pre = take_preprocessed(raw_sources, source_paths, include_dirs, defines)
+        .filter(|_| sources.as_slice() == raw_sources);
     let cache = design_cache_config();
+    if cache.is_some() && pre.is_none() {
+        // One pass serves both the cache key and (on a miss) elaboration.
+        pre = Some(xezim_core::preprocess_design(
+            &sources,
+            source_paths,
+            include_dirs,
+            defines,
+        ));
+    }
     let mut cache_pp_texts: Vec<String> = Vec::new();
     let mut cache_line_maps = Vec::new();
     let cache_key = cache.as_ref().map(|config| {
@@ -966,6 +1098,7 @@ fn simulate_multi_inner(
             top_module_name,
             include_dirs,
             defines,
+            pre.as_ref(),
         );
         cache_pp_texts = texts;
         cache_line_maps = maps;
@@ -977,12 +1110,21 @@ fn simulate_multi_inner(
         .and_then(|(config, key)| read_design_cache(config, key));
 
     let elab = if let Some(mut elab) = cached_elab {
+        drop(sources);
         // The artifact skips the (large) preprocessed texts; refill them from
         // the cache-key pass so runtime diagnostics keep `file:line`
         // resolution on cache hits. `source_files` / `src_file_of_module`
         // travel inside the artifact.
-        elab.source_texts = std::mem::take(&mut cache_pp_texts);
-        elab.source_line_maps = std::mem::take(&mut cache_line_maps);
+        match pre.take() {
+            Some(p) => {
+                elab.source_texts = p.texts;
+                elab.source_line_maps = p.line_maps;
+            }
+            None => {
+                elab.source_texts = std::mem::take(&mut cache_pp_texts);
+                elab.source_line_maps = std::mem::take(&mut cache_line_maps);
+            }
+        }
         if elab.source_files.is_empty() {
             elab.source_files = source_paths.to_vec();
         }
@@ -1001,17 +1143,26 @@ fn simulate_multi_inner(
         // Fresh per-kind duplicate counters for this elaboration, so a second
         // run in the same process/thread reports its own first five.
         xezim_core::elab_diag_reset_counts();
-        let (definitions, mut elab) = parse_and_elaborate_multi(
+        let (definitions, mut elab) = xezim_core::parse_and_elaborate_multi_preprocessed(
             &sources,
             top_module_name,
             include_dirs,
             source_paths,
             defines,
+            pre.take(),
         )?;
+        rss_trace("parse+elaborate");
+        if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+            elab_census(&elab);
+        }
 
         // §18.5.1: recover any out-of-class constraint body that the class-table
         // repopulation in `inline_instantiations` dropped.
         reinstall_ooc_constraint_bodies(&sources, source_paths, include_dirs, defines, &mut elab);
+        // The rewritten source texts are dead from here on (the elaborated
+        // design keeps its own preprocessed copies for diagnostics); don't
+        // carry a second copy of the whole design through simulation.
+        drop(sources);
 
         // Second-pass `should_fail` lint (additive — reuses the elaboration above,
         // no extra cost; does not alter elaborate/simulate behavior). Rejecting
@@ -1030,8 +1181,13 @@ fn simulate_multi_inner(
         // static-init assignments before the AST is dropped (issue #26).
         defer_static_syscall_inits(&definitions, &mut elab);
 
-        // Drop the parsed AST before constructing runtime state.
+        // Drop the parsed AST before constructing runtime state, and hand
+        // its pages back at once: the allocator would otherwise keep them
+        // resident for its purge delay, right while `Simulator::new` makes
+        // its largest fresh allocations, and peak RSS would carry both.
         drop(definitions);
+        xezim_core::release_free_memory();
+        rss_trace("parsed AST dropped");
 
         if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
             // Pending rewrite contexts are intentionally omitted from the
@@ -1047,6 +1203,7 @@ fn simulate_multi_inner(
     };
 
     let mut sim = compiler::Simulator::new(elab, max_time);
+    rss_trace("simulator constructed");
     if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
         sim.set_prepared_comb_cache_path(Some(config.directory.join(format!("{}.xezcomb", key))));
     }
@@ -1085,6 +1242,7 @@ fn simulate_multi_inner(
         sim.sdf_annotation = Some(annotation);
     }
     sim.compile();
+    rss_trace("compiled");
     // A compile-time failure (e.g. §6.18 illegal non-class to class-handle
     // assignment) aborts before any block is scheduled; surface it as `Err` so
     // library callers see the compile error instead of a bogus run.
@@ -1095,6 +1253,11 @@ fn simulate_multi_inner(
         "[PHASE] compilation: {:.1}ms",
         compilation_start.elapsed().as_secs_f64() * 1000.0
     );
+    // Startup-cost measurement: stop once the design is ready to simulate,
+    // before any time-0 process runs.
+    if std::env::var_os("XEZIM_EXIT_AFTER_COMPILE").is_some() {
+        std::process::exit(0);
+    }
 
     if let Some(path) = emit_hypergraph {
         let t = std::time::Instant::now();
@@ -1199,6 +1362,14 @@ fn simulate_multi_inner(
 
     let simulation_start = WallTimer::now();
     sim.simulate();
+    rss_trace("simulated");
+    if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
+        eprintln!(
+            "[MEM-CENSUS] end of run: runtime name->value map {} entries; {}",
+            sim.signals.len(),
+            sim.class_heap_census()
+        );
+    }
     chatter!(
         "[PHASE] simulation: {:.1}ms",
         simulation_start.elapsed().as_secs_f64() * 1000.0

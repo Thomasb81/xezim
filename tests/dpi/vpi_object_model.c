@@ -94,9 +94,13 @@ static PLI_INT32 om_check(PLI_BYTE8 *user_data) {
     CHECK(parent && strcmp(vpi_get_str(vpiName, parent), "tb") == 0, "vpiScope of an instance is its parent");
 
     /* A sub-module's own objects, ports included (`clk` is a port of `sub`,
-     * and has its own signal in the instance's scope). */
+     * and has its own signal in the instance's scope). IEEE 1800-2017
+     * §23.2.2.3: an `input logic` port with no net type or `var` keyword is a
+     * net; an `output logic` port is a variable. */
+    collect(vpiNet, sub, buf, sizeof buf);
+    CHECK(strcmp(buf, "clk,i") == 0, "a sub-module's input ports are nets");
     collect(vpiReg, sub, buf, sizeof buf);
-    CHECK(strcmp(buf, "clk,i,o") == 0, "a sub-module's own objects");
+    CHECK(strcmp(buf, "o") == 0, "a sub-module's output logic port is a variable");
 
     /* --- values --- */
     s_vpi_value v;
@@ -119,7 +123,11 @@ static PLI_INT32 om_check(PLI_BYTE8 *user_data) {
 
     /* --- memory words --- */
     vpiHandle mem = vpi_handle_by_name("tb.mem", NULL);
-    CHECK(mem && vpi_get(vpiType, mem) == vpiMemory, "an unpacked array is a vpiMemory");
+    /* §37.17: an array of variables is a vpiRegArray (vpiArrayVar); a
+     * one-dimensional array of logic is also a 1364 memory, which the
+     * vpiMemory iteration above and vpiIsMemory report. */
+    CHECK(mem && vpi_get(vpiType, mem) == vpiRegArray, "an unpacked array is a vpiRegArray");
+    CHECK(vpi_get(vpiIsMemory, mem) == 1, "a 1-D array of logic is a memory");
     CHECK(vpi_get(vpiSize, mem) == 4, "vpiSize of a memory is its word count");
     vpiHandle w1 = vpi_handle_by_index(mem, 1);
     CHECK(w1 != NULL, "vpi_handle_by_index");

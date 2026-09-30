@@ -4,8 +4,7 @@
 // Mirrors `uvm_dpi.cc` from the Accellera UVM reference but skips
 // `uvm_hdl.c` entirely (its per-simulator branches all
 // require proprietary vendor headers). The `uvm_hdl_*` surface is
-// implemented directly here against standard IEEE 1800 VPI — no
-// separate C file, no mangling concerns.
+// implemented directly here against standard IEEE 1800 VPI.
 //
 // Build:
 //   g++ -shared -fPIC -std=c++17 -Wno-format-security \
@@ -22,11 +21,23 @@
 // simulator's UVM build applies the same suppression.
 //----------------------------------------------------------------------
 
-// `uvm_dpi.h` declares its prototypes without `extern "C"`. When this
-// file is compiled as C++ those prototypes default to C++ linkage.
-// We need C linkage for the implementations below (so SV can resolve
-// the symbols by their C names), so wrap the header include.
+#include <string.h>
+#ifndef __cplusplus
+// The 2020 `uvm_regex.cc` uses `false`, so a C build needs <stdbool.h>.
+#include <stdbool.h>
+#endif
+
+// Everything below has C linkage, as in the reference `uvm_dpi.cc`:
+// SV resolves DPI imports and exports by their C names. `uvm_dpi.h`
+// declares its prototypes without `extern "C"`, and the UVM sources
+// included at the end reference SV exports (`m__uvm_report_dpi`,
+// `uvm_polling_value_change_notify`) through plain `extern`
+// declarations. Compiled as C++ outside this block, those references
+// would be mangled and could never bind to the exported functions.
+#ifdef __cplusplus
 extern "C" {
+#endif
+
 #include "uvm_dpi.h"
 
 // Forward declaration for `uvm_re_compexecfree` — the Accellera
@@ -38,9 +49,6 @@ extern "C" {
 // dlsym lookup then fails with "unresolved symbol".
 unsigned char uvm_re_compexecfree(const char* re, const char* str,
                                    unsigned char deglob, int* exec_ret);
-}
-
-#include <string.h>
 
 //----------------------------------------------------------------------
 // uvm_hdl_* — IEEE 1800.2-2017 Annex C (UVM HDL Access).
@@ -143,8 +151,6 @@ static int uvm_hdl_get_vlog(char *path, p_vpi_vecval value) {
     return 1;
 }
 
-extern "C" {
-
 int uvm_hdl_check_path(char *path) {
     if (path == NULL) return 0;
     vpiHandle h = vpi_handle_by_name(path, NULL);
@@ -179,8 +185,6 @@ int uvm_hdl_release_and_read(char *path, p_vpi_vecval value) {
     return uvm_hdl_set_vlog(path, NULL, vpiReleaseFlag);
 }
 
-}  // extern "C"
-
 //----------------------------------------------------------------------
 // UVM C/C++ sources. Same include order as `uvm_dpi.cc` but with
 // `uvm_hdl.c` skipped — its `uvm_hdl_*` surface is implemented above.
@@ -196,4 +200,8 @@ int uvm_hdl_release_and_read(char *path, p_vpi_vecval value) {
 // XEZIM_UVM_POLLING via -D when the source dir provides the file.
 #ifdef XEZIM_UVM_POLLING
 #include "uvm_hdl_polling.c"
+#endif
+
+#ifdef __cplusplus
+}  // extern "C"
 #endif

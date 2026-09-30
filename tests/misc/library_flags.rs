@@ -1,7 +1,7 @@
 //! Commercial-style library flags: `-v <file>`, `-y <dir>`, `+libext+<ext>`.
 //!
 //! `-v` was previously a no-op "verbose" flag (nothing consumed it); it now
-//! carries the Verilog-XL/VCS meaning: a library FILE whose modules are
+//! carries its traditional meaning: a library FILE whose modules are
 //! compiled only to satisfy unresolved instantiations and are never
 //! top-module candidates. `+libext+` REPLACES the `-y` extension list
 //! (default .v/.sv/.V), matching commercial tools. Both also work inside

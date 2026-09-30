@@ -147,7 +147,7 @@ static PLI_INT32 st_errors(PLI_BYTE8 *ud) {
      * setting vpiSuppressVal — vpi_chk_error must see it too. */
     vpiHandle h = vpi_handle_by_name("tb.a", NULL);
     s_vpi_value v;
-    v.format = vpiStrengthVal;
+    v.format = 99; /* no such format */
     vpi_get_value(h, &v);
     CHECK(v.format == vpiSuppressVal, "unsupported format sets vpiSuppressVal");
 

@@ -121,6 +121,8 @@ mod packed_record_output_chain;
 mod param_typedef_instance_isolation;
 #[path = "hierarchy/parameter_override_identifiers.rs"]
 mod parameter_override_identifiers;
+#[path = "hierarchy/parenless_task_enables.rs"]
+mod parenless_task_enables;
 #[path = "hierarchy/pct_m_block_scope.rs"]
 mod pct_m_block_scope;
 #[path = "hierarchy/percent_m_declaring_scope.rs"]
@@ -145,6 +147,8 @@ mod repro_import;
 mod resource_pool_scope_lookup;
 #[path = "hierarchy/same_name_port_hop.rs"]
 mod same_name_port_hop;
+#[path = "hierarchy/submodule_array_element_assigns.rs"]
+mod submodule_array_element_assigns;
 #[path = "hierarchy/submodule_net_array_shapes.rs"]
 mod submodule_net_array_shapes;
 #[path = "hierarchy/submodule_two_dim_array_element.rs"]
@@ -165,6 +169,8 @@ mod t_no_parens_static_method;
 mod typedef_array_ports_in_children;
 #[path = "hierarchy/undefined_call_in_instance.rs"]
 mod undefined_call_in_instance;
+#[path = "hierarchy/undriven_implicit_output_is_z.rs"]
+mod undriven_implicit_output_is_z;
 #[path = "hierarchy/unpacked_struct_port.rs"]
 mod unpacked_struct_port;
 #[path = "hierarchy/vif_arrays_and_null_default.rs"]

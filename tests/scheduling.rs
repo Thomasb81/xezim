@@ -31,6 +31,8 @@ mod assoc_bracket_keys;
 mod audit_ports_disable_drivers;
 #[path = "scheduling/bare_clocking_event.rs"]
 mod bare_clocking_event;
+#[path = "scheduling/bit_sensitivity.rs"]
+mod bit_sensitivity;
 #[path = "scheduling/block_local_decl_ast_fallback.rs"]
 mod block_local_decl_ast_fallback;
 #[path = "scheduling/blocking_loop_break_continue.rs"]
@@ -77,6 +79,8 @@ mod disable_loop_label;
 mod edge_delivery;
 #[path = "scheduling/edge_event_lsb.rs"]
 mod edge_event_lsb;
+#[path = "scheduling/element_sensitivity_after_large_array.rs"]
+mod element_sensitivity_after_large_array;
 #[path = "scheduling/event_control_iff_guard.rs"]
 mod event_control_iff_guard;
 #[path = "scheduling/event_features_15_5.rs"]
@@ -117,6 +121,8 @@ mod intra_assignment_delay;
 mod intra_assignment_event_identifier;
 #[path = "scheduling/ivtest_always_cluster.rs"]
 mod ivtest_always_cluster;
+#[path = "scheduling/large_array_element_events.rs"]
+mod large_array_element_events;
 #[path = "scheduling/local_arrays_and_edge_always.rs"]
 mod local_arrays_and_edge_always;
 #[path = "scheduling/loop_control_and_oob_index.rs"]
@@ -197,6 +203,8 @@ mod vardelay_clock_period;
 mod wait_fork_immediate_children;
 #[path = "scheduling/wait_in_foreach_blocks.rs"]
 mod wait_in_foreach_blocks;
+#[path = "scheduling/wait_named_event_retrigger.rs"]
+mod wait_named_event_retrigger;
 #[path = "scheduling/wait_satisfaction_order.rs"]
 mod wait_satisfaction_order;
 #[path = "scheduling/waiter_edge_ordering.rs"]

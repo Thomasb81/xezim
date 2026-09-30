@@ -125,12 +125,13 @@ pub(super) struct PollProbe {
 }
 
 /// Value-change callback of an enabled probe; `user_data` is its chandle.
-extern "C" fn uvm_polling_value_change(cb: *mut s_cb_data) {
+extern "C" fn uvm_polling_value_change(cb: *mut s_cb_data) -> libc::c_int {
     if cb.is_null() {
-        return;
+        return 0;
     }
     let h = unsafe { (*cb).user_data } as u64;
     let _ = try_active_sim("uvm_polling", |sim| sim.uvm_polling_changed(h));
+    0
 }
 
 /// Storage behind a `uvm_hdl_*` path.
@@ -531,26 +532,16 @@ impl Simulator {
         }
         p.enabled = enable;
         let slot = p.slot;
-        let routine = uvm_polling_value_change as usize;
+        let routine = uvm_polling_value_change as *const () as usize;
         if enable {
             let t = p.target.clone();
             let now = self.uvm_polling_sample(&t);
             if let Some(p) = self.uvm_dpi.polls.get_mut(&h) {
                 p.last = now;
             }
-            self.dpi_value_change_cbs
-                .entry(slot)
-                .or_default()
-                .push(DpiCbHandle {
-                    cb_type: vpi::CB_VALUE_CHANGE,
-                    signal_id: slot,
-                    cb_routine: routine,
-                    user_data: h as usize,
-                    obj: 0,
-                    value_format: vpi::SUPPRESS_VAL,
-                });
-        } else if let Some(list) = self.dpi_value_change_cbs.get_mut(&slot) {
-            list.retain(|cb| cb.cb_routine != routine || cb.user_data != h as usize);
+            self.vpi_cb_add_internal_watch(slot, routine, h as usize);
+        } else {
+            self.vpi_cb_remove_internal_watch(slot, routine, h as usize);
         }
     }
 
@@ -1218,14 +1209,6 @@ impl Simulator {
                 return false;
             }
         };
-        let packed_cell = matches!(t.obj, HdlObj::Slot(id) if is_packed_id(id));
-        if force && packed_cell {
-            self.uvm_dpi_note(format!(
-                "{}(\"{}\"): a packed-arena memory cell (XEZIM_PACKED_MEM) cannot be forced",
-                c_name, path
-            ));
-            return false;
-        }
         if let Some(bits) = &t.bits {
             if force {
                 self.uvm_dpi_note(format!(
@@ -1245,7 +1228,7 @@ impl Simulator {
             // A second force replaces the first (§10.6.2): lift it so the
             // guarded write below lands, then re-arm with the new value.
             if let HdlObj::Slot(id) = t.obj {
-                self.forced_signals.remove(&id);
+                self.unforce_cell(id);
             }
             self.forced_names.remove(&t.key);
             let key = t.key.clone();
@@ -1255,8 +1238,7 @@ impl Simulator {
         if force {
             match t.obj {
                 HdlObj::Slot(id) => {
-                    let stored = self.signal_table[id].clone();
-                    self.forced_signals.insert(id, stored);
+                    self.force_cell(id, v);
                 }
                 HdlObj::Named(_) => {
                     self.forced_names.insert(t.key);
@@ -1287,7 +1269,6 @@ impl Simulator {
             return false;
         }
         let id = match t.obj {
-            HdlObj::Slot(id) if is_packed_id(id) => None,
             HdlObj::Slot(id) => Some(id),
             HdlObj::Named(_) => None,
         };

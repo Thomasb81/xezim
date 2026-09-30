@@ -277,6 +277,8 @@ mod unpacked_array_ports_and_vif_arrays;
 mod unpacked_struct_array_members;
 #[path = "types/unpacked_struct_func_arg.rs"]
 mod unpacked_struct_func_arg;
+#[path = "types/unpacked_struct_multidim_members.rs"]
+mod unpacked_struct_multidim_members;
 #[path = "types/untyped_param_width.rs"]
 mod untyped_param_width;
 #[path = "types/valparam_spec_cycle.rs"]

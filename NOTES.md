@@ -15,6 +15,180 @@ and the development workflow are in [README.md](README.md).
   step the child's counter. A bare name also no longer follows an earlier
   hierarchical reference such as `u.x = 1` down into that child. (#195, from
   PR #196 by Ganesh T S)
+* A member access through a struct no longer lands on an unrelated class
+  object whose handle number happens to equal the struct's value: the path is
+  chosen from the declared type. This covers struct variables, collections of
+  structs, hierarchical references, `ref` formals and part-selects, a
+  module-level struct holding a class handle, and class handles declared
+  through a typedef (including a parameterized one). (#193, from PR #194 by
+  Ganesh T S)
+* Members of a struct-typed class property resolve at any depth: indexed and
+  part-selected members, nested structs, and queue, dynamic and associative
+  array members, in methods and at module scope. (#197, from PR #198 by
+  Ganesh T S)
+* A class that extends a parameterized class without giving all its
+  parameters (`class d extends base;`) gets their declared defaults, in
+  functions and tasks alike. A type parameter used to read as a 1-bit
+  `logic`, so a UVM base test built this way created null objects and drove
+  nothing. (PR #199 by eenky)
+* `+incdir+` directories in a `-F` args file resolve against the file's own
+  directory first, so `+incdir+.` means that directory. (PR #200 by Francesco
+  Urbani)
+* `--dpi-lib` libraries are loaded into the global symbol scope, as the DPI
+  guide says, so one library can call another, in either command-line order.
+  A call into a second library used to end the run with `symbol lookup
+  error`. (#202)
+* A `--dpi-lib` library that cannot be loaded stops the run before it starts
+  (exit 1), and calling a DPI import that no loaded library defines is a
+  `Fatal`. Both used to continue, with the import returning 0, and exit 0.
+  (#201)
+* `$display` output from a testbench that prints rarely appears as it is
+  printed, not only at exit. (xezim-core #49)
+* A task enabled without parentheses through a hierarchical path or a
+  package scope (`u.t;`, `a.b.t;`, `pkg::t;`) is called. It used to be
+  dropped inside a task, so an `always` calling that task spun at time 0
+  and the run hung, and directly in an `always` it was rejected as having no
+  timing control. A three-level enable inside a task (`a.b.t();`) also kept
+  advancing time after `$finish`.
+* An exported task called from C returns only when it has finished:
+  `fork ... join`, `join_any`, `wait fork`, `wait(...)` and `@(...)` inside it
+  now wait, with the rest of the simulation running meanwhile. `fork ... join`
+  used to drop the rest of the task and return, and the others returned at
+  once. (#204)
+* `wait(ev)` on a named event waits for a new trigger every time. After the
+  event's first trigger it used to fall straight through.
+* VPI: `vpi_mcd_open`, `vpi_mcd_close`, `vpi_mcd_flush`, `vpi_mcd_name`,
+  `vpi_mcd_vprintf`, `vpi_flush`, `vpi_compare_objects` and `vpi_get64` are
+  available, and `vpi_mcd_printf` writes to files opened with `vpi_mcd_open`
+  or `$fopen` instead of only stdout. The DPI guide lists the VPI calls that
+  are still missing. (#205)
+* `vpi_get(vpiTimeUnit, ...)` and `vpi_get(vpiTimePrecision, ...)` return a
+  module's own timescale for a module handle (the two names are now defined in
+  `vpi_user.h`), and `svGetTime`, `svGetTimeUnit` and `svGetTimePrecision`
+  give the same answers from DPI code. (#206)
+* Gate primitives, `#(rise, fall)` gates, UDP instances with parameter
+  delays and `wire #d w = expr;` inside sub-module instances keep their
+  delays, resolved per instance in the child's timeunit; a sub-module `buf`
+  turns z into x as at top level.
+* `always @(m[i])` fires in designs that also declare an array of more than
+  100,000 elements; every array allocated after the large one used to lose
+  element sensitivity.
+* Ports with no data type, and ANSI `input logic` / `inout logic` ports, are
+  nets (§23.2.2.3); a hierarchical `assign dut.u.clk = ...` onto a net-typed
+  port chain drives it. A continuous assign that only reads an unpacked-array
+  element no longer creates a phantom 1-bit net named after the array.
+* The one-time notes for ignored system tasks (such as `$dumpfile` without
+  `--wave`) are written to stderr as one piece, so `$display` output going to
+  the same file can no longer land inside one and hide a UVM message from log
+  parsers.
+* Continuous assigns to a bit or part of an unpacked-array element
+  (`assign r[i][j] = ...`, `.out(r[i][j])`) drive the array inside
+  instantiated modules. They used to be dropped silently there, which left
+  the c906 interrupt controller's gated clocks dead. Writes to a bit of a
+  2-D or deeper array element (`m[i][j][k] = ...`) are no longer dropped
+  either, at the top level or in procedural code.
+* A net delay (`wire #2 w;`, `#(rise, fall, off)`, `#(P)`) delays every
+  driver of the net: separate assigns, ports, gates and UDPs. It acts after
+  the drivers' own delays and after resolution, bit by bit on a vector. A
+  declaration assignment's delay stays that assignment's own. A port bound to
+  a net takes the external net's delay. Each of several drivers on one net
+  keeps its own delay, and driven `tri0`/`tri1` nets start at x.
+* An undriven output port with no data type (`output o`, `output [3:0] o`,
+  non-ANSI `output o;`) floats at z. It used to start at x.
+* `@(mem[5])`, `@(mem[i])` and `@(posedge mem[i][0])` on a large memory wake,
+  in `always` blocks and in procedural waits alike, and continuous assigns and
+  `always_comb` blocks reading an element follow writes to it. The event was
+  dropped. An event on a select (`v[3]`, `v[5:4]`, `m[i]`) is an event on the
+  selected value: edges are judged on the selected bit, and a changed index
+  re-selects the element. `posedge v[P-1]` with a parameter index watches the
+  right bit.
+* A class parameter default is evaluated in the class's own scope, so
+  `int D = W*2` and `type U = T` follow the parameters before them in every
+  specialization, including typedefs, extends clauses, parameterized
+  subclasses and static calls. Specializations that differ only in defaulted
+  parameters share statics. Named class parameter assignment (`C #(.W(5))`)
+  binds by name, `$typename` lists every parameter, and a class variable
+  declared in an instantiated module keeps its specialization.
+* A virtual interface reached through any receiver works: class-handle chains
+  (`cfg.vif`, `a.cfg.vif`, `this.cfg.vif`), local and formal handles,
+  module-scope chains, inherited, parameterized, static and typedef'd
+  properties, and vif arrays and queues. This holds for reads, writes,
+  nonblocking writes, `@(...)`, `wait(...)`, clocking blocks, interface task
+  and function calls, and binding. They used to read 0 or x, drop writes and
+  never wake. `@(vif.cb)` in a class method resumes after the clocking block
+  samples. (From PR #207 by eenky)
+* A call in receiver position (`get_obj().x`, `q.pop_front().addr`) runs
+  once. It used to run up to 12 times, and `q.pop_front().addr` drained the
+  queue.
+* Unpacked-struct members with two or more unpacked dimensions
+  (`bit [7:0] m [2][2]`) survive whole-struct copies (module, block-local,
+  nested, array, queue and associative-array elements, class properties),
+  struct formals of every direction, function returns, assignment patterns and
+  `%p`. Only the first dimension used to be seen, so the member read as x
+  or 0. A nonblocking whole-struct assignment `b <= a` updates every member;
+  it used to get even scalar members wrong. Struct input ports and struct
+  continuous assigns carry array members, patterns and `%p` follow a
+  descending dimension's declared order, 2-state array members default to 0,
+  `num()` on an associative array of structs counts keys, and
+  `$size`/`$bits` work on a member sub-array such as `s.mm[1]`.
+* A UVM DPI library built from `include/uvm_dpi_xezim.cc` loads. The UVM
+  sources it compiles call the SV export `m__uvm_report_dpi`, and built as
+  C++ that call was mangled, so `--dpi-lib` stopped with `undefined symbol`.
+  The driver now gives everything C linkage, as the reference `uvm_dpi.cc`
+  does, and also builds as C. (#208)
+
+**Performance**
+
+* Combinational logic re-evaluates only when a bit it actually reads
+  changes (`assign lo = bus[3:0]` stays idle while `bus[7:4]` moves;
+  `XEZIM_BIT_SENS=0` restores whole-signal sensitivity), and the two-state
+  executors and the settle loop do less bookkeeping.
+* Class method calls cache a per-method call plan and save the formals'
+  type metadata only when it is rewritten; instantiation reuses a per-class
+  template.
+* Startup is much cheaper: the design is preprocessed once per run instead
+  of two or three times, elaboration and the bytecode compiler allocate far
+  less, and a warm `--cache` run loads the stored design about twice as
+  fast. `XEZIM_EXIT_AFTER_COMPILE=1` stops right after compile, for measuring
+  startup.
+* Together, host instructions fall 7% on a C906 CoreMark run and on the
+  AXI4 AVIP and 11% on a C910 memcpy run, with identical output; a UVM
+  testbench reaches time 0 with about a third of the previous work.
+
+**Memory**
+
+* Large memories live in a packed arena by default (integral elements up to
+  64 bits in arrays of more than 100,000 cells; `XEZIM_PACKED_MEM=0` turns it
+  off), and arrays of 257 or more elements no longer store a name per
+  element (`XEZIM_VIRTUAL_NAME_MIN_CELLS` sets the cut-off). `force`/`release`,
+  `$readmemh`/`$writememh`, DPI array arguments and `uvm_hdl_force` work on
+  arena memories. A C906 CoreMark run peaks at 0.6 GB instead of 2.6 GB.
+  `XEZIM_RSS_TRACE=1` prints resident and peak memory at every phase.
+
+**VPI**
+
+* Every routine of IEEE 1800-2017 clause 38 is implemented: user data per
+  call instance, `vpi_get_systf_info` with `vpiUserSystf` handles,
+  `vpi_handle_by_multi_index`, `vpi_handle_multi(vpiInterModPath)`,
+  `vpi_get_value_array`/`vpi_put_value_array`, `vpi_get_delays`/
+  `vpi_put_delays` (nets, module paths, timing checks, intermodule paths) and
+  `vpi_get_data`/`vpi_put_data` (always 0: xezim has no `$save`/`$restart`).
+  `vpiStrengthVal`, the short/long integer, shortreal and raw value formats
+  and `vpiTimeVal` puts work; `vpiObjTypeVal` follows §38.15.
+* `vpi_register_cb` accepts every §38.36 reason. Simulation-time callbacks
+  run in their region order within each time step; `cbValueChange` reports
+  every change, including continuous assignments (cocotb edge triggers on
+  such nets no longer hang); force, release, assign, deassign, disable,
+  statement, error, timing-violation, signal and unresolved-systf callbacks
+  are new; `vpi_get_cb_info` and `vpi_remove_cb` work for all of them.
+  `cbReadOnlySynch` fires once at the end of a time step.
+* A VPI application can walk the whole design (IEEE 1800-2017 chapter 37):
+  instances of every kind, packages, generate scopes, named blocks, tasks and
+  functions, processes, continuous assignments, gate/switch/UDP primitives,
+  specify paths and timing checks, modports, `bind` instances and ports, each
+  with `vpiFile`/`vpiLineNo`; `vpiType` is the declared type through
+  typedefs, with ranges and typespecs. Ports iterate in port-list order and
+  SystemVerilog unpacked arrays report `vpiRegArray`.
 
 ### 0.11.0 — code coverage, reference-parity fixes, faster UVM (September 2026)
 
