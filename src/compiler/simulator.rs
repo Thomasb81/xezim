@@ -6910,6 +6910,11 @@ pub struct Simulator {
     /// the run. Hand out a refcounted handle instead; the deep copy happens
     /// once per function, then it is a refcount bump.
     fn_decl_cache: HashMap<String, std::rc::Rc<FunctionDeclaration>>,
+    /// The same for `module.tasks`: every interpreted task call cloned the
+    /// whole `TaskDeclaration`, and the clone plus its drop was about a
+    /// quarter of a behavioural memory model's run (a device calling a
+    /// handful of timing-check tasks every clock).
+    task_decl_cache: HashMap<String, std::rc::Rc<TaskDeclaration>>,
     /// Memoized answer to "is this module-scope function side-effect free?",
     /// used to decide whether a call may be skipped when its result provably
     /// cannot affect the expression. Conservative: anything the walker does
@@ -11067,6 +11072,7 @@ impl Simulator {
             fst_path: None,
             cast_widths,
             fn_decl_cache: HashMap::default(),
+            task_decl_cache: HashMap::default(),
             fn_pure_cache: HashMap::default(),
             elem_dotted_bases: RefCell::new(None),
             fst_trace: Vec::new(),
@@ -14124,7 +14130,7 @@ impl Simulator {
                 _ => r.to_i64().unwrap_or(0),
             };
         }
-        if let Some(td) = self.module.tasks.get(&name).cloned() {
+        if let Some(td) = self.task_decl_rc(&name) {
             self.dpi_export_depth += 1;
             self.exec_task_call(&td, &arg_exprs);
             self.dpi_export_depth -= 1;
@@ -49246,7 +49252,7 @@ impl Simulator {
                                     self.class_has_method(&cls, &h.path[0].name.name)
                                 });
                             if let Some(td) = (!is_this_method)
-                                .then(|| self.module.tasks.get(&h.path[0].name.name).cloned())
+                                .then(|| self.task_decl_rc(&h.path[0].name.name))
                                 .flatten()
                             {
                                 if self.stmts_have_blocking(&td.items) {
@@ -49304,7 +49310,7 @@ impl Simulator {
                         {
                             let full = self.resolve_hier_task_target(func);
                             if let Some(full) = full {
-                                let td = self.module.tasks.get(&full).cloned().unwrap();
+                                let td = self.task_decl_rc(&full).unwrap();
                                 if self.stmts_have_blocking(&td.items) {
                                     let scope = full
                                         .rsplit_once('.')
@@ -117516,7 +117522,7 @@ impl Simulator {
                             if let Some(fd) = self.fn_decl_rc(&name) {
                                 return self.exec_function_call(&fd, args);
                             }
-                            if let Some(td) = self.module.tasks.get(&name).cloned() {
+                            if let Some(td) = self.task_decl_rc(&name) {
                                 self.exec_task_call(&td, args);
                                 return Value::zero(32);
                             }
@@ -117553,7 +117559,7 @@ impl Simulator {
                     if let Some(fd) = self.fn_decl_rc(&joined) {
                         return self.exec_function_call(&fd, args);
                     }
-                    if let Some(td) = self.module.tasks.get(&joined).cloned() {
+                    if let Some(td) = self.task_decl_rc(&joined) {
                         self.task_clears_this = true;
                         self.exec_task_call(&td, args);
                         return Value::zero(32);
@@ -117572,7 +117578,7 @@ impl Simulator {
                             if let Some(fd) = self.fn_decl_rc(&scoped) {
                                 return self.exec_function_call(&fd, args);
                             }
-                            if let Some(td) = self.module.tasks.get(&scoped).cloned() {
+                            if let Some(td) = self.task_decl_rc(&scoped) {
                                 self.exec_task_call(&td, args);
                                 return Value::zero(32);
                             }
@@ -120476,7 +120482,7 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = saved;
                     return r;
                 }
-                if let Some(td) = self.module.tasks.get(&full).cloned() {
+                if let Some(td) = self.task_decl_rc(&full) {
                     let saved = self.name_resolve_hint.borrow().clone();
                     *self.name_resolve_hint.borrow_mut() = scope.clone();
                     let saved_ts = self.timescale_scope_override.take();
@@ -120640,7 +120646,7 @@ impl Simulator {
                         self.pending_pkg_scope = Some(pkg);
                         return self.exec_function_call(&fd, args);
                     }
-                    if let Some(td) = self.module.tasks.get(&qual).cloned() {
+                    if let Some(td) = self.task_decl_rc(&qual) {
                         self.pending_pkg_scope = Some(pkg);
                         self.exec_task_call(&td, args);
                         return Value::zero(32);
@@ -120657,7 +120663,7 @@ impl Simulator {
                 return self.exec_let_call(&ld, args);
             }
             // Module-level task call
-            if let Some(td) = self.module.tasks.get(name).cloned() {
+            if let Some(td) = self.task_decl_rc(name) {
                 self.pending_pkg_scope = self.bare_call_pkg_scope(name, hier.path.len());
                 self.exec_task_call(&td, args);
                 return Value::zero(32);
@@ -122670,6 +122676,18 @@ impl Simulator {
         let fd = self.module.functions.get(name)?.clone();
         let rc = std::rc::Rc::new(fd);
         self.fn_decl_cache.insert(name.to_string(), rc.clone());
+        Some(rc)
+    }
+
+    /// `fn_decl_rc` for tasks: the task table is never modified after
+    /// elaboration, so one shared copy per name serves every call.
+    fn task_decl_rc(&mut self, name: &str) -> Option<std::rc::Rc<TaskDeclaration>> {
+        if let Some(rc) = self.task_decl_cache.get(name) {
+            return Some(rc.clone());
+        }
+        let td = self.module.tasks.get(name)?.clone();
+        let rc = std::rc::Rc::new(td);
+        self.task_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
     }
 
