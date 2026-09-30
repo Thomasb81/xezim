@@ -25,3 +25,5 @@ mod packed_record_edge_loop;
 mod wide_block_counters;
 #[path = "perf/x_plane_executor.rs"]
 mod x_plane_executor;
+#[path = "perf/front_end_levers.rs"]
+mod front_end_levers;

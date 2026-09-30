@@ -1533,14 +1533,17 @@ struct SensitivityId {
     /// LRM §9.4.2.3 `iff` guard for this event term: the edge only counts
     /// when this expression is true at edge time. `None` for an unguarded
     /// term. Consulted by the procedural `@`-event wake path; the always-
-    /// block edge paths carry it but do not yet evaluate it.
-    iff: Option<Expression>,
+    /// block edge paths carry it but do not yet evaluate it. Boxed, like
+    /// `value_of`: almost every term has neither, and an inline
+    /// `Option<Expression>` made each term hundreds of bytes (68 MB of edge
+    /// sensitivity lists on a 64k-cell DRAM).
+    iff: Option<Box<Expression>>,
     /// §9.4.2: for a NON-TRIVIAL event expression (`@(a + b)`), the term's
     /// full expression. Operand-signal edges only COUNT when this
     /// expression's value differs from its value at arm time (stored in
     /// `EventWaiter::guard_prev`) — `a=2;b=1` leaving `a+b` at 3 must not
     /// fire. `None` for plain signal/edge terms.
-    value_of: Option<Expression>,
+    value_of: Option<Box<Expression>>,
     /// Scheduling depth of the NAME this term was written with (see
     /// `Simulator::sig_wake_rank`); orders same-pass waiter wakeups.
     wake_rank: u8,
@@ -1556,9 +1559,9 @@ struct Sensitivity {
     signal_name: String,
     edge: EdgeKind,
     /// See `SensitivityId::iff` — carried through name→id resolution.
-    iff: Option<Expression>,
+    iff: Option<Box<Expression>>,
     /// See `SensitivityId::value_of` — carried through name→id resolution.
-    value_of: Option<Expression>,
+    value_of: Option<Box<Expression>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4985,7 +4988,7 @@ enum CombPlan {
 
 pub struct Simulator {
     pub signals: SignalMap,
-    vpi_port_directions: HashMap<String, PortDirection>,
+    vpi_port_directions: HashMap<Arc<str>, PortDirection>,
     /// Signals currently under force/release control (LRM §9.3.1).
     forced_signals: HashMap<usize, Value>,
     /// Nets released while a settle pass was running (the entry table is
@@ -5238,6 +5241,11 @@ pub struct Simulator {
     /// collapsed into a shared id. The dropped connect made them wire-typed
     /// for a dump, and the shared id can't carry per-name typing.
     collapsed_port_children: HashSet<String>,
+    /// Set by a `collapse_identity_port_nets` run that reached its fixed
+    /// point: the name-map generation it left, the continuous-assign list
+    /// (length, buffer) and port-alias count it read, and whether its buffer
+    /// pass ran. A later run over the same inputs has nothing to re-point.
+    collapse_settled: Option<(u64, usize, usize, usize, bool)>,
     /// Sparse: signal_id → declared user type name (e.g. class/struct
     /// type for `MyClass h;`). Only populated for signals where the
     /// elaborator recorded a non-None `type_name` on the source
@@ -8437,14 +8445,14 @@ impl Simulator {
 
         fn best_scope_for_leaves(
             leaves: &HashSet<String>,
-            existing: &HashSet<String>,
-            parents_by_leaf: &HashMap<String, Vec<String>>,
+            existing: &HashSet<&str>,
+            parents_by_leaf: &HashMap<&str, Vec<&str>>,
         ) -> Option<String> {
             let mut best_parent: Option<String> = None;
             let mut best_score = 0usize;
             let mut best_depth = 0usize;
             for leaf in leaves {
-                let Some(parents) = parents_by_leaf.get(leaf) else {
+                let Some(parents) = parents_by_leaf.get(leaf.as_str()) else {
                     continue;
                 };
                 for parent in parents {
@@ -8499,25 +8507,20 @@ impl Simulator {
             }
         }
 
-        let mut existing: HashSet<String> = module.signals.keys().cloned().collect();
-        existing.extend(module.parameters.keys().cloned());
-        let mut parents_by_leaf: HashMap<String, Vec<String>> = HashMap::default();
-        for full_name in &existing {
+        // Borrowed from the module's maps (no copy of every name); built in
+        // the same insertion order, so the sets iterate, and the parent
+        // lists come out, exactly as owned copies would.
+        let mut existing: HashSet<&str> = module.signals.keys().map(String::as_str).collect();
+        existing.extend(module.parameters.keys().map(String::as_str));
+        let mut parents_by_leaf: HashMap<&str, Vec<&str>> = HashMap::default();
+        for &full_name in &existing {
             if let Some((parent, leaf)) = full_name.rsplit_once('.') {
-                parents_by_leaf
-                    .entry(leaf.to_string())
-                    .or_default()
-                    .push(parent.to_string());
+                parents_by_leaf.entry(leaf).or_default().push(parent);
             }
         }
 
         let mut to_create: HashSet<String> = HashSet::default();
         for ca in &module.continuous_assigns {
-            let lhs_raw = ident_raw(&ca.lhs);
-            let rhs_raw = ident_raw(&ca.rhs);
-            let lhs_leaf = ident_leaf(&ca.lhs);
-            let rhs_leaf = ident_leaf(&ca.rhs);
-
             let mut leaves = HashSet::default();
             let mut reads = HashSet::default();
             let mut writes = HashSet::default();
@@ -8528,6 +8531,15 @@ impl Simulator {
                     leaves.insert(name.clone());
                 }
             }
+            // Only a bare (unscoped) leaf can need an implicit net; a
+            // flattened instance's assigns name none.
+            if leaves.is_empty() {
+                continue;
+            }
+            let lhs_raw = ident_raw(&ca.lhs);
+            let rhs_raw = ident_raw(&ca.rhs);
+            let lhs_leaf = ident_leaf(&ca.lhs);
+            let rhs_leaf = ident_leaf(&ca.rhs);
 
             let scope = if lhs_leaf.is_none() && rhs_leaf.is_some() {
                 lhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
@@ -8551,8 +8563,9 @@ impl Simulator {
             }
         }
 
+        drop(parents_by_leaf);
+        drop(existing);
         for name in to_create {
-            existing.insert(name.clone());
             module.signals.insert(
                 name.clone(),
                 Signal {
@@ -8963,11 +8976,17 @@ impl Simulator {
         // so a frameless local landed on the module signal itself (see
         // `rename_process_shadowed_locals`).
         {
+            // `rename_process_shadowed_locals` only ever asks whether a
+            // process body's own top-level local is taken, so the set holds
+            // just those locals (the ones a module symbol or a second
+            // process also claims) instead of a copy of every module name.
             let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
-            taken.extend(module.signals.keys().cloned());
-            taken.extend(module.arrays.keys().cloned());
-            taken.extend(module.dynamic_arrays.iter().cloned());
-            taken.extend(module.associative_arrays.keys().cloned());
+            let module_claims = |nm: &str| {
+                module.signals.contains_key(nm)
+                    || module.arrays.contains_key(nm)
+                    || module.dynamic_arrays.contains(nm)
+                    || module.associative_arrays.contains_key(nm)
+            };
             // §6.21 extended: two processes declaring the SAME frameless
             // block-local name (neither shadowing any module symbol) would
             // share one `signals[name]` slot and last-write-win — e.g.
@@ -9008,7 +9027,7 @@ impl Simulator {
                 }
             }
             for (nm, c) in per_proc_counts {
-                if c >= 2 {
+                if c >= 2 || module_claims(&nm) {
                     taken.insert(nm);
                 }
             }
@@ -9283,25 +9302,28 @@ impl Simulator {
         // `Vec<(name, Value, …)>` because cloning each Value into that
         // Vec would peak-spike RSS by exactly the amount we just saved
         // by skipping the legacy bulk-populate.
-        let mut names: Vec<String> =
+        // Borrowed from the two maps (they outlive the id loop below), so
+        // naming 426k signals costs no string copies before the interned
+        // `Arc<str>` each one gets there.
+        let mut names: Vec<std::borrow::Cow<'_, str>> =
             Vec::with_capacity(module.signals.len() + module.parameters.len());
         let phase_names = std::time::Instant::now();
         for name in module.signals.keys() {
-            names.push(name.clone());
+            names.push(std::borrow::Cow::Borrowed(name.as_str()));
         }
         // Port directions for the VPI layer (`vpiPort` iteration and
-        // `vpiDirection`). Taken here because `module.signals` is freed once
-        // the indexed signal table exists, further down this constructor.
-        let vpi_port_directions: HashMap<String, PortDirection> = module
-            .signals
-            .iter()
-            .filter_map(|(name, signal)| signal.direction.map(|dir| (name.clone(), dir)))
-            .collect();
+        // `vpiDirection`), keyed by the interned signal name: filled in the
+        // static-signal pass below, which visits every `module.signals`
+        // entry before that map is freed.
+        let mut vpi_port_directions: HashMap<Arc<str>, PortDirection> = HashMap::default();
         for name in module.parameters.keys() {
             // Parameter and signal can share a name — dedup after sort.
-            names.push(name.clone());
+            names.push(std::borrow::Cow::Borrowed(name.as_str()));
         }
-        names.sort();
+        // Same order as `sort()` (equal names are the same text, so their
+        // relative order cannot matter), without re-comparing the long
+        // shared hierarchical prefixes.
+        names::sort_lexicographic(&mut names);
         names.dedup();
         // Signal placement (`XEZIM_PLACE_SIGNALS=1`, opt-in; measured NEGATIVE
         // on c906 memcpy: L2 misses +1.1%, cycles +0.35% — the greedy
@@ -9317,7 +9339,13 @@ impl Simulator {
         // L2-miss bound at ~23 misses per evaluation). Arrays keep their own
         // contiguous element ids (allocated separately below).
         if std::env::var("XEZIM_PLACE_SIGNALS").ok().as_deref() == Some("1") {
-            names = Self::place_signal_names(&module, names);
+            names = Self::place_signal_names(
+                &module,
+                names.into_iter().map(|n| n.into_owned()).collect(),
+            )
+            .into_iter()
+            .map(std::borrow::Cow::Owned)
+            .collect();
         }
         let names_ms = phase_names.elapsed().as_secs_f64() * 1000.0;
         crate::rss_trace("sim::new names");
@@ -9390,23 +9418,31 @@ impl Simulator {
         // and is freed promptly, instead of being kept alongside the
         // Arc<str> copies until the end of construction.
         for (id, name) in names.drain(..).enumerate() {
-            let arc_name: Arc<str> = Arc::from(name.as_str());
+            let name: &str = &name;
+            let arc_name: Arc<str> = Arc::from(name);
             signal_name_to_id.insert(arc_name.clone(), id);
             // Build leaf-name reverse index (skip array-element style names
             // ending with `]`, which are added below and don't participate
             // in bare-leaf lookups).
-            let leaf = name
-                .rsplit_once('.')
-                .map(|(_, l)| l)
-                .unwrap_or(name.as_str());
+            let leaf = name.rsplit_once('.').map(|(_, l)| l).unwrap_or(name);
             if !leaf.is_empty() && !leaf.ends_with(']') {
-                let arc_leaf: Arc<str> = Arc::from(leaf);
-                leaf_name_to_ids.entry(arc_leaf).or_default().push(id);
+                // Most leaves repeat (`q` in every instance): allocate the
+                // key only for a leaf not seen yet.
+                match leaf_name_to_ids.get_mut(leaf) {
+                    Some(ids) => ids.push(id),
+                    None => {
+                        leaf_name_to_ids.insert(Arc::from(leaf), vec![id]);
+                    }
+                }
             }
-            id_to_name.push(arc_name);
             // Fetch value/metadata directly from the source map. The
             // signal entry takes precedence over a same-named parameter.
-            if let Some(sig) = module.signals.get(&name) {
+            let sig = module.signals.get(name);
+            if let Some(dir) = sig.and_then(|sig| sig.direction) {
+                vpi_port_directions.insert(arc_name.clone(), dir);
+            }
+            id_to_name.push(arc_name);
+            if let Some(sig) = sig {
                 let mut val = sig.value.clone();
                 if sig.is_signed {
                     val.is_signed = true;
@@ -9439,7 +9475,7 @@ impl Simulator {
                 if let Some(ref tn) = sig.type_name {
                     signal_type_names.insert(id, tn.clone());
                 }
-            } else if let Some(val) = module.parameters.get(&name) {
+            } else if let Some(val) = module.parameters.get(name) {
                 sim_dbg_eprintln!(
                     "[DEBUG] Simulator::new parameter {} = {} (signed={})",
                     name,
@@ -10592,6 +10628,7 @@ impl Simulator {
             warn_x_drivers: None,
             cont_driven: HashSet::default(),
             collapsed_port_children: HashSet::default(),
+            collapse_settled: None,
             signal_type_names,
             time: 0,
             output: Vec::new(),
@@ -11575,7 +11612,14 @@ impl Simulator {
         }
         // Collapse identity port nets before anything resolves names to ids:
         // per-node id caches make later re-pointing unreliable.
+        let collapse_t = std::time::Instant::now();
         sim.collapse_identity_port_nets();
+        if std::env::var_os("XEZIM_COMPILE_PHASES").is_some() {
+            eprintln!(
+                "[COMPILE-PHASE] identity port-net collapse (construction): {:.1}ms",
+                collapse_t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         sim.load_dpi_libraries();
         sim.bind_all_dpi_imports();
         // VPI modules register their $systf's before simulation starts. The
@@ -16003,7 +16047,9 @@ impl Simulator {
             self.jit_nba_side_len = 0;
         }
         self.collapse_identity_port_nets();
+        mark_compile_phase("identity port-net collapse", &mut compile_phase_start);
         self.compile_edge_blocks();
+        self.drop_compiled_edge_block_asts();
         // Intern each edge block's instance scope to a dense u32 so the `%m`
         // tracking in `exec_bytecode` compares integers, not strings. Blocks
         // sharing an instance share an id, which is what lets consecutive
@@ -21178,6 +21224,10 @@ impl Simulator {
                     self.event_queue.schedule(0, pid, vec![forever_stmt].into());
                     return None;
                 }
+                // `collect` leaves room for four terms; an edge block keeps
+                // its list for the whole run and nearly always has one.
+                let mut resolved = resolved;
+                resolved.shrink_to_fit();
                 Arc::make_mut(&mut self.edge_blocks).push(EdgeSensitiveBlock {
                     resolved_sensitivities: resolved,
                     stmt: body,
@@ -28178,12 +28228,44 @@ impl Simulator {
     }
 
     fn collapse_identity_port_nets(&mut self) {
+        use std::borrow::Cow;
+        // The flat name `resolve_hier_name_static` gives, borrowed for the
+        // overwhelmingly common single segment (no allocation per assign).
+        fn flat_name<'a>(h: &'a HierarchicalIdentifier, module: &ElaboratedModule) -> Cow<'a, str> {
+            let skip_root = usize::from(h.path.len() > 1 && h.path[0].name.name == "$root");
+            if h.path.len() == skip_root + 1 {
+                Cow::Borrowed(h.path[skip_root].name.name.as_str())
+            } else {
+                Cow::Owned(Simulator::resolve_hier_name_static(h, module))
+            }
+        }
+        let buf_collapse_on = !matches!(std::env::var("XEZIM_BUF_COLLAPSE").as_deref(), Ok("0"))
+            && self.sdf_delays.is_empty()
+            && self.module.dpi_imports.is_empty()
+            && configured_vpi_libs().is_empty()
+            && configured_dpi_libs().is_empty();
+        // The pass runs again at compile time. When the first run settled and
+        // nothing it reads has changed since (no name added or re-pointed, the
+        // same assign list and port aliases; widths and the two-state and
+        // gate-driven tables are fixed at construction), the second run would
+        // re-derive the same links and re-point nothing.
+        if let Some((generation, ca_len, ca_ptr, alias_len, buf_ran)) = self.collapse_settled {
+            if generation == self.signal_name_to_id.generation()
+                && ca_len == self.module.continuous_assigns.len()
+                && ca_ptr == self.module.continuous_assigns.as_ptr() as usize
+                && alias_len == self.module.port_aliases.len()
+                && (buf_ran || !buf_collapse_on)
+                && std::env::var_os("XEZIM_BUF_CENSUS").is_none()
+            {
+                return;
+            }
+        }
         let mut collapsed = 0usize;
         // A net the connect CA drives may have OTHER continuous drivers (a
         // hierarchical TB assign, a shorted second output). Dropping the
         // connect then loses multi-driver resolution, so only nets with
         // exactly one continuous driver — the connect itself — collapse.
-        let mut ca_driver_counts: HashMap<String, u32> = HashMap::default();
+        let mut ca_driver_counts: HashMap<Cow<'_, str>, u32> = HashMap::default();
         for ca in &self.module.continuous_assigns {
             let base = match &ca.lhs.kind {
                 ExprKind::Ident(h) => Some(h),
@@ -28194,12 +28276,7 @@ impl Simulator {
                 _ => None,
             };
             let Some(h) = base else { continue };
-            let name = if h.path.len() == 1 {
-                h.path[0].name.name.clone()
-            } else {
-                Self::resolve_hier_name_static(h, &self.module)
-            };
-            *ca_driver_counts.entry(name).or_insert(0) += 1;
+            *ca_driver_counts.entry(flat_name(h, &self.module)).or_insert(0) += 1;
         }
         // INPUT identity connects only (`u1.din = src`, rhs in parent
         // scope): the child name re-points at the parent's id. Output
@@ -28210,7 +28287,7 @@ impl Simulator {
         // observably wrong, not just unprofitable. These shape tests and the
         // resolved rhs name do not change between passes, so they are taken
         // once, in assign order.
-        let port_candidates: Vec<(&str, String)> = self
+        let port_candidates: Vec<(&str, Cow<'_, str>)> = self
             .module
             .continuous_assigns
             .iter()
@@ -28229,58 +28306,106 @@ impl Simulator {
                 {
                     return None;
                 }
-                Some((
-                    lh.path[0].name.name.as_str(),
-                    Self::resolve_hier_name_static(rh, &self.module),
-                ))
+                Some((lh.path[0].name.name.as_str(), flat_name(rh, &self.module)))
             })
             .collect();
+        // The passes below re-point names in `signal_name_to_id` and read
+        // back what earlier links wrote. They run on a local mirror of just
+        // the names involved (one hash probe per name instead of several per
+        // link per pass); the re-pointed names are written back in the order
+        // they first changed, which leaves both tables exactly as re-pointing
+        // them in place would.
+        // A key type of its own, so these compile-time maps share no
+        // monomorphized code with run-time ones.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        struct NameKey<'a>(&'a str);
+        struct Mirror<'a> {
+            slot: HashMap<NameKey<'a>, usize>,
+            names: Vec<&'a str>,
+            ids: Vec<Option<usize>>,
+            changed: Vec<bool>,
+            order: Vec<usize>,
+        }
+        impl<'a> Mirror<'a> {
+            fn new() -> Self {
+                Mirror {
+                    slot: HashMap::default(),
+                    names: Vec::new(),
+                    ids: Vec::new(),
+                    changed: Vec::new(),
+                    order: Vec::new(),
+                }
+            }
+            fn slot(&mut self, name: &'a str, map: &NameMap) -> usize {
+                if let Some(&s) = self.slot.get(&NameKey(name)) {
+                    return s;
+                }
+                let s = self.names.len();
+                self.slot.insert(NameKey(name), s);
+                self.names.push(name);
+                self.ids.push(map.get(name).copied());
+                self.changed.push(false);
+                s
+            }
+            fn repoint(&mut self, s: usize, id: usize) {
+                self.ids[s] = Some(id);
+                if !self.changed[s] {
+                    self.changed[s] = true;
+                    self.order.push(s);
+                }
+            }
+        }
+        let mut mirror = Mirror::new();
+        // Only connections the elaborator recorded as WHOLE-NET identity
+        // (the same predicate the dump-side fold trusts), driven by the
+        // connect alone (the net it drives is its CA lhs), between non-event
+        // names.
+        let mut port_links: Vec<(usize, usize)> = Vec::new();
+        for (lhs_name, rhs_name) in &port_candidates {
+            let (child, parent): (&str, &str) = (lhs_name, rhs_name);
+            if self.module.port_aliases.get(child).map(String::as_str) != Some(parent)
+                || ca_driver_counts.get(child).copied().unwrap_or(0) != 1
+                || self.module.events.contains(child)
+                || self.module.events.contains(parent)
+            {
+                continue;
+            }
+            let c = mirror.slot(child, &self.signal_name_to_id);
+            let p = mirror.slot(parent, &self.signal_name_to_id);
+            port_links.push((c, p));
+        }
         // Chains (leaf -> mid -> top) resolve over multiple passes; they are
         // short, and each pass only ever re-points names, so a small bound
         // is plenty.
+        let mut port_settled = false;
         for _ in 0..8 {
             let mut changed = false;
-            for (lhs_name, rhs_name) in &port_candidates {
-                let lhs_name: &str = lhs_name;
-                // Only connections the elaborator recorded as WHOLE-NET
-                // identity (the same predicate the dump-side fold trusts).
-                if self.module.port_aliases.get(lhs_name).map(String::as_str)
-                    != Some(rhs_name.as_str())
-                {
-                    continue;
-                }
-                let (child, parent) = (lhs_name, rhs_name.as_str());
-                // The net this connect drives is its CA lhs; require the
-                // connect to be that net's only continuous driver.
-                if ca_driver_counts.get(lhs_name).copied().unwrap_or(0) != 1 {
-                    continue;
-                }
-                let (Some(&cid), Some(&pid)) = (
-                    self.signal_name_to_id.get(child),
-                    self.signal_name_to_id.get(parent),
-                ) else {
+            for &(c, p) in &port_links {
+                let (Some(cid), Some(pid)) = (mirror.ids[c], mirror.ids[p]) else {
                     continue;
                 };
-                if cid == pid {
-                    continue;
-                }
-                if self.signal_widths[cid] != self.signal_widths[pid]
+                if cid == pid
+                    || self.signal_widths[cid] != self.signal_widths[pid]
                     || self.signal_real[cid] != self.signal_real[pid]
-                    || self.module.events.contains(child)
-                    || self.module.events.contains(parent)
                 {
                     continue;
                 }
-                self.signal_name_to_id.insert(child.into(), pid);
-                // The lhs is the name the dropped connect was driving; it
-                // stays wire-typed in dumps by NAME (the shared id can't say).
-                self.collapsed_port_children.insert(lhs_name.into());
+                mirror.repoint(c, pid);
                 collapsed += 1;
                 changed = true;
             }
             if !changed {
+                port_settled = true;
                 break;
             }
+        }
+        for &s in &mirror.order {
+            let name = mirror.names[s];
+            self.signal_name_to_id
+                .insert(name.into(), mirror.ids[s].unwrap());
+            // The lhs is the name the dropped connect was driving; it
+            // stays wire-typed in dumps by NAME (the shared id can't say).
+            self.collapsed_port_children.insert(name.into());
         }
         if collapsed > 0 && std::env::var("XEZIM_DEBUG").is_ok() {
             eprintln!("[NET-COLLAPSE] {} identity port nets collapsed", collapsed);
@@ -28304,11 +28429,11 @@ impl Simulator {
         // two-state-ness differs from the source (a 2-state copy must drop
         // X/Z), the design carries SDF delays, or a DPI/VPI backdoor may look
         // the folded name up by itself.
-        let buf_collapse_on = !matches!(std::env::var("XEZIM_BUF_COLLAPSE").as_deref(), Ok("0"))
-            && self.sdf_delays.is_empty()
-            && self.module.dpi_imports.is_empty()
-            && configured_vpi_libs().is_empty()
-            && configured_dpi_libs().is_empty();
+        let port_mirror = mirror;
+        // Settled when every pass that ran reached its fixed point and the
+        // buffer pass re-pointed no name a port link reads (which would give
+        // the port pass new work).
+        let mut settled = port_settled;
         if buf_collapse_on {
             // Same rule as the port pass above: never alias onto a source a
             // process WRITES. A reader parked on the same edge that writes
@@ -28324,13 +28449,17 @@ impl Simulator {
                     super::elaborate::collect_procedural_write_names(&self.module),
                 ));
             }
-            let (override_leaves, proc_writes) =
-                self.buf_collapse_write_sets.clone().unwrap_or_default();
-            let leaf_of = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+            let (override_leaves, proc_writes) = self
+                .buf_collapse_write_sets
+                .as_ref()
+                .expect("collected above");
+            fn leaf_of(n: &str) -> &str {
+                n.rsplit('.').next().unwrap_or(n)
+            }
             let mut buf_collapsed = 0usize;
             // Whole-net identity assigns and their resolved names: fixed
             // across passes, taken once in assign order.
-            let buf_candidates: Vec<(String, String)> = self
+            let buf_candidates: Vec<(Cow<'_, str>, Cow<'_, str>)> = self
                 .module
                 .continuous_assigns
                 .iter()
@@ -28347,43 +28476,58 @@ impl Simulator {
                     {
                         return None;
                     }
-                    Some((
-                        Self::resolve_hier_name_static(lh, &self.module),
-                        Self::resolve_hier_name_static(rh, &self.module),
-                    ))
+                    Some((flat_name(lh, &self.module), flat_name(rh, &self.module)))
                 })
                 .collect();
+            // The name-only conditions do not change between passes.
+            let mut mirror = Mirror::new();
+            let mut buf_links: Vec<(usize, usize)> = Vec::new();
+            for (ln, rn) in &buf_candidates {
+                let (ln, rn): (&str, &str) = (ln, rn);
+                if self.module.events.contains(ln)
+                    || self.module.events.contains(rn)
+                    || ca_driver_counts.get(ln).copied().unwrap_or(0) != 1
+                    || override_leaves.contains(leaf_of(ln))
+                    || override_leaves.contains(leaf_of(rn))
+                    || proc_writes.contains(rn)
+                {
+                    continue;
+                }
+                let l = mirror.slot(ln, &self.signal_name_to_id);
+                let r = mirror.slot(rn, &self.signal_name_to_id);
+                buf_links.push((l, r));
+            }
+            let mut buf_settled = false;
             for _ in 0..8 {
                 let mut changed = false;
-                for (ln, rn) in &buf_candidates {
-                    let (Some(&lid), Some(&rid)) = (
-                        self.signal_name_to_id.get(ln.as_str()),
-                        self.signal_name_to_id.get(rn.as_str()),
-                    ) else {
+                for &(l, r) in &buf_links {
+                    let (Some(lid), Some(rid)) = (mirror.ids[l], mirror.ids[r]) else {
                         continue;
                     };
                     if lid == rid
                         || self.signal_widths[lid] != self.signal_widths[rid]
                         || self.signal_real[lid] != self.signal_real[rid]
                         || self.signal_two_state[lid] != self.signal_two_state[rid]
-                        || self.module.events.contains(ln.as_str())
-                        || self.module.events.contains(rn.as_str())
-                        || ca_driver_counts.get(ln.as_str()).copied().unwrap_or(0) != 1
-                        || override_leaves.contains(&leaf_of(ln.as_str()))
-                        || override_leaves.contains(&leaf_of(rn.as_str()))
-                        || proc_writes.contains(rn.as_str())
                         || self.signal_gate_driven.get(lid).copied().unwrap_or(false)
                     {
                         continue;
                     }
-                    self.signal_name_to_id.insert(ln.as_str().into(), rid);
-                    self.collapsed_port_children.insert(ln.clone());
+                    mirror.repoint(l, rid);
                     buf_collapsed += 1;
                     changed = true;
                 }
                 if !changed {
+                    buf_settled = true;
                     break;
                 }
+            }
+            settled &= buf_settled;
+            for &s in &mirror.order {
+                let name = mirror.names[s];
+                settled &= !port_mirror.slot.contains_key(&NameKey(name));
+                self.signal_name_to_id
+                    .insert(name.into(), mirror.ids[s].unwrap());
+                self.collapsed_port_children.insert(name.to_string());
             }
             if buf_collapsed > 0 && std::env::var("XEZIM_DEBUG").is_ok() {
                 eprintln!(
@@ -28392,6 +28536,15 @@ impl Simulator {
                 );
             }
         }
+        self.collapse_settled = settled.then(|| {
+            (
+                self.signal_name_to_id.generation(),
+                self.module.continuous_assigns.len(),
+                self.module.continuous_assigns.as_ptr() as usize,
+                self.module.port_aliases.len(),
+                buf_collapse_on,
+            )
+        });
         // Census for the buffer-net collapse experiment: how many WHOLE-NET
         // identity continuous assigns (`assign y = x;`, equal widths, single
         // driver) remain after the port collapse above — the std-cell BUF
@@ -28434,6 +28587,128 @@ impl Simulator {
                 "[BUF-CENSUS] cont_assigns={} identity={} identity_single_driver={}",
                 total_ca, identity, identity_single
             );
+        }
+    }
+
+    /// Free the source statement of every edge block whose bytecode now
+    /// stands in for it everywhere. An edge block keeps its statement for
+    /// three kinds of later reader: the AST interpreter (a block that did not
+    /// compile), the writer census at simulation start (a block whose
+    /// bytecode holds fallback or whole-array writes) and the §16.9.3
+    /// sampled-value registration (a `$rose`/`$fell`/`$stable`/`$changed`/
+    /// `$past` call). Every other block is only ever run from bytecode, and
+    /// a block folded into a merged one never runs at all, so its statement
+    /// is replaced by an empty one with the same span (diagnostics report
+    /// the span). On a 64k-cell DRAM that frees ~200 MB before the comb
+    /// build, the compile's peak. `--warn-x` and `XEZIM_TRACE_ALWAYS` derive
+    /// driver write sets from the statements at run time, so they keep all.
+    fn drop_compiled_edge_block_asts(&mut self) {
+        use super::bytecode::Insn;
+        if self.warn_x || self.trace_always.is_some() {
+            return;
+        }
+        fn expr_has_sampled_call(e: &Expression) -> bool {
+            match &e.kind {
+                ExprKind::SystemCall { name, args } => {
+                    matches!(
+                        name.as_str(),
+                        "$rose" | "$fell" | "$stable" | "$changed" | "$past"
+                    ) || args.iter().any(expr_has_sampled_call)
+                }
+                ExprKind::Call { args, .. } => args.iter().any(expr_has_sampled_call),
+                ExprKind::Binary { left, right, .. } => {
+                    expr_has_sampled_call(left) || expr_has_sampled_call(right)
+                }
+                ExprKind::Unary { operand, .. } => expr_has_sampled_call(operand),
+                ExprKind::Paren(inner) => expr_has_sampled_call(inner),
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => {
+                    expr_has_sampled_call(condition)
+                        || expr_has_sampled_call(then_expr)
+                        || expr_has_sampled_call(else_expr)
+                }
+                ExprKind::Concatenation(items) => items.iter().any(expr_has_sampled_call),
+                ExprKind::Index { expr, index } => {
+                    expr_has_sampled_call(expr) || expr_has_sampled_call(index)
+                }
+                _ => false,
+            }
+        }
+        // The statement positions `scan_sampled_stmt` and
+        // `collect_sampled_sites_stmt` visit.
+        fn stmt_has_sampled_call(st: &Statement) -> bool {
+            use crate::ast::stmt::StatementKind as SK;
+            match &st.kind {
+                SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                    stmts.iter().any(stmt_has_sampled_call)
+                }
+                SK::If {
+                    condition,
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => {
+                    expr_has_sampled_call(condition)
+                        || stmt_has_sampled_call(then_stmt)
+                        || else_stmt.as_deref().is_some_and(stmt_has_sampled_call)
+                }
+                SK::TimingControl { stmt, .. } => stmt_has_sampled_call(stmt),
+                SK::For { body, .. }
+                | SK::While { body, .. }
+                | SK::DoWhile { body, .. }
+                | SK::Repeat { body, .. }
+                | SK::Forever { body }
+                | SK::Foreach { body, .. } => stmt_has_sampled_call(body),
+                SK::Case { expr, items, .. } => {
+                    expr_has_sampled_call(expr)
+                        || items.iter().any(|it| stmt_has_sampled_call(&it.stmt))
+                }
+                SK::BlockingAssign { rvalue, .. } | SK::NonblockingAssign { rvalue, .. } => {
+                    expr_has_sampled_call(rvalue)
+                }
+                SK::Expr(e) => expr_has_sampled_call(e),
+                _ => false,
+            }
+        }
+        let nb = self.edge_blocks.len();
+        let droppable: Vec<bool> = (0..nb)
+            .map(|bi| {
+                if self.edge_block_retired.get(bi).copied().unwrap_or(false) {
+                    return true;
+                }
+                let Some(Some(cb)) = self.compiled_edge_blocks.get(bi) else {
+                    return false;
+                };
+                // The writer census re-derives these from the statement.
+                let census_reads_ast = cb.instructions.iter().any(|insn| {
+                    matches!(
+                        insn,
+                        Insn::StmtFallback(..)
+                            | Insn::EvalExprFallback(..)
+                            | Insn::NbaAssignArray(..)
+                            | Insn::BlockingAssignArray(..)
+                            | Insn::NbaAssignArrayRange(..)
+                            | Insn::BlockingAssignArrayRange(..)
+                    )
+                });
+                !census_reads_ast && !stmt_has_sampled_call(&self.edge_blocks[bi].stmt)
+            })
+            .collect();
+        if !droppable.iter().any(|&d| d) {
+            return;
+        }
+        // Shared (a worker holds the list): leave it rather than copy it.
+        let Some(blocks) = Arc::get_mut(&mut self.edge_blocks) else {
+            return;
+        };
+        for (b, drop) in blocks.iter_mut().zip(droppable) {
+            if drop {
+                let span = b.stmt.span;
+                b.stmt = Statement::new(StatementKind::Null, span);
+            }
         }
     }
 
@@ -33701,6 +33976,12 @@ impl Simulator {
         unsafe {
             libc::malloc_trim(0);
         }
+        // Hand the pages freed by the comb build (the source ASTs, the
+        // ordering graph, the build's temporaries) back to the OS now: the
+        // allocator would otherwise keep them resident through the whole
+        // simulation (64k-cell DRAM: 1373 -> 857 MB steady RSS). The callee
+        // skips a small process, where purging only splits huge pages.
+        xezim_core::release_free_memory();
     }
 
     fn prepared_comb_cache_is_valid(&self, cache: &PreparedCombCache) -> bool {
@@ -34028,6 +34309,34 @@ impl Simulator {
                     }
                 }
             }
+            // A whole-name identity assign (`assign dst = src`, the shape of
+            // every port connect) resolves both ids up front: when a collapsed
+            // identity port net made it a self-copy (see
+            // `collapse_identity_port_nets`) it is dropped here, before any of
+            // the read/write/scope analysis below, none of which it needs.
+            let ident_copy_ids: Option<(usize, usize)> =
+                if explicit_delay == 0 && cov_counter.is_none() {
+                    if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) =
+                        (&ca.lhs.kind, &ca.rhs.kind)
+                    {
+                        let dst_name = Self::resolve_hier_name_static(lhs_hier, &self.module);
+                        let src_name = Self::resolve_hier_name_static(rhs_hier, &self.module);
+                        match (
+                            self.signal_name_to_id.get(dst_name.as_str()),
+                            self.signal_name_to_id.get(src_name.as_str()),
+                        ) {
+                            (Some(&dst_id), Some(&src_id)) => Some((dst_id, src_id)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            if ident_copy_ids.is_some_and(|(dst_id, src_id)| dst_id == src_id) {
+                continue;
+            }
             reads.clear();
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
@@ -34084,64 +34393,43 @@ impl Simulator {
                     .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads))
             };
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
-            let direct_copy = if explicit_delay == 0 && cov_counter.is_none() {
-                if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) =
-                    (&ca.lhs.kind, &ca.rhs.kind)
-                {
-                    let dst_name = Self::resolve_hier_name_static(lhs_hier, &self.module);
-                    let src_name = Self::resolve_hier_name_static(rhs_hier, &self.module);
-                    if let (Some(&dst_id), Some(&src_id)) = (
-                        self.signal_name_to_id.get(dst_name.as_str()),
-                        self.signal_name_to_id.get(src_name.as_str()),
-                    ) {
-                        // A collapsed identity port net (see
-                        // `collapse_identity_port_nets`) leaves its connect
-                        // assign as a self-copy — drop it entirely.
-                        if dst_id == src_id {
-                            continue;
-                        }
-                        let width = self.signal_widths[dst_id];
-                        let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
-                        if width == self.signal_widths[src_id] {
-                            if width <= 64 && delay == 0 {
-                                Some(CombItem::FastDirectCopy { dst_id, src_id })
-                            } else if self
-                                .module_paths
-                                .as_ref()
-                                .is_some_and(|mp| mp.is_path_net(dst_id))
-                            {
-                                // §30.4 path-delayed output: the general
-                                // cont-assign path cancels a pending update
-                                // when the source reverts (§28.16 pulse
-                                // rejection); DirectCopy does not.
-                                None
-                            } else {
-                                Some(CombItem::DirectCopy {
-                                    dst_id,
-                                    src_id,
-                                    width,
-                                })
-                            }
-                        } else if delay == 0 {
-                            // Width-mismatched bare ident copy (e.g. a wider
-                            // parent net driving a narrower input port).
-                            // Resolve both ids statically here instead of
-                            // falling through to the bytecode compiler, whose
-                            // scope_hint can mis-resolve a parent-scope RHS to a
-                            // same-named local port signal (self-assign -> X).
-                            // DirectCopy resizes the source to `width` (the
-                            // destination width). (pr2224949)
-                            Some(CombItem::DirectCopy {
-                                dst_id,
-                                src_id,
-                                width,
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
+            let direct_copy = if let Some((dst_id, src_id)) = ident_copy_ids {
+                let width = self.signal_widths[dst_id];
+                let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
+                if width == self.signal_widths[src_id] {
+                    if width <= 64 && delay == 0 {
+                        Some(CombItem::FastDirectCopy { dst_id, src_id })
+                    } else if self
+                        .module_paths
+                        .as_ref()
+                        .is_some_and(|mp| mp.is_path_net(dst_id))
+                    {
+                        // §30.4 path-delayed output: the general
+                        // cont-assign path cancels a pending update
+                        // when the source reverts (§28.16 pulse
+                        // rejection); DirectCopy does not.
                         None
+                    } else {
+                        Some(CombItem::DirectCopy {
+                            dst_id,
+                            src_id,
+                            width,
+                        })
                     }
+                } else if delay == 0 {
+                    // Width-mismatched bare ident copy (e.g. a wider
+                    // parent net driving a narrower input port).
+                    // Resolve both ids statically here instead of
+                    // falling through to the bytecode compiler, whose
+                    // scope_hint can mis-resolve a parent-scope RHS to a
+                    // same-named local port signal (self-assign -> X).
+                    // DirectCopy resizes the source to `width` (the
+                    // destination width). (pr2224949)
+                    Some(CombItem::DirectCopy {
+                        dst_id,
+                        src_id,
+                        width,
+                    })
                 } else {
                     None
                 }
@@ -35234,10 +35522,6 @@ impl Simulator {
             // Store successors as a compact CSR adjacency list. The previous
             // `Vec<Vec<usize>>` paid a Vec header for every comb entry and
             // produced many small allocations on large flattened designs.
-            let mut indeg = vec![0usize; n];
-            // Use a temporary visited matrix row-by-row to avoid double-counting edges.
-            let mut seen_pred: Vec<u32> = vec![u32::MAX; n];
-            let mut edges: Vec<(u32, u32)> = Vec::new();
             // A single net with thousands of combinational writers is never real
             // RTL (one driver per net is the norm). It arises when a parameter
             // underflows so a `for i: assign bus[i] = …` generate-loop's index
@@ -35248,6 +35532,69 @@ impl Simulator {
             // fan-in from any such degenerate net; its entries still converge via
             // the unresolved-read re-fire path, just without precise topo order.
             const MAX_WRITERS_PER_NET: usize = 1024;
+            // A net with W writers and R readers contributes W × R
+            // writer -> reader edges. A vector written bit by bit and read
+            // whole by many entries makes that product explode (a DRAM mat's
+            // 128 per-row `rs[r]` drivers × 4,480 readers: 27 M edges at 64k
+            // cells, most of the compile's peak memory). Such a net gets ONE
+            // join node instead: writers -> join -> readers, W + R edges that
+            // carry exactly the same ordering constraints transitively. Join
+            // nodes are ordered like entries but never emitted. A reader that
+            // is itself one of the net's writers keeps its direct edges (a
+            // join edge back to it would close a false cycle). Nets below the
+            // product threshold keep the plain edges, so ordinary graphs, and
+            // their tie-breaks in cyclic regions, are unchanged.
+            const TOPO_JOIN_MIN_EDGES: usize = 1 << 14;
+            let topo_join_on = !matches!(std::env::var("XEZIM_TOPO_JOIN").as_deref(), Ok("0"));
+            // Keyed by a type of its own: sharing the monomorphized maps the
+            // run-time paths use (`HashMap<usize, u32>` is the NBA index)
+            // moved their inlining and cost the simulation ~1% on c906.
+            #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+            struct NetKey(usize);
+            // A multi-writer net's (writers, readers), then its join node:
+            // u32::MAX until the first reader creates it.
+            let mut join_of: HashMap<NetKey, u32> = HashMap::default();
+            if topo_join_on {
+                let mut counts: HashMap<NetKey, (usize, usize)> = HashMap::default();
+                for entry in entries.iter() {
+                    for &sid in &entry.cold.write_signal_ids {
+                        if sid < num_signals {
+                            counts.entry(NetKey(sid)).or_insert((0, 0)).0 += 1;
+                        }
+                    }
+                }
+                for entry in entries.iter() {
+                    for &sid in &entry.cold.read_signal_ids {
+                        if let Some(c) = counts.get_mut(&NetKey(sid)) {
+                            c.1 += 1;
+                        }
+                    }
+                }
+                for (key, (w, r)) in counts {
+                    if (2..=MAX_WRITERS_PER_NET).contains(&w)
+                        && w.saturating_mul(r) >= TOPO_JOIN_MIN_EDGES
+                    {
+                        join_of.insert(key, u32::MAX);
+                    }
+                }
+            }
+            // `writers` is ascending (pushed in entry order).
+            fn is_writer(writers: &[usize], b: usize) -> bool {
+                let (mut lo, mut hi) = (0usize, writers.len());
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if writers[mid] < b {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo < writers.len() && writers[lo] == b
+            }
+            let mut indeg = vec![0usize; n];
+            // Use a temporary visited matrix row-by-row to avoid double-counting edges.
+            let mut seen_pred: Vec<u32> = vec![u32::MAX; n];
+            let mut edges: Vec<(u32, u32)> = Vec::new();
             let mut capped_warned = false;
             for b in 0..n {
                 for &sid in &entries[b].cold.read_signal_ids {
@@ -35269,6 +35616,31 @@ impl Simulator {
                             }
                             continue;
                         }
+                        if let Some(slot) = join_of.get_mut(&NetKey(sid)) {
+                            if !is_writer(writers, b) {
+                                if *slot == u32::MAX {
+                                    let j = indeg.len();
+                                    *slot = j as u32;
+                                    indeg.push(0);
+                                    seen_pred.push(u32::MAX);
+                                    let mut prev = usize::MAX;
+                                    for &a in writers {
+                                        if a != prev {
+                                            edges.push((a as u32, j as u32));
+                                            indeg[j] += 1;
+                                            prev = a;
+                                        }
+                                    }
+                                }
+                                let j = *slot as usize;
+                                if seen_pred[j] != b as u32 {
+                                    seen_pred[j] = b as u32;
+                                    edges.push((j as u32, b as u32));
+                                    indeg[b] += 1;
+                                }
+                                continue;
+                            }
+                        }
                         for &a in writers {
                             if a == b {
                                 continue;
@@ -35283,7 +35655,20 @@ impl Simulator {
                     }
                 }
             }
-            let mut succ_offsets = vec![0u32; n + 1];
+            drop(join_of);
+            drop(seen_pred);
+            let n_nodes = indeg.len();
+            if std::env::var_os("XEZIM_COMPILE_PHASES").is_some() {
+                eprintln!(
+                    "[COMPILE-PHASE]   topo-order graph: {} entries, {} join nodes, {} edges ({:.1} MB)",
+                    n,
+                    n_nodes - n,
+                    edges.len(),
+                    edges.capacity() as f64 * 8.0 / 1048576.0
+                );
+            }
+            crate::rss_trace("bce: topo edges built");
+            let mut succ_offsets = vec![0u32; n_nodes + 1];
             for &(a, _) in &edges {
                 succ_offsets[a as usize + 1] += 1;
             }
@@ -35291,7 +35676,7 @@ impl Simulator {
                 succ_offsets[i] += succ_offsets[i - 1];
             }
             let mut succ_entries = vec![0u32; edges.len()];
-            let mut succ_cursor = succ_offsets[..n].to_vec();
+            let mut succ_cursor = succ_offsets[..n_nodes].to_vec();
             for (a, b) in edges {
                 let pos = succ_cursor[a as usize] as usize;
                 succ_entries[pos] = b;
@@ -35312,14 +35697,15 @@ impl Simulator {
             // lowest bucket that may hold a live node and only moves down when a
             // decrement creates a lower-degree node.
             let mut new_order: Vec<usize> = Vec::with_capacity(n);
-            let mut placed = vec![false; n];
+            let mut placed = vec![false; n_nodes];
             let max_d = indeg.iter().copied().max().unwrap_or(0);
             let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); max_d + 1];
-            for i in 0..n {
+            for i in 0..n_nodes {
                 buckets[indeg[i]].push(i as u32);
             }
             let mut min_d = 0usize;
-            while new_order.len() < n {
+            let mut n_placed = 0usize;
+            while n_placed < n_nodes {
                 // Advance to the lowest bucket holding a live (unplaced,
                 // current-indegree-matches) node, discarding stale entries.
                 let mut a = usize::MAX;
@@ -35343,7 +35729,10 @@ impl Simulator {
                     break;
                 }
                 placed[a] = true;
-                new_order.push(a);
+                n_placed += 1;
+                if a < n {
+                    new_order.push(a);
+                }
                 let lo = succ_offsets[a] as usize;
                 let hi = succ_offsets[a + 1] as usize;
                 for &b_u32 in &succ_entries[lo..hi] {
@@ -35360,6 +35749,12 @@ impl Simulator {
                         }
                     }
                 }
+            }
+            if std::env::var_os("XEZIM_COMPILE_PHASES").is_some() {
+                let h = new_order.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &i| {
+                    (h ^ i as u64).wrapping_mul(0x0100_0000_01b3)
+                });
+                eprintln!("[COMPILE-PHASE]   topo-order hash: {h:016x}");
             }
             // Apply permutation only if we got a real full permutation.
             let valid_permutation = if new_order.len() == n {
@@ -38185,13 +38580,6 @@ impl Simulator {
         // the module is no longer read. Same for combinational always blocks
         // — edge-sensitive ones were moved into self.edge_blocks earlier.
         self.drop_comb_source_ast();
-        // Force the glibc allocator to return freed pages to the OS. On
-        // c906 hello the AST drops above release ~1.3 GB but glibc's arena
-        // retains it until a future large allocation triggers reuse —
-        // observed RSS staying at the elaborate-time peak of 2.7 GB through
-        // the entire time-0 settle phase, only dropping to 1.4 GB when the
-        // event loop's allocation pattern shifts. malloc_trim(0) forces
-        // an immediate release. No-op on non-glibc platforms.
     }
 
     /// `--primitive-verbose` terminal annotation: the net's current 4-state
@@ -41307,7 +41695,7 @@ impl Simulator {
                                     out.push(Sensitivity {
                                         signal_name: self.resolve_event_key(&key),
                                         edge,
-                                        iff: ee.iff.clone(),
+                                        iff: ee.iff.clone().map(Box::new),
                                         value_of: None,
                                     });
                                     continue;
@@ -41324,7 +41712,7 @@ impl Simulator {
                                 out.push(Sensitivity {
                                     signal_name: format!("{}[{}]", bn, value.replace('_', "")),
                                     edge,
-                                    iff: ee.iff.clone(),
+                                    iff: ee.iff.clone().map(Box::new),
                                     value_of: None,
                                 });
                                 continue;
@@ -41366,8 +41754,8 @@ impl Simulator {
                                 out.push(Sensitivity {
                                     signal_name: bn.into_owned(),
                                     edge,
-                                    iff: ee.iff.clone(),
-                                    value_of: Some(ee.expr.clone()),
+                                    iff: ee.iff.clone().map(Box::new),
+                                    value_of: Some(Box::new(ee.expr.clone())),
                                 });
                                 continue;
                             }
@@ -41393,7 +41781,7 @@ impl Simulator {
                                     out.push(Sensitivity {
                                         signal_name: hidden,
                                         edge: EdgeKind::AnyEdge,
-                                        iff: ee.iff.clone(),
+                                        iff: ee.iff.clone().map(Box::new),
                                         value_of: None,
                                     });
                                     continue;
@@ -41414,7 +41802,7 @@ impl Simulator {
                                 out.push(Sensitivity {
                                     signal_name: self.resolve_event_key(&key),
                                     edge,
-                                    iff: ee.iff.clone(),
+                                    iff: ee.iff.clone().map(Box::new),
                                     value_of: None,
                                 });
                                 continue;
@@ -41447,7 +41835,7 @@ impl Simulator {
                                         .get(&cb_key)
                                         .copied()
                                         .unwrap_or(EdgeKind::Posedge),
-                                    iff: ee.iff.clone(),
+                                    iff: ee.iff.clone().map(Box::new),
                                     value_of: None,
                                 });
                                 continue;
@@ -41468,8 +41856,8 @@ impl Simulator {
                                 out.push(Sensitivity {
                                     signal_name: base,
                                     edge,
-                                    iff: ee.iff.clone(),
-                                    value_of: Some(ee.expr.clone()),
+                                    iff: ee.iff.clone().map(Box::new),
+                                    value_of: Some(Box::new(ee.expr.clone())),
                                 });
                                 continue;
                             }
@@ -41477,7 +41865,7 @@ impl Simulator {
                         out.push(Sensitivity {
                             signal_name: sig.to_string(),
                             edge,
-                            iff: ee.iff.clone(),
+                            iff: ee.iff.clone().map(Box::new),
                             value_of: None,
                         });
                     }
@@ -41494,7 +41882,7 @@ impl Simulator {
                         )
                     {
                         for sens in out.iter_mut().skip(term_start) {
-                            sens.value_of = Some(ee.expr.clone());
+                            sens.value_of = Some(Box::new(ee.expr.clone()));
                         }
                     }
                     if selects {
@@ -41541,7 +41929,7 @@ impl Simulator {
                                     out.push(Sensitivity {
                                         signal_name: self.resolve_event_key(&k),
                                         edge: EdgeKind::AnyEdge,
-                                        iff: ee.iff.clone(),
+                                        iff: ee.iff.clone().map(Box::new),
                                         value_of: None,
                                     });
                                     continue;
@@ -41562,7 +41950,7 @@ impl Simulator {
                                         out.push(Sensitivity {
                                             signal_name: hidden,
                                             edge: EdgeKind::AnyEdge,
-                                            iff: ee.iff.clone(),
+                                            iff: ee.iff.clone().map(Box::new),
                                             value_of: None,
                                         });
                                         continue;
@@ -41586,7 +41974,7 @@ impl Simulator {
                                         out.push(Sensitivity {
                                             signal_name: format!("{}.{}", b, member.name),
                                             edge,
-                                            iff: ee.iff.clone(),
+                                            iff: ee.iff.clone().map(Box::new),
                                             value_of: None,
                                         });
                                     }
@@ -42076,7 +42464,7 @@ impl Simulator {
     /// process's frame is. Such a name cannot change while its process
     /// waits, so replace it by its value now.
     fn freeze_value_terms(&mut self, terms: &mut [SensitivityId]) {
-        let mut frozen: Vec<(crate::ast::Span, Option<Expression>)> = Vec::new();
+        let mut frozen: Vec<(crate::ast::Span, Option<Box<Expression>>)> = Vec::new();
         for t in terms.iter_mut() {
             let Some(span) = t.value_of.as_ref().map(|e| e.span) else {
                 continue;
@@ -53802,7 +54190,7 @@ impl Simulator {
             }
             // §9.4.2.3: `@(posedge clk iff en)` samples only while `en` holds.
             if let Some(iff) = triggered {
-                self.sample_covergroup_guarded(handle, iff.as_ref());
+                self.sample_covergroup_guarded(handle, iff.as_deref());
             }
         }
         if let Some(t) = _t_cg {
@@ -54305,8 +54693,9 @@ impl Simulator {
         // this runs the always blocks have already been compiled into edge
         // blocks and the module vec is empty, which is why procedural
         // `$rose`/`$fell` had no clock and silently never fired.
+        // Read through a second handle on the list instead of cloning every
+        // block's statement (the registration below needs `&mut self`).
         let blocks = Arc::clone(&self.edge_blocks);
-        let mut tagged: Vec<(Statement, u8, usize)> = Vec::new();
         for b in blocks.iter() {
             let clk = b.resolved_sensitivities.iter().find_map(|s| match s.edge {
                 EdgeKind::Posedge => Some((1u8, s.signal_id)),
@@ -54314,12 +54703,9 @@ impl Simulator {
                 _ => None,
             });
             if let Some((ec, cid)) = clk {
-                tagged.push((b.stmt.clone(), ec, cid));
+                self.record_sampled_sites(&b.stmt, ec, cid);
+                self.scan_sampled_stmt(&b.stmt);
             }
-        }
-        for (st, ec, cid) in tagged {
-            self.record_sampled_sites(&st, ec, cid);
-            self.scan_sampled_stmt(&st);
         }
     }
 
@@ -124953,7 +125339,7 @@ impl Simulator {
                     self.cg_named_event_waiters
                         .entry(id)
                         .or_default()
-                        .push((handle, s.iff.clone()));
+                        .push((handle, s.iff.as_deref().cloned()));
                     continue;
                 }
                 resolved.push(SensitivityId {
@@ -142150,7 +142536,7 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
                 .into_iter()
                 .filter(|(_, id)| *id != usize::MAX)
                 .filter_map(|(name, id)| {
-                    let dir = sim.vpi_port_directions.get(&name)?;
+                    let dir = sim.vpi_port_directions.get(name.as_str())?;
                     let leaf = name.rsplit('.').next().unwrap_or(&name).to_string();
                     let width = sim.signal_widths.get(id).copied().unwrap_or(1) as u32;
                     Some(VpiHandle::port(

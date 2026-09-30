@@ -1155,6 +1155,18 @@ fn simulate_multi_inner(
             pre.take(),
         )?;
         rss_trace("parse+elaborate");
+        let phases = std::env::var_os("XEZIM_COMPILE_PHASES").is_some();
+        let mut phase_t = WallTimer::now();
+        let mut phase = |label: &str| {
+            if phases {
+                eprintln!(
+                    "[ELAB-PHASE] {}: {:.1}ms",
+                    label,
+                    phase_t.elapsed().as_secs_f64() * 1000.0
+                );
+                phase_t = WallTimer::now();
+            }
+        };
         if std::env::var_os("XEZIM_MEM_CENSUS").is_some() {
             elab_census(&elab);
         }
@@ -1183,6 +1195,7 @@ fn simulate_multi_inner(
         // were const-folded to garbage by elaboration — re-issue them as time-0
         // static-init assignments before the AST is dropped (issue #26).
         defer_static_syscall_inits(&definitions, &mut elab);
+        phase("constraint bodies, lint, static inits");
 
         // Drop the parsed AST before constructing runtime state, and hand
         // its pages back at once: the allocator would otherwise keep them
@@ -1191,6 +1204,7 @@ fn simulate_multi_inner(
         drop(definitions);
         xezim_core::release_free_memory();
         rss_trace("parsed AST dropped");
+        phase("parsed AST dropped");
 
         if let Some((config, key)) = cache.as_ref().zip(cache_key.as_deref()) {
             // Pending rewrite contexts are intentionally omitted from the
