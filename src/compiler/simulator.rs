@@ -222,6 +222,11 @@ pub fn set_warn_x_limit(n: usize) {
     WARN_X_LIMIT.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether x-warnings are on (`--x-warn`, `+X_WARN`, `XEZIM_X_WARN`).
+pub fn warn_x_active() -> bool {
+    warn_x_enabled()
+}
+
 fn warn_x_enabled() -> bool {
     if WARN_X.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
@@ -8611,13 +8616,16 @@ impl Simulator {
             }
         }
         // Peel an Index chain down to its base Ident; indices returned
-        // OUTERMOST-LAST (declaration order).
+        // OUTERMOST-LAST (declaration order). The flag tells a parent-rooted
+        // base (a substituted port actual, see `mark_actual_rooted`), which
+        // names the absolute signal and must not be tried under the block's
+        // own scope.
         fn peel<'a>(
             mut e: &'a Expression,
             idxs: &mut Vec<i64>,
             params: &HashMap<String, Value>,
             scope: &str,
-        ) -> Option<String> {
+        ) -> Option<(String, bool)> {
             loop {
                 match &e.kind {
                     ExprKind::Paren(inner) => e = inner,
@@ -8626,13 +8634,14 @@ impl Simulator {
                         e = expr;
                     }
                     ExprKind::Ident(h) => {
-                        return Some(
+                        return Some((
                             h.path
                                 .iter()
                                 .map(|s| s.name.name.as_str())
                                 .collect::<Vec<_>>()
                                 .join("."),
-                        );
+                            h.root.is_some(),
+                        ));
                     }
                     _ => return None,
                 }
@@ -8690,7 +8699,7 @@ impl Simulator {
                     continue;
                 }
                 let mut idxs: Vec<i64> = Vec::new();
-                let Some(base) = peel(&ee.expr, &mut idxs, params, &ab.scope) else {
+                let Some((base, rooted)) = peel(&ee.expr, &mut idxs, params, &ab.scope) else {
                     if dbg {
                         eprintln!(
                             "[EDGESEL] scope='{}' peel failed: {:?}",
@@ -8712,7 +8721,11 @@ impl Simulator {
                 // The base must name a real signal or unpacked array (either
                 // spelled as-is post-inline or under the block's scope);
                 // events keep their own element machinery.
-                let spellings: Vec<String> = if ab.scope.is_empty() {
+                // §23.3.3: `.wl(wl[1])` into a child whose own port is also
+                // `wl` substitutes the ROOTED `wl[1]`; under the child's scope
+                // it spelled the child's 1-bit port net, and the edge watched
+                // bit 1 of it — never rising.
+                let spellings: Vec<String> = if ab.scope.is_empty() || rooted {
                     vec![base.clone()]
                 } else {
                     vec![format!("{}.{}", ab.scope, base), base.clone()]
@@ -9342,6 +9355,19 @@ impl Simulator {
 
         let n = names.len();
         let mut signal_name_to_id = NameMap::with_capacity(n);
+        // Ports the elaborator left out as unobserved: a lookup that misses
+        // is checked against them (see `names::ElidedPorts`).
+        if module.elided_port_count > 0 {
+            chatter!(
+                "[ELIDE] {} unobserved input-port nets left out",
+                module.elided_port_count
+            );
+        }
+        if !module.elided_port_hashes.is_empty() {
+            signal_name_to_id.set_elided(Some(Arc::new(names::ElidedPorts::new(std::mem::take(
+                &mut module.elided_port_hashes,
+            )))));
+        }
         let mut leaf_name_to_ids: HashMap<Arc<str>, Vec<usize>> = HashMap::default();
         let mut id_to_name = IdNames::with_capacity(n);
         let mut signal_table: Vec<Value> = Vec::with_capacity(n);
@@ -19903,6 +19929,13 @@ impl Simulator {
             self.signal_name_to_id.contains_key(name.as_str()) || {
                 let suffix = format!(".{}", name);
                 self.signal_name_to_id.any_name_ends_with(&suffix)
+                    // An elided input port ending in this name counted
+                    // before it was left out; keep the same verdict.
+                    || (!self.module.elided_port_leaves.is_empty()
+                        && self
+                            .module
+                            .elided_port_leaves
+                            .contains(name.rsplit('.').next().unwrap_or(name)))
             }
         })
     }
@@ -87674,6 +87707,13 @@ impl Simulator {
         // On c910, this scan over 35.7M signals dominated time-0 settle
         // (575s / 11K probes).
         if hier.path.len() == 1 && !leaf.contains('.') {
+            // An elided input port with this leaf could have been the match
+            // this heuristic picked before the port was left out.
+            if !self.module.elided_port_leaves.is_empty()
+                && self.module.elided_port_leaves.contains(leaf.as_str())
+            {
+                names::report_elided_lookup(&leaf);
+            }
             // Use leaf-name reverse index — O(1) instead of O(N) scan.
             let candidates: Vec<&str> = self
                 .leaf_name_to_ids

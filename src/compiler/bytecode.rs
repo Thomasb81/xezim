@@ -5198,7 +5198,10 @@ impl<'a> BytecodeCompiler<'a> {
             (self.signal_name_to_id.get(k).copied() == Some(id))
                 .then(|| params.get(k).filter(|v| !v.is_real).cloned())
         };
-        if let Some(scope) = &self.scope_hint {
+        // A parent-rooted ident (a substituted port actual) is absolute:
+        // `lookup_signal_id` never qualifies it with the scope, and neither
+        // does this check.
+        if let (Some(scope), None) = (&self.scope_hint, &hier.root) {
             if let Some(r) = with_dotted(scope, &raw, check) {
                 return r;
             }

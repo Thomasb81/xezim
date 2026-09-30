@@ -3373,6 +3373,33 @@ suppressed but the explicit SDF annotation still applies."
     };
     drop(line_maps);
 
+    // Unobserved-port elision (xezim_core::elaborate::set_port_elision): the
+    // elaborator may leave out the nets of substituted input ports that the
+    // SOURCES cannot reach by name. Whatever reaches nets by name from
+    // outside the sources is ruled out here: waveform dumps (--wave, --fst,
+    // --xtrace), VPI and DPI libraries, SDF and UPF annotation, code
+    // coverage, x-warnings (they name the net that went x), the PDES
+    // partition tooling, and XEZIM_KEEP_PORTS=1. Library callers never turn
+    // it on: they may look any signal up after the run.
+    xezim_core::elaborate::set_port_elision(
+        !xezim::compiler::simulator::wave_enabled()
+            && fst_file.is_none()
+            && xtrace_file.is_none()
+            && vpi_libs.is_empty()
+            && dpi_libs.is_empty()
+            && sdf_file.is_none()
+            && upf_files.is_empty()
+            && !xezim_core::upf::upf_configured()
+            && code_cov == 0
+            && !xezim::compiler::simulator::warn_x_active()
+            && emit_hypergraph.is_none()
+            && load_partition.is_none()
+            && write_profile.is_none()
+            && profile_input.is_none()
+            && multikernel_scope.is_none()
+            && std::env::var("XEZIM_KEEP_PORTS").ok().as_deref() != Some("1"),
+    );
+
     match xezim::simulate_multi(
         &sources,
         max_time,

@@ -188,6 +188,9 @@ fn design_cache_key(
     hash.text(env!("CARGO_PKG_VERSION"));
     hash.text(&config.semantic_salt);
     hash.text(top_module_name.unwrap_or(""));
+    // An elaboration with unobserved-port elision on leaves nets out, so it
+    // must not serve a run that may observe them.
+    hash.bytes(&[xezim_core::elaborate::port_elision_requested() as u8]);
 
     // Invalidate after a local rebuild even when the package version did not
     // change, since the executable may contain elaboration fixes.

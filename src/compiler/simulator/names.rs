@@ -35,6 +35,49 @@ pub struct NameMap {
     /// non-element `…]` names (queue slots, class properties) before the
     /// second hash lookup a real element needs.
     base_len_mask: u64,
+    /// Input-port nets the elaborator left out (see
+    /// `xezim_core::elaborate::set_port_elision`). A lookup that misses is
+    /// checked against it, so a by-name reference the elision analysis did
+    /// not foresee is reported instead of silently resolving to nothing.
+    elided: Option<Arc<ElidedPorts>>,
+}
+
+/// The elided port nets: `elided_port_hash` of each flat name, sorted.
+pub struct ElidedPorts {
+    hashes: Vec<u64>,
+}
+
+impl ElidedPorts {
+    pub fn new(hashes: Vec<u64>) -> Self {
+        ElidedPorts { hashes }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.hashes
+            .binary_search(&xezim_core::elaborate::elided_port_hash(name))
+            .is_ok()
+    }
+}
+
+/// Report a by-name lookup of an elided port net. Every one is a reference
+/// the elision analysis should have kept the port for, so it is loud: a
+/// one-time warning, or a panic under `XEZIM_ELIDE_STRICT=1` (the test and
+/// validation mode).
+#[cold]
+#[inline(never)]
+pub fn report_elided_lookup(name: &str) {
+    if std::env::var("XEZIM_ELIDE_STRICT").ok().as_deref() == Some("1") {
+        panic!("lookup of elided port net `{}`", name);
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "xezim: warning: `{}` names an input-port net that was left out as unobserved; \
+             results that depend on it may be wrong. Re-run with XEZIM_KEEP_PORTS=1 and \
+             please report this.",
+            name
+        );
+    });
 }
 
 /// `idx` must be written the way `format!("{}", i64)` writes it: the
@@ -127,17 +170,50 @@ impl NameMap {
     pub fn get(&self, name: &str) -> Option<&usize> {
         match self.map.get(name) {
             Some(id) => Some(id),
-            None => self.virtual_id(name).map(|id| &self.identity[id]),
+            None => match self.virtual_id(name) {
+                Some(id) => Some(&self.identity[id]),
+                None => {
+                    if self.elided.is_some() {
+                        self.elided_miss(name);
+                    }
+                    None
+                }
+            },
         }
     }
 
     #[inline(always)]
     pub fn contains_key(&self, name: &str) -> bool {
-        self.map.contains_key(name) || self.virtual_id(name).is_some()
+        let hit = self.map.contains_key(name) || self.virtual_id(name).is_some();
+        if !hit && self.elided.is_some() {
+            self.elided_miss(name);
+        }
+        hit
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut usize> {
+        if self.elided.is_some() && !self.map.contains_key(name) {
+            self.elided_miss(name);
+        }
         self.map.get_mut(name)
+    }
+
+    /// Install the elided port nets (see [`ElidedPorts`]).
+    pub fn set_elided(&mut self, elided: Option<Arc<ElidedPorts>>) {
+        self.elided = elided;
+    }
+
+    /// Whether `name` is an elided port net.
+    pub fn is_elided(&self, name: &str) -> bool {
+        self.elided.as_ref().is_some_and(|e| e.contains(name))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn elided_miss(&self, name: &str) {
+        if self.is_elided(name) {
+            report_elided_lookup(name);
+        }
     }
 
     pub fn insert(&mut self, name: Arc<str>, id: usize) -> Option<usize> {

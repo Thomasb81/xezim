@@ -326,6 +326,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Elab: print elaboration statistics (instances, signals, timing)",
     ),
     (
+        "XEZIM_ELIDE_STRICT",
+        "Debug: =1 panics when a name lookup reaches an input-port net left out by unobserved-port elision (default: one warning)",
+    ),
+    (
         "XEZIM_ENABLE_CACHE",
         "Elab cache: force-enable the design cache (overrides --no-cache heuristics)",
     ),
@@ -509,6 +513,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "JIT: print compilation coverage summary",
     ),
     ("XEZIM_JIT_XZ_BAIL", "JIT: trace X/Z-guard bailouts"),
+    (
+        "XEZIM_KEEP_PORTS",
+        "Elab: =1 keeps the nets of substituted input ports that nothing can reach by name (turns unobserved-port elision off)",
+    ),
     (
         "XEZIM_LARGE_ARRAY_NAME_THRESHOLD",
         "Elab: element-count threshold above which per-element names are lazy",

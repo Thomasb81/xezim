@@ -227,5 +227,7 @@ mod ref_formal_same_name;
 mod single_element_instance_array;
 #[path = "hierarchy/unit_scope_library_subroutine.rs"]
 mod unit_scope_library_subroutine;
+#[path = "hierarchy/unobserved_port_elision.rs"]
+mod unobserved_port_elision;
 #[path = "hierarchy/vif_packed_array_elem_nba.rs"]
 mod vif_packed_array_elem_nba;
