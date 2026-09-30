@@ -66,10 +66,74 @@ and the development workflow are in [README.md](README.md).
   module's own timescale for a module handle (the two names are now defined in
   `vpi_user.h`), and `svGetTime`, `svGetTimeUnit` and `svGetTimePrecision`
   give the same answers from DPI code. (#206)
+* Gate primitives, `#(rise, fall)` gates, UDP instances with parameter
+  delays and `wire #d w = expr;` inside sub-module instances keep their
+  delays, resolved per instance in the child's timeunit; a sub-module `buf`
+  turns z into x as at top level.
+* `always @(m[i])` fires in designs that also declare an array of more than
+  100,000 elements; every array allocated after the large one used to lose
+  element sensitivity.
+* Ports with no data type, and ANSI `input logic` / `inout logic` ports, are
+  nets (§23.2.2.3); a hierarchical `assign dut.u.clk = ...` onto a net-typed
+  port chain drives it. A continuous assign that only reads an unpacked-array
+  element no longer creates a phantom 1-bit net named after the array.
 * The one-time notes for ignored system tasks (such as `$dumpfile` without
   `--wave`) are written to stderr as one piece, so `$display` output going to
   the same file can no longer land inside one and hide a UVM message from log
   parsers.
+
+**Performance**
+
+* Combinational logic re-evaluates only when a bit it actually reads
+  changes (`assign lo = bus[3:0]` stays idle while `bus[7:4]` moves;
+  `XEZIM_BIT_SENS=0` restores whole-signal sensitivity), and the two-state
+  executors and the settle loop do less bookkeeping.
+* Class method calls cache a per-method call plan and save the formals'
+  type metadata only when it is rewritten; instantiation reuses a per-class
+  template.
+* Startup is much cheaper: the design is preprocessed once per run instead
+  of two or three times, elaboration and the bytecode compiler allocate far
+  less, and a warm `--cache` run loads the stored design about twice as
+  fast. `XEZIM_EXIT_AFTER_COMPILE=1` stops right after compile, for measuring
+  startup.
+* Together, host instructions fall 7% on a C906 CoreMark run and on the
+  AXI4 AVIP and 11% on a C910 memcpy run, with identical output; a UVM
+  testbench reaches time 0 with about a third of the previous work.
+
+**Memory**
+
+* Large memories live in a packed arena by default (integral elements up to
+  64 bits in arrays of more than 100,000 cells; `XEZIM_PACKED_MEM=0` turns it
+  off), and arrays of 257 or more elements no longer store a name per
+  element (`XEZIM_VIRTUAL_NAME_MIN_CELLS` sets the cut-off). `force`/`release`,
+  `$readmemh`/`$writememh`, DPI array arguments and `uvm_hdl_force` work on
+  arena memories. A C906 CoreMark run peaks at 0.6 GB instead of 2.6 GB.
+  `XEZIM_RSS_TRACE=1` prints resident and peak memory at every phase.
+
+**VPI**
+
+* Every routine of IEEE 1800-2017 clause 38 is implemented: user data per
+  call instance, `vpi_get_systf_info` with `vpiUserSystf` handles,
+  `vpi_handle_by_multi_index`, `vpi_handle_multi(vpiInterModPath)`,
+  `vpi_get_value_array`/`vpi_put_value_array`, `vpi_get_delays`/
+  `vpi_put_delays` (nets, module paths, timing checks, intermodule paths) and
+  `vpi_get_data`/`vpi_put_data` (always 0: xezim has no `$save`/`$restart`).
+  `vpiStrengthVal`, the short/long integer, shortreal and raw value formats
+  and `vpiTimeVal` puts work; `vpiObjTypeVal` follows §38.15.
+* `vpi_register_cb` accepts every §38.36 reason. Simulation-time callbacks
+  run in their region order within each time step; `cbValueChange` reports
+  every change, including continuous assignments (cocotb edge triggers on
+  such nets no longer hang); force, release, assign, deassign, disable,
+  statement, error, timing-violation, signal and unresolved-systf callbacks
+  are new; `vpi_get_cb_info` and `vpi_remove_cb` work for all of them.
+  `cbReadOnlySynch` fires once at the end of a time step.
+* A VPI application can walk the whole design (IEEE 1800-2017 chapter 37):
+  instances of every kind, packages, generate scopes, named blocks, tasks and
+  functions, processes, continuous assignments, gate/switch/UDP primitives,
+  specify paths and timing checks, modports, `bind` instances and ports, each
+  with `vpiFile`/`vpiLineNo`; `vpiType` is the declared type through
+  typedefs, with ranges and typespecs. Ports iterate in port-list order and
+  SystemVerilog unpacked arrays report `vpiRegArray`.
 
 ### 0.11.0 — code coverage, reference-parity fixes, faster UVM (September 2026)
 
