@@ -530,3 +530,46 @@ fn design_cache_does_not_leak_elision_into_a_dump_run() {
     assert_eq!(elided(&dumped), 0, "a --wave run must elaborate afresh");
     assert_eq!(user_lines(&plain), user_lines(&dumped));
 }
+
+/// A class method, a package function or compilation-unit code runs in the
+/// scope of the instance that calls it: a bare name it does not declare
+/// itself is looked up under that instance, where it can land on the
+/// instance's own port net. Any port named in such code keeps its net.
+/// Here the method's `token[15:12]` must read its argument: with the port
+/// net gone, the lookup fell through to the testbench's own `token`.
+#[test]
+fn class_code_names_keep_ports() {
+    let src = r#"
+package util;
+  function automatic logic [3:0] low(input logic [15:0] word);
+    return word[3:0];
+  endfunction
+endpackage
+class dec_c;
+  function logic [3:0] hi(input logic [15:0] token);
+    return token[15:12];
+  endfunction
+endclass
+module ep(input logic clk, input logic [15:0] token, input logic [15:0] word);
+  dec_c d = new();
+  logic [3:0] r, s;
+  always @(posedge clk) begin r = d.hi(token); s = word[3:0]; end
+endmodule
+module top;
+  logic clk = 0;
+  logic [1:0][15:0] token, word;
+  assign token[0] = 16'hA123; assign token[1] = 16'hB456;
+  assign word[0] = 16'h0007; assign word[1] = 16'h0009;
+  ep e0(.clk(clk), .token(token[0]), .word(word[0]));
+  ep e1(.clk(clk), .token(token[1]), .word(word[1]));
+  initial begin
+    #1 clk = 1;
+    #1 $display("T|%h %h %h %h %h", e0.r, e1.r, e0.s, e1.s, util::low(16'h1234));
+  end
+endmodule
+"#;
+    let (n, _) = check("classcode", src, &[], &["T|a b 7 9 4"]);
+    // Only the two `clk` ports go; `token` and `word` are named in class
+    // and package code.
+    assert_eq!(n, 2);
+}

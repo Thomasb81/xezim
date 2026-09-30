@@ -87600,6 +87600,9 @@ impl Simulator {
                     if self.signal_name_to_id.contains_key(scoped.as_str()) {
                         return scoped;
                     }
+                    // An input-port net of this instance, left out as
+                    // unobserved, would have been found right here.
+                    self.signal_name_to_id.check_miss(scoped.as_str());
                 }
                 // No activation (build/detection eval): hint-first, the
                 // order those contexts are built around. A stale
