@@ -393,6 +393,8 @@ mod parked_task_local_vif_alias;
 mod randomize_joint_constraints;
 #[path = "classes/randomize_obj_array_property.rs"]
 mod randomize_obj_array_property;
+#[path = "classes/receiver_call_evaluated_once.rs"]
+mod receiver_call_evaluated_once;
 #[path = "classes/ref_formal_shadows_property.rs"]
 mod ref_formal_shadows_property;
 #[path = "classes/sqr_zero_time_loop.rs"]

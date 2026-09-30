@@ -5548,6 +5548,13 @@ pub struct Simulator {
     /// bus_if.master vif`) so the rewrite path can also emit a direction
     /// warning when writing to a modport-input member.
     virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
+    /// §13.4/§8.5: the CALL in receiver position of a member/select chain
+    /// being evaluated (`me()` in `me().o.x`, `q.pop_front()` in
+    /// `q.pop_front().addr`), with its one value: `(node address, call-frame
+    /// depth, value)`. The chain's paths re-evaluate their receiver freely;
+    /// while an entry is live, the same node at the same depth returns the
+    /// value instead of running the call again. See `recv_call_once_eval`.
+    recv_call_memo: Vec<(usize, usize, Value)>,
     /// A virtual-interface handle token has been stored in a collection
     /// element (see `queue_eval_arg`): receivers may then resolve BY VALUE.
     vif_tokens_stored: bool,
@@ -10638,6 +10645,7 @@ impl Simulator {
             uvm_dpi: Default::default(),
             heap: vec![None], // index 0 is null
             virtual_iface_bindings: HashMap::default(),
+            recv_call_memo: Vec::new(),
             vif_tokens_stored: false,
             tb_cache: std::cell::RefCell::new(HashMap::default()),
             local_iface_aliases: Vec::new(),
@@ -60770,6 +60778,17 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
+        if let ExprKind::MemberAccess { expr: b, .. }
+        | ExprKind::Index { expr: b, .. }
+        | ExprKind::RangeSelect { expr: b, .. } = &lhs.kind
+            && matches!(
+                b.kind,
+                ExprKind::Call { .. } | ExprKind::MemberAccess { .. }
+            )
+            && let Some(changed) = self.recv_call_once_assign(lhs, val)
+        {
+            return changed;
+        }
         let changed = self.assign_value_inner(lhs, val);
         if changed && !self.condition_waiters.is_empty() {
             self.check_condition_waiters_for_write(lhs);
@@ -69105,6 +69124,109 @@ impl Simulator {
         })
     }
 
+    /// The outermost CALL in receiver position of the member/select chain
+    /// `e` — `me()` in `me().o.x`, `q.pop_front()` in `q.pop_front().addr`,
+    /// `a().b()` in `a().b().c` — never `e`'s own callee.
+    fn recv_chain_call(e: &Expression) -> Option<&Expression> {
+        let mut cur: &Expression = match &e.kind {
+            ExprKind::MemberAccess { expr, .. }
+            | ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. } => expr,
+            ExprKind::Call { func, .. } => match &func.kind {
+                ExprKind::MemberAccess { expr, .. } => expr,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        loop {
+            match &cur.kind {
+                ExprKind::Call { .. } => return Some(cur),
+                ExprKind::MemberAccess { expr, .. }
+                | ExprKind::Index { expr, .. }
+                | ExprKind::RangeSelect { expr, .. } => cur = expr,
+                ExprKind::Paren(inner) => cur = inner,
+                _ => return None,
+            }
+        }
+    }
+
+    /// `e`'s receiver call when no enclosing evaluation at this call depth
+    /// already holds its value.
+    fn recv_call_to_memoize<'e>(&self, e: &'e Expression) -> Option<&'e Expression> {
+        let call = Self::recv_chain_call(e)?;
+        let key = call as *const Expression as usize;
+        let depth = self.local_stack.len();
+        (!self
+            .recv_call_memo
+            .iter()
+            .any(|&(k, d, _)| k == key && d == depth))
+        .then_some(call)
+    }
+
+    /// The held value of receiver call `e` (see `recv_call_memo`).
+    fn recv_call_memo_hit(&self, e: &Expression) -> Option<Value> {
+        let key = e as *const Expression as usize;
+        let depth = self.local_stack.len();
+        self.recv_call_memo
+            .iter()
+            .rev()
+            .find(|&&(k, d, _)| k == key && d == depth)
+            .map(|(_, _, v)| v.clone())
+    }
+
+    /// §13.4/§8.5: a member or select applied to a CALL result — `me().x`,
+    /// `q.pop_front().addr`, `get_cfg().vif.data`, `me().o.get()` — runs the
+    /// call ONCE. The member paths below re-evaluate their receiver as they
+    /// try each storage shape (a handle, a packed or unpacked struct value, a
+    /// struct leaf), so a chain rooted at a call ran it up to a dozen times:
+    /// every side effect repeated, and `q.pop_front().addr` drained the whole
+    /// queue. Evaluate the call first, hold its value for the duration of
+    /// this evaluation (the paths keep the call's AST for its type), and
+    /// resolve the chain as before.
+    #[inline(never)]
+    fn recv_call_once_eval(&mut self, expr: &Expression, ctx_width: u32) -> Option<Value> {
+        let call = self.recv_call_to_memoize(expr)?;
+        let v = self.eval_expr(call);
+        let key = call as *const Expression as usize;
+        self.recv_call_memo.push((key, self.local_stack.len(), v));
+        let r = self.eval_expr_ctx(expr, ctx_width);
+        self.recv_call_memo.pop();
+        Some(r)
+    }
+
+    /// The write-side twin of [`recv_call_once_eval`]: `me().x = v` runs
+    /// `me()` once.
+    #[inline(never)]
+    fn recv_call_once_assign(&mut self, lhs: &Expression, val: &Value) -> Option<bool> {
+        let call = self.recv_call_to_memoize(lhs)?;
+        let v = self.eval_expr(call);
+        let key = call as *const Expression as usize;
+        self.recv_call_memo.push((key, self.local_stack.len(), v));
+        let r = self.assign_value(lhs, val);
+        self.recv_call_memo.pop();
+        Some(r)
+    }
+
+    /// Statement-wide twin of [`recv_call_once_eval`]: run the receiver call
+    /// of each of a statement's own expressions (RHS first) and hold the
+    /// value until the statement ends — its probes (collection storage,
+    /// fixed-array shape, lvalue width) evaluate those expressions on their
+    /// own, outside any one evaluation. Returns the memo length the caller
+    /// restores when the statement completes; `None` when no expression has
+    /// a receiver call left to run.
+    #[inline(never)]
+    fn pin_stmt_recv_calls(&mut self, exprs: &[&Expression]) -> Option<usize> {
+        let base = self.recv_call_memo.len();
+        for e in exprs {
+            if let Some(call) = self.recv_call_to_memoize(e) {
+                let v = self.eval_expr(call);
+                let key = call as *const Expression as usize;
+                self.recv_call_memo.push((key, self.local_stack.len(), v));
+            }
+        }
+        (self.recv_call_memo.len() > base).then_some(base)
+    }
+
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
@@ -69121,9 +69243,37 @@ impl Simulator {
                 if let Some(v) = self.plain_member_read(base, member) {
                     return v;
                 }
+                if matches!(
+                    base.kind,
+                    ExprKind::Call { .. } | ExprKind::MemberAccess { .. }
+                ) && let Some(v) = self.recv_call_once_eval(expr, ctx_width)
+                {
+                    return v;
+                }
             }
             ExprKind::Call { func, args } => {
+                if !self.recv_call_memo.is_empty()
+                    && let Some(v) = self.recv_call_memo_hit(expr)
+                {
+                    return v;
+                }
                 if let Some(v) = self.plain_member_call(func, args) {
+                    return v;
+                }
+                if matches!(&func.kind, ExprKind::MemberAccess { expr: r, .. }
+                    if matches!(r.kind, ExprKind::Call { .. } | ExprKind::MemberAccess { .. }))
+                    && let Some(v) = self.recv_call_once_eval(expr, ctx_width)
+                {
+                    return v;
+                }
+            }
+            ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. }
+                if matches!(
+                    base.kind,
+                    ExprKind::Call { .. } | ExprKind::MemberAccess { .. }
+                ) =>
+            {
+                if let Some(v) = self.recv_call_once_eval(expr, ctx_width) {
                     return v;
                 }
             }
@@ -73633,6 +73783,22 @@ impl Simulator {
     /// dispatcher recursed with a 7.8 KB frame per level).
     #[inline(never)]
     fn exec_stmt_blocking_assign(
+        &mut self,
+        stmt: &Statement,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) {
+        if (Self::recv_chain_call(rvalue).is_some() || Self::recv_chain_call(lvalue).is_some())
+            && let Some(base) = self.pin_stmt_recv_calls(&[rvalue, lvalue])
+        {
+            self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue);
+            self.recv_call_memo.truncate(base);
+            return;
+        }
+        self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue)
+    }
+
+    fn exec_stmt_blocking_assign_body(
         &mut self,
         stmt: &Statement,
         lvalue: &Expression,
@@ -80026,6 +80192,12 @@ impl Simulator {
             }
             StatementKind::Return(expr) => {
                 if let Some(e) = expr {
+                    // One call for a receiver call in the returned chain
+                    // (`return me().o.x;`), shared by the probes below.
+                    let pinned = Self::recv_chain_call(e)
+                        .is_some()
+                        .then(|| self.pin_stmt_recv_calls(&[e]))
+                        .flatten();
                     // An operand no virtual-interface source can name: both
                     // vif lookups below come back empty for it.
                     let vif_free = !self.vif_rhs_possible(e);
@@ -80152,6 +80324,9 @@ impl Simulator {
                         if self.is_interface_instance(&bound) {
                             self.last_vif_return = Some(bound);
                         }
+                    }
+                    if let Some(base) = pinned {
+                        self.recv_call_memo.truncate(base);
                     }
                 }
                 self.break_flag = true;
@@ -115119,15 +115294,19 @@ impl Simulator {
         // `this.m` / `obj.m` (either parse shape) on an object resolves to a
         // store only for a member some class can hold as a collection.
         let obj_member_name = match &expr.kind {
+            // Every receiver shape but a class scope or specialization (the
+            // static-collection arms) — checked by NAME before the arms below
+            // evaluate a nested, indexed or call receiver: a name no class can
+            // hold as a collection resolves to no store whatever the object.
             ExprKind::MemberAccess { expr: base, member } => match &base.kind {
-                ExprKind::This => Some(member.name.as_str()),
                 ExprKind::Ident(bh)
                     if bh.path.len() == 1
-                        && !self.module.classes.contains_key(&bh.path[0].name.name) =>
+                        && self.module.classes.contains_key(&bh.path[0].name.name) =>
                 {
-                    Some(member.name.as_str())
+                    None
                 }
-                _ => None,
+                ExprKind::Specialization { .. } => None,
+                _ => Some(member.name.as_str()),
             },
             ExprKind::Ident(h) if h.path.len() == 2 && h.path[0].selects.is_empty() => {
                 Some(h.path[1].name.name.as_str())
