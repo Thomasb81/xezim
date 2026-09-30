@@ -282,6 +282,8 @@ mod edge_and_delay_select_fixes;
 mod edge_task_call_process;
 #[path = "misc/factory_register_reentrant.rs"]
 mod factory_register_reentrant;
+#[path = "misc/fallback_carried_locals.rs"]
+mod fallback_carried_locals;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/packed_elem_fn_inline.rs"]

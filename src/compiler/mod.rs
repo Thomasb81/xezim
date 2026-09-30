@@ -9,6 +9,7 @@ pub mod aot;
 pub mod arena;
 pub mod bytecode;
 pub mod dispatch;
+mod fb_scan;
 pub mod fst_sink;
 pub mod jit;
 pub mod prof_sampler;

@@ -248,6 +248,39 @@ pub struct CaseLutData {
     pub default: Value,
 }
 
+/// How a register-backed local is typed, for handing it to the AST
+/// interpreter (`FbLocal`). Only shapes whose interpreter view is fully
+/// described by the `Value` itself are listed: a plain integral vector with
+/// a `[N-1:0]` range (or none), a real, a string. Anything else — structs,
+/// enums, typedefs, multi-dimensional or offset ranges — has metadata the
+/// interpreter keeps by NAME, which a compiled local never registered, so a
+/// fallback that names one is refused and the enclosing unit stays on the
+/// interpreter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LocalKind {
+    /// Integral, declared width and signedness (§6.11, §6.8).
+    Int {
+        width: u32,
+        signed: bool,
+    },
+    Real,
+    Str,
+}
+
+/// One register-backed local an AST fallback reads or writes. The executor
+/// binds `name` to the register's value in a fresh interpreter frame around
+/// the fallback and copies the (re-typed) value back afterwards.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FbLocal {
+    pub name: Arc<str>,
+    pub reg: RegId,
+    pub kind: LocalKind,
+}
+
+/// The locals a fallback carries; empty for the ordinary fallback, which
+/// sees no register at all.
+pub type FbLocals = Box<[FbLocal]>;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Insn {
     /// Load a constant value into a register. `Box<Value>` keeps the
@@ -414,14 +447,16 @@ pub enum Insn {
     /// Boxed payload keeps the variant at 8 B (Box ptr) instead of
     /// 24 B (Arc + fat-ptr str). StmtFallback is the AST-interpreter
     /// escape hatch — its dispatch cost dwarfs an extra deref.
-    StmtFallback(Box<(Arc<Statement>, Arc<str>)>),
+    /// The third field lists the register-backed locals the statement
+    /// names (see `FbLocal`); empty when none are live.
+    StmtFallback(Box<(Arc<Statement>, Arc<str>, FbLocals)>),
     /// Expression-level AST escape hatch: interpret ONE sub-expression the
     /// compiler can't handle (unresolvable ident, member access, impure
     /// call, ...) into a register, keeping the REST of the statement
-    /// compiled. (RegId dest, ctx width for §11.8.1 sizing.) Forbidden
-    /// while any register-backed locals are live — the interpreter cannot
-    /// see VM registers.
-    EvalExprFallback(Box<(Arc<Expression>, Arc<str>)>, RegId, u32),
+    /// compiled. (RegId dest, ctx width for §11.8.1 sizing.) The
+    /// interpreter cannot see VM registers, so the register-backed locals
+    /// the expression names travel in the payload (see `FbLocal`).
+    EvalExprFallback(Box<(Arc<Expression>, Arc<str>, FbLocals)>, RegId, u32),
 
     SetSigned(RegId),
     /// §11.8.1: the enclosing expression is UNSIGNED (some operand is
@@ -1014,6 +1049,15 @@ pub struct BytecodeCompiler<'a> {
     /// are read-only for the compiled statement; writes leave compilation so
     /// the process interpreter can preserve full local-lifetime semantics.
     process_local_names: HashSet<String>,
+    /// Declared type of each register-backed local that an AST fallback may
+    /// carry (see `FbLocal`), keyed by its register. A local bound without an
+    /// entry (an unsupported type, a process-frame import) makes any fallback
+    /// that names it refuse, so the enclosing unit is interpreted instead.
+    local_kinds: HashMap<RegId, LocalKind>,
+    /// Enclosing inlined task bodies declared in a DIFFERENT scope than the
+    /// block being compiled. A fallback inside one would print the block's
+    /// `%m` and use its timescale, so none is emitted there.
+    inline_foreign: u32,
     /// Depth of enclosing loops whose counter lives in a VM REGISTER
     /// (`for (int i = ...)`). While > 0, StmtFallback emission is FORBIDDEN:
     /// the AST interpreter cannot see VM registers, so a fallback statement
@@ -1211,6 +1255,8 @@ impl<'a> BytecodeCompiler<'a> {
             local_var_regs: std::collections::HashMap::default(),
             decl_local_regs: std::collections::HashSet::default(),
             process_local_names: HashSet::default(),
+            local_kinds: HashMap::default(),
+            inline_foreign: 0,
             reg_var_loop_depth: 0,
             allow_expr_fallback: false,
             tasks: None,
@@ -1874,6 +1920,36 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// Does `stmt` declare a variable anywhere (a block-local `VarDecl`)?
+    fn stmt_declares(stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::VarDecl { .. } => true,
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_declares)
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::stmt_declares(then_stmt)
+                    || else_stmt.as_ref().is_some_and(|e| Self::stmt_declares(e))
+            }
+            StatementKind::Case { items, .. } => {
+                items.iter().any(|it| Self::stmt_declares(&it.stmt))
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => Self::stmt_declares(body),
+            _ => false,
+        }
+    }
+
     fn stmt_is_blocking(stmt: &Statement) -> bool {
         match &stmt.kind {
             StatementKind::TimingControl { .. } => true,
@@ -2146,6 +2222,11 @@ impl<'a> BytecodeCompiler<'a> {
             if formal_is_real {
                 real_formal_names.push(p.name.name.clone());
             }
+            if let Some(k) =
+                self.local_kind_of(Self::port_effective_type(&fd.ports, i), Some(&name))
+            {
+                self.local_kinds.insert(slot, k);
+            }
             binds.push((p.name.name.clone(), (slot, w)));
             if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
                 if ew > 0 && w > ew && w % ew == 0 {
@@ -2361,6 +2442,9 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.local_var_elem.insert(d.name.name.clone(), ew);
                             }
                         }
+                        if let Some(k) = self.local_kind_of(data_type, None) {
+                            self.local_kinds.insert(slot, k);
+                        }
                         self.local_var_regs.insert(d.name.name.clone(), (slot, w));
                     }
                 }
@@ -2406,17 +2490,32 @@ impl<'a> BytecodeCompiler<'a> {
         // §13.4.1: a VOID function called as a statement is a task enable in
         // all but name — inline it through the same machinery. (Non-void
         // returns would need a result variable; those stay on the AST.)
-        let (ports, body): (Vec<crate::ast::decl::FunctionPort>, Vec<Statement>) =
-            if let Some(td) = self.tasks.and_then(|t| t.get(task_name)) {
-                (td.ports.clone(), td.items.clone())
-            } else if let Some(fd) = self.functions.and_then(|f| f.get(task_name)) {
-                if !matches!(fd.return_type, crate::ast::types::DataType::Void(_)) {
-                    return false;
-                }
-                (fd.ports.clone(), fd.items.clone())
-            } else {
+        let (ports, body, lifetime): (
+            Vec<crate::ast::decl::FunctionPort>,
+            Vec<Statement>,
+            Option<crate::ast::types::Lifetime>,
+        ) = if let Some(td) = self.tasks.and_then(|t| t.get(task_name)) {
+            (td.ports.clone(), td.items.clone(), td.lifetime)
+        } else if let Some(fd) = self.functions.and_then(|f| f.get(task_name)) {
+            if !matches!(fd.return_type, crate::ast::types::DataType::Void(_)) {
                 return false;
-            };
+            }
+            (fd.ports.clone(), fd.items.clone(), fd.lifetime)
+        } else {
+            return false;
+        };
+        // §13.3.1: a STATIC subroutine's variables — its locals and output
+        // formals — keep their values between calls; an inline gives each
+        // call fresh registers. Only an input-only static body with no
+        // declarations behaves the same either way.
+        if matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+            && (ports
+                .iter()
+                .any(|p| !matches!(p.direction, PortDirection::Input))
+                || body.iter().any(Self::stmt_declares))
+        {
+            return false;
+        }
         if ports.len() != args.len()
             || ports.iter().any(|p| {
                 !matches!(p.direction, PortDirection::Input | PortDirection::Output)
@@ -2433,34 +2532,58 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let start = self.insns.len();
         let start_reg = self.next_reg;
+        let qpfx = task_name.rsplit_once('.').map(|(p, _)| p.to_string());
 
         // Evaluate input actuals in the CALLER's scope, before any binding.
         let mut binds: Vec<(String, (RegId, u32))> = Vec::with_capacity(ports.len());
         let mut out_writes: Vec<(Expression, RegId, u32)> = Vec::new();
         let mut ok = true;
         let mut string_formals: Vec<String> = Vec::new();
+        let mut real_formals: Vec<String> = Vec::new();
         for (i, (p, a)) in ports.iter().zip(args).enumerate() {
+            // §13.5.2: a formal that omits its type inherits the previous
+            // formal's (the parser leaves it `Implicit`).
+            let eff_dt = Self::port_effective_type(&ports, i);
             // §6.16 string formal: no declared width, so no Resize — a
             // resize would truncate the front of the text.
             let is_string = matches!(
-                &p.data_type,
+                eff_dt,
                 crate::ast::types::DataType::Simple {
                     kind: crate::ast::types::SimpleType::String,
                     ..
                 }
             );
+            let is_real = crate::compiler::elaborate::is_type_real(eff_dt);
             let w = if is_string {
                 0
             } else {
                 self.port_effective_width(&ports, i, Some(task_name))
             };
+            let kind = if is_string {
+                Some(LocalKind::Str)
+            } else {
+                self.local_kind_of(eff_dt, Some(task_name))
+            };
             let slot = self.alloc_reg();
+            match kind {
+                Some(k) => {
+                    self.local_kinds.insert(slot, k);
+                }
+                None => {
+                    self.local_kinds.remove(&slot);
+                }
+            }
             if matches!(p.direction, PortDirection::Output) {
                 if is_string {
                     ok = false;
                     break;
                 }
-                let init = self.type_default_value(&p.data_type, w);
+                // §13.5.3: an output starts at its type's default.
+                let init = if is_real {
+                    Value::from_f64(0.0)
+                } else {
+                    self.type_default_value(eff_dt, w)
+                };
                 self.emit(Insn::LoadConst(slot, Box::new(init)));
                 out_writes.push((a.clone(), slot, w));
             } else {
@@ -2472,8 +2595,13 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
             }
-            if w > 0 {
+            if is_real {
+                // §13.3.1: an integral actual CONVERTS to a real formal.
+                self.emit_to_real(slot);
+                real_formals.push(p.name.name.clone());
+            } else if w > 0 {
                 self.emit(Insn::Resize(slot, w));
+                self.emit_local_fit(slot);
             }
             if is_string {
                 string_formals.push(p.name.name.clone());
@@ -2482,11 +2610,36 @@ impl<'a> BytecodeCompiler<'a> {
         }
 
         if ok {
+            // The body sees its own formals and locals and the module scope —
+            // never the CALLER's locals, loop constants or register banks
+            // (§13: a subroutine body is its own scope). Inheriting them let a
+            // body's module-variable `cnt` resolve to a caller local `cnt`.
+            let saved_locals = std::mem::take(&mut self.local_var_regs);
+            let saved_local_strings = std::mem::take(&mut self.local_var_is_string);
+            let saved_local_reals = std::mem::take(&mut self.local_var_is_real);
+            let saved_local_elems = std::mem::take(&mut self.local_var_elem);
+            let saved_local_arrays = std::mem::take(&mut self.local_var_array);
+            let saved_banks = std::mem::take(&mut self.local_array_regs);
+            let saved_consts = std::mem::take(&mut self.local_const_vars);
+            let saved_const_binds = std::mem::take(&mut self.const_var_binds);
+            let saved_decl_locals = std::mem::take(&mut self.decl_local_regs);
+            let saved_loop_depth = std::mem::replace(&mut self.reg_var_loop_depth, 0);
+            // `%m` inside the body names the task: a scope-printing fallback
+            // is wrapped in a block carrying the task's own name.
+            let leaf = task_name.rsplit('.').next().unwrap_or(task_name);
+            let saved_labels = std::mem::replace(
+                &mut self.m_labels,
+                vec![crate::ast::Identifier {
+                    name: leaf.to_string(),
+                    span: crate::ast::Span::dummy(),
+                }],
+            );
+            // A body declared in another scope prints that scope's `%m` and
+            // runs on its timescale; no fallback may be emitted inside it.
+            let foreign = qpfx.as_deref() != self.scope_hint.as_deref();
+            self.inline_foreign += foreign as u32;
             // Formals shadow for the body only. The qualified spellings cover
             // elaboration's instance-rewritten bodies, same as pure calls.
-            let qpfx = task_name.rsplit_once('.').map(|(p, _)| p.to_string());
-            let saved_locals = self.local_var_regs.clone();
-            let saved_local_strings = self.local_var_is_string.clone();
             for (n, b) in &binds {
                 if let Some(pfx) = &qpfx {
                     self.local_var_regs.insert(format!("{pfx}.{n}"), *b);
@@ -2499,11 +2652,16 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 self.local_var_is_string.insert(n.clone());
             }
-            // No AST fallback inside: formals live in registers the
-            // interpreter cannot see, so a deferred statement would read and
-            // write the wrong storage (silently). All-or-nothing.
-            let saved_fallback = self.allow_ast_fallback;
-            self.allow_ast_fallback = false;
+            for n in &real_formals {
+                if let Some(pfx) = &qpfx {
+                    self.local_var_is_real.insert(format!("{pfx}.{n}"));
+                }
+                self.local_var_is_real.insert(n.clone());
+            }
+            // A statement the compiler cannot handle falls back to the
+            // interpreter carrying the formals and locals it names (see
+            // `fb_carry`); one that cannot be carried fails the inline, and
+            // the call keeps the ordinary interpreted path.
             self.inlining_stack.push(task_name.to_string());
             let saved_ret = self.inline_ret;
             let saved_ret_jumps = std::mem::take(&mut self.inline_ret_jumps);
@@ -2521,6 +2679,23 @@ impl<'a> BytecodeCompiler<'a> {
             }
             self.inline_ret = saved_ret;
             self.inline_ret_jumps = saved_ret_jumps;
+            self.inlining_stack.pop();
+            self.inline_foreign -= foreign as u32;
+            self.m_labels = saved_labels;
+            self.local_var_regs = saved_locals;
+            self.local_var_is_string = saved_local_strings;
+            self.local_var_is_real = saved_local_reals;
+            self.local_var_elem = saved_local_elems;
+            self.local_var_array = saved_local_arrays;
+            self.local_array_regs = saved_banks;
+            self.local_const_vars = saved_consts;
+            self.const_var_binds = saved_const_binds;
+            self.decl_local_regs = saved_decl_locals;
+            self.reg_var_loop_depth = saved_loop_depth;
+            // The copy-out targets are the CALLER's lvalues, resolved in the
+            // caller's scope: with the formals still bound, an actual named
+            // like its formal (`t1(cyc, o)` into `output int o`) wrote the
+            // formal's own register and the caller's `o` never changed.
             if ok {
                 for (target, value, width) in &out_writes {
                     if !self.compile_blocking_target(target, *value, *width) {
@@ -2529,10 +2704,6 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
             }
-            self.inlining_stack.pop();
-            self.allow_ast_fallback = saved_fallback;
-            self.local_var_regs = saved_locals;
-            self.local_var_is_string = saved_local_strings;
         }
         if !ok {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
@@ -2899,20 +3070,208 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// The interpreter-visible type of a register-backed local declared with
+    /// `dt` (see `LocalKind`), or None when the interpreter would need
+    /// metadata the compiled local never registered.
+    fn local_kind_of(
+        &mut self,
+        dt: &crate::ast::types::DataType,
+        scope: Option<&str>,
+    ) -> Option<LocalKind> {
+        use crate::ast::types::{
+            DataType as D, IntegerAtomType as A, PackedDimension as P, Signing as Sg,
+            SimpleType as St,
+        };
+        match dt {
+            D::Real { .. } => Some(LocalKind::Real),
+            D::Simple {
+                kind: St::String, ..
+            } => Some(LocalKind::Str),
+            D::IntegerAtom { kind, signing, .. } => {
+                let width = match kind {
+                    A::Byte => 8,
+                    A::ShortInt => 16,
+                    A::Int | A::Integer => 32,
+                    A::LongInt | A::Time => 64,
+                };
+                // §6.11: the atoms are signed by default, `time` is not.
+                let signed = match signing {
+                    Some(Sg::Signed) => true,
+                    Some(Sg::Unsigned) => false,
+                    None => !matches!(kind, A::Time),
+                };
+                Some(LocalKind::Int { width, signed })
+            }
+            D::IntegerVector {
+                signing,
+                dimensions,
+                ..
+            }
+            | D::Implicit {
+                signing,
+                dimensions,
+                ..
+            } => {
+                // One `[N-1:0]` range at most: the interpreter selects bits
+                // of a frame value from bit 0, with no declared range.
+                match dimensions.as_slice() {
+                    [] => {}
+                    [P::Range { right, .. }] => {
+                        if self.fold_const(right)?.to_u64()? != 0 {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+                let width = self.decl_width_in(dt, scope);
+                if width == 0 {
+                    return None;
+                }
+                Some(LocalKind::Int {
+                    width,
+                    signed: matches!(signing, Some(Sg::Signed)),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// §6.8/§10.7: a write to an integral local takes the local's declared
+    /// signedness, whatever the right-hand side's was. Width is the caller's
+    /// `Resize`; this stamps the flag the register-backed value would
+    /// otherwise inherit from its source (`int s; s = u;` with an unsigned
+    /// `u` left `s < 0` false).
+    fn emit_local_fit(&mut self, reg: RegId) {
+        if let Some(LocalKind::Int { signed, .. }) = self.local_kinds.get(&reg).copied() {
+            self.emit(if signed {
+                Insn::SetSigned(reg)
+            } else {
+                Insn::ClearSigned(reg)
+            });
+        }
+    }
+
+    /// Is any register-backed name in scope, or are we inside an inlined
+    /// body? Only then can a fallback need to carry locals (or be unable
+    /// to): everywhere else fallbacks are emitted exactly as they always were.
+    fn fb_live(&self) -> bool {
+        !self.local_var_regs.is_empty()
+            || !self.local_const_vars.is_empty()
+            || !self.local_array_regs.is_empty()
+            || !self.local_var_array.is_empty()
+            || !self.inlining_stack.is_empty()
+    }
+
+    /// The register-backed locals a fallback over the scanned fragment must
+    /// carry, or why it cannot be emitted at all. Unrolled loop constants
+    /// are loaded into fresh registers here, so call this only once the
+    /// fallback is certain to be emitted next.
+    fn fb_carry(&mut self, scan: &super::fb_scan::FbScan) -> Result<FbLocals, &'static str> {
+        use super::fb_scan::{HIER, NBA, SEL, WRITE};
+        if let Some(why) = scan.bad {
+            return Err(why);
+        }
+        // A process-frame import already lives in the interpreter's frame; a
+        // carried frame on top would hide it.
+        if !self.process_local_names.is_empty() {
+            return Err("fb_process_locals");
+        }
+        if self.inline_foreign > 0 {
+            return Err("fb_foreign_inline");
+        }
+        let is_local = |c: &Self, n: &str| {
+            c.local_var_regs.contains_key(n)
+                || c.local_const_vars.contains_key(n)
+                || c.local_array_regs.contains_key(n)
+                || c.local_var_array.contains_key(n)
+        };
+        // A declaration inside the fragment would land in the carried frame
+        // and be copied back over the outer local of the same name.
+        if scan.decls.iter().any(|d| is_local(self, d)) {
+            return Err("fb_decl_shadows_local");
+        }
+        let mut consts: Vec<(Arc<str>, Value)> = Vec::new();
+        let mut out: Vec<FbLocal> = Vec::new();
+        for (name, flags) in &scan.names {
+            let flags = *flags;
+            if !is_local(self, name) {
+                continue;
+            }
+            if flags & (HIER | NBA) != 0 {
+                return Err("fb_local_by_path");
+            }
+            // Same precedence as `compile_expr`: an unrolled constant first.
+            if let Some(v) = self.local_const_vars.get(name) {
+                if flags & WRITE != 0 {
+                    return Err("fb_const_local_write");
+                }
+                consts.push((Arc::from(name.as_str()), v.clone()));
+                continue;
+            }
+            let Some(&(reg, _)) = self.local_var_regs.get(name) else {
+                return Err("fb_local_array");
+            };
+            let Some(&kind) = self.local_kinds.get(&reg) else {
+                return Err("fb_local_untyped");
+            };
+            if flags & SEL != 0
+                && (!matches!(kind, LocalKind::Int { .. })
+                    || self.local_var_elem.contains_key(name))
+            {
+                return Err("fb_local_select");
+            }
+            // An unrolled `foreach` index is folded as a constant elsewhere
+            // in the iteration.
+            if flags & WRITE != 0 && self.const_var_binds.contains_key(name) {
+                return Err("fb_const_local_write");
+            }
+            out.push(FbLocal {
+                name: Arc::from(name.as_str()),
+                reg,
+                kind,
+            });
+        }
+        for (name, v) in consts {
+            let r = self.alloc_reg();
+            let kind = LocalKind::Int {
+                width: v.width,
+                signed: v.is_signed,
+            };
+            self.emit(Insn::LoadConst(r, Box::new(v)));
+            out.push(FbLocal { name, reg: r, kind });
+        }
+        Ok(out.into_boxed_slice())
+    }
+
+    /// `fb_carry` for a statement fallback.
+    fn fb_stmt_locals(&mut self, stmt: &Statement) -> Result<FbLocals, &'static str> {
+        // A declaration run by the interpreter would live in the carried
+        // frame and vanish with it, while the statements after it still
+        // need the variable.
+        if matches!(stmt.kind, StatementKind::VarDecl { .. }) {
+            return Err("fb_decl_escapes");
+        }
+        let mut scan = super::fb_scan::FbScan::default();
+        scan.stmt(stmt);
+        // Inside an inlined body `%m` must name the task: the fallback is
+        // wrapped in the task's name (see `m_labels`), which a contained
+        // `disable` rules out.
+        if !self.inlining_stack.is_empty() && Self::stmt_names_scope(stmt).is_none() {
+            return Err("fb_inline_scope_name");
+        }
+        self.fb_carry(&scan)
+    }
+
     /// Expression-level escape hatch (see Insn::EvalExprFallback). Returns
-    /// None when forbidden (no ast-fallback, or register-backed locals are
-    /// live and the interpreter couldn't see them).
+    /// None when forbidden: no ast-fallback, or it names a register-backed
+    /// local the interpreter cannot be handed (see `fb_carry`).
     fn emit_expr_fallback(
         &mut self,
         e: &Expression,
         ctx_width: u32,
         reason: &'static str,
     ) -> Option<RegId> {
-        if !self.allow_ast_fallback
-            || !self.allow_expr_fallback
-            || self.reg_var_loop_depth > 0
-            || !self.local_var_regs.is_empty()
-        {
+        if !self.allow_ast_fallback || !self.allow_expr_fallback {
             return None;
         }
         // Sampled-value functions ($past/$rose/...) take their clock from the
@@ -2921,10 +3280,26 @@ impl<'a> BytecodeCompiler<'a> {
         if Self::expr_has_sampled_value_call(e) {
             return None;
         }
-        self.trace_fallback_site(reason, e.span, "expr");
+        let locals = if self.fb_live() {
+            let mut scan = super::fb_scan::FbScan::default();
+            scan.expr(e);
+            if !self.inlining_stack.is_empty() && Self::expr_names_scope(e) {
+                return None;
+            }
+            match self.fb_carry(&scan) {
+                Ok(l) => l,
+                Err(why) => {
+                    self.trace_fallback_site(why, e.span, "expr-refused");
+                    return None;
+                }
+            }
+        } else {
+            FbLocals::default()
+        };
+        self.trace_fallback_site_carrying(reason, e.span, "expr", &locals);
         let r = self.alloc_reg();
         self.emit(Insn::EvalExprFallback(
-            Box::new((Arc::new(e.clone()), Arc::from(reason))),
+            Box::new((Arc::new(e.clone()), Arc::from(reason), locals)),
             r,
             ctx_width,
         ));
@@ -2938,6 +3313,18 @@ impl<'a> BytecodeCompiler<'a> {
     /// names the statements worth compiling — the `[PROF] fallback_reason`
     /// counters say how much they cost, this says where they are.
     fn trace_fallback_site(&mut self, reason: &str, span: crate::ast::Span, what: &str) {
+        self.trace_fallback_site_carrying(reason, span, what, &[]);
+    }
+
+    /// `trace_fallback_site`, naming the register-backed locals the fallback
+    /// carries (`carries=a,b`) when there are any.
+    fn trace_fallback_site_carrying(
+        &mut self,
+        reason: &str,
+        span: crate::ast::Span,
+        what: &str,
+        locals: &[FbLocal],
+    ) {
         use std::sync::OnceLock;
         static ON: OnceLock<bool> = OnceLock::new();
         let on = *ON.get_or_init(|| {
@@ -2948,68 +3335,101 @@ impl<'a> BytecodeCompiler<'a> {
         if !on {
             return;
         }
+        let carries = if locals.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<&str> = locals.iter().map(|l| l.name.as_ref()).collect();
+            format!(" carries={}", names.join(","))
+        };
         eprintln!(
-            "[FALLBACK] {} reason={} bytes={}..{} scope={}",
+            "[FALLBACK] {} reason={} bytes={}..{} scope={}{}",
             what,
             reason,
             span.start,
             span.end,
-            self.scope_hint.as_deref().unwrap_or("-")
+            self.scope_hint.as_deref().unwrap_or("-"),
+            carries
         );
     }
 
     fn emit_fallback(&mut self, stmt: &Statement) -> bool {
-        if !self.decl_local_regs.is_empty() {
-            // See decl_local_regs — the interpreter has no storage for a
-            // register-backed block local, so bail the whole block instead.
-            self.trace_fallback_site(
-                self.bail_reason
-                    .unwrap_or_else(|| Self::stmt_kind_label(stmt)),
-                stmt.span,
-                "block-bail(local-regs)",
-            );
+        if !self.allow_ast_fallback {
             return false;
         }
-        if self.reg_var_loop_depth > 0 {
-            // See reg_var_loop_depth — a fallback here would mis-read the
-            // register-backed loop var; force the whole loop to bail. This is
-            // the expensive case: one statement takes its whole loop to the
-            // interpreter, so report it even though no fallback is emitted.
-            self.trace_fallback_site(
-                self.bail_reason
-                    .unwrap_or_else(|| Self::stmt_kind_label(stmt)),
-                stmt.span,
-                "loop-bail",
-            );
-            return false;
-        }
-        if self.allow_ast_fallback {
-            let reason = self
-                .bail_reason
-                .unwrap_or_else(|| Self::stmt_kind_label(stmt));
-            self.trace_fallback_site(reason, stmt.span, "stmt");
-            // §21.2.1.7: the interpreter pushes a named block onto the `%m`
-            // chain only while it runs the block, so a scope-printing
-            // statement lifted out of one is re-wrapped in its names.
-            let mut body = stmt.clone();
-            if !self.m_labels.is_empty() && Self::stmt_names_scope(stmt) == Some(true) {
-                for n in self.m_labels.iter().rev() {
-                    body = Statement::new(
-                        StatementKind::SeqBlock {
-                            name: Some(n.clone()),
-                            stmts: vec![body],
-                        },
-                        stmt.span,
-                    );
+        let locals = if self.fb_live() {
+            match self.fb_stmt_locals(stmt) {
+                Ok(l) => l,
+                Err(why) => {
+                    // The interpreter cannot be handed the register-backed
+                    // locals this statement needs; fail it so the enclosing
+                    // unit (loop, block, inlined call) rolls back to one
+                    // interpreted piece. Reported because one statement can
+                    // take a whole block with it.
+                    self.trace_fallback_site(why, stmt.span, "block-bail(local-regs)");
+                    return false;
                 }
             }
-            self.emit(Insn::StmtFallback(Box::new((
-                Arc::new(body),
-                Arc::from(reason),
-            ))));
-            true
         } else {
-            false
+            FbLocals::default()
+        };
+        let reason = self
+            .bail_reason
+            .unwrap_or_else(|| Self::stmt_kind_label(stmt));
+        self.trace_fallback_site_carrying(reason, stmt.span, "stmt", &locals);
+        self.push_stmt_fallback(stmt, reason, locals);
+        true
+    }
+
+    /// Emit a `StmtFallback` for `stmt`. §21.2.1.7: the interpreter pushes a
+    /// named block onto the `%m` chain only while it runs the block, so a
+    /// scope-printing statement lifted out of one is re-wrapped in its names
+    /// (inside an inlined body the first name is the task's own).
+    fn push_stmt_fallback(&mut self, stmt: &Statement, reason: &'static str, locals: FbLocals) {
+        let mut body = stmt.clone();
+        if !self.m_labels.is_empty() && Self::stmt_names_scope(stmt) == Some(true) {
+            for n in self.m_labels.iter().rev() {
+                body = Statement::new(
+                    StatementKind::SeqBlock {
+                        name: Some(n.clone()),
+                        stmts: vec![body],
+                    },
+                    stmt.span,
+                );
+            }
+        }
+        self.emit(Insn::StmtFallback(Box::new((
+            Arc::new(body),
+            Arc::from(reason),
+            locals,
+        ))));
+    }
+
+    /// Can evaluating `e` print a scope name (`%m` in a format string, a
+    /// severity task)?
+    fn expr_names_scope(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::StringLiteral(s) => s.contains("%m") || s.contains("%M"),
+            ExprKind::SystemCall { name, args } => {
+                matches!(name.as_str(), "$info" | "$warning" | "$error" | "$fatal")
+                    || args.iter().any(Self::expr_names_scope)
+            }
+            ExprKind::Call { args, .. } => args.iter().any(Self::expr_names_scope),
+            ExprKind::Unary { operand, .. } => Self::expr_names_scope(operand),
+            ExprKind::Binary { left, right, .. } => {
+                Self::expr_names_scope(left) || Self::expr_names_scope(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_names_scope(condition)
+                    || Self::expr_names_scope(then_expr)
+                    || Self::expr_names_scope(else_expr)
+            }
+            ExprKind::Concatenation(parts) => parts.iter().any(Self::expr_names_scope),
+            ExprKind::Paren(inner) => Self::expr_names_scope(inner),
+            _ => false,
         }
     }
 
@@ -3017,26 +3437,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// or an assertion report? `None` when it contains a `disable`, which a
     /// synthetic named block around it could intercept.
     fn stmt_names_scope(stmt: &Statement) -> Option<bool> {
-        fn expr(e: &Expression) -> bool {
-            match &e.kind {
-                ExprKind::StringLiteral(s) => s.contains("%m") || s.contains("%M"),
-                ExprKind::SystemCall { name, args } => {
-                    matches!(name.as_str(), "$info" | "$warning" | "$error" | "$fatal")
-                        || args.iter().any(expr)
-                }
-                ExprKind::Call { args, .. } => args.iter().any(expr),
-                ExprKind::Unary { operand, .. } => expr(operand),
-                ExprKind::Binary { left, right, .. } => expr(left) || expr(right),
-                ExprKind::Conditional {
-                    condition,
-                    then_expr,
-                    else_expr,
-                } => expr(condition) || expr(then_expr) || expr(else_expr),
-                ExprKind::Concatenation(parts) => parts.iter().any(expr),
-                ExprKind::Paren(inner) => expr(inner),
-                _ => false,
-            }
-        }
+        let expr = Self::expr_names_scope;
         let any = |stmts: &mut dyn Iterator<Item = &Statement>| -> Option<bool> {
             let mut found = false;
             for st in stmts {
@@ -3758,6 +4159,20 @@ impl<'a> BytecodeCompiler<'a> {
     /// The parser leaves such a port's data_type Implicit, and sizing it
     /// directly gives 1 bit — `input logic [7:0] a0, a1` bound a1 one bit
     /// wide and truncated every argument passed through it.
+    fn port_effective_type(
+        ports: &[crate::ast::decl::FunctionPort],
+        i: usize,
+    ) -> &crate::ast::types::DataType {
+        for k in (0..=i).rev() {
+            let dt = &ports[k].data_type;
+            if !matches!(dt, crate::ast::types::DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+            {
+                return dt;
+            }
+        }
+        &ports[i].data_type
+    }
+
     fn port_effective_width(
         &self,
         ports: &[crate::ast::decl::FunctionPort],
@@ -4079,6 +4494,11 @@ impl<'a> BytecodeCompiler<'a> {
             return 0;
         };
         self.next_reg += 1;
+        // A rolled-back compile rewinds `next_reg`, so this id may have held
+        // a typed local before: whoever binds a local here re-types it.
+        if !self.local_kinds.is_empty() {
+            self.local_kinds.remove(&r);
+        }
         r
     }
 
@@ -4440,14 +4860,11 @@ impl<'a> BytecodeCompiler<'a> {
                 ok = false;
                 break;
             }
-            // The interpreter cannot see the const-bound loop variable (or
-            // any register bank), so a statement deferring to AST fallback
-            // inside the body would silently read the WRONG storage. Compile
-            // fully or roll the whole unroll back.
-            let saved_fb = self.allow_ast_fallback;
-            self.allow_ast_fallback = false;
+            // A statement deferring to the AST interpreter inside the body
+            // carries the const-bound loop variable in a register
+            // (`fb_carry`), and may not write it; one naming a register bank
+            // cannot fall back at all and rolls the whole unroll back.
             let body_ok = self.compile_stmt(body);
-            self.allow_ast_fallback = saved_fb;
             if !body_ok {
                 ok = false;
                 break;
@@ -6301,22 +6718,29 @@ impl<'a> BytecodeCompiler<'a> {
         // while the entry reported success. Fail the statement instead so
         // the whole loop (or block) rolls back to one AST-interpreted unit
         // where the loop var is a real interpreter local.
-        if self.allow_ast_fallback
-            && self.reg_var_loop_depth == 0
-            && self.decl_local_regs.is_empty()
-        {
+        if self.allow_ast_fallback {
             let reason = self
                 .bail_reason
                 .unwrap_or_else(|| Self::stmt_kind_label(stmt));
             self.insns.truncate(start);
             self.next_reg = start_reg;
-            self.emit(Insn::StmtFallback(Box::new((
-                Arc::new(stmt.clone()),
-                Arc::from(reason),
-            ))));
-            self.bail_reason = saved_reason;
-            self.register_overflow = saved_overflow;
-            return true;
+            let locals = if self.fb_live() {
+                self.fb_stmt_locals(stmt)
+            } else {
+                Ok(FbLocals::default())
+            };
+            match locals {
+                Ok(locals) => {
+                    self.trace_fallback_site_carrying(reason, stmt.span, "stmt-whole", &locals);
+                    self.push_stmt_fallback(stmt, reason, locals);
+                    self.bail_reason = saved_reason;
+                    self.register_overflow = saved_overflow;
+                    return true;
+                }
+                Err(why) => {
+                    self.trace_fallback_site(why, stmt.span, "block-bail(local-regs)");
+                }
+            }
         }
         self.register_overflow = saved_overflow;
         false
@@ -6500,7 +6924,23 @@ impl<'a> BytecodeCompiler<'a> {
                     } else {
                         self.decl_width(data_type)
                     };
+                    // §6.12: a `real` local holds a real, whatever its
+                    // initializer (or its default, 0.0) is.
+                    let is_real = crate::compiler::elaborate::is_type_real(data_type);
+                    let kind = if is_string {
+                        Some(LocalKind::Str)
+                    } else {
+                        self.local_kind_of(data_type, None)
+                    };
                     let slot = self.alloc_reg();
+                    match kind {
+                        Some(k) => {
+                            self.local_kinds.insert(slot, k);
+                        }
+                        None => {
+                            self.local_kinds.remove(&slot);
+                        }
+                    }
                     match &decl.init {
                         Some(expr) => {
                             let Some(value) = self.compile_expr(expr, width) else {
@@ -6510,19 +6950,32 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::Move(slot, value));
                         }
                         None => {
-                            let value = self.type_default_value(data_type, width);
+                            let value = if is_real {
+                                Value::from_f64(0.0)
+                            } else {
+                                self.type_default_value(data_type, width)
+                            };
                             self.emit(Insn::LoadConst(slot, Box::new(value)));
                         }
                     }
-                    if width > 0 {
-                        self.emit(Insn::Resize(slot, width));
+                    let name = &decl.name.name;
+                    if is_real {
+                        self.emit_to_real(slot);
+                        self.local_var_is_real.insert(name.clone());
+                    } else {
+                        self.local_var_is_real.remove(name);
+                        if width > 0 {
+                            self.emit(Insn::Resize(slot, width));
+                            self.emit_local_fit(slot);
+                        }
                     }
                     if is_string {
-                        self.local_var_is_string.insert(decl.name.name.clone());
+                        self.local_var_is_string.insert(name.clone());
+                    } else {
+                        self.local_var_is_string.remove(name);
                     }
-                    self.local_var_regs
-                        .insert(decl.name.name.clone(), (slot, width));
-                    self.decl_local_regs.insert(decl.name.name.clone());
+                    self.local_var_regs.insert(name.clone(), (slot, width));
+                    self.decl_local_regs.insert(name.clone());
                 }
                 true
             }
@@ -6736,22 +7189,26 @@ impl<'a> BytecodeCompiler<'a> {
             StatementKind::SeqBlock { name, stmts } => {
                 let saved_locals = self.local_var_regs.clone();
                 let saved_decl_locals = self.decl_local_regs.clone();
+                // A block's declarations re-type their names only inside it.
+                let saved_reals = self.local_var_is_real.clone();
+                let saved_strings = self.local_var_is_string.clone();
                 let m_depth = self.m_labels.len();
                 if let Some(n) = name {
                     self.m_labels.push(n.clone());
                 }
+                let mut ok = true;
                 for s in stmts {
                     if !self.compile_stmt(s) {
-                        self.m_labels.truncate(m_depth);
-                        self.local_var_regs = saved_locals;
-                        self.decl_local_regs = saved_decl_locals;
-                        return false;
+                        ok = false;
+                        break;
                     }
                 }
                 self.m_labels.truncate(m_depth);
                 self.local_var_regs = saved_locals;
                 self.decl_local_regs = saved_decl_locals;
-                true
+                self.local_var_is_real = saved_reals;
+                self.local_var_is_string = saved_strings;
+                ok
             }
             // Bail out on anything else (timing controls, loops, system tasks, etc.)
             StatementKind::Expr(e)
@@ -7123,6 +7580,9 @@ impl<'a> BytecodeCompiler<'a> {
                             } else {
                                 self.emit(Insn::ClearSigned(slot));
                             }
+                            if let Some(k) = self.local_kind_of(data_type, None) {
+                                self.local_kinds.insert(slot, k);
+                            }
                             self.local_var_regs.insert(name.name.clone(), (slot, w));
                             self.reg_var_loop_depth += 1;
                             reg_vars_registered += 1;
@@ -7455,13 +7915,17 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 let var_reg = self.alloc_reg();
                 let saved_local = self.local_var_regs.insert(var.clone(), (var_reg, 32));
+                // §12.7.3: a fixed-size array's loop variable is an `int`. A
+                // fallback in the body carries it (`fb_carry`), read-only —
+                // the rest of the iteration folds it as a constant.
+                self.local_kinds.insert(
+                    var_reg,
+                    LocalKind::Int {
+                        width: 32,
+                        signed: true,
+                    },
+                );
                 let saved_const = self.const_var_binds.get(&var).copied();
-                let saved_fallback = self.allow_ast_fallback;
-                // A per-statement AST fallback inside the unrolled body
-                // would read the loop var as a (non-existent) SIGNAL — same
-                // hazard as the register-var for-loop guard. Fail the body
-                // instead, so the WHOLE foreach rolls back as one unit.
-                self.allow_ast_fallback = false;
                 let mut ok = true;
                 for k in 0..ab.regs.len() {
                     let idx = (ab.lo + k as i64) as u64;
@@ -7472,7 +7936,6 @@ impl<'a> BytecodeCompiler<'a> {
                         break;
                     }
                 }
-                self.allow_ast_fallback = saved_fallback;
                 match saved_const {
                     Some(v) => {
                         self.const_var_binds.insert(var.clone(), v);
@@ -10100,6 +10563,202 @@ impl<'a> BytecodeCompiler<'a> {
         self.const_multi_dim_array_elem_signal_id(elem).map(Err)
     }
 
+    /// `fold_const` as a signed 64-bit integer (x/z or too wide: None).
+    fn fold_const_i64(&mut self, e: &Expression) -> Option<i64> {
+        let v = self.fold_const(e)?;
+        if v.has_xz() || v.is_real || v.width == 0 || v.width > 64 {
+            return None;
+        }
+        let u = v.to_u64()?;
+        Some(
+            if v.is_signed && v.width < 64 && (u >> (v.width - 1)) & 1 == 1 {
+                (u | (u64::MAX << v.width)) as i64
+            } else {
+                u as i64
+            },
+        )
+    }
+
+    /// §11.5.1/§11.5.2 bit or part-select STORE into a register-backed
+    /// integral local — `v[6:4] = c[3:1]`, `cur[b*8 +: 8] = d`, `x[i] = b` —
+    /// as a mask splice on the register: `x = (x & ~(m << lo)) | ((v & m) << lo)`.
+    /// 4-state exact: the constant mask passes untouched bits through and
+    /// lands x/z of `v` as x/z. None when `lhs` is not such a store (the
+    /// caller's other paths decide); Some(false) on a compile failure.
+    ///
+    /// Only locals whose declared range is `[N-1:0]` qualify (`LocalKind::Int`
+    /// records exactly those), so an index is a bit offset. A constant select
+    /// writes exactly its in-range bits; a dynamic one needs an unsigned
+    /// index, and one with an x/z bit writes nothing.
+    fn compile_local_select_store(&mut self, lhs: &Expression, val_reg: RegId) -> Option<bool> {
+        // (base ident, lsb expression or constant range, field width)
+        enum Sel<'e> {
+            Bit(&'e Expression),
+            Range(RangeKind, &'e Expression, &'e Expression),
+        }
+        let (h, sel) = match &lhs.kind {
+            ExprKind::Index { expr, index } => match &expr.kind {
+                ExprKind::Ident(h) => (h, Sel::Bit(index)),
+                _ => return None,
+            },
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => match &expr.kind {
+                ExprKind::Ident(h) => (h, Sel::Range(*kind, left, right)),
+                _ => return None,
+            },
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.len() == 1 => {
+                (h, Sel::Bit(&h.path[0].selects[0]))
+            }
+            _ => return None,
+        };
+        if h.root.is_some() || h.path.len() != 1 {
+            return None;
+        }
+        let name = h.path[0].name.name.as_str();
+        let &(yreg, yw) = self.local_var_regs.get(name)?;
+        if !matches!(self.local_kinds.get(&yreg), Some(LocalKind::Int { .. }))
+            || self.local_var_elem.contains_key(name)
+            || self.process_local_names.contains(name)
+            || yw == 0
+        {
+            return None;
+        }
+        // (constant lsb, or dynamic lsb register) and the field width.
+        let (lo_const, lo_expr, fw): (Option<i64>, Option<&Expression>, i64) = match sel {
+            Sel::Bit(ix) => match self.fold_const_i64(ix) {
+                Some(c) => (Some(c), None, 1),
+                None => (None, Some(ix), 1),
+            },
+            Sel::Range(RangeKind::Constant, l, r) => {
+                let (Some(l), Some(r)) = (self.fold_const_i64(l), self.fold_const_i64(r)) else {
+                    return None;
+                };
+                if l < r {
+                    // A reversed select on a descending local is illegal.
+                    return None;
+                }
+                (Some(r), None, l - r + 1)
+            }
+            Sel::Range(kind, b, w) => {
+                let w = self.fold_const_i64(w).filter(|&w| w > 0)?;
+                match (kind, self.fold_const_i64(b)) {
+                    (RangeKind::IndexedUp, Some(c)) => (Some(c), None, w),
+                    (RangeKind::IndexedDown, Some(c)) => (Some(c - w + 1), None, w),
+                    (RangeKind::IndexedUp, None) => (None, Some(b), w),
+                    // `b -: w` at run time can reach below bit 0.
+                    _ => return None,
+                }
+            }
+        };
+        if fw > 64 {
+            return None;
+        }
+        let fw = fw as u32;
+        let ones = |w: u32| -> Value {
+            if w >= 64 {
+                Value::from_u64(u64::MAX, 64)
+            } else {
+                Value::from_u64((1u64 << w) - 1, w)
+            }
+        };
+        match (lo_const, lo_expr) {
+            (Some(lo), _) => {
+                // Clip the field to the local's bits: below 0 drops the
+                // value's low bits, above N-1 its high bits.
+                let (mut lo, mut fw, mut vshift) = (lo, fw as i64, 0i64);
+                if lo < 0 {
+                    vshift = -lo;
+                    fw += lo;
+                    lo = 0;
+                }
+                if fw <= 0 || lo >= yw as i64 {
+                    return Some(true);
+                }
+                let fw = fw.min(yw as i64 - lo) as u32;
+                let lo = lo as u32;
+                let mut keep = Value::ones(yw);
+                for b in lo..lo + fw {
+                    keep.set_bit(b as usize, xezim_core::value::LogicBit::Zero);
+                }
+                let keep_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(keep_reg, Box::new(keep)));
+                let cleared = self.alloc_reg();
+                self.emit(Insn::BitAnd(cleared, yreg, keep_reg));
+                let vex = self.alloc_reg();
+                self.emit(Insn::Move(vex, val_reg));
+                if vshift > 0 {
+                    let k = self.alloc_reg();
+                    self.emit(Insn::LoadConst(
+                        k,
+                        Box::new(Value::from_u64(vshift as u64, 32)),
+                    ));
+                    self.emit(Insn::ClearSigned(vex));
+                    self.emit(Insn::Shr(vex, vex, k));
+                }
+                self.emit(Insn::Resize(vex, fw));
+                self.emit(Insn::ClearSigned(vex));
+                self.emit(Insn::Resize(vex, yw));
+                let merged = self.alloc_reg();
+                if lo > 0 {
+                    let k = self.alloc_reg();
+                    self.emit(Insn::LoadConst(k, Box::new(Value::from_u64(lo as u64, 32))));
+                    let vsh = self.alloc_reg();
+                    self.emit(Insn::Shl(vsh, vex, k));
+                    self.emit(Insn::BitOr(merged, cleared, vsh));
+                } else {
+                    self.emit(Insn::BitOr(merged, cleared, vex));
+                }
+                self.emit(Insn::Move(yreg, merged));
+                self.emit(Insn::Resize(yreg, yw));
+                self.emit_local_fit(yreg);
+                Some(true)
+            }
+            (None, Some(ix)) => {
+                // A negative index could still write in-range bits; only an
+                // unsigned one is a plain shift amount.
+                if self.expr_signedness(ix) != Some(false) {
+                    return None;
+                }
+                let Some(lo_reg) = self.compile_expr(ix, 0) else {
+                    return Some(false);
+                };
+                // §11.5.1: an x/z index writes nothing.
+                let known = self.alloc_reg();
+                self.emit(Insn::Eq(known, lo_reg, lo_reg));
+                let skip = self.insns.len();
+                self.emit(Insn::BranchIfFalse(known, 0));
+                let mask_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(mask_reg, Box::new(ones(fw).resize(yw))));
+                let shifted = self.alloc_reg();
+                self.emit(Insn::Shl(shifted, mask_reg, lo_reg));
+                let inv = self.alloc_reg();
+                self.emit(Insn::BitNot(inv, shifted));
+                let cleared = self.alloc_reg();
+                self.emit(Insn::BitAnd(cleared, yreg, inv));
+                let vex = self.alloc_reg();
+                self.emit(Insn::Move(vex, val_reg));
+                self.emit(Insn::Resize(vex, fw));
+                self.emit(Insn::ClearSigned(vex));
+                self.emit(Insn::Resize(vex, yw));
+                let vsh = self.alloc_reg();
+                self.emit(Insn::Shl(vsh, vex, lo_reg));
+                let merged = self.alloc_reg();
+                self.emit(Insn::BitOr(merged, cleared, vsh));
+                self.emit(Insn::Move(yreg, merged));
+                self.emit(Insn::Resize(yreg, yw));
+                self.emit_local_fit(yreg);
+                let end = self.insns.len() as u32;
+                self.insns[skip] = Insn::BranchIfFalse(known, end);
+                Some(true)
+            }
+            (None, None) => None,
+        }
+    }
+
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
         // Packed element WRITE on a register-backed local (`y[i] = v` on a
         // `u8_vec16_t y` inside an inlined function): mask-splice with plain
@@ -10222,6 +10881,10 @@ impl<'a> BytecodeCompiler<'a> {
                 }
             }
         }
+        // Bit / part-select store into a register-backed integral local.
+        if let Some(done) = self.compile_local_select_store(lhs, val_reg) {
+            return done;
+        }
         // Assignment to a register-backed block local (the loop variable of an
         // enclosing `for (int i = ...)`).
         if let ExprKind::Ident(hier) = &lhs.kind {
@@ -10238,6 +10901,7 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit_to_real(dst);
                 } else if w > 0 {
                     self.emit(Insn::Resize(dst, w));
+                    self.emit_local_fit(dst);
                 }
                 return true;
             }
@@ -11458,6 +12122,15 @@ impl<'a> BytecodeCompiler<'a> {
                 system_function_result(name).map(|(_, signed)| signed)
             }
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                // A register-backed local of a known integral type carries its
+                // declared signedness (`emit_local_fit` stamps it on every
+                // write); an untyped one stays unknown.
+                if let Some((reg, _)) = self.local_var_reg_of(h) {
+                    return match self.local_kinds.get(&reg) {
+                        Some(LocalKind::Int { signed, .. }) => Some(*signed),
+                        _ => None,
+                    };
+                }
                 let id = self.lookup_signal_id(h)?;
                 Some(self.signal_signed[id])
             }
@@ -13082,6 +13755,10 @@ impl<'a> BytecodeCompiler<'a> {
             // Register the instruction defines (None: defines no register).
             // Anything not listed clears all knowledge.
             let dest: Option<Option<RegId>> = match &insns[i] {
+                // A fallback carrying locals writes them back: every register
+                // it names is redefined.
+                Insn::StmtFallback(p) if !p.2.is_empty() => None,
+                Insn::EvalExprFallback(p, _, _) if !p.2.is_empty() => None,
                 Insn::LoadConst(d, _)
                 | Insn::LoadSignal(d, _)
                 | Insn::LoadSignalSigned(d, _)
@@ -14274,8 +14951,17 @@ mod tests {
     #[test]
     fn reg_readers_match_a_full_scan() {
         let k = || Box::new(Value::from_u64(3, 8));
-        let fallback =
-            || Insn::EvalExprFallback(Box::new((Arc::new(ident_expr("x")), Arc::from(""))), 9, 8);
+        let fallback = || {
+            Insn::EvalExprFallback(
+                Box::new((
+                    Arc::new(ident_expr("x")),
+                    Arc::from(""),
+                    FbLocals::default(),
+                )),
+                9,
+                8,
+            )
+        };
         let mut insns = vec![
             Insn::LoadConst(1, k()),
             Insn::Add(2, 1, 1),
@@ -14510,6 +15196,72 @@ mod tests {
         BytecodeCompiler::elide_redundant_resizes(&mut insns, &[8], None, 1);
         assert!(matches!(insns[2], Insn::Nop));
         assert!(matches!(insns[3], Insn::Resize(0, 8)));
+    }
+
+    fn carrying_fallback(reg: Option<RegId>) -> Insn {
+        let stmt = Statement::new(
+            StatementKind::Expr(ident_expr("x")),
+            crate::ast::Span::dummy(),
+        );
+        let locals: FbLocals = match reg {
+            Some(reg) => vec![FbLocal {
+                name: Arc::from("x"),
+                reg,
+                kind: LocalKind::Int {
+                    width: 8,
+                    signed: false,
+                },
+            }]
+            .into_boxed_slice(),
+            None => FbLocals::default(),
+        };
+        Insn::StmtFallback(Box::new((Arc::new(stmt), Arc::from(""), locals)))
+    }
+
+    /// A fallback that carries a register-backed local copies it back, so
+    /// nothing known about that register before it may be used after it.
+    #[test]
+    fn constant_folding_stops_at_a_fallback_that_carries_the_register() {
+        let run = |fb: Insn| {
+            let mut insns = vec![
+                Insn::LoadConst(0, Box::new(Value::from_u64(3, 8))),
+                Insn::LoadSignal(2, 0),
+                fb,
+                Insn::BitSelect(1, 2, 0),
+                Insn::BlockingAssign(0, 1, 8),
+            ];
+            BytecodeCompiler::fold_const_regs(&mut insns, &[8]);
+            insns
+        };
+        let carried = run(carrying_fallback(Some(0)));
+        assert!(
+            matches!(carried[3], Insn::BitSelect(1, 2, 0)),
+            "{:?}",
+            carried[3]
+        );
+        // An ordinary fallback cannot see registers: the index still folds.
+        let plain = run(carrying_fallback(None));
+        assert!(
+            matches!(plain[3], Insn::BitSelectConst(1, 2, 3)),
+            "{:?}",
+            plain[3]
+        );
+    }
+
+    /// Carried locals live in the four-state register file; the two-state
+    /// lowering must leave such a block alone.
+    #[test]
+    fn two_state_lowering_refuses_a_fallback_that_carries_locals() {
+        let block = |fb: Insn| CompiledBlock {
+            instructions: vec![Insn::LoadConst(0, Box::new(Value::from_u64(3, 8))), fb],
+            num_regs: 1,
+            has_fallback: true,
+            nba_dup_targets: false,
+        };
+        let lower =
+            |cb: &CompiledBlock| lower_two_state(cb, &[8], &[false], &[false], &HashMap::default());
+        assert!(lower(&block(carrying_fallback(Some(0)))).is_none());
+        assert!(lower(&block(carrying_fallback(None))).is_some());
     }
 
     #[test]
@@ -18734,7 +19486,11 @@ pub fn lower_two_state(
             Insn::StmtFallback(payload) => {
                 // Run by the interpreter in place; its reads and writes go
                 // through the four-state paths, so nothing here needs the
-                // register model to know about it.
+                // register model to know about it — unless it carries
+                // register-backed locals, which live in the 4-state file.
+                if !payload.2.is_empty() {
+                    gate!("fallback carries locals");
+                }
                 side_effects = true;
                 out.push(TsInsn::Fallback(payload.0.clone()));
             }

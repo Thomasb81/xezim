@@ -5045,6 +5045,11 @@ pub struct Simulator {
     name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
+    /// Name-keyed type registrations (`widths`, `signed_signals`,
+    /// `real_signals`, `string_signals`) that a fallback carrying locals
+    /// replaced for its duration: (name, width, signed, real, string) as they
+    /// were before. See `fb_frame_push`.
+    fb_meta_saves: Vec<(String, Option<u32>, bool, bool, bool)>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
     /// compiler's suffix-match fallback (see `lookup_param_value`). Built
     /// once — parameters are final before any bytecode compilation runs.
@@ -10549,6 +10554,7 @@ impl Simulator {
             name_stats: Default::default(),
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
+            fb_meta_saves: Vec::new(),
             param_leaf_index_cell: std::cell::OnceCell::new(),
             var_decl_leaf_index_cell: std::cell::OnceCell::new(),
             forced_names: HashSet::default(),
@@ -32955,7 +32961,11 @@ impl Simulator {
                     let reason = payload.1.clone();
                     self.prof_fallback_insns += 1;
                     let (r, ctxw) = (*r as usize, *ctxw);
-                    let v = self.eval_expr_ctx(&e, ctxw);
+                    let v = if payload.2.is_empty() {
+                        self.eval_expr_ctx(&e, ctxw)
+                    } else {
+                        self.fb_eval_expr_with_locals(&payload.2, &e, ctxw)
+                    };
                     self.vm_regs[r] = v;
                     let ent = self
                         .prof_fallback_by_reason
@@ -32968,7 +32978,11 @@ impl Simulator {
                     self.prof_fallback_insns += 1;
                     let r = payload.1.clone();
                     let t0 = std::time::Instant::now();
-                    self.exec_statement(&s);
+                    if payload.2.is_empty() {
+                        self.exec_statement(&s);
+                    } else {
+                        self.fb_exec_stmt_with_locals(&payload.2, &s);
+                    }
                     let elapsed = t0.elapsed().as_nanos() as u64;
                     let e = self
                         .prof_fallback_by_reason
@@ -102543,6 +102557,160 @@ impl Simulator {
     fn next_frame_gen(&mut self) -> u64 {
         self.frame_gen += 1;
         self.frame_gen
+    }
+
+    /// Run a `StmtFallback` that names register-backed locals: they are
+    /// bound in a fresh interpreter frame for the statement's duration and
+    /// copied back to their registers afterwards (see `FbLocal`). A fresh
+    /// frame, not the caller's: a compiled block has no interpreter frame of
+    /// its own, and one that runs nested (a comb entry settling inside a
+    /// task) must not see — or write — the task's locals.
+    #[inline(never)]
+    fn fb_exec_stmt_with_locals(&mut self, locals: &[super::bytecode::FbLocal], s: &Statement) {
+        let at = self.fb_frame_push(locals);
+        self.exec_statement(s);
+        self.fb_frame_pop(locals, at);
+    }
+
+    /// `fb_exec_stmt_with_locals` for an `EvalExprFallback`.
+    #[inline(never)]
+    fn fb_eval_expr_with_locals(
+        &mut self,
+        locals: &[super::bytecode::FbLocal],
+        e: &Expression,
+        ctxw: u32,
+    ) -> Value {
+        let at = self.fb_frame_push(locals);
+        let v = self.eval_expr_ctx(e, ctxw);
+        self.fb_frame_pop(locals, at);
+        v
+    }
+
+    /// Bind each carried local to its register's value, retyped to the
+    /// declaration (the register may hold an unstamped flag), in a new
+    /// frame. The interpreter also types a local BY NAME — `widths` fits a
+    /// write, `signed_signals`/`real_signals` stamp it, `string_signals`
+    /// makes it text for `%p` and concatenation — registrations an
+    /// interpreted declaration makes and a compiled one never did; they are
+    /// set for the statement's duration and restored after it. Returns the
+    /// frame depth and the mark of the saved registrations.
+    fn fb_frame_push(&mut self, locals: &[super::bytecode::FbLocal]) -> (usize, usize) {
+        use super::bytecode::LocalKind;
+        let depth = self.local_stack.len();
+        let mark = self.fb_meta_saves.len();
+        let mut f = self.take_pooled_frame();
+        for l in locals {
+            let v = Self::fb_fit(self.vm_regs[l.reg as usize].clone(), l.kind);
+            f.insert(l.name.to_string(), v);
+            let name = l.name.as_ref();
+            let cur = (
+                self.widths.get(name).copied(),
+                self.signed_signals.contains(name),
+                self.real_signals.contains(name),
+                self.string_signals.contains(name),
+            );
+            let want = match l.kind {
+                LocalKind::Int { width, signed } => (Some(width), signed, false, false),
+                LocalKind::Real => (Some(64), false, true, false),
+                // Text is exempt from width fitting; leave `widths` alone.
+                LocalKind::Str => (cur.0, false, false, true),
+            };
+            if cur != want {
+                self.fb_meta_saves
+                    .push((name.to_string(), cur.0, cur.1, cur.2, cur.3));
+                self.fb_meta_apply(name, want);
+            }
+        }
+        self.push_local_frame(f);
+        (depth, mark)
+    }
+
+    fn fb_meta_apply(&mut self, name: &str, m: (Option<u32>, bool, bool, bool)) {
+        match m.0 {
+            Some(w) => {
+                self.widths.insert(name.to_string(), w);
+            }
+            None => {
+                self.widths.remove(name);
+            }
+        }
+        if m.1 {
+            self.signed_signals.insert(name.to_string());
+        } else {
+            self.signed_signals.remove(name);
+        }
+        if m.2 {
+            self.real_signals.insert(name.to_string());
+        } else {
+            self.real_signals.remove(name);
+        }
+        if m.3 {
+            self.string_signals.insert(name.to_string());
+        } else {
+            self.string_signals.remove(name);
+        }
+    }
+
+    /// Pop the frame `fb_frame_push` made and copy each local back to its
+    /// register, fitted to its declaration as a compiled assignment would.
+    fn fb_frame_pop(&mut self, locals: &[super::bytecode::FbLocal], at: (usize, usize)) {
+        let (depth, mark) = at;
+        while self.fb_meta_saves.len() > mark {
+            if let Some((name, w, sg, re, st)) = self.fb_meta_saves.pop() {
+                self.fb_meta_apply(&name, (w, sg, re, st));
+            }
+        }
+        // The statement ran to completion (no fallback that carries locals
+        // can suspend, return or disable an outer scope), so exactly our
+        // frame is on top; anything else is dropped rather than misread.
+        while self.local_stack.len() > depth + 1 {
+            self.pop_local_frame();
+        }
+        if self.local_stack.len() != depth + 1 {
+            return;
+        }
+        if let Some(mut f) = self.pop_local_frame_take() {
+            for l in locals {
+                if let Some(v) = f.remove(l.name.as_ref()) {
+                    let v = Self::fb_fit(v, l.kind);
+                    let slot = &mut self.vm_regs[l.reg as usize];
+                    if *slot != v {
+                        *slot = v;
+                    }
+                }
+            }
+            if self.frame_pool.len() < 64 {
+                f.clear();
+                self.frame_pool.push(f);
+            }
+        }
+    }
+
+    /// A value as the declared local holds it: integral at its width and
+    /// signedness, a real as a real (§6.12, §10.7).
+    fn fb_fit(v: Value, kind: super::bytecode::LocalKind) -> Value {
+        use super::bytecode::LocalKind;
+        match kind {
+            LocalKind::Int { width, signed } => {
+                let mut v = if v.is_real {
+                    Self::real_to_int(v.to_f64(), width.max(1))
+                } else if v.width != width || v.is_fill {
+                    v.resize_for_assign(width)
+                } else {
+                    v
+                };
+                v.is_signed = signed;
+                v
+            }
+            LocalKind::Real => {
+                if v.is_real {
+                    v
+                } else {
+                    Value::from_f64(v.to_f64())
+                }
+            }
+            LocalKind::Str => v,
+        }
     }
 
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {

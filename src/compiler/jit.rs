@@ -3405,6 +3405,14 @@ mod enabled {
         {
             return false;
         }
+        // A fallback carrying register-backed locals needs the interpreter's
+        // register file around the bridge call; native code keeps its
+        // registers in stack slots the interpreter cannot see.
+        if let StmtFallback(p) = insn {
+            if !p.2.is_empty() {
+                return false;
+            }
+        }
         matches!(
             insn,
             LoadConst(..)
