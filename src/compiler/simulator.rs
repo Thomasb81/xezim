@@ -2814,6 +2814,9 @@ type PropOwners = HashMap<String, (String, Arc<super::elaborate::ElaboratedClass
 struct ClassMemberNames {
     statics: HashSet<String>,
     vif_props: HashSet<String>,
+    /// First bytes of the `vif_props` names: a cheap prefilter for the
+    /// member-chain checks that ask whether a name can be a vif property.
+    vif_first: [bool; 256],
     /// Every declared method name, of any kind.
     methods: HashSet<String>,
     /// Every declared task name.
@@ -5545,6 +5548,9 @@ pub struct Simulator {
     /// bus_if.master vif`) so the rewrite path can also emit a direction
     /// warning when writing to a modport-input member.
     virtual_iface_bindings: HashMap<(usize, String), (String, Option<String>)>,
+    /// A virtual-interface handle token has been stored in a collection
+    /// element (see `queue_eval_arg`): receivers may then resolve BY VALUE.
+    vif_tokens_stored: bool,
     /// Memo for transitive blocking-task detection (pure-LRM mode only): maps a
     /// subroutine name to whether its body — following calls — eventually hits a
     /// blocking construct (`#`/`@`/`wait`/`fork…join[_any]`). Lets a task that
@@ -5918,6 +5924,9 @@ pub struct Simulator {
     /// Paths of instances whose definition is an interface (see
     /// `is_interface_instance`); filled on first use.
     iface_instance_paths: std::cell::OnceCell<std::collections::HashSet<String>>,
+    /// Interface instance path by its virtual-interface handle token (see
+    /// `iface_handle_token`); filled on first use.
+    iface_by_token: std::cell::OnceCell<HashMap<u64, String>>,
     /// See `iface_path_parts`.
     #[allow(clippy::type_complexity)]
     iface_path_parts: std::cell::OnceCell<(HashSet<String>, HashSet<String>)>,
@@ -10629,6 +10638,7 @@ impl Simulator {
             uvm_dpi: Default::default(),
             heap: vec![None], // index 0 is null
             virtual_iface_bindings: HashMap::default(),
+            vif_tokens_stored: false,
             tb_cache: std::cell::RefCell::new(HashMap::default()),
             local_iface_aliases: Vec::new(),
             viface_var_aliases: HashMap::default(),
@@ -10663,6 +10673,7 @@ impl Simulator {
             gate_queued: Vec::new(),
             gate_lane_valid: false,
             iface_instance_paths: std::cell::OnceCell::new(),
+            iface_by_token: std::cell::OnceCell::new(),
             iface_path_parts: std::cell::OnceCell::new(),
             quiet_bits: Vec::new(),
             quiet_valid: false,
@@ -41168,6 +41179,22 @@ impl Simulator {
             EventControl::EventExpr(exprs) => {
                 let mut out: Vec<Sensitivity> = Vec::with_capacity(exprs.len());
                 for ee in exprs {
+                    // §25.8/§25.9: a term whose receiver is a bound virtual
+                    // interface (`@(cfg.vif.data)`, `@(posedge d.vif.clk)`,
+                    // `@(c.vif.cb)`) waits on the bound instance's signal.
+                    let ee_vif;
+                    let ee = match self.vif_rebase_expr(&ee.expr) {
+                        Some(expr) => {
+                            ee_vif = crate::ast::stmt::EventExpr {
+                                edge: ee.edge,
+                                expr,
+                                iff: ee.iff.clone(),
+                                span: ee.span,
+                            };
+                            &ee_vif
+                        }
+                        None => ee,
+                    };
                     // §14.13: normalize a plain dotted chain (`@(vif.cb)` in a
                     // subroutine body) to the flat Ident every arm below
                     // expects — the chain form collected no identifiers and
@@ -42355,7 +42382,17 @@ impl Simulator {
                 if ee.edge.is_some() {
                     return false;
                 }
-                if let ExprKind::Ident(h) = &ee.expr.kind {
+                // The term exactly as `event_to_sens` sees it: a receiver that
+                // is a bound vif resolved to its instance (§25.9), a dotted
+                // chain (`@(vif.cb)` in a method) flattened. Unrecognized, a
+                // clocking waiter resumed in the Active region, before the
+                // block sampled — its `vif.cb.sig` read returned the PREVIOUS
+                // edge's sample.
+                let rebased = self.vif_rebase_expr(&ee.expr);
+                let term = rebased.as_ref().unwrap_or(&ee.expr);
+                let flat = Self::member_chain_as_flat_ident_for_sens(term);
+                let term = flat.as_ref().unwrap_or(term);
+                if let ExprKind::Ident(h) = &term.kind {
                     // Interface-scoped `@(iface.cb)` / vif-aliased `@(vif.cb)`
                     // key on the (alias-resolved) dotted path; resolve_hier_name
                     // strips it to `cb`. Try both.
@@ -52236,12 +52273,7 @@ impl Simulator {
             .get(this_h)
             .and_then(|o| o.as_ref())
             .map(|i| i.class_name.as_str())?;
-        if !self
-            .module
-            .classes
-            .get(cls_name)
-            .is_some_and(|cd| cd.virtual_iface_properties.contains_key(prop))
-        {
+        if self.class_vif_decl(cls_name, prop).is_none() {
             return None;
         }
         let (bound_name, _modport) = self
@@ -52364,9 +52396,7 @@ impl Simulator {
                                 .map(|i| i.class_name.clone());
                             let is_vif = cls_name
                                 .as_ref()
-                                .and_then(|cn| self.module.classes.get(cn))
-                                .map(|cd| cd.virtual_iface_properties.contains_key(prop))
-                                .unwrap_or(false);
+                                .is_some_and(|cn| self.class_vif_decl(cn, prop).is_some());
                             if is_vif {
                                 let bound = self
                                     .virtual_iface_bindings
@@ -61824,17 +61854,11 @@ impl Simulator {
                                 .get(this_h)
                                 .and_then(|o| o.as_ref())
                                 .map(|i| i.class_name.clone())?;
-                            self.module
-                                .classes
-                                .get(&cls_name)
-                                .and_then(|cd| {
-                                    cd.virtual_iface_properties.get(vif_prop).map(|_| ())
-                                })
-                                .and(
-                                    self.virtual_iface_bindings
-                                        .get(&(this_h, vif_prop.to_string()))
-                                        .cloned(),
-                                )
+                            self.class_vif_decl(&cls_name, vif_prop).map(|_| ()).and(
+                                self.virtual_iface_bindings
+                                    .get(&(this_h, vif_prop.to_string()))
+                                    .cloned(),
+                            )
                         });
                     if let Some((bound_name, _modport)) = binding {
                         let target = format!("{}.{}", bound_name, sig_member);
@@ -64596,11 +64620,9 @@ impl Simulator {
                                     .heap
                                     .get(this_h)
                                     .and_then(|o| o.as_ref().map(|i| i.class_name.clone()));
-                                let is_vif = cls_name
-                                    .as_ref()
-                                    .and_then(|cn| self.module.classes.get(cn))
-                                    .map(|cd| cd.virtual_iface_properties.contains_key(&prop_base))
-                                    .unwrap_or(false);
+                                let is_vif = cls_name.as_ref().is_some_and(|cn| {
+                                    self.class_vif_decl(cn, &prop_base).is_some()
+                                });
                                 if is_vif {
                                     let idx = self.eval_expr(index).to_u64().unwrap_or(0);
                                     let key_prop = format!("{}[{}]", prop_base, idx);
@@ -64682,8 +64704,7 @@ impl Simulator {
                             };
                             let bound = cls_name
                                 .as_ref()
-                                .and_then(|cn| self.module.classes.get(cn))
-                                .and_then(|cd| cd.virtual_iface_properties.get(prop).map(|_| ()))
+                                .and_then(|cn| self.class_vif_decl(cn, prop).map(|_| ()))
                                 .and(
                                     self.virtual_iface_bindings
                                         .get(&(*this_h, prop.to_string()))
@@ -64702,9 +64723,8 @@ impl Simulator {
                                     // virtual_iface_properties record.
                                     let iface_t = cls_name
                                         .as_ref()
-                                        .and_then(|cn| self.module.classes.get(cn))
-                                        .and_then(|cd| cd.virtual_iface_properties.get(prop))
-                                        .map(|(t, _)| t.clone());
+                                        .and_then(|cn| self.class_vif_decl(cn, prop))
+                                        .map(|(_, (t, _))| t.clone());
                                     if let Some(iface_t) = iface_t {
                                         if let Some(dirs) = self
                                             .module
@@ -68501,9 +68521,7 @@ impl Simulator {
                         .heap
                         .get(this_h)
                         .and_then(|o| o.as_ref().map(|i| i.class_name.clone()))
-                        .and_then(|cn| self.module.classes.get(&cn))
-                        .map(|c| c.virtual_iface_properties.contains_key(seg0))
-                        .unwrap_or(false);
+                        .is_some_and(|cn| self.class_vif_decl(&cn, seg0).is_some());
                     if is_vif {
                         if let Some((bound, _mp)) = self
                             .virtual_iface_bindings
@@ -68538,55 +68556,6 @@ impl Simulator {
         if let Some((sig, lsb, w)) = self.packed_member_slice(expr, &member.name) {
             if let Some(v) = self.get_signal_value_by_name(&sig) {
                 return v.range_select((lsb + w - 1) as usize, lsb as usize);
-            }
-        }
-        // LRM §25.8: `<recv>.<vifprop>.<member>` VALUE read where `<recv>` is
-        // not a plain hierarchical name — a class handle held in a subroutine
-        // LOCAL, an instance property, or a nested chain. The name-based
-        // rewrites above only fire for receivers the parser kept as a single
-        // hierarchical identifier (module-scope dotted names); anything rooted
-        // at a local class handle parses as MemberAccess, fell through to the
-        // generic property read, and returned the binding-EXISTENCE sentinel
-        // instead of the interface. Consequence: a driver that received its
-        // `vif` through config_db/resource_db read x from every `vif.<sig>`
-        // access, so its handshake never completed and the testbench ran
-        // silently empty. Resolve the owning handle generally, then follow the
-        // binding recorded by the write path.
-        // Gate on the design declaring ANY virtual-interface property: without
-        // one there is nothing to resolve, and every member access would
-        // otherwise pay a receiver split (an Expression clone) plus a name
-        // lookup. Designs with no virtual interfaces skip the block outright.
-        if !self.class_member_names().vif_props.is_empty() {
-            let mut vif_pair: Option<(usize, String)> = None;
-            // Split WITHOUT evaluating: the receiver evaluation is only worth
-            // doing when the trailing member is a known vif property name.
-            if let Some((obj_expr, prop)) = Self::split_trailing_member(expr) {
-                let prop_is_vif = self.class_member_names().vif_props.contains(&prop);
-                if prop_is_vif {
-                    if let Some(h) = self.eval_expr(&obj_expr).to_u64() {
-                        vif_pair = Some((h as usize, prop));
-                    }
-                }
-            }
-            if let Some((recv_h, prop)) = vif_pair {
-                let is_vif = recv_h != 0
-                    && self
-                        .heap
-                        .get(recv_h)
-                        .and_then(|o| o.as_ref())
-                        .and_then(|i| self.module.classes.get(&i.class_name))
-                        .map(|c| c.virtual_iface_properties.contains_key(&prop))
-                        .unwrap_or(false);
-                if is_vif {
-                    if let Some((bound, _mp)) =
-                        self.virtual_iface_bindings.get(&(recv_h, prop)).cloned()
-                    {
-                        let resolved = format!("{}.{}", bound, member.name);
-                        if let Some(v) = self.lookup_signal_value(&resolved) {
-                            return v;
-                        }
-                    }
-                }
             }
         }
         let base = self.eval_expr(expr);
@@ -69739,27 +69708,18 @@ impl Simulator {
                         .last()
                         .filter(|_| self.class_member_names().vif_props.contains(name.as_str()))
                     {
-                        let cls = self
+                        // Own or inherited (§8.13), instance or static.
+                        let slot = self
                             .heap
                             .get(*handle)
-                            .and_then(|o| o.as_ref().map(|i| i.class_name.clone()));
-                        if let Some(cn) = cls {
-                            let is_vif = self
-                                .module
-                                .classes
-                                .get(&cn)
-                                .map(|cd| cd.virtual_iface_properties.contains_key(name))
-                                .unwrap_or(false);
-                            if is_vif {
-                                let bound = self
-                                    .virtual_iface_bindings
-                                    .contains_key(&(*handle, name.clone()));
-                                return if bound {
-                                    Value::from_u64(1, 32)
-                                } else {
-                                    Value::zero(32)
-                                };
-                            }
+                            .and_then(|o| o.as_ref())
+                            .and_then(|i| self.vif_slot(&i.class_name, *handle, name));
+                        if let Some((slot, _)) = slot {
+                            return if self.virtual_iface_bindings.contains_key(&slot) {
+                                Value::from_u64(1, 32)
+                            } else {
+                                Value::zero(32)
+                            };
                         }
                     }
                     // A `static` class property must NOT be read from the
@@ -69884,27 +69844,18 @@ impl Simulator {
                         if let Some(v) = obj_handle {
                             let handle = v.to_u64().unwrap_or(0) as usize;
                             if handle != 0 && handle < self.heap.len() {
-                                let cls = self
+                                // Own or inherited (§8.13), instance or static.
+                                let slot = self
                                     .heap
                                     .get(handle)
-                                    .and_then(|o| o.as_ref().map(|i| i.class_name.clone()));
-                                if let Some(cn) = cls {
-                                    let is_vif = self
-                                        .module
-                                        .classes
-                                        .get(&cn)
-                                        .map(|cd| cd.virtual_iface_properties.contains_key(prop))
-                                        .unwrap_or(false);
-                                    if is_vif {
-                                        let bound = self
-                                            .virtual_iface_bindings
-                                            .contains_key(&(handle, prop.clone()));
-                                        return if bound {
-                                            Value::from_u64(1, 32)
-                                        } else {
-                                            Value::zero(32)
-                                        };
-                                    }
+                                    .and_then(|o| o.as_ref())
+                                    .and_then(|i| self.vif_slot(&i.class_name, handle, prop));
+                                if let Some((slot, _)) = slot {
+                                    return if self.virtual_iface_bindings.contains_key(&slot) {
+                                        Value::from_u64(1, 32)
+                                    } else {
+                                        Value::zero(32)
+                                    };
                                 }
                             }
                         }
@@ -78947,6 +78898,19 @@ impl Simulator {
                 delay,
                 rvalue,
             } => {
+                // §25.8/§25.9: an lvalue whose receiver is a bound virtual
+                // interface (`cfg.vif.data`, `d.a.cfg.vif.cb.data`) targets
+                // the bound instance. Resolved NOW, while the owner handles
+                // and `this` are live: the commit runs later in a context
+                // where neither is.
+                let lvalue_vif;
+                let lvalue: &Expression = match self.vif_rebase_expr(lvalue) {
+                    Some(r) => {
+                        lvalue_vif = r;
+                        &lvalue_vif
+                    }
+                    None => lvalue,
+                };
                 // §14.4: normalize a plain dotted-chain lvalue (`vif.cb.data`
                 // inside a method) to the flat Ident the clocking-drive check
                 // below expects — the chain shape skipped the check and the
@@ -81181,17 +81145,9 @@ impl Simulator {
                 .get(handle)
                 .and_then(|o| o.as_ref())
                 .map(|o| o.class_name.clone())?;
-            let is_vif = self
-                .module
-                .classes
-                .get(&cn)
-                .map(|cd| cd.virtual_iface_properties.contains_key(segs[i]))
-                .unwrap_or(false);
-            if is_vif {
-                let (bound, _) = self
-                    .virtual_iface_bindings
-                    .get(&(handle, segs[i].to_string()))
-                    .cloned()?;
+            // Own or inherited (§8.13), instance or static.
+            if self.class_vif_decl(&cn, segs[i]).is_some() {
+                let (bound, _) = self.vif_prop_target(&cn, handle, segs[i])?;
                 let rest = segs[i + 1..].join(".");
                 if rest.is_empty() {
                     return None;
@@ -87143,12 +87099,7 @@ impl Simulator {
                     None
                 };
                 if let Some(cn) = cls_name {
-                    let cls_has_vif = self
-                        .module
-                        .classes
-                        .get(&cn)
-                        .map(|c| c.virtual_iface_properties.contains_key(segs[0]))
-                        .unwrap_or(false);
+                    let cls_has_vif = self.class_vif_decl(&cn, segs[0]).is_some();
                     if cls_has_vif {
                         if let Some((bound, _mp)) = self
                             .virtual_iface_bindings
@@ -87175,12 +87126,7 @@ impl Simulator {
                     if handle != 0 && handle < self.heap.len() {
                         if let Some(Some(inst)) = self.heap.get(handle) {
                             let cn = inst.class_name.clone();
-                            let cls_has_vif = self
-                                .module
-                                .classes
-                                .get(&cn)
-                                .map(|c| c.virtual_iface_properties.contains_key(segs[1]))
-                                .unwrap_or(false);
+                            let cls_has_vif = self.class_vif_decl(&cn, segs[1]).is_some();
                             if cls_has_vif {
                                 if let Some((bound, _mp)) = self
                                     .virtual_iface_bindings
@@ -109524,6 +109470,17 @@ impl Simulator {
     /// bare `new(<args>)` call, construct an instance of that class
     /// and return its handle. Otherwise fall back to regular eval.
     fn queue_eval_arg(&mut self, container_name: &str, arg: &Expression) -> Value {
+        // §25.9: an element of a virtual-interface collection holds a vif
+        // HANDLE — the instance the argument names (`vq.push_back(bus)`) or is
+        // bound to (`vq.push_back(cfg.vif)`), as its handle token. Evaluating
+        // the argument as a value yields neither: an interface instance has no
+        // value and a vif property reads only its binding's existence.
+        if self.vif_collection(container_name)
+            && let Some(inst) = self.resolve_vif_rhs_name_strict(arg)
+        {
+            self.vif_tokens_stored = true;
+            return Value::from_u64(Self::iface_handle_token(&inst), 32);
+        }
         let class_name = self.module.array_elem_class.get(container_name).cloned();
         if let Some(cn) = class_name {
             // NOTE: a BARE `new` is deliberately not accepted here. `new` is
@@ -110628,6 +110585,51 @@ impl Simulator {
         }
         for cname in &names {
             self.place_named_extends_args(cname);
+        }
+        // §25.9: a property typed by a TYPEDEF of a virtual interface
+        // (`typedef virtual bus_if vif_t; vif_t vif;`) is a virtual-interface
+        // property exactly like the spelled-out `virtual bus_if vif;` — but
+        // only the `virtual` qualifier marked one, so every binding, read and
+        // `== null` test through it missed.
+        let mut vif_added = false;
+        for cname in &names {
+            let adds: Vec<(String, (String, Option<String>))> = self
+                .module
+                .classes
+                .get(cname)
+                .map(|cd| {
+                    cd.property_types
+                        .iter()
+                        .filter(|(p, _)| !cd.virtual_iface_properties.contains_key(p.as_str()))
+                        .filter_map(|(p, dt)| {
+                            if !matches!(dt, DataType::TypeReference { .. }) {
+                                return None;
+                            }
+                            match Self::resolve_type_ref(dt, &self.module.typedef_types) {
+                                DataType::Interface { name, modport, .. } => {
+                                    Some((p.clone(), (name.name.clone(), modport.map(|m| m.name))))
+                                }
+                                _ => None,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if adds.is_empty() {
+                continue;
+            }
+            if let Some(cd) = self
+                .module
+                .classes
+                .get_mut(cname)
+                .map(std::sync::Arc::make_mut)
+            {
+                cd.virtual_iface_properties.extend(adds);
+                vif_added = true;
+            }
+        }
+        if vif_added {
+            self.class_member_names_cell = std::cell::OnceCell::new();
         }
         for start in names {
             let mut seen: HashSet<String> = HashSet::default();
@@ -112383,8 +112385,7 @@ impl Simulator {
                         .copied()
                         .flatten()
                         .and_then(|hd| self.heap.get(hd).and_then(|o| o.as_ref()))
-                        .and_then(|i| self.module.classes.get(&i.class_name))
-                        .is_some_and(|cd| cd.virtual_iface_properties.contains_key(name));
+                        .is_some_and(|i| self.class_vif_decl(&i.class_name, name).is_some());
                 if is_viface_var && !shadows_class_prop {
                     // §25.10: whole-array binding (`vifs = interfaces`). Each
                     // virtual-interface element is an independent alias to the
@@ -112455,14 +112456,10 @@ impl Simulator {
                         // through another vif's current binding) may bind.
                         if self.is_interface_instance(&bound) {
                             let name = name.to_string();
-                            // Store a non-null sentinel VALUE in the variable
-                            // too (same FNV hash the config_db vif path uses)
-                            // so `vif != null` existence checks pass.
-                            let mut hsh: u64 = 0xcbf29ce484222325;
-                            for b in bound.bytes() {
-                                hsh ^= b as u64;
-                                hsh = hsh.wrapping_mul(0x100000001b3);
-                            }
+                            // Store the instance's handle token as the
+                            // variable's VALUE too, so `vif != null`
+                            // existence checks pass.
+                            let token = Self::iface_handle_token(&bound);
                             if frame_local {
                                 if let Some(f) = self.local_iface_aliases.last_mut() {
                                     f.insert(name.clone(), bound);
@@ -112470,10 +112467,7 @@ impl Simulator {
                             } else {
                                 self.viface_var_aliases.insert(name, bound);
                             }
-                            self.assign_value(
-                                lvalue,
-                                &Value::from_u64((hsh & 0x7FFF_FFFF) | 1, 32),
-                            );
+                            self.assign_value(lvalue, &Value::from_u64(token, 32));
                             return true;
                         }
                     }
@@ -112502,16 +112496,9 @@ impl Simulator {
                                 // fall through: the value path stores null.
                             } else if let Some(bound) = self.resolve_vif_rhs_name(rvalue) {
                                 if self.is_interface_instance(&bound) {
-                                    let mut hsh: u64 = 0xcbf29ce484222325;
-                                    for b in bound.bytes() {
-                                        hsh ^= b as u64;
-                                        hsh = hsh.wrapping_mul(0x100000001b3);
-                                    }
+                                    let token = Self::iface_handle_token(&bound);
                                     self.viface_var_aliases.insert(key, bound);
-                                    self.assign_value(
-                                        lvalue,
-                                        &Value::from_u64((hsh & 0x7FFF_FFFF) | 1, 32),
-                                    );
+                                    self.assign_value(lvalue, &Value::from_u64(token, 32));
                                     return true;
                                 }
                             }
@@ -112533,11 +112520,18 @@ impl Simulator {
         // (handle, prop) for the target. `prop` for arrays encodes the
         // index as `"vif_arr[<idx>]"` so existing single-key storage
         // can stash per-index bindings (LRM §25.10).
+        // A STATIC vif property (§8.9) is reached through its class scope —
+        // `Cls::svif = bus`, or `svif = bus` in a static method — with no
+        // object; `static_scope` names that class.
+        let mut static_scope: Option<String> = None;
         let (handle, prop) = match &lvalue.kind {
             // Bare `v = ...` inside a method — `v` is `this.<v>` (a class vif
             // property). The prop_info check below filters non-vif locals.
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let handle = self.this_stack.last().copied().flatten().unwrap_or(0);
+                if handle == 0 {
+                    static_scope = self.class_context_stack.last().cloned().flatten();
+                }
                 (handle, h.path[0].name.name.clone())
             }
             // `c.vif = bus;` — `c` may be a local, a property of `this` (a
@@ -112546,7 +112540,11 @@ impl Simulator {
             ExprKind::Ident(h) if h.path.len() == 2 => {
                 let obj = h.path[0].name.name.as_str();
                 let prop = h.path[1].name.name.clone();
-                (self.vif_owner_handle(obj), prop)
+                let oh = self.vif_owner_handle(obj);
+                if oh == 0 && self.module.classes.contains_key(obj) {
+                    static_scope = Some(obj.to_string());
+                }
+                (oh, prop)
             }
             // `p.cfg.vif = bus;` — the vif property's OWNER is itself reached
             // through a handle chain. Walk the chain to the owning object;
@@ -112562,7 +112560,12 @@ impl Simulator {
             ExprKind::MemberAccess { expr, member } => {
                 let obj_handle = match &expr.kind {
                     ExprKind::Ident(h) if h.path.len() == 1 => {
-                        self.vif_owner_handle(&h.path[0].name.name)
+                        let obj = h.path[0].name.name.as_str();
+                        let oh = self.vif_owner_handle(obj);
+                        if oh == 0 && self.module.classes.contains_key(obj) {
+                            static_scope = Some(obj.to_string());
+                        }
+                        oh
                     }
                     // `this.vif = bus;` — the explicit-`this` spelling of the
                     // bare `vif = bus;` handled above. Resolving only an Ident
@@ -112593,7 +112596,8 @@ impl Simulator {
                             ExprKind::Ident(h) if h.path.len() == 1 => {
                                 self.vif_owner_handle(&h.path[0].name.name)
                             }
-                            _ => 0,
+                            // A nested owner (`a.cfg.vifs[i] = bus`).
+                            _ => self.eval_handle_expr(outer).unwrap_or(0),
                         };
                         (h, member.name.clone())
                     }
@@ -112611,6 +112615,14 @@ impl Simulator {
                         let prop = h.path[1].name.name.clone();
                         (self.vif_owner_handle(obj), prop)
                     }
+                    // A nested owner in hier-Ident form: `d.cfg.vifs[i]`.
+                    ExprKind::Ident(h) if h.path.len() >= 3 => {
+                        let n = h.path.len();
+                        let oh = self
+                            .vif_owner_of_path(&h.path[..n - 1])
+                            .map_or(0, |(_, oh)| oh);
+                        (oh, h.path[n - 1].name.name.clone())
+                    }
                     _ => return false,
                 };
                 // The index is evaluated (as it always was); only a declared
@@ -112626,24 +112638,17 @@ impl Simulator {
             }
             _ => return false,
         };
-        if handle == 0 || handle >= self.heap.len() {
-            return false;
-        }
-        // Look up the class to see if `prop` is virtual-iface. Strip
-        // any `[idx]` suffix on the prop key so array elements match
-        // the bare property declaration.
-        let class_name = if let Some(Some(inst)) = self.heap.get(handle) {
-            inst.class_name.clone()
-        } else {
-            return false;
+        // The owner's class: the object's, else the class scope of a static.
+        let class_name: String = match self.heap.get(handle).and_then(|o| o.as_ref()) {
+            Some(inst) if handle != 0 => inst.class_name.clone(),
+            _ => match static_scope {
+                Some(c) => c,
+                None => return false,
+            },
         };
-        let prop_base: &str = prop.split('[').next().unwrap_or(&prop);
-        let prop_info = self
-            .module
-            .classes
-            .get(&class_name)
-            .and_then(|cd| cd.virtual_iface_properties.get(prop_base).cloned());
-        let Some((_iface_t, modport)) = prop_info else {
+        // The binding slot of a vif property the owner's class declares or
+        // INHERITS (§8.13) — a static one keys by its class cell (§8.9).
+        let Some((slot, modport)) = self.vif_slot(&class_name, handle, &prop) else {
             return false;
         };
         // RHS resolution (LRM §25.9):
@@ -112654,7 +112659,7 @@ impl Simulator {
         //     vif's CURRENT bound interface, not the variable name (without
         //     this the copy bound to a name that resolves to nothing -> X).
         if matches!(&rvalue.kind, ExprKind::Null) {
-            self.virtual_iface_bindings.remove(&(handle, prop));
+            self.virtual_iface_bindings.remove(&slot);
             return true;
         }
         let Some(rhs_name) = self.resolve_vif_rhs_name(rvalue) else {
@@ -112664,7 +112669,7 @@ impl Simulator {
         // will follow it; the modport (if any) is consulted at write
         // time to emit a direction warning.
         self.virtual_iface_bindings
-            .insert((handle, prop), (rhs_name, modport));
+            .insert(slot, (rhs_name, modport));
         true
     }
 
@@ -113137,154 +113142,359 @@ impl Simulator {
         self.get_signal_value_by_name(net)
     }
 
-    /// §25.8/§25.9: the interface INSTANCE a bare name is bound to, through
-    /// every alias kind — a subroutine's vif formal (frame alias), a plain
-    /// `virtual <iface>` variable, or a class property of the current `this`.
-    /// One resolver, so every consumer sees every binding: the per-shape arms
-    /// each knew about a subset, and the shapes they missed fell through to a
-    /// phantom signal keyed by the literal source text.
-    fn vif_bound_for_root(&self, root: &str) -> Option<String> {
-        if let Some(b) = self.iface_alias_for(root) {
-            return Some(b);
+    /// §8.13/§25.9: the virtual-interface declaration of property `prop` as
+    /// an object of class `class_name` sees it — the class's own, else the
+    /// nearest ancestor's (a derived class inherits its base's vif
+    /// properties). Returns the DECLARING class and `(interface type,
+    /// modport)`; `None` when the nearest declaration of `prop` on the chain
+    /// is not a virtual interface. Every vif consumer asks this one question:
+    /// keyed on the object's leaf class alone, a vif declared in a base class
+    /// was invisible to binding, reads, writes and event controls alike.
+    fn class_vif_decl<'a>(
+        &'a self,
+        class_name: &'a str,
+        prop: &str,
+    ) -> Option<(&'a str, &'a (String, Option<String>))> {
+        let mut cur: Option<&'a str> = Some(class_name);
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(cn)?;
+            if let Some(d) = cd.virtual_iface_properties.get(prop) {
+                return Some((cn, d));
+            }
+            if cd.properties.contains_key(prop) {
+                return None;
+            }
+            cur = cd.extends.as_deref();
         }
-        if self.virtual_iface_bindings.is_empty() {
-            return None;
-        }
-        // An ELEMENT key (`va[0]`) checks the BASE property name but binds
-        // per element (§25.10).
-        let prop_base = root.split('[').next().unwrap_or(root);
-        if !self.class_member_names().vif_props.contains(prop_base) {
-            return None;
-        }
-        let this_h = self.this_stack.last().copied().flatten()?;
-        let cn: &str = self
-            .heap
-            .get(this_h)
-            .and_then(|o| o.as_ref())
-            .map(|i| i.class_name.as_str())?;
-        let has = self.module.classes.get(cn).is_some_and(|c| {
-            !c.virtual_iface_properties.is_empty()
-                && c.virtual_iface_properties.contains_key(prop_base)
-        });
-        if !has {
-            return None;
-        }
-        self.virtual_iface_bindings
-            .get(&(this_h, root.to_string()))
-            .map(|(b, _mp)| b.clone())
+        None
     }
 
-    /// Rewrite the ROOT of an expression chain whose leading name is a bound
-    /// virtual interface, so everything downstream sees a DIRECT interface
-    /// access — which already works in every shape. Inside a subroutine body
-    /// the parser emits `MemberAccess`/`Index`/`Call` chains rather than one
-    /// flat `Ident`, and the ad-hoc arms matched only single-level shapes: a
-    /// nested member (`v.us.a`), a queue op (`v.q.push_back(x)`), or an
-    /// interface subroutine (`v.dbl(4)`) silently read 0 / wrote nowhere.
-    /// `None` when the root is not a bound vif — the common case, gated to a
-    /// few empty-map checks.
-    fn vif_rebase_expr(&self, e: &Expression) -> Option<Expression> {
-        if self.local_iface_aliases.last().is_none_or(|m| m.is_empty())
-            && self.viface_var_aliases.is_empty()
-            && self.virtual_iface_bindings.is_empty()
+    /// §25.8/§25.10/§8.9: the `virtual_iface_bindings` slot of the vif
+    /// property named by `key` (`prop`, or `prop[i]` for an element of a vif
+    /// array) on object `handle` of class `class_name`, with the property's
+    /// declared modport. A STATIC property has one cell per declaring class,
+    /// keyed under the null handle; an instance property needs a live object.
+    fn vif_slot(
+        &self,
+        class_name: &str,
+        handle: usize,
+        key: &str,
+    ) -> Option<((usize, String), Option<String>)> {
+        let base = key.split('[').next().unwrap_or(key);
+        let (decl, (_, modport)) = self.class_vif_decl(class_name, base)?;
+        if self
+            .module
+            .classes
+            .get(decl)
+            .is_some_and(|cd| cd.static_properties.contains(base))
+        {
+            return Some(((0, format!("{}::{}", decl, key)), modport.clone()));
+        }
+        (handle != 0).then(|| ((handle, key.to_string()), modport.clone()))
+    }
+
+    /// The interface instance (and declared modport) bound to vif property
+    /// `key` of object `handle` / class `class_name` (see [`vif_slot`]).
+    fn vif_prop_target(
+        &self,
+        class_name: &str,
+        handle: usize,
+        key: &str,
+    ) -> Option<(String, Option<String>)> {
+        let (slot, modport) = self.vif_slot(class_name, handle, key)?;
+        let (bound, _) = self.virtual_iface_bindings.get(&slot)?;
+        Some((bound.clone(), modport))
+    }
+
+    /// Can `name` be a virtual-interface PROPERTY of some class? Every
+    /// binding is keyed by such a name, so a receiver whose trailing name
+    /// fails this never resolves through one. A borrowed lookup behind a
+    /// first-byte filter: this runs on member chains of every class design.
+    #[inline]
+    fn vif_prop_name_possible(&self, name: &str) -> bool {
+        let n = self.class_member_names();
+        name.as_bytes()
+            .first()
+            .is_some_and(|&b| n.vif_first[b as usize])
+            && n.vif_props.contains(name)
+    }
+
+    /// The object (or, for a class name, the class scope, handle 0) owning a
+    /// vif property reached through the select-free path `segs` — `d`,
+    /// `d.a.cfg`, `this.cfg`, `Cls` — walked through the heap without side
+    /// effects.
+    fn vif_owner_of_path<'a>(
+        &'a self,
+        segs: &'a [crate::ast::expr::HierPathSegment],
+    ) -> Option<(&'a str, usize)> {
+        let (first, rest) = segs.split_first()?;
+        let head = first.name.name.as_str();
+        let mut h = match first.selects.as_slice() {
+            [] if head == "this" => self.this_stack.last().copied().flatten()?,
+            [] => match self.eval_ident_handle(head) {
+                Some(h) if h != 0 => h,
+                // `Cls::svif` — a class scope owns only its statics.
+                _ if rest.is_empty() && self.module.classes.contains_key(head) => {
+                    return Some((head, 0));
+                }
+                _ => return None,
+            },
+            // An element of a handle collection (`ag[0].cfg`).
+            [sel] => {
+                let coll = self
+                    .instance_assoc_member(head)
+                    .unwrap_or_else(|| head.to_string());
+                self.coll_elem_handle(&coll, head, sel)?
+            }
+            _ => return None,
+        };
+        for s in rest {
+            if h == 0 {
+                return None;
+            }
+            h = match s.selects.as_slice() {
+                [] => self.member_handle(h, &s.name.name)?,
+                [sel] => {
+                    let coll = self.handle_collection_name(h, &s.name.name)?;
+                    self.coll_elem_handle(&coll, &s.name.name, sel)?
+                }
+                _ => return None,
+            };
+        }
+        if h == 0 {
+            return None;
+        }
+        Some((self.heap.get(h)?.as_ref()?.class_name.as_str(), h))
+    }
+
+    /// The owner of `owner.prop`: `this`, a class scope, or any handle chain
+    /// `eval_handle_expr` resolves side-effect-free (a local or formal
+    /// handle, `a.cfg`, `arr[i].cfg`).
+    fn vif_owner_of_expr<'a>(&'a self, owner: &'a Expression) -> Option<(&'a str, usize)> {
+        let h = match &owner.kind {
+            ExprKind::This => self.this_stack.last().copied().flatten()?,
+            ExprKind::Ident(h) if h.root.is_none() => return self.vif_owner_of_path(&h.path),
+            ExprKind::Paren(inner) => return self.vif_owner_of_expr(inner),
+            _ => self.eval_handle_expr(owner)?,
+        };
+        if h == 0 {
+            return None;
+        }
+        Some((self.heap.get(h)?.as_ref()?.class_name.as_str(), h))
+    }
+
+    /// A BARE vif name (`key` is `name`, or `name[i]` for an array element):
+    /// a vif formal or plain `virtual` variable (the alias frames), else a vif
+    /// property of `this` — own or inherited, instance or static — or, in a
+    /// static method, a static one of the lexical class. A frame local of
+    /// that name shadows the property.
+    fn vif_bare_target(&self, name: &str, key: &str) -> Option<(String, Option<String>)> {
+        if let Some(b) = self.iface_alias_for(key) {
+            return Some((b, None));
+        }
+        if self.virtual_iface_bindings.is_empty()
+            || !self.vif_prop_name_possible(name)
+            || self
+                .local_stack
+                .last()
+                .is_some_and(|l| l.contains_key(name))
         {
             return None;
         }
-        // Every rebase resolves the chain's ROOT name (the first segment of
-        // its base identifier) through an alias or a vif property binding;
-        // a root no alias can name and no class declares as a vif property
-        // never rebases.
-        if !self.iface_alias_possible() {
-            let mut cur = e;
-            loop {
-                match &cur.kind {
-                    ExprKind::MemberAccess { expr, .. }
-                    | ExprKind::Index { expr, .. }
-                    | ExprKind::RangeSelect { expr, .. } => cur = expr,
-                    ExprKind::Call { func, .. } => cur = func,
-                    _ => break,
-                }
+        match self.this_stack.last().copied().flatten() {
+            Some(th) if th != 0 => {
+                let cn = self.heap.get(th)?.as_ref()?.class_name.as_str();
+                self.vif_prop_target(cn, th, key)
             }
-            match &cur.kind {
-                ExprKind::Ident(h) => {
-                    if !h.path.first().is_some_and(|s| {
-                        self.class_member_names()
-                            .vif_props
-                            .contains(s.name.name.as_str())
-                    }) {
-                        return None;
-                    }
-                }
-                _ => return None,
+            _ => {
+                let ctx = self.class_context_stack.last()?.as_deref()?;
+                self.vif_prop_target(ctx, 0, key)
             }
         }
-        // Only CHAINS are rebased: a bare `v` read/write is a HANDLE
-        // operation (`v2 = v;`, `v == null`) and must stay untouched.
-        match &e.kind {
-            ExprKind::Ident(h) if h.path.len() >= 2 => self.vif_rebase_ident(h, e.span),
-            // A top-level Index is a chain when its base is one (`v.q[0]`).
-            // An index on a BARE name (`varr[0]`) is a vif-ARRAY element —
-            // its binding is keyed per-element, so the bare root never
-            // resolves and the rebase correctly declines.
-            ExprKind::MemberAccess { .. }
-            | ExprKind::Call { .. }
-            | ExprKind::Index { .. }
-            | ExprKind::RangeSelect { .. } => self.vif_rebase_chain(e),
+    }
+
+    /// [`vif_recv_target`] for a flattened path whose LAST segment names the
+    /// vif (optionally with one element select).
+    fn vif_recv_path(
+        &self,
+        segs: &[crate::ast::expr::HierPathSegment],
+    ) -> Option<(String, Option<String>)> {
+        let (last, owner) = segs.split_last()?;
+        let elem = match last.selects.as_slice() {
+            [] => None,
+            [sel] => Some(sel),
+            _ => return None,
+        };
+        let name = last.name.name.as_str();
+        if owner.is_empty() {
+            return self.vif_named_target(None, name, elem);
+        }
+        if !self.vif_prop_name_possible(name) {
+            return None;
+        }
+        let owner = self.vif_owner_of_path(owner)?;
+        self.vif_named_target(Some(owner), name, elem)
+    }
+
+    /// The vif named `name` — element `elem` of it for a §25.10 vif array or a
+    /// vif collection — on `owner` (object class and handle; handle 0 for a
+    /// class scope), or, with no owner, a BARE name (see [`vif_bare_target`]).
+    fn vif_named_target(
+        &self,
+        owner: Option<(&str, usize)>,
+        name: &str,
+        elem: Option<&Expression>,
+    ) -> Option<(String, Option<String>)> {
+        if owner.is_some() || !self.iface_alias_possible() {
+            // Nothing but a vif property, or (bare) a `virtual` collection
+            // variable holding handle tokens, can resolve.
+            if !self.vif_prop_name_possible(name)
+                && !(owner.is_none() && elem.is_some() && self.vif_tokens_stored)
+            {
+                return None;
+            }
+        }
+        let key: std::borrow::Cow<str> = match elem {
+            None => std::borrow::Cow::Borrowed(name),
+            Some(ix) => {
+                std::borrow::Cow::Owned(format!("{}[{}]", name, self.eval_scalar_self(ix)?))
+            }
+        };
+        let hit = match owner {
+            None => self.vif_bare_target(name, &key),
+            Some((cn, oh)) => self.vif_prop_target(cn, oh, &key),
+        };
+        if hit.is_some() || !self.vif_tokens_stored {
+            return hit;
+        }
+        self.vif_elem_by_value(owner, name, elem?)
+    }
+
+    /// §25.9/§7.10: a vif held as an ELEMENT of a collection — a queue,
+    /// dynamic or associative array of virtual interfaces — has no binding
+    /// slot (none would survive `push_front`/`insert`/`delete`): the element
+    /// holds the handle token itself (see `queue_eval_arg`), which names the
+    /// instance. `owner` owns the collection property `name`; with none,
+    /// `name` is a property of `this` or a plain `virtual` variable.
+    fn vif_elem_by_value(
+        &self,
+        owner: Option<(&str, usize)>,
+        name: &str,
+        index: &Expression,
+    ) -> Option<(String, Option<String>)> {
+        let owner = owner.or_else(|| {
+            let th = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .filter(|&h| h != 0)?;
+            let cn = self.heap.get(th)?.as_ref()?.class_name.as_str();
+            self.class_vif_decl(cn, name).map(|_| (cn, th))
+        });
+        let (coll, modport) = match owner {
+            Some((cn, oh)) => {
+                let (_, (_, mp)) = self.class_vif_decl(cn, name)?;
+                (self.handle_collection_name(oh, name)?, mp.clone())
+            }
+            None if self.vif_collection(name) => (name.to_string(), None),
+            None => return None,
+        };
+        let token = self.coll_elem_handle(&coll, name, index)? as u64;
+        self.iface_by_token(token)
+            .map(|inst| (inst.to_string(), modport))
+    }
+
+    /// §25.8/§25.9/§25.10 — THE receiver resolution step: the interface
+    /// instance (with the declared modport) that a receiver expression of
+    /// VIRTUAL-INTERFACE type denotes, whatever its spelling:
+    /// * a bare name — a vif formal or plain `virtual` variable, or a vif
+    ///   property of `this`, own or inherited, instance or static;
+    /// * a vif property reached through any class-handle chain — `cfg.vif`,
+    ///   `a.cfg.vif`, `this.cfg.vif`, `c.vif` (a local or formal handle),
+    ///   `d.cfg.vif` at module scope, `Cls::svif`;
+    /// * an element of a vif array or collection — `vifs[i]`, `d.vifs[i]`,
+    ///   `cfg.vifs[i]`, `vq[0]`.
+    ///
+    /// The owner chain resolves side-effect-free (`&self`): a receiver that
+    /// needs a CALL to reach its owner never resolves here, so no consumer
+    /// evaluates a receiver twice. `None` when `recv` is no bound vif.
+    fn vif_recv_target(&self, recv: &Expression) -> Option<(String, Option<String>)> {
+        match &recv.kind {
+            ExprKind::Paren(inner) => self.vif_recv_target(inner),
+            ExprKind::Ident(h) if h.root.is_none() => self.vif_recv_path(&h.path),
+            ExprKind::MemberAccess {
+                expr: owner,
+                member,
+            } => {
+                if !self.vif_prop_name_possible(&member.name) {
+                    return None;
+                }
+                let owner = self.vif_owner_of_expr(owner)?;
+                self.vif_named_target(Some(owner), &member.name, None)
+            }
+            ExprKind::Index { expr: base, index } => match &base.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.last().is_some_and(|s| s.selects.is_empty()) =>
+                {
+                    let (last, owner) = h.path.split_last()?;
+                    let name = last.name.name.as_str();
+                    if owner.is_empty() {
+                        return self.vif_named_target(None, name, Some(index));
+                    }
+                    if !self.vif_prop_name_possible(name) {
+                        return None;
+                    }
+                    let owner = self.vif_owner_of_path(owner)?;
+                    self.vif_named_target(Some(owner), name, Some(index))
+                }
+                ExprKind::MemberAccess {
+                    expr: owner,
+                    member,
+                } => {
+                    if !self.vif_prop_name_possible(&member.name) {
+                        return None;
+                    }
+                    let owner = self.vif_owner_of_expr(owner)?;
+                    self.vif_named_target(Some(owner), &member.name, Some(index))
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
 
-    fn vif_rebase_ident(
-        &self,
-        h: &crate::ast::expr::HierarchicalIdentifier,
+    /// §25.8/§25.9: the interface INSTANCE a bare name (or `name[i]` element
+    /// key) is bound to — [`vif_bare_target`] without the modport.
+    fn vif_bound_for_root(&self, root: &str) -> Option<String> {
+        let base = root.split('[').next().unwrap_or(root);
+        self.vif_bare_target(base, root).map(|(b, _)| b)
+    }
+
+    /// A flat identifier expression over `path`.
+    fn hier_ident_expr(
+        path: Vec<crate::ast::expr::HierPathSegment>,
         span: crate::ast::Span,
-    ) -> Option<Expression> {
-        // `varr[0].data` in flat form carries the index in the first
-        // segment's selects — resolve the per-element key (§25.10).
-        if h.path[0].selects.len() == 1 {
-            let idx = self.eval_scalar_self(&h.path[0].selects[0])?;
-            let key = format!("{}[{}]", h.path[0].name.name, idx);
-            let bound = self.vif_bound_for_root(&key)?;
-            let mut segs: Vec<crate::ast::expr::HierPathSegment> = bound
-                .split('.')
-                .map(|part| crate::ast::expr::HierPathSegment {
-                    name: crate::ast::Identifier {
-                        name: part.to_string(),
-                        span,
-                    },
-                    selects: Vec::new(),
-                })
-                .collect();
-            segs.extend(h.path[1..].iter().cloned());
-            return Some(Expression::new(
-                ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                    root: h.root.clone(),
-                    path: segs,
-                    span,
-                    cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
-                }),
+    ) -> Expression {
+        Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root: None,
+                path,
                 span,
-            ));
-        }
-        if !h.path[0].selects.is_empty() {
-            return None;
-        }
-        let bound = self.vif_bound_for_root(&h.path[0].name.name)?;
-        // IDENTITY REWRITE GUARD. Both callers (`eval_expr_ctx`,
-        // `assign_value`) RE-ENTER on the rewrite, so a rewrite that
-        // reproduces its input recurses until the stack dies. That is not
-        // hypothetical: the universal UVM convention names the class property
-        // after the interface instance (`virtual foo_if vif;` bound to
-        // `foo_if vif()`), so `vif.x` rebases to `vif.x` — every
-        // `uvm_config_db#(virtual iface)` testbench aborted with a stack
-        // overflow at the first access. Declining is exactly equivalent: the
-        // rewrite was a no-op, so the caller resolves the same expression it
-        // already had, minus the recursion.
-        if bound == h.path[0].name.name {
-            return None;
-        }
-        let mut segs: Vec<crate::ast::expr::HierPathSegment> = bound
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        )
+    }
+
+    /// The path segments of interface instance `bound` (`bus`, `top.u.bus`,
+    /// `INT[1]`).
+    fn iface_path_segs(
+        bound: &str,
+        span: crate::ast::Span,
+    ) -> Vec<crate::ast::expr::HierPathSegment> {
+        bound
             .split('.')
             .map(|part| crate::ast::expr::HierPathSegment {
                 name: crate::ast::Identifier {
@@ -113293,60 +113503,169 @@ impl Simulator {
                 },
                 selects: Vec::new(),
             })
-            .collect();
-        segs.extend(h.path[1..].iter().cloned());
-        Some(Expression::new(
-            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                root: h.root.clone(),
-                path: segs,
-                span,
-                cached_signal_id: std::cell::Cell::new(None),
-                cached_resolved_name: std::cell::OnceCell::new(),
-            }),
-            span,
-        ))
+            .collect()
     }
 
-    /// Recursive half of [`vif_rebase_expr`]: inside a chain, a SINGLE-segment
-    /// `Ident(v)` base is rebased too (the chain itself provides the member
-    /// context a bare read lacks).
+    /// Could any name along the chain `e` be a vif property? The prefilter of
+    /// [`vif_rebase_expr`] when no alias exists.
+    fn chain_may_name_vif(&self, e: &Expression) -> bool {
+        // The member a chain SELECTS (`data` in `cfg.vif.data`, the method in
+        // `cfg.vif.t()`, the leaf of a flat `d.vif.data`) is never a receiver:
+        // start below it.
+        let mut cur = e;
+        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &cur.kind {
+            cur = expr;
+        }
+        match &cur.kind {
+            ExprKind::MemberAccess { expr, .. } => cur = expr,
+            ExprKind::Call { func, .. } => match &func.kind {
+                ExprKind::MemberAccess { expr, .. } => cur = expr,
+                ExprKind::Ident(h) if h.path.len() >= 2 => {
+                    return h.path[..h.path.len() - 1]
+                        .iter()
+                        .any(|s| self.vif_prop_name_possible(&s.name.name));
+                }
+                _ => return false,
+            },
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                return h.path[..h.path.len() - 1]
+                    .iter()
+                    .any(|s| self.vif_prop_name_possible(&s.name.name));
+            }
+            _ => {}
+        }
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    if self.vif_prop_name_possible(&member.name) {
+                        return true;
+                    }
+                    cur = expr;
+                }
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => cur = expr,
+                ExprKind::Call { func, .. } => cur = func,
+                ExprKind::Paren(inner) => cur = inner,
+                ExprKind::Ident(h) => {
+                    return h
+                        .path
+                        .iter()
+                        .any(|s| self.vif_prop_name_possible(&s.name.name));
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Rewrite an expression chain whose RECEIVER is a bound virtual
+    /// interface — at any depth, spelled any way [`vif_recv_target`]
+    /// resolves — into a DIRECT access of the bound instance, so everything
+    /// downstream (read, write, NBA, event and wait controls, clocking
+    /// blocks, interface subroutine calls) sees the instance path, which
+    /// already works in every shape. Inside a subroutine body the parser
+    /// emits `MemberAccess`/`Index`/`Call` chains rather than one flat
+    /// `Ident`; at module scope the same source is one flat `Ident`. `None`
+    /// when no receiver in the chain is a bound vif — the common case, gated
+    /// to a few emptiness and name checks.
+    fn vif_rebase_expr(&self, e: &Expression) -> Option<Expression> {
+        let alias_possible = self.iface_alias_possible();
+        if !alias_possible && self.virtual_iface_bindings.is_empty() && !self.vif_tokens_stored {
+            return None;
+        }
+        // Only CHAINS are rebased: a bare `v` read/write (or `d.v`, `varr[0]`)
+        // is a HANDLE operation (`v2 = v;`, `v == null`) and stays untouched.
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() >= 2 => {}
+            ExprKind::MemberAccess { .. }
+            | ExprKind::Call { .. }
+            | ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. } => {}
+            _ => return None,
+        }
+        if !alias_possible && !self.vif_tokens_stored && !self.chain_may_name_vif(e) {
+            return None;
+        }
+        self.vif_rebase_chain(e)
+    }
+
+    /// A flattened path: the first prefix `path[..=i]` (with at least one
+    /// segment after it) that is a bound vif is replaced by the bound
+    /// instance's path.
+    fn vif_rebase_ident(
+        &self,
+        h: &crate::ast::expr::HierarchicalIdentifier,
+        span: crate::ast::Span,
+    ) -> Option<Expression> {
+        if h.root.is_some() {
+            return None;
+        }
+        let n = h.path.len();
+        let alias_possible = self.iface_alias_possible();
+        for i in 0..n.saturating_sub(1) {
+            let seg = &h.path[i];
+            let name = seg.name.name.as_str();
+            if !(self.vif_prop_name_possible(name)
+                || (i == 0 && (alias_possible || self.vif_tokens_stored)))
+            {
+                continue;
+            }
+            let Some((bound, _)) = self.vif_recv_path(&h.path[..=i]) else {
+                continue;
+            };
+            // IDENTITY REWRITE GUARD. Every consumer RE-ENTERS on the rewrite,
+            // so a rewrite that reproduces its input recurses until the stack
+            // dies. The universal UVM convention names the class property after
+            // the interface instance (`virtual foo_if vif;` bound to
+            // `foo_if vif()`), so `vif.x` would rebase to `vif.x`. Declining is
+            // exactly equivalent: the path already names the instance.
+            if i == 0 && seg.selects.is_empty() && bound == name {
+                return None;
+            }
+            let mut segs = Self::iface_path_segs(&bound, span);
+            segs.extend(h.path[i + 1..].iter().cloned());
+            return Some(Self::hier_ident_expr(segs, span));
+        }
+        None
+    }
+
+    /// Recursive half of [`vif_rebase_expr`]: the innermost receiver in the
+    /// chain that is a bound vif becomes the instance identifier; the
+    /// selects, members and call around it are rebuilt unchanged.
     fn vif_rebase_chain(&self, e: &Expression) -> Option<Expression> {
         match &e.kind {
-            ExprKind::Ident(h) => {
-                if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                    let bound = self.vif_bound_for_root(&h.path[0].name.name)?;
-                    // Identity rewrite (property named after the instance —
-                    // the UVM `vif` convention): see the guard in
-                    // `vif_rebase_ident`. Rebasing `v` to `v` makes the
-                    // re-entering callers recurse forever.
-                    if bound == h.path[0].name.name {
+            ExprKind::Ident(h) if h.path.len() >= 2 => self.vif_rebase_ident(h, e.span),
+            ExprKind::MemberAccess { expr: recv, member } => {
+                if let Some((bound, _)) = self.vif_recv_target(recv) {
+                    // Identity guard (see `vif_rebase_ident`): the receiver
+                    // already names the bound instance.
+                    if matches!(&recv.kind, ExprKind::Ident(rh)
+                        if rh.path.len() == 1
+                            && rh.path[0].selects.is_empty()
+                            && rh.path[0].name.name == bound)
+                    {
                         return None;
                     }
-                    let segs: Vec<crate::ast::expr::HierPathSegment> = bound
-                        .split('.')
-                        .map(|part| crate::ast::expr::HierPathSegment {
-                            name: crate::ast::Identifier {
-                                name: part.to_string(),
-                                span: e.span,
-                            },
-                            selects: Vec::new(),
-                        })
-                        .collect();
-                    return Some(Expression::new(
-                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                            root: h.root.clone(),
-                            path: segs,
-                            span: e.span,
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
-                        }),
-                        e.span,
-                    ));
+                    // The instance's member as ONE flat identifier — exactly
+                    // the module-scope spelling `bus.data` of the same access,
+                    // which every consumer (width inference and NBA targets
+                    // included) resolves.
+                    let mut segs = Self::iface_path_segs(&bound, e.span);
+                    segs.push(crate::ast::expr::HierPathSegment {
+                        name: member.clone(),
+                        selects: Vec::new(),
+                    });
+                    return Some(Self::hier_ident_expr(segs, e.span));
                 }
-                self.vif_rebase_ident(h, e.span)
-            }
-            ExprKind::MemberAccess { expr, member } => {
-                let nb = self.vif_rebase_chain(expr)?;
+                let nb = self.vif_rebase_chain(recv)?;
+                // A plain member of a rebased instance path stays flat too
+                // (`cfg.vif.cb.data` → `bus.cb.data`).
+                if let ExprKind::Ident(h) = &nb.kind {
+                    let mut path = h.path.clone();
+                    path.push(crate::ast::expr::HierPathSegment {
+                        name: member.clone(),
+                        selects: Vec::new(),
+                    });
+                    return Some(Self::hier_ident_expr(path, e.span));
+                }
                 Some(Expression::new(
                     ExprKind::MemberAccess {
                         expr: Box::new(nb),
@@ -113356,47 +113675,6 @@ impl Simulator {
                 ))
             }
             ExprKind::Index { expr, index } => {
-                // §25.10: a vif-ARRAY element (`varr[0]`) is bound per
-                // element, so the whole `name[idx]` key resolves where the
-                // bare base never will.
-                if let ExprKind::Ident(h) = &expr.kind {
-                    // `vif_bound_for_root` of an element key can only hit
-                    // through an alias or a vif property base name.
-                    if h.path.len() == 1
-                        && h.path[0].selects.is_empty()
-                        && (self.iface_alias_possible()
-                            || self
-                                .class_member_names()
-                                .vif_props
-                                .contains(h.path[0].name.name.as_str()))
-                    {
-                        if let Some(idx) = self.eval_scalar_self(index) {
-                            let key = format!("{}[{}]", h.path[0].name.name, idx);
-                            if let Some(bound) = self.vif_bound_for_root(&key) {
-                                let segs: Vec<crate::ast::expr::HierPathSegment> = bound
-                                    .split('.')
-                                    .map(|part| crate::ast::expr::HierPathSegment {
-                                        name: crate::ast::Identifier {
-                                            name: part.to_string(),
-                                            span: e.span,
-                                        },
-                                        selects: Vec::new(),
-                                    })
-                                    .collect();
-                                return Some(Expression::new(
-                                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                                        root: None,
-                                        path: segs,
-                                        span: e.span,
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
-                                    }),
-                                    e.span,
-                                ));
-                            }
-                        }
-                    }
-                }
                 let nb = self.vif_rebase_chain(expr)?;
                 Some(Expression::new(
                     ExprKind::Index {
@@ -113583,6 +113861,12 @@ impl Simulator {
     /// (`cfg.vif.t()`, `this.vif.t()` — the owner object is evaluated and
     /// its property binding consulted).
     fn resolve_hier_task_target(&self, func: &Expression) -> Option<String> {
+        // §25.8/§25.9: a callee reached through a bound virtual-interface
+        // receiver (`cfg.vif.t()`, `d.a.cfg.vif.t()`, `vifs[i].t()`) names the
+        // bound instance's task.
+        if let Some(rebased) = self.vif_rebase_expr(func) {
+            return self.resolve_hier_task_target(&rebased);
+        }
         let in_tasks = |full: String| -> Option<String> {
             if self.module.tasks.contains_key(&full) {
                 Some(full)
@@ -113734,6 +114018,59 @@ impl Simulator {
                 .collect()
         });
         set.contains(path)
+    }
+
+    /// §25.9: the VALUE a virtual interface bound to instance `path` holds —
+    /// a non-null token derived from the path (FNV-1a folded to 31 bits, low
+    /// bit set), the same for every holder, so handles compare equal exactly
+    /// when they name the same instance.
+    fn iface_handle_token(path: &str) -> u64 {
+        let mut hsh: u64 = 0xcbf29ce484222325;
+        for b in path.bytes() {
+            hsh ^= b as u64;
+            hsh = hsh.wrapping_mul(0x100000001b3);
+        }
+        (hsh & 0x7FFF_FFFF) | 1
+    }
+
+    /// The interface instance a virtual-interface VALUE names (the inverse
+    /// of [`iface_handle_token`]) — how a vif held in storage with no binding
+    /// slot (a queue, dynamic or associative array element) resolves.
+    fn iface_by_token(&self, token: u64) -> Option<&str> {
+        self.iface_by_token
+            .get_or_init(|| {
+                self.module
+                    .instances
+                    .iter()
+                    .filter(|i| self.module.interfaces.contains(&i.def_name))
+                    .map(|i| (Self::iface_handle_token(&i.path), i.path.clone()))
+                    .collect()
+            })
+            .get(&token)
+            .map(String::as_str)
+    }
+
+    /// Is the collection stored as `coll` — a class property's
+    /// `<handle>#<prop>` store or a plain variable — declared with
+    /// virtual-interface elements (`virtual bus_if vq[$]`)?
+    fn vif_collection(&self, coll: &str) -> bool {
+        if self.module.interfaces.is_empty() {
+            return false;
+        }
+        match coll.split_once('#') {
+            Some((h, prop)) => {
+                self.vif_prop_name_possible(prop)
+                    && h.parse::<usize>()
+                        .ok()
+                        .and_then(|h| self.heap.get(h)?.as_ref())
+                        .is_some_and(|i| self.class_vif_decl(&i.class_name, prop).is_some())
+            }
+            None => self
+                .module
+                .var_decl_types
+                .get(coll)
+                .is_some_and(|dt| self.is_virtual_iface_type(dt)),
+        }
     }
 
     /// Is `dt` a virtual-interface variable type — the `virtual <iface>`
@@ -115270,39 +115607,59 @@ impl Simulator {
                 }
                 self.member_handle(bh, &member.name)
             }
-            ExprKind::Index { expr: base, index } => {
-                if let ExprKind::Ident(bh) = &base.kind {
-                    if bh.path.len() == 1 {
-                        let bname = bh.path[0].name.name.clone();
-                        let scoped = self
-                            .instance_assoc_member(&bname)
-                            .unwrap_or_else(|| bname.clone());
-                        // A STRING-keyed assoc element (`rtab[string]`) must key
-                        // by the string, not a truncated scalar — otherwise
-                        // `assoc[key].method()` (a method on the element class
-                        // handle) resolves to the wrong/empty slot → handle 0 →
-                        // null receiver. This is string-keyed resource table lookup
-                        // (`rtab[name].get(i)`).
-                        let string_keyed = self.is_string_keyed_array(&scoped)
-                            || self.is_string_keyed_array(&bname);
-                        let key_str = if string_keyed {
-                            self.eval_index_value_self(index)
-                                .map(|v| v.to_sv_string())
-                                .unwrap_or_default()
-                        } else {
-                            self.eval_scalar_self(index)?.to_string()
-                        };
-                        let key = format!("{}[{}]", scoped, key_str);
-                        return self
-                            .get_signal_value_by_name(&key)
-                            .and_then(|v| v.to_u64())
-                            .map(|h| h as usize);
-                    }
+            ExprKind::Index { expr: base, index } => match &base.kind {
+                ExprKind::Ident(bh) if bh.path.len() == 1 => {
+                    let bname = bh.path[0].name.name.as_str();
+                    let scoped = self
+                        .instance_assoc_member(bname)
+                        .unwrap_or_else(|| bname.to_string());
+                    self.coll_elem_handle(&scoped, bname, index)
                 }
-                None
-            }
+                // An element of a collection PROPERTY reached through a
+                // handle — `e.ag[0]`, `a.b.ag[i]` (either parse shape).
+                ExprKind::MemberAccess { expr: ob, member } => {
+                    let oh = self.eval_handle_expr(ob).filter(|&h| h != 0)?;
+                    let coll = self.handle_collection_name(oh, &member.name)?;
+                    self.coll_elem_handle(&coll, &member.name, index)
+                }
+                ExprKind::Ident(bh)
+                    if bh.path.len() >= 2 && bh.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    let mut oh = self.eval_ident_handle(&bh.path[0].name.name)?;
+                    let n = bh.path.len();
+                    for seg in &bh.path[1..n - 1] {
+                        oh = self.member_handle(oh, &seg.name.name).filter(|&h| h != 0)?;
+                    }
+                    let member = &bh.path[n - 1].name.name;
+                    let coll = self.handle_collection_name(oh, member)?;
+                    self.coll_elem_handle(&coll, member, index)
+                }
+                _ => None,
+            },
             _ => None,
         }
+    }
+
+    /// The handle held by element `index` of the collection stored as `coll`
+    /// (`bare` is its declared name, which fixes the key type).
+    fn coll_elem_handle(&self, coll: &str, bare: &str, index: &Expression) -> Option<usize> {
+        // A STRING-keyed assoc element (`rtab[string]`) must key by the
+        // string, not a truncated scalar — otherwise `assoc[key].method()`
+        // (a method on the element class handle) resolves to the wrong/empty
+        // slot → handle 0 → null receiver. This is string-keyed resource
+        // table lookup (`rtab[name].get(i)`).
+        let string_keyed = self.is_string_keyed_array(coll) || self.is_string_keyed_array(bare);
+        let key_str = if string_keyed {
+            self.eval_index_value_self(index)
+                .map(|v| v.to_sv_string())
+                .unwrap_or_default()
+        } else {
+            self.eval_scalar_self(index)?.to_string()
+        };
+        let key = format!("{}[{}]", coll, key_str);
+        self.get_signal_value_by_name(&key)
+            .and_then(|v| v.to_u64())
+            .map(|h| h as usize)
     }
 
     /// Does `class_name` or any ancestor declare a method `name`?
@@ -135931,10 +136288,17 @@ impl Simulator {
             ident_slow.extend(self.struct_capable_names().iter().cloned());
             ident_slow.insert("UVM_ACTIVE".to_string());
             ident_slow.insert("UVM_PASSIVE".to_string());
+            let mut vif_first = [false; 256];
+            for n in &vif_props {
+                if let Some(&b) = n.as_bytes().first() {
+                    vif_first[b as usize] = true;
+                }
+            }
             ClassMemberNames {
                 ident_slow,
                 statics,
                 vif_props,
+                vif_first,
                 methods,
                 tasks,
                 packed_vec_props,

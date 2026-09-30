@@ -413,6 +413,10 @@ mod typedef_receiver_static_task;
 mod vif_member_read_nested_receiver;
 #[path = "classes/vif_property_named_like_instance.rs"]
 mod vif_property_named_like_instance;
+#[path = "classes/vif_receiver_neighbor_shapes.rs"]
+mod vif_receiver_neighbor_shapes;
+#[path = "classes/vif_receiver_operation_matrix.rs"]
+mod vif_receiver_operation_matrix;
 #[path = "classes/vif_resource_db_shape.rs"]
 mod vif_resource_db_shape;
 #[path = "classes/vif_static_roundtrip.rs"]
