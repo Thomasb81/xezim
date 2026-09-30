@@ -6511,6 +6511,11 @@ pub struct Simulator {
     marker_key_scratch: String,
     /// See `lvalue_root_is_unpacked_struct_prop`.
     unpacked_struct_prop_names: std::cell::OnceCell<HashSet<String>>,
+    /// See `struct_root_possible`.
+    struct_root_names: HashSet<String>,
+    struct_root_names_built: bool,
+    /// See `multidim_members_possible`.
+    multidim_members: Option<bool>,
     /// See `struct_prop_name_possible`.
     struct_capable_prop_names: std::cell::OnceCell<HashSet<String>>,
     /// Member names that appear as dynamic/queue/associative members of a
@@ -10915,6 +10920,9 @@ impl Simulator {
             vif_key_scratch: std::cell::RefCell::new(String::new()),
             marker_key_scratch: String::new(),
             unpacked_struct_prop_names: std::cell::OnceCell::new(),
+            struct_root_names: HashSet::default(),
+            struct_root_names_built: false,
+            multidim_members: None,
             struct_capable_prop_names: std::cell::OnceCell::new(),
             struct_coll_member_prop_names: std::cell::OnceCell::new(),
             class_member_names_cell: std::cell::OnceCell::new(),
@@ -60819,13 +60827,40 @@ impl Simulator {
             return None;
         }
         let name = hier.path[0].name.name.as_str();
+        // §13.5.2: an UNPACKED-struct formal binds member-wise into the frame
+        // (its `<formal>.` marker) and copies back on return, as the
+        // MemberAccess arm of `ref_formal_redirect_inner` already honours.
+        // Redirecting a member ELEMENT (`r.arr[i]`, `r.mm[i][j]`) to the
+        // actual bypassed that copy, and the stale frame value then
+        // clobbered the write at return. Only a member whose storage is
+        // per-element leaves (no frame key of its own) is exempt; a member
+        // that is one frame leaf keeps the redirect. Probed only for a name
+        // that would redirect.
+        let member_wise_struct = |sim: &Self| {
+            if !sim.any_struct_formal_markers
+                || hier.path.len() < 2
+                || hier.path.iter().any(|s| !s.selects.is_empty())
+            {
+                return false;
+            }
+            let Some(frame) = sim.local_stack.last() else {
+                return false;
+            };
+            let path = hier
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            frame.contains_key(format!("{}.", name).as_str()) && !frame.contains_key(path.as_str())
+        };
         if let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(name)) {
             // A formal bound to an actual of the SAME name (`run_checks(ref
             // u7_t [..] cnt)` called as `run_checks(cnt)`) rewrote the
             // identifier to itself, and the evaluator re-entered this
             // redirect on the rewritten node until the stack overflowed.
             // Plain resolution of the name already reaches that storage.
-            if storage == name {
+            if storage == name || member_wise_struct(self) {
                 return None;
             }
             let mut path = hier.path.clone();
@@ -60847,6 +60882,7 @@ impl Simulator {
             .ref_identity_stack
             .last()
             .is_some_and(|v| v.iter().any(|n| n == name))
+            || member_wise_struct(self)
         {
             return None;
         }
@@ -60946,11 +60982,16 @@ impl Simulator {
                 if let ExprKind::Ident(rh) = &expr.kind {
                     if rh.path.len() == 1 && rh.path[0].selects.is_empty() {
                         let key = format!("{}.{}", rh.path[0].name.name, member.name);
-                        if self
-                            .local_stack
-                            .last()
-                            .is_some_and(|f| f.contains_key(&key))
-                        {
+                        // A member with per-element (or nested) leaves has
+                        // no key of its own; the formal's `<formal>.` marker
+                        // still says it is bound member-wise.
+                        if self.local_stack.last().is_some_and(|f| {
+                            f.contains_key(&key)
+                                || (self.any_struct_formal_markers
+                                    && f.contains_key(
+                                        format!("{}.", rh.path[0].name.name).as_str(),
+                                    ))
+                        }) {
                             return None;
                         }
                     }
@@ -61754,6 +61795,51 @@ impl Simulator {
                     return changed;
                 }
             }
+        }
+        // §7.4.2: an element of a struct member with two or more unpacked
+        // dimensions is its own leaf (see `struct_member_elem_leaf`).
+        let elem_leaf = if matches!(expr.kind, ExprKind::Index { .. })
+            && self.multidim_members != Some(false)
+        {
+            self.struct_member_elem_leaf(expr, index)
+        } else {
+            None
+        };
+        if let Some(leaf) = elem_leaf {
+            if let Some(&id) = self.signal_name_to_id.get(leaf.as_str()) {
+                let resized = self.fit_value_to_signal(id, val);
+                let changed = self.signal_table[id] != resized;
+                if changed {
+                    if !self.dirty_signals[id] {
+                        self.dirty_signals[id] = true;
+                        self.dirty_list.push(id);
+                    }
+                    self.dirty_any = true;
+                    write_sig!(self, id, resized);
+                    self.table_modified = true;
+                }
+                return changed;
+            }
+            let fitted = match self.signals.get(&leaf) {
+                Some(p) if p.is_real && !val.is_real => Value::from_f64(val.to_f64()),
+                Some(p) if !p.is_real && val.is_real => {
+                    let mut f = Self::real_to_int(val.to_f64(), p.width.max(1));
+                    f.is_signed = p.is_signed;
+                    f
+                }
+                Some(p) if !p.is_real && p.width > 0 => {
+                    let mut f = val.resize(p.width);
+                    f.is_signed = p.is_signed;
+                    f
+                }
+                _ => val.clone(),
+            };
+            let changed = self.signals.get(&leaf) != Some(&fitted);
+            if changed {
+                self.signals.insert(leaf.clone(), fitted);
+                self.mark_dirty(&leaf);
+            }
+            return changed;
         }
         // Nested packed multi-D element write (`a[i][j] = v` on
         // `reg [1:0][15:0][7:0] a;`) — splice the slice into the flat
@@ -65986,14 +66072,15 @@ impl Simulator {
                     // past one element.
                     if let Some(flat) = self.flat_member_name(arg) {
                         if flat.contains('.') {
-                            if let Some((elem_dt, Some(idxs))) = self.flat_path_type(&flat) {
+                            if let Some((elem_dt, Some(lists))) = self.flat_path_type(&flat) {
                                 let ew = super::elaborate::resolve_type_width(
                                     &elem_dt,
                                     Some(&self.module.parameters),
                                     Some(&self.module.typedefs),
                                 )
                                 .max(1);
-                                return Value::from_u64(ew as u64 * idxs.len() as u64, 32);
+                                let n: u64 = lists.iter().map(|l| l.len() as u64).product();
+                                return Value::from_u64(ew as u64 * n, 32);
                             }
                         }
                     }
@@ -67132,6 +67219,9 @@ impl Simulator {
                     }
                 }
                 if let Some(arg) = args.first() {
+                    if let Some(rv) = self.member_array_query(&sn, arg, dim) {
+                        return rv;
+                    }
                     // Resolve the operand to the name its declared bounds
                     // are registered under. A plain / hierarchical Ident
                     // resolves as it always did; a HANDLE-QUALIFIED member
@@ -71843,6 +71933,17 @@ impl Simulator {
                             }
                             let w = self.module.arrays_2d.get(&*name).map(|t| t.2).unwrap_or(1);
                             return Value::new(w);
+                        }
+                    }
+                }
+                // §7.4.2: an element of a struct member with two or more
+                // unpacked dimensions is its own leaf.
+                if matches!(expr.kind, ExprKind::Index { .. })
+                    && self.multidim_members != Some(false)
+                {
+                    if let Some(leaf) = self.struct_member_elem_leaf(expr, index) {
+                        if let Some(v) = self.get_signal_value_by_name(&leaf) {
+                            return v;
                         }
                     }
                 }
@@ -76852,6 +76953,7 @@ impl Simulator {
                         is_str = false;
                     } else {
                         let prefix = format!("{}[", an);
+                        let mut struct_elem: Option<bool> = None;
                         // An assoc-of-collections member (e.g.
                         // `bq_t all[int]`) stores elements as
                         // `all[5][0]` etc. — extract the key up to
@@ -76862,7 +76964,11 @@ impl Simulator {
                             .elem_keys_with_prefix(&prefix)
                             .filter_map(|k| {
                                 let rest = k.strip_prefix(prefix.as_str())?;
-                                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
+                                let se = Self::key_has_member_suffix(rest)
+                                    && *struct_elem.get_or_insert_with(|| {
+                                        self.queue_elem_struct(&an).is_some()
+                                    });
+                                Self::assoc_elem_key_seg(rest, se).map(|s| s.to_string())
                             })
                             .collect();
                         ks.sort();
@@ -77095,6 +77201,39 @@ impl Simulator {
             // loop vars are ALSO bound under it (see
             // set_loop_var_aliased).
             let var_scope: Option<String> = name.rsplit_once('.').map(|(p, _)| p.to_string());
+            // §12.7.3 over an unpacked-struct MEMBER array with no
+            // registered shape — a member of a subroutine-local or formal
+            // struct (`foreach (r.mm[i, j])` in a function). Its dimensions
+            // come from the member declaration, iterated left bound to
+            // right bound.
+            if name.contains('.')
+                && self.struct_root_possible(name.split(['.', '[']).next().unwrap_or(""))
+                && self.foreach_dims(&name).is_none()
+                && !self.module.dynamic_arrays.contains(&*name)
+                && !self.is_associative_array(&name)
+            {
+                if let Some((_, Some(lists))) = self.flat_path_type(&name) {
+                    if vars.len() <= lists.len() {
+                        let n = vars.len();
+                        let dims: Vec<(i64, i64)> = lists[..n]
+                            .iter()
+                            .map(|l| {
+                                let (a, b) = (l[0], l[l.len() - 1]);
+                                (a.min(b), a.max(b))
+                            })
+                            .collect();
+                        let descs: Vec<bool> =
+                            lists[..n].iter().map(|l| l[0] > l[l.len() - 1]).collect();
+                        self.exec_foreach_nested_dir(&dims, vars, body, None, Some(&descs));
+                        self.auto_loop_vars.truncate(fe_auto_len);
+                        self.restore_loop_vars(&fe_saved);
+                        if !self.return_flag {
+                            self.break_flag = false;
+                        }
+                        return;
+                    }
+                }
+            }
             // IEEE 1800-2017 §12.7.3: one loop variable per leading
             // dimension — `foreach (m[i, j])`. A null entry (`m[, j]`)
             // skips that dimension. Only `vars[0]` was ever bound, so
@@ -77350,6 +77489,7 @@ impl Simulator {
                     let (kw, ks_sign) = self.assoc_index_width_for(&name).unwrap_or((32, false));
                     self.widths.insert(var.name.clone(), kw);
                     let prefix = format!("{}[", name);
+                    let mut struct_elem: Option<bool> = None;
                     // An assoc-of-collections (e.g. `bq_t all[int]`
                     // where `bq_t = Base[$]`) stores elements as
                     // `all[5][0]` etc. — extract the key up to the
@@ -77360,7 +77500,10 @@ impl Simulator {
                         .elem_keys_with_prefix(&prefix)
                         .filter_map(|k| {
                             let rest = k.strip_prefix(prefix.as_str())?;
-                            Self::assoc_first_key_seg(rest).map(|s| s.to_string())
+                            let se = Self::key_has_member_suffix(rest)
+                                && *struct_elem
+                                    .get_or_insert_with(|| self.queue_elem_struct(&name).is_some());
+                            Self::assoc_elem_key_seg(rest, se).map(|s| s.to_string())
                         })
                         .collect();
                     keys.sort();
@@ -78374,8 +78517,29 @@ impl Simulator {
                 } else {
                     self.forget_string_flag(&name);
                 }
+                // §7.2/§7.4: an element of a local array of UNPACKED structs
+                // is stored as its member leaves, as a module-scope one is —
+                // every element of every member dimension (`a[1].mm[i][j]`).
+                // A packed container per element had no leaf for a member
+                // element select to land on.
+                let elem_su = self.unpacked_struct_of(data_type);
+                if elem_su.is_some() {
+                    self.note_struct_root(&bare);
+                    self.note_struct_root(&name);
+                    self.note_struct_type(data_type);
+                }
                 for idx in lo..=hi {
                     let elem = format!("{}[{}]", name, idx);
+                    if let Some(su) = &elem_su {
+                        let mut leaves = Vec::new();
+                        self.unpacked_struct_leaf_defaults(&elem, su, 0, &mut leaves);
+                        for (k, dv, mdt) in leaves {
+                            self.register_packed_leaf_layout(&k, &mdt);
+                            self.widths.insert(k.clone(), dv.width);
+                            self.signals.insert(k, dv);
+                        }
+                        continue;
+                    }
                     let seed = if is_string_elem {
                         Value::from_string("")
                     } else {
@@ -78704,6 +78868,8 @@ impl Simulator {
                     self.module
                         .var_decl_types
                         .insert(d.name.name.clone(), data_type.clone());
+                    self.note_struct_root(&d.name.name);
+                    self.note_struct_type(data_type);
                     // A decl-init whose SOURCE is an unpacked-struct
                     // CLASS property (`pair_t p = o.orig;`, incl. the
                     // ternary form) must write the leaves member-wise —
@@ -78725,6 +78891,8 @@ impl Simulator {
                         if let crate::ast::types::DataType::Struct(su) = self.resolve_dt(data_type)
                         {
                             if Self::spreads_member_wise(&su) {
+                                self.note_struct_root(&d.name.name);
+                                self.note_struct_type(data_type);
                                 let mut leaves = Vec::new();
                                 self.unpacked_struct_leaf_defaults(
                                     &d.name.name,
@@ -79198,6 +79366,42 @@ impl Simulator {
                             return;
                         }
                     }
+                }
+                // §10.4.2: a whole UNPACKED struct has no storage of its own —
+                // its member leaves are the storage — so it is updated as one
+                // nonblocking assignment per leaf, every source leaf read now.
+                if let Some(leaf_nbas) = self.unpacked_struct_nba_leaves(lvalue, rvalue) {
+                    let d = match intra_d {
+                        Some(d) => d,
+                        None => delay
+                            .as_ref()
+                            .map(|de| self.eval_expr(de).to_u64().unwrap_or(0))
+                            .unwrap_or(0),
+                    };
+                    let delay_expr = (d > 0).then(|| {
+                        Expression::new(
+                            ExprKind::Number(NumberLiteral::Integer {
+                                size: None,
+                                signed: false,
+                                base: NumberBase::Decimal,
+                                value: d.to_string(),
+                                cached_val: Cell::new(None),
+                            }),
+                            stmt.span,
+                        )
+                    });
+                    for (leaf_lvalue, v) in leaf_nbas {
+                        let saved = self.make_intra_saved_expr(v, rvalue.span);
+                        self.exec_statement(&Statement::new(
+                            StatementKind::NonblockingAssign {
+                                lvalue: leaf_lvalue,
+                                delay: delay_expr.clone(),
+                                rvalue: saved,
+                            },
+                            stmt.span,
+                        ));
+                    }
+                    return;
                 }
                 let val = match &rvalue.kind {
                     ExprKind::AssignmentPattern(items) => self
@@ -96309,13 +96513,17 @@ impl Simulator {
         // run (see `assoc_static_keys_cache`), so scan it once per prefix
         // instead of on every call.
         let static_keys = self.assoc_static_keys(&prefix);
+        let mut struct_elem: Option<bool> = None;
         let mut keys: Vec<String> = self
             .signals
             .elem_keys_with_prefix(&prefix)
             .chain(static_keys.iter().map(|k| &**k))
             .filter_map(|k| {
                 let rest = &k[prefix.len()..];
-                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
+                let se = Self::key_has_member_suffix(rest)
+                    && *struct_elem
+                        .get_or_insert_with(|| self.queue_elem_struct(obj_name).is_some());
+                Self::assoc_elem_key_seg(rest, se).map(|s| s.to_string())
             })
             .collect();
         keys.sort();
@@ -97390,6 +97598,35 @@ impl Simulator {
         }
     }
 
+    /// `assoc_first_key_seg` for an array whose ELEMENT is an unpacked
+    /// struct when `struct_elem`: such an element is stored as its member
+    /// leaves (`sa[KEY].m`, `sa[KEY].arr[1][0]`), so the key ends at the
+    /// first `].` — the last `]` would take the member's own index as part
+    /// of the key and enumerate one phantom key per array-member leaf.
+    /// Whether a stored entry's text after `name[` has a `].` — the shape of
+    /// a struct-element member leaf. A byte scan on `]` (memchr), not a
+    /// substring search: this runs once per stored entry of every
+    /// associative-array enumeration.
+    fn key_has_member_suffix(rest: &str) -> bool {
+        let mut s = rest;
+        while let Some(p) = s.find(']') {
+            if s.as_bytes().get(p + 1) == Some(&b'.') {
+                return true;
+            }
+            s = &s[p + 1..];
+        }
+        false
+    }
+
+    fn assoc_elem_key_seg(rest: &str, struct_elem: bool) -> Option<&str> {
+        if struct_elem {
+            if let Some(p) = rest.find("].") {
+                return Self::assoc_first_key_seg(&rest[..=p]);
+            }
+        }
+        Self::assoc_first_key_seg(rest)
+    }
+
     fn array_iter_keys(&self, name: &str) -> (Vec<String>, bool) {
         // A queue / dynamic array carries an authoritative `<name>.size`
         // shadow and is DENSE: iterate the logical range [0, size). Scanning
@@ -97415,12 +97652,15 @@ impl Simulator {
         // verbatim as `arr[KEY]`. Distinguish by shape: a multi-index entry
         // has an inner `[` right after its first `]` (`k1][k2]`), so extract
         // up to that `]`; otherwise take the whole key up to the final `]`.
+        let mut struct_elem: Option<bool> = None;
         let mut ks: Vec<String> = self
             .signals
             .elem_keys_with_prefix(&prefix)
             .filter_map(|k| {
                 let rest = k.strip_prefix(prefix.as_str())?;
-                Self::assoc_first_key_seg(rest).map(|s| s.to_string())
+                let se = Self::key_has_member_suffix(rest)
+                    && *struct_elem.get_or_insert_with(|| self.queue_elem_struct(name).is_some());
+                Self::assoc_elem_key_seg(rest, se).map(|s| s.to_string())
             })
             .collect();
         ks.sort();
@@ -102907,19 +103147,20 @@ impl Simulator {
         concrete.to_string()
     }
 
-    /// Constant indices of a member's (single) unpacked dimension.
-    fn member_dim_indices(
-        &self,
-        dims: &[crate::ast::types::UnpackedDimension],
-    ) -> Option<Vec<i64>> {
+    /// Constant indices of ONE fixed unpacked dimension in DECLARED order,
+    /// left bound first: `[1:0]` gives `[1, 0]`, `[0:1]` and `[2]` give
+    /// `[0, 1]`. That is an unpacked array's element order (IEEE 1800-2017
+    /// §7.4.2): an assignment pattern fills the left bound first (§10.10)
+    /// and `%p` prints it first (§21.2.1.7). `None` for a dynamic, queue or
+    /// associative dimension, or one whose bounds do not resolve.
+    fn fixed_dim_indices(&self, dim: &crate::ast::types::UnpackedDimension) -> Option<Vec<i64>> {
         use crate::ast::types::UnpackedDimension as UD;
         // `m[N]` (N a parameter) parses as an associative dim keyed by "type" N.
         let dims = super::elaborate::normalize_unpacked_dims(
-            dims,
+            std::slice::from_ref(dim),
             &self.module.parameters,
             &self.module.typedef_types,
         );
-        let dims = &dims[..];
         let p = Some(&self.module.parameters);
         match dims.first()? {
             UD::Expression { expr, .. } => {
@@ -102931,37 +103172,219 @@ impl Simulator {
             UD::Range { left, right, .. } => {
                 let l = super::elaborate::const_eval_i64_with_params(left, p)?;
                 let r = super::elaborate::const_eval_i64_with_params(right, p)?;
-                let (lo, hi) = if l <= r { (l, r) } else { (r, l) };
-                if hi - lo < 4096 {
-                    Some((lo..=hi).collect())
-                } else {
+                if (l - r).abs() >= 4096 {
                     None
+                } else if l <= r {
+                    Some((l..=r).collect())
+                } else {
+                    Some((r..=l).rev().collect())
                 }
             }
             _ => None,
         }
     }
 
-    /// Constant indices of EVERY unpacked dimension of a member, as one list
-    /// per dimension — the cartesian product of the lists addresses the
-    /// member's elements (`bit [255:0] mem [2][2]` → keys `mem[i][j]`).
-    /// A member with a single dimension yields exactly the list
-    /// `member_dim_indices` produced, so 1-D leaf keys are unchanged.
-    /// `None` when any dimension is not a fixed range, or the product would
-    /// explode.
-    fn member_dim_indices_multi(
+    /// IEEE 1800-2017 §7.4.2: the SHAPE of a struct member's unpacked
+    /// dimensions — one constant index list per dimension, outermost first,
+    /// each in declared order. `bit [7:0] mm [2][2]` has two dimensions and
+    /// its elements are `mm[i][j]`; every one of them is its own leaf.
+    ///
+    /// This is the one place a member's element layout comes from: leaf
+    /// enumeration, defaults, whole-struct copy, member-wise assignment,
+    /// assignment patterns and `%p` all walk it. It used to report only the
+    /// FIRST dimension, so everything past `mm[i]` was invisible to those
+    /// consumers and a member with two or more unpacked dimensions was lost
+    /// by every copy, pattern, formal and local.
+    ///
+    /// `None` when the member has no unpacked dimension, when any dimension
+    /// is not a fixed range, or when the element count would explode.
+    fn member_dim_indices(
         &self,
         dims: &[crate::ast::types::UnpackedDimension],
     ) -> Option<Vec<Vec<i64>>> {
+        if dims.is_empty() {
+            return None;
+        }
         let mut out: Vec<Vec<i64>> = Vec::with_capacity(dims.len());
         for d in dims {
-            out.push(self.member_dim_indices(std::slice::from_ref(d))?);
+            out.push(self.fixed_dim_indices(d)?);
         }
         let total: u64 = out.iter().map(|l| l.len() as u64).product();
         if total == 0 || total > (1 << 20) {
             return None;
         }
         Some(out)
+    }
+
+    /// IEEE 1800-2017 §20.7 `$left`/`$right`/`$low`/`$high`/`$size`/
+    /// `$increment` of an unpacked-struct MEMBER array that has no registered
+    /// shape — a member of a block-local, formal or array-element struct, or
+    /// a sub-array (`$size(s.mm[1])`) — answered from the member's declared
+    /// dimensions. `None` for anything else, including a member whose shape
+    /// is registered (the general path answers it).
+    fn member_array_query(&mut self, sn: &str, arg: &Expression, dim: usize) -> Option<Value> {
+        match &arg.kind {
+            ExprKind::Index { .. } | ExprKind::MemberAccess { .. } => {}
+            ExprKind::Ident(h) if h.path.len() >= 2 => {}
+            _ => return None,
+        }
+        if !Self::expr_root_first_seg(arg).is_some_and(|r| self.struct_root_possible(r)) {
+            return None;
+        }
+        let flat = self.flat_member_name(arg)?;
+        if !flat.contains('.') || self.foreach_dims(&flat).is_some() {
+            return None;
+        }
+        let (_, lists) = self.flat_path_type(&flat)?;
+        let list = lists?.get(dim.checked_sub(1)?)?.clone();
+        let (left, right) = (*list.first()?, *list.last()?);
+        let (lo, hi) = (left.min(right), left.max(right));
+        let result = match sn {
+            "$left" => left,
+            "$right" => right,
+            "$low" => lo,
+            "$high" => hi,
+            "$size" => hi - lo + 1,
+            "$increment" => {
+                if left >= right {
+                    1
+                } else {
+                    -1
+                }
+            }
+            _ => return None,
+        };
+        let mut rv = Value::from_u64((result as u64) & 0xFFFF_FFFF, 32);
+        rv.is_signed = true;
+        Some(rv)
+    }
+
+    /// Every element of a member with fixed unpacked dimensions, as one index
+    /// tuple each, in element order (last dimension varying fastest) — the
+    /// cartesian product of [`member_dim_indices`].
+    fn member_elem_indices(
+        &self,
+        dims: &[crate::ast::types::UnpackedDimension],
+    ) -> Option<Vec<Vec<i64>>> {
+        self.member_dim_indices(dims)
+            .map(|lists| Self::cartesian_indices(&lists))
+    }
+
+    /// Cheap gate for the member-wise struct paths that must flatten a name
+    /// first: can a variable whose name (or instance-local last segment, or
+    /// leading scope segment) is `root` hold an UNPACKED struct — itself, as
+    /// an array / queue / associative element, or as a block-local? One hash
+    /// probe, so the ordinary element selects and nonblocking assignments of
+    /// a design pay nothing for the struct handling.
+    fn struct_root_possible(&mut self, root: &str) -> bool {
+        if !self.struct_root_names_built {
+            self.struct_root_names_built = true;
+            let names: Vec<String> = self
+                .module
+                .var_decl_types
+                .iter()
+                .filter(|(_, dt)| {
+                    matches!(self.resolve_dt_ref(dt),
+                        DataType::Struct(su) if Self::spreads_member_wise(su))
+                })
+                .map(|(n, _)| n.clone())
+                .collect();
+            for n in names {
+                self.note_struct_root(&n);
+            }
+        }
+        self.struct_root_names.contains(root)
+    }
+
+    /// Record `name` for `struct_root_possible`: the full name, its first
+    /// segment and its last segment (an instance-local variable is written
+    /// under its bare name inside the instance).
+    fn note_struct_root(&mut self, name: &str) {
+        let first = name.split(['.', '[']).next().unwrap_or(name);
+        let last = name.rsplit('.').next().unwrap_or(name);
+        let last = last.split('[').next().unwrap_or(last);
+        for n in [name, first, last] {
+            if !self.struct_root_names.contains(n) {
+                self.struct_root_names.insert(n.to_string());
+            }
+        }
+    }
+
+    /// Does any unpacked struct type of the design have a member with two or
+    /// more unpacked dimensions? Only such a member has element leaves that
+    /// `struct_member_elem_leaf` must find, so a design without one skips
+    /// that name flattening entirely. Computed once over the declared
+    /// variable, typedef and class-property types; a block-local struct of
+    /// a new anonymous type updates it through `note_struct_type`.
+    #[inline]
+    fn multidim_members_possible(&mut self) -> bool {
+        match self.multidim_members {
+            Some(b) => b,
+            None => self.compute_multidim_members(),
+        }
+    }
+
+    #[cold]
+    fn compute_multidim_members(&mut self) -> bool {
+        let found = self
+            .module
+            .var_decl_types
+            .values()
+            .chain(self.module.typedef_types.values())
+            .chain(
+                self.module
+                    .classes
+                    .values()
+                    .flat_map(|c| c.property_types.values()),
+            )
+            .any(|dt| self.dt_has_multidim_member(dt, 0));
+        self.multidim_members = Some(found);
+        found
+    }
+
+    /// `multidim_members_possible` bookkeeping for a type declared at run
+    /// time (a block-local struct).
+    fn note_struct_type(&mut self, dt: &DataType) {
+        if self.multidim_members == Some(false) && self.dt_has_multidim_member(dt, 0) {
+            self.multidim_members = Some(true);
+        }
+    }
+
+    fn dt_has_multidim_member(&self, dt: &DataType, depth: u32) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        let DataType::Struct(su) = self.resolve_dt_ref(dt) else {
+            return false;
+        };
+        su.members.iter().any(|m| {
+            m.declarators.iter().any(|d| d.dimensions.len() >= 2)
+                || self.dt_has_multidim_member(&m.data_type, depth + 1)
+        })
+    }
+
+    /// The first path segment of the identifier at the root of a
+    /// member/index chain (`s` in `s.mm[1][0]`, `arr` in `arr[2].x`).
+    fn expr_root_first_seg(e: &Expression) -> Option<&str> {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.first().map(|s| s.name.name.as_str()),
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+                Self::expr_root_first_seg(expr)
+            }
+            _ => None,
+        }
+    }
+
+    /// `[i][j]...` for an element index tuple — the key suffix of a member
+    /// element's leaf.
+    fn index_suffix(tup: &[i64]) -> String {
+        let mut s = String::with_capacity(tup.len() * 4);
+        for &i in tup {
+            s.push('[');
+            Self::push_i64(&mut s, i);
+            s.push(']');
+        }
+        s
     }
 
     /// Write one flattened leaf, honouring the declared width / signedness /
@@ -103785,7 +104208,7 @@ impl Simulator {
 
     /// Cartesian expansion of per-dimension index lists, last dimension
     /// varying fastest — the element enumeration order of
-    /// `unpacked_struct_leaves` / `member_dim_indices_multi`.
+    /// `unpacked_struct_leaves` / `member_elem_indices`.
     fn cartesian_indices(lists: &[Vec<i64>]) -> Vec<Vec<i64>> {
         let mut tuples: Vec<Vec<i64>> = vec![Vec::new()];
         for list in lists {
@@ -103874,20 +104297,12 @@ impl Simulator {
                     Some(&self.module.typedefs),
                 )
                 .max(1);
-                let lists = if md.dimensions.is_empty() {
-                    None
-                } else {
-                    self.member_dim_indices_multi(&md.dimensions)
-                };
-                match lists {
-                    Some(lists) => {
-                        // Cartesian expansion, last dimension varying fastest
-                        // — the enumeration order of `unpacked_struct_leaves`.
-                        for tup in Self::cartesian_indices(&lists) {
-                            let mut ekey = mkey.clone();
-                            for i in tup {
-                                ekey.push_str(&format!("[{}]", i));
-                            }
+                match self.member_elem_indices(&md.dimensions) {
+                    Some(tups) => {
+                        // Element order, last dimension varying fastest —
+                        // the enumeration order of `unpacked_struct_leaves`.
+                        for tup in tups {
+                            let ekey = format!("{}{}", mkey, Self::index_suffix(&tup));
                             match &nested {
                                 Some(inner) => self.unpacked_pack_cells(inner, &ekey, out),
                                 None => out.push((ekey, mw)),
@@ -103946,16 +104361,14 @@ impl Simulator {
         for m in &su.members {
             for md in &m.declarators {
                 let mname = md.name.name.as_str();
-                if !md.dimensions.is_empty() {
-                    if let Some(lists) = self.member_dim_indices_multi(&md.dimensions) {
-                        for tup in Self::cartesian_indices(&lists) {
-                            let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
-                            let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
-                            let v = self.eval_expr(&rhs_f);
-                            self.assign_value(&lhs_f, &v);
-                        }
-                        continue;
+                if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                    for tup in tups {
+                        let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
+                        let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
+                        let v = self.eval_expr(&rhs_f);
+                        self.assign_value(&lhs_f, &v);
                     }
+                    continue;
                 }
                 let lhs_f = Self::append_member_expr(lvalue, mname);
                 let rhs_f = Self::append_member_expr(rvalue, mname);
@@ -104019,16 +104432,14 @@ impl Simulator {
         for m in &su.members {
             for md in &m.declarators {
                 let mname = md.name.name.as_str();
-                if !md.dimensions.is_empty() {
-                    if let Some(lists) = self.member_dim_indices_multi(&md.dimensions) {
-                        for tup in Self::cartesian_indices(&lists) {
-                            let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
-                            let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
-                            let v = self.eval_expr(&rhs_f);
-                            self.assign_value(&lhs_f, &v);
-                        }
-                        continue;
+                if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                    for tup in tups {
+                        let lhs_f = Self::append_elem_path(lvalue, mname, &tup);
+                        let rhs_f = Self::append_elem_path(rvalue, mname, &tup);
+                        let v = self.eval_expr(&rhs_f);
+                        self.assign_value(&lhs_f, &v);
                     }
+                    continue;
                 }
                 let lhs_f = Self::append_member_expr(lvalue, mname);
                 let rhs_f = Self::append_member_expr(rvalue, mname);
@@ -104457,7 +104868,7 @@ impl Simulator {
             // math below instead.
             let mut consumed = 0usize;
             if !dims.is_empty() {
-                if let Some(lists) = self.member_dim_indices_multi(&dims) {
+                if let Some(lists) = self.member_dim_indices(&dims) {
                     while consumed < dims.len() {
                         let Some(MemberSel::Index(idx)) = rest.get(i + 1 + consumed) else {
                             break;
@@ -105313,13 +105724,18 @@ impl Simulator {
                 let pairs: Vec<(Expression, Expression)> = if md.dimensions.is_empty() {
                     vec![(lhs_f, rhs_f)]
                 } else {
-                    match self.member_dim_indices(&md.dimensions) {
-                        Some(idxs) if md.dimensions.len() == 1 => idxs
-                            .into_iter()
-                            .map(|i| (index_expr(&lhs_f, i), index_expr(&rhs_f, i)))
+                    match self.member_elem_indices(&md.dimensions) {
+                        Some(tups) => tups
+                            .iter()
+                            .map(|t| {
+                                (
+                                    t.iter().fold(lhs_f.clone(), |e, &i| index_expr(&e, i)),
+                                    t.iter().fold(rhs_f.clone(), |e, &i| index_expr(&e, i)),
+                                )
+                            })
                             .collect(),
-                        // Dynamic or multi-dimensional member: whole-member copy.
-                        _ => {
+                        // Dynamic member: whole-member copy.
+                        None => {
                             let v = self.eval_expr(&rhs_f);
                             self.assign_value(&lhs_f, &v);
                             continue;
@@ -105775,7 +106191,7 @@ impl Simulator {
         if dimensions.is_empty() {
             return false;
         }
-        self.assign_pattern_array(&scoped, &dimensions, &data_type, items, false);
+        self.assign_pattern_array(&scoped, &dimensions, &data_type, items, &[]);
         true
     }
 
@@ -106018,28 +106434,82 @@ impl Simulator {
                 self.assign_pattern_or_leaf(&target, mdt, e);
                 continue;
             }
-            // Array member: an inner pattern supplies one value per element,
-            // anything else (typically `default:`) fills every element.
-            let Some(idxs) = self.member_dim_indices(dims) else {
+            // Array member: spread over every dimension.
+            let Some(lists) = self.member_dim_indices(dims) else {
                 continue;
             };
-            match &e.kind {
-                ExprKind::AssignmentPattern(sub) if !sub.is_empty() => {
-                    for (k, idx) in idxs.iter().enumerate() {
-                        if let Some(se) = sub.get(k) {
-                            self.assign_pattern_or_leaf(
-                                &format!("{}[{}]", target, idx),
-                                mdt,
-                                se.expr(),
-                            );
+            self.assign_pattern_over_dims(&target, mdt, &lists, e);
+        }
+    }
+
+    /// Spread one pattern item over the unpacked array rooted at `target`,
+    /// whose remaining dimensions are `lists` (declared order, outermost
+    /// first). IEEE 1800-2017 §10.10: a nested pattern supplies the elements
+    /// of the outermost dimension left bound first — positionally, by
+    /// `index:` key, or through `default:` for any element left unset — and
+    /// each item recurses into the next dimension. Anything that is not a
+    /// pattern (a `default:` value of the enclosing struct pattern, say)
+    /// fills every element below.
+    fn assign_pattern_over_dims(
+        &mut self,
+        target: &str,
+        dt: &DataType,
+        lists: &[Vec<i64>],
+        e: &Expression,
+    ) {
+        let Some((first, rest)) = lists.split_first() else {
+            self.assign_pattern_or_leaf(target, dt, e);
+            return;
+        };
+        match &e.kind {
+            ExprKind::AssignmentPattern(sub) => {
+                self.assign_pattern_items_over_dims(target, dt, lists, sub);
+            }
+            _ => {
+                for idx in first {
+                    self.assign_pattern_over_dims(&format!("{}[{}]", target, idx), dt, rest, e);
+                }
+            }
+        }
+    }
+
+    /// The pattern-items half of [`assign_pattern_over_dims`]: `sub` are the
+    /// items of a pattern over the outermost of `lists`.
+    fn assign_pattern_items_over_dims(
+        &mut self,
+        target: &str,
+        dt: &DataType,
+        lists: &[Vec<i64>],
+        sub: &[AssignmentPatternItem],
+    ) {
+        let Some((first, rest)) = lists.split_first() else {
+            return;
+        };
+        let mut per_elem: Vec<Option<&Expression>> = vec![None; first.len()];
+        let mut dflt: Option<&Expression> = None;
+        let mut pos = 0usize;
+        for item in sub {
+            match item {
+                AssignmentPatternItem::Ordered(v) => {
+                    if let Some(slot) = per_elem.get_mut(pos) {
+                        *slot = Some(v);
+                    }
+                    pos += 1;
+                }
+                AssignmentPatternItem::Keyed(k, v) => {
+                    if let Some(key) = self.eval_expr(k).to_i64() {
+                        if let Some(p) = first.iter().position(|&i| i == key) {
+                            per_elem[p] = Some(v);
                         }
                     }
                 }
-                _ => {
-                    for idx in idxs {
-                        self.assign_pattern_or_leaf(&format!("{}[{}]", target, idx), mdt, e);
-                    }
-                }
+                AssignmentPatternItem::Default(v) => dflt = Some(v),
+                _ => {}
+            }
+        }
+        for (p, idx) in first.iter().enumerate() {
+            if let Some(v) = per_elem[p].or(dflt) {
+                self.assign_pattern_over_dims(&format!("{}[{}]", target, idx), dt, rest, v);
             }
         }
     }
@@ -106144,44 +106614,57 @@ impl Simulator {
         for m in &su.members {
             let resolved = self.resolve_dt(&m.data_type);
             for md in &m.declarators {
-                if !md.dimensions.is_empty() {
-                    continue;
-                }
-                let leaf = format!("{}.{}", base, md.name.name);
-                match &resolved {
-                    DT::Struct(inner) if Self::spreads_member_wise(inner) => {
-                        let inner = inner.clone();
-                        self.zero_two_state_members(&leaf, &inner);
+                let mbase = format!("{}.{}", base, md.name.name);
+                // §7.4.2: a member with fixed unpacked dimensions is one leaf
+                // per element, each defaulting like a scalar member; a
+                // dynamic member has no leaves to seed.
+                let leaves: Vec<String> = if md.dimensions.is_empty() {
+                    vec![mbase]
+                } else {
+                    match self.member_elem_indices(&md.dimensions) {
+                        Some(tups) => tups
+                            .iter()
+                            .map(|t| format!("{}{}", mbase, Self::index_suffix(t)))
+                            .collect(),
+                        None => continue,
                     }
-                    DT::IntegerVector { kind: IVT::Bit, .. }
-                    | DT::IntegerAtom {
-                        kind: IAT::Byte | IAT::ShortInt | IAT::Int | IAT::LongInt,
-                        ..
-                    } => {
-                        // The leaf is 2-state: later writes drop X/Z too.
-                        if let Some(&id) = self.signal_name_to_id.get(leaf.as_str()) {
-                            if let Some(t) = self.signal_two_state.get_mut(id) {
-                                *t = true;
+                };
+                for leaf in leaves {
+                    match &resolved {
+                        DT::Struct(inner) if Self::spreads_member_wise(inner) => {
+                            let inner = inner.clone();
+                            self.zero_two_state_members(&leaf, &inner);
+                        }
+                        DT::IntegerVector { kind: IVT::Bit, .. }
+                        | DT::IntegerAtom {
+                            kind: IAT::Byte | IAT::ShortInt | IAT::Int | IAT::LongInt,
+                            ..
+                        } => {
+                            // The leaf is 2-state: later writes drop X/Z too.
+                            if let Some(&id) = self.signal_name_to_id.get(leaf.as_str()) {
+                                if let Some(t) = self.signal_two_state.get_mut(id) {
+                                    *t = true;
+                                }
+                            }
+                            // Overwrite an ALL-X current value too: the member
+                            // signal may be pre-registered x-filled. A restored
+                            // declared initializer is never fully x, so it wins.
+                            let cur = self.get_signal_value_by_name(&leaf);
+                            let untouched = cur.as_ref().is_none_or(|v| *v == Value::new(v.width));
+                            if untouched {
+                                let w = cur.map(|v| v.width).unwrap_or_else(|| {
+                                    crate::elaborate::resolve_type_width(
+                                        &m.data_type,
+                                        Some(&self.module.parameters),
+                                        Some(&self.module.typedefs),
+                                    )
+                                    .max(1)
+                                });
+                                self.set_signal_value_by_name(&leaf, Value::zero(w));
                             }
                         }
-                        // Overwrite an ALL-X current value too: the member
-                        // signal may be pre-registered x-filled. A restored
-                        // declared initializer is never fully x, so it wins.
-                        let cur = self.get_signal_value_by_name(&leaf);
-                        let untouched = cur.as_ref().is_none_or(|v| *v == Value::new(v.width));
-                        if untouched {
-                            let w = cur.map(|v| v.width).unwrap_or_else(|| {
-                                crate::elaborate::resolve_type_width(
-                                    &m.data_type,
-                                    Some(&self.module.parameters),
-                                    Some(&self.module.typedefs),
-                                )
-                                .max(1)
-                            });
-                            self.set_signal_value_by_name(&leaf, Value::zero(w));
-                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -106190,7 +106673,20 @@ impl Simulator {
     fn struct_storage_exists(&self, src: &str, su: &crate::ast::types::StructUnionType) -> bool {
         su.members.iter().any(|m| {
             m.declarators.iter().any(|md| {
-                let leaf = format!("{}.{}", src, md.name.name);
+                let mut leaf = format!("{}.{}", src, md.name.name);
+                // A member with fixed unpacked dimensions is stored per
+                // element, and a nested unpacked struct per leaf: probe the
+                // first of them (a struct whose members are all arrays, like
+                // `struct { bit [7:0] m [2][2]; }`, has no `src.m` at all).
+                if let Some(lists) = self.member_dim_indices(&md.dimensions) {
+                    let first: Vec<i64> = lists.iter().map(|l| l[0]).collect();
+                    leaf.push_str(&Self::index_suffix(&first));
+                }
+                if let Some(inner) = self.unpacked_struct_of(&m.data_type) {
+                    if self.struct_storage_exists(&leaf, &inner) {
+                        return true;
+                    }
+                }
                 self.signal_name_to_id.contains_key(leaf.as_str())
                     || self.signals.contains_key(&leaf)
                     // a subroutine-local struct / member-wise-bound FORMAL
@@ -106207,6 +106703,115 @@ impl Simulator {
                     || self.signals.contains_key(&format!("{}.size", leaf))
             })
         })
+    }
+
+    /// IEEE 1800-2017 §10.4.2: the per-leaf updates of a nonblocking
+    /// assignment whose target is a whole UNPACKED struct (a variable, an
+    /// array element or a struct-typed member), as `(leaf lvalue, value)`
+    /// pairs with every source value read now. The struct has no storage of
+    /// its own, so the single update the generic path queues against the
+    /// struct's name landed nowhere and every member — scalar ones included —
+    /// read back garbage. `None` when the target is anything else.
+    fn unpacked_struct_nba_leaves(
+        &mut self,
+        lvalue: &Expression,
+        rvalue: &Expression,
+    ) -> Option<Vec<(Expression, Value)>> {
+        match &lvalue.kind {
+            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {}
+            ExprKind::MemberAccess { .. } | ExprKind::Index { .. } => {}
+            _ => return None,
+        }
+        if matches!(rvalue.kind, ExprKind::AssignmentPattern(_))
+            || !Self::expr_root_first_seg(lvalue).is_some_and(|r| self.struct_root_possible(r))
+        {
+            return None;
+        }
+        let dst = self.flat_member_name(lvalue)?;
+        let (dst, su) = self.struct_copy_target(dst);
+        let su = su?;
+        if self.module.dynamic_arrays.contains(&dst)
+            || self.module.arrays.contains_key(&dst)
+            || self.module.associative_arrays.contains_key(&dst)
+        {
+            return None;
+        }
+        let mut leaves = Vec::new();
+        self.unpacked_struct_leaves(&dst, lvalue, &su, 0, &mut leaves);
+        if leaves.is_empty() {
+            return None;
+        }
+        // A source with storage of its own is read leaf by leaf, like the
+        // blocking copy; anything else (a call, a class property) is one
+        // packed value laid out like `struct_leaf_layout` — reverse leaf
+        // order, ascending offsets.
+        let src = self
+            .flat_member_name(rvalue)
+            .filter(|s| self.struct_storage_exists(s, &su));
+        // Each leaf target in the parse shape of its source text
+        // (`b.mm[1][0]`), which every NBA target resolver understands.
+        let leaves: Vec<(String, Expression, u32, bool)> = leaves
+            .into_iter()
+            .map(|(key, _, w, is_real)| {
+                let lexpr = Self::append_leaf_path(lvalue, &key[dst.len()..]);
+                (key, lexpr, w, is_real)
+            })
+            .collect();
+        let mut out = Vec::with_capacity(leaves.len());
+        match src {
+            Some(src) => {
+                for (key, lexpr, _, _) in leaves {
+                    let skey = Self::name_with_suffix(&src, &key[dst.len()..]);
+                    if let Some(v) = self.get_signal_value_by_name(&skey) {
+                        out.push((lexpr, v));
+                    }
+                }
+            }
+            None => {
+                let v = self.eval_expr(rvalue);
+                let mut off = 0u32;
+                let mut rev = Vec::with_capacity(leaves.len());
+                for (_, lexpr, w, is_real) in leaves.into_iter().rev() {
+                    let mut mv = Value::new(w);
+                    for i in 0..w {
+                        mv.set_bit(i as usize, v.get_bit((off + i) as usize));
+                    }
+                    off += w;
+                    if is_real {
+                        mv = Value::from_f64(f64::from_bits(mv.to_u64().unwrap_or(0)));
+                    }
+                    rev.push((lexpr, mv));
+                }
+                out.extend(rev.into_iter().rev());
+            }
+        }
+        Some(out)
+    }
+
+    /// `base` followed by the member / index path `suffix` of a leaf key
+    /// (`.mm[1][0]`, `.body.sd[1]`), built in the parse shape of the same
+    /// source text: a member step extends an identifier path, an index step
+    /// wraps in `Index`.
+    fn append_leaf_path(base: &Expression, suffix: &str) -> Expression {
+        let mut out = base.clone();
+        let mut rest = suffix;
+        loop {
+            if let Some(r) = rest.strip_prefix('.') {
+                let end = r.find(['.', '[']).unwrap_or(r.len());
+                out = Self::append_member_expr(&out, &r[..end]);
+                rest = &r[end..];
+            } else if let Some(r) = rest.strip_prefix('[') {
+                let Some(end) = r.find(']') else { break };
+                let Ok(i) = r[..end].parse::<i64>() else {
+                    break;
+                };
+                out = Self::index_expr(&out, i);
+                rest = &r[end + 1..];
+            } else {
+                break;
+            }
+        }
+        out
     }
 
     /// Copy every leaf of an unpacked struct from `src` to `dst`.
@@ -106254,12 +106859,13 @@ impl Simulator {
                         }
                     }
                     self.set_queue_size(&d, n);
-                } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
+                } else if let Some(tups) = self.member_elem_indices(&md.dimensions) {
                     // An array of unpacked STRUCTS has no element leaf of its
                     // own — each element copies member by member.
                     let elem_su = self.unpacked_struct_of(&m.data_type);
-                    for i in idxs {
-                        let (di, si) = (format!("{}[{}]", d, i), format!("{}[{}]", sname, i));
+                    for t in tups {
+                        let sfx = Self::index_suffix(&t);
+                        let (di, si) = (format!("{}{}", d, sfx), format!("{}{}", sname, sfx));
                         if let Some(inner) = &elem_su {
                             self.copy_unpacked_struct(&di, &si, inner);
                         } else if let Some(v) = self.get_signal_value_by_name(&si) {
@@ -106513,16 +107119,17 @@ impl Simulator {
                         }
                     }
                     out.push(base);
-                } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
+                } else if let Some(tups) = self.member_elem_indices(&md.dimensions) {
                     let inner = self.unpacked_struct_of(&m.data_type);
-                    for i in idxs {
+                    for t in tups {
+                        let elem = format!("{}{}", base, Self::index_suffix(&t));
                         match &inner {
                             Some(inner) => {
                                 for sfx in self.struct_leaf_suffixes(inner) {
-                                    out.push(format!("{}[{}].{}", base, i, sfx));
+                                    out.push(format!("{}.{}", elem, sfx));
                                 }
                             }
-                            None => out.push(format!("{}[{}]", base, i)),
+                            None => out.push(elem),
                         }
                     }
                 }
@@ -106785,14 +107392,17 @@ impl Simulator {
         dims: &[(i64, i64)],
         dt: &DataType,
         items: &[AssignmentPatternItem],
-        descending: bool,
+        descending: &[bool],
     ) {
         let (lo, hi) = dims[0];
-        let indices: Vec<i64> = if descending && dims.len() == 1 {
+        // §10.10: positional items fill the LEFT bound first, so a
+        // descending dimension (`[1:0]`) takes its first item at index 1.
+        let indices: Vec<i64> = if descending.first().copied().unwrap_or(false) {
             (lo..=hi).rev().collect()
         } else {
             (lo..=hi).collect()
         };
+        let inner_desc = descending.get(1..).unwrap_or(&[]);
         let elems = self.pattern_elems(items, &indices);
         for (k, e) in elems.into_iter().enumerate() {
             let Some(e) = e else { continue };
@@ -106800,7 +107410,7 @@ impl Simulator {
             if dims.len() > 1 {
                 match &e.kind {
                     ExprKind::AssignmentPattern(sub) if !sub.is_empty() => {
-                        self.assign_pattern_array(&target, &dims[1..], dt, sub, descending);
+                        self.assign_pattern_array(&target, &dims[1..], dt, sub, inner_desc);
                     }
                     _ => self.fill_dims(&target, &dims[1..], dt, e),
                 }
@@ -107116,8 +107726,18 @@ impl Simulator {
             if cells <= 0 || cells > (1 << 20) {
                 return false;
             }
-            let descending = self.module.descending_arrays.contains(base);
-            self.assign_pattern_array(base, &dims, &dt, items, descending);
+            // Each dimension's direction from its declared bounds; without
+            // them only the outermost one is known.
+            let descending: Vec<bool> = match self
+                .module
+                .unpacked_decl_dims
+                .get(base)
+                .filter(|d| d.len() == dims.len())
+            {
+                Some(decl) => decl.iter().map(|&(l, r)| l > r).collect(),
+                None => vec![dims.len() == 1 && self.module.descending_arrays.contains(base)],
+            };
+            self.assign_pattern_array(base, &dims, &dt, items, &descending);
             return true;
         }
 
@@ -107178,17 +107798,16 @@ impl Simulator {
         // Unindexed unpacked array member: one pattern item per element. The
         // element type need not be a struct — `real m[3] = '{1.1, 2.2, 3.3}`
         // spreads exactly the same way.
-        if let Some(idxs) = arr {
+        // A member with several dimensions takes one nested pattern level
+        // per dimension (§10.10).
+        if let Some(lists) = arr {
             if !items
                 .iter()
                 .all(|i| matches!(i, AssignmentPatternItem::Ordered(_)))
             {
                 return false;
             }
-            for (k, idx) in idxs.iter().enumerate() {
-                let Some(item) = items.get(k) else { break };
-                self.assign_pattern_or_leaf(&format!("{}[{}]", flat, idx), &dt, item.expr());
-            }
+            self.assign_pattern_items_over_dims(flat, &dt, &lists, items);
             return true;
         }
         let DataType::Struct(su) = self.resolve_dt(&dt) else {
@@ -107253,9 +107872,11 @@ impl Simulator {
 
     /// Declared type of a flattened SUB-PATH (`c.nodes[0].str`, `cmb[20]`),
     /// which has no declaration of its own — walk the base variable's declared
-    /// type. The second element holds the element indices when the path still
-    /// names an unindexed unpacked array (so `%p` can print an element list).
-    fn flat_path_type(&self, flat: &str) -> Option<(DataType, Option<Vec<i64>>)> {
+    /// type. The second element holds the index list of every dimension the
+    /// path leaves unselected when it still names an unpacked array — all of
+    /// a member's dimensions for `s.mm`, the inner ones for `s.mm[1]` — so
+    /// `%p`, `$bits` and pattern assignment see the whole sub-array.
+    fn flat_path_type(&self, flat: &str) -> Option<(DataType, Option<Vec<Vec<i64>>>)> {
         // Without a select the first segment is the text before the first
         // `.`; a base with no declared type answers None before any split.
         if !flat.as_bytes().contains(&b'[') {
@@ -107268,13 +107889,13 @@ impl Simulator {
         let (base, base_idx) = segs.first()?.clone();
         // For an array (or associative array) this is already the ELEMENT type.
         let mut dt = self.module.var_decl_types.get(&base)?.clone();
-        let mut arr: Option<Vec<i64>> =
+        let mut arr: Option<Vec<Vec<i64>>> =
             if base_idx > 0 || self.module.associative_arrays.contains_key(&base) {
                 None
             } else {
                 self.module.arrays.get(&base).and_then(|&(lo, hi, _)| {
                     if hi >= lo && hi - lo < 4096 {
-                        Some((lo..=hi).collect())
+                        Some(vec![(lo..=hi).collect()])
                     } else {
                         None
                     }
@@ -107292,11 +107913,10 @@ impl Simulator {
                     .map(|md| (m.data_type.clone(), md.dimensions.clone()))
             })?;
             dt = mdt;
-            arr = if *nidx > 0 || dims.is_empty() {
-                None
-            } else {
-                self.member_dim_indices(&dims)
-            };
+            arr = self
+                .member_dim_indices(&dims)
+                .filter(|lists| *nidx < lists.len())
+                .map(|lists| lists[*nidx..].to_vec());
         }
         Some((dt, arr))
     }
@@ -107362,17 +107982,23 @@ impl Simulator {
     /// element may itself be a collection (an array of queues), so it goes back
     /// through `render_p_var` first.
     fn render_p_dims(&mut self, base: &str, dims: &[(i64, i64)], dt: &DataType) -> String {
-        let (lo, hi) = dims[0];
+        let lists: Vec<Vec<i64>> = dims.iter().map(|&(lo, hi)| (lo..=hi).collect()).collect();
+        self.render_p_dim_lists(base, &lists, dt)
+    }
+
+    /// `render_p_dims` over explicit per-dimension index lists, so a
+    /// descending dimension prints left bound first (§21.2.1.7).
+    fn render_p_dim_lists(&mut self, base: &str, lists: &[Vec<i64>], dt: &DataType) -> String {
         let mut parts: Vec<String> = Vec::new();
-        for i in lo..=hi {
+        for &i in &lists[0] {
             let elem = format!("{}[{}]", base, i);
-            if dims.len() == 1 {
+            if lists.len() == 1 {
                 let rendered = self
                     .render_p_var(&elem)
                     .unwrap_or_else(|| self.render_p_typed(&elem, dt));
                 parts.push(rendered);
             } else {
-                parts.push(self.render_p_dims(&elem, &dims[1..], dt));
+                parts.push(self.render_p_dim_lists(&elem, &lists[1..], dt));
             }
         }
         format!("'{{{}}}", parts.join(", "))
@@ -107539,6 +108165,26 @@ impl Simulator {
         if self.module.arrays_2d.contains_key(name) || self.module.arrays_nd.contains_key(name) {
             let dims = self.foreach_dims(name)?;
             let dt = self.p_elem_type(name)?;
+            // Declared bounds give each dimension's direction: `[1:0]`
+            // prints element 1 first.
+            if let Some(decl) = self
+                .module
+                .unpacked_decl_dims
+                .get(name)
+                .filter(|d| d.len() == dims.len())
+            {
+                let lists: Vec<Vec<i64>> = decl
+                    .iter()
+                    .map(|&(l, r)| {
+                        if l <= r {
+                            (l..=r).collect()
+                        } else {
+                            (r..=l).rev().collect()
+                        }
+                    })
+                    .collect();
+                return Some(self.render_p_dim_lists(name, &lists, &dt));
+            }
             return Some(self.render_p_dims(name, &dims, &dt));
         }
         // A PARTIAL index into one (`q3[1]` of `int q3[2][2][$]`) still names a
@@ -107600,28 +108246,8 @@ impl Simulator {
         }
         let Some(dt) = self.module.var_decl_types.get(name).cloned() else {
             let (dt, arr) = self.flat_path_type(name)?;
-            if let Some(idxs) = arr {
-                let parts: Vec<String> = idxs
-                    .iter()
-                    .map(|i| {
-                        // An element may itself be a collection (`int aq[2][$]`:
-                        // each `aq[i]` is a queue). A LOCAL such array has no
-                        // `var_decl_types` entry, so recurse through `render_p_var`
-                        // when the element is a registered collection; otherwise
-                        // it renders as the scalar element type.
-                        let elem = format!("{}[{}]", name, i);
-                        if self.module.dynamic_arrays.contains(&elem)
-                            || self.module.associative_arrays.contains_key(&elem)
-                            || self.module.arrays.contains_key(&elem)
-                        {
-                            if let Some(nested) = self.render_p_var(&elem) {
-                                return nested;
-                            }
-                        }
-                        self.render_p_typed(&elem, &dt)
-                    })
-                    .collect();
-                return Some(format!("'{{{}}}", parts.join(", ")));
+            if let Some(lists) = arr {
+                return Some(self.render_p_elem_lists(name, &dt, &lists));
             }
             return Some(self.render_p_typed(name, &dt));
         };
@@ -107740,6 +108366,38 @@ impl Simulator {
         format!("'{{{}}}", parts.join(", "))
     }
 
+    /// `%p` of the unpacked array rooted at flat name `name` whose dimensions
+    /// are `lists` (declared order, outermost first): one nested `'{...}` per
+    /// dimension, left bound first (IEEE 1800-2017 §21.2.1.7).
+    fn render_p_elem_lists(&mut self, name: &str, dt: &DataType, lists: &[Vec<i64>]) -> String {
+        let Some((first, rest)) = lists.split_first() else {
+            return self.render_p_typed(name, dt);
+        };
+        let parts: Vec<String> = first
+            .iter()
+            .map(|i| {
+                let elem = format!("{}[{}]", name, i);
+                if rest.is_empty() {
+                    // An element may itself be a collection (`int aq[2][$]`:
+                    // each `aq[i]` is a queue). A LOCAL such array has no
+                    // `var_decl_types` entry, so recurse through `render_p_var`
+                    // when the element is a registered collection; otherwise
+                    // it renders as the scalar element type.
+                    if self.module.dynamic_arrays.contains(&elem)
+                        || self.module.associative_arrays.contains_key(&elem)
+                        || self.module.arrays.contains_key(&elem)
+                    {
+                        if let Some(nested) = self.render_p_var(&elem) {
+                            return nested;
+                        }
+                    }
+                }
+                self.render_p_elem_lists(&elem, dt, rest)
+            })
+            .collect();
+        format!("'{{{}}}", parts.join(", "))
+    }
+
     /// Render the value stored at flat signal `name`, interpreted as `dt`.
     fn render_p_typed(&mut self, name: &str, dt: &DataType) -> String {
         use crate::ast::types::SimpleType;
@@ -107782,14 +108440,8 @@ impl Simulator {
                         let mbase = format!("{}.{}", name, md.name.name);
                         let rendered = if md.dimensions.is_empty() {
                             self.render_p_typed(&mbase, &m.data_type)
-                        } else if let Some(idxs) = self.member_dim_indices(&md.dimensions) {
-                            let elems: Vec<String> = idxs
-                                .into_iter()
-                                .map(|i| {
-                                    self.render_p_typed(&format!("{}[{}]", mbase, i), &m.data_type)
-                                })
-                                .collect();
-                            format!("'{{{}}}", elems.join(", "))
+                        } else if let Some(lists) = self.member_dim_indices(&md.dimensions) {
+                            self.render_p_elem_lists(&mbase, &m.data_type, &lists)
                         } else {
                             // Dynamic / queue / associative member: size unknown here.
                             "'{}".to_string()
@@ -120425,19 +121077,11 @@ impl Simulator {
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
                 let mexpr = mk_member(base, &md.name.name);
-                let idxs = if md.dimensions.is_empty() {
-                    None
-                } else {
-                    self.member_dim_indices_multi(&md.dimensions)
-                };
-                match idxs {
-                    Some(lists) => {
-                        // Cartesian expansion, last dimension varying
-                        // fastest — `m[2][3]` addresses elements `m[i][j]`.
-                        // A single dimension yields exactly the list the
-                        // one-dimension form produced, so 1-D leaf keys are
-                        // unchanged.
-                        for tup in Self::cartesian_indices(&lists) {
+                match self.member_elem_indices(&md.dimensions) {
+                    Some(tups) => {
+                        // Every element, last dimension varying fastest —
+                        // `m[2][3]` addresses elements `m[i][j]`.
+                        for tup in tups {
                             let mut ekey = mkey.clone();
                             let mut eexpr = mexpr.clone();
                             for i in tup {
@@ -120518,13 +121162,12 @@ impl Simulator {
             for md in &m.declarators {
                 let mkey = format!("{}.{}", key_prefix, md.name.name);
                 // Same keys as `unpacked_struct_leaves`.
-                let keys = if md.dimensions.is_empty() {
-                    vec![mkey]
-                } else {
-                    match self.member_dim_indices(&md.dimensions) {
-                        Some(list) => list.iter().map(|i| format!("{}[{}]", mkey, i)).collect(),
-                        None => vec![mkey],
-                    }
+                let keys = match self.member_elem_indices(&md.dimensions) {
+                    Some(tups) => tups
+                        .iter()
+                        .map(|t| format!("{}{}", mkey, Self::index_suffix(t)))
+                        .collect(),
+                    None => vec![mkey],
                 };
                 for k in keys {
                     match &nested {
@@ -120744,6 +121387,7 @@ impl Simulator {
         let mut leaves = Vec::new();
         self.unpacked_struct_leaves(port_name, arg, &su, 0, &mut leaves);
         self.any_struct_formal_markers = true;
+        self.note_struct_root(port_name);
         locals.insert(format!("{}.", port_name), Value::zero(1));
         // A positional STRUCT pattern literal actual (`'{a, b}`) can't be read
         // member-by-member (`.a` on a pattern returns x), so bind its evaluated
@@ -120839,6 +121483,57 @@ impl Simulator {
             .last()
             .is_some_and(|l| l.contains_key(&flat))
             .then_some(flat)
+    }
+
+    /// IEEE 1800-2017 §7.2/§7.4.2: the stored leaf that `base[index]` names
+    /// when `base` is itself an element select below a struct member —
+    /// `s.mm[i][j]`, `arr[k].mm[i][j]`, `s.inner.m3[i][j][k]`. Every element
+    /// of a member with two or more unpacked dimensions is its own leaf,
+    /// keyed by the full index list. The generic element arms key off the
+    /// `arrays_2d`/`arrays_nd` shape of a plain identifier, which a
+    /// member reached through an index (`arr[k].mm`), a synthesized
+    /// member-access chain (a formal's caller expression, a member-wise
+    /// copy) or a block-local struct never has; they then read `s.mm[i]` and
+    /// bit-selected it. `None` unless such a leaf exists, so every other
+    /// select keeps its existing path.
+    fn struct_member_elem_leaf(&mut self, base: &Expression, index: &Expression) -> Option<String> {
+        if !matches!(base.kind, ExprKind::Index { .. })
+            || !self.multidim_members_possible()
+            || !Self::cond_expr_is_effect_free(index)
+        {
+            return None;
+        }
+        let mut cur = base;
+        while let ExprKind::Index { expr, index } = &cur.kind {
+            if !Self::cond_expr_is_effect_free(index) {
+                return None;
+            }
+            cur = expr;
+        }
+        let member_path = match &cur.kind {
+            ExprKind::MemberAccess { .. } => true,
+            ExprKind::Ident(h) => h.path.len() >= 2,
+            _ => false,
+        };
+        if !member_path
+            || !Self::expr_root_first_seg(cur).is_some_and(|r| self.struct_root_possible(r))
+        {
+            return None;
+        }
+        let bflat = self.flat_member_name(base)?;
+        let iv = self.eval_expr(index);
+        if iv.has_xz() {
+            return None;
+        }
+        let leaf = Self::name_with_index(&bflat, iv.to_i64()?);
+        let exists = |sim: &Self, n: &str| {
+            sim.signal_name_to_id.contains_key(n) || sim.signals.contains_key(n)
+        };
+        if exists(self, &leaf) {
+            return Some(leaf);
+        }
+        // Inside an inlined instance the leaf carries the instance prefix.
+        self.hint_scoped(&leaf).filter(|s| exists(self, s))
     }
 
     /// The leading identifier of a member/index chain (`s` in `s.arr[2].x`).
@@ -120948,6 +121643,47 @@ impl Simulator {
             .iter()
             .flat_map(|m| m.declarators.iter().map(|md| md.name.name.clone()))
             .collect();
+        // §7.2/§13.5.2: a member with fixed unpacked dimensions, or one that
+        // is itself an unpacked struct, has no storage of its own — only its
+        // leaves do. Binding it as ONE value left `a.arr[i]` and
+        // `a.inner.x` unbound in the method body, so bind every leaf, as a
+        // module-scope subroutine's formal does. A struct of plain members
+        // keeps the per-member binding below.
+        let nested_leaves = su.members.iter().any(|m| {
+            self.unpacked_struct_of(&m.data_type).is_some()
+                || m.declarators
+                    .iter()
+                    .any(|md| self.member_dim_indices(&md.dimensions).is_some())
+        });
+        if nested_leaves {
+            let mut leaves = Vec::new();
+            self.unpacked_struct_leaves(port_name, arg, &su, 0, &mut leaves);
+            // The `<port>.` marker routes indexed / nested member references
+            // to the frame (see `frame_leaf_key_of`).
+            self.any_struct_formal_markers = true;
+            self.note_struct_root(port_name);
+            locals.insert(format!("{}.", port_name), Value::zero(1));
+            let pattern_vals = self.eval_flat_struct_pattern(arg, leaves.len());
+            for (pos, (key, caller_expr, _, _)) in leaves.into_iter().enumerate() {
+                let v = match &pattern_vals {
+                    Some(pv) => pv[pos].clone(),
+                    None => self.eval_expr(&caller_expr),
+                };
+                locals.insert(key.clone(), v);
+                // A top-level member writes back through the same lvalue
+                // form as the per-member binding below.
+                let top = key
+                    .strip_prefix(port_name)
+                    .and_then(|k| k.strip_prefix('.'))
+                    .filter(|k| flat_names.iter().any(|n| n == k));
+                let lv = match top {
+                    Some(m) => Self::struct_member_lvalue(arg, m),
+                    None => caller_expr,
+                };
+                entries.push((key, lv));
+            }
+            return Some(entries);
+        }
         let pattern_vals = self.eval_flat_struct_pattern(arg, flat_names.len());
         let mut member_pos = 0usize;
         for m in &su.members {
