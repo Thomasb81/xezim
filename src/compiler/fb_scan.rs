@@ -29,9 +29,18 @@ pub(crate) const WRITE: u8 = 2;
 pub(crate) const HIER: u8 = 4;
 /// The target of a nonblocking assignment.
 pub(crate) const NBA: u8 = 8;
+/// An argument of `$strobe`/`$monitor`: evaluated after the statement
+/// (end of time step, or on every later change), when no carried frame
+/// exists any more.
+pub(crate) const DEFER: u8 = 16;
+
+/// Per-argument "is an input formal" for a user subroutine named by a call,
+/// or None when the callee is unknown (every argument then counts as
+/// possibly written).
+pub(crate) type CalleeInputs<'a> = &'a dyn Fn(&str) -> Option<Vec<bool>>;
 
 #[derive(Default)]
-pub(crate) struct FbScan {
+pub(crate) struct FbScan<'a> {
     /// Every simple name the fragment uses, with its flags OR-ed together.
     pub names: Vec<(String, u8)>,
     /// Names the fragment itself declares (`VarDecl`, `for (int i ...)`,
@@ -39,8 +48,39 @@ pub(crate) struct FbScan {
     pub decls: Vec<String>,
     /// Why carrying locals across this fragment is unsound, if it is.
     pub bad: Option<&'static str>,
+    /// Formal directions of the subroutines the fragment calls.
+    pub callee_inputs: Option<CalleeInputs<'a>>,
     loop_depth: u32,
+    /// Inside the arguments of a deferred system task (see `DEFER`).
+    defer: u32,
     blocks: Vec<String>,
+}
+
+/// Built-in methods whose arguments are all inputs (§7.9, §7.10, §7.12,
+/// §6.16): any other method may write one (`first(k)`, `next(k)`, ...).
+fn method_reads_args(name: &str) -> bool {
+    matches!(
+        name,
+        "exists"
+            | "delete"
+            | "num"
+            | "size"
+            | "push_back"
+            | "push_front"
+            | "insert"
+            | "len"
+            | "getc"
+            | "substr"
+            | "toupper"
+            | "tolower"
+            | "compare"
+            | "icompare"
+            | "atoi"
+            | "atohex"
+            | "atooct"
+            | "atobin"
+            | "atoreal"
+    )
 }
 
 /// System calls that never write through an argument. Any other system call
@@ -124,8 +164,28 @@ fn syscall_reads_only(name: &str) -> bool {
     )
 }
 
-impl FbScan {
+impl<'a> FbScan<'a> {
+    pub(crate) fn new(callee_inputs: Option<CalleeInputs<'a>>) -> Self {
+        FbScan {
+            callee_inputs,
+            ..Default::default()
+        }
+    }
+
+    /// The result of a finished scan, without the callee lookup it borrowed.
+    pub(crate) fn detach(self) -> FbScan<'static> {
+        FbScan {
+            names: self.names,
+            decls: self.decls,
+            bad: self.bad,
+            ..Default::default()
+        }
+    }
+}
+
+impl FbScan<'_> {
     fn note(&mut self, name: &str, flags: u8) {
+        let flags = if self.defer > 0 { flags | DEFER } else { flags };
         if let Some(e) = self.names.iter_mut().find(|(n, _)| n == name) {
             e.1 |= flags;
         } else {
@@ -279,23 +339,45 @@ impl FbScan {
                 // The callee is a subroutine name, not a variable — except a
                 // method call through a variable (`s.len()`), whose receiver
                 // the interpreter resolves by name.
-                if let ExprKind::Ident(h) = &func.kind {
-                    if h.path.len() > 1 {
-                        for seg in &h.path[..h.path.len() - 1] {
-                            self.note(&seg.name.name, HIER);
+                let mut inputs: Option<Vec<bool>> = None;
+                match &func.kind {
+                    ExprKind::Ident(h) => {
+                        if h.path.len() > 1 {
+                            for seg in &h.path[..h.path.len() - 1] {
+                                self.note(&seg.name.name, HIER);
+                            }
+                            let m = &h.path[h.path.len() - 1].name.name;
+                            if method_reads_args(m) {
+                                inputs = Some(vec![true; args.len()]);
+                            }
+                        } else if h.root.is_none() {
+                            inputs = self.callee_inputs.and_then(|f| f(&h.path[0].name.name));
+                        }
+                        for seg in &h.path {
+                            for s in &seg.selects {
+                                self.expr(s);
+                            }
                         }
                     }
-                    for seg in &h.path {
-                        for s in &seg.selects {
-                            self.expr(s);
+                    ExprKind::MemberAccess { member, .. } => {
+                        if method_reads_args(&member.name) {
+                            inputs = Some(vec![true; args.len()]);
                         }
+                        self.expr_with(func, HIER);
                     }
-                } else {
-                    self.expr_with(func, HIER);
+                    _ => self.expr_with(func, HIER),
                 }
                 // An argument may bind to an `output`/`ref` formal.
-                for a in args {
-                    self.call_arg(a);
+                for (i, a) in args.iter().enumerate() {
+                    let input = matches!(&a.kind, ExprKind::NamedArg { .. })
+                        .then_some(false)
+                        .or_else(|| inputs.as_ref().and_then(|v| v.get(i).copied()))
+                        .unwrap_or(false);
+                    if input {
+                        self.expr(a);
+                    } else {
+                        self.call_arg(a);
+                    }
                 }
             }
             ExprKind::SystemCall { name, args } => {
@@ -305,7 +387,17 @@ impl FbScan {
                 ) {
                     self.refuse("fb_sampled");
                 }
-                if syscall_reads_only(name) {
+                let deferred = {
+                    let base = name.trim_end_matches(['b', 'h', 'o']);
+                    matches!(base, "$strobe" | "$monitor" | "$fstrobe" | "$fmonitor")
+                };
+                if deferred {
+                    self.defer += 1;
+                    for a in args {
+                        self.expr(a);
+                    }
+                    self.defer -= 1;
+                } else if syscall_reads_only(name) {
                     for a in args {
                         self.expr(a);
                     }

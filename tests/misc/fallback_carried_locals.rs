@@ -432,3 +432,47 @@ endmodule
         ],
     );
 }
+
+#[test]
+fn deferred_and_call_arguments_of_interpreted_statements() {
+    // `$strobe` reads its arguments at the end of the time step, when a
+    // carried frame is gone: a block whose `$strobe` names a local stays on
+    // the interpreter. An unrolled loop constant passed to an input formal
+    // of a call that stays interpreted (recursive) is carried read-only.
+    let src = r#"
+module sub (input logic clk);
+  int aa [int];
+  int log_n;
+  initial begin aa[0] = 5; aa[2] = 7; end
+  // not inlinable (recursive), called with an unrolled loop constant
+  task automatic note(input int k, input int depth);
+    int d;
+    d = depth;
+    if (d > 0) note(k, d - 1);
+    else log_n = log_n + k;
+  endtask
+  always @(posedge clk) begin
+    int x;
+    x = 3;
+    $strobe("T| strobe x=%0d", x);
+    x = 4;
+    for (int k = 0; k < 3; k++)
+      if (aa.exists(k)) note(k, 1);
+    $display("T| log_n=%0d", log_n);
+  end
+endmodule
+module tb;
+  logic clk = 0;
+  sub u (.clk(clk));
+  initial begin
+    repeat (2) begin #5 clk = 1; #5 clk = 0; end
+    $finish;
+  end
+endmodule
+"#;
+    expect(
+        src,
+        1_000_000,
+        &["T| log_n=2", "T| strobe x=4", "T| log_n=4", "T| strobe x=4"],
+    );
+}

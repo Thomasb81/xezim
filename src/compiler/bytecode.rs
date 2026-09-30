@@ -1101,6 +1101,9 @@ pub struct BytecodeCompiler<'a> {
     /// before every other name source, so `state[col*4]` folds to a constant
     /// index while `col` is unrolled.
     local_const_vars: HashMap<String, Value>,
+    /// Declared type of each unrolled loop variable, for a fallback that
+    /// carries it (`fb_carry`); absent when the type is not carryable.
+    local_const_kinds: HashMap<String, LocalKind>,
     /// Register-bank locals: a small fixed-size local unpacked array whose
     /// elements live in consecutive VM registers. name -> (base reg, element
     /// width, length, declared lo index). Only CONSTANT indexes can address a
@@ -1271,6 +1274,7 @@ impl<'a> BytecodeCompiler<'a> {
             cast_widths: None,
             pattern_layout: None,
             local_const_vars: HashMap::default(),
+            local_const_kinds: HashMap::default(),
             local_array_regs: HashMap::default(),
             top_module_name: None,
             packed_elem_widths: None,
@@ -2621,6 +2625,7 @@ impl<'a> BytecodeCompiler<'a> {
             let saved_local_arrays = std::mem::take(&mut self.local_var_array);
             let saved_banks = std::mem::take(&mut self.local_array_regs);
             let saved_consts = std::mem::take(&mut self.local_const_vars);
+            let saved_const_kinds = std::mem::take(&mut self.local_const_kinds);
             let saved_const_binds = std::mem::take(&mut self.const_var_binds);
             let saved_decl_locals = std::mem::take(&mut self.decl_local_regs);
             let saved_loop_depth = std::mem::replace(&mut self.reg_var_loop_depth, 0);
@@ -2689,6 +2694,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.local_var_array = saved_local_arrays;
             self.local_array_regs = saved_banks;
             self.local_const_vars = saved_consts;
+            self.local_const_kinds = saved_const_kinds;
             self.const_var_binds = saved_const_binds;
             self.decl_local_regs = saved_decl_locals;
             self.reg_var_loop_depth = saved_loop_depth;
@@ -3167,7 +3173,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// are loaded into fresh registers here, so call this only once the
     /// fallback is certain to be emitted next.
     fn fb_carry(&mut self, scan: &super::fb_scan::FbScan) -> Result<FbLocals, &'static str> {
-        use super::fb_scan::{HIER, NBA, SEL, WRITE};
+        use super::fb_scan::{DEFER, HIER, NBA, SEL, WRITE};
         if let Some(why) = scan.bad {
             return Err(why);
         }
@@ -3190,7 +3196,7 @@ impl<'a> BytecodeCompiler<'a> {
         if scan.decls.iter().any(|d| is_local(self, d)) {
             return Err("fb_decl_shadows_local");
         }
-        let mut consts: Vec<(Arc<str>, Value)> = Vec::new();
+        let mut consts: Vec<(Arc<str>, Value, LocalKind)> = Vec::new();
         let mut out: Vec<FbLocal> = Vec::new();
         for (name, flags) in &scan.names {
             let flags = *flags;
@@ -3200,12 +3206,21 @@ impl<'a> BytecodeCompiler<'a> {
             if flags & (HIER | NBA) != 0 {
                 return Err("fb_local_by_path");
             }
+            if flags & DEFER != 0 {
+                return Err("fb_local_deferred");
+            }
             // Same precedence as `compile_expr`: an unrolled constant first.
             if let Some(v) = self.local_const_vars.get(name) {
                 if flags & WRITE != 0 {
                     return Err("fb_const_local_write");
                 }
-                consts.push((Arc::from(name.as_str()), v.clone()));
+                let Some(&kind) = self.local_const_kinds.get(name) else {
+                    return Err("fb_local_untyped");
+                };
+                if flags & SEL != 0 && !matches!(kind, LocalKind::Int { .. }) {
+                    return Err("fb_local_select");
+                }
+                consts.push((Arc::from(name.as_str()), v.clone(), kind));
                 continue;
             }
             let Some(&(reg, _)) = self.local_var_regs.get(name) else {
@@ -3231,16 +3246,57 @@ impl<'a> BytecodeCompiler<'a> {
                 kind,
             });
         }
-        for (name, v) in consts {
+        for (name, v, kind) in consts {
             let r = self.alloc_reg();
-            let kind = LocalKind::Int {
-                width: v.width,
-                signed: v.is_signed,
-            };
             self.emit(Insn::LoadConst(r, Box::new(v)));
             out.push(FbLocal { name, reg: r, kind });
         }
         Ok(out.into_boxed_slice())
+    }
+
+    /// Per-argument "binds an input formal" for a call to the user
+    /// subroutine `name` (`FbScan::callee_inputs`): None unless every
+    /// declaration the interpreter could resolve the name to — the one in
+    /// the block's own scope and the bare one — agrees.
+    fn callee_input_dirs(
+        tasks: Option<&HashMap<String, TaskDeclaration>>,
+        functions: Option<&HashMap<String, FunctionDeclaration>>,
+        scope: Option<&str>,
+        name: &str,
+    ) -> Option<Vec<bool>> {
+        let dirs = |key: &str| -> Option<Vec<bool>> {
+            let ports = tasks
+                .and_then(|t| t.get(key))
+                .map(|td| &td.ports)
+                .or_else(|| functions.and_then(|f| f.get(key)).map(|fd| &fd.ports))?;
+            Some(
+                ports
+                    .iter()
+                    .map(|p| matches!(p.direction, PortDirection::Input))
+                    .collect(),
+            )
+        };
+        let scoped = scope.and_then(|sc| dirs(&format!("{sc}.{name}")));
+        let bare = dirs(name);
+        match (scoped, bare) {
+            (Some(a), Some(b)) => (a == b).then_some(a),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        }
+    }
+
+    /// Scan a fallback fragment (see `FbScan`), resolving the formal
+    /// directions of the subroutines it calls.
+    fn fb_scan_with<F: FnOnce(&mut super::fb_scan::FbScan<'_>)>(
+        &self,
+        f: F,
+    ) -> super::fb_scan::FbScan<'static> {
+        let (tasks, functions) = (self.tasks, self.functions);
+        let scope = self.scope_hint.clone();
+        let look = move |n: &str| Self::callee_input_dirs(tasks, functions, scope.as_deref(), n);
+        let mut scan = super::fb_scan::FbScan::new(Some(&look));
+        f(&mut scan);
+        scan.detach()
     }
 
     /// `fb_carry` for a statement fallback.
@@ -3251,15 +3307,52 @@ impl<'a> BytecodeCompiler<'a> {
         if matches!(stmt.kind, StatementKind::VarDecl { .. }) {
             return Err("fb_decl_escapes");
         }
-        let mut scan = super::fb_scan::FbScan::default();
-        scan.stmt(stmt);
-        // Inside an inlined body `%m` must name the task: the fallback is
-        // wrapped in the task's name (see `m_labels`), which a contained
-        // `disable` rules out.
-        if !self.inlining_stack.is_empty() && Self::stmt_names_scope(stmt).is_none() {
+        let scan = self.fb_scan_with(|s| s.stmt(stmt));
+        // Inside an inlined body `%m` must name the task: a scope-printing
+        // fallback is wrapped in the task's name (see `m_labels`), which a
+        // `disable` in the same statement rules out.
+        if !self.inlining_stack.is_empty()
+            && Self::stmt_names_scope(stmt).is_none()
+            && Self::stmt_prints_scope(stmt)
+        {
             return Err("fb_inline_scope_name");
         }
         self.fb_carry(&scan)
+    }
+
+    /// Can `stmt` print a scope name anywhere (`stmt_names_scope`, ignoring
+    /// the `disable` that makes that one give up)?
+    fn stmt_prints_scope(stmt: &Statement) -> bool {
+        let expr = Self::expr_names_scope;
+        match &stmt.kind {
+            StatementKind::Expr(e) => expr(e),
+            StatementKind::BlockingAssign { rvalue, .. }
+            | StatementKind::NonblockingAssign { rvalue, .. } => expr(rvalue),
+            StatementKind::Assertion(_) => true,
+            StatementKind::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                expr(condition)
+                    || Self::stmt_prints_scope(then_stmt)
+                    || else_stmt.as_deref().is_some_and(Self::stmt_prints_scope)
+            }
+            StatementKind::Case { items, .. } => {
+                items.iter().any(|it| Self::stmt_prints_scope(&it.stmt))
+            }
+            StatementKind::SeqBlock { stmts, .. } => stmts.iter().any(Self::stmt_prints_scope),
+            StatementKind::For { body, .. }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::TimingControl { stmt: body, .. }
+            | StatementKind::Wait { stmt: body, .. } => Self::stmt_prints_scope(body),
+            _ => false,
+        }
     }
 
     /// Expression-level escape hatch (see Insn::EvalExprFallback). Returns
@@ -3281,8 +3374,7 @@ impl<'a> BytecodeCompiler<'a> {
             return None;
         }
         let locals = if self.fb_live() {
-            let mut scan = super::fb_scan::FbScan::default();
-            scan.expr(e);
+            let scan = self.fb_scan_with(|s| s.expr(e));
             if !self.inlining_stack.is_empty() && Self::expr_names_scope(e) {
                 return None;
             }
@@ -4766,6 +4858,7 @@ impl<'a> BytecodeCompiler<'a> {
     fn try_unroll_for(
         &mut self,
         name: &crate::ast::Identifier,
+        data_type: &crate::ast::types::DataType,
         init: &Expression,
         condition: &Option<Expression>,
         step: &[Expression],
@@ -4840,6 +4933,12 @@ impl<'a> BytecodeCompiler<'a> {
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let outer_const = self.local_const_vars.remove(&vname);
+        // How a fallback in the body hands the constant to the interpreter.
+        let kind = self.local_kind_of(data_type, None);
+        let outer_kind = match kind {
+            Some(k) => self.local_const_kinds.insert(vname.clone(), k),
+            None => self.local_const_kinds.remove(&vname),
+        };
         let mut ok = true;
         let mut trips = 0usize;
         loop {
@@ -4874,6 +4973,14 @@ impl<'a> BytecodeCompiler<'a> {
         self.local_const_vars.remove(&vname);
         if let Some(v) = outer_const {
             self.local_const_vars.insert(vname.clone(), v);
+        }
+        match outer_kind {
+            Some(k) => {
+                self.local_const_kinds.insert(vname.clone(), k);
+            }
+            None => {
+                self.local_const_kinds.remove(&vname);
+            }
         }
         if !ok {
             self.insns.truncate(start);
@@ -7592,9 +7699,11 @@ impl<'a> BytecodeCompiler<'a> {
                         // const-index folding) unroll with a const-bound loop
                         // variable.
                         #[allow(unreachable_patterns)]
-                        ForInit::VarDecl { name, init, .. }
-                            if self.try_unroll_for(name, init, condition, step, body) =>
-                        {
+                        ForInit::VarDecl {
+                            name,
+                            init,
+                            data_type,
+                        } if self.try_unroll_for(name, data_type, init, condition, step, body) => {
                             self.for_loop_var_ids = saved_for_vars;
                             self.local_var_regs = saved_locals;
                             return true;
