@@ -39014,7 +39014,8 @@ impl Simulator {
                 // A multi-D PACKED vector root (`logic [1:0][3:0][7:0] foo`)
                 // is a real write target for `foo[i][j]` — only drop the
                 // assign when the root resolves to nothing at all.
-                !self.module.arrays_2d.contains_key(&*name)
+                !self.module.arrays.contains_key(&*name)
+                    && !self.module.arrays_2d.contains_key(&*name)
                     && !self.module.arrays_nd.contains_key(&*name)
                     && !self.signal_name_to_id.contains_key(name.as_ref())
             }
@@ -60053,6 +60054,61 @@ impl Simulator {
         }
     }
 
+    /// Store `val` into select `index` of `elem`, one element (signal `id`)
+    /// of the unpacked array `arr`: a bit, or a whole sub-vector when the
+    /// element is a multi-dimensional PACKED array (a lane of `logic
+    /// [1:0][63:0] q [0:2]` is 64 bits wide). `None` for a label this plain
+    /// 0-based / ascending mapping does not cover (negative or otherwise
+    /// exotic packed labels, `logic [-1:-5][31:0] d [-2:-4]`), which the
+    /// normalizing paths further down resolve.
+    fn store_unpacked_elem_select(
+        &mut self,
+        arr: &str,
+        elem: &str,
+        id: usize,
+        index: &Expression,
+        val: &Value,
+    ) -> Option<bool> {
+        let w = self.signal_widths[id];
+        let Some(raw) = self.eval_expr(index).to_index() else {
+            return Some(false); // §11.5.1: x/z index writes nothing
+        };
+        let pos = match self.module.ascending_packed.get(arr).copied() {
+            Some((lo_l, hi_l)) if raw >= lo_l && raw <= hi_l => Some((hi_l - raw) as u32),
+            Some(_) => None,
+            None if raw >= 0 => Some(raw as u32),
+            None => None,
+        };
+        let ew = self
+            .module
+            .packed_signal_elem_widths
+            .get(arr)
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+        let lo = pos
+            .map(|p| p.saturating_mul(ew))
+            .filter(|&lo| lo.checked_add(ew).is_some_and(|hi| hi <= w))?;
+        let mut cur = self.signal_table[id].clone();
+        let prev = cur.clone();
+        for b in 0..ew {
+            cur.set_bit((lo + b) as usize, val.get_bit(b as usize));
+        }
+        let changed = cur != prev;
+        if changed {
+            if !self.dirty_signals[id] {
+                self.dirty_signals[id] = true;
+                self.dirty_list.push(id);
+            }
+            self.dirty_any = true;
+            write_sig!(self, id, cur);
+            self.table_modified = true;
+            self.after_signal_write(id);
+            self.mark_dirty(elem);
+        }
+        Some(changed)
+    }
+
     /// Outlined from `assign_value_inner` (see `exec_stmt_blocking_assign`): keeps
     /// the dispatcher's stack frame small.
     #[inline(never)]
@@ -60573,6 +60629,37 @@ impl Simulator {
                         return changed;
                     }
                 }
+                // §7.4.5 / §11.5.1: one index MORE than a 2-D/N-D array has
+                // unpacked dimensions selects INSIDE one element
+                // (`logic [2:0] m [1:0][1:0]; m[i][j][k] = b`): the element
+                // `m[i][j]` is a signal of its own and `[k]` a bit of it (a
+                // slice, for a multi-D packed element). No arm took that
+                // shape, so the write was silently dropped, procedurally and
+                // as a continuous assign alike.
+                if rev_idxs.len() >= 3 {
+                    let depth = match self.module.arrays_nd.get(&*base_name) {
+                        Some((shape, _)) => shape.len(),
+                        None if self.module.arrays_2d.contains_key(&*base_name) => 2,
+                        None => 0,
+                    };
+                    if depth >= 2 && rev_idxs.len() == depth + 1 {
+                        let mut elem = base_name.to_string();
+                        for ix in rev_idxs[1..].iter().rev() {
+                            let v = self.eval_expr(ix);
+                            let Some(k) = v.to_i64().filter(|_| !v.has_xz()) else {
+                                return false; // §7.4.6: an x/z index writes nothing
+                            };
+                            elem.push_str(&format!("[{}]", k));
+                        }
+                        if let Some(&id) = self.signal_name_to_id.get(elem.as_str()) {
+                            if let Some(changed) =
+                                self.store_unpacked_elem_select(&base_name, &elem, id, index, val)
+                            {
+                                return changed;
+                            }
+                        }
+                    }
+                }
             }
         }
         // §7.4.1: bit-select of an element of a 1-D UNPACKED array
@@ -60603,56 +60690,9 @@ impl Simulator {
                     let i = self.eval_expr(inner_idx).to_i64().unwrap_or(0);
                     let elem = format!("{}[{}]", name, i);
                     if let Some(&id) = self.signal_name_to_id.get(elem.as_str()) {
-                        let w = self.signal_widths[id];
-                        let Some(raw) = self.eval_expr(index).to_index() else {
-                            return false; // §11.5.1: x/z index writes nothing
-                        };
-                        // Handle only the plain 0-based case here; a
-                        // NEGATIVE or otherwise exotic packed label
-                        // (`logic [-1:-5][31:0] d [-2:-4]`) falls
-                        // through to the pre-existing normalizing
-                        // paths below, which already resolve it.
-                        // (Casting such a label to u32 overflowed.)
-                        let pos = match self.module.ascending_packed.get(&*name).copied() {
-                            Some((lo_l, hi_l)) if raw >= lo_l && raw <= hi_l => {
-                                Some((hi_l - raw) as u32)
-                            }
-                            Some(_) => None,
-                            None if raw >= 0 => Some(raw as u32),
-                            None => None,
-                        };
-                        // The element may itself be a multi-dimensional
-                        // PACKED array, in which case `[j]` selects a
-                        // whole sub-vector, not one bit — a lane of
-                        // `logic [1:0][63:0] q [0:2]` is 64 bits wide.
-                        let ew = self
-                            .module
-                            .packed_signal_elem_widths
-                            .get(&*name)
-                            .copied()
-                            .unwrap_or(1)
-                            .max(1);
-                        let lo = pos.map(|p| p.saturating_mul(ew));
-                        if let Some(lo) =
-                            lo.filter(|&lo| lo.checked_add(ew).is_some_and(|hi| hi <= w))
+                        if let Some(changed) =
+                            self.store_unpacked_elem_select(&name, &elem, id, index, val)
                         {
-                            let mut cur = self.signal_table[id].clone();
-                            let prev = cur.clone();
-                            for b in 0..ew {
-                                cur.set_bit((lo + b) as usize, val.get_bit(b as usize));
-                            }
-                            let changed = cur != prev;
-                            if changed {
-                                if !self.dirty_signals[id] {
-                                    self.dirty_signals[id] = true;
-                                    self.dirty_list.push(id);
-                                }
-                                self.dirty_any = true;
-                                write_sig!(self, id, cur);
-                                self.table_modified = true;
-                                self.after_signal_write(id);
-                                self.mark_dirty(&elem);
-                            }
                             return changed;
                         }
                     }

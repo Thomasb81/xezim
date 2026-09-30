@@ -9994,6 +9994,92 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// `arr[i][j] = v` on a 1-D unpacked array, or `m[i][j][k] = v` on a
+    /// 2-D/N-D one with constant array indices: a store into ONE BIT of one
+    /// element (§7.4.2: every element is a packed vector of its own, and the
+    /// trailing select addresses a bit inside it, §11.5.1). A 1-D element
+    /// takes the store the `arr[i][j:j]` part-select arm emits; a
+    /// constant N-D element names its own signal. `elem` is the element
+    /// reference, `bit` the trailing select.
+    ///
+    /// Only a CONSTANT bit of a plain vector element is handled: a multi-D
+    /// packed element's trailing index selects a slice, and a string's
+    /// selects a character. `None` leaves every other shape to the caller.
+    /// Label-mapped elements (ascending or non-zero-based) never get here:
+    /// `sel_base_needs_ast` sends them to the interpreter first.
+    fn compile_unpacked_elem_bit_store(
+        &mut self,
+        elem: &Expression,
+        bit: &Expression,
+        val_reg: RegId,
+    ) -> Option<bool> {
+        let target = self.plain_unpacked_elem(elem)?;
+        let b = u32::try_from(self.eval_const_bound(bit)?).ok()?;
+        match target {
+            Ok(name) => {
+                let ExprKind::Index {
+                    index: elem_idx, ..
+                } = &elem.kind
+                else {
+                    return None;
+                };
+                let Some(idx_reg) = self.compile_expr(elem_idx, 0) else {
+                    return Some(false);
+                };
+                let b_reg = self.alloc_reg();
+                self.emit(Insn::LoadConst(
+                    b_reg,
+                    Box::new(Value::from_u64(b as u64, 32)),
+                ));
+                let array = self.array_operand(name);
+                self.emit(Insn::BlockingAssignArrayRange(
+                    array, idx_reg, b_reg, b_reg, val_reg,
+                ));
+            }
+            Err(id) => {
+                if b >= self.signal_widths[id] {
+                    return None;
+                }
+                let resized = self.alloc_reg();
+                self.emit(Insn::Move(resized, val_reg));
+                self.emit(Insn::Resize(resized, 1));
+                self.emit(Insn::BlockingAssignRange(as_sig_id(id), b, b, resized));
+            }
+        }
+        Some(true)
+    }
+
+    /// Is `elem` one element of an unpacked array whose elements are plain
+    /// vectors, so that one more index selects a single BIT (§11.5.1)?
+    /// `Ok(array)` for an element of a 1-D array (any index), `Err(id)` for a
+    /// 2-D/N-D element named by constant indices (its own signal). A
+    /// multi-D packed element (the index selects a slice) and a string (a
+    /// character) are not.
+    fn plain_unpacked_elem(&self, elem: &Expression) -> Option<Result<String, usize>> {
+        let ExprKind::Index { expr: arr_expr, .. } = &elem.kind else {
+            return None;
+        };
+        let mut root = arr_expr.as_ref();
+        while let ExprKind::Index { expr, .. } = &root.kind {
+            root = expr;
+        }
+        let ExprKind::Ident(root_hier) = &root.kind else {
+            return None;
+        };
+        if self.is_packed_multi_dim(root_hier)
+            || self
+                .packed_full_dims_of(root_hier)
+                .is_some_and(|d| d.len() > 1)
+            || self.signal_is_string_name(root_hier)
+        {
+            return None;
+        }
+        if let ExprKind::Ident(ah) = &arr_expr.kind {
+            return self.lookup_array_name(ah).map(Ok);
+        }
+        self.const_multi_dim_array_elem_signal_id(elem).map(Err)
+    }
+
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
         // Packed element WRITE on a register-backed local (`y[i] = v` on a
         // `u8_vec16_t y` inside an inlined function): mask-splice with plain
@@ -10321,6 +10407,9 @@ impl<'a> BytecodeCompiler<'a> {
                         return true;
                     }
                 }
+                if let Some(done) = self.compile_unpacked_elem_bit_store(expr, index, val_reg) {
+                    return done;
+                }
                 if self.try_packed_path_blocking(lhs, val_reg) {
                     return true;
                 }
@@ -10574,6 +10663,36 @@ impl<'a> BytecodeCompiler<'a> {
                         return true;
                     }
                 }
+                // `m[i][j][hi:lo] = v`: a part of one constant element of a
+                // 2-D/N-D unpacked array, which is a signal of its own.
+                if let Some(Err(id)) = self.plain_unpacked_elem(expr) {
+                    let bounds = match kind {
+                        RangeKind::Constant => self
+                            .eval_const_bound(left)
+                            .zip(self.eval_const_bound(right))
+                            .filter(|(l, r)| l >= r),
+                        RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                            let w = self.eval_const_expr(right).filter(|&w| w > 0);
+                            self.eval_const_bound(left).zip(w).map(|(b, w)| {
+                                if *kind == RangeKind::IndexedUp {
+                                    (b + w as i64 - 1, b)
+                                } else {
+                                    (b, b - w as i64 + 1)
+                                }
+                            })
+                        }
+                    };
+                    if let Some((hi, lo)) =
+                        bounds.filter(|&(hi, lo)| lo >= 0 && hi < self.signal_widths[id] as i64)
+                    {
+                        let (hi, lo) = (hi as u32, lo as u32);
+                        let resized = self.alloc_reg();
+                        self.emit(Insn::Move(resized, val_reg));
+                        self.emit(Insn::Resize(resized, hi - lo + 1));
+                        self.emit(Insn::BlockingAssignRange(as_sig_id(id), hi, lo, resized));
+                        return true;
+                    }
+                }
                 // Handle mem[i][hi:lo] = val
                 if let ExprKind::Index {
                     expr: arr_expr,
@@ -10793,6 +10912,10 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                     }
                     // Not an array — bit-select on a plain packed signal; width = 1.
+                    1
+                } else if self.plain_unpacked_elem(expr).is_some() {
+                    // A bit of one unpacked-array element (`arr[i][j]`): the
+                    // context width of its RHS is 1 (§11.6.1), not 32.
                     1
                 } else {
                     32
