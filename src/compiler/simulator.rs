@@ -31645,7 +31645,7 @@ impl Simulator {
                 Insn::Cast(ci, src_reg, out) => {
                     let (dest, dest_expr, stmt_form) = (&ci.dest, &ci.expr, ci.stmt_form);
                     let v = self.vm_regs[*src_reg as usize].clone();
-                    let ok = self.cast_type_ok(dest_expr, &v);
+                    let ok = self.cast_type_ok_ex(dest_expr, &v, ci.decl_class.as_deref());
                     if ok {
                         match dest {
                             CastDest::Reg(r) => {
@@ -112134,6 +112134,15 @@ impl Simulator {
     /// when types are unknown (null src, non-class handle, untracked dest type)
     /// so only a definite type mismatch fails (IEEE 1800-2023 §8.16).
     fn cast_type_ok(&self, dest: &Expression, src: &Value) -> bool {
+        self.cast_type_ok_ex(dest, src, None)
+    }
+
+    /// class-perf P2: `ovr` is the dest local's compile-time DECLARED class
+    /// (threaded through CastInsn for nested-block handle locals the
+    /// runtime overlay never typed). It replaces the overlay lookup in the
+    /// Ident arm; all downstream checks (type-param resolution, value-param
+    /// specialization, hierarchy) are unchanged.
+    fn cast_type_ok_ex(&self, dest: &Expression, src: &Value, ovr: Option<&str>) -> bool {
         // §6.24.1: casting to an ENUM succeeds only when the value is one of
         // its members. Checked before the class logic, whose "not a live class
         // object" escape hatch would otherwise wave every integer through.
@@ -112165,7 +112174,10 @@ impl Simulator {
         // procedural locals are), so it used to fall into the permissive
         // `None` branch and EVERY downcast reported success.
         let dest_type = match &dest.kind {
-            ExprKind::Ident(hh) if hh.path.len() == 1 => self.class_of_var(&hh.path[0].name.name),
+            ExprKind::Ident(hh) if hh.path.len() == 1 => match ovr {
+                Some(c) => Some(c.to_string()),
+                None => self.class_of_var(&hh.path[0].name.name),
+            },
             _ => None,
         };
         match dest_type {

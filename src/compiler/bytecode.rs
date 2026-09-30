@@ -733,6 +733,11 @@ pub struct CastInsn {
     pub dest: CastDest,
     pub expr: Box<Expression>,
     pub stmt_form: bool,
+    /// class-perf P2: the dest local's DECLARED class, threaded through
+    /// for nested-block handle locals the runtime overlay never typed
+    /// (`begin my_comp tmp; ... $cast(tmp, parent)`). The executor uses
+    /// it as the cast's destination type instead of the overlay lookup.
+    pub decl_class: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -5387,6 +5392,56 @@ impl<'a> BytecodeCompiler<'a> {
         )
     }
 
+    /// class-perf P2: is this operand string-UNSAFE at the point where an
+    /// operator coerces to 1-bit (`&&`/`||`/`!`)? A string-touching operand
+    /// that is ITSELF an equality compare (or `!` of one, or a `&&`/`||`
+    /// of such) already reduced to 1 bit through the string-safe compare
+    /// path — `parent==null && name=="__top__"` compiles. A string VALUE
+    /// used directly (`s && x`) stays unsafe.
+    fn string_operand_unsafe(&self, e: &Expression) -> bool {
+        use crate::ast::expr::ExprKind;
+        match &e.kind {
+            ExprKind::Paren(inner) => self.string_operand_unsafe(inner),
+            ExprKind::Unary {
+                op: crate::ast::expr::UnaryOp::LogNot,
+                operand,
+            } => self.string_operand_unsafe(operand),
+            ExprKind::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
+                ) =>
+            {
+                false
+            }
+            // Any other operator node (relational/arithmetic/logical,
+            // `&&`/`||` above included) coerces its OPERANDS, not their
+            // innards: recurse. A string-valued leaf still trips the base
+            // case below (`s < v`, `s1 + s2` stay bailed).
+            ExprKind::Binary { left, right, .. } => {
+                self.string_operand_unsafe(left) || self.string_operand_unsafe(right)
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                self.string_operand_unsafe(condition)
+                    || self.string_operand_unsafe(then_expr)
+                    || self.string_operand_unsafe(else_expr)
+            }
+            ExprKind::Concatenation(parts) => {
+                parts.iter().any(|p| self.string_operand_unsafe(p))
+            }
+            // A CALL is only string-unsafe through its RESULT type — a
+            // string FORMAL as an argument flows by value into the callee
+            // and the operator sees the (integral) return
+            // (`get_report_verbosity_level(sev, id) < verbosity`). A
+            // string-returning callee (`get_name()`) in a non-eq operator
+            // stays unsafe.
+            ExprKind::Call { .. } | ExprKind::SystemCall { .. } => {
+                self.expr_is_string_static(e)
+            }
+            _ => self.touches_string_formal(e),
+        }
+    }
+
     fn touches_string_formal(&self, e: &Expression) -> bool {
         if self.string_formal_names.is_empty() {
             return false;
@@ -8105,6 +8160,21 @@ impl<'a> BytecodeCompiler<'a> {
                     if width > 0 && !via_new {
                         self.emit(Insn::Resize(val_reg, width));
                     }
+                    // class-perf P2: STRING member store (`m_leaf_name = name`)
+                    // whose RHS is from the string-valued expr universe. The
+                    // heap round-trip is exact for string Values — the store
+                    // executor's fit_class_prop has no declared integral
+                    // width for a string slot and clones the Value verbatim,
+                    // same as the AST store. Bare this-relative and dotted
+                    // chain targets only; shadow-gated like the integral path.
+                    if self.method_mode
+                        && width == 0
+                        && !via_new
+                        && self.expr_is_string_static(rvalue)
+                        && self.method_string_store_target(lvalue, val_reg)
+                    {
+                        return true;
+                    }
                     if self.compile_blocking_target(lvalue, val_reg, width) {
                         return true;
                     }
@@ -9499,6 +9569,52 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(r)
             }
             ExprKind::Unary { op, operand } => {
+                // class-perf P2: EXPRESSION-position ++/-- (uvm_object::new's
+                // `m_inst_id = m_inst_count++`) — read, ±1, store through
+                // the assignment machinery; yield the OLD (post) or NEW
+                // (pre) value. Width discipline identical to the statement
+                // form: 0 = self-determined member store (heap truncates
+                // at the declared width), Resize only for width>0 targets.
+                if self.method_mode
+                    && matches!(
+                        op,
+                        UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
+                    )
+                {
+                    let width = self.infer_lhs_width(operand);
+                    let start = self.insns.len();
+                    let start_reg = self.next_reg;
+                    let is_incr = matches!(op, UnaryOp::PreIncr | UnaryOp::PostIncr);
+                    let is_post = matches!(op, UnaryOp::PostIncr | UnaryOp::PostDecr);
+                    let lowered = (|| {
+                        let r = self.compile_expr(operand, width)?;
+                        let one = self.alloc_reg();
+                        self.emit(Insn::LoadConst(
+                            one,
+                            Box::new(Value::from_u64(1, if width > 0 { width } else { 32 })),
+                        ));
+                        let result = self.alloc_reg();
+                        if is_incr {
+                            self.emit(Insn::Add(result, r, one));
+                        } else {
+                            self.emit(Insn::Sub(result, r, one));
+                        }
+                        if width > 0 {
+                            self.emit(Insn::Resize(result, width));
+                        }
+                        if !self.compile_blocking_target(operand, result, width) {
+                            return None;
+                        }
+                        Some(if is_post { r } else { result })
+                    })();
+                    if let Some(out) = lowered {
+                        return Some(out);
+                    }
+                    self.insns.truncate(start);
+                    self.next_reg = start_reg;
+                    self.bail("Expr_IncrExpr");
+                    return None;
+                }
                 // Reduction (&a, |a, ^a, ~&a, ~|a, ~^a) and logical-NOT (!a)
                 // are SELF-DETERMINED: operand keeps its natural width, the
                 // unary produces 1 bit. Passing parent ctx_width here would
@@ -9508,7 +9624,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // Step 8 (string formals): `!s`/`~s` on a string value would
                 // bit-bang bytes the interpreter string-paths never form —
                 // bail.
-                if self.touches_string_formal(operand) {
+                if self.string_operand_unsafe(operand) {
                     self.bail("string_formal_unary");
                     return None;
                 }
@@ -9583,8 +9699,7 @@ impl<'a> BytecodeCompiler<'a> {
                 if !matches!(
                     op,
                     BinaryOp::Eq | BinaryOp::Neq | BinaryOp::CaseEq | BinaryOp::CaseNeq
-                ) && (self.touches_string_formal(left)
-                    || self.touches_string_formal(right))
+                ) && (self.string_operand_unsafe(left) || self.string_operand_unsafe(right))
                 {
                     self.bail("string_formal_non_eq_binary");
                     return None;
@@ -12476,6 +12591,7 @@ impl<'a> BytecodeCompiler<'a> {
         if args.len() != 2 {
             return None;
         }
+        let mut decl_class: Option<Box<str>> = None;
         let dest = match &args[0].kind {
             ExprKind::Ident(h)
                 if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
@@ -12485,10 +12601,18 @@ impl<'a> BytecodeCompiler<'a> {
                     if !self.cast_reg_ok_locals.contains(name) {
                         // A NESTED-block local: register-backed, but its
                         // declared type was never recorded in the runtime
-                        // overlay (only formals and top-level decls are),
-                        // so `cast_type_ok` could consult a stale
-                        // cross-frame entry and disagree with the AST path.
-                        return None;
+                        // overlay (only formals and top-level decls are).
+                        // class-perf P2: T1's typed-local map now knows the
+                        // declared class at any nesting depth — thread it
+                        // through CastInsn so `cast_type_ok` uses it instead
+                        // of the overlay lookup. Without a known class the
+                        // old refusal stands (stale cross-frame risk).
+                        match self.method_handle_local_types.get(name) {
+                            Some(c) if !c.contains('#') => {
+                                decl_class = Some(c.as_str().to_owned().into_boxed_str())
+                            }
+                            _ => return None,
+                        }
                     }
                     CastDest::Reg(r)
                 } else {
@@ -12528,6 +12652,7 @@ impl<'a> BytecodeCompiler<'a> {
                 dest,
                 expr: Box::new(args[0].clone()),
                 stmt_form,
+                decl_class,
             }),
             src_reg,
             out,
@@ -12536,6 +12661,59 @@ impl<'a> BytecodeCompiler<'a> {
             self.emit(Insn::Resize(out, ctx_width));
         }
         Some(out)
+    }
+
+    /// class-perf P2: a STRING member store target — bare this-relative
+    /// (`m_leaf_name = name`) or a dotted handle-chain leaf
+    /// (`obj.m_name = s`). Only admits names in `string_member_names`
+    /// (the P1 load universe — bare-key stable, instance members); the
+    /// RHS has already been checked string-valued by the caller. The
+    /// dotted form mirrors the integral chain store's shadow guard.
+    fn method_string_store_target(&mut self, lhs: &Expression, val_reg: RegId) -> bool {
+        if let ExprKind::Ident(h) = &lhs.kind
+            && self.method_mode
+            && h.root.is_none()
+            && h.path.len() == 1
+            && h.path[0].selects.is_empty()
+        {
+            let bare = h.path[0].name.name.as_str();
+            if !self.local_var_regs.contains_key(bare)
+                && self.string_member_names.contains(bare)
+            {
+                let Some(this) = self.method_this_reg else {
+                    return false;
+                };
+                self.emit(Insn::StoreClassMember(
+                    this,
+                    val_reg,
+                    bare.to_string().into_boxed_str(),
+                ));
+                return true;
+            }
+            return false;
+        }
+        if let ExprKind::MemberAccess { expr: base, member } = &lhs.kind
+            && self.method_mode
+            && self.method_handle_chain_ok(base)
+            && self.string_member_names.contains(member.name.as_str())
+            && !(self.class_shadow_names.contains(member.name.as_str())
+                && !self.member_safe_names.contains(member.name.as_str()))
+        {
+            let handle_reg = match self.method_member_handle_reg(base) {
+                Some(r) => r,
+                None => match self.compile_expr(base, 0) {
+                    Some(r) => r,
+                    None => return false,
+                },
+            };
+            self.emit(Insn::StoreClassMember(
+                handle_reg,
+                val_reg,
+                member.name.clone().into_boxed_str(),
+            ));
+            return true;
+        }
+        false
     }
 
     fn compile_blocking_target(&mut self, lhs: &Expression, val_reg: RegId, width: u32) -> bool {
@@ -13378,6 +13556,14 @@ impl<'a> BytecodeCompiler<'a> {
                     {
                         return 0;
                     }
+                    // class-perf P2: a bare STRING member store/read is
+                    // self-determined — a nonzero width would Resize and
+                    // truncate the text from the front.
+                    if !self.local_var_regs.contains_key(bare)
+                        && self.string_member_names.contains(bare)
+                    {
+                        return 0;
+                    }
                 }
                 if let Some(id) = self.lookup_signal_id(hier) {
                     self.signal_widths[id]
@@ -13495,6 +13681,9 @@ impl<'a> BytecodeCompiler<'a> {
                                 && h.path[0].name.name.as_str() == "this"
                     );
                 if is_this && self.bare_member_names.contains(member.name.as_str()) {
+                    0
+                } else if is_this && self.string_member_names.contains(member.name.as_str()) {
+                    // class-perf P2: a string member leaf is self-determined.
                     0
                 } else {
                     32
