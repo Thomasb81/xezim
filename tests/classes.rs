@@ -140,6 +140,10 @@ mod compiled_method_statics;
 mod compiled_method_pcache;
 #[path = "classes/compiled_method_tiering.rs"]
 mod compiled_method_tiering;
+#[path = "classes/compiled_method_array_members.rs"]
+mod compiled_method_array_members;
+#[path = "classes/compiled_method_string_loop.rs"]
+mod compiled_method_string_loop;
 #[path = "classes/compiled_method_cast.rs"]
 mod compiled_method_cast;
 #[path = "classes/class_local_typedef_aa.rs"]

@@ -3251,7 +3251,16 @@ impl<'a> BytecodeCompiler<'a> {
             // because `StmtFallback` cannot be emitted while
             // `reg_var_loop_depth > 0`.
             ExprKind::Call { func, args } => {
-                args.iter().all(|a| self.expr_loop_simple(a)) && self.call_is_inlinable(func, args)
+                args.iter().all(|a| self.expr_loop_simple(a))
+                    // A PURE string method (.len/.getc/.substr/... on a
+                    // string object) lowers to a single StrOp with no call at
+                    // all, exactly like an inlinable free function. Optimistic
+                    // admission is safe for the same reason: a body that then
+                    // fails to compile bails the whole loop, because
+                    // StmtFallback cannot be emitted while reg_var_loop_depth
+                    // > 0.
+                    && (self.call_is_inlinable(func, args)
+                        || self.string_method_shape(func, func.span).is_some())
             }
             _ => true,
         }
@@ -3517,7 +3526,17 @@ impl<'a> BytecodeCompiler<'a> {
                     && step_ok
                     && self.for_body_is_simple(body)
             }
-            _ => false,
+            // A bare side-effecting expression statement — `n++;` lower to
+            // `StatementKind::Expr(Unary PostIncr n)` after elaboration, NOT
+            // BlockingAssign, so without this arm every counter-increment
+            // inside a register-backed `for` body (a ubiquitous
+            // string/counting idiom) hit the default and bailed to AST.
+            // Arithmetic/incr statements on a plain local/formal are
+            // register-safe; the compile phase re-audits and bails to AST if
+            // they are not (e.g. a member-array lvalue with a runtime index,
+            // which needs StmtFallback, unavailable under reg_var_loop_depth).
+            StatementKind::Expr(e) => expr_simple(e),
+            other => false,
         }
     }
 
@@ -5365,23 +5384,49 @@ impl<'a> BytecodeCompiler<'a> {
         func: &'e Expression,
         span: crate::ast::Span,
     ) -> Option<(Expression, &'e str)> {
-        let ExprKind::Ident(h) = &func.kind else {
-            return None;
-        };
-        if h.root.is_some() || h.path.len() < 2 {
-            return None;
+        // Two syntactic forms reach here: a dotted ident `s.getc` (the
+        // elaborator's normal shape) OR a bare `MemberAccess { expr: s,
+        // member: getc }` (how the method-mode loop/expression compiler
+        // sees some string-verb calls). Both mean the same thing; a
+        // string-typed receiver with a supported verb is a pure StrOp.
+        match &func.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.len() < 2 {
+                    return None;
+                }
+                if h.path.iter().any(|seg| !seg.selects.is_empty()) {
+                    return None;
+                }
+                let method = h.path.last().unwrap().name.name.as_str();
+                let mut recv = h.clone();
+                recv.path.pop();
+                let recv_expr = Expression::new(ExprKind::Ident(recv), span);
+                if !self.expr_is_string_static(&recv_expr) {
+                    return None;
+                }
+                Some((recv_expr, method))
+            }
+            ExprKind::MemberAccess { expr: recv, member } => {
+                let recv_expr = (**recv).clone();
+                // The receiver must resolve as a bare string object (a
+                // string signal/local/formal), not a dotted handle chain.
+                let ExprKind::Ident(h) = &recv_expr.kind else {
+                    return None;
+                };
+                if h.root.is_some()
+                    || h.path.is_empty()
+                    || h.path.iter().any(|seg| !seg.selects.is_empty())
+                {
+                    return None;
+                }
+                let method = member.name.as_str();
+                if !self.expr_is_string_static(&recv_expr) {
+                    return None;
+                }
+                Some((recv_expr, method))
+            }
+            _ => None,
         }
-        if h.path.iter().any(|seg| !seg.selects.is_empty()) {
-            return None;
-        }
-        let method = h.path.last().unwrap().name.name.as_str();
-        let mut recv = h.clone();
-        recv.path.pop();
-        let recv_expr = Expression::new(ExprKind::Ident(recv), span);
-        if !self.expr_is_string_static(&recv_expr) {
-            return None;
-        }
-        Some((recv_expr, method))
     }
 
     /// Compile a PURE string method call to a `StrOp`. Mutators (putc, the
@@ -11477,7 +11522,14 @@ impl<'a> BytecodeCompiler<'a> {
                 // that mentions a string formal. (ARGS are pass-through and
                 // stay allowed — `m.exists(key)` is the whole point.)
                 if let ExprKind::MemberAccess { expr: base, .. } = &func.kind {
-                    if self.touches_string_formal(base) {
+                    // A PURE string method (.len/.getc/.substr/...) lowers
+                    // below this call path to a StrOp, so the string-formal
+                    // receiver is NOT passed to the interpreter's dispatcher —
+                    // don't bail for it here. (compile_string_method handles
+                    // the bare MemberAccess form and the dotted-Ident form.)
+                    if !self.string_method_shape(func, func.span).is_some()
+                        && self.touches_string_formal(base)
+                    {
                         self.bail("string_formal_method_receiver");
                         return None;
                     }

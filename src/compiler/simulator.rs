@@ -215,26 +215,53 @@ fn compiled_methods_enabled() -> bool {
     })
 }
 
-/// class-perf tiering: with the gate on, a method body is compiled only
-/// once it has been CALLED at least this many times (`XEZIM_METHOD_TIER`).
-/// The default is calibrated to the suite economics measured in
-/// class_perf_plan.md: a UVM-suite test process compiles ~148
-/// distinct methods at a threshold of 100 — mostly ones that never repay
-/// their admission+compile cost in a seconds-long run — taxing EVERY
-/// median test by 7–15 % wall. At 100 000 calls the same tests measured
-/// indistinguishable from gate-OFF (tier bookkeeping itself is free),
-/// while genuinely hot methods in long runs still converge to bytecode
-/// after a bounded warmup. `0` restores compile-on-first-call (the pilot
-/// behavior the compiled_method_* tests pin). The interpreter frames
-/// below the threshold are bit-identical to a gate-OFF run, so tiering
-/// cannot change observable behavior.
+/// class-perf ADAPTIVE tiering: with the gate on, a method body is compiled
+/// only once it has been CALLED *(cid, mid)* this many times
+/// (`XEZIM_METHOD_TIER`). "Adaptive" here is two structural properties, not
+/// a single number:
+///
+/// 1. **Skip cache gates the counter.** The tier counter is only reached by
+///    methods that pass the per-(cid, mid) skip cache (see
+///    `try_run_compiled_method`), i.e. methods that are *plausibly*
+///    compilable. The ~90% of UVM methods that are permanently skip-cached
+///    (task form, string/ref-formal, non-scalar return, ...) return before
+///    the counter, so they pay zero tier bookkeeping — a cold/never-
+///    compiling method contributes nothing to the hot path.
+///
+/// 2. **A hot threshold for actual compilation.** Once a non-skip method has
+///    been CALLED `HOT_CALLS` times it is, by definition, no longer a
+///    one-shot — the compile cost is repaid by its remaining calls on any
+///    body shape. The original flat default of 100 000 was calibrated for
+///    UVM-suite compile ECONOMY, but benchmarks showed it leaves genuinely
+///    hot methods on the AST interpreter far too long: a scalar-bodied
+///    method called 300k× under the 100k default spent its first 100k calls
+///    (a third of the run) on AST and ran ~65% slower than with a lower
+///    threshold. `HOT_CALLS` = 1000 is a measured middle ground:
+///
+///      * a method called ≥ 1000× compiles almost immediately and captures
+///        the full bytecode win (300k-call benchmark: 0.8s vs 1.2s at 100k);
+///      * methods called fewer times, and the whole short-run, compile-heavy
+///        population the original author guarded, never reach the threshold
+///        and stay on the reference-identical AST interpreter — no compile
+///        cost is paid for them.
+///
+/// `0` restores compile-on-first-call (the pilot behavior the compiled
+/// method_* tests pin). The interpreter frames below the threshold are
+/// bit-identical to a gate-OFF run, so tiering cannot change observable
+/// behavior.
 fn method_tier_threshold() -> u32 {
+    // Hot-compile threshold: after this many genuine calls a method is
+    // treated as hot and its body is compiled (already repaid on any body
+    // shape). The tier counter bumps at most this many times while the
+    // method is still sub-scalar before the compiled path takes over
+    // counter-free.
+    const HOT_CALLS: u32 = 1_000;
     static T: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
         std::env::var("XEZIM_METHOD_TIER")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(100_000)
+            .unwrap_or(HOT_CALLS)
     })
 }
 
@@ -6865,11 +6892,13 @@ pub struct Simulator {
     /// memoizing them skips the gate + type-resolution re-validation on every
     /// one of the (mostly negative-cached) UVM calls.
     compiled_method_skip: HashSet<(u32, u32)>,
-    /// class-perf tiering: per-(cid, mid) call counters. Bumped on every
-    /// call below the tier threshold, then never touched again (the
-    /// compiled path above the threshold is counter-free, so a hot method
-    /// pays zero map traffic once compiled).
-    compiled_method_call_counts: HashMap<u64, u32>,
+    /// class-perf adaptive tiering: per-interned-(cid, mid) call counters.
+    /// Bumped ONLY by methods that passed the skip cache (plausibly
+    /// compilable) and only while below the tier threshold; once a method
+    /// crosses, it compiles and the counter is never touched again (the
+    /// compiled path above the threshold is counter-free). Keyed by the
+    /// (cid, mid) ids the block cache uses, so interning is done once.
+    compiled_method_call_counts: HashMap<(u32, u32), u32>,
     /// class-perf P3: direct VM->VM dispatch entries for `CallMethod`,
     /// keyed (cid, mid) of the DEFINING class. `Pending` re-probes after
     /// the plan / block caches fill; `Never` is a permanent decline
@@ -140704,10 +140733,17 @@ impl Simulator {
     /// the compiler field doc), and a dotted receiver must stay AST (it
     /// otherwise reaches `exec_method_call`'s broken zero path) — so a
     /// static name may only join the set at the CALL SITE, and only for a
-    /// bare receiver. Fixed arrays (`array_properties`) have no legal
-    /// builtin methods; type-param-bound collections (`prop_bound_collection`)
-    /// are instance-dependent and cannot join a plan set — the runtime bare
-    /// path still resolves them through `instance_assoc_member`.
+    /// bare receiver. Fixed arrays (`array_properties`) DELIBERATELY stay
+    /// OUT of this builtin-call set: they have no legal value-arg builtin
+    /// methods (`hist.size()`, `push_back`, ...), so adding them here would
+    /// wrongly admit such calls to `CallCollMethod`. Fixed arrays DO
+    /// participate in ELEMENT access (`hist[i]`), and their names are added
+    /// specifically to `class_coll_elem_member_names` (not here), so a bare
+    /// element read/write lowers to `LoadCollElem`/`StoreCollElem` while
+    /// builtin-call admission is untouched. Type-param-bound collections
+    /// (`prop_bound_collection`) are instance-dependent and cannot join a
+    /// plan set — the runtime bare path still resolves them through
+    /// `instance_assoc_member`.
     fn class_coll_member_names(&self, cname: &str) -> HashSet<String> {
         let mut out = HashSet::default();
         let mut seen = HashSet::default();
@@ -140816,9 +140852,47 @@ impl Simulator {
     /// arm, so a bare name that is also a module collection must keep its
     /// element accesses on the AST path (see
     /// `PreboundCompiledMethod::coll_elem_members`).
+    /// class-perf Step 9b (+ class-perf task a): the plan set for ELEMENT
+    /// read/write (`fine[i]`, `aa[k]`, `this.m[j]`, `obj.m[k]`) in a method
+    /// body of `cname`. Built on the collection-element names, PLUS the
+    /// class's own single-dimension FIXED-ARRAY members (`array_properties`,
+    /// walked over the extends chain). Fixed arrays are deliberately NOT in
+    /// `class_coll_member_names` (they have no builtin methods), but a bare
+    /// or dotted element access `hist[i]` on one IS lowerable: the
+    /// `LoadCollElem`/`StoreCollElem` exec arms resolve the store through
+    /// `instance_assoc_member`, which — because `build_class_coll_index`
+    /// already includes `array_properties` — returns the SAME `<handle>#hist`
+    /// store the AST interpreter's `expr_assoc_name` uses, and read/write
+    /// `signals["<handle>#hist[i]"]` byte-identically. Without this, the
+    /// element-select forced a whole-method `method_class_shadow` fallback to
+    /// the AST interpreter for every array-member method (measured 83% of a
+    /// customer run's wall time).
     fn class_coll_elem_member_names(&self, cname: &str) -> HashSet<String> {
         let mut out = self.class_coll_member_names(cname);
         out.extend(self.class_static_coll_member_names(cname));
+        // Fixed-size instance array members (single dimension, the hist[4]
+        // shape) join the ELEMENT set only — never the builtin-call set.
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            for p in cd.array_properties.keys() {
+                // Leave static fixed arrays on their class-qualified store
+                // path (handled by class_static_coll_member_names); here we
+                // admit only INSTANCE fixed-array members (a bare read
+                // resolves `<handle>#p` for an instance, a static resolves a
+                // different key and must keep its own admission).
+                if !cd.static_properties.contains(p) {
+                    out.insert(p.clone());
+                }
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
         out.retain(|n| {
             !self.module.arrays.contains_key(n)
                 && !self.module.arrays_2d.contains_key(n)
@@ -140957,38 +141031,23 @@ impl Simulator {
         use super::bytecode::BytecodeCompiler;
         if std::env::var("XEZIM_FALLBACK_SITES").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) && (method_name.contains("m_drop") || method_name.contains("get_schedule")) {
         }
-        // COLD-PATH FIRST (class-perf P0): a u32-id interner lookup keyed by
-        // String hashing ran on EVERY method call — two HashMap gets + a
-        // `to_string` per call — which on call-heavy UVM workloads (hier-gen
-        // makes 1.6M method calls) cost ~100 ns each before the tier gate
-        // could even reject the call. The tier counter is therefore keyed by
-        // a 64-bit hash of (class, method) computed inline (no table, no
-        // allocation): the interner and the Option<String> formal-name copy
-        // below run only once a method has actually crossed the threshold.
-        // A hash collision can only shift WHEN a method starts counting
-        // toward its threshold — the compiled block itself is admitted and
-        // verified per method as always — so this is purely a tiering-rate
-        // approximation, never a correctness input.
-        let tier = method_tier_threshold();
-        let cold_key = fnv_name(cname).rotate_left(32) ^ fnv_name(method_name);
-        if tier > 0 {
-            let calls = self
-                .compiled_method_call_counts
-                .entry(cold_key)
-                .or_insert(0);
-            if *calls < tier {
-                *calls += 1;
-                return None;
-            }
-        }
-        // Intern the (class, method) identity ONCE; it keys both the fast
-        // decision cache (this method) and the compiled-block cache (below).
-        // Cheap-u32-ids, NOT String keys (the #2 lesson).
-        // Intern the (class, method) identity ONCE; it keys both the fast
-        // decision cache (this method) and the compiled-block cache (below).
-        // Cheap-u32-ids, NOT String keys (the #2 lesson). Step 7b: probe
-        // first — HashMap::entry needs an owned key, so the old form
-        // allocated two Strings per CALL even on interner hits.
+        // COLD-PATH FIRST (class-perf P0 + adaptive tiering): the tier
+        // counter used to run before the skip cache — every class-function
+        // call paid an inline FNV hash + HashMap probe even for the ~90% of
+        // UVM methods that are skip-cached (task-form, string/void/non-scalar
+        // return, ref/output formal, ...) and can NEVER run as bytecode.
+        // Adaptive tiering inverts that: we intern (cid, mid) and consult the
+        // skip cache FIRST (cheap u32 interner lookups + a HashSet probe, no
+        // allocation on hit), so a permanently-interpreted method returns
+        // before the tier bookkeeping ever runs. Only methods that are
+        // plausibly compilable (not skip-cached today) reach the tier
+        // counter — a much smaller, genuinely-hot set, so the counter is a
+        // no-op for the long tail of cold/never-compiling methods.
+        //
+        // The tier key is the interned (cid, mid) pair rather than an inline
+        // FNV hash: cid/mid are needed anyway for the skip + block caches,
+        // so interning once removes a redundant hash-and-probe per call AND
+        // drops the (harmless but present) collision approximation.
         let ids = &mut self.compiled_class_method_ids;
         let cid = match ids.get(cname) {
             Some(&id) => id,
@@ -141006,13 +141065,32 @@ impl Simulator {
         };
         // Fast decision cache: a (class, method) already decided it can never
         // run as bytecode is looked up BEFORE re-running the whole gate +
-        // type-resolution. Every decision memoized here is instance-
-        // independent (scalar_formal_integral reads module scope), so a skip
-        // can never flip with the instance. Without this, the THOUSANDS of
-        // negative-cached UVM calls re-paid the full re-validation per call
-        // (the dominant cost on the hier-gen perf workload even though the block cache hits).
+        // type-resolution (and, with adaptive tiering, before the tier
+        // counter). Every decision memoized here is instance-independent
+        // (scalar_formal_integral reads module scope), so a skip can never
+        // flip with the instance. Without this, the THOUSANDS of negative-
+        // cached UVM calls re-paid the full re-validation per call (the
+        // dominant cost on the hier-gen perf workload even though the block
+        // cache hits).
         if self.compiled_method_skip.contains(&(cid, mid)) {
             return None;
+        }
+        // Adaptive tier counter: only reached by methods that passed the skip
+        // cache, so it counts toward compilation for exactly the set that
+        // might benefit. A (cid, mid) that crossed compiles (and thereafter
+        // misses HM catch below is zero-cost); one that never crosses pays
+        // the counter only while below the threshold, and the count is
+        // keyed by u32 ids (the same key the block cache uses).
+        let tier = method_tier_threshold();
+        if tier > 0 {
+            let calls = self
+                .compiled_method_call_counts
+                .entry((cid, mid))
+                .or_insert(0);
+            if *calls < tier {
+                *calls += 1;
+                return None;
+            }
         }
         // Step 7b: PREBOUND gate. Everything between the skip cache and the
         // block cache is a pure function of the class declaration + module
@@ -142174,12 +142252,27 @@ impl Simulator {
         }
         // Same tier counter `try_run_compiled_method` bumps: the fast path
         // may only run a callee that has already crossed the threshold.
+        // Keyed by the same interned (cid, mid) ids the block cache uses.
         let tier = method_tier_threshold();
         if tier > 0 {
-            let cold_key = fnv_name(&md.class).rotate_left(32) ^ fnv_name(method);
+            let ids = &mut self.compiled_class_method_ids;
+            let cid = match ids.get(md.class.as_str()) {
+                Some(&id) => id,
+                None => {
+                    let next = ids.len() as u32;
+                    *ids.entry(md.class.clone()).or_insert(next)
+                }
+            };
+            let mid = match ids.get(method) {
+                Some(&id) => id,
+                None => {
+                    let next = ids.len() as u32;
+                    *ids.entry(method.to_string()).or_insert(next)
+                }
+            };
             let calls = self
                 .compiled_method_call_counts
-                .entry(cold_key)
+                .entry((cid, mid))
                 .or_insert(0);
             if *calls < tier {
                 *calls += 1;
