@@ -21239,6 +21239,182 @@ impl Simulator {
         Some(mask)
     }
 
+    /// The bits each signal of an all-level event list is watched through:
+    /// `(signal id, mask)` for a signal named only by constant selects
+    /// (`@(a[1:0] or b)` gives `a`'s two bits; `b`, named whole, needs
+    /// none). None when some term is neither a plain name nor such a select
+    /// (`@(mem[i])`, `@(a + b)`) or names no signal.
+    fn comb_select_masks(&self, sens: &[Sensitivity], scope: &str) -> Option<Vec<(usize, u64)>> {
+        let mut masks: Vec<(usize, u64)> = Vec::new();
+        let mut whole: Vec<usize> = Vec::new();
+        for s in sens {
+            let sid = self.sens_term_sid(&s.signal_name, scope)?;
+            match &s.value_of {
+                None => whole.push(sid),
+                Some(e) => {
+                    let m = self.narrow_event_mask(e, sid, scope)?;
+                    match masks.iter_mut().find(|(id, _)| *id == sid) {
+                        Some(entry) => entry.1 |= m,
+                        None => masks.push((sid, m)),
+                    }
+                }
+            }
+        }
+        masks.retain(|(id, _)| !whole.contains(id));
+        Some(masks)
+    }
+
+    /// Does an always body read the signals of `masks` only through
+    /// constant selects inside their masks, and do nothing a repeated run
+    /// could observe — only blocking/nonblocking assignments, `if` and
+    /// `case`, with no call other than a pure system function? `resolve`
+    /// maps a name the way the comb path's read set does.
+    fn body_reads_within_masks(
+        &self,
+        body: &Statement,
+        masks: &[(usize, u64)],
+        scope: &str,
+        resolve: &dyn Fn(&str) -> Vec<usize>,
+    ) -> bool {
+        let masked = |h: &HierarchicalIdentifier| -> Option<(usize, u64)> {
+            let raw = Self::resolve_hier_name_static(h, &self.module);
+            resolve(&raw)
+                .into_iter()
+                .find_map(|id| masks.iter().find(|(m, _)| *m == id).copied())
+        };
+        fn expr_ok(
+            sim: &Simulator,
+            e: &Expression,
+            masks: &[(usize, u64)],
+            scope: &str,
+            masked: &dyn Fn(&HierarchicalIdentifier) -> Option<(usize, u64)>,
+        ) -> bool {
+            let ok = |x: &Expression| expr_ok(sim, x, masks, scope, masked);
+            match &e.kind {
+                ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+                ExprKind::Ident(h) => masked(h).is_none(),
+                ExprKind::Paren(x) => ok(x),
+                ExprKind::Unary { operand, .. } => ok(operand),
+                ExprKind::Binary { left, right, .. } => ok(left) && ok(right),
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => ok(condition) && ok(then_expr) && ok(else_expr),
+                ExprKind::Concatenation(parts) => parts.iter().all(ok),
+                ExprKind::Replication { count, exprs } => ok(count) && exprs.iter().all(ok),
+                ExprKind::Inside { expr, ranges } => ok(expr) && ranges.iter().all(ok),
+                ExprKind::Range(l, r) => ok(l) && ok(r),
+                ExprKind::Index { expr: base, index } => match &base.kind {
+                    ExprKind::Ident(h) => match masked(h) {
+                        // The listed bits may be read; the index is constant.
+                        Some((sid, want)) => sim
+                            .narrow_event_mask(e, sid, scope)
+                            .is_some_and(|m| m & !want == 0),
+                        None => ok(index),
+                    },
+                    _ => ok(base) && ok(index),
+                },
+                ExprKind::RangeSelect {
+                    expr: base,
+                    left,
+                    right,
+                    ..
+                } => match &base.kind {
+                    ExprKind::Ident(h) => match masked(h) {
+                        Some((sid, want)) => sim
+                            .narrow_event_mask(e, sid, scope)
+                            .is_some_and(|m| m & !want == 0),
+                        None => ok(left) && ok(right),
+                    },
+                    _ => ok(base) && ok(left) && ok(right),
+                },
+                ExprKind::SystemCall { name, args } => {
+                    matches!(
+                        name.as_str(),
+                        "$signed"
+                            | "$unsigned"
+                            | "$bits"
+                            | "$clog2"
+                            | "$countones"
+                            | "$onehot"
+                            | "$onehot0"
+                            | "$isunknown"
+                    ) && args.iter().all(ok)
+                }
+                _ => false,
+            }
+        }
+        fn stmt_ok(
+            sim: &Simulator,
+            st: &Statement,
+            masks: &[(usize, u64)],
+            scope: &str,
+            masked: &dyn Fn(&HierarchicalIdentifier) -> Option<(usize, u64)>,
+        ) -> bool {
+            let e_ok = |x: &Expression| expr_ok(sim, x, masks, scope, masked);
+            let s_ok = |x: &Statement| stmt_ok(sim, x, masks, scope, masked);
+            // A target's indices are reads; the target itself must not be a
+            // listed signal.
+            let lv_ok = |lv: &Expression| -> bool {
+                fn base_and_indices<'a>(
+                    e: &'a Expression,
+                    idx: &mut Vec<&'a Expression>,
+                ) -> Option<&'a HierarchicalIdentifier> {
+                    match &e.kind {
+                        ExprKind::Ident(h) => Some(h),
+                        ExprKind::Paren(x) => base_and_indices(x, idx),
+                        ExprKind::Index { expr, index } => {
+                            idx.push(index);
+                            base_and_indices(expr, idx)
+                        }
+                        ExprKind::RangeSelect {
+                            expr, left, right, ..
+                        } => {
+                            idx.push(left);
+                            idx.push(right);
+                            base_and_indices(expr, idx)
+                        }
+                        _ => None,
+                    }
+                }
+                let parts: Vec<&Expression> = match &lv.kind {
+                    ExprKind::Concatenation(parts) => parts.iter().collect(),
+                    _ => vec![lv],
+                };
+                parts.into_iter().all(|p| {
+                    let mut idx = Vec::new();
+                    base_and_indices(p, &mut idx)
+                        .is_some_and(|h| masked(h).is_none() && idx.into_iter().all(e_ok))
+                })
+            };
+            match &st.kind {
+                StatementKind::Null => true,
+                StatementKind::BlockingAssign { lvalue, rvalue } => lv_ok(lvalue) && e_ok(rvalue),
+                StatementKind::NonblockingAssign {
+                    lvalue,
+                    delay: None,
+                    rvalue,
+                } => lv_ok(lvalue) && e_ok(rvalue),
+                StatementKind::SeqBlock { stmts, .. } => stmts.iter().all(s_ok),
+                StatementKind::If {
+                    condition,
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => e_ok(condition) && s_ok(then_stmt) && else_stmt.as_deref().is_none_or(s_ok),
+                StatementKind::Case { expr, items, .. } => {
+                    e_ok(expr)
+                        && items.iter().all(|it| {
+                            it.pattern.is_none() && it.patterns.iter().all(e_ok) && s_ok(&it.stmt)
+                        })
+                }
+                _ => false,
+            }
+        }
+        stmt_ok(self, body, masks, scope, &masked)
+    }
+
     /// Count the statement-level timing controls in a subtree (waits an FSM
     /// would own). Intra-assignment delays are canonicalized into marker
     /// CALLS by the elaborator and do not appear as TimingControl nodes.
@@ -21717,70 +21893,92 @@ impl Simulator {
                         // fires on that VALUE alone — never on whatever else
                         // the body happens to read (a select-listed block
                         // whose body called a task woke on every signal the
-                        // body read). Such a list is no read set; it goes to
-                        // the edge path, or to a value waiter below.
-                        EventListShape::NonPlain => false,
-                        EventListShape::Plain => {
-                            let mut b_reads: HashSet<String> = HashSet::default();
-                            let mut b_writes: HashSet<String> = HashSet::default();
-                            Self::collect_stmt_reads(
-                                &body,
-                                &self.module,
-                                &mut b_reads,
-                                &mut b_writes,
-                            );
-                            let scope_hint = self.infer_scope_from_rw_sets(&b_writes, &b_reads);
-                            let name_to_id = &self.signal_name_to_id;
-                            let resolve_ids = |name: &str| -> Vec<usize> {
-                                let mut out: Vec<usize> = Vec::new();
-                                if let Some(scope) = &scope_hint {
-                                    if let Some(&id) =
-                                        name_to_id.get(format!("{}.{}", scope, name).as_str())
-                                    {
-                                        out.push(id);
-                                    }
+                        // body read). The comb path, which wakes on any change
+                        // of a whole signal the body reads, is faithful only
+                        // when every term is a plain name or constant bits of
+                        // one, the body reads those signals only within the
+                        // listed bits, and it has nothing but assignments to
+                        // repeat: then a wake on a sibling bit recomputes the
+                        // very same values. Everything else goes to the edge
+                        // path, or to a value waiter below.
+                        shape => {
+                            let select_masks = match shape {
+                                EventListShape::NonPlain => {
+                                    self.comb_select_masks(&sens, &ab.scope)
                                 }
-                                if let Some(&id) = name_to_id.get(name) {
-                                    out.push(id);
-                                } else if let Some(stripped) = name.strip_prefix(&top_prefix) {
-                                    if let Some(&id) = name_to_id.get(stripped) {
-                                        out.push(id);
-                                    }
-                                }
-                                out
+                                _ => Some(Vec::new()),
                             };
-                            let mut sens_ids: Vec<usize> = Vec::new();
-                            for s in &sens {
-                                for id in resolve_ids(s.signal_name.as_str()) {
-                                    if !sens_ids.contains(&id) {
-                                        sens_ids.push(id);
+                            select_masks.is_some_and(|select_masks| {
+                                let mut b_reads: HashSet<String> = HashSet::default();
+                                let mut b_writes: HashSet<String> = HashSet::default();
+                                Self::collect_stmt_reads(
+                                    &body,
+                                    &self.module,
+                                    &mut b_reads,
+                                    &mut b_writes,
+                                );
+                                let scope_hint = self.infer_scope_from_rw_sets(&b_writes, &b_reads);
+                                let name_to_id = &self.signal_name_to_id;
+                                let resolve_ids = |name: &str| -> Vec<usize> {
+                                    let mut out: Vec<usize> = Vec::new();
+                                    if let Some(scope) = &scope_hint {
+                                        if let Some(&id) =
+                                            name_to_id.get(format!("{}.{}", scope, name).as_str())
+                                        {
+                                            out.push(id);
+                                        }
+                                    }
+                                    if let Some(&id) = name_to_id.get(name) {
+                                        out.push(id);
+                                    } else if let Some(stripped) = name.strip_prefix(&top_prefix) {
+                                        if let Some(&id) = name_to_id.get(stripped) {
+                                            out.push(id);
+                                        }
+                                    }
+                                    out
+                                };
+                                let mut sens_ids: Vec<usize> = Vec::new();
+                                for s in &sens {
+                                    for id in resolve_ids(s.signal_name.as_str()) {
+                                        if !sens_ids.contains(&id) {
+                                            sens_ids.push(id);
+                                        }
                                     }
                                 }
-                            }
-                            // Mirror the comb path's `sens_reads = reads - writes`.
-                            // The union of the resolved ids is built ONCE and
-                            // both directions are answered from it: `for all r,
-                            // for all id in resolve_ids(r)` is by construction
-                            // the same as `for all id in union` (the union is
-                            // exactly that flat_map), so this is the same test
-                            // the two separate passes used to run.
-                            let read_id_union: std::collections::HashSet<usize> = b_reads
-                                .difference(&b_writes)
-                                .flat_map(|r| resolve_ids(r.as_str()))
-                                .collect();
-                            let reads_covered =
-                                read_id_union.iter().all(|id| sens_ids.contains(id));
-                            // The reverse must hold too: every LISTED signal has to be
-                            // in the derived read set, or the comb path silently drops
-                            // it from the sensitivity. `always @(a) t = $time;` reads
-                            // no signal at all, so the containment above passes
-                            // VACUOUSLY, the entry's read set came out empty, and the
-                            // block fired exactly once (at t0) — every later edge of
-                            // `a` was missed and the captured time stayed 0. Routing
-                            // the not-equal case to the edge path costs a little speed
-                            // for an unusual shape and follows §9.4.2 exactly.
-                            let sens_covered = sens_ids.iter().all(|id| read_id_union.contains(id));
-                            reads_covered && sens_covered
+                                // Mirror the comb path's `sens_reads = reads - writes`.
+                                // The union of the resolved ids is built ONCE and
+                                // both directions are answered from it: `for all r,
+                                // for all id in resolve_ids(r)` is by construction
+                                // the same as `for all id in union` (the union is
+                                // exactly that flat_map), so this is the same test
+                                // the two separate passes used to run.
+                                let read_id_union: std::collections::HashSet<usize> = b_reads
+                                    .difference(&b_writes)
+                                    .flat_map(|r| resolve_ids(r.as_str()))
+                                    .collect();
+                                let reads_covered =
+                                    read_id_union.iter().all(|id| sens_ids.contains(id));
+                                // The reverse must hold too: every LISTED signal has to be
+                                // in the derived read set, or the comb path silently drops
+                                // it from the sensitivity. `always @(a) t = $time;` reads
+                                // no signal at all, so the containment above passes
+                                // VACUOUSLY, the entry's read set came out empty, and the
+                                // block fired exactly once (at t0) — every later edge of
+                                // `a` was missed and the captured time stayed 0. Routing
+                                // the not-equal case to the edge path costs a little speed
+                                // for an unusual shape and follows §9.4.2 exactly.
+                                let sens_covered =
+                                    sens_ids.iter().all(|id| read_id_union.contains(id));
+                                reads_covered
+                                    && sens_covered
+                                    && (select_masks.is_empty()
+                                        || self.body_reads_within_masks(
+                                            &body,
+                                            &select_masks,
+                                            &ab.scope,
+                                            &resolve_ids,
+                                        ))
+                            })
                         }
                     }
                 {

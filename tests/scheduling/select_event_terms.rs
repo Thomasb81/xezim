@@ -303,3 +303,72 @@ endmodule
         "{o}"
     );
 }
+
+/// A select list stays a combinational block when that is unobservable: the
+/// body only assigns and reads the listed signals within the listed bits
+/// (`@(a[1:0] or b) case (a[1:0])`, the generated-netlist shape). A body
+/// reading other bits of a listed signal (`@(a[2]) z = a[3:0]`) must not
+/// follow them.
+#[test]
+fn comb_style_select_lists() {
+    let o = run(
+        "comb",
+        r#"
+`timescale 1ns/1ns
+module tb;
+  logic [7:0] a = 0, b = 0;
+  logic [3:0] y, z;
+  int nw = 0;
+  // comb-style select lists: body reads only the listed bits
+  always @( a[1:0] or b) begin
+    case (a[1:0])
+      2'b00: y = b[3:0];
+      2'b01: y = b[7:4];
+      default: y = 4'hf;
+    endcase
+  end
+  // body reads an unlisted bit of a listed signal: must not wake on it
+  always @(a[2]) z = a[3:0];
+  initial begin
+    for (int i = 0; i < 40; i++) begin #1 a = a + 8'h3; b = b + 8'h11; end
+    #1 $display("T| y=%h z=%h", y, z);
+    $finish;
+  end
+endmodule
+"#,
+        &[],
+    );
+    assert_eq!(t_lines(&o), ["T| y=8 z=8"], "{o}");
+    let o = run(
+        "comb_sens",
+        r#"
+`timescale 1ns/1ns
+module tb;
+  logic [7:0] a = 0, b = 0;
+  logic [3:0] y, z;
+  int nw = 0;
+  // comb-style select lists: body reads only the listed bits
+  always @( a[1:0] or b) begin
+    case (a[1:0])
+      2'b00: y = b[3:0];
+      2'b01: y = b[7:4];
+      default: y = 4'hf;
+    endcase
+  end
+  // body reads an unlisted bit of a listed signal: must not wake on it
+  always @(a[2]) z = a[3:0];
+  initial begin
+    for (int i = 0; i < 40; i++) begin #1 a = a + 8'h3; b = b + 8'h11; end
+    #1 $display("T| y=%h z=%h", y, z);
+    $finish;
+  end
+endmodule
+"#,
+        &[("XEZIM_DUMP_COMB_SENS", "1")],
+    );
+    assert_eq!(
+        o.lines().filter(|l| l.starts_with("[COMB-SENS]")).count(),
+        1,
+        "{o}"
+    );
+}
