@@ -137,6 +137,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   C++ that call was mangled, so `--dpi-lib` stopped with `undefined symbol`.
   The driver now gives everything C linkage, as the reference `uvm_dpi.cc`
   does, and also builds as C. (#208)
+* An input port whose connection computes something (`.p(a & b)`) is a net
+  of its own (§23.3.3), so `@(p)` no longer wakes when an operand changes
+  while `a & b` stays the same. A child reached through a select
+  (`.wl(wl[1])`) whose own port has the same name latches again.
+* Inlined task bodies no longer see the caller's local variables, an output
+  argument is copied back into the caller's own variable, `disable` of a task
+  inside `foreach` ends the task, and integer values written to `real` locals
+  and formals convert.
+* `/` and `%` size both operands to the wider one (§11.6.1); a narrow dividend
+  used to narrow a ternary divisor and read x.
+* A two-state variable no longer stores x or z when a value with x or z bits
+  is written to it from compiled code.
 
 **Performance**
 
@@ -155,6 +167,22 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * Together, host instructions fall 7% on a C906 CoreMark run and on the
   AXI4 AVIP and 11% on a C910 memcpy run, with identical output; a UVM
   testbench reaches time 0 with about a third of the previous work.
+* Designs built from many small instances, such as a cell-level memory:
+  input ports that nothing can observe by name are left out
+  (`XEZIM_KEEP_PORTS=1` keeps them; waveform dumps, VPI, DPI and hierarchical
+  references keep them automatically), AND/OR gates whose other input holds
+  the controlling value skip clock-driven evaluation (`XEZIM_CTL_MASK=0` turns
+  it off), and `acc = acc | x[k]` reduction loops compile straight-line. A
+  64k-cell DRAM model simulates with 1.0 G instead of 11.7 G host
+  instructions; a C906 CoreMark run uses 4% fewer.
+* Behavioural memory models: a task call from compiled code no longer copies
+  the task, and a statement that still needs the interpreter runs inside its
+  compiled block instead of sending the whole block to the interpreter. A
+  DDR4-style behavioural model runs 4 to 6 times faster.
+* Large flat designs start faster: elaboration skips passes that cannot apply,
+  and dependency ordering joins nets with very many writers and readers
+  (`XEZIM_TOPO_JOIN=0` turns that off). The 64k-cell DRAM model elaborates and
+  compiles in about 3.5 s instead of 8.2 s.
 
 **Memory**
 
@@ -165,6 +193,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `$readmemh`/`$writememh`, DPI array arguments and `uvm_hdl_force` work on
   arena memories. A C906 CoreMark run peaks at 0.6 GB instead of 2.6 GB.
   `XEZIM_RSS_TRACE=1` prints resident and peak memory at every phase.
+* Instantiated `always` blocks stay in their shared form until they compile
+  (`XEZIM_LAZY_ALWAYS=0` turns it off), compiled blocks drop their statement
+  trees when nothing needs them, and freed memory is returned after
+  compilation. The 64k-cell DRAM model peaks at 0.58 GB instead of 1.6 GB, and
+  a 256k-cell one at 2.1 GB instead of 7 GB.
 
 **VPI**
 
