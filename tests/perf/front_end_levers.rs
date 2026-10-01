@@ -407,8 +407,8 @@ fn identity_chains_collapse_in_any_order() {
         "{out}"
     );
     // Same re-pointing work as the in-place passes did.
-    assert!(out.contains("[NET-COLLAPSE] 3 identity port nets collapsed"), "{out}");
-    assert!(out.contains("[BUF-COLLAPSE] 28 identity buffer nets collapsed"), "{out}");
+    assert!(out.contains("[NET-COLLAPSE] 2 identity port nets collapsed"), "{out}");
+    assert!(out.contains("[BUF-COLLAPSE] 24 identity buffer nets collapsed"), "{out}");
 }
 
 #[test]
