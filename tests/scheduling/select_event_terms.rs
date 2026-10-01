@@ -372,3 +372,140 @@ endmodule
         "{o}"
     );
 }
+
+/// The 1-bit nets synthesized to watch an edge of a select (`posedge dq[2]`
+/// through a port, `posedge v[1]`) are no design objects: a waveform dump
+/// leaves them out.
+#[test]
+fn edge_alias_nets_stay_out_of_dumps() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("select_event_terms");
+    std::fs::create_dir_all(&dir).unwrap();
+    let vcd = dir.join("alias.vcd");
+    let _ = std::fs::remove_file(&vcd);
+    let src = r#"
+`timescale 1ns/1ns
+module dev (inout [3:0] dq);
+  int np = 0;
+  always @(posedge dq[2]) np++;
+endmodule
+module tb;
+  logic [7:0] v = 0;
+  wire [7:0] bus; assign bus = v;
+  int nl = 0;
+  dev u (.dq(bus[7:4]));
+  always @(posedge v[1]) nl++;
+  initial begin
+    $dumpfile("VCD"); $dumpvars(0, tb);
+    repeat (20) #1 v = v + 8'h13;
+    $display("T| np=%0d nl=%0d", u.np, nl);
+    $finish;
+  end
+endmodule
+"#
+    .replace("VCD", vcd.to_str().unwrap());
+    let sv = dir.join("alias.sv");
+    std::fs::write(&sv, src).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .args([
+            "--simulate",
+            "--wave",
+            "-s",
+            "tb",
+            "--no-cache",
+            sv.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(output.status.success(), "{text}");
+    assert_eq!(t_lines(&text), ["T| np=3 nl=5"], "{text}");
+    let dump = std::fs::read_to_string(&vcd).unwrap();
+    let vars: Vec<&str> = dump.lines().filter(|l| l.contains("$var")).collect();
+    assert!(!vars.is_empty(), "{dump}");
+    assert!(vars.iter().all(|l| !l.contains("__xz_")), "{vars:?}");
+}
+
+/// Generated-netlist select lists through ports and on wide vectors stay
+/// combinational: a booth-encoder child whose port reads arrive as selects
+/// of the connection (`A[W-1]` over `.A(m[32:0])`, `code[2:0]` over
+/// `.code(d[4:2])`), a block listing one bit of a port and reading only it,
+/// and a 128-bit select list. Two encoder instances with two blocks each
+/// and the wide mux make five combinational entries.
+#[test]
+fn port_and_wide_select_lists_stay_combinational() {
+    let src = r#"
+module enc (input [32:0] A, input [2:0] code, output reg [32:0] product, output reg sn);
+  parameter W = 33;
+  always @( A[32:0] or code[2:0]) begin
+    case (code[2:0])
+      3'b000, 3'b111: product[W-1:0] = {W{1'b0}};
+      3'b001, 3'b010: product[W-1:0] = {A[W-1:0]};
+      3'b011: product[W-1:0] = {A[W-2:0], 1'b0};
+      3'b100: product[W-1:0] = {~A[W-2:0], 1'b0};
+      default: product[W-1:0] = ~A[W-1:0];
+    endcase
+  end
+  always @( A[32] or code[2:0]) begin
+    case (code[2:0])
+      3'b000, 3'b111: sn = 1'b1;
+      3'b001, 3'b010, 3'b011: sn = ~A[W-1];
+      default: sn = A[W-1];
+    endcase
+  end
+endmodule
+module tb;
+  reg [32:0] m = 0;
+  reg [6:0] d = 0;
+  reg [127:0] w0 = 0, w1 = 0;
+  reg [1:0] sel = 0;
+  reg [127:0] q;
+  wire [32:0] p0, p1; wire s0, s1;
+  enc e0 (.A(m[32:0]), .code(d[2:0]), .product(p0), .sn(s0));
+  enc e1 (.A(m[32:0]), .code(d[4:2]), .product(p1), .sn(s1));
+  always @( w1[127:0] or w0[127:0] or sel[1:0]) begin
+    case (sel[1:0]) 2'b10: q[127:0] = w0[127:0]; 2'b01: q[127:0] = w1[127:0]; default: q[127:0] = 128'hx; endcase
+  end
+  initial begin
+    repeat (21) begin
+      #1 m = m * 3 + 7; d = d + 5; w0 = {w0[126:0], ~w0[127]}; w1 = w1 + 128'h1_0000_0000_0000_0001; sel = sel + 1;
+      #1 $display("T| %h %h %b %b %h", p0, p1, s0, s1, q);
+    end
+    $finish;
+  end
+endmodule
+"#;
+    let o = run("comb_ports", src, &[]);
+    assert_eq!(
+        t_lines(&o),
+        [
+            "T| 1fffffff8 000000007 0 1 00000000000000010000000000000001",
+            "T| 00000001c 00000001c 1 1 00000000000000000000000000000003",
+            "T| 000000000 0000000b6 1 1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T| 1fffffdce 1fffffee7 0 0 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T| 00000034f 1fffffcb0 1 0 00000000000000050000000000000005",
+            "T| 1fffff60b 000000000 0 1 0000000000000000000000000000003f",
+            "T| 000003bc6 000000000 1 1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T| 000000000 0000059b0 1 1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T| 1fffef2e8 000021a2e 0 1 00000000000000090000000000000009",
+            "T| 00003274c 1fff9b166 1 0 000000000000000000000000000003ff",
+            "T| 000000000 1fff68a14 1 0 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T| 1ffc73c6e 000000000 0 1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T| 00055255f 000000000 1 1 000000000000000d000000000000000d",
+            "T| 1ff008fdb 000ff7024 0 1 00000000000000000000000000003fff",
+            "T| 005fca0e6 002fe5073 1 1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T| 000000000 1ee0a1d3e 1 0 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T| 1e50f2bd8 1e50f2bd8 0 0 00000000000000110000000000000011",
+            "T| 050d27c7c 1af2d8383 1 0 0000000000000000000000000003ffff",
+            "T| 000000000 000000000 1 1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T| 051333f0e 0d7666078 0 1 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "T| 08633216f 08633216f 1 1 00000000000000150000000000000015",
+        ],
+        "{o}"
+    );
+    let o = run("comb_ports_sens", src, &[("XEZIM_DUMP_COMB_SENS", "1")]);
+    assert_eq!(
+        o.lines().filter(|l| l.starts_with("[COMB-SENS]")).count(),
+        5,
+        "{o}"
+    );
+}

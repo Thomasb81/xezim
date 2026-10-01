@@ -21196,10 +21196,27 @@ impl Simulator {
         while let ExprKind::Paren(inner) = &e.kind {
             e = inner;
         }
-        let (base, sel) = match &e.kind {
+        match &e.kind {
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }
+                if matches!(expr.kind, ExprKind::Ident(_)) => {}
+            _ => return None,
+        }
+        self.select_chain_bits(e, sid, scope)?
+            .into_iter()
+            .try_fold(0u64, |m, b| (b < 64).then(|| m | 1u64 << b))
+    }
+
+    /// The PHYSICAL bits of signal `sid` a constant select chain rooted at
+    /// it reads, LSB first: `v[7:4]`, or the port-substitution shapes
+    /// `v[32:0][31]` and `v[15:8][3:2]`, where an outer select counts
+    /// positions in the value of the inner one. None when an index is not
+    /// constant, a select leaves its operand, or the root is no plain vector.
+    fn select_chain_bits(&self, e: &Expression, sid: usize, scope: &str) -> Option<Vec<i64>> {
+        let (base, kind, l, r) = match &e.kind {
+            ExprKind::Paren(x) => return self.select_chain_bits(x, sid, scope),
             ExprKind::Index { expr, index } => {
                 let k = self.event_const_index(index, scope)?;
-                (expr, (RangeKind::Constant, k, k))
+                (expr, RangeKind::Constant, k, k)
             }
             ExprKind::RangeSelect {
                 expr,
@@ -21208,35 +21225,44 @@ impl Simulator {
                 right,
             } => (
                 expr,
-                (
-                    *kind,
-                    self.event_const_index(left, scope)?,
-                    self.event_const_index(right, scope)?,
-                ),
+                *kind,
+                self.event_const_index(left, scope)?,
+                self.event_const_index(right, scope)?,
             ),
             _ => return None,
         };
-        let ExprKind::Ident(h) = &base.kind else {
-            return None;
-        };
-        if h.path.last().is_some_and(|s| !s.selects.is_empty()) {
-            return None;
+        let mut b = &**base;
+        while let ExprKind::Paren(x) = &b.kind {
+            b = x;
         }
-        let width = *self.signal_widths.get(sid)?;
-        if self.signal_real.get(sid).copied().unwrap_or(false) {
-            return None;
-        }
-        let dim = event_bits::vector_decl_dim(&self.module, self.name_for_id(sid), width)?;
-        let (lo, hi) = event_bits::select_label_span(dim, sel.0, sel.1, sel.2)?;
-        let mut mask = 0u64;
-        for label in lo..=hi {
-            let phys = event_bits::label_to_phys(dim, label);
-            if !(0..(width as i64).min(64)).contains(&phys) {
+        if let ExprKind::Ident(h) = &b.kind {
+            if h.path.last().is_some_and(|s| !s.selects.is_empty()) {
                 return None;
             }
-            mask |= 1u64 << phys;
+            let width = *self.signal_widths.get(sid)?;
+            if self.signal_real.get(sid).copied().unwrap_or(false) {
+                return None;
+            }
+            let dim = event_bits::vector_decl_dim(&self.module, self.name_for_id(sid), width)?;
+            let (lo, hi) = event_bits::select_label_span(dim, kind, l, r)?;
+            let mut bits: Vec<i64> = Vec::new();
+            for label in lo..=hi {
+                let phys = event_bits::label_to_phys(dim, label);
+                if !(0..width as i64).contains(&phys) || bits.len() > 4096 {
+                    return None;
+                }
+                bits.push(phys);
+            }
+            bits.sort_unstable();
+            return Some(bits);
         }
-        Some(mask)
+        // A select of an unnamed value counts positions from its LSB.
+        let inner = self.select_chain_bits(b, sid, scope)?;
+        let (lo, hi) = event_bits::select_label_span((i64::MAX, 0), kind, l, r)?;
+        if lo < 0 || hi >= inner.len() as i64 {
+            return None;
+        }
+        Some(inner[lo as usize..=hi as usize].to_vec())
     }
 
     /// The bits each signal of an all-level event list is watched through:
@@ -21244,18 +21270,29 @@ impl Simulator {
     /// (`@(a[1:0] or b)` gives `a`'s two bits; `b`, named whole, needs
     /// none). None when some term is neither a plain name nor such a select
     /// (`@(mem[i])`, `@(a + b)`) or names no signal.
-    fn comb_select_masks(&self, sens: &[Sensitivity], scope: &str) -> Option<Vec<(usize, u64)>> {
-        let mut masks: Vec<(usize, u64)> = Vec::new();
+    fn comb_select_masks(
+        &self,
+        sens: &[Sensitivity],
+        scope: &str,
+    ) -> Option<Vec<(usize, Vec<u64>)>> {
+        let mut masks: Vec<(usize, Vec<u64>)> = Vec::new();
         let mut whole: Vec<usize> = Vec::new();
         for s in sens {
             let sid = self.sens_term_sid(&s.signal_name, scope)?;
             match &s.value_of {
                 None => whole.push(sid),
                 Some(e) => {
-                    let m = self.narrow_event_mask(e, sid, scope)?;
-                    match masks.iter_mut().find(|(id, _)| *id == sid) {
-                        Some(entry) => entry.1 |= m,
-                        None => masks.push((sid, m)),
+                    let bits = self.select_chain_bits(e, sid, scope)?;
+                    let words = (*self.signal_widths.get(sid)? as usize).div_ceil(64);
+                    let entry = match masks.iter().position(|(id, _)| *id == sid) {
+                        Some(k) => &mut masks[k].1,
+                        None => {
+                            masks.push((sid, vec![0u64; words]));
+                            &mut masks.last_mut().unwrap().1
+                        }
+                    };
+                    for b in bits {
+                        entry[b as usize / 64] |= 1u64 << (b % 64);
                     }
                 }
             }
@@ -21269,25 +21306,28 @@ impl Simulator {
     /// could observe — only blocking/nonblocking assignments, `if` and
     /// `case`, with no call other than a pure system function? `resolve`
     /// maps a name the way the comb path's read set does.
-    fn body_reads_within_masks(
+    fn body_reads_within_masks<'m>(
         &self,
         body: &Statement,
-        masks: &[(usize, u64)],
+        masks: &'m [(usize, Vec<u64>)],
         scope: &str,
         resolve: &dyn Fn(&str) -> Vec<usize>,
     ) -> bool {
-        let masked = |h: &HierarchicalIdentifier| -> Option<(usize, u64)> {
+        let masked = |h: &HierarchicalIdentifier| -> Option<(usize, &'m [u64])> {
             let raw = Self::resolve_hier_name_static(h, &self.module);
-            resolve(&raw)
-                .into_iter()
-                .find_map(|id| masks.iter().find(|(m, _)| *m == id).copied())
+            resolve(&raw).into_iter().find_map(|id| {
+                masks
+                    .iter()
+                    .find(|(m, _)| *m == id)
+                    .map(|(m, w)| (*m, w.as_slice()))
+            })
         };
-        fn expr_ok(
+        fn expr_ok<'m>(
             sim: &Simulator,
             e: &Expression,
-            masks: &[(usize, u64)],
+            masks: &'m [(usize, Vec<u64>)],
             scope: &str,
-            masked: &dyn Fn(&HierarchicalIdentifier) -> Option<(usize, u64)>,
+            masked: &dyn Fn(&HierarchicalIdentifier) -> Option<(usize, &'m [u64])>,
         ) -> bool {
             let ok = |x: &Expression| expr_ok(sim, x, masks, scope, masked);
             match &e.kind {
@@ -21305,30 +21345,36 @@ impl Simulator {
                 ExprKind::Replication { count, exprs } => ok(count) && exprs.iter().all(ok),
                 ExprKind::Inside { expr, ranges } => ok(expr) && ranges.iter().all(ok),
                 ExprKind::Range(l, r) => ok(l) && ok(r),
-                ExprKind::Index { expr: base, index } => match &base.kind {
-                    ExprKind::Ident(h) => match masked(h) {
-                        // The listed bits may be read; the index is constant.
-                        Some((sid, want)) => sim
-                            .narrow_event_mask(e, sid, scope)
-                            .is_some_and(|m| m & !want == 0),
-                        None => ok(index),
-                    },
-                    _ => ok(base) && ok(index),
-                },
-                ExprKind::RangeSelect {
-                    expr: base,
-                    left,
-                    right,
-                    ..
-                } => match &base.kind {
-                    ExprKind::Ident(h) => match masked(h) {
-                        Some((sid, want)) => sim
-                            .narrow_event_mask(e, sid, scope)
-                            .is_some_and(|m| m & !want == 0),
-                        None => ok(left) && ok(right),
-                    },
-                    _ => ok(base) && ok(left) && ok(right),
-                },
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => {
+                    // A select chain rooted at a listed signal may read only
+                    // listed bits; any other select is an ordinary read.
+                    let mut root = e;
+                    loop {
+                        match &root.kind {
+                            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                                root = expr
+                            }
+                            ExprKind::Paren(x) => root = x,
+                            _ => break,
+                        }
+                    }
+                    match &root.kind {
+                        ExprKind::Ident(h) if masked(h).is_some() => {
+                            let (sid, want) = masked(h).unwrap();
+                            sim.select_chain_bits(e, sid, scope).is_some_and(|bits| {
+                                bits.iter()
+                                    .all(|&b| want[b as usize / 64] >> (b % 64) & 1 == 1)
+                            })
+                        }
+                        _ => match &e.kind {
+                            ExprKind::Index { expr, index } => ok(expr) && ok(index),
+                            ExprKind::RangeSelect {
+                                expr, left, right, ..
+                            } => ok(expr) && ok(left) && ok(right),
+                            _ => false,
+                        },
+                    }
+                }
                 ExprKind::SystemCall { name, args } => {
                     matches!(
                         name.as_str(),
@@ -21345,12 +21391,12 @@ impl Simulator {
                 _ => false,
             }
         }
-        fn stmt_ok(
+        fn stmt_ok<'m>(
             sim: &Simulator,
             st: &Statement,
-            masks: &[(usize, u64)],
+            masks: &'m [(usize, Vec<u64>)],
             scope: &str,
-            masked: &dyn Fn(&HierarchicalIdentifier) -> Option<(usize, u64)>,
+            masked: &dyn Fn(&HierarchicalIdentifier) -> Option<(usize, &'m [u64])>,
         ) -> bool {
             let e_ok = |x: &Expression| expr_ok(sim, x, masks, scope, masked);
             let s_ok = |x: &Statement| stmt_ok(sim, x, masks, scope, masked);
@@ -21952,8 +21998,23 @@ impl Simulator {
                                 // the same as `for all id in union` (the union is
                                 // exactly that flat_map), so this is the same test
                                 // the two separate passes used to run.
+                                // A select list used to take this path unchecked, and
+                                // generated netlists list every operand but the
+                                // parameters (`case (cur_st) IDLE:`). A parameter
+                                // never changes, so it adds no wake; for those lists
+                                // a read of one does not count.
+                                let params = &self.module.parameters;
+                                let is_param = |r: &str| {
+                                    shape == EventListShape::NonPlain
+                                        && (params.contains_key(r)
+                                            || scope_hint.as_ref().is_some_and(|sc| {
+                                                params
+                                                    .contains_key(format!("{}.{}", sc, r).as_str())
+                                            }))
+                                };
                                 let read_id_union: std::collections::HashSet<usize> = b_reads
                                     .difference(&b_writes)
+                                    .filter(|r| !is_param(r.as_str()))
                                     .flat_map(|r| resolve_ids(r.as_str()))
                                     .collect();
                                 let reads_covered =
@@ -95236,7 +95297,8 @@ impl Simulator {
                 || enum_lits.contains(name)
                 || scope_names.contains(name)
                 || expanded_bases.contains(name)
-                || xezim_core::elaborate::is_delay_stage_net(name))
+                || xezim_core::elaborate::is_delay_stage_net(name)
+                || event_bits::is_edge_alias_net(name))
                 && Self::dump_name_selected(name, filters.as_deref(), depth)
         };
         for name in stored() {
@@ -150342,6 +150404,7 @@ fn vpi_scope_members(sim: &Simulator, scope: &str) -> Vec<(String, usize)> {
         if leaf.contains('[')
             || vpi_is_instance_name(sim, name)
             || xezim_core::elaborate::is_delay_stage_net(name)
+            || event_bits::is_edge_alias_net(name)
         {
             continue;
         }

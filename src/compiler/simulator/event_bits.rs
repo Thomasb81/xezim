@@ -93,6 +93,14 @@ pub(super) fn complete_ascending_ranges(module: &mut ElaboratedModule) {
     module.ascending_packed.extend(add);
 }
 
+/// A 1-bit net the simulator synthesized to watch an edge of a select or a
+/// computed expression (`__xz_edgesel<N>`, `__xz_edge_<tag>_<N>`, see
+/// `rewrite_edge_select_sensitivities`). It is no design object, so dumps
+/// and VPI scopes leave it out.
+pub(super) fn is_edge_alias_net(name: &str) -> bool {
+    name.starts_with("__xz_edgesel") || name.starts_with("__xz_edge_")
+}
+
 /// §7.4.1 physical bit (0 = LSB) of declared label `label`.
 pub(super) fn label_to_phys(dim: (i64, i64), label: i64) -> i64 {
     if dim.0 >= dim.1 {
