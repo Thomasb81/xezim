@@ -167,6 +167,24 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `uvm_port_base` and `uvm_reg_sequence` extend a type parameter, so a `$cast`
   from a TLM port to its interface base failed and register sequences never ran
   their `body`. (#210)
+* A static property read or written through an object handle (`h.count`)
+  reaches the static of the handle's declared class and specialization, also
+  through a null handle. It used to read x unless the static had been used
+  through the class name first, and writes through a specialized handle were
+  lost.
+* `$cast` to a variable declared with a class specialization
+  (`pbase #(8, byte) x;`) checks the parameters wherever the variable is
+  declared: module scope, class property, local, formal or typedef. Outside
+  procedural locals it used to accept an object of any specialization.
+* An interface class that extends a type parameter is an error in every mode,
+  as IEEE 1800 requires, including as a second base (`extends ic_a, B`).
+* Class properties take the width of the object's specialization:
+  `bit [W-1:0] pv = '1` in `pbase #(8)` is `8'hff`, not the default width's
+  fill, and the same holds for member arrays, queues, statics and class-local
+  typedefs. A type parameter bound by an ancestor's `extends comp_base #(byte)`
+  gives inherited properties, locals and function returns that type's width
+  and signedness. A ranged type argument (`#(bit [5:0])`) in a typedef keeps
+  its range.
 
 **Performance**
 
