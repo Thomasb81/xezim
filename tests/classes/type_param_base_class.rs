@@ -353,6 +353,67 @@ endmodule
     );
 }
 
+/// A class extending a typedef of a specialization, a wrapper whose own default binds a
+/// non-default base (`w3 #(type B = derived_c) extends wrap_c #(B)`), and class properties
+/// typed by a specialization or its typedef, constructed inside a method.
+#[test]
+fn type_param_base_typedef_extends_defaulted_wrapper_properties() {
+    const SRC: &str = r#"
+class base_c;
+  int x = 5;
+  virtual function string who(); return "base_c"; endfunction
+endclass
+class derived_c extends base_c;
+  int y = 7;
+  virtual function string who(); return "derived_c"; endfunction
+endclass
+class wrap_c #(type BASE = base_c) extends BASE;
+  virtual function string who(); return {"wrap_c/", super.who()}; endfunction
+endclass
+typedef wrap_c #(derived_c) wd_t;
+class via_td extends wd_t;
+  virtual function string who(); return {"via_td/", super.who()}; endfunction
+endclass
+class w3 #(type B = derived_c) extends wrap_c #(B);
+  virtual function string who(); return {"w3/", super.who()}; endfunction
+endclass
+class owner;
+  wrap_c #(derived_c) p;
+  wd_t q;
+  function void build(); p = new(); q = new(); endfunction
+endclass
+module tb;
+  via_td v; w3 a; w3 #(base_c) ab; owner o; derived_c d; base_c b;
+  initial begin
+    v = new();
+    $display("T| v who=%s y=%0d cast=%0d", v.who(), v.y, $cast(d, v));
+    a = new(); ab = new();
+    $display("T| a who=%s y=%0d", a.who(), a.y);
+    $display("T| ab who=%s cast=%0d", ab.who(), $cast(d, ab));
+    $display("T| tn a=%s ab=%s", $typename(a), $typename(ab));
+    o = new(); o.build();
+    $display("T| o.p who=%s y=%0d", o.p.who(), o.p.y);
+    $display("T| o.q who=%s y=%0d", o.q.who(), o.q.y);
+    b = o.p;
+    $display("T| b who=%s", b.who());
+  end
+endmodule
+"#;
+    check(
+        "t6",
+        SRC,
+        &[
+            "T| v who=via_td/wrap_c/derived_c y=7 cast=1",
+            "T| a who=w3/wrap_c/derived_c y=7",
+            "T| ab who=w3/wrap_c/base_c cast=0",
+            "T| tn a=class w3 #(class derived_c) ab=class w3 #(class base_c)",
+            "T| o.p who=wrap_c/derived_c y=7",
+            "T| o.q who=wrap_c/derived_c y=7",
+            "T| b who=wrap_c/derived_c",
+        ],
+    );
+}
+
 /// `this_type` construction in a static method, a value parameter beside the type parameter,
 /// a named `extends wrap_c #(.BASE(B))`, a typedef default, a specialization made inside
 /// another parameterized class, a nested `wrap_c #(wrap_c #(derived_c))`, and
