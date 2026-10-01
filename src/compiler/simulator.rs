@@ -91916,6 +91916,8 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
+        // §6.11.1: a two-state destination drops x/z, as the VM's stores do.
+        let (val_bits, xz_bits) = self.ts_scrub_two_state(id, val_bits, xz_bits);
         let sig_w = self.signal_widths[id];
         let w = if width == 0 { sig_w } else { width };
         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
@@ -91981,6 +91983,8 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
+        // §6.11.1: a two-state destination drops x/z, as the VM's stores do.
+        let (val_bits, xz_bits) = self.ts_scrub_two_state(id, val_bits, xz_bits);
         let sig_w = self.signal_widths[id];
         let w = if width == 0 { sig_w } else { width };
         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
