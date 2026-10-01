@@ -233,6 +233,8 @@ mod placeholder_parameter_replication;
 mod port_width_mismatch_explains;
 #[path = "misc/real_call_bytecode.rs"]
 mod real_call_bytecode;
+#[path = "misc/reduce_loop_unroll.rs"]
+mod reduce_loop_unroll;
 #[path = "misc/repeat_real_count.rs"]
 mod repeat_real_count;
 #[path = "misc/replication_and_cast_operands.rs"]

@@ -4993,11 +4993,14 @@ impl<'a> BytecodeCompiler<'a> {
     /// `for (k = K0; cond(k); k = k ± d) acc = acc | e(k);` (or `&`): the
     /// accumulate-over-a-range loop RTL writes as an OR (AND) tree over an
     /// unpacked array, `acc = acc | row_out[k]`. With a constant trip count
-    /// it compiles straight-line: `k` a compile-time constant per trip,
-    /// `acc` carried in one register, then one store of `acc` and the stores
-    /// that leave `k` where the loop leaves it. The rolled loop paid two
-    /// signal stores (each noting the write for propagation), a compare and
-    /// a branch per trip.
+    /// it compiles straight-line: `k` a constant per trip (`row_out[k]` a
+    /// plain load of the element), `acc` carried in one register, then one
+    /// store of `acc` and the stores that leave `k` where the loop leaves
+    /// it. The rolled loop paid two signal stores (each noting the write for
+    /// propagation), a compare, a branch and an element-index check per trip
+    /// (about 100 host instructions; the DRAM model's 128-row OR spent
+    /// 12.7k per evaluation). `e` is compiled once and replayed per trip, so
+    /// the compile cost stays a few instructions per trip.
     ///
     /// Exact. The loop is atomic (no timing control, call or fallback) and
     /// the emitted `e` reads neither `acc` nor `k`'s storage, so the only
@@ -5257,9 +5260,9 @@ impl<'a> BytecodeCompiler<'a> {
             x.is_signed = k_signed;
             x
         };
-        let Some(k0) =
-            self.fold_const(k_init)
-                .and_then(|v| if v.has_xz() { None } else { v.to_u64() })
+        let Some(k0) = self
+            .fold_const(k_init)
+            .and_then(|v| if v.has_xz() { None } else { v.to_u64() })
         else {
             return false;
         };
@@ -5302,12 +5305,12 @@ impl<'a> BytecodeCompiler<'a> {
             }
             cur = norm(cur.wrapping_add(delta));
         }
+        restore(self);
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let ok = self.emit_reduce_loop(
             lvalue, acc_expr, e, &op, acc_id, k_sig, k_init, k_w, &vals, cur, &names, &kval,
         );
-        restore(self);
         if !ok {
             self.insns.truncate(start);
             self.next_reg = start_reg;
@@ -5348,54 +5351,141 @@ impl<'a> BytecodeCompiler<'a> {
         if !vals.is_empty() {
             // Per trip exactly the body's `acc OP e` (the Binary arm: both
             // operands scrubbed / resized to the statement width), with the
-            // left operand the carried register instead of a reload.
+            // left operand the carried register instead of a reload. The
+            // carried register's scrub and resize are idempotent after the
+            // first trip (its width and signedness no longer change), so they
+            // are emitted once.
             let width = self.infer_lhs_width(lvalue);
+            if width == 0 {
+                return false;
+            }
             let ls = self.expr_signedness(acc_expr);
             let rs = self.expr_signedness(e);
             let unsigned = ls == Some(false) || rs == Some(false);
-            let scrub_acc = width > 0 && unsigned && !self.operand_scrub_is_noop(acc_expr);
-            let scrub_e = width > 0 && unsigned && !self.operand_scrub_is_noop(e);
+            let scrub_acc = unsigned && !self.operand_scrub_is_noop(acc_expr);
+            let scrub_e = unsigned && !self.operand_scrub_is_noop(e);
             let Some(a) = self.compile_expr(acc_expr, width) else {
                 return false;
             };
-            let trip_reg = self.next_reg;
-            let mut peak_reg = trip_reg;
-            let k_id = k_sig.map(|(kid, _)| kid);
-            for &v in vals {
-                for n in names {
-                    self.local_const_vars.insert(n.clone(), kval(v));
-                }
-                let e_start = self.insns.len();
-                let Some(r) = self.compile_expr(e, width) else {
-                    return false;
+            if scrub_acc {
+                self.emit(Insn::ClearSigned(a));
+            }
+            self.emit(Insn::Resize(a, width));
+            // `e` is compiled ONCE, with the loop variable bound to a
+            // register; each trip replays it with that register's reads
+            // turned into the trip's constant (what compiling `e` with the
+            // variable bound to the constant emits: one `LoadConst`), and an
+            // element read through such a constant into the element's load.
+            // (An outer unroll's constant binding of the same name would
+            // shadow the register: lift it for the template.)
+            let kreg = self.alloc_reg();
+            let saved: Vec<(String, Option<(RegId, u32)>, Option<Value>)> = names
+                .iter()
+                .map(|n| {
+                    (
+                        n.clone(),
+                        self.local_var_regs.insert(n.clone(), (kreg, k_w)),
+                        self.local_const_vars.remove(n),
+                    )
+                })
+                .collect();
+            let t_start = self.insns.len();
+            let r = self.compile_expr(e, width);
+            for (n, v, c) in saved {
+                match v {
+                    Some(v) => self.local_var_regs.insert(n.clone(), v),
+                    None => self.local_var_regs.remove(&n),
                 };
-                if !Self::reduce_operand_ok(&self.insns[e_start..], k_id, acc_id) {
-                    return false;
+                if let Some(c) = c {
+                    self.local_const_vars.insert(n, c);
                 }
-                self.fold_const_elem_loads(e_start);
-                if width > 0 {
-                    if scrub_acc {
-                        self.emit(Insn::ClearSigned(a));
-                    }
-                    if scrub_e {
-                        self.emit(Insn::ClearSigned(r));
-                    }
-                    self.emit(Insn::Resize(a, width));
-                    self.emit(Insn::Resize(r, width));
+            }
+            let Some(r) = r else {
+                return false;
+            };
+            let template: Vec<Insn> = self.insns.drain(t_start..).collect();
+            let k_id = k_sig.map(|(kid, _)| kid);
+            if !Self::reduce_operand_ok(&template, k_id, acc_id)
+                || template.iter().any(|i| {
+                    !matches!(i, Insn::Move(_, s) if *s == kreg) && Self::insn_reads_reg(i, kreg)
+                })
+                || template
+                    .iter()
+                    .any(|i| Self::dest_reg(i).or_else(|| Self::in_place_reg(i)) == Some(kreg))
+            {
+                return false;
+            }
+            // `Move(t, k); LoadArrayElem(d, arr, t)` with `t` read nowhere
+            // else: per trip one load of the element signal.
+            let mut elem_of: Vec<Option<(usize, i64, i64)>> = vec![None; template.len()];
+            let mut skip = vec![false; template.len()];
+            for (i, ins) in template.iter().enumerate() {
+                let Insn::LoadArrayElem(_, arr, t) = ins else {
+                    continue;
+                };
+                let ArrayOperand::Dense {
+                    first_id, lo, hi, ..
+                } = &**arr
+                else {
+                    continue;
+                };
+                let defs: Vec<usize> = (0..i)
+                    .filter(|&j| {
+                        let x = &template[j];
+                        Self::dest_reg(x).or_else(|| Self::in_place_reg(x)) == Some(*t)
+                    })
+                    .collect();
+                let [j] = defs.as_slice() else {
+                    continue;
+                };
+                let reads = template
+                    .iter()
+                    .enumerate()
+                    .filter(|&(m, x)| m != i && Self::insn_reads_reg(x, *t))
+                    .count();
+                if matches!(template[*j], Insn::Move(_, s) if s == kreg) && reads == 0 && hi >= lo {
+                    elem_of[i] = Some((*first_id, *lo, *hi));
+                    skip[*j] = true;
                 }
+            }
+            for &v in vals {
+                // The element index the trip's constant names, exactly as
+                // `LoadArrayElem` resolves it (the register's bits as an
+                // unsigned number).
+                let kv = kval(v);
+                let idx = kv.to_u64().map(|x| x as i64);
+                for (n, i) in template.iter().enumerate() {
+                    match (i, elem_of[n]) {
+                        (Insn::LoadArrayElem(d, ..), Some((first, lo, hi)))
+                            if idx.is_some_and(|x| x >= lo && x <= hi)
+                                && first + ((hi - lo) as usize) < self.signal_widths.len() =>
+                        {
+                            let eid = first + (idx.unwrap() - lo) as usize;
+                            self.emit(Insn::LoadSignal(*d, eid as SigId));
+                        }
+                        (Insn::LoadArrayElem(_, _, t), Some(_)) => {
+                            // Out of range: the generic read (x), as compiled.
+                            self.emit(Insn::LoadConst(*t, Box::new(kv.clone())));
+                            self.emit(i.clone());
+                        }
+                        (Insn::Move(d, s), _) if *s == kreg => {
+                            if !skip[n] {
+                                self.emit(Insn::LoadConst(*d, Box::new(kv.clone())));
+                            }
+                        }
+                        _ => self.emit(i.clone()),
+                    }
+                }
+                if scrub_e {
+                    self.emit(Insn::ClearSigned(r));
+                }
+                self.emit(Insn::Resize(r, width));
                 self.emit(match op {
                     BinaryOp::BitOr => Insn::BitOr(a, a, r),
                     _ => Insn::BitAnd(a, a, r),
                 });
-                if width > 0 {
-                    self.emit(Insn::Resize(a, width));
-                }
-                // The trip's temporaries are dead: the next trip reuses them
-                // at the same widths (the block's register count is the peak).
-                peak_reg = peak_reg.max(self.next_reg);
-                self.next_reg = trip_reg;
             }
-            self.next_reg = peak_reg;
+            self.emit(Insn::Resize(a, width));
             if self.register_overflow || !self.compile_blocking_target(lvalue, a, width) {
                 return false;
             }
@@ -5428,67 +5518,6 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         !self.register_overflow
-    }
-
-    /// In `insns[from..]`, a dense-array element read whose index register
-    /// holds an in-range constant (an unrolled trip's `arr[k]`) becomes a
-    /// plain load of the element's signal, and the index constant a `Nop`
-    /// when nothing else reads it.
-    fn fold_const_elem_loads(&mut self, from: usize) {
-        let n = self.insns.len();
-        for i in from..n {
-            let Insn::LoadArrayElem(d, arr, ri) = &self.insns[i] else {
-                continue;
-            };
-            let (d, ri) = (*d, *ri);
-            let ArrayOperand::Dense {
-                first_id, lo, hi, ..
-            } = &**arr
-            else {
-                continue;
-            };
-            let (first_id, lo, hi) = (*first_id, *lo, *hi);
-            // The index's one definition, in this range, before the read.
-            let defs: Vec<usize> = (from..i)
-                .filter(|&j| {
-                    let i = &self.insns[j];
-                    Self::dest_reg(i).or_else(|| Self::in_place_reg(i)) == Some(ri)
-                })
-                .collect();
-            let [j] = defs.as_slice() else {
-                continue;
-            };
-            let Insn::LoadConst(_, v) = &self.insns[*j] else {
-                continue;
-            };
-            if v.has_xz() || v.is_real {
-                continue;
-            }
-            let Some(idx) = v
-                .to_u64()
-                .filter(|&x| x <= i64::MAX as u64)
-                .map(|x| x as i64)
-            else {
-                continue;
-            };
-            // A signed index constant with the top bit set is negative.
-            if v.is_signed && v.width > 0 && v.width < 64 && (idx >> (v.width - 1)) & 1 == 1 {
-                continue;
-            }
-            if idx < lo
-                || idx > hi
-                || hi < lo
-                || first_id + ((hi - lo) as usize) >= self.signal_widths.len()
-            {
-                continue;
-            }
-            let eid = first_id + (idx - lo) as usize;
-            self.insns[i] = Insn::LoadSignal(d, eid as SigId);
-            let used = (from..n).any(|m| m != *j && Self::insn_reads_reg(&self.insns[m], ri));
-            if !used {
-                self.insns[*j] = Insn::Nop;
-            }
-        }
     }
 
     /// `try_reduce_loop`'s check on one trip's compiled operand: pure

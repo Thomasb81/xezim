@@ -24547,6 +24547,16 @@ impl Simulator {
                 continue;
             }
             let (hot, other) = if fa >= fb { (a, b) } else { (b, a) };
+            // A clock-tree controlling input re-evaluates the gate only
+            // through the eager tree pass, never through its own edge.
+            if self
+                .is_clock_tree_signal
+                .get(other.sig_id as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
             let e = eidx as u32;
             let edge_range = |sig: u32| -> (usize, usize) {
                 let s = sig as usize;
