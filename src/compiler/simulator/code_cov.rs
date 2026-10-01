@@ -1464,7 +1464,7 @@ impl Simulator {
             let mut names: Vec<String> = cls.methods.keys().cloned().collect();
             names.sort();
             for m in names {
-                let Some(method) = cls.methods.get_mut(&m) else {
+                let Some(method) = Arc::make_mut(&mut cls.methods).get_mut(&m) else {
                     continue;
                 };
                 let items = match &mut method.kind {

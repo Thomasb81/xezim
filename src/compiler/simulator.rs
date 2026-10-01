@@ -6253,9 +6253,18 @@ pub struct Simulator {
     /// rewrote them. Each specialization whose base differs from the
     /// default's gets its own class entry (see `ensure_spec_class`).
     dep_base: HashMap<String, (String, Vec<String>)>,
-    /// The default specialization's base link `(base class, base args)` of
-    /// each `dep_base` class; the class entry itself carries this base.
-    dep_default: HashMap<String, (String, Vec<String>)>,
+    /// The default specialization's base class ENTRY of each `dep_base`
+    /// class; the class entry itself carries this base. A specialization
+    /// binding a base of another class gets its own entry; one binding the
+    /// same base class with other arguments shares this one, the arguments
+    /// flowing through the specialization (see `spec_projection`).
+    dep_default: HashMap<String, String>,
+    /// The `dep_base` keys as a short list: the hot paths (every `new`,
+    /// `$cast`, static key and type-parameter lookup) ask whether a class is
+    /// one, and a design has a handful at most.
+    dep_names: Vec<String>,
+    /// `spec_entry` answers for `dep_base` classes, keyed `"<base>\0<sig>"`.
+    spec_entry_cache: std::cell::RefCell<HashMap<String, String>>,
     /// Specialized class entry name -> the class it was specialized from
     /// (`"wrap_c<derived_c>"` -> `"wrap_c"`).
     spec_clone_origin: HashMap<String, String>,
@@ -11180,6 +11189,8 @@ impl Simulator {
             shadowed_prop_names: HashSet::default(),
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),
+            dep_names: Vec::new(),
+            spec_entry_cache: std::cell::RefCell::new(HashMap::default()),
             spec_clone_origin: HashMap::default(),
             dep_typedefs: HashSet::default(),
             inst_templates: std::cell::RefCell::new(HashMap::default()),
@@ -96630,7 +96641,9 @@ impl Simulator {
             _ => "",
         };
         let scope_key: &str = tref.scope.as_ref().map(|s| s.name.as_str()).unwrap_or("");
-        let ncls = self.module.classes.len();
+        // A specialization's own class entry (`wrap_c<derived_c>`) is no
+        // name any source can spell, so making one does not stale an entry.
+        let ncls = self.module.classes.len() - self.spec_clone_origin.len();
         {
             let memo = self.typeref_class_memo.borrow();
             if let Some((n, hit)) = memo
@@ -97590,6 +97603,11 @@ impl Simulator {
         let child = chain[k - 1];
         let i = chain[k].param_order.iter().position(|p| p == name)?;
         let a = child.extends_type_args.get(i)?.trim();
+        if Self::spec_projection(a).is_some() {
+            return Self::carry_extends_arg(a, &|p| {
+                Self::carried_type_binding(bindings, chain, k - 1, p)
+            });
+        }
         Some(Self::carried_type_binding(bindings, chain, k - 1, a).unwrap_or_else(|| a.to_string()))
     }
 
@@ -112897,6 +112915,16 @@ impl Simulator {
         }
     }
 
+    /// Whether `name` is a `dep_base` class (its base depends on its
+    /// parameters).
+    fn is_dep_class(&self, name: &str) -> bool {
+        if self.dep_names.len() <= 8 {
+            self.dep_names.iter().any(|d| d == name)
+        } else {
+            self.dep_base.contains_key(name)
+        }
+    }
+
     /// The class a specialized class entry was made from (`"wrap_c<d>"` ->
     /// `"wrap_c"`); any other name is its own origin.
     fn class_origin<'a>(&'a self, name: &'a str) -> &'a str {
@@ -112905,6 +112933,12 @@ impl Simulator {
         if self.spec_clone_origin.is_empty() || !name.ends_with('>') {
             return name;
         }
+        self.class_origin_slow(name)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn class_origin_slow<'a>(&'a self, name: &'a str) -> &'a str {
         self.spec_clone_origin
             .get(name)
             .map(|s| s.as_str())
@@ -112913,6 +112947,7 @@ impl Simulator {
 
     /// A type fragment naming a class (`derived_c`, `pbase#(8)`, or a typedef
     /// of either) as `(class, specialization args)`.
+    #[inline(never)]
     fn type_base_frag_class(&self, frag: &str) -> Option<(String, Vec<String>)> {
         let frag = frag.trim();
         let (b, args) = Self::strip_class_specialization(frag);
@@ -112946,6 +112981,7 @@ impl Simulator {
     /// under the specialization fragments `args` (positional; a missing
     /// position takes its declared default, §6.20.2). The base class is an
     /// ORIGIN name; `spec_class_name` maps it to its specialized entry.
+    #[inline(never)]
     fn spec_base_link(&self, cname: &str, args: &[String]) -> Option<(String, Vec<String>)> {
         let (ext, ext_args) = self.dep_base.get(cname)?;
         let cd = self.module.classes.get(cname)?;
@@ -113000,6 +113036,116 @@ impl Simulator {
         Some((b, bargs))
     }
 
+    /// The type parameter a `dep_base` class extends (`BASE` in `class
+    /// wrap_c #(type BASE) extends BASE`); None for one extending a class.
+    fn dep_type_param(&self, cname: &str) -> Option<String> {
+        let (e, _) = self.dep_base.get(cname)?;
+        let cd = self.module.classes.get(cname)?;
+        cd.type_param_names
+            .iter()
+            .any(|t| t == e)
+            .then(|| e.clone())
+    }
+
+    /// The binding of type parameter `p` of `child`, a class on the chain of
+    /// an object of leaf entry `leaf` (declared class `origin`) under
+    /// construction: from the active specialization for the leaf itself,
+    /// else derived up the chain. Only a `BASE#[i]` projection asks.
+    #[cold]
+    #[inline(never)]
+    fn child_type_binding(
+        &self,
+        origin: &str,
+        leaf: &crate::compiler::elaborate::ElaboratedClass,
+        child: &crate::compiler::elaborate::ElaboratedClass,
+        p: &str,
+        type_args: Option<&[Expression]>,
+    ) -> Option<String> {
+        let explicit = type_args.is_some_and(|ta| !ta.is_empty());
+        let leaf_sig: Option<String> = if explicit {
+            let frags: Vec<String> = type_args
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|e| self.expr_to_spec_fragment(e))
+                .collect();
+            Some(self.canonicalize_spec_sig(origin, &frags.join(",")))
+        } else {
+            self.current_spec
+                .as_ref()
+                .filter(|(b, _)| b == origin)
+                .map(|(_, s)| s.clone())
+                .or_else(|| {
+                    self.class_is_parameterized(origin)
+                        .then(|| self.canonicalize_spec_sig(origin, ""))
+                })
+        };
+        let child_sig = if child.name == leaf.name {
+            leaf_sig?
+        } else {
+            match leaf_sig {
+                Some(ls) => self.ancestor_spec(origin, &ls, &child.name)?,
+                None => self.static_receiver_spec(&leaf.name, &child.name)?.1,
+            }
+        };
+        let j = child.param_order.iter().position(|x| x == p)?;
+        Self::spec_arg_at(&child_sig, j)
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .or_else(|| {
+                child
+                    .type_param_defaults
+                    .iter()
+                    .find(|(n, _)| n == p)
+                    .map(|(_, d)| d.clone())
+            })
+    }
+
+    /// The `extends` arguments of a class whose base is type parameter `tp`
+    /// bound to a specialization of `base`: argument `i` is `tp#[i]`, the
+    /// i-th argument of whatever `tp` is bound to (`spec_projection`).
+    fn base_projection_args(&self, tp: &str, base: &str) -> Vec<String> {
+        let n = self
+            .module
+            .classes
+            .get(base)
+            .map(|b| b.param_order.len())
+            .unwrap_or(0);
+        (0..n).map(|i| format!("{}#[{}]", tp, i)).collect()
+    }
+
+    /// `P#[i]` in an `extends` argument list: the i-th `#(...)` argument of
+    /// the specialization bound to type parameter `P`.
+    fn spec_projection(frag: &str) -> Option<(&str, usize)> {
+        let f = frag.trim();
+        if !f.ends_with(']') {
+            return None;
+        }
+        let (p, rest) = f.split_once("#[")?;
+        Some((p, rest.strip_suffix(']')?.parse().ok()?))
+    }
+
+    /// Argument `i` of specialization `binding` (`pbase#(8)`, 0 -> `8`).
+    /// None when the binding does not spell it (its default applies).
+    fn project_spec_arg(binding: &str, i: usize) -> Option<String> {
+        let (_, args) = Self::strip_class_specialization(binding.trim());
+        Self::split_spec_args(&args?)
+            .get(i)
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+    }
+
+    /// One `extends` argument of a child class carried up a level:
+    /// a projection `P#[i]` reads the child's binding of `P` through
+    /// `lookup`; a bare name is looked up as a parameter of the child.
+    /// None when it is neither (the caller keeps it as written) or the
+    /// projected argument is not spelled.
+    fn carry_extends_arg(arg: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+        match Self::spec_projection(arg) {
+            Some((p, i)) => lookup(p).and_then(|b| Self::project_spec_arg(&b, i)),
+            None => lookup(arg.trim()),
+        }
+    }
+
     /// The declared default of type parameter `tp` of `cd` as a fragment
     /// WITH its `#(...)` arguments (`uvm_sequence#(uvm_reg_item)`), when it
     /// is a specialized class type.
@@ -113025,6 +113171,38 @@ impl Simulator {
         Some(format!("{}#({})", name.name.name, frags.join(",")))
     }
 
+    /// The class entry `new` builds for `dep_base` class `cname`: the one of
+    /// the specialization given by `#(...)`, else of the active one when it
+    /// is this class's (`typedef wrap_c #(derived_c) wd_t; wd_t w = new;`),
+    /// else of the default. None when that is `cname` itself.
+    #[cold]
+    #[inline(never)]
+    fn spec_entry_for_new(
+        &mut self,
+        cname: &str,
+        type_args: Option<&[Expression]>,
+        computed_spec: Option<&(String, String)>,
+    ) -> Option<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>> {
+        let explicit = type_args.is_some_and(|ta| !ta.is_empty());
+        let active = self
+            .current_spec
+            .as_ref()
+            .filter(|(b, _)| !explicit && *b == cname);
+        let args: Vec<String> = active
+            .or(computed_spec)
+            .map(|(_, sig)| {
+                Self::split_spec_args(sig)
+                    .into_iter()
+                    .map(|a| a.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let key = self.ensure_spec_class(cname, &args);
+        (key != cname)
+            .then(|| self.module.classes.get(&key).cloned())
+            .flatten()
+    }
+
     /// The class entry of specialization `(base, sig)` if one was made, else
     /// `base` itself.
     fn spec_entry(&self, base: &str, sig: &str) -> String {
@@ -113034,19 +113212,28 @@ impl Simulator {
     /// `spec_entry` without a copy when `base` is its own entry (hot: the
     /// type-parameter and static-key resolvers call it per lookup).
     fn spec_entry_cow<'a>(&self, base: &'a str, sig: &str) -> std::borrow::Cow<'a, str> {
-        if self.spec_clone_origin.is_empty() || !self.dep_base.contains_key(base) {
+        if self.spec_clone_origin.is_empty() || !self.is_dep_class(base) {
             return std::borrow::Cow::Borrowed(base);
         }
         std::borrow::Cow::Owned(self.spec_entry_slow(base, sig))
     }
 
+    #[cold]
+    #[inline(never)]
     fn spec_entry_slow(&self, base: &str, sig: &str) -> String {
+        let key = format!("{}\0{}", base, sig);
+        if let Some(hit) = self.spec_entry_cache.borrow().get(&key) {
+            return hit.clone();
+        }
         let args: Vec<String> = Self::split_spec_args(sig)
             .into_iter()
             .map(|a| a.trim().to_string())
             .collect();
         let n = self.spec_class_name(base, &args);
-        if self.module.classes.contains_key(&n) {
+        // An entry not made yet may be made later: only a settled answer
+        // (the class itself, or an existing entry) is remembered.
+        if n == base || self.module.classes.contains_key(&n) {
+            self.spec_entry_cache.borrow_mut().insert(key, n.clone());
             n
         } else {
             base.to_string()
@@ -113061,6 +113248,7 @@ impl Simulator {
         self.spec_class_name_depth(cname, args, 0)
     }
 
+    #[inline(never)]
     fn spec_class_name_depth(&self, cname: &str, args: &[String], depth: usize) -> String {
         if depth > 32 || !self.dep_base.contains_key(cname) {
             return cname.to_string();
@@ -113068,18 +113256,11 @@ impl Simulator {
         let Some(link) = self.spec_base_link(cname, args) else {
             return cname.to_string();
         };
-        if self.dep_default.get(cname) == Some(&link) {
+        let bkey = self.spec_class_name_depth(&link.0, &link.1, depth + 1);
+        if self.dep_default.get(cname) == Some(&bkey) {
             return cname.to_string();
         }
-        let bkey = self.spec_class_name_depth(&link.0, &link.1, depth + 1);
-        let mut tag = bkey;
-        if !link.1.is_empty() {
-            tag.push('(');
-            tag.push_str(&link.1.join(","));
-            tag.push(')');
-        }
-        let tag: String = tag.chars().filter(|c| !matches!(c, '#' | ' ')).collect();
-        format!("{}<{}>", cname, tag)
+        format!("{}<{}>", cname, bkey)
     }
 
     /// Make (once) the class entry `spec_class_name(cname, args)` names: a
@@ -113091,6 +113272,7 @@ impl Simulator {
         self.ensure_spec_class_depth(cname, args, 0)
     }
 
+    #[inline(never)]
     fn ensure_spec_class_depth(&mut self, cname: &str, args: &[String], depth: usize) -> String {
         let name = self.spec_class_name(cname, args);
         if name == cname || self.module.classes.contains_key(&name) || depth > 32 {
@@ -113106,21 +113288,16 @@ impl Simulator {
         let mut c = (**orig).clone();
         c.name = name.clone();
         c.extends = Some(bkey);
-        if self
-            .dep_base
-            .get(cname)
-            .is_some_and(|(e, _)| c.type_param_names.iter().any(|t| t == e))
-        {
+        if let Some(tp) = self.dep_type_param(cname) {
             // A type parameter takes no `#(...)`: any `extends BASE(args)`
             // arguments are the base constructor's (§8.7) and stay.
-            c.extends_type_args = bargs;
+            c.extends_type_args = self.base_projection_args(&tp, &b);
         }
         self.module
             .classes
             .insert(name.clone(), std::sync::Arc::new(c));
         self.spec_clone_origin
             .insert(name.clone(), cname.to_string());
-        self.has_method_cache.borrow_mut().clear();
         name
     }
 
@@ -113132,6 +113309,7 @@ impl Simulator {
     /// entry takes its DEFAULT specialization's base; every other
     /// specialization gets its own entry (`ensure_spec_class`), which
     /// `new` constructs and an `extends` clause naming it links to.
+    #[inline(never)]
     fn link_type_param_bases(&mut self) {
         let mut names: Vec<String> = self.module.classes.keys().cloned().collect();
         names.sort();
@@ -113223,6 +113401,7 @@ impl Simulator {
                 break;
             }
         }
+        self.dep_names = self.dep_base.keys().cloned().collect();
         // Default links, bases first.
         let dep: Vec<String> = names
             .iter()
@@ -113242,23 +113421,16 @@ impl Simulator {
                     continue;
                 }
                 let bkey = self.ensure_spec_class(&link.0, &link.1);
-                let is_tp = self
-                    .dep_base
-                    .get(c)
-                    .and_then(|(e, _)| {
-                        self.module
-                            .classes
-                            .get(c)
-                            .map(|cd| cd.type_param_names.iter().any(|t| t == e))
-                    })
-                    .unwrap_or(false);
+                let proj = self
+                    .dep_type_param(c)
+                    .map(|tp| self.base_projection_args(&tp, &link.0));
                 if let Some(cd) = self.module.classes.get_mut(c).map(std::sync::Arc::make_mut) {
-                    cd.extends = Some(bkey);
-                    if is_tp {
-                        cd.extends_type_args = link.1.clone();
+                    cd.extends = Some(bkey.clone());
+                    if let Some(proj) = proj {
+                        cd.extends_type_args = proj;
                     }
                 }
-                self.dep_default.insert(c.clone(), link);
+                self.dep_default.insert(c.clone(), bkey);
                 progress = true;
             }
             if !progress {
@@ -113314,6 +113486,17 @@ impl Simulator {
                 .flat_map(|cd| cd.typedef_targets.iter()),
         );
         for (t, dt) in typedefs {
+            // Only a typedef naming a `dep_base` class with arguments can
+            // qualify; resolving every typedef of the design is not cheap.
+            let DataType::TypeReference {
+                name, type_args, ..
+            } = dt
+            else {
+                continue;
+            };
+            if type_args.is_empty() || !self.dep_base.contains_key(&name.name.name) {
+                continue;
+            }
             if self
                 .spec_from_typedef_dt(dt)
                 .is_some_and(|(b, _)| self.dep_base.contains_key(&b))
@@ -113738,51 +113921,65 @@ impl Simulator {
                 }
                 nm.to_string()
             };
-            let parent_args: Vec<String> = if cd.extends_args.len() == cd.extends_type_args.len() {
-                cd.extends_args
-                    .iter()
-                    .map(|e| {
-                        if let crate::ast::expr::ExprKind::Ident(h) = &e.kind {
-                            if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                                return name_arg(&h.path[0].name.name);
+            let has_proj = cd
+                .extends_type_args
+                .iter()
+                .any(|t| Self::spec_projection(t).is_some());
+            let parent_args: Vec<String> =
+                if !has_proj && cd.extends_args.len() == cd.extends_type_args.len() {
+                    cd.extends_args
+                        .iter()
+                        .map(|e| {
+                            if let crate::ast::expr::ExprKind::Ident(h) = &e.kind {
+                                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                                    return name_arg(&h.path[0].name.name);
+                                }
                             }
-                        }
-                        // An EXPRESSION extends-arg (`extends Base#(N * 3)`)
-                        // must be evaluated with this class's bindings — the
-                        // raw fragment "N*3" matches no registered spec and
-                        // the ancestor silently fell back to its defaults.
-                        let mut ptab: HashMap<String, Value> = HashMap::default();
-                        for (k, v) in &bindings {
-                            if let Ok(n) = v.parse::<i64>() {
-                                ptab.insert(k.clone(), Value::from_u64(n as u64, 32));
+                            // An EXPRESSION extends-arg (`extends Base#(N * 3)`)
+                            // must be evaluated with this class's bindings — the
+                            // raw fragment "N*3" matches no registered spec and
+                            // the ancestor silently fell back to its defaults.
+                            let mut ptab: HashMap<String, Value> = HashMap::default();
+                            for (k, v) in &bindings {
+                                if let Ok(n) = v.parse::<i64>() {
+                                    ptab.insert(k.clone(), Value::from_u64(n as u64, 32));
+                                }
                             }
-                        }
-                        if let Some(n) =
-                            super::elaborate::const_eval_i64_with_params(e, Some(&ptab))
-                        {
-                            return n.to_string();
-                        }
-                        self.expr_to_spec_fragment(e).unwrap_or_default()
-                    })
-                    .collect()
-            } else {
-                // A type argument written as a keyword type (`#(byte, 4)`) is
-                // no expression, so `extends_args` skips it and every later
-                // argument would shift one slot left; the textual list keeps
-                // every position.
-                cd.extends_type_args
-                    .iter()
-                    .map(|t| {
+                            if let Some(n) =
+                                super::elaborate::const_eval_i64_with_params(e, Some(&ptab))
+                            {
+                                return n.to_string();
+                            }
+                            self.expr_to_spec_fragment(e).unwrap_or_default()
+                        })
+                        .collect()
+                } else {
+                    // A type argument written as a keyword type (`#(byte, 4)`) is
+                    // no expression, so `extends_args` skips it and every later
+                    // argument would shift one slot left; the textual list keeps
+                    // every position.
+                    let mut v: Vec<String> = Vec::with_capacity(cd.extends_type_args.len());
+                    for t in &cd.extends_type_args {
                         let t = t.trim();
+                        if Self::spec_projection(t).is_some() {
+                            // `BASE#[i]`: an argument of this class's binding of
+                            // its base type parameter; one it does not spell
+                            // (and every later one) takes the base's default.
+                            match Self::carry_extends_arg(t, &|p| Some(name_arg(p))) {
+                                Some(a) => v.push(a),
+                                None => break,
+                            }
+                            continue;
+                        }
                         let is_name = t
                             .chars()
                             .next()
                             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                             && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-                        if is_name { name_arg(t) } else { t.to_string() }
-                    })
-                    .collect()
-            };
+                        v.push(if is_name { name_arg(t) } else { t.to_string() });
+                    }
+                    v
+                };
             if parent == ancestor_class || self.class_origin(&parent) == ancestor_class {
                 return Some(parent_args.join(","));
             }
@@ -114386,9 +114583,25 @@ impl Simulator {
                 // run unbroken: the scope a later default is evaluated in.
                 let mut bound: Vec<String> = Vec::with_capacity(order.len());
                 for (i, pname) in order.iter().enumerate() {
-                    let v = if let Some(arg) = cd.extends_type_args.get(i) {
+                    let v = if let Some(arg) = cd
+                        .extends_type_args
+                        .get(i)
+                        .filter(|a| Self::spec_projection(a).is_none())
+                    {
                         let a = arg.trim();
                         Some(carried.get(a).cloned().unwrap_or_else(|| a.to_string()))
+                    } else if let Some(arg) = cd.extends_type_args.get(i) {
+                        // `BASE#[i]`: the argument of this class's binding of
+                        // its base type parameter, else the parent's default.
+                        Self::carry_extends_arg(arg, &|p| {
+                            carried.get(p).cloned().or_else(|| {
+                                cd.type_param_defaults
+                                    .iter()
+                                    .find(|(n, _)| n == p)
+                                    .map(|(_, d)| d.clone())
+                            })
+                        })
+                        .or_else(|| self.param_default_fragment(pcd, i, &bound))
                     } else {
                         // IEEE 1800-2023 §6.20.2: an extends clause that omits a
                         // parameter leaves it at its DECLARED DEFAULT, evaluated
@@ -118747,14 +118960,15 @@ impl Simulator {
                 // §8.25: specializations of a class whose base is a type
                 // parameter are distinct class entries; the source must
                 // derive from the destination's own specialization.
-                if self.dep_base.contains_key(&resolved) {
-                    let want = self.spec_class_name(
+                if self.is_dep_class(&resolved)
+                    && !self.cast_dep_spec_ok(
+                        &src_class,
                         &resolved,
-                        &self.cast_dest_spec_args(spec_args_from_name.as_deref(), dest),
-                    );
-                    if !self.class_chain_has_entry(&src_class, &want) {
-                        return false;
-                    }
+                        spec_args_from_name.as_deref(),
+                        dest,
+                    )
+                {
+                    return false;
                 }
                 // Value-parameter specialization check: if the dest class
                 // has value parameters, src and dest must agree on every
@@ -118772,36 +118986,61 @@ impl Simulator {
                 // §8.25: a destination declared through a typedef of a
                 // specialization of a class whose base is a type parameter
                 // (`typedef wrap_c #(derived_c) wd_t; wd_t t;`) takes only
-                // that specialization.
-                let tn = match &dest.kind {
-                    ExprKind::Ident(hh) if hh.path.len() == 1 && !self.dep_typedefs.is_empty() => {
-                        let v = &hh.path[0].name.name;
-                        self.var_class_types.get(v).cloned().or_else(|| {
-                            self.signal_name_to_id
-                                .get(v)
-                                .and_then(|id| self.signal_type_names.get(id))
-                                .cloned()
-                        })
-                    }
-                    _ => None,
-                };
-                match tn
-                    .filter(|t| self.dep_typedefs.contains(t))
-                    .and_then(|t| self.resolve_typedef_spec(&t))
-                {
-                    Some((b, sig)) if self.dep_base.contains_key(&b) => {
-                        let args: Vec<String> = Self::split_spec_args(&sig)
-                            .into_iter()
-                            .map(|a| a.trim().to_string())
-                            .collect();
-                        let want = self.spec_class_name(&b, &args);
-                        self.class_chain_has_entry(&src_class, &want)
-                    }
-                    _ => true, // unknown dest type — stay permissive
-                }
+                // that specialization; any other unknown type stays
+                // permissive.
+                self.dep_typedefs.is_empty()
+                    || self.cast_dep_typedef_ok(&src_class, dest).unwrap_or(true)
             }
         }
     }
+    /// §8.25: `src_class` derives from the destination's own specialization
+    /// of `dep_base` class `resolved` (each is a distinct class entry).
+    #[cold]
+    #[inline(never)]
+    fn cast_dep_spec_ok(
+        &self,
+        src_class: &str,
+        resolved: &str,
+        from_name: Option<&str>,
+        dest: &Expression,
+    ) -> bool {
+        let want = self.spec_class_name(resolved, &self.cast_dest_spec_args(from_name, dest));
+        self.class_chain_has_entry(src_class, &want)
+    }
+
+    /// `$cast` to a destination declared through a typedef of a `dep_base`
+    /// specialization; None when the destination is not one.
+    #[cold]
+    #[inline(never)]
+    fn cast_dep_typedef_ok(&self, src_class: &str, dest: &Expression) -> Option<bool> {
+        let ExprKind::Ident(hh) = &dest.kind else {
+            return None;
+        };
+        if hh.path.len() != 1 {
+            return None;
+        }
+        let v = &hh.path[0].name.name;
+        let t = self.var_class_types.get(v).cloned().or_else(|| {
+            self.signal_name_to_id
+                .get(v)
+                .and_then(|id| self.signal_type_names.get(id))
+                .cloned()
+        })?;
+        if !self.dep_typedefs.contains(&t) {
+            return None;
+        }
+        let (b, sig) = self.resolve_typedef_spec(&t)?;
+        if !self.dep_base.contains_key(&b) {
+            return None;
+        }
+        let args: Vec<String> = Self::split_spec_args(&sig)
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .collect();
+        let want = self.spec_class_name(&b, &args);
+        Some(self.class_chain_has_entry(src_class, &want))
+    }
+
     /// The `#(...)` arguments a `$cast` destination's type carries: the
     /// resolved type name's, else the variable's declared ones (none for an
     /// unspecialized declaration, which is the default specialization).
@@ -126599,7 +126838,7 @@ impl Simulator {
                 let differs = match self.current_spec.as_ref() {
                     None => true,
                     Some((b, s)) => {
-                        *b != cn
+                        *b != self.class_origin(&cn)
                             || inst
                                 .spec
                                 .as_ref()
@@ -129472,7 +129711,12 @@ impl Simulator {
                     // value params interleaved). `extends_type_args` stores
                     // ALL args positionally, so we index by param_order.
                     if let Some(idx) = acd.param_order.iter().position(|p| p == tn) {
-                        if let Some(arg) = cur_type_args.get(idx) {
+                        // A projection `BASE#[i]` depends on the binding one
+                        // level down: the ancestor-spec path below derives it.
+                        if let Some(arg) = cur_type_args
+                            .get(idx)
+                            .filter(|a| Self::spec_projection(a).is_none())
+                        {
                             let arg = arg.trim();
                             if arg == "this_type" || arg == "this" {
                                 return Some(format!("{}#({})", base, sig));
@@ -129969,27 +130213,8 @@ impl Simulator {
         // the object is an instance of that entry, so every hierarchy walk
         // from it sees the bound base. The specialization stays keyed by
         // the declared class (statics, `$typename`).
-        let spec_entry = if self.dep_base.contains_key(&class_name_owned) {
-            // No `#(...)` here, but a specialization of this class is active
-            // (`typedef wrap_c #(derived_c) wd_t; wd_t w = new;`): it binds.
-            let explicit = type_args.is_some_and(|ta| !ta.is_empty());
-            let active = self
-                .current_spec
-                .as_ref()
-                .filter(|(b, _)| !explicit && *b == class_name_owned);
-            let args: Vec<String> = active
-                .or(computed_spec.as_ref())
-                .map(|(_, sig)| {
-                    Self::split_spec_args(sig)
-                        .into_iter()
-                        .map(|a| a.trim().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let key = self.ensure_spec_class(&class_name_owned, &args);
-            (key != class_name_owned)
-                .then(|| self.module.classes.get(&key).cloned())
-                .flatten()
+        let spec_entry = if self.is_dep_class(&class_name_owned) {
+            self.spec_entry_for_new(&class_name_owned, type_args, computed_spec.as_ref())
         } else {
             None
         };
@@ -130086,6 +130311,25 @@ impl Simulator {
                     };
                     let frag = frag.trim();
                     if frag.is_empty() {
+                        continue;
+                    }
+                    if let Some((p, k)) = Self::spec_projection(frag) {
+                        // `BASE#[k]`: argument k of the child's binding of its
+                        // base type parameter (`wrap_c #(pbase#(8))`).
+                        if let Some(v) = self
+                            .child_type_binding(&class_name_owned, class_def, child, p, type_args)
+                            .and_then(|b| Self::project_spec_arg(&b, k))
+                            .and_then(|f| Self::parse_spec_number(&f))
+                            .and_then(|lit| {
+                                let e = Expression::new(
+                                    ExprKind::Number(lit),
+                                    crate::ast::Span::dummy(),
+                                );
+                                crate::elaborate::const_eval_i64_with_params(&e, None)
+                            })
+                        {
+                            binds.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                        }
                         continue;
                     }
                     if let Some(lit) = Self::parse_spec_number(frag) {
@@ -131469,7 +131713,14 @@ impl Simulator {
                 if arg.is_empty() {
                     continue;
                 }
-                let sub = nb.get(arg).cloned().unwrap_or_else(|| arg.to_string());
+                let sub = if Self::spec_projection(arg).is_some() {
+                    match Self::carry_extends_arg(arg, &|p| binds.get(p).cloned()) {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                } else {
+                    nb.get(arg).cloned().unwrap_or_else(|| arg.to_string())
+                };
                 nb.insert(pname.clone(), sub);
             }
         }
@@ -139275,6 +139526,8 @@ impl Simulator {
         class_name: &str,
         method_name: &str,
     ) -> Option<Arc<crate::ast::decl::ClassMethod>> {
+        // A specialization's class entry shares its origin's method bodies.
+        let class_name = self.class_origin(class_name);
         if let Some(cached) = self
             .class_method_cache
             .borrow()
@@ -139319,7 +139572,7 @@ impl Simulator {
             let mut static_or_param: HashSet<String> = HashSet::default();
             let mut string_methods: HashSet<String> = HashSet::default();
             for cd in self.module.classes.values() {
-                for (name, cm) in &cd.methods {
+                for (name, cm) in cd.methods.iter() {
                     if let crate::ast::decl::ClassMethodKind::Function(fd)
                     | crate::ast::decl::ClassMethodKind::Extern(fd)
                     | crate::ast::decl::ClassMethodKind::PureVirtual(fd) = &cm.kind
@@ -140439,7 +140692,7 @@ impl Simulator {
                         // the caller's (base_comp) cell, so typewide
                         // callbacks never propagate to derived types.
                         Some((b, s)) => {
-                            b != cn
+                            b != self.class_origin(cn)
                                 || inst
                                     .spec
                                     .as_ref()
