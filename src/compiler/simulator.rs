@@ -62132,8 +62132,13 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
-        if let Some(ok) = self.assign_static_through_chain(lhs, val) {
-            return ok;
+        if matches!(&lhs.kind, ExprKind::MemberAccess { expr, .. }
+                if !matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() == 1))
+            || matches!(&lhs.kind, ExprKind::Ident(h) if h.path.len() >= 3)
+        {
+            if let Some(ok) = self.assign_static_through_chain(lhs, val) {
+                return ok;
+            }
         }
         if let ExprKind::MemberAccess { expr: b, .. }
         | ExprKind::Index { expr: b, .. }
@@ -70085,19 +70090,17 @@ impl Simulator {
         // `obj = new`). Route to the shared cell. class_static_get
         // returns None for a non-static member, so ordinary reads fall
         // through unchanged.
-        {
+        let member_static = self
+            .class_member_names()
+            .statics
+            .contains(member.name.as_str());
+        if member_static {
             let (var, resolved) = match &expr.kind {
                 ExprKind::Ident(h) if h.path.len() == 1 => (
                     Some(h.path[0].name.name.clone()),
                     Some(self.resolve_hier_name(h).into_owned()),
                 ),
-                ExprKind::MemberAccess { .. } | ExprKind::Ident(_)
-                    if handle == 0
-                        && self
-                            .class_member_names()
-                            .statics
-                            .contains(member.name.as_str()) =>
-                {
+                ExprKind::MemberAccess { .. } | ExprKind::Ident(_) if handle == 0 => {
                     // §8.9: a static through a null property.
                     if let Some((o, p)) = self.handle_chain_owner(expr) {
                         if let Some((cn, spec)) =
@@ -70121,11 +70124,7 @@ impl Simulator {
         }
         // A class constant (localparam) through the reference; a static
         // property was resolved above, by the reference's declared type.
-        let static_class: Option<String> = if self
-            .class_member_names()
-            .statics
-            .contains(member.name.as_str())
-        {
+        let static_class: Option<String> = if member_static {
             None
         } else if handle != 0 && handle < self.heap.len() {
             self.heap[handle].as_ref().map(|i| i.class_name.clone())
@@ -119141,12 +119140,9 @@ impl Simulator {
         match &dest.kind {
             ExprKind::Ident(hh) if hh.path.len() == 1 => {
                 let n = &hh.path[0].name.name;
-                if let Some((b, spec, explicit)) = self.this_property_decl(n) {
-                    return Some(spelled(self, b, spec, explicit));
-                }
                 let dt = self.class_of_var(n);
-                // A type parameter or an already-specialized spelling keeps
-                // the caller's handling.
+                // A class without parameters, a type parameter or an
+                // already-specialized spelling keeps the caller's handling.
                 if let Some(c) = &dt {
                     if c.contains('#')
                         || !self.module.classes.contains_key(c)
@@ -119154,6 +119150,9 @@ impl Simulator {
                     {
                         return dt;
                     }
+                }
+                if let Some((b, spec, explicit)) = self.this_property_decl(n) {
+                    return Some(spelled(self, b, spec, explicit));
                 }
                 let resolved = self.resolve_hier_name(hh);
                 let explicit = self
