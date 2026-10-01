@@ -24629,8 +24629,15 @@ impl Simulator {
     /// from the controlling input it just read. `edges` is the dependency
     /// edge table (the settle's local, or `comb_dep_edges`). Returns the
     /// destination when the commit changed it.
+    /// `in_settle`: record the change for the settle loop's post-entry
+    /// propagation (`ts_direct_dirty`) instead of marking it dirty.
     #[inline(never)]
-    fn ctl_gate_exec(&mut self, slot: u32, edges: &mut [DepEdge]) -> Option<BitRef> {
+    fn ctl_gate_exec(
+        &mut self,
+        slot: u32,
+        edges: &mut [DepEdge],
+        in_settle: bool,
+    ) -> Option<BitRef> {
         let g = self.ctl_gates[slot as usize];
         let (dst, new_bit) = self.fused_gate_eval(&g.op);
         let o = self.signal_table[g.other.sig_id as usize].get_bit_code(g.other.bit as usize);
@@ -24643,6 +24650,10 @@ impl Simulator {
         }
         let sdf_any = !self.sdf_delays.is_empty();
         if self.fused_bit_commit(dst, new_bit, sdf_any) {
+            if in_settle {
+                let chg = self.bit_chg_mask(dst.sig_id, dst.bit);
+                self.ts_direct_dirty(dst.sig_id as usize, chg);
+            }
             Some(dst)
         } else {
             None
@@ -24653,13 +24664,13 @@ impl Simulator {
     fn ctl_gate_exec_self(&mut self, slot: u32) -> Option<BitRef> {
         let mut edges = std::mem::take(&mut self.comb_dep_edges);
         let r = if edges.len() == self.comb_dep_entries.len() {
-            self.ctl_gate_exec(slot, &mut edges)
+            self.ctl_gate_exec(slot, &mut edges, false)
         } else {
             // No edges to update (none yet, or the settle holds them). The
             // mask stays as the last settle evaluation left it: a change of
             // the controlling input since then has woken the gate through
             // its own (never masked) edge, and that evaluation fixes it.
-            self.ctl_gate_exec(slot, &mut [])
+            self.ctl_gate_exec(slot, &mut [], false)
         };
         self.comb_dep_edges = edges;
         r
@@ -59543,42 +59554,51 @@ impl Simulator {
         // with uninitialised inputs (see CombEntry::defer_at_time0).
         let skip_deferred_at_t0 = self.time == 0 && !self.comb_time0_fired;
         let seed_dirty_len = self.dirty_list.len();
-        for seed_idx in 0..seed_dirty_len {
-            let id = self.dirty_list[seed_idx];
-            if self.dirty_signals[id] {
-                self.dirty_signals[id] = false;
-                if id + 1 < dep_offsets.len() {
-                    let lo = dep_offsets[id] as usize;
-                    let hi = dep_offsets[id + 1] as usize;
-                    let tree_clk = tree_sig.get(id).copied().unwrap_or(false);
-                    let mut seed = |eidx: usize| {
-                        if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
-                            return;
-                        }
-                        // the eager clock-tree pass already evaluated these
-                        if tree_clk && tree_entry.get(eidx).copied().unwrap_or(false) {
-                            return;
-                        }
-                        if !triggered[eidx] {
-                            triggered[eidx] = true;
-                            next_list.push(eidx);
-                        }
-                    };
-                    if self.ctl_sig.get(id).copied().unwrap_or(false) {
-                        // A controlled `CtlGate` has masked this edge
-                        // (static masks are never zero on such a signal).
-                        for e in &dep_edges[lo..hi] {
-                            if e.mask != 0 {
-                                seed(e.entry as usize);
+        // `$ctl`: whether a seeded signal's edges may carry a `CtlGate`
+        // mask (then a zero mask skips the dependent). Two instances, so a
+        // design without controlled gates runs the original loop.
+        macro_rules! seed_dirty {
+            ($ctl:expr) => {
+                for seed_idx in 0..seed_dirty_len {
+                    let id = self.dirty_list[seed_idx];
+                    if self.dirty_signals[id] {
+                        self.dirty_signals[id] = false;
+                        if id + 1 < dep_offsets.len() {
+                            let lo = dep_offsets[id] as usize;
+                            let hi = dep_offsets[id + 1] as usize;
+                            let tree_clk = tree_sig.get(id).copied().unwrap_or(false);
+                            let masked: bool = $ctl(id);
+                            for (j, &eidx_u32) in dep_entries[lo..hi].iter().enumerate() {
+                                let eidx = eidx_u32 as usize;
+                                if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
+                                    continue;
+                                }
+                                // A controlled `CtlGate` masked this edge
+                                // (static masks are never zero on such a
+                                // signal).
+                                if masked && dep_edges[lo + j].mask == 0 {
+                                    continue;
+                                }
+                                // the eager clock-tree pass already evaluated these
+                                if tree_clk && tree_entry.get(eidx).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                if !triggered[eidx] {
+                                    triggered[eidx] = true;
+                                    next_list.push(eidx);
+                                }
                             }
-                        }
-                    } else {
-                        for &eidx_u32 in &dep_entries[lo..hi] {
-                            seed(eidx_u32 as usize);
                         }
                     }
                 }
-            }
+            };
+        }
+        if self.ctl_sig.is_empty() {
+            seed_dirty!(|_id: usize| false);
+        } else {
+            let ctl_sig = std::mem::take(&mut self.ctl_sig);
+            seed_dirty!(|id: usize| ctl_sig.get(id).copied().unwrap_or(false));
+            self.ctl_sig = ctl_sig;
         }
         self.dirty_list.clear();
         self.dirty_any = false;
@@ -60607,14 +60627,12 @@ impl Simulator {
                             }
                             n_dc += 1;
                         }
+                        // Out of line; a changed bit is recorded like a
+                        // two-state store and propagated by the shared
+                        // post-entry walk below (keeps this arm small).
                         CombItem::CtlGate { slot } => {
-                            if let Some(dst) = self.ctl_gate_exec(*slot, &mut dep_edges) {
-                                let id = dst.sig_id as usize;
-                                if capture_churn {
-                                    churn.push((id, eidx));
-                                }
-                                note_toggle!(id);
-                                trigger_deps!(id, eidx, self.bit_chg_mask(dst.sig_id, dst.bit));
+                            if let Some(dst) = self.ctl_gate_exec(*slot, &mut dep_edges, true) {
+                                note_toggle!(dst.sig_id as usize);
                             }
                             n_dc += 1;
                         }
