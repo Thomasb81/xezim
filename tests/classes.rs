@@ -77,6 +77,8 @@ mod static_fixed_array_storage;
 mod static_param_class_collection_reuse;
 #[path = "classes/struct_member_class_handle_new.rs"]
 mod struct_member_class_handle_new;
+#[path = "classes/struct_member_bitselect_frame_local.rs"]
+mod struct_member_bitselect_frame_local;
 #[path = "classes/this_collection_struct_members.rs"]
 mod this_collection_struct_members;
 #[path = "classes/this_super_member.rs"]
@@ -284,6 +286,8 @@ mod nested_seq_method_dispatch;
 mod nonvirtual_dispatch_fscanf_process;
 #[path = "classes/out_of_class_method_shadow.rs"]
 mod out_of_class_method_shadow;
+#[path = "classes/oor_packed_index_2state.rs"]
+mod oor_packed_index_2state;
 #[path = "classes/param_typedef_ctor_resolution.rs"]
 mod param_typedef_ctor_resolution;
 #[path = "classes/process_class_9_7.rs"]
@@ -336,6 +340,28 @@ mod typedef_extends_cast;
 mod typedef_param_base_inherits_spec_arg;
 #[path = "classes/typename_param_class.rs"]
 mod typename_param_class;
+#[path = "classes/nba_region_event_same_slot.rs"]
+mod nba_region_event_same_slot;
+
+#[path = "classes/factory_vif_type_param_specialization.rs"]
+mod factory_vif_type_param_specialization;
+
+#[path = "classes/type_param_member_resolves_to_own_spec.rs"]
+mod type_param_member_resolves_to_own_spec;
+
+#[path = "classes/process_kill_via_member_handle.rs"]
+mod process_kill_via_member_handle;
+
+#[path = "classes/sibling_type_param_default_cast.rs"]
+mod sibling_type_param_default_cast;
+#[path = "classes/queue_eq_construction_path.rs"]
+mod queue_eq_construction_path;
+#[path = "classes/queue_elem_receiver_splice.rs"]
+mod queue_elem_receiver_splice;
+#[path = "classes/reg_field_byte_shift_stream_cast.rs"]
+mod reg_field_byte_shift_stream_cast;
+#[path = "classes/pkg_assoc_elem_read_neq.rs"]
+mod pkg_assoc_elem_read_neq;
 #[path = "classes/unpacked_struct_class_property_whole_value.rs"]
 mod unpacked_struct_class_property_whole_value;
 #[path = "classes/uvm_config_db_tests.rs"]
@@ -352,6 +378,8 @@ mod uvm_integration_tests;
 mod uvm_objection_bridge;
 #[path = "classes/uvm_printer_fixes.rs"]
 mod uvm_printer_fixes;
+#[path = "classes/uvm_resource_db_raw_type_roundtrip.rs"]
+mod uvm_resource_db_raw_type_roundtrip;
 #[path = "classes/virtual_iface_this_binding.rs"]
 mod virtual_iface_this_binding;
 
@@ -511,3 +539,11 @@ mod vif_static_roundtrip;
 mod constraint_shift_bounds;
 #[path = "classes/formal_class_type_frame_scoped.rs"]
 mod formal_class_type_frame_scoped;
+#[path = "classes/type_param_inherited_member_write.rs"]
+mod type_param_inherited_member_write;
+#[path = "classes/struct_array_field_read.rs"]
+mod struct_array_field_read;
+#[path = "classes/dyn_array_struct_copy.rs"]
+mod dyn_array_struct_copy;
+#[path = "classes/assoc_wide_packed_struct_key.rs"]
+mod assoc_wide_packed_struct_key;

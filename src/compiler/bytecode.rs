@@ -12467,6 +12467,30 @@ impl<'a> BytecodeCompiler<'a> {
                     });
                     let inner_is_call =
                         matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
+                    // §6.24.1: a cast whose operand is a STREAMING concat yields its
+                    // elements — route the natural-width (no element-collapse)
+                    // interpretation to the AST, which knows the target's packed
+                    // vs unpacked shape (see the named-cast arm there). This is the
+                    // shape uvm_reg_map's byte-shift relies on:
+                    //   `p = {<< 8 {bit_q_t'({<< {bits}}) }}`
+                    {
+                        fn is_stream(e: &Expression) -> bool {
+                            match &e.kind {
+                                ExprKind::StreamOp { .. } => true,
+                                ExprKind::Paren(i) => is_stream(i),
+                                _ => false,
+                            }
+                        }
+                        if args.get(1).is_some_and(is_stream) {
+                            if let Some(r) =
+                                self.emit_expr_fallback(expr, ctx_width, "named_cast_stream")
+                            {
+                                return Some(r);
+                            }
+                            self.bail("named_cast_stream");
+                            return None;
+                        }
+                    }
                     let known = literal_w.map(|w| (w, false)).or_else(|| {
                         target.as_ref().and_then(|nm| {
                             self.cast_widths
