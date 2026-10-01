@@ -1518,12 +1518,74 @@ struct EdgeSensitiveBlock {
     /// edge_signal_ids/names) was rewritten to use this resolved
     /// list + id_to_name.
     resolved_sensitivities: Vec<SensitivityId>,
+    /// The block body. Between classification and `compile_edge_blocks` a
+    /// block built from a lazy child always block holds an empty statement
+    /// with the body's span here and its source in `lazy`; compilation
+    /// rebuilds the body and keeps it only where a later reader needs it
+    /// (see `drop_compiled_edge_block_asts`).
     stmt: Statement,
+    lazy: Option<Box<LazyAlways>>,
     kind: AlwaysKind,
     /// Instance scope the block was inlined under, empty for top-level.
     /// Preferred over sensitivity-derived scopes (a port-connected clock's
     /// sensitivity collapses to the PARENT's signal and yields none).
     scope: String,
+}
+
+/// A child-module always block of the `@(...) body` shape, kept as its
+/// un-rewritten source (shared by every instance) plus this instance's
+/// rewrite context instead of a per-instance statement tree: on a 64k-cell
+/// DRAM array the 65k materialized trees were a third of the peak memory.
+/// `patches` replace header event-term expressions exactly as the passes in
+/// `Simulator::new` (edge-select aliases, computed edge terms) rewrote them;
+/// nothing else in such a block is rewritten after elaboration.
+#[derive(Debug, Clone)]
+struct LazyAlways {
+    src: super::elaborate::PendingAlways,
+    patches: Vec<(usize, Expression)>,
+}
+
+impl LazyAlways {
+    /// The always block exactly as the eager pipeline would have held it.
+    fn materialize(&self) -> AlwaysBlock {
+        let mut ab = self.src.clone().materialize();
+        if !self.patches.is_empty() {
+            if let StatementKind::TimingControl {
+                control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                ..
+            } = &mut ab.stmt.kind
+            {
+                for (i, e) in &self.patches {
+                    exprs[*i].expr = e.clone();
+                }
+            }
+        }
+        ab
+    }
+
+    /// The body `classify_one_always_block` keeps for an edge block (the
+    /// statement under the `@(...)` header).
+    fn materialize_body(&self) -> Statement {
+        match self.materialize().stmt.kind {
+            StatementKind::TimingControl { stmt, .. } => *stmt,
+            _ => unreachable!("lazy always blocks have an event-control header"),
+        }
+    }
+}
+
+/// An always block taken out of `module.pending_always` by
+/// `rewrite_edge_select_sensitivities`, in its original order: eagerly
+/// materialized, or lazy (see `LazyAlways`). While `Simulator::new` runs a
+/// lazy one also carries its rewritten header, which the passes there edit;
+/// `patched` lists the header terms they replaced.
+#[derive(Debug)]
+enum DeferredAlways {
+    Eager(AlwaysBlock),
+    Lazy {
+        lazy: LazyAlways,
+        header: Option<Box<Statement>>,
+        patched: Vec<usize>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -5246,6 +5308,9 @@ pub struct Simulator {
     /// (length, buffer) and port-alias count it read, and whether its buffer
     /// pass ran. A later run over the same inputs has nothing to re-point.
     collapse_settled: Option<(u64, usize, usize, usize, bool)>,
+    /// Instantiated always blocks awaiting classification, in order (see
+    /// `DeferredAlways`); empty once `classify_always_blocks` has run.
+    deferred_always: Vec<DeferredAlways>,
     /// Sparse: signal_id → declared user type name (e.g. class/struct
     /// type for `MyClass h;`). Only populated for signals where the
     /// elaborator recorded a non-None `type_name` on the source
@@ -8596,7 +8661,10 @@ impl Simulator {
     /// `posedge __xz_edgesel<N>`. The alias updates in the same delta as its
     /// operands (ordinary comb entry), so edge timing is unchanged. Only
     /// constant indices rewrite; anything else keeps the old behavior.
-    fn rewrite_edge_select_sensitivities(module: &mut ElaboratedModule) {
+    fn rewrite_edge_select_sensitivities(
+        module: &mut ElaboratedModule,
+        lazy_ok: bool,
+    ) -> Vec<DeferredAlways> {
         // A literal, or a parameter expression (`v[W-1]`: an elaboration-time
         // constant, §6.20) under `+ - *`.
         fn const_index(
@@ -8694,39 +8762,71 @@ impl Simulator {
         let dbg = std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some();
         // #7 keeps child always blocks PENDING (un-rewritten) until
         // classification — but the select-on-port shape this pass fixes is
-        // only visible AFTER the per-instance rewrite. Materialize the always
-        // blocks here (pre-#7 eager semantics for this vec only; initial/CA
-        // stay lazy). classify_always_blocks drains an empty pending vec.
+        // only visible AFTER the per-instance rewrite. Each pending block is
+        // taken out in order into the returned list: one of the `@(...)
+        // body` shape whose body holds no further event control stays lazy
+        // (only its header is rewritten here, and the terms this pass
+        // replaces are recorded as patches); any other is materialized.
         let pending = std::mem::take(&mut module.pending_always);
+        let mut always = std::mem::take(&mut module.always_blocks);
+        let mut deferred: Vec<DeferredAlways> = Vec::with_capacity(pending.len());
         for p in pending {
-            module.always_blocks.push(p.materialize());
+            if lazy_ok && Self::lazy_always_eligible(&p.source) {
+                if let Some(header) = p.materialize_header() {
+                    deferred.push(DeferredAlways::Lazy {
+                        lazy: LazyAlways {
+                            src: p,
+                            patches: Vec::new(),
+                        },
+                        header: Some(Box::new(header)),
+                        patched: Vec::new(),
+                    });
+                    continue;
+                }
+            }
+            deferred.push(DeferredAlways::Eager(p.materialize()));
         }
         let params = &module.parameters;
-        for ab in &mut module.always_blocks {
+        let headers = always
+            .iter_mut()
+            .map(|ab| (&mut ab.stmt, ab.scope.clone(), None))
+            .chain(deferred.iter_mut().map(|d| match d {
+                DeferredAlways::Eager(ab) => (&mut ab.stmt, ab.scope.clone(), None),
+                DeferredAlways::Lazy {
+                    lazy,
+                    header,
+                    patched,
+                } => (
+                    &mut **header.as_mut().expect("header kept until Simulator::new ends"),
+                    lazy.src.scope(),
+                    Some(patched),
+                ),
+            }));
+        for (stmt, scope, mut patched) in headers {
             let StatementKind::TimingControl {
                 control: TimingControl::Event(EventControl::EventExpr(exprs)),
                 ..
-            } = &mut ab.stmt.kind
+            } = &mut stmt.kind
             else {
                 if dbg {
                     eprintln!(
                         "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
-                        ab.scope,
-                        std::mem::discriminant(&ab.stmt.kind)
+                        scope,
+                        std::mem::discriminant(&stmt.kind)
                     );
                 }
                 continue;
             };
-            for ee in exprs.iter_mut() {
+            for (term, ee) in exprs.iter_mut().enumerate() {
                 if !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
                     continue;
                 }
                 let mut idxs: Vec<i64> = Vec::new();
-                let Some((base, rooted)) = peel(&ee.expr, &mut idxs, params, &ab.scope) else {
+                let Some((base, rooted)) = peel(&ee.expr, &mut idxs, params, &scope) else {
                     if dbg {
                         eprintln!(
                             "[EDGESEL] scope='{}' peel failed: {:?}",
-                            ab.scope, ee.expr.kind
+                            scope, ee.expr.kind
                         );
                     }
                     continue;
@@ -8734,7 +8834,7 @@ impl Simulator {
                 if dbg {
                     eprintln!(
                         "[EDGESEL] scope='{}' base={} idxs={:?}",
-                        ab.scope, base, idxs
+                        scope, base, idxs
                     );
                 }
                 if idxs.is_empty() {
@@ -8748,10 +8848,10 @@ impl Simulator {
                 // `wl` substitutes the ROOTED `wl[1]`; under the child's scope
                 // it spelled the child's 1-bit port net, and the edge watched
                 // bit 1 of it — never rising.
-                let spellings: Vec<String> = if ab.scope.is_empty() || rooted {
+                let spellings: Vec<String> = if scope.is_empty() || rooted {
                     vec![base.clone()]
                 } else {
-                    vec![format!("{}.{}", ab.scope, base), base.clone()]
+                    vec![format!("{}.{}", scope, base), base.clone()]
                 };
                 let mut resolved: Option<String> = None;
                 let mut is_event = false;
@@ -8795,7 +8895,7 @@ impl Simulator {
                             .collect();
                         eprintln!(
                             "[EDGESEL] scope='{}' base '{}' unresolved; signals~{:?} arrays~{:?}",
-                            ab.scope, base, sig_like, arr_like
+                            scope, base, sig_like, arr_like
                         );
                     }
                     continue;
@@ -8846,10 +8946,13 @@ impl Simulator {
                 if dbg {
                     eprintln!(
                         "[EDGESEL] scope='{}' {}{:?} -> {}",
-                        ab.scope, resolved, idxs, alias
+                        scope, resolved, idxs, alias
                     );
                 }
                 ee.expr = mk_ident(alias, ee.expr.span);
+                if let Some(p) = patched.as_mut() {
+                    p.push(term);
+                }
             }
         }
         for name in new_signals {
@@ -8868,6 +8971,46 @@ impl Simulator {
             );
         }
         module.continuous_assigns.extend(new_assigns);
+        module.always_blocks = always;
+        deferred
+    }
+
+    /// Can a pending always block stay lazy through `Simulator::new` (see
+    /// `LazyAlways`)? Its source must be `@(...) body` with no timing control
+    /// anywhere in the body that the computed-edge pass there would visit:
+    /// then that pass, like the edge-select pass, can only touch the header
+    /// (`rename_process_shadowed_locals` only ever renames a `begin..end`
+    /// body's own locals, which this shape does not have at its top).
+    fn lazy_always_eligible(src: &Statement) -> bool {
+        fn has_timing(st: &Statement) -> bool {
+            match &st.kind {
+                StatementKind::TimingControl { .. } => true,
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    stmts.iter().any(has_timing)
+                }
+                StatementKind::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => has_timing(then_stmt) || else_stmt.as_deref().is_some_and(has_timing),
+                StatementKind::For { body, .. }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body, .. } => has_timing(body),
+                StatementKind::Wait { stmt, .. } => has_timing(stmt),
+                StatementKind::Case { items, .. } => items.iter().any(|it| has_timing(&it.stmt)),
+                _ => false,
+            }
+        }
+        match &src.kind {
+            StatementKind::TimingControl {
+                control: TimingControl::Event(_),
+                stmt: body,
+            } => !has_timing(body),
+            _ => false,
+        }
     }
 
     /// Whether a 1-D array's cells may live in the packed arena
@@ -8956,7 +9099,14 @@ impl Simulator {
 
         let phase_materialize = crate::WallTimer::now();
         Self::materialize_implicit_contassign_nets(&mut module);
-        Self::rewrite_edge_select_sensitivities(&mut module);
+        // Lazy always blocks (see `LazyAlways`) everywhere except where a
+        // pass reads every always-block body before classification: code
+        // coverage instruments them, and opt-in signal placement walks them.
+        let lazy_always_ok = code_cov::code_coverage().is_none()
+            && std::env::var("XEZIM_PLACE_SIGNALS").ok().as_deref() != Some("1")
+            && !matches!(std::env::var("XEZIM_LAZY_ALWAYS").as_deref(), Ok("0"));
+        let mut deferred_always =
+            Self::rewrite_edge_select_sensitivities(&mut module, lazy_always_ok);
         // §18.3/§18.4: publish class-local `typedef enum`/`typedef struct`
         // types into the module type tables so a rand property declared with
         // one gets its enum-member domain / packed bit layout.
@@ -9020,6 +9170,11 @@ impl Simulator {
             let mut all_proc = Vec::new();
             all_proc.extend(module.initial_blocks.iter().map(|b| &b.stmt));
             all_proc.extend(module.always_blocks.iter().map(|b| &b.stmt));
+            // A lazy block (`@(...) body`) has no top-level locals.
+            all_proc.extend(deferred_always.iter().filter_map(|d| match d {
+                DeferredAlways::Eager(ab) => Some(&ab.stmt),
+                DeferredAlways::Lazy { .. } => None,
+            }));
             all_proc.extend(module.final_blocks.iter().map(|b| &b.stmt));
             for st in all_proc.iter() {
                 for nm in frameless_locals(st) {
@@ -9040,7 +9195,20 @@ impl Simulator {
                     ib.stmt = new_stmt;
                 }
             }
-            for (i, ab) in module.always_blocks.iter_mut().enumerate() {
+            let n_always = module.always_blocks.len();
+            let deferred_eager = deferred_always
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(k, d)| match d {
+                    DeferredAlways::Eager(ab) => Some((n_always + k, ab)),
+                    DeferredAlways::Lazy { .. } => None,
+                });
+            for (i, ab) in module
+                .always_blocks
+                .iter_mut()
+                .enumerate()
+                .chain(deferred_eager)
+            {
                 if let Some(new_stmt) = super::elaborate::rename_process_shadowed_locals(
                     &ab.stmt,
                     &taken,
@@ -9178,6 +9346,41 @@ impl Simulator {
                     &computed_edge_term,
                 );
             }
+            // The deferred blocks continue the numbering. A lazy block's
+            // header is the only part this pass can touch (see
+            // `lazy_always_eligible`); record which terms it replaces.
+            let n_always = module.always_blocks.len();
+            for (k, d) in deferred_always.iter_mut().enumerate() {
+                let tag = format!("a{}", n_always + k);
+                let stmt = match d {
+                    DeferredAlways::Eager(ab) => &mut ab.stmt,
+                    DeferredAlways::Lazy {
+                        header, patched, ..
+                    } => {
+                        let header = &mut **header.as_mut().expect("header kept until here");
+                        if let StatementKind::TimingControl {
+                            control: TC::Event(EC::EventExpr(exprs)),
+                            ..
+                        } = &header.kind
+                        {
+                            for (i, ee) in exprs.iter().enumerate() {
+                                if ee.edge.is_some() && computed_edge_term(&ee.expr) {
+                                    patched.push(i);
+                                }
+                            }
+                        }
+                        header
+                    }
+                };
+                rewrite_edges(
+                    stmt,
+                    &tag,
+                    &mut n,
+                    &mut synth,
+                    &mk_ident,
+                    &computed_edge_term,
+                );
+            }
             for (bi, ib) in module.initial_blocks.iter_mut().enumerate() {
                 let tag = format!("i{}", bi);
                 rewrite_edges(
@@ -9225,6 +9428,30 @@ impl Simulator {
                         delay_fall: None,
                         delay_off: None,
                     });
+            }
+        }
+        // The passes over always-block headers are done: keep only the
+        // replaced terms of each lazy block's header.
+        for d in deferred_always.iter_mut() {
+            if let DeferredAlways::Lazy {
+                lazy,
+                header,
+                patched,
+            } = d
+            {
+                let header = header.take().expect("header kept until here");
+                if let StatementKind::TimingControl {
+                    control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                    ..
+                } = header.kind
+                {
+                    patched.sort_unstable();
+                    patched.dedup();
+                    lazy.patches = patched
+                        .drain(..)
+                        .map(|i| (i, exprs[i].expr.clone()))
+                        .collect();
+                }
             }
         }
         // §8.4/§25.9: an unassigned `virtual <iface>` VARIABLE holds the null
@@ -10629,6 +10856,7 @@ impl Simulator {
             cont_driven: HashSet::default(),
             collapsed_port_children: HashSet::default(),
             collapse_settled: None,
+            deferred_always,
             signal_type_names,
             time: 0,
             output: Vec::new(),
@@ -20886,7 +21114,11 @@ impl Simulator {
         }
     }
 
-    fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
+    fn classify_one_always_block(
+        &mut self,
+        ab: AlwaysBlock,
+        lazy: Option<LazyAlways>,
+    ) -> Option<AlwaysBlock> {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
         // rewritten as `return Some(...)`.)
@@ -21164,7 +21396,8 @@ impl Simulator {
                     }
                     self.bitsel_sid_bits[w] |= 1u64 << b;
                 }
-                if std::env::var("XEZIM_DUMP_EDGE_SENS").is_ok() {
+                static DUMP_EDGE_SENS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *DUMP_EDGE_SENS.get_or_init(|| std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some()) {
                     let terms: Vec<String> = resolved
                         .iter()
                         .map(|si| {
@@ -21228,9 +21461,19 @@ impl Simulator {
                 // its list for the whole run and nearly always has one.
                 let mut resolved = resolved;
                 resolved.shrink_to_fit();
+                // A lazy block keeps its source, not the tree: the body is
+                // rebuilt (and usually dropped again) when it compiles.
+                let (stmt, lazy) = match lazy {
+                    Some(l) => (
+                        Statement::new(StatementKind::Null, body.span),
+                        Some(Box::new(l)),
+                    ),
+                    None => (body, None),
+                };
                 Arc::make_mut(&mut self.edge_blocks).push(EdgeSensitiveBlock {
                     resolved_sensitivities: resolved,
-                    stmt: body,
+                    stmt,
+                    lazy,
                     kind: ab.kind,
                     scope: ab.scope,
                 });
@@ -21580,26 +21823,112 @@ impl Simulator {
         true
     }
 
+    /// The write-target census of every process body (see
+    /// `collect_override_target_leaves` / `collect_procedural_write_names`),
+    /// deferred always blocks included. A lazy block is not materialized for
+    /// it when its source can be read directly: a written name whose head is
+    /// not a substituted port or interface reference is rewritten only by
+    /// prefixing a local (`prefix + name`), else kept, so both spellings are
+    /// returned (in the second set; a superset of the rewritten census, which
+    /// only ever stops an alias). Sources are shared by every instance of a
+    /// module, so each is read once. Any other lazy block (an override, or a
+    /// write through a port or interface) is materialized for the walk.
+    #[allow(clippy::type_complexity)]
+    fn write_target_census(&self) -> ((HashSet<String>, HashSet<String>), Vec<String>) {
+        let mut by_source: HashMap<usize, (HashSet<String>, HashSet<String>)> =
+            HashMap::default();
+        let mut extra_writes: Vec<String> = Vec::new();
+        let mut walk_lazy: Vec<&LazyAlways> = Vec::new();
+        for d in &self.deferred_always {
+            let DeferredAlways::Lazy { lazy, .. } = d else {
+                continue;
+            };
+            let src = &lazy.src;
+            let (overrides, writes) = by_source
+                .entry(std::rc::Rc::as_ptr(&src.source) as usize)
+                .or_insert_with(|| super::elaborate::stmt_write_targets(&src.source));
+            let ctx = &src.ctx;
+            let direct = overrides.is_empty()
+                && writes.iter().all(|w| {
+                    let head = w.split('.').next().unwrap_or(w);
+                    !ctx.port_map.contains_key(head)
+                        && !ctx.interface_map.contains_key(head)
+                        && !head.starts_with("$unit::")
+                });
+            if !direct {
+                walk_lazy.push(lazy);
+                continue;
+            }
+            for w in writes.iter() {
+                let head = w.split('.').next().unwrap_or(w);
+                if ctx.local_names.contains(head) {
+                    extra_writes.push(format!("{}{}", ctx.prefix, w));
+                }
+                extra_writes.push(w.clone());
+            }
+        }
+        let deferred = &self.deferred_always;
+        let sets = super::elaborate::collect_write_target_sets(
+            &self.module,
+            &mut |visit: &mut dyn FnMut(&Statement)| {
+                for d in deferred {
+                    if let DeferredAlways::Eager(ab) = d {
+                        visit(&ab.stmt);
+                    }
+                }
+                for lazy in &walk_lazy {
+                    visit(&lazy.materialize().stmt);
+                }
+            },
+        );
+        (sets, extra_writes)
+    }
+
+    /// Materialize every deferred always block onto `module.always_blocks`,
+    /// after the module's own (the order classification would take them).
+    fn flush_deferred_always(&mut self) {
+        for d in std::mem::take(&mut self.deferred_always) {
+            let ab = match d {
+                DeferredAlways::Eager(ab) => ab,
+                DeferredAlways::Lazy { lazy, .. } => lazy.materialize(),
+            };
+            self.module.always_blocks.push(ab);
+        }
+    }
+
     fn classify_always_blocks(&mut self) {
         // Take ownership — the remaining-only subset is written back at the
         // end. Avoids a full clone of every always-block AST (significant on
         // c910-scale designs with 20K+ blocks).
         //
-        // #7 lazy-prefix path: drain `module.pending_always` one at a time,
-        // materialize, feed through classify_one_always_block. Peak memory is
-        // the single materialized AlwaysBlock + bytecode-so-far, instead of
-        // the full Vec<AlwaysBlock> for every per-instance rewritten body.
-        let pending = std::mem::take(&mut self.module.pending_always);
+        // Order: the module's own always blocks, then the instantiated
+        // ones `rewrite_edge_select_sensitivities` took out of
+        // `module.pending_always`, in their original order. A lazy one is
+        // materialized just for its classification; an edge block keeps
+        // only its source (see `LazyAlways`), so the trees never all exist
+        // at once. Anything still in `pending_always` (none on the normal
+        // path) follows, materialized one at a time.
         let blocks = std::mem::take(&mut self.module.always_blocks);
+        let deferred = std::mem::take(&mut self.deferred_always);
+        let pending = std::mem::take(&mut self.module.pending_always);
         let mut remaining = Vec::new();
-        for p in pending {
-            let ab = p.materialize();
-            if let Some(rest) = self.classify_one_always_block(ab) {
+        for ab in blocks.into_iter() {
+            if let Some(rest) = self.classify_one_always_block(ab, None) {
                 remaining.push(rest);
             }
         }
-        for ab in blocks.into_iter() {
-            if let Some(rest) = self.classify_one_always_block(ab) {
+        for d in deferred {
+            let (ab, lazy) = match d {
+                DeferredAlways::Eager(ab) => (ab, None),
+                DeferredAlways::Lazy { lazy, .. } => (lazy.materialize(), Some(lazy)),
+            };
+            if let Some(rest) = self.classify_one_always_block(ab, lazy) {
+                remaining.push(rest);
+            }
+        }
+        for p in pending {
+            let ab = p.materialize();
+            if let Some(rest) = self.classify_one_always_block(ab, None) {
                 remaining.push(rest);
             }
         }
@@ -28444,10 +28773,10 @@ impl Simulator {
             // form, so the two name sets are collected on the FIRST call,
             // while every process body is still on the module, and kept.
             if self.buf_collapse_write_sets.is_none() {
-                self.buf_collapse_write_sets = Some((
-                    super::elaborate::collect_override_target_leaves(&self.module),
-                    super::elaborate::collect_procedural_write_names(&self.module),
-                ));
+                let (sets, lazy_writes) = self.write_target_census();
+                let mut sets = sets;
+                sets.1.extend(lazy_writes);
+                self.buf_collapse_write_sets = Some(sets);
             }
             let (override_leaves, proc_writes) = self
                 .buf_collapse_write_sets
@@ -28590,111 +28919,122 @@ impl Simulator {
         }
     }
 
-    /// Free the source statement of every edge block whose bytecode now
-    /// stands in for it everywhere. An edge block keeps its statement for
-    /// three kinds of later reader: the AST interpreter (a block that did not
-    /// compile), the writer census at simulation start (a block whose
-    /// bytecode holds fallback or whole-array writes) and the §16.9.3
-    /// sampled-value registration (a `$rose`/`$fell`/`$stable`/`$changed`/
-    /// `$past` call). Every other block is only ever run from bytecode, and
-    /// a block folded into a merged one never runs at all, so its statement
-    /// is replaced by an empty one with the same span (diagnostics report
-    /// the span). On a 64k-cell DRAM that frees ~200 MB before the comb
-    /// build, the compile's peak. `--warn-x` and `XEZIM_TRACE_ALWAYS` derive
-    /// driver write sets from the statements at run time, so they keep all.
-    fn drop_compiled_edge_block_asts(&mut self) {
+    /// Does a compiled edge block still need its source statement after
+    /// compilation? Three kinds of later reader use it: the AST interpreter
+    /// (a block that did not compile), the writer census at simulation start
+    /// (a block whose bytecode holds fallback or whole-array writes) and the
+    /// §16.9.3 sampled-value registration (a `$rose`/`$fell`/`$stable`/
+    /// `$changed`/`$past` call). `--warn-x` and `XEZIM_TRACE_ALWAYS` derive
+    /// driver write sets from every statement at run time.
+    fn edge_body_needed(
+        &self,
+        cb: Option<&super::bytecode::CompiledBlock>,
+        body: &Statement,
+    ) -> bool {
         use super::bytecode::Insn;
         if self.warn_x || self.trace_always.is_some() {
-            return;
+            return true;
         }
-        fn expr_has_sampled_call(e: &Expression) -> bool {
-            match &e.kind {
-                ExprKind::SystemCall { name, args } => {
-                    matches!(
-                        name.as_str(),
-                        "$rose" | "$fell" | "$stable" | "$changed" | "$past"
-                    ) || args.iter().any(expr_has_sampled_call)
-                }
-                ExprKind::Call { args, .. } => args.iter().any(expr_has_sampled_call),
-                ExprKind::Binary { left, right, .. } => {
-                    expr_has_sampled_call(left) || expr_has_sampled_call(right)
-                }
-                ExprKind::Unary { operand, .. } => expr_has_sampled_call(operand),
-                ExprKind::Paren(inner) => expr_has_sampled_call(inner),
-                ExprKind::Conditional {
-                    condition,
-                    then_expr,
-                    else_expr,
-                } => {
-                    expr_has_sampled_call(condition)
-                        || expr_has_sampled_call(then_expr)
-                        || expr_has_sampled_call(else_expr)
-                }
-                ExprKind::Concatenation(items) => items.iter().any(expr_has_sampled_call),
-                ExprKind::Index { expr, index } => {
-                    expr_has_sampled_call(expr) || expr_has_sampled_call(index)
-                }
-                _ => false,
+        let Some(cb) = cb else {
+            return true;
+        };
+        let census_reads_ast = cb.instructions.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::StmtFallback(..)
+                    | Insn::EvalExprFallback(..)
+                    | Insn::NbaAssignArray(..)
+                    | Insn::BlockingAssignArray(..)
+                    | Insn::NbaAssignArrayRange(..)
+                    | Insn::BlockingAssignArrayRange(..)
+            )
+        });
+        census_reads_ast || Self::stmt_has_sampled_call(body)
+    }
+
+    fn expr_has_sampled_call(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::SystemCall { name, args } => {
+                matches!(
+                    name.as_str(),
+                    "$rose" | "$fell" | "$stable" | "$changed" | "$past"
+                ) || args.iter().any(Self::expr_has_sampled_call)
             }
-        }
-        // The statement positions `scan_sampled_stmt` and
-        // `collect_sampled_sites_stmt` visit.
-        fn stmt_has_sampled_call(st: &Statement) -> bool {
-            use crate::ast::stmt::StatementKind as SK;
-            match &st.kind {
-                SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
-                    stmts.iter().any(stmt_has_sampled_call)
-                }
-                SK::If {
-                    condition,
-                    then_stmt,
-                    else_stmt,
-                    ..
-                } => {
-                    expr_has_sampled_call(condition)
-                        || stmt_has_sampled_call(then_stmt)
-                        || else_stmt.as_deref().is_some_and(stmt_has_sampled_call)
-                }
-                SK::TimingControl { stmt, .. } => stmt_has_sampled_call(stmt),
-                SK::For { body, .. }
-                | SK::While { body, .. }
-                | SK::DoWhile { body, .. }
-                | SK::Repeat { body, .. }
-                | SK::Forever { body }
-                | SK::Foreach { body, .. } => stmt_has_sampled_call(body),
-                SK::Case { expr, items, .. } => {
-                    expr_has_sampled_call(expr)
-                        || items.iter().any(|it| stmt_has_sampled_call(&it.stmt))
-                }
-                SK::BlockingAssign { rvalue, .. } | SK::NonblockingAssign { rvalue, .. } => {
-                    expr_has_sampled_call(rvalue)
-                }
-                SK::Expr(e) => expr_has_sampled_call(e),
-                _ => false,
+            ExprKind::Call { args, .. } => args.iter().any(Self::expr_has_sampled_call),
+            ExprKind::Binary { left, right, .. } => {
+                Self::expr_has_sampled_call(left) || Self::expr_has_sampled_call(right)
             }
+            ExprKind::Unary { operand, .. } => Self::expr_has_sampled_call(operand),
+            ExprKind::Paren(inner) => Self::expr_has_sampled_call(inner),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_has_sampled_call(condition)
+                    || Self::expr_has_sampled_call(then_expr)
+                    || Self::expr_has_sampled_call(else_expr)
+            }
+            ExprKind::Concatenation(items) => items.iter().any(Self::expr_has_sampled_call),
+            ExprKind::Index { expr, index } => {
+                Self::expr_has_sampled_call(expr) || Self::expr_has_sampled_call(index)
+            }
+            _ => false,
         }
+    }
+
+    /// A sampled-value call anywhere `scan_sampled_stmt` and
+    /// `collect_sampled_sites_stmt` look (a superset of both).
+    fn stmt_has_sampled_call(st: &Statement) -> bool {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_has_sampled_call)
+            }
+            SK::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::expr_has_sampled_call(condition)
+                    || Self::stmt_has_sampled_call(then_stmt)
+                    || else_stmt.as_deref().is_some_and(Self::stmt_has_sampled_call)
+            }
+            SK::TimingControl { stmt, .. } => Self::stmt_has_sampled_call(stmt),
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::Foreach { body, .. } => Self::stmt_has_sampled_call(body),
+            SK::Case { expr, items, .. } => {
+                Self::expr_has_sampled_call(expr)
+                    || items.iter().any(|it| Self::stmt_has_sampled_call(&it.stmt))
+            }
+            SK::BlockingAssign { rvalue, .. } | SK::NonblockingAssign { rvalue, .. } => {
+                Self::expr_has_sampled_call(rvalue)
+            }
+            SK::Expr(e) => Self::expr_has_sampled_call(e),
+            _ => false,
+        }
+    }
+
+    /// Free the source statement of every edge block whose bytecode now
+    /// stands in for it everywhere (see `edge_body_needed`); a block folded
+    /// into a merged one never runs at all. Such a block keeps an empty
+    /// statement with the same span (diagnostics report the span). A lazy
+    /// block's body was already dropped, or kept, as it compiled.
+    fn drop_compiled_edge_block_asts(&mut self) {
         let nb = self.edge_blocks.len();
         let droppable: Vec<bool> = (0..nb)
             .map(|bi| {
-                if self.edge_block_retired.get(bi).copied().unwrap_or(false) {
-                    return true;
-                }
-                let Some(Some(cb)) = self.compiled_edge_blocks.get(bi) else {
-                    return false;
-                };
-                // The writer census re-derives these from the statement.
-                let census_reads_ast = cb.instructions.iter().any(|insn| {
-                    matches!(
-                        insn,
-                        Insn::StmtFallback(..)
-                            | Insn::EvalExprFallback(..)
-                            | Insn::NbaAssignArray(..)
-                            | Insn::BlockingAssignArray(..)
-                            | Insn::NbaAssignArrayRange(..)
-                            | Insn::BlockingAssignArrayRange(..)
-                    )
-                });
-                !census_reads_ast && !stmt_has_sampled_call(&self.edge_blocks[bi].stmt)
+                let retired = self.edge_block_retired.get(bi).copied().unwrap_or(false);
+                let cb = self.compiled_edge_blocks.get(bi).and_then(|c| c.as_ref());
+                let body = &self.edge_blocks[bi].stmt;
+                !matches!(body.kind, StatementKind::Null)
+                    && !(self.warn_x || self.trace_always.is_some())
+                    && (retired || !self.edge_body_needed(cb, body))
             })
             .collect();
         if !droppable.iter().any(|&d| d) {
@@ -28717,7 +29057,16 @@ impl Simulator {
         let mut compiled = Vec::with_capacity(self.edge_blocks.len());
         let mut bc_count = 0;
         let mut max_regs: u32 = 0;
-        for block in self.edge_blocks.iter() {
+        let bc_dump = std::env::var("XEZIM_BC_DUMP").ok();
+        // Bodies rebuilt for lazy blocks that must keep them (see
+        // `edge_body_needed`); the others are dropped right after compiling,
+        // so the bodies never all exist at once.
+        let mut kept_bodies: Vec<(usize, Statement)> = Vec::new();
+        let mut any_lazy = false;
+        for (bi, block) in self.edge_blocks.iter().enumerate() {
+            let lazy_body = block.lazy.as_ref().map(|l| l.materialize_body());
+            any_lazy |= lazy_body.is_some();
+            let body: &Statement = lazy_body.as_ref().unwrap_or(&block.stmt);
             // Scope hint for unqualified idents inside the block: the
             // block's own inlining scope when it has one, else derived from
             // the first sensitivity signal. (Sensitivity-only derivation
@@ -28747,7 +29096,7 @@ impl Simulator {
                         let mut reads: HashSet<String> = HashSet::default();
                         let mut writes: HashSet<String> = HashSet::default();
                         Self::collect_stmt_reads(
-                            &block.stmt,
+                            body,
                             &self.module,
                             &mut reads,
                             &mut writes,
@@ -28792,19 +29141,19 @@ impl Simulator {
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
             compiler.top_module_name = Some(self.module.name.clone());
-            let ok = compiler.compile_stmt(&block.stmt);
+            let ok = compiler.compile_stmt(body);
             if !ok && std::env::var_os("XEZIM_EDGE_BLOCK_STATS").is_some() {
                 eprintln!(
                     "[EDGE-BAIL] scope='{}' reason={} span={}..{}",
                     block.scope,
                     compiler.bail_reason.unwrap_or("unknown"),
-                    block.stmt.span.start,
-                    block.stmt.span.end
+                    body.span.start,
+                    body.span.end
                 );
             }
             if ok {
                 let cb = compiler.finish();
-                if let Ok(limit) = std::env::var("XEZIM_BC_DUMP") {
+                if let Some(limit) = &bc_dump {
                     let limit: usize = limit.parse().unwrap_or(0);
                     if compiled.len() < limit {
                         eprintln!(
@@ -28832,6 +29181,21 @@ impl Simulator {
                 compiled.push(Some(cb));
             } else {
                 compiled.push(None);
+            }
+            if let Some(body) = lazy_body {
+                let cb = compiled.last().and_then(|c| c.as_ref());
+                if self.edge_body_needed(cb, &body) {
+                    kept_bodies.push((bi, body));
+                }
+            }
+        }
+        if any_lazy {
+            let blocks = Arc::make_mut(&mut self.edge_blocks);
+            for b in blocks.iter_mut() {
+                b.lazy = None;
+            }
+            for (bi, body) in kept_bodies {
+                blocks[bi].stmt = body;
             }
         }
         self.compiled_edge_blocks = compiled;
@@ -34198,6 +34562,10 @@ impl Simulator {
         let mut ca_compile_fail: HashMap<&'static str, usize> = HashMap::default();
         let mut ca_compile_fail_samples = 0usize;
         let cont_loop_t0 = std::time::Instant::now();
+        // Read once, not per assign (a `getenv` scan per assign is
+        // measurable at 150k assigns).
+        let dump_ca_reads = std::env::var_os("XEZIM_DUMP_CA_READS").is_some();
+        let dump_unresolved = std::env::var_os("XEZIM_DUMP_UNRESOLVED").is_some();
         for mut ca in cas
             .into_iter()
             .chain({
@@ -35017,7 +35385,7 @@ impl Simulator {
                             continue;
                         }
                     }
-                    if !found && std::env::var("XEZIM_DUMP_UNRESOLVED").is_ok() {
+                    if !found && dump_unresolved {
                         let leaf = r.rsplit('.').next().unwrap_or(r.as_str());
                         let near: Vec<&str> = self
                             .array_first_id
@@ -35035,7 +35403,7 @@ impl Simulator {
                     unresolved_count += 1;
                 }
             }
-            if std::env::var("XEZIM_DUMP_CA_READS").is_ok() {
+            if dump_ca_reads {
                 let rn: Vec<&str> = rids.iter().map(|&i| self.name_for_id(i)).collect();
                 eprintln!(
                     "[CA-READS] scope_hint={:?} reads={:?} rids={:?} lhs_abs={}",
@@ -35043,7 +35411,7 @@ impl Simulator {
                 );
             }
             let has_unresolved_reads = unresolved_count > 0;
-            if has_unresolved_reads && std::env::var("XEZIM_DUMP_UNRESOLVED").is_ok() {
+            if has_unresolved_reads && dump_unresolved {
                 let unresolved: Vec<&String> = reads
                     .iter()
                     .filter(|r| {
@@ -38565,11 +38933,19 @@ impl Simulator {
         }
         if std::env::var("XEZIM_LAYOUT").is_ok() {
             eprintln!(
-                "[LAYOUT] CombEntry={}B CombItem={}B Value={}B entries={}",
+                "[LAYOUT] CombEntry={}B CombItem={}B Value={}B entries={} SensitivityId={}B Expression={}B EdgeSensitiveBlock={}B edge_blocks={} sens_terms={}",
                 std::mem::size_of::<CombEntry>(),
                 std::mem::size_of::<CombItem>(),
                 std::mem::size_of::<Value>(),
-                entries.len()
+                entries.len(),
+                std::mem::size_of::<SensitivityId>(),
+                std::mem::size_of::<Expression>(),
+                std::mem::size_of::<EdgeSensitiveBlock>(),
+                self.edge_blocks.len(),
+                self.edge_blocks
+                    .iter()
+                    .map(|b| b.resolved_sensitivities.capacity())
+                    .sum::<usize>()
             );
         }
         self.comb_entries = entries;

@@ -1053,6 +1053,9 @@ impl Simulator {
         let Some(cfg) = code_coverage() else {
             return;
         };
+        // Every always body is instrumented as a tree (normally none is
+        // lazy under coverage; this covers a configuration set late).
+        self.flush_deferred_always();
         let kinds = cfg.kinds;
         let inst_paths: HashSet<String> = self
             .module

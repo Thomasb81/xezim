@@ -16,6 +16,10 @@
 //!   without unpacked structs.
 //! - The identity-net collapse runs on a local mirror of the name table.
 //! - Sensitivity terms keep `iff` guards and expression values out of line.
+//! - Instantiated `@(...)` always blocks stay lazy (shared source plus
+//!   instance context) until they compile; the edge-select alias, computed
+//!   edge terms, the buffer-collapse write census, `%m`, sampled-value calls
+//!   and whole-array writes must all come out as with eager trees.
 use std::process::Command;
 
 fn run(name: &str, src: &str, env: &[(&str, &str)]) -> String {
@@ -262,6 +266,72 @@ module tb;
 endmodule
 "#;
 
+const LAZY_CHILDREN: &str = r#"
+module flop(input clk, input [3:0] d, output reg [3:0] q);
+  reg [3:0] r;
+  always @(posedge clk) begin r <= d; q <= r; end
+endmodule
+module edgecnt(input ck, input x, output reg [3:0] n, output reg [3:0] rises);
+  initial begin n = 0; rises = 0; end
+  always @(posedge ck) n <= n + 1;
+  always @(posedge ck) if ($rose(x)) rises <= rises + 1;
+endmodule
+module arrw(input clk, input go, output [7:0] s);
+  reg [3:0] m [0:1];
+  initial begin m[0] = 0; m[1] = 0; end
+  always @(posedge clk) if (go) m <= '{4'd5, 4'd9};
+  assign s = {m[0], m[1]};
+endmodule
+module named(input clk, input [3:0] d);
+  reg [3:0] v;
+  always @(posedge clk) begin
+    v <= d;
+    if (d == 4'd6) $display("T|m=%m v=%0d", v);
+  end
+endmodule
+module tb;
+  reg clk = 0; always #5 clk = ~clk;
+  reg [3:0] bus = 0, d = 0;
+  reg a = 0, en = 0, x = 0, go = 0;
+  wire [3:0] q [0:1];
+  wire [3:0] q0, q1, n_bit, r_bit, n_and, r_and;
+  assign q0 = q[0];
+  assign q1 = q[1];
+  wire [7:0] s;
+  // Clock from a vector bit, through a generate loop.
+  genvar i;
+  for (i = 0; i < 2; i++) begin : g
+    flop u(.clk(bus[i]), .d(d ^ i[3:0]), .q(q[i]));
+  end
+  // A clock that is an expression of the parent's nets.
+  edgecnt c1(.ck(bus[2]), .x(x), .n(n_bit), .rises(r_bit));
+  edgecnt c2(.ck(a & en), .x(x), .n(n_and), .rises(r_and));
+  wire [3:0] n_clk, r_clk;
+  edgecnt c3(.ck(clk), .x(x), .n(n_clk), .rises(r_clk));
+  arrw w(.clk(clk), .go(go), .s(s));
+  named nm(.clk(clk), .d(d));
+  // Whole-net buffers onto names the child blocks write.
+  wire [3:0] b_r, b_q;
+  assign b_r = g[0].u.r;
+  assign b_q = q1;
+  initial begin
+    for (int t = 0; t < 12; t++) begin
+      @(negedge clk);
+      d = t[3:0];
+      bus = bus + 1;
+      a = t[0];
+      en = (t > 3);
+      x = (t == 2 || t == 3 || t == 7);
+      go = (t == 5);
+    end
+    #1 $display("T|q0=%0d q1=%0d br=%0d bq=%0d nb=%0d na=%0d ra=%0d nc=%0d s=%h",
+                q0, q1, b_r, b_q, n_bit, n_and, r_and, n_clk, s);
+    $display("R|rc=%0d", r_clk);
+    $finish;
+  end
+endmodule
+"#;
+
 #[test]
 fn topo_join_orders_bit_driven_nets() {
     let want = [
@@ -349,4 +419,32 @@ fn guarded_and_expression_event_terms() {
         ["T|iff=2 blk=2 sum=2 or=3 mem=4 cov=6.2"],
         "{out}"
     );
+}
+
+#[test]
+fn lazy_child_always_blocks_match_eager_trees() {
+    let lazy = run("lazy_children", LAZY_CHILDREN, &[("XEZIM_DEBUG", "1")]);
+    assert_eq!(
+        t_lines(&lazy),
+        [
+            "T|m=tb.nm v=5",
+            "T|q0=8 q1=4 br=10 bq=4 nb=2 na=4 ra=0 nc=12 s=59",
+        ],
+        "{lazy}"
+    );
+    let eager = run(
+        "lazy_children_off",
+        LAZY_CHILDREN,
+        &[("XEZIM_DEBUG", "1"), ("XEZIM_LAZY_ALWAYS", "0")],
+    );
+    let keep = |t: &str| -> Vec<String> {
+        t.lines()
+            .filter(|l| l.starts_with("T|") || l.starts_with("R|") || l.contains("COLLAPSE]"))
+            .map(str::to_string)
+            .collect()
+    };
+    // Same values, and the same buffer collapses: the write census saw the
+    // lazy blocks' targets exactly as it sees materialized ones.
+    assert_eq!(keep(&lazy), keep(&eager), "lazy:\n{lazy}\neager:\n{eager}");
+    assert!(lazy.contains("[BUF-COLLAPSE]"), "{lazy}");
 }

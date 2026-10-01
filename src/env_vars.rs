@@ -523,6 +523,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     ("XEZIM_LAYOUT", "Print signal-table memory layout summary"),
     (
+        "XEZIM_LAZY_ALWAYS",
+        "Default on; =0 disables: keep instantiated `@(...)` always blocks as shared source plus instance context until they compile, instead of one materialized tree each",
+    ),
+    (
         "XEZIM_LAZY_PROC_SETTLE",
         "Scheduling: defer comb settle across process boundaries (0/1)",
     ),

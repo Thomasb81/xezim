@@ -14139,7 +14139,8 @@ impl<'a> BytecodeCompiler<'a> {
                 dead += 1;
             }
         }
-        if std::env::var_os("XEZIM_FOLD_CONST_STATS").is_some() {
+        static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *STATS.get_or_init(|| std::env::var_os("XEZIM_FOLD_CONST_STATS").is_some()) {
             eprintln!("[FOLD-CONST] folded={folded} dead_consts={dead} insns={n}");
         }
     }
