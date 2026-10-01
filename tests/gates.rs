@@ -71,3 +71,5 @@ mod udp_table_entry_shape;
 mod vcd_lrm_compliance;
 #[path = "gates/wave_flag_gates_dumping.rs"]
 mod wave_flag_gates_dumping;
+#[path = "gates/zero_delay_path_edge_ordering.rs"]
+mod zero_delay_path_edge_ordering;

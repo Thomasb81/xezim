@@ -153,6 +153,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`class p #(type CFG = cfg_c); CFG a; ... a.x = 1;`) reaches the object.
   It used to be dropped without a diagnostic, along with compound,
   nonblocking and nested writes through such a property. (PR #209 by eenky)
+* A module path or SDF delay that rounds to zero ticks is no delay: the
+  change it carries happens in the same Active region as its cause. A clock
+  passed through a zero-delay library cell (`(posedge A => (Y:1'b1)) = (0.01,
+  100.0)` at 1ps precision) clocked its flops after that time step's
+  nonblocking assignments had committed, so they sampled the new values.
 
 **Performance**
 

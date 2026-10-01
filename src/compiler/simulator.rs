@@ -44214,6 +44214,9 @@ impl Simulator {
                     t_settle += t.elapsed().as_nanos() as u64;
                 }
             }
+            if !self.delayed_updates.is_empty() {
+                self.apply_due_delayed_now();
+            }
             let t0 = self.profile_timing.then(std::time::Instant::now);
             let edges_before = self.prof_edges_fired;
             self.edge_dispatch_phase = "cascade";
@@ -45410,6 +45413,9 @@ impl Simulator {
         let _t = profile_timing.then(std::time::Instant::now);
         if self.dirty_any {
             self.settle_combinatorial();
+            non_clock_change = true;
+        }
+        if !self.delayed_updates.is_empty() && self.apply_due_delayed_now() {
             non_clock_change = true;
         }
         if let Some(t) = _t {
@@ -48296,6 +48302,12 @@ impl Simulator {
             }
             if self.dirty_any {
                 self.settle_combinatorial();
+            }
+            // Zero-delay updates due now, before this pass's edge check
+            // (see `apply_due_delayed_now`).
+            let mut dly_applied = dly_applied;
+            if !self.delayed_updates.is_empty() && self.apply_due_delayed_now() {
+                dly_applied = true;
             }
             // After advancing time and any clock/delay fires, check for
             // edge triggers so always_ff blocks fire within this delay
@@ -54134,6 +54146,28 @@ impl Simulator {
             } else {
                 i += 1;
             }
+        }
+        applied
+    }
+
+    /// §4.4, §30.4: a delayed update already due now (a module path or SDF
+    /// delay that rounds to zero ticks, or a path-delayed net with no enabled
+    /// path) is a change of this slot's Active region. Apply it, and any
+    /// zero-delay hop it causes in turn, then settle, so the caller's next
+    /// edge check sees it: an edge it raises (a clock through a zero-delay
+    /// library cell) must sample pre-NBA values, like the undelayed edge
+    /// beside it. It used to wait for the next pass of the time step, after
+    /// this slot's NBAs had committed. Out of line: callers test
+    /// `delayed_updates.is_empty()` first, so the common case costs one load.
+    #[inline(never)]
+    fn apply_due_delayed_now(&mut self) -> bool {
+        let mut applied = false;
+        let mut hops = 0;
+        while hops < 1024 && self.apply_delayed_updates() {
+            applied = true;
+            self.dirty_any = true;
+            self.settle_combinatorial();
+            hops += 1;
         }
         applied
     }
