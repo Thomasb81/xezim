@@ -233,6 +233,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: trace constant propagation in elaboration",
     ),
     (
+        "XEZIM_CTL_MASK",
+        "Scheduling: an AND/OR gate whose other input holds the controlling value skips its high-fanout (clock) input; 0 disables",
+    ),
+    (
         "XEZIM_CYCLE_CENSUS",
         "Census: comb entries in combinational loops (SCCs) / self-loops and edge blocks on derived clocks — the exclusion set for single-pass cycle evaluation (=2 samples the largest SCCs)",
     ),
