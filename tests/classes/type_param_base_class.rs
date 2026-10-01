@@ -523,6 +523,61 @@ endmodule
     );
 }
 
+/// One class entry per bound base CLASS: the base's own arguments (`pbase#(8, byte)`) reach
+/// it through the specialization, also two levels down (`wrap2_c #(pbase#(6))`) and from
+/// a non-parameterized subclass, for value and type parameters and per-spec statics.
+#[test]
+fn type_param_base_projected_arguments() {
+    const SRC: &str = r#"
+class base_c;
+  function new(); endfunction
+  virtual function string who(); return "base_c"; endfunction
+endclass
+class pbase #(int W = 4, type T = int) extends base_c;
+  T tv;
+  static int cnt;
+  function new(); super.new(); cnt++; endfunction
+  function int w(); return W; endfunction
+  virtual function string who(); return $sformatf("pbase%0d/%s", W, $typename(T)); endfunction
+endclass
+class wrap_c #(type BASE = base_c) extends BASE;
+  virtual function string who(); return {"wrap_c/", super.who()}; endfunction
+endclass
+class wrap2_c #(type B = base_c) extends wrap_c #(B);
+  virtual function string who(); return {"wrap2_c/", super.who()}; endfunction
+endclass
+class leaf8 extends wrap_c #(pbase#(8, byte));
+endclass
+module tb;
+  leaf8 l; wrap2_c #(pbase#(6)) w6; wrap_c #(pbase#(7, shortint)) w7; wrap_c #(pbase) w4;
+  pbase #(8, byte) pb8; base_c b;
+  initial begin
+    l = new(); w6 = new(); w7 = new(); w4 = new();
+    $display("T| l %s %0d", l.who(), l.w());
+    $display("T| w6 %s %0d", w6.who(), w6.w());
+    $display("T| w7 %s %0d", w7.who(), w7.w());
+    $display("T| w4 %s %0d", w4.who(), w4.w());
+    $display("T| cnt %0d %0d %0d %0d", pbase#(8, byte)::cnt, pbase#(6)::cnt, pbase#(7, shortint)::cnt, pbase#()::cnt);
+    $display("T| cast %0d", $cast(pb8, l));
+    $display("T| tn %s | %s", $typename(w6), $typename(w7));
+  end
+endmodule
+"#;
+    check(
+        "t10",
+        SRC,
+        &[
+            "T| l wrap_c/pbase8/byte 8",
+            "T| w6 wrap2_c/wrap_c/pbase6/int 6",
+            "T| w7 wrap_c/pbase7/shortint 7",
+            "T| w4 wrap_c/pbase4/int 4",
+            "T| cnt 1 1 1 1",
+            "T| cast 1",
+            "T| tn class wrap2_c #(class pbase #(6, int)) | class wrap_c #(class pbase #(7, shortint))",
+        ],
+    );
+}
+
 /// `this_type` construction in a static method, a value parameter beside the type parameter,
 /// a named `extends wrap_c #(.BASE(B))`, a typedef default, a specialization made inside
 /// another parameterized class, a nested `wrap_c #(wrap_c #(derived_c))`, and

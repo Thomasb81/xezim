@@ -6250,7 +6250,7 @@ pub struct Simulator {
     /// parameter) or `class W2 #(type B) extends W #(B);` (the base is such a
     /// class specialized with this class's parameters). Maps the class to its
     /// DECLARED `extends` name and argument fragments, before linking
-    /// rewrote them. Each specialization whose base differs from the
+    /// rewrote them. Each specialization whose base CLASS differs from the
     /// default's gets its own class entry (see `ensure_spec_class`).
     dep_base: HashMap<String, (String, Vec<String>)>,
     /// The default specialization's base class ENTRY of each `dep_base`
@@ -113242,8 +113242,10 @@ impl Simulator {
 
     /// §8.25: the class entry for specialization `args` of `cname`. A class
     /// whose base does not depend on its parameters, and a specialization
-    /// whose base is the default one, is the class itself; any other is
-    /// `"<cname><<base>>"`, made by `ensure_spec_class`.
+    /// whose base is the default one's class, is the class itself; any other
+    /// is `"<cname><<base entry>>"`, made by `ensure_spec_class`. The base's
+    /// own arguments are not part of the entry: they reach the base through
+    /// the specialization (`BASE#[i]`, see `spec_projection`).
     fn spec_class_name(&self, cname: &str, args: &[String]) -> String {
         self.spec_class_name_depth(cname, args, 0)
     }
@@ -113306,9 +113308,9 @@ impl Simulator {
     /// `extends = "BASE"`, which names no class, so every walk up the
     /// hierarchy stopped at `wrap_c` — no base constructor, no inherited
     /// properties or methods, an empty `super.`, a failing upcast. The class
-    /// entry takes its DEFAULT specialization's base; every other
-    /// specialization gets its own entry (`ensure_spec_class`), which
-    /// `new` constructs and an `extends` clause naming it links to.
+    /// entry takes its DEFAULT specialization's base; a specialization that
+    /// binds a base of another class gets its own entry (`ensure_spec_class`),
+    /// which `new` constructs and an `extends` clause naming it links to.
     #[inline(never)]
     fn link_type_param_bases(&mut self) {
         let mut names: Vec<String> = self.module.classes.keys().cloned().collect();
