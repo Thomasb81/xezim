@@ -2042,6 +2042,17 @@ pub fn install_hang_report_handler() {
 #[cfg(not(unix))]
 pub fn install_hang_report_handler() {}
 
+/// See `Simulator::event_list_shape`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventListShape {
+    /// `@*`, `always_comb`, a named event, or no leading event control.
+    Implicit,
+    /// An explicit list whose every term is a plain identifier.
+    Plain,
+    /// An explicit list with a select, concatenation or expression term.
+    NonPlain,
+}
+
 #[derive(Debug, Clone)]
 struct EventWaiter {
     pid: usize,
@@ -2534,6 +2545,7 @@ impl NbaFastIndex {
 }
 
 mod code_cov;
+mod event_bits;
 mod module_paths;
 mod names;
 mod rand_csp;
@@ -6594,14 +6606,17 @@ pub struct Simulator {
     /// re-triggers itself through its own delay could recurse without bound.
     /// Bounded by `EDGE_PASS_DEPTH_LIMIT`.
     edge_pass_depth: u32,
-    /// §9.4.2 bit-select event terms: `(signal_id, block_idx) -> bit`, for
-    /// `always @(v[3])` / `@(posedge v[3])`. Edge sensitivity is otherwise
-    /// tracked per SIGNAL, so a block watching `v[0]` also woke on a change to
-    /// `v[3]`. Kept as a sparse side map rather than a field on `SensitivityId`
-    /// because bit-select terms are rare and the dispatch loop is the hottest
-    /// path in the simulator: when this map is empty the extra work is a single
-    /// already-hot bool test.
-    bitsel_edge_sens: HashMap<(usize, usize), u32>,
+    /// §9.4.2 bit- and part-select level event terms: `(signal_id,
+    /// block_idx) -> mask` of the PHYSICAL bits the block's terms on that
+    /// signal watch, for `always @(v[3] or v[7:5])`. Edge sensitivity is
+    /// otherwise tracked per SIGNAL, so a block watching `v[0]` also woke on
+    /// a change to `v[3]`. Applies to the any-change fanout only; an entry
+    /// exists only when every term of the block on that signal is such a
+    /// select (see `narrow_event_mask`). Kept as a sparse side map rather
+    /// than a field on `SensitivityId` because select terms are rare and the
+    /// dispatch loop is the hottest path in the simulator: when this map is
+    /// empty the extra work is a single already-hot bool test.
+    bitsel_edge_sens: HashMap<(usize, usize), u64>,
     /// Bitset over signal ids: bit set ⇔ `bitsel_edge_sens` has ≥1 entry for
     /// that sid. Lets the edge dispatch loop skip the per-(sid, block) tuple
     /// hash for the overwhelmingly common signals with no bit-select
@@ -9217,6 +9232,9 @@ impl Simulator {
             }
             deferred.push(DeferredAlways::Eager(p.materialize()));
         }
+        // Port substitution leaves `@(dq[3])` as a select of the connection
+        // (`bus[15:8][3]`); spell such terms as the net bit they read first.
+        event_bits::fold_port_select_events(module);
         let params = &module.parameters;
         let headers = always
             .iter_mut()
@@ -21120,103 +21138,96 @@ impl Simulator {
         walk(stmt)
     }
 
-    /// True when every term of an explicit event control is a PLAIN identifier
-    /// (edge qualifier allowed). A term carrying a select or an expression —
-    /// `@(vco_tap[c_ph_val[0]])`, `@(sig[5:0])`, `@({a,b})` — collapses to just
-    /// its base identifier in `event_to_sens`, which drops the signals that
-    /// appear in the INDEX. Such a block genuinely needs the comb path's
-    /// read-set sensitivity so it re-evaluates when the index changes
-    /// (tests/prtest/pr2011429.v: `c_ph_val[0]` selects which tap is watched).
-    /// Only for all-plain lists is the explicit list a complete description of
-    /// what may trigger the block, and only then may we require the read set to
-    /// stay within it.
-    fn event_terms_all_plain_idents(stmt: &Statement) -> bool {
-        fn check(control: &TimingControl) -> bool {
+    /// The shape of an always block's leading event control. Only an
+    /// explicit list of PLAIN identifiers (edge qualifier allowed) can be
+    /// compared with the body's read set; a term carrying a select or an
+    /// expression (`@(vco_tap[c_ph_val[0]])`, `@(sig[5:0])`, `@({a,b})`) fires
+    /// on that value, which the edge path narrows or a value waiter
+    /// evaluates (tests/prtest/pr2011429.v: `c_ph_val[0]` selects which tap
+    /// is watched, so the waiter follows the index).
+    fn event_list_shape(stmt: &Statement) -> EventListShape {
+        fn check(control: &TimingControl) -> EventListShape {
             let TimingControl::Event(EventControl::EventExpr(exprs)) = control else {
                 // `@*`, a named event, or any other form: leave the existing
                 // routing untouched.
-                return false;
+                return EventListShape::Implicit;
             };
-            exprs.iter().all(|ee| {
+            let plain = exprs.iter().all(|ee| {
                 let mut e = &ee.expr;
                 while let ExprKind::Paren(inner) = &e.kind {
                     e = inner;
                 }
                 matches!(&e.kind, ExprKind::Ident(_))
-            })
+            });
+            if plain {
+                EventListShape::Plain
+            } else {
+                EventListShape::NonPlain
+            }
         }
         match &stmt.kind {
             StatementKind::TimingControl { control, .. } => check(control),
             StatementKind::SeqBlock { stmts, .. } => match stmts.first().map(|s| &s.kind) {
                 Some(StatementKind::TimingControl { control, .. }) => check(control),
-                _ => false,
+                _ => EventListShape::Implicit,
             },
-            _ => false,
+            _ => EventListShape::Implicit,
         }
     }
 
-    /// Constant bit-select event terms of an explicit event control, as
-    /// `(signal_id, bit)`. `@(v[3])`, `@(posedge v[3])` and `@(v[3] or w)` all
-    /// yield the pair for `v`; a non-constant index (`@(v[i])`) yields nothing,
-    /// so those keep whole-signal sensitivity — that block also needs to wake
-    /// when the INDEX moves.
-    fn const_bitselect_event_terms(&self, stmt: &Statement, scope: &str) -> Vec<(usize, u32)> {
-        let mut out: Vec<(usize, u32)> = Vec::new();
-        let control = match &stmt.kind {
-            StatementKind::TimingControl { control, .. } => Some(control),
-            StatementKind::SeqBlock { stmts, .. } => match stmts.first().map(|s| &s.kind) {
-                Some(StatementKind::TimingControl { control, .. }) => Some(control),
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some(TimingControl::Event(EventControl::EventExpr(exprs))) = control else {
-            return out;
-        };
-        let top_prefix = format!("{}.", self.module.name);
-        for ee in exprs {
-            let mut e = &ee.expr;
-            while let ExprKind::Paren(inner) = &e.kind {
-                e = inner;
-            }
-            let ExprKind::Index { expr: base, index } = &e.kind else {
-                continue;
-            };
-            let ExprKind::Ident(h) = &base.kind else {
-                continue;
-            };
-            // A select on an ARRAY picks an element, not a bit — leave it.
-            if self
-                .module
-                .arrays
-                .contains_key(Self::resolve_hier_name_static(h, &self.module).as_str())
-            {
-                continue;
-            }
-            let Some(bit) = self
-                .event_const_index(index, scope)
-                .and_then(|b| u32::try_from(b).ok())
-            else {
-                continue;
-            };
-            let raw = Self::resolve_hier_name_static(h, &self.module);
-            let sid = self
-                .signal_name_to_id
-                .get(raw.as_str())
-                .copied()
-                .or_else(|| {
-                    raw.strip_prefix(&top_prefix)
-                        .and_then(|b| self.signal_name_to_id.get(b).copied())
-                });
-            if let Some(sid) = sid {
-                // Only bits the u64 fast path can test; wider selects keep the
-                // whole-signal superset.
-                if bit < 64 && (self.signal_widths.get(sid).copied().unwrap_or(0) as u32) > bit {
-                    out.push((sid, bit));
-                }
-            }
+    /// §9.4.2: the PHYSICAL bits of signal `sid` a level event term `e`
+    /// watches, when `e` is a constant bit- or part-select of that signal as
+    /// a plain vector (`v[3]`, `v[W-1]`, `v[7:4]`, `v[b +: 2]`), read through
+    /// its declared range. None for every other shape — a runtime index, an
+    /// element of a packed multi-D vector or of an array, a bit past the
+    /// 64-bit word the edge scan compares — which must wait on the
+    /// expression's value instead.
+    fn narrow_event_mask(&self, e: &Expression, sid: usize, scope: &str) -> Option<u64> {
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &e.kind {
+            e = inner;
         }
-        out
+        let (base, sel) = match &e.kind {
+            ExprKind::Index { expr, index } => {
+                let k = self.event_const_index(index, scope)?;
+                (expr, (RangeKind::Constant, k, k))
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => (
+                expr,
+                (
+                    *kind,
+                    self.event_const_index(left, scope)?,
+                    self.event_const_index(right, scope)?,
+                ),
+            ),
+            _ => return None,
+        };
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.path.last().is_some_and(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let width = *self.signal_widths.get(sid)?;
+        if self.signal_real.get(sid).copied().unwrap_or(false) {
+            return None;
+        }
+        let dim = event_bits::vector_decl_dim(&self.module, self.name_for_id(sid), width)?;
+        let (lo, hi) = event_bits::select_label_span(dim, sel.0, sel.1, sel.2)?;
+        let mut mask = 0u64;
+        for label in lo..=hi {
+            let phys = event_bits::label_to_phys(dim, label);
+            if !(0..(width as i64).min(64)).contains(&phys) {
+                return None;
+            }
+            mask |= 1u64 << phys;
+        }
+        Some(mask)
     }
 
     /// Count the statement-level timing controls in a subtree (waits an FSM
@@ -21689,12 +21700,18 @@ impl Simulator {
                     && !self.stmt_is_blocking(&body)
                     && !self.stmt_calls_blocking_task(&body, &ab.scope, 3)
                     && !sens.iter().any(|s| self.sens_unnamed_cell(s))
-                    && (
-                        // Index-dependent / select / concat sensitivity: the
-                        // list does not name everything that may trigger the
-                        // block, so the read-set superset is the intended
-                        // behaviour.
-                        !Self::event_terms_all_plain_idents(&ab.stmt) || {
+                    && match Self::event_list_shape(&ab.stmt) {
+                        // `@*` and the other implicit forms ARE the read set.
+                        EventListShape::Implicit => true,
+                        // §9.4.2: an explicit term that selects, concatenates
+                        // or computes (`@(a[1])`, `@(mem[i])`, `@(a + b)`)
+                        // fires on that VALUE alone — never on whatever else
+                        // the body happens to read (a select-listed block
+                        // whose body called a task woke on every signal the
+                        // body read). Such a list is no read set; it goes to
+                        // the edge path, or to a value waiter below.
+                        EventListShape::NonPlain => false,
+                        EventListShape::Plain => {
                             let mut b_reads: HashSet<String> = HashSet::default();
                             let mut b_writes: HashSet<String> = HashSet::default();
                             Self::collect_stmt_reads(
@@ -21756,7 +21773,7 @@ impl Simulator {
                             let sens_covered = sens_ids.iter().all(|id| read_id_union.contains(id));
                             reads_covered && sens_covered
                         }
-                    )
+                    }
                 {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
@@ -21852,14 +21869,36 @@ impl Simulator {
                     );
                 }
                 let block_idx = self.edge_blocks.len();
-                // §9.4.2: record constant bit-select event terms (`@(v[3])`).
-                // `event_to_sens` walks past the select and yields the BASE
-                // signal, so without this the block would wake on a change to
-                // any bit of `v`. `check_edges_inner` narrows the wake to this
-                // bit; terms whose index is not a constant keep the (safe,
-                // superset) whole-signal behaviour.
-                for (sid, bit) in self.const_bitselect_event_terms(&ab.stmt, &ab.scope) {
-                    self.bitsel_edge_sens.insert((sid, block_idx), bit);
+                // §9.4.2: record constant bit/part-select level terms
+                // (`@(v[3])`, `@(v[7:4])`). `event_to_sens` walks past the
+                // select and yields the BASE signal, so without this the block
+                // would wake on a change to any bit of `v`. `check_edges_inner`
+                // narrows the any-change wake to these bits. A signal the block
+                // also watches whole (`@(v[3] or v)`) keeps the whole-signal
+                // wake; every other select went to a value waiter above.
+                let mut narrowed: Vec<(usize, u64)> = Vec::new();
+                let mut whole: Vec<usize> = Vec::new();
+                for s in &sens {
+                    let Some(sid) = self.sens_term_sid(&s.signal_name, &ab.scope) else {
+                        continue;
+                    };
+                    let mask = match (&s.value_of, s.edge) {
+                        (Some(e), EdgeKind::AnyEdge) => self.narrow_event_mask(e, sid, &ab.scope),
+                        _ => None,
+                    };
+                    match mask {
+                        Some(m) => match narrowed.iter_mut().find(|(id, _)| *id == sid) {
+                            Some(entry) => entry.1 |= m,
+                            None => narrowed.push((sid, m)),
+                        },
+                        None => whole.push(sid),
+                    }
+                }
+                for (sid, mask) in narrowed {
+                    if whole.contains(&sid) {
+                        continue;
+                    }
+                    self.bitsel_edge_sens.insert((sid, block_idx), mask);
                     let (w, b) = (sid >> 6, sid & 63);
                     if w >= self.bitsel_sid_bits.len() {
                         self.bitsel_sid_bits.resize(w + 1, 0);
@@ -43401,37 +43440,53 @@ impl Simulator {
 
     /// §9.4.2: must an always block with this event list run as a process
     /// (a waiter that evaluates the event expressions) rather than as an
-    /// edge block? An edge block watches whole signals, narrowed at most to
-    /// one constant bit (`@(posedge v[3])`, see
-    /// `const_bitselect_event_terms`). A term that selects through a runtime
-    /// index (`@(mem[i])`, `@(posedge v[i])`), selects a part or a bit of an
-    /// array element (`@(mem[3][1])`), or names an element of a memory
-    /// stored without element names (`@(big[5])`: no signal slot, no edge
-    /// snapshot) has nothing an edge block can watch.
+    /// edge block? An edge block watches whole signals; a level term on
+    /// constant bits of a plain vector (`@(v[3])`, `@(v[7:4])`) is narrowed
+    /// to those bits (`narrow_event_mask`), and an edge on one bit
+    /// (`@(posedge v[3])`) was given an alias net before classification. Any
+    /// other select — a runtime index (`@(mem[i])`, `@(posedge v[i])`), a
+    /// part or bit of an array element (`@(mem[3][1])`), an edge left on a
+    /// select, an element of a memory stored without element names
+    /// (`@(big[5])`: no signal slot, no edge snapshot) — has nothing an edge
+    /// block can watch.
     fn event_needs_value_waiter(&self, sens: &[Sensitivity], scope: &str) -> bool {
         sens.iter().any(|s| {
             let name = s.signal_name.as_str();
-            if self.signal_name_to_id.contains_key(name) {
+            if let Some(sid) = self.sens_term_sid(name, scope) {
                 let Some(e) = &s.value_of else {
                     return false;
                 };
                 if !Self::event_expr_selects(e) {
                     return false;
                 }
-                // The one select shape an edge block narrows exactly.
-                let mut e = e;
-                while let ExprKind::Paren(inner) = &e.kind {
-                    e = inner;
-                }
-                return !matches!(
-                    &e.kind,
-                    ExprKind::Index { expr, index }
-                        if matches!(expr.kind, ExprKind::Ident(_))
-                            && self.event_const_index(index, scope).is_some()
-                );
+                return s.edge != EdgeKind::AnyEdge
+                    || self.narrow_event_mask(e, sid, scope).is_none();
             }
             self.sens_unnamed_cell(s) || (s.value_of.is_some() && self.unpacked_dims_of(name) > 0)
         })
+    }
+
+    /// The signal an always block's sensitivity term names: as spelled,
+    /// without the top module's prefix, or under the block's instance scope
+    /// (an inlined child whose rewrite left the leaf bare) — the order the
+    /// edge-block registration resolves terms in.
+    fn sens_term_sid(&self, name: &str, scope: &str) -> Option<usize> {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return Some(id);
+        }
+        let top_prefix = format!("{}.", self.module.name);
+        if let Some(&id) = name
+            .strip_prefix(top_prefix.as_str())
+            .and_then(|b| self.signal_name_to_id.get(b))
+        {
+            return Some(id);
+        }
+        if scope.is_empty() {
+            return None;
+        }
+        self.signal_name_to_id
+            .get(format!("{}.{}", scope, name).as_str())
+            .copied()
     }
 
     /// Does event term `s` watch a memory cell that has no per-element name —
@@ -57193,7 +57248,7 @@ impl Simulator {
         // fanout events.
         let blk_armed: &[u8] = &self.edge_block_armed;
         let bitsel_sid_bits: &[u64] = &self.bitsel_sid_bits;
-        let bitsel_edge_sens: &HashMap<(usize, usize), u32> = &self.bitsel_edge_sens;
+        let bitsel_edge_sens: &HashMap<(usize, usize), u64> = &self.bitsel_edge_sens;
         let prefilter_seen: &mut [u32] = &mut self.edge_prefilter_seen;
         let stats_on = self.edge_block_stats_enabled;
         let scan_stats = self.edge_scan_stats;
@@ -57405,31 +57460,15 @@ impl Simulator {
             macro_rules! dispatch_block {
                 ($block_idx:expr_2021, $kind:expr_2021) => {{
                     let block_idx = $block_idx;
-                    // §9.4.2 bit-select term (`@(v[3])`): detection above is per
-                    // SIGNAL, so re-test the one bit this block actually watches
-                    // and drop the wake when only a sibling bit moved. Mirrors
-                    // the whole-signal formulas, on bit `b` instead of bit 0.
+                    // §9.4.2 bit/part-select level term (`@(v[3])`): detection
+                    // above is per SIGNAL, so re-test the bits this block
+                    // actually watches and drop the wake when only a sibling
+                    // bit moved. Edge terms never carry a mask.
                     let bitsel_ok = !sid_bitsel
+                        || !matches!($kind, EdgeKind::AnyEdge)
                         || match bitsel_edge_sens.get(&(sid, block_idx)) {
                             None => true,
-                            Some(&b) => {
-                                let cb = (cur_v >> b) & 1;
-                                let cx = (cur_x >> b) & 1;
-                                let pb = (prev_v >> b) & 1;
-                                let px = (prev_x >> b) & 1;
-                                let cur_one = cb == 1 && cx == 0;
-                                let cur_zero = cb == 0 && cx == 0;
-                                let prev_one = pb == 1 && px == 0;
-                                let prev_zero = pb == 0 && px == 0;
-                                match $kind {
-                                    EdgeKind::Posedge => !prev_one && cur_one,
-                                    EdgeKind::Negedge => !prev_zero && cur_zero,
-                                    EdgeKind::AnyEdge => cb != pb || cx != px,
-                                    EdgeKind::LsbEdge => {
-                                        (!prev_one && cur_one) || (!prev_zero && cur_zero)
-                                    }
-                                }
-                            }
+                            Some(&m) => ((cur_v ^ prev_v) | (cur_x ^ prev_x)) & m != 0,
                         };
                     if bitsel_ok
                         && block_idx < triggered_bitmap.len()

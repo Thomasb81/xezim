@@ -173,6 +173,8 @@ mod randcase_blocking_branch;
 mod ranged_port_connections_and_nba_freeze;
 #[path = "scheduling/sampled_value_inferred_clock.rs"]
 mod sampled_value_inferred_clock;
+#[path = "scheduling/select_event_terms.rs"]
+mod select_event_terms;
 #[path = "scheduling/sequential_event_waits.rs"]
 mod sequential_event_waits;
 #[path = "scheduling/shared_edge_outputs.rs"]
