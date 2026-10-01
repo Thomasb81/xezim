@@ -1053,6 +1053,9 @@ impl Simulator {
         let Some(cfg) = code_coverage() else {
             return;
         };
+        // Every always body is instrumented as a tree (normally none is
+        // lazy under coverage; this covers a configuration set late).
+        self.flush_deferred_always();
         let kinds = cfg.kinds;
         let inst_paths: HashSet<String> = self
             .module
@@ -1461,7 +1464,7 @@ impl Simulator {
             let mut names: Vec<String> = cls.methods.keys().cloned().collect();
             names.sort();
             for m in names {
-                let Some(method) = cls.methods.get_mut(&m) else {
+                let Some(method) = Arc::make_mut(&mut cls.methods).get_mut(&m) else {
                     continue;
                 };
                 let items = match &mut method.kind {

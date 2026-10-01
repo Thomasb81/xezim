@@ -35,6 +35,52 @@ pub struct NameMap {
     /// non-element `…]` names (queue slots, class properties) before the
     /// second hash lookup a real element needs.
     base_len_mask: u64,
+    /// Input-port nets the elaborator left out (see
+    /// `xezim_core::elaborate::set_port_elision`). A lookup that misses is
+    /// checked against it, so a by-name reference the elision analysis did
+    /// not foresee is reported instead of silently resolving to nothing.
+    elided: Option<Arc<ElidedPorts>>,
+    /// Bumped by every call that can change what a name maps to, so a
+    /// caller can tell the map is untouched since it last looked.
+    generation: u64,
+}
+
+/// The elided port nets: `elided_port_hash` of each flat name, sorted.
+pub struct ElidedPorts {
+    hashes: Vec<u64>,
+}
+
+impl ElidedPorts {
+    pub fn new(hashes: Vec<u64>) -> Self {
+        ElidedPorts { hashes }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.hashes
+            .binary_search(&xezim_core::elaborate::elided_port_hash(name))
+            .is_ok()
+    }
+}
+
+/// Report a by-name lookup of an elided port net. Every one is a reference
+/// the elision analysis should have kept the port for, so it is loud: a
+/// one-time warning, or a panic under `XEZIM_ELIDE_STRICT=1` (the test and
+/// validation mode).
+#[cold]
+#[inline(never)]
+pub fn report_elided_lookup(name: &str) {
+    if std::env::var("XEZIM_ELIDE_STRICT").ok().as_deref() == Some("1") {
+        panic!("lookup of elided port net `{}`", name);
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "xezim: warning: `{}` names an input-port net that was left out as unobserved; \
+             results that depend on it may be wrong. Re-run with XEZIM_KEEP_PORTS=1 and \
+             please report this.",
+            name
+        );
+    });
 }
 
 /// `idx` must be written the way `format!("{}", i64)` writes it: the
@@ -63,6 +109,7 @@ impl NameMap {
     /// Register the elements of array `base` (ids `first..=first+(hi-lo)`)
     /// as virtual names.
     pub fn add_virtual_array(&mut self, base: Arc<str>, first: usize, lo: i64, hi: i64) {
+        self.generation += 1;
         if hi < lo {
             return;
         }
@@ -127,21 +174,77 @@ impl NameMap {
     pub fn get(&self, name: &str) -> Option<&usize> {
         match self.map.get(name) {
             Some(id) => Some(id),
-            None => self.virtual_id(name).map(|id| &self.identity[id]),
+            None => {
+                let v = self.virtual_id(name).map(|id| &self.identity[id]);
+                if v.is_none() {
+                    self.audit_miss(name);
+                }
+                v
+            }
         }
     }
 
     #[inline(always)]
     pub fn contains_key(&self, name: &str) -> bool {
-        self.map.contains_key(name) || self.virtual_id(name).is_some()
+        let hit = self.map.contains_key(name) || self.virtual_id(name).is_some();
+        if !hit {
+            self.audit_miss(name);
+        }
+        hit
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut usize> {
+        if !self.map.contains_key(name) {
+            self.audit_miss(name);
+        }
+        self.generation += 1;
         self.map.get_mut(name)
     }
 
+    /// Every failed lookup is checked against the elided port nets only in
+    /// an `elide-audit` build: the check on this path cost 0.2% on a UVM
+    /// run. Release builds check the resolution points that can plausibly
+    /// reach a port net by name (see [`NameMap::check_miss`]).
+    #[inline(always)]
+    fn audit_miss(&self, _name: &str) {
+        #[cfg(feature = "elide-audit")]
+        self.check_miss(_name);
+    }
+
+    /// Report `name` if it is an elided port net; for a lookup that missed.
+    #[inline(always)]
+    pub fn check_miss(&self, name: &str) {
+        if self.elided.is_some() {
+            self.elided_miss(name);
+        }
+    }
+
+    /// Install the elided port nets (see [`ElidedPorts`]).
+    pub fn set_elided(&mut self, elided: Option<Arc<ElidedPorts>>) {
+        self.elided = elided;
+    }
+
+    /// Whether `name` is an elided port net.
+    pub fn is_elided(&self, name: &str) -> bool {
+        self.elided.as_ref().is_some_and(|e| e.contains(name))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn elided_miss(&self, name: &str) {
+        if self.is_elided(name) {
+            report_elided_lookup(name);
+        }
+    }
+
     pub fn insert(&mut self, name: Arc<str>, id: usize) -> Option<usize> {
+        self.generation += 1;
         self.map.insert(name, id)
+    }
+
+    /// Changes whenever a name may have been added or re-pointed.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn reserve(&mut self, n: usize) {
@@ -404,9 +507,126 @@ impl IdNames {
     }
 }
 
+/// Sort `names` into byte-lexicographic order, the order `slice::sort` on
+/// strings gives (equal names end up adjacent, in no particular order).
+///
+/// A flattened design's names share long prefixes (`tb.dut.u_bank[0].bank.
+/// u_mat[3]...`, 65 bytes on average on a DRAM array), so a comparison sort
+/// spends its time comparing the same prefixes again and again, each time
+/// chasing two pointers to scattered heap strings. This sort compares eight
+/// bytes at a time held inline next to the index: one pass orders the whole
+/// set by bytes `[0, 8)`, and only a run of names that tie on them is ordered
+/// by the next eight, so each name's bytes are read about once.
+pub fn sort_lexicographic<S: AsRef<str>>(names: &mut Vec<S>) {
+    fn chunk(s: &[u8], d: usize) -> u64 {
+        let mut buf = [0u8; 8];
+        if d < s.len() {
+            let n = (s.len() - d).min(8);
+            buf[..n].copy_from_slice(&s[d..d + n]);
+        }
+        u64::from_be_bytes(buf)
+    }
+    // Every item of `items` shares its first `d` bytes with the others.
+    fn sort_from(items: &mut [(u64, u32)], bytes: &[&[u8]], d: usize) {
+        let suffix = |i: u32| bytes[i as usize].get(d..).unwrap_or(&[]);
+        if items.len() <= 32 {
+            items.sort_unstable_by(|a, b| suffix(a.1).cmp(suffix(b.1)));
+            return;
+        }
+        for it in items.iter_mut() {
+            it.0 = chunk(bytes[it.1 as usize], d);
+        }
+        items.sort_unstable_by_key(|it| it.0);
+        let mut i = 0;
+        while i < items.len() {
+            let k = items[i].0;
+            let mut j = i + 1;
+            while j < items.len() && items[j].0 == k {
+                j += 1;
+            }
+            if j - i > 1 {
+                if k & 0xff != 0 {
+                    // Every name of the run is longer than `d + 8` bytes
+                    // and they all agree on `[d, d + 8)`.
+                    sort_from(&mut items[i..j], bytes, d + 8);
+                } else {
+                    // Some name of the run ends inside this chunk (or
+                    // holds a NUL byte there): compare exactly.
+                    items[i..j].sort_unstable_by(|a, b| suffix(a.1).cmp(suffix(b.1)));
+                }
+            }
+            i = j;
+        }
+    }
+    if names.len() < 2 {
+        return;
+    }
+    assert!(names.len() <= u32::MAX as usize);
+    let mut items: Vec<(u64, u32)> = (0..names.len() as u32).map(|i| (0, i)).collect();
+    {
+        let bytes: Vec<&[u8]> = names.iter().map(|n| n.as_ref().as_bytes()).collect();
+        sort_from(&mut items, &bytes, 0);
+    }
+    let mut slots: Vec<Option<S>> = std::mem::take(names).into_iter().map(Some).collect();
+    names.extend(
+        items
+            .into_iter()
+            .map(|(_, i)| slots[i as usize].take().unwrap()),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lexicographic_sort_matches_slice_sort() {
+        // Hierarchical names with long shared prefixes, bytes that sort
+        // around '.', prefixes of each other, duplicates, NULs and the empty
+        // name.
+        let mut input: Vec<String> = Vec::new();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..5000 {
+            let mut n = String::from("tb.dut.u_bank");
+            n.push_str(&format!("[{}].bank.u_mat[{}]", next(4), next(8)));
+            match next(5) {
+                0 => {}
+                1 => n.push_str(&format!(".mat.u_row[{}].q", next(130))),
+                2 => n.push_str(&format!("_{}", next(10))),
+                3 => n.push_str(&format!(".mat.u_row[{}]", next(130))),
+                _ => n.push_str(&format!(".x{}\0y", next(3))),
+            }
+            input.push(n);
+        }
+        for extra in [
+            "", "a", "a.b", "a_b", "a.b.c", "a\0", "a\0b", "tb", "tb.", "zz",
+        ] {
+            input.push(extra.to_string());
+            input.push(extra.to_string());
+        }
+        let mut want = input.clone();
+        want.sort();
+        let mut got = input.clone();
+        sort_lexicographic(&mut got);
+        assert_eq!(got, want);
+        let mut borrowed: Vec<std::borrow::Cow<'_, str>> = input
+            .iter()
+            .map(|s| std::borrow::Cow::Borrowed(s.as_str()))
+            .collect();
+        sort_lexicographic(&mut borrowed);
+        assert!(
+            borrowed
+                .iter()
+                .map(|c| c.as_ref())
+                .eq(want.iter().map(|s| s.as_str()))
+        );
+    }
 
     #[test]
     fn virtual_element_names_resolve_like_stored_ones() {

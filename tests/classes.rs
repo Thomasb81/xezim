@@ -75,10 +75,14 @@ mod struct_member_class_handle_new;
 mod this_collection_struct_members;
 #[path = "classes/this_super_member.rs"]
 mod this_super_member;
+#[path = "classes/type_param_base_class.rs"]
+mod type_param_base_class;
 #[path = "classes/type_param_default_implicit_extends.rs"]
 mod type_param_default_implicit_extends;
 #[path = "classes/type_param_formal_stale_local.rs"]
 mod type_param_formal_stale_local;
+#[path = "classes/type_param_property_member_write.rs"]
+mod type_param_property_member_write;
 #[path = "classes/typename_p_subroutine_locals.rs"]
 mod typename_p_subroutine_locals;
 #[path = "classes/typename_type_param_resolves_concrete.rs"]

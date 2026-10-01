@@ -43,6 +43,8 @@ mod dump_merged_sv_adopted_primary;
 mod dump_merged_sv_library_dedup;
 #[path = "hierarchy/dump_merged_sv_top_pruning.rs"]
 mod dump_merged_sv_top_pruning;
+#[path = "hierarchy/expression_port_actuals.rs"]
+mod expression_port_actuals;
 #[path = "hierarchy/final_blocks_hierarchy.rs"]
 mod final_blocks_hierarchy;
 #[path = "hierarchy/flat_actual_struct_port.rs"]
@@ -227,5 +229,7 @@ mod ref_formal_same_name;
 mod single_element_instance_array;
 #[path = "hierarchy/unit_scope_library_subroutine.rs"]
 mod unit_scope_library_subroutine;
+#[path = "hierarchy/unobserved_port_elision.rs"]
+mod unobserved_port_elision;
 #[path = "hierarchy/vif_packed_array_elem_nba.rs"]
 mod vif_packed_array_elem_nba;

@@ -1999,6 +1999,9 @@ fn set_net_delays(
             sim.sdf_delays.resize(n, 0);
         }
         sim.sdf_delays[id] = rise;
+        // Gate edges assume no delays (`comb_entry_read_masks`, `CtlGate`):
+        // rebuild them at the next settle.
+        sim.comb_dep_edges.clear();
     } else {
         for e in explicit {
             if let CombItem::ContAssign { delay, .. } = &mut sim.comb_entries[e].item {

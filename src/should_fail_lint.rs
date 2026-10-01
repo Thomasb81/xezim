@@ -1328,6 +1328,25 @@ fn check_class(c: &ClassDeclaration, errs: &mut Vec<String>) {
             }
         }
     }
+    // §8.26.2: an interface class shall not extend a type parameter
+    // (`interface class ic #(type B) extends B;`).
+    if c.is_interface {
+        if let Some(e) = &c.extends {
+            let is_type_param = c.params.iter().any(|p| match &p.kind {
+                xezim_core::ast::decl::ParameterKind::Type { assignments } => {
+                    assignments.iter().any(|a| a.name.name == e.name.name)
+                }
+                _ => false,
+            });
+            if is_type_param {
+                errs.push(format!(
+                    "interface class '{}': extends type parameter '{}'; an interface \
+                     class shall not extend a type parameter (LRM 1800-2017 §8.26.2)",
+                    c.name.name, e.name.name
+                ));
+            }
+        }
+    }
     // Per-method checks: output/inout port defaults, and (for the constructor)
     // that `super.new(...)` is the first statement.
     let has_base = c.extends.is_some();

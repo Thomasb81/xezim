@@ -83,6 +83,8 @@ mod delay_precision;
 mod dep_reg_entry_synth;
 #[path = "misc/deposit_task.rs"]
 mod deposit_task;
+#[path = "misc/disable_task_inside_foreach.rs"]
+mod disable_task_inside_foreach;
 #[path = "misc/duplicate_decl_locations.rs"]
 mod duplicate_decl_locations;
 #[path = "misc/elaboration_runaway_guards.rs"]
@@ -231,6 +233,8 @@ mod placeholder_parameter_replication;
 mod port_width_mismatch_explains;
 #[path = "misc/real_call_bytecode.rs"]
 mod real_call_bytecode;
+#[path = "misc/reduce_loop_unroll.rs"]
+mod reduce_loop_unroll;
 #[path = "misc/repeat_real_count.rs"]
 mod repeat_real_count;
 #[path = "misc/replication_and_cast_operands.rs"]
@@ -282,6 +286,8 @@ mod edge_and_delay_select_fixes;
 mod edge_task_call_process;
 #[path = "misc/factory_register_reentrant.rs"]
 mod factory_register_reentrant;
+#[path = "misc/fallback_carried_locals.rs"]
+mod fallback_carried_locals;
 #[path = "misc/new_ctor_vs_shallow_copy.rs"]
 mod new_ctor_vs_shallow_copy;
 #[path = "misc/packed_elem_fn_inline.rs"]

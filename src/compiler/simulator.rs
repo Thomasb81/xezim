@@ -481,6 +481,11 @@ pub fn set_warn_x_limit(n: usize) {
     WARN_X_LIMIT.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether x-warnings are on (`--x-warn`, `+X_WARN`, `XEZIM_X_WARN`).
+pub fn warn_x_active() -> bool {
+    warn_x_enabled()
+}
+
 fn warn_x_enabled() -> bool {
     if WARN_X.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
@@ -1070,6 +1075,44 @@ enum CombItem {
     TimingCheck {
         idx: usize,
     },
+    /// A `FusedGate` AND/OR (NAND/NOR) whose high-fanout input is ignored
+    /// while the other input holds the controlling value: the gate is
+    /// `ctl_gates[slot]` (see `CtlGate`). Made from `FusedGate` entries at
+    /// the first settle, never before the prepared-comb cache is written.
+    CtlGate {
+        slot: u32,
+    },
+}
+
+/// Controlling-value skip for one two-input AND/OR gate (`CombItem::CtlGate`).
+///
+/// `wl = clk & rs` cannot change while `rs` is 0, however `clk` toggles, so
+/// the gate's dependency edges from `clk` (the high-fanout input) carry mask
+/// 0 while `rs` sits at the controlling value (0 for AND/NAND, 1 for
+/// OR/NOR) and the static mask otherwise. Every evaluation of the gate
+/// recomputes that mask from the controlling input's value it read, so:
+/// - a zero mask always means the controlling input held the controlling
+///   value at the gate's last evaluation, and the output already equals the
+///   forced result (x AND 0 = 0; x and z never control);
+/// - the controlling input's own edge is never masked, so its change always
+///   re-evaluates the gate, which restores the mask with the current value
+///   of the masked input in hand (same-delta changes of both inputs are
+///   read together).
+#[derive(Clone, Copy, Debug)]
+struct CtlGate {
+    /// The gate (`FusedGate::Bin2` with `GateBin::And` / `GateBin::Or`).
+    op: FusedGate,
+    /// The input whose controlling value masks the other one.
+    other: BitRef,
+    /// The masked (high-fanout) input's signal.
+    hot: u32,
+    /// `comb_dep_edges[pos..pos + npos]`: the edges from `hot` to the gate.
+    pos: u32,
+    npos: u32,
+    /// Their static (bit-sensitivity) mask, restored when not controlled.
+    smask: u64,
+    /// Controlling bit code: 0 for AND/NAND, 1 for OR/NOR.
+    ctl: u8,
 }
 
 /// Per-instance runtime state for a §29 UDP. Terminals are resolved to single
@@ -1772,12 +1815,74 @@ struct EdgeSensitiveBlock {
     /// edge_signal_ids/names) was rewritten to use this resolved
     /// list + id_to_name.
     resolved_sensitivities: Vec<SensitivityId>,
+    /// The block body. Between classification and `compile_edge_blocks` a
+    /// block built from a lazy child always block holds an empty statement
+    /// with the body's span here and its source in `lazy`; compilation
+    /// rebuilds the body and keeps it only where a later reader needs it
+    /// (see `drop_compiled_edge_block_asts`).
     stmt: Statement,
+    lazy: Option<Box<LazyAlways>>,
     kind: AlwaysKind,
     /// Instance scope the block was inlined under, empty for top-level.
     /// Preferred over sensitivity-derived scopes (a port-connected clock's
     /// sensitivity collapses to the PARENT's signal and yields none).
     scope: String,
+}
+
+/// A child-module always block of the `@(...) body` shape, kept as its
+/// un-rewritten source (shared by every instance) plus this instance's
+/// rewrite context instead of a per-instance statement tree: on a 64k-cell
+/// DRAM array the 65k materialized trees were a third of the peak memory.
+/// `patches` replace header event-term expressions exactly as the passes in
+/// `Simulator::new` (edge-select aliases, computed edge terms) rewrote them;
+/// nothing else in such a block is rewritten after elaboration.
+#[derive(Debug, Clone)]
+struct LazyAlways {
+    src: super::elaborate::PendingAlways,
+    patches: Vec<(usize, Expression)>,
+}
+
+impl LazyAlways {
+    /// The always block exactly as the eager pipeline would have held it.
+    fn materialize(&self) -> AlwaysBlock {
+        let mut ab = self.src.clone().materialize();
+        if !self.patches.is_empty() {
+            if let StatementKind::TimingControl {
+                control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                ..
+            } = &mut ab.stmt.kind
+            {
+                for (i, e) in &self.patches {
+                    exprs[*i].expr = e.clone();
+                }
+            }
+        }
+        ab
+    }
+
+    /// The body `classify_one_always_block` keeps for an edge block (the
+    /// statement under the `@(...)` header).
+    fn materialize_body(&self) -> Statement {
+        match self.materialize().stmt.kind {
+            StatementKind::TimingControl { stmt, .. } => *stmt,
+            _ => unreachable!("lazy always blocks have an event-control header"),
+        }
+    }
+}
+
+/// An always block taken out of `module.pending_always` by
+/// `rewrite_edge_select_sensitivities`, in its original order: eagerly
+/// materialized, or lazy (see `LazyAlways`). While `Simulator::new` runs a
+/// lazy one also carries its rewritten header, which the passes there edit;
+/// `patched` lists the header terms they replaced.
+#[derive(Debug)]
+enum DeferredAlways {
+    Eager(AlwaysBlock),
+    Lazy {
+        lazy: LazyAlways,
+        header: Option<Box<Statement>>,
+        patched: Vec<usize>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1787,14 +1892,17 @@ struct SensitivityId {
     /// LRM §9.4.2.3 `iff` guard for this event term: the edge only counts
     /// when this expression is true at edge time. `None` for an unguarded
     /// term. Consulted by the procedural `@`-event wake path; the always-
-    /// block edge paths carry it but do not yet evaluate it.
-    iff: Option<Expression>,
+    /// block edge paths carry it but do not yet evaluate it. Boxed, like
+    /// `value_of`: almost every term has neither, and an inline
+    /// `Option<Expression>` made each term hundreds of bytes (68 MB of edge
+    /// sensitivity lists on a 64k-cell DRAM).
+    iff: Option<Box<Expression>>,
     /// §9.4.2: for a NON-TRIVIAL event expression (`@(a + b)`), the term's
     /// full expression. Operand-signal edges only COUNT when this
     /// expression's value differs from its value at arm time (stored in
     /// `EventWaiter::guard_prev`) — `a=2;b=1` leaving `a+b` at 3 must not
     /// fire. `None` for plain signal/edge terms.
-    value_of: Option<Expression>,
+    value_of: Option<Box<Expression>>,
     /// Scheduling depth of the NAME this term was written with (see
     /// `Simulator::sig_wake_rank`); orders same-pass waiter wakeups.
     wake_rank: u8,
@@ -1810,9 +1918,9 @@ struct Sensitivity {
     signal_name: String,
     edge: EdgeKind,
     /// See `SensitivityId::iff` — carried through name→id resolution.
-    iff: Option<Expression>,
+    iff: Option<Box<Expression>>,
     /// See `SensitivityId::value_of` — carried through name→id resolution.
-    value_of: Option<Expression>,
+    value_of: Option<Box<Expression>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5239,7 +5347,7 @@ enum CombPlan {
 
 pub struct Simulator {
     pub signals: SignalMap,
-    vpi_port_directions: HashMap<String, PortDirection>,
+    vpi_port_directions: HashMap<Arc<str>, PortDirection>,
     /// Signals currently under force/release control (LRM §9.3.1).
     forced_signals: HashMap<usize, Value>,
     /// Nets released while a settle pass was running (the entry table is
@@ -5299,6 +5407,11 @@ pub struct Simulator {
     name_stats: [std::cell::Cell<u64>; 5],
     name_stats_on: bool,
     frame_pool: Vec<HashMap<String, Value>>,
+    /// Name-keyed type registrations (`widths`, `signed_signals`,
+    /// `real_signals`, `string_signals`) that a fallback carrying locals
+    /// replaced for its duration: (name, width, signed, real, string) as they
+    /// were before. See `fb_frame_push`.
+    fb_meta_saves: Vec<(String, Option<u32>, bool, bool, bool)>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
     /// compiler's suffix-match fallback (see `lookup_param_value`). Built
     /// once — parameters are final before any bytecode compilation runs.
@@ -5487,6 +5600,14 @@ pub struct Simulator {
     /// collapsed into a shared id. The dropped connect made them wire-typed
     /// for a dump, and the shared id can't carry per-name typing.
     collapsed_port_children: HashSet<String>,
+    /// Set by a `collapse_identity_port_nets` run that reached its fixed
+    /// point: the name-map generation it left, the continuous-assign list
+    /// (length, buffer) and port-alias count it read, and whether its buffer
+    /// pass ran. A later run over the same inputs has nothing to re-point.
+    collapse_settled: Option<(u64, usize, usize, usize, bool)>,
+    /// Instantiated always blocks awaiting classification, in order (see
+    /// `DeferredAlways`); empty once `classify_always_blocks` has run.
+    deferred_always: Vec<DeferredAlways>,
     /// Sparse: signal_id → declared user type name (e.g. class/struct
     /// type for `MyClass h;`). Only populated for signals where the
     /// elaborator recorded a non-None `type_name` on the source
@@ -6391,6 +6512,33 @@ pub struct Simulator {
     /// `"<Class>::<name>"`; the set is the cheap gate that keeps every
     /// unshadowed access on the bare-name fast path.
     shadowed_prop_names: HashSet<String>,
+    /// §8.25 / §8.3: classes whose base class depends on their own
+    /// parameters — `class W #(type B = base) extends B;` (the base IS a type
+    /// parameter) or `class W2 #(type B) extends W #(B);` (the base is such a
+    /// class specialized with this class's parameters). Maps the class to its
+    /// DECLARED `extends` name and argument fragments, before linking
+    /// rewrote them. Each specialization whose base CLASS differs from the
+    /// default's gets its own class entry (see `ensure_spec_class`).
+    dep_base: HashMap<String, (String, Vec<String>)>,
+    /// The default specialization's base class ENTRY of each `dep_base`
+    /// class; the class entry itself carries this base. A specialization
+    /// binding a base of another class gets its own entry; one binding the
+    /// same base class with other arguments shares this one, the arguments
+    /// flowing through the specialization (see `spec_projection`).
+    dep_default: HashMap<String, String>,
+    /// The `dep_base` keys as a short list: the hot paths (every `new`,
+    /// `$cast`, static key and type-parameter lookup) ask whether a class is
+    /// one, and a design has a handful at most.
+    dep_names: Vec<String>,
+    /// `spec_entry` answers for `dep_base` classes, keyed `"<base>\0<sig>"`.
+    spec_entry_cache: std::cell::RefCell<HashMap<String, String>>,
+    /// Specialized class entry name -> the class it was specialized from
+    /// (`"wrap_c<derived_c>"` -> `"wrap_c"`).
+    spec_clone_origin: HashMap<String, String>,
+    /// Typedef names whose target is a specialization of a `dep_base` class
+    /// (`typedef wrap_c #(derived_c) wd_t;`): `$cast` checks a destination
+    /// declared through one against that specialization.
+    dep_typedefs: HashSet<String>,
     /// Scratch key for the property-initializer loop of instantiation.
     inst_key_scratch: String,
     /// Instantiation templates by leaf class name (see `InstTemplate`).
@@ -7225,6 +7373,12 @@ pub struct Simulator {
     /// method compiler (free-function calls). Built lazily on the first
     /// class-method compile; cloned per call site by Rc only.
     free_fn_table: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,
+    /// The same for `module.tasks`: every interpreted task call cloned the
+    /// whole `TaskDeclaration`, and the clone plus its drop was about a
+    /// quarter of a behavioural memory model's run (a device calling a
+    /// handful of timing-check tasks every clock).
+    task_decl_cache: HashMap<String, std::rc::Rc<TaskDeclaration>>,
+
     /// Memoized answer to "is this module-scope function side-effect free?",
     /// used to decide whether a call may be skipped when its result provably
     /// cannot affect the expression. Conservative: anything the walker does
@@ -7462,6 +7616,21 @@ pub struct Simulator {
     bit_sens_pending: Vec<u32>,
     /// XEZIM_BIT_SENS=0 turns the masks off (every dependent triggers).
     bit_sens_on: bool,
+    /// Controlling-value skip (`CtlGate`): the gates, indexed by the
+    /// `CombItem::CtlGate` slot. Rebuilt with the dependency edges.
+    ctl_gates: Vec<CtlGate>,
+    /// Per signal: some dependency edge from it may be masked by a
+    /// `CtlGate`, so the settle's dirty seed must test the edge masks.
+    /// Empty when no gate qualifies.
+    ctl_sig: Vec<bool>,
+    /// `(destination signal, slot)` of every `CtlGate`, sorted: an external
+    /// write to a destination (a deposit) must re-arm its gate.
+    ctl_dsts: Vec<(u32, u32)>,
+    /// Slots re-armed while the settle held the dependency edges.
+    ctl_rearm_pending: Vec<u32>,
+    /// XEZIM_CTL_MASK=0, or a settle mode that evaluates entries outside the
+    /// canonical loop (partitioned / level-BSP), turns the skip off.
+    ctl_on: bool,
     /// Dirty records of the stores a two-state entry makes in the settle
     /// loop (direct mode), with each store's changed bits (`u64::MAX` when
     /// unknown): `ts_rec_n` records, the first in `ts_rec0` (most entries
@@ -8743,14 +8912,14 @@ impl Simulator {
 
         fn best_scope_for_leaves(
             leaves: &HashSet<String>,
-            existing: &HashSet<String>,
-            parents_by_leaf: &HashMap<String, Vec<String>>,
+            existing: &HashSet<&str>,
+            parents_by_leaf: &HashMap<&str, Vec<&str>>,
         ) -> Option<String> {
             let mut best_parent: Option<String> = None;
             let mut best_score = 0usize;
             let mut best_depth = 0usize;
             for leaf in leaves {
-                let Some(parents) = parents_by_leaf.get(leaf) else {
+                let Some(parents) = parents_by_leaf.get(leaf.as_str()) else {
                     continue;
                 };
                 for parent in parents {
@@ -8805,25 +8974,20 @@ impl Simulator {
             }
         }
 
-        let mut existing: HashSet<String> = module.signals.keys().cloned().collect();
-        existing.extend(module.parameters.keys().cloned());
-        let mut parents_by_leaf: HashMap<String, Vec<String>> = HashMap::default();
-        for full_name in &existing {
+        // Borrowed from the module's maps (no copy of every name); built in
+        // the same insertion order, so the sets iterate, and the parent
+        // lists come out, exactly as owned copies would.
+        let mut existing: HashSet<&str> = module.signals.keys().map(String::as_str).collect();
+        existing.extend(module.parameters.keys().map(String::as_str));
+        let mut parents_by_leaf: HashMap<&str, Vec<&str>> = HashMap::default();
+        for &full_name in &existing {
             if let Some((parent, leaf)) = full_name.rsplit_once('.') {
-                parents_by_leaf
-                    .entry(leaf.to_string())
-                    .or_default()
-                    .push(parent.to_string());
+                parents_by_leaf.entry(leaf).or_default().push(parent);
             }
         }
 
         let mut to_create: HashSet<String> = HashSet::default();
         for ca in &module.continuous_assigns {
-            let lhs_raw = ident_raw(&ca.lhs);
-            let rhs_raw = ident_raw(&ca.rhs);
-            let lhs_leaf = ident_leaf(&ca.lhs);
-            let rhs_leaf = ident_leaf(&ca.rhs);
-
             let mut leaves = HashSet::default();
             let mut reads = HashSet::default();
             let mut writes = HashSet::default();
@@ -8834,6 +8998,15 @@ impl Simulator {
                     leaves.insert(name.clone());
                 }
             }
+            // Only a bare (unscoped) leaf can need an implicit net; a
+            // flattened instance's assigns name none.
+            if leaves.is_empty() {
+                continue;
+            }
+            let lhs_raw = ident_raw(&ca.lhs);
+            let rhs_raw = ident_raw(&ca.rhs);
+            let lhs_leaf = ident_leaf(&ca.lhs);
+            let rhs_leaf = ident_leaf(&ca.rhs);
 
             let scope = if lhs_leaf.is_none() && rhs_leaf.is_some() {
                 lhs_raw.as_deref().and_then(|raw| parent_n(raw, 1))
@@ -8857,8 +9030,9 @@ impl Simulator {
             }
         }
 
+        drop(parents_by_leaf);
+        drop(existing);
         for name in to_create {
-            existing.insert(name.clone());
             module.signals.insert(
                 name.clone(),
                 Signal {
@@ -8889,7 +9063,10 @@ impl Simulator {
     /// `posedge __xz_edgesel<N>`. The alias updates in the same delta as its
     /// operands (ordinary comb entry), so edge timing is unchanged. Only
     /// constant indices rewrite; anything else keeps the old behavior.
-    fn rewrite_edge_select_sensitivities(module: &mut ElaboratedModule) {
+    fn rewrite_edge_select_sensitivities(
+        module: &mut ElaboratedModule,
+        lazy_ok: bool,
+    ) -> Vec<DeferredAlways> {
         // A literal, or a parameter expression (`v[W-1]`: an elaboration-time
         // constant, §6.20) under `+ - *`.
         fn const_index(
@@ -8932,13 +9109,16 @@ impl Simulator {
             }
         }
         // Peel an Index chain down to its base Ident; indices returned
-        // OUTERMOST-LAST (declaration order).
+        // OUTERMOST-LAST (declaration order). The flag tells a parent-rooted
+        // base (a substituted port actual, see `mark_actual_rooted`), which
+        // names the absolute signal and must not be tried under the block's
+        // own scope.
         fn peel<'a>(
             mut e: &'a Expression,
             idxs: &mut Vec<i64>,
             params: &HashMap<String, Value>,
             scope: &str,
-        ) -> Option<String> {
+        ) -> Option<(String, bool)> {
             loop {
                 match &e.kind {
                     ExprKind::Paren(inner) => e = inner,
@@ -8947,13 +9127,14 @@ impl Simulator {
                         e = expr;
                     }
                     ExprKind::Ident(h) => {
-                        return Some(
+                        return Some((
                             h.path
                                 .iter()
                                 .map(|s| s.name.name.as_str())
                                 .collect::<Vec<_>>()
                                 .join("."),
-                        );
+                            h.root.is_some(),
+                        ));
                     }
                     _ => return None,
                 }
@@ -8983,48 +9164,81 @@ impl Simulator {
         let dbg = std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some();
         // #7 keeps child always blocks PENDING (un-rewritten) until
         // classification — but the select-on-port shape this pass fixes is
-        // only visible AFTER the per-instance rewrite. Materialize the always
-        // blocks here (pre-#7 eager semantics for this vec only; initial/CA
-        // stay lazy). classify_always_blocks drains an empty pending vec.
+        // only visible AFTER the per-instance rewrite. Each pending block is
+        // taken out in order into the returned list: one of the `@(...)
+        // body` shape whose body holds no further event control stays lazy
+        // (only its header is rewritten here, and the terms this pass
+        // replaces are recorded as patches); any other is materialized.
         let pending = std::mem::take(&mut module.pending_always);
+        let mut always = std::mem::take(&mut module.always_blocks);
+        let mut deferred: Vec<DeferredAlways> = Vec::with_capacity(pending.len());
         for p in pending {
-            module.always_blocks.push(p.materialize());
+            if lazy_ok && Self::lazy_always_eligible(&p.source) {
+                if let Some(header) = p.materialize_header() {
+                    deferred.push(DeferredAlways::Lazy {
+                        lazy: LazyAlways {
+                            src: p,
+                            patches: Vec::new(),
+                        },
+                        header: Some(Box::new(header)),
+                        patched: Vec::new(),
+                    });
+                    continue;
+                }
+            }
+            deferred.push(DeferredAlways::Eager(p.materialize()));
         }
         let params = &module.parameters;
-        for ab in &mut module.always_blocks {
+        let headers = always
+            .iter_mut()
+            .map(|ab| (&mut ab.stmt, ab.scope.clone(), None))
+            .chain(deferred.iter_mut().map(|d| {
+                match d {
+                    DeferredAlways::Eager(ab) => (&mut ab.stmt, ab.scope.clone(), None),
+                    DeferredAlways::Lazy {
+                        lazy,
+                        header,
+                        patched,
+                    } => (
+                        &mut **header
+                            .as_mut()
+                            .expect("header kept until Simulator::new ends"),
+                        lazy.src.scope(),
+                        Some(patched),
+                    ),
+                }
+            }));
+        for (stmt, scope, mut patched) in headers {
             let StatementKind::TimingControl {
                 control: TimingControl::Event(EventControl::EventExpr(exprs)),
                 ..
-            } = &mut ab.stmt.kind
+            } = &mut stmt.kind
             else {
                 if dbg {
                     eprintln!(
                         "[EDGESEL] block scope='{}' not a TimingControl/EventExpr: {:?}",
-                        ab.scope,
-                        std::mem::discriminant(&ab.stmt.kind)
+                        scope,
+                        std::mem::discriminant(&stmt.kind)
                     );
                 }
                 continue;
             };
-            for ee in exprs.iter_mut() {
+            for (term, ee) in exprs.iter_mut().enumerate() {
                 if !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
                     continue;
                 }
                 let mut idxs: Vec<i64> = Vec::new();
-                let Some(base) = peel(&ee.expr, &mut idxs, params, &ab.scope) else {
+                let Some((base, rooted)) = peel(&ee.expr, &mut idxs, params, &scope) else {
                     if dbg {
                         eprintln!(
                             "[EDGESEL] scope='{}' peel failed: {:?}",
-                            ab.scope, ee.expr.kind
+                            scope, ee.expr.kind
                         );
                     }
                     continue;
                 };
                 if dbg {
-                    eprintln!(
-                        "[EDGESEL] scope='{}' base={} idxs={:?}",
-                        ab.scope, base, idxs
-                    );
+                    eprintln!("[EDGESEL] scope='{}' base={} idxs={:?}", scope, base, idxs);
                 }
                 if idxs.is_empty() {
                     continue;
@@ -9033,10 +9247,14 @@ impl Simulator {
                 // The base must name a real signal or unpacked array (either
                 // spelled as-is post-inline or under the block's scope);
                 // events keep their own element machinery.
-                let spellings: Vec<String> = if ab.scope.is_empty() {
+                // §23.3.3: `.wl(wl[1])` into a child whose own port is also
+                // `wl` substitutes the ROOTED `wl[1]`; under the child's scope
+                // it spelled the child's 1-bit port net, and the edge watched
+                // bit 1 of it — never rising.
+                let spellings: Vec<String> = if scope.is_empty() || rooted {
                     vec![base.clone()]
                 } else {
-                    vec![format!("{}.{}", ab.scope, base), base.clone()]
+                    vec![format!("{}.{}", scope, base), base.clone()]
                 };
                 let mut resolved: Option<String> = None;
                 let mut is_event = false;
@@ -9080,7 +9298,7 @@ impl Simulator {
                             .collect();
                         eprintln!(
                             "[EDGESEL] scope='{}' base '{}' unresolved; signals~{:?} arrays~{:?}",
-                            ab.scope, base, sig_like, arr_like
+                            scope, base, sig_like, arr_like
                         );
                     }
                     continue;
@@ -9131,10 +9349,13 @@ impl Simulator {
                 if dbg {
                     eprintln!(
                         "[EDGESEL] scope='{}' {}{:?} -> {}",
-                        ab.scope, resolved, idxs, alias
+                        scope, resolved, idxs, alias
                     );
                 }
                 ee.expr = mk_ident(alias, ee.expr.span);
+                if let Some(p) = patched.as_mut() {
+                    p.push(term);
+                }
             }
         }
         for name in new_signals {
@@ -9153,6 +9374,46 @@ impl Simulator {
             );
         }
         module.continuous_assigns.extend(new_assigns);
+        module.always_blocks = always;
+        deferred
+    }
+
+    /// Can a pending always block stay lazy through `Simulator::new` (see
+    /// `LazyAlways`)? Its source must be `@(...) body` with no timing control
+    /// anywhere in the body that the computed-edge pass there would visit:
+    /// then that pass, like the edge-select pass, can only touch the header
+    /// (`rename_process_shadowed_locals` only ever renames a `begin..end`
+    /// body's own locals, which this shape does not have at its top).
+    fn lazy_always_eligible(src: &Statement) -> bool {
+        fn has_timing(st: &Statement) -> bool {
+            match &st.kind {
+                StatementKind::TimingControl { .. } => true,
+                StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                    stmts.iter().any(has_timing)
+                }
+                StatementKind::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => has_timing(then_stmt) || else_stmt.as_deref().is_some_and(has_timing),
+                StatementKind::For { body, .. }
+                | StatementKind::Foreach { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body, .. } => has_timing(body),
+                StatementKind::Wait { stmt, .. } => has_timing(stmt),
+                StatementKind::Case { items, .. } => items.iter().any(|it| has_timing(&it.stmt)),
+                _ => false,
+            }
+        }
+        match &src.kind {
+            StatementKind::TimingControl {
+                control: TimingControl::Event(_),
+                stmt: body,
+            } => !has_timing(body),
+            _ => false,
+        }
     }
 
     /// Whether a 1-D array's cells may live in the packed arena
@@ -9241,7 +9502,14 @@ impl Simulator {
 
         let phase_materialize = crate::WallTimer::now();
         Self::materialize_implicit_contassign_nets(&mut module);
-        Self::rewrite_edge_select_sensitivities(&mut module);
+        // Lazy always blocks (see `LazyAlways`) everywhere except where a
+        // pass reads every always-block body before classification: code
+        // coverage instruments them, and opt-in signal placement walks them.
+        let lazy_always_ok = code_cov::code_coverage().is_none()
+            && std::env::var("XEZIM_PLACE_SIGNALS").ok().as_deref() != Some("1")
+            && !matches!(std::env::var("XEZIM_LAZY_ALWAYS").as_deref(), Ok("0"));
+        let mut deferred_always =
+            Self::rewrite_edge_select_sensitivities(&mut module, lazy_always_ok);
         // §18.3/§18.4: publish class-local `typedef enum`/`typedef struct`
         // types into the module type tables so a rand property declared with
         // one gets its enum-member domain / packed bit layout.
@@ -9261,11 +9529,17 @@ impl Simulator {
         // so a frameless local landed on the module signal itself (see
         // `rename_process_shadowed_locals`).
         {
+            // `rename_process_shadowed_locals` only ever asks whether a
+            // process body's own top-level local is taken, so the set holds
+            // just those locals (the ones a module symbol or a second
+            // process also claims) instead of a copy of every module name.
             let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
-            taken.extend(module.signals.keys().cloned());
-            taken.extend(module.arrays.keys().cloned());
-            taken.extend(module.dynamic_arrays.iter().cloned());
-            taken.extend(module.associative_arrays.keys().cloned());
+            let module_claims = |nm: &str| {
+                module.signals.contains_key(nm)
+                    || module.arrays.contains_key(nm)
+                    || module.dynamic_arrays.contains(nm)
+                    || module.associative_arrays.contains_key(nm)
+            };
             // §6.21 extended: two processes declaring the SAME frameless
             // block-local name (neither shadowing any module symbol) would
             // share one `signals[name]` slot and last-write-win — e.g.
@@ -9299,6 +9573,11 @@ impl Simulator {
             let mut all_proc = Vec::new();
             all_proc.extend(module.initial_blocks.iter().map(|b| &b.stmt));
             all_proc.extend(module.always_blocks.iter().map(|b| &b.stmt));
+            // A lazy block (`@(...) body`) has no top-level locals.
+            all_proc.extend(deferred_always.iter().filter_map(|d| match d {
+                DeferredAlways::Eager(ab) => Some(&ab.stmt),
+                DeferredAlways::Lazy { .. } => None,
+            }));
             all_proc.extend(module.final_blocks.iter().map(|b| &b.stmt));
             for st in all_proc.iter() {
                 for nm in frameless_locals(st) {
@@ -9306,7 +9585,7 @@ impl Simulator {
                 }
             }
             for (nm, c) in per_proc_counts {
-                if c >= 2 {
+                if c >= 2 || module_claims(&nm) {
                     taken.insert(nm);
                 }
             }
@@ -9319,7 +9598,21 @@ impl Simulator {
                     ib.stmt = new_stmt;
                 }
             }
-            for (i, ab) in module.always_blocks.iter_mut().enumerate() {
+            let n_always = module.always_blocks.len();
+            let deferred_eager =
+                deferred_always
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(k, d)| match d {
+                        DeferredAlways::Eager(ab) => Some((n_always + k, ab)),
+                        DeferredAlways::Lazy { .. } => None,
+                    });
+            for (i, ab) in module
+                .always_blocks
+                .iter_mut()
+                .enumerate()
+                .chain(deferred_eager)
+            {
                 if let Some(new_stmt) = super::elaborate::rename_process_shadowed_locals(
                     &ab.stmt,
                     &taken,
@@ -9457,6 +9750,41 @@ impl Simulator {
                     &computed_edge_term,
                 );
             }
+            // The deferred blocks continue the numbering. A lazy block's
+            // header is the only part this pass can touch (see
+            // `lazy_always_eligible`); record which terms it replaces.
+            let n_always = module.always_blocks.len();
+            for (k, d) in deferred_always.iter_mut().enumerate() {
+                let tag = format!("a{}", n_always + k);
+                let stmt = match d {
+                    DeferredAlways::Eager(ab) => &mut ab.stmt,
+                    DeferredAlways::Lazy {
+                        header, patched, ..
+                    } => {
+                        let header = &mut **header.as_mut().expect("header kept until here");
+                        if let StatementKind::TimingControl {
+                            control: TC::Event(EC::EventExpr(exprs)),
+                            ..
+                        } = &header.kind
+                        {
+                            for (i, ee) in exprs.iter().enumerate() {
+                                if ee.edge.is_some() && computed_edge_term(&ee.expr) {
+                                    patched.push(i);
+                                }
+                            }
+                        }
+                        header
+                    }
+                };
+                rewrite_edges(
+                    stmt,
+                    &tag,
+                    &mut n,
+                    &mut synth,
+                    &mk_ident,
+                    &computed_edge_term,
+                );
+            }
             for (bi, ib) in module.initial_blocks.iter_mut().enumerate() {
                 let tag = format!("i{}", bi);
                 rewrite_edges(
@@ -9504,6 +9832,30 @@ impl Simulator {
                         delay_fall: None,
                         delay_off: None,
                     });
+            }
+        }
+        // The passes over always-block headers are done: keep only the
+        // replaced terms of each lazy block's header.
+        for d in deferred_always.iter_mut() {
+            if let DeferredAlways::Lazy {
+                lazy,
+                header,
+                patched,
+            } = d
+            {
+                let header = header.take().expect("header kept until here");
+                if let StatementKind::TimingControl {
+                    control: TimingControl::Event(EventControl::EventExpr(exprs)),
+                    ..
+                } = header.kind
+                {
+                    patched.sort_unstable();
+                    patched.dedup();
+                    lazy.patches = patched
+                        .drain(..)
+                        .map(|i| (i, exprs[i].expr.clone()))
+                        .collect();
+                }
             }
         }
         // §8.4/§25.9: an unassigned `virtual <iface>` VARIABLE holds the null
@@ -9581,25 +9933,28 @@ impl Simulator {
         // `Vec<(name, Value, …)>` because cloning each Value into that
         // Vec would peak-spike RSS by exactly the amount we just saved
         // by skipping the legacy bulk-populate.
-        let mut names: Vec<String> =
+        // Borrowed from the two maps (they outlive the id loop below), so
+        // naming 426k signals costs no string copies before the interned
+        // `Arc<str>` each one gets there.
+        let mut names: Vec<std::borrow::Cow<'_, str>> =
             Vec::with_capacity(module.signals.len() + module.parameters.len());
         let phase_names = std::time::Instant::now();
         for name in module.signals.keys() {
-            names.push(name.clone());
+            names.push(std::borrow::Cow::Borrowed(name.as_str()));
         }
         // Port directions for the VPI layer (`vpiPort` iteration and
-        // `vpiDirection`). Taken here because `module.signals` is freed once
-        // the indexed signal table exists, further down this constructor.
-        let vpi_port_directions: HashMap<String, PortDirection> = module
-            .signals
-            .iter()
-            .filter_map(|(name, signal)| signal.direction.map(|dir| (name.clone(), dir)))
-            .collect();
+        // `vpiDirection`), keyed by the interned signal name: filled in the
+        // static-signal pass below, which visits every `module.signals`
+        // entry before that map is freed.
+        let mut vpi_port_directions: HashMap<Arc<str>, PortDirection> = HashMap::default();
         for name in module.parameters.keys() {
             // Parameter and signal can share a name — dedup after sort.
-            names.push(name.clone());
+            names.push(std::borrow::Cow::Borrowed(name.as_str()));
         }
-        names.sort();
+        // Same order as `sort()` (equal names are the same text, so their
+        // relative order cannot matter), without re-comparing the long
+        // shared hierarchical prefixes.
+        names::sort_lexicographic(&mut names);
         names.dedup();
         // Signal placement (`XEZIM_PLACE_SIGNALS=1`, opt-in; measured NEGATIVE
         // on c906 memcpy: L2 misses +1.1%, cycles +0.35% — the greedy
@@ -9615,7 +9970,13 @@ impl Simulator {
         // L2-miss bound at ~23 misses per evaluation). Arrays keep their own
         // contiguous element ids (allocated separately below).
         if std::env::var("XEZIM_PLACE_SIGNALS").ok().as_deref() == Some("1") {
-            names = Self::place_signal_names(&module, names);
+            names = Self::place_signal_names(
+                &module,
+                names.into_iter().map(|n| n.into_owned()).collect(),
+            )
+            .into_iter()
+            .map(std::borrow::Cow::Owned)
+            .collect();
         }
         let names_ms = phase_names.elapsed().as_secs_f64() * 1000.0;
         crate::rss_trace("sim::new names");
@@ -9663,6 +10024,19 @@ impl Simulator {
 
         let n = names.len();
         let mut signal_name_to_id = NameMap::with_capacity(n);
+        // Ports the elaborator left out as unobserved: a lookup that misses
+        // is checked against them (see `names::ElidedPorts`).
+        if module.elided_port_count > 0 {
+            chatter!(
+                "[ELIDE] {} unobserved input-port nets left out",
+                module.elided_port_count
+            );
+        }
+        if !module.elided_port_hashes.is_empty() {
+            signal_name_to_id.set_elided(Some(Arc::new(names::ElidedPorts::new(std::mem::take(
+                &mut module.elided_port_hashes,
+            )))));
+        }
         let mut leaf_name_to_ids: HashMap<Arc<str>, Vec<usize>> = HashMap::default();
         let mut id_to_name = IdNames::with_capacity(n);
         let mut signal_table: Vec<Value> = Vec::with_capacity(n);
@@ -9675,23 +10049,31 @@ impl Simulator {
         // and is freed promptly, instead of being kept alongside the
         // Arc<str> copies until the end of construction.
         for (id, name) in names.drain(..).enumerate() {
-            let arc_name: Arc<str> = Arc::from(name.as_str());
+            let name: &str = &name;
+            let arc_name: Arc<str> = Arc::from(name);
             signal_name_to_id.insert(arc_name.clone(), id);
             // Build leaf-name reverse index (skip array-element style names
             // ending with `]`, which are added below and don't participate
             // in bare-leaf lookups).
-            let leaf = name
-                .rsplit_once('.')
-                .map(|(_, l)| l)
-                .unwrap_or(name.as_str());
+            let leaf = name.rsplit_once('.').map(|(_, l)| l).unwrap_or(name);
             if !leaf.is_empty() && !leaf.ends_with(']') {
-                let arc_leaf: Arc<str> = Arc::from(leaf);
-                leaf_name_to_ids.entry(arc_leaf).or_default().push(id);
+                // Most leaves repeat (`q` in every instance): allocate the
+                // key only for a leaf not seen yet.
+                match leaf_name_to_ids.get_mut(leaf) {
+                    Some(ids) => ids.push(id),
+                    None => {
+                        leaf_name_to_ids.insert(Arc::from(leaf), vec![id]);
+                    }
+                }
             }
-            id_to_name.push(arc_name);
             // Fetch value/metadata directly from the source map. The
             // signal entry takes precedence over a same-named parameter.
-            if let Some(sig) = module.signals.get(&name) {
+            let sig = module.signals.get(name);
+            if let Some(dir) = sig.and_then(|sig| sig.direction) {
+                vpi_port_directions.insert(arc_name.clone(), dir);
+            }
+            id_to_name.push(arc_name);
+            if let Some(sig) = sig {
                 let mut val = sig.value.clone();
                 if sig.is_signed {
                     val.is_signed = true;
@@ -9724,7 +10106,7 @@ impl Simulator {
                 if let Some(ref tn) = sig.type_name {
                     signal_type_names.insert(id, tn.clone());
                 }
-            } else if let Some(val) = module.parameters.get(&name) {
+            } else if let Some(val) = module.parameters.get(name) {
                 sim_dbg_eprintln!(
                     "[DEBUG] Simulator::new parameter {} = {} (signed={})",
                     name,
@@ -10839,6 +11221,7 @@ impl Simulator {
             name_stats: Default::default(),
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
+            fb_meta_saves: Vec::new(),
             param_leaf_index_cell: std::cell::OnceCell::new(),
             var_decl_leaf_index_cell: std::cell::OnceCell::new(),
             forced_names: HashSet::default(),
@@ -10876,6 +11259,8 @@ impl Simulator {
             warn_x_drivers: None,
             cont_driven: HashSet::default(),
             collapsed_port_children: HashSet::default(),
+            collapse_settled: None,
+            deferred_always,
             signal_type_names,
             time: 0,
             output: Vec::new(),
@@ -11126,6 +11511,12 @@ impl Simulator {
             rand_receiver: None,
             randomize_subset: None,
             shadowed_prop_names: HashSet::default(),
+            dep_base: HashMap::default(),
+            dep_default: HashMap::default(),
+            dep_names: Vec::new(),
+            spec_entry_cache: std::cell::RefCell::new(HashMap::default()),
+            spec_clone_origin: HashMap::default(),
+            dep_typedefs: HashSet::default(),
             inst_templates: std::cell::RefCell::new(HashMap::default()),
             inst_key_scratch: String::new(),
             settling: false,
@@ -11373,6 +11764,8 @@ impl Simulator {
             cast_widths,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
+            task_decl_cache: HashMap::default(),
+
             fn_pure_cache: HashMap::default(),
             elem_dotted_bases: RefCell::new(None),
             fst_trace: Vec::new(),
@@ -11449,6 +11842,15 @@ impl Simulator {
             comb_dep_edges: Vec::new(),
             bit_sens_pending: Vec::new(),
             bit_sens_on: !matches!(std::env::var("XEZIM_BIT_SENS").as_deref(), Ok("0")),
+            ctl_gates: Vec::new(),
+            ctl_sig: Vec::new(),
+            ctl_dsts: Vec::new(),
+            ctl_rearm_pending: Vec::new(),
+            ctl_on: !matches!(std::env::var("XEZIM_CTL_MASK").as_deref(), Ok("0"))
+                && std::env::var_os("XEZIM_BSP_SETTLE").is_none()
+                && std::env::var_os("XEZIM_BSP_SHADOW").is_none()
+                && std::env::var("XEZIM_PERLP_SETTLE").ok().as_deref() != Some("1")
+                && std::env::var("XEZIM_PERLP_SHADOW").ok().as_deref() != Some("1"),
             ts_rec0: (0, 0),
             ts_rec_n: 0,
             ts_recs: Vec::new(),
@@ -11869,7 +12271,14 @@ impl Simulator {
         }
         // Collapse identity port nets before anything resolves names to ids:
         // per-node id caches make later re-pointing unreliable.
+        let collapse_t = std::time::Instant::now();
         sim.collapse_identity_port_nets();
+        if std::env::var_os("XEZIM_COMPILE_PHASES").is_some() {
+            eprintln!(
+                "[COMPILE-PHASE] identity port-net collapse (construction): {:.1}ms",
+                collapse_t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         sim.load_dpi_libraries();
         sim.bind_all_dpi_imports();
         // VPI modules register their $systf's before simulation starts. The
@@ -14430,7 +14839,7 @@ impl Simulator {
                 _ => r.to_i64().unwrap_or(0),
             };
         }
-        if let Some(td) = self.module.tasks.get(&name).cloned() {
+        if let Some(td) = self.task_decl_rc(&name) {
             self.dpi_export_depth += 1;
             self.exec_task_call(&td, &arg_exprs);
             self.dpi_export_depth -= 1;
@@ -16297,7 +16706,9 @@ impl Simulator {
             self.jit_nba_side_len = 0;
         }
         self.collapse_identity_port_nets();
+        mark_compile_phase("identity port-net collapse", &mut compile_phase_start);
         self.compile_edge_blocks();
+        self.drop_compiled_edge_block_asts();
         // Intern each edge block's instance scope to a dense u32 so the `%m`
         // tracking in `exec_bytecode` compares integers, not strings. Blocks
         // sharing an instance share an id, which is what lets consecutive
@@ -17143,7 +17554,8 @@ impl Simulator {
                 | CombItem::TimingCheck { .. }
                 | CombItem::GateRegion { .. }
                 | CombItem::VectorGate { .. }
-                | CombItem::ScatterGate { .. } => {}
+                | CombItem::ScatterGate { .. }
+                | CombItem::CtlGate { .. } => {}
             }
             if e.has_unresolved_reads {
                 unresolved += 1;
@@ -17831,7 +18243,8 @@ impl Simulator {
             // Serial-only in v1: fall back to the full-simulator path.
             CombItem::GateRegion { .. }
             | CombItem::VectorGate { .. }
-            | CombItem::ScatterGate { .. } => false,
+            | CombItem::ScatterGate { .. }
+            | CombItem::CtlGate { .. } => false,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 // LRM §9.3.1: skip if the destination is forced
                 if self.forced_signals.is_empty() || !self.forced_signals.contains_key(dst_id) {
@@ -17991,7 +18404,8 @@ impl Simulator {
             CombItem::Udp { .. } | CombItem::UdpBatch { .. } | CombItem::TimingCheck { .. } => true,
             CombItem::GateRegion { .. }
             | CombItem::VectorGate { .. }
-            | CombItem::ScatterGate { .. } => false,
+            | CombItem::ScatterGate { .. }
+            | CombItem::CtlGate { .. } => false,
             CombItem::FastDirectCopy { dst_id, src_id } => {
                 let (mut sv, mut sx) = view[*src_id].raw_bits();
                 // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).
@@ -19050,6 +19464,9 @@ impl Simulator {
                     }
                 }
                 CombItem::FusedGate { op } => SendCombItem::Fused(*op),
+                CombItem::CtlGate { slot } => {
+                    SendCombItem::Fused(self.ctl_gates[*slot as usize].op)
+                }
                 CombItem::FusedBufFanout { src, dsts, invert } => SendCombItem::FusedBufFanout {
                     src: *src,
                     dsts: dsts.clone(),
@@ -20235,6 +20652,13 @@ impl Simulator {
             self.signal_name_to_id.contains_key(name.as_str()) || {
                 let suffix = format!(".{}", name);
                 self.signal_name_to_id.any_name_ends_with(&suffix)
+                    // An elided input port ending in this name counted
+                    // before it was left out; keep the same verdict.
+                    || (!self.module.elided_port_leaves.is_empty()
+                        && self
+                            .module
+                            .elided_port_leaves
+                            .contains(name.rsplit('.').next().unwrap_or(name)))
             }
         })
     }
@@ -21127,7 +21551,11 @@ impl Simulator {
         }
     }
 
-    fn classify_one_always_block(&mut self, ab: AlwaysBlock) -> Option<AlwaysBlock> {
+    fn classify_one_always_block(
+        &mut self,
+        ab: AlwaysBlock,
+        lazy: Option<LazyAlways>,
+    ) -> Option<AlwaysBlock> {
         // (Body of the original `for ab in blocks.into_iter()` loop, with
         // each `continue` rewritten as `return None` and each `remaining.push`
         // rewritten as `return Some(...)`.)
@@ -21405,7 +21833,10 @@ impl Simulator {
                     }
                     self.bitsel_sid_bits[w] |= 1u64 << b;
                 }
-                if std::env::var("XEZIM_DUMP_EDGE_SENS").is_ok() {
+                static DUMP_EDGE_SENS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *DUMP_EDGE_SENS
+                    .get_or_init(|| std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some())
+                {
                     let terms: Vec<String> = resolved
                         .iter()
                         .map(|si| {
@@ -21465,9 +21896,23 @@ impl Simulator {
                     self.event_queue.schedule(0, pid, vec![forever_stmt].into());
                     return None;
                 }
+                // `collect` leaves room for four terms; an edge block keeps
+                // its list for the whole run and nearly always has one.
+                let mut resolved = resolved;
+                resolved.shrink_to_fit();
+                // A lazy block keeps its source, not the tree: the body is
+                // rebuilt (and usually dropped again) when it compiles.
+                let (stmt, lazy) = match lazy {
+                    Some(l) => (
+                        Statement::new(StatementKind::Null, body.span),
+                        Some(Box::new(l)),
+                    ),
+                    None => (body, None),
+                };
                 Arc::make_mut(&mut self.edge_blocks).push(EdgeSensitiveBlock {
                     resolved_sensitivities: resolved,
-                    stmt: body,
+                    stmt,
+                    lazy,
                     kind: ab.kind,
                     scope: ab.scope,
                 });
@@ -21817,26 +22262,111 @@ impl Simulator {
         true
     }
 
+    /// The write-target census of every process body (see
+    /// `collect_override_target_leaves` / `collect_procedural_write_names`),
+    /// deferred always blocks included. A lazy block is not materialized for
+    /// it when its source can be read directly: a written name whose head is
+    /// not a substituted port or interface reference is rewritten only by
+    /// prefixing a local (`prefix + name`), else kept, so both spellings are
+    /// returned (in the second set; a superset of the rewritten census, which
+    /// only ever stops an alias). Sources are shared by every instance of a
+    /// module, so each is read once. Any other lazy block (an override, or a
+    /// write through a port or interface) is materialized for the walk.
+    #[allow(clippy::type_complexity)]
+    fn write_target_census(&self) -> ((HashSet<String>, HashSet<String>), Vec<String>) {
+        let mut by_source: HashMap<usize, (HashSet<String>, HashSet<String>)> = HashMap::default();
+        let mut extra_writes: Vec<String> = Vec::new();
+        let mut walk_lazy: Vec<&LazyAlways> = Vec::new();
+        for d in &self.deferred_always {
+            let DeferredAlways::Lazy { lazy, .. } = d else {
+                continue;
+            };
+            let src = &lazy.src;
+            let (overrides, writes) = by_source
+                .entry(std::rc::Rc::as_ptr(&src.source) as usize)
+                .or_insert_with(|| super::elaborate::stmt_write_targets(&src.source));
+            let ctx = &src.ctx;
+            let direct = overrides.is_empty()
+                && writes.iter().all(|w| {
+                    let head = w.split('.').next().unwrap_or(w);
+                    !ctx.port_map.contains_key(head)
+                        && !ctx.interface_map.contains_key(head)
+                        && !head.starts_with("$unit::")
+                });
+            if !direct {
+                walk_lazy.push(lazy);
+                continue;
+            }
+            for w in writes.iter() {
+                let head = w.split('.').next().unwrap_or(w);
+                if ctx.local_names.contains(head) {
+                    extra_writes.push(format!("{}{}", ctx.prefix, w));
+                }
+                extra_writes.push(w.clone());
+            }
+        }
+        let deferred = &self.deferred_always;
+        let sets = super::elaborate::collect_write_target_sets(
+            &self.module,
+            &mut |visit: &mut dyn FnMut(&Statement)| {
+                for d in deferred {
+                    if let DeferredAlways::Eager(ab) = d {
+                        visit(&ab.stmt);
+                    }
+                }
+                for lazy in &walk_lazy {
+                    visit(&lazy.materialize().stmt);
+                }
+            },
+        );
+        (sets, extra_writes)
+    }
+
+    /// Materialize every deferred always block onto `module.always_blocks`,
+    /// after the module's own (the order classification would take them).
+    fn flush_deferred_always(&mut self) {
+        for d in std::mem::take(&mut self.deferred_always) {
+            let ab = match d {
+                DeferredAlways::Eager(ab) => ab,
+                DeferredAlways::Lazy { lazy, .. } => lazy.materialize(),
+            };
+            self.module.always_blocks.push(ab);
+        }
+    }
+
     fn classify_always_blocks(&mut self) {
         // Take ownership — the remaining-only subset is written back at the
         // end. Avoids a full clone of every always-block AST (significant on
         // c910-scale designs with 20K+ blocks).
         //
-        // #7 lazy-prefix path: drain `module.pending_always` one at a time,
-        // materialize, feed through classify_one_always_block. Peak memory is
-        // the single materialized AlwaysBlock + bytecode-so-far, instead of
-        // the full Vec<AlwaysBlock> for every per-instance rewritten body.
-        let pending = std::mem::take(&mut self.module.pending_always);
+        // Order: the module's own always blocks, then the instantiated
+        // ones `rewrite_edge_select_sensitivities` took out of
+        // `module.pending_always`, in their original order. A lazy one is
+        // materialized just for its classification; an edge block keeps
+        // only its source (see `LazyAlways`), so the trees never all exist
+        // at once. Anything still in `pending_always` (none on the normal
+        // path) follows, materialized one at a time.
         let blocks = std::mem::take(&mut self.module.always_blocks);
+        let deferred = std::mem::take(&mut self.deferred_always);
+        let pending = std::mem::take(&mut self.module.pending_always);
         let mut remaining = Vec::new();
-        for p in pending {
-            let ab = p.materialize();
-            if let Some(rest) = self.classify_one_always_block(ab) {
+        for ab in blocks.into_iter() {
+            if let Some(rest) = self.classify_one_always_block(ab, None) {
                 remaining.push(rest);
             }
         }
-        for ab in blocks.into_iter() {
-            if let Some(rest) = self.classify_one_always_block(ab) {
+        for d in deferred {
+            let (ab, lazy) = match d {
+                DeferredAlways::Eager(ab) => (ab, None),
+                DeferredAlways::Lazy { lazy, .. } => (lazy.materialize(), Some(lazy)),
+            };
+            if let Some(rest) = self.classify_one_always_block(ab, lazy) {
+                remaining.push(rest);
+            }
+        }
+        for p in pending {
+            let ab = p.materialize();
+            if let Some(rest) = self.classify_one_always_block(ab, None) {
                 remaining.push(rest);
             }
         }
@@ -22172,7 +22702,7 @@ impl Simulator {
             CombItem::FastDirectFanout { .. } => 3,
             CombItem::FusedBufFanout { .. } => 4,
             CombItem::FusedAndFanout { .. } => 5,
-            CombItem::FusedGate { .. } => 6,
+            CombItem::FusedGate { .. } | CombItem::CtlGate { .. } => 6,
             CombItem::Udp { .. } => 7,
             CombItem::CompiledContAssign { .. } => 8,
             CombItem::CompiledAlwaysBlock { .. } => 9,
@@ -22583,7 +23113,7 @@ impl Simulator {
         let ranges: Vec<(HashMap<usize, (u32, u32)>, Vec<(usize, u32, u32)>)> = self
             .comb_entries
             .iter()
-            .map(Self::comb_entry_bit_ranges)
+            .map(|e| Self::comb_entry_bit_ranges(e, &self.ctl_gates))
             .collect();
         // A tree net is a generator, or a single-writer net whose writer is a
         // fused gate / direct copy with EXACTLY ONE tree-net input (the rest
@@ -22993,11 +23523,17 @@ impl Simulator {
         };
         let list: Vec<usize> = list.clone();
         let sdf_any = !self.sdf_delays.is_empty();
+        if !self.ctl_rearm_pending.is_empty() {
+            for s in std::mem::take(&mut self.ctl_rearm_pending) {
+                self.ctl_rearm(s);
+            }
+        }
         for e in list {
             self.prof_clock_tree_evals += 1;
             if !matches!(
                 self.comb_entries[e].item,
                 CombItem::FusedGate { .. }
+                    | CombItem::CtlGate { .. }
                     | CombItem::DirectCopy { .. }
                     | CombItem::FastDirectCopy { .. }
             ) {
@@ -23047,6 +23583,29 @@ impl Simulator {
                         None
                     }
                 }
+                CombItem::CtlGate { slot } => {
+                    let slot = *slot;
+                    // Masked AND still controlled: the output already holds
+                    // the controlled value (its settle evaluation masked it,
+                    // and no evaluation or deposit has re-armed it since),
+                    // so evaluating would commit nothing. The live test
+                    // covers a controlling input written but not yet
+                    // settled, which this eager pass must still see.
+                    let g = self.ctl_gates[slot as usize];
+                    let masked = self
+                        .comb_dep_edges
+                        .get(g.pos as usize)
+                        .is_some_and(|d| d.mask == 0);
+                    if masked
+                        && self.signal_table[g.other.sig_id as usize]
+                            .get_bit_code(g.other.bit as usize)
+                            == g.ctl
+                    {
+                        None
+                    } else {
+                        self.ctl_gate_exec_self(slot).map(|d| d.sig_id as usize)
+                    }
+                }
                 CombItem::DirectCopy { dst_id, .. } | CombItem::FastDirectCopy { dst_id, .. } => {
                     let dst = *dst_id;
                     let Some(&src) = self.comb_entries[e].cold.read_signal_ids.first() else {
@@ -23090,6 +23649,7 @@ impl Simulator {
     /// instruction forms); everything else is whole-signal.
     fn comb_entry_bit_ranges(
         entry: &CombEntry,
+        ctl_gates: &[CtlGate],
     ) -> (HashMap<usize, (u32, u32)>, Vec<(usize, u32, u32)>) {
         use super::bytecode::Insn;
         let whole = (0u32, u32::MAX);
@@ -23108,7 +23668,18 @@ impl Simulator {
             e.1 = e.1.max(hi);
         };
         let mut ranged = true;
-        match &entry.item {
+        let ctl_item;
+        let item = match &entry.item {
+            CombItem::CtlGate { slot } => match ctl_gates.get(*slot as usize) {
+                Some(g) => {
+                    ctl_item = CombItem::FusedGate { op: g.op };
+                    &ctl_item
+                }
+                None => &entry.item,
+            },
+            item => item,
+        };
+        match item {
             CombItem::FusedGate { op } => match op {
                 FusedGate::Buf1 { dst, src, .. } => {
                     add(&mut r, src.sig_id as usize, src.bit, src.bit);
@@ -24155,6 +24726,9 @@ impl Simulator {
         let gates_ok = self.sdf_delays.is_empty();
         match &entry.item {
             CombItem::FusedGate { op } if gates_ok => add_gate(&mut out, op),
+            CombItem::CtlGate { slot } if gates_ok => {
+                add_gate(&mut out, &self.ctl_gates.get(*slot as usize)?.op)
+            }
             CombItem::GateRegion { gates } if gates_ok => {
                 for g in gates.iter() {
                     add_gate(&mut out, g);
@@ -24224,6 +24798,9 @@ impl Simulator {
     /// (which moves the tables into locals).
     fn bit_sens_refresh(&mut self) {
         if self.comb_dep_edges.len() != self.comb_dep_entries.len() {
+            // The edge positions and static masks the gates hold are about
+            // to be rebuilt: turn them back into plain gates first.
+            self.ctl_revert();
             self.comb_dep_edges = self
                 .comb_dep_entries
                 .iter()
@@ -24238,6 +24815,7 @@ impl Simulator {
                     self.bit_sens_patch(eidx);
                 }
             }
+            self.ctl_build();
         } else if !self.bit_sens_pending.is_empty() {
             let pending = std::mem::take(&mut self.bit_sens_pending);
             if self.bit_sens_on {
@@ -24247,6 +24825,287 @@ impl Simulator {
             }
             self.bit_sens_pending = pending;
             self.bit_sens_pending.clear();
+        }
+    }
+
+    /// Turn every `CombItem::CtlGate` back into its `FusedGate` and restore
+    /// the static masks of the edges it held (when they are still in place).
+    fn ctl_revert(&mut self) {
+        if self.ctl_gates.is_empty() {
+            return;
+        }
+        for e in self.comb_entries.iter_mut() {
+            if let CombItem::CtlGate { slot } = e.item {
+                e.item = CombItem::FusedGate {
+                    op: self.ctl_gates[slot as usize].op,
+                };
+            }
+        }
+        if self.comb_dep_edges.len() == self.comb_dep_entries.len() {
+            for g in &self.ctl_gates {
+                let (lo, hi) = (g.pos as usize, (g.pos + g.npos) as usize);
+                if let Some(edges) = self.comb_dep_edges.get_mut(lo..hi) {
+                    for e in edges {
+                        e.mask = g.smask;
+                    }
+                }
+            }
+        }
+        self.ctl_gates.clear();
+        self.ctl_sig.clear();
+        self.ctl_dsts.clear();
+        self.ctl_rearm_pending.clear();
+        self.gate_lane_valid = false;
+    }
+
+    /// Pick the controlling-value gates (`CtlGate`) once the dependency
+    /// edges carry their static masks: every two-input AND/OR fused gate
+    /// (NAND/NOR included) with two distinct input signals, one of which
+    /// fans out to at least `CTL_MIN_FANOUT` comb entries (a clock or other
+    /// broadcast net: the input whose toggles are worth skipping).
+    ///
+    /// Not with SDF delays (a delayed gate re-schedules on every
+    /// evaluation) or under the settle modes that evaluate entries outside
+    /// the canonical loop (`ctl_on`).
+    fn ctl_build(&mut self) {
+        const CTL_MIN_FANOUT: u32 = 64;
+        debug_assert!(self.ctl_gates.is_empty());
+        if !self.ctl_on || !self.sdf_delays.is_empty() || self.perlp_settle.is_some() {
+            return;
+        }
+        let n = self.comb_entries.len();
+        let nsig = self.comb_dep_offsets.len().saturating_sub(1);
+        let offs = &self.comb_dep_offsets;
+        let fanout = |s: u32| -> u32 {
+            let s = s as usize;
+            if s < nsig { offs[s + 1] - offs[s] } else { 0 }
+        };
+        // A hot signal's dirty seed treats a zero mask as "masked", so none
+        // of its edges may carry a static zero.
+        let mut hot_ok: HashMap<u32, bool> = HashMap::default();
+        let mut picked: Vec<(usize, CtlGate)> = Vec::new();
+        for (eidx, entry) in self.comb_entries.iter().enumerate() {
+            let CombItem::FusedGate { op } = &entry.item else {
+                continue;
+            };
+            let FusedGate::Bin2 {
+                dst, a, b, op: gop, ..
+            } = *op
+            else {
+                continue;
+            };
+            let ctl = match gop {
+                GateBin::And => 0u8,
+                GateBin::Or => 1u8,
+                GateBin::Xor => continue,
+            };
+            if a.sig_id == b.sig_id || dst.sig_id == a.sig_id || dst.sig_id == b.sig_id {
+                continue;
+            }
+            let (fa, fb) = (fanout(a.sig_id), fanout(b.sig_id));
+            if fa.max(fb) < CTL_MIN_FANOUT {
+                continue;
+            }
+            // Only a declared net: nothing but its drivers, a force or a
+            // deposit (all re-arming, see `ctl_note_external_write`) can
+            // write it. A variable could also take a procedural write that
+            // a masked gate would no longer overwrite.
+            if !self
+                .name_opt(dst.sig_id as usize)
+                .is_some_and(|n| self.module.nets.contains(n))
+            {
+                continue;
+            }
+            let (hot, other) = if fa >= fb { (a, b) } else { (b, a) };
+            // A clock-tree controlling input re-evaluates the gate only
+            // through the eager tree pass, never through its own edge.
+            if self
+                .is_clock_tree_signal
+                .get(other.sig_id as usize)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let e = eidx as u32;
+            let edge_range = |sig: u32| -> (usize, usize) {
+                let s = sig as usize;
+                let (lo, hi) = (offs[s] as usize, offs[s + 1] as usize);
+                let deps = &self.comb_dep_entries[lo..hi];
+                let k = lo + deps.partition_point(|&d| d < e);
+                let mut k2 = k;
+                while k2 < hi && self.comb_dep_entries[k2] == e {
+                    k2 += 1;
+                }
+                (k, k2)
+            };
+            let (k, k2) = edge_range(hot.sig_id);
+            // The controlling input must wake the gate (its edge is never
+            // masked): that evaluation is what restores the mask.
+            let (ok_lo, ok_hi) = edge_range(other.sig_id);
+            if k == k2 || ok_lo == ok_hi || fanout(other.sig_id) == 0 {
+                continue;
+            }
+            let smask = self.comb_dep_edges[k].mask;
+            if smask == 0 || self.comb_dep_edges[k..k2].iter().any(|d| d.mask != smask) {
+                continue;
+            }
+            let ok = *hot_ok.entry(hot.sig_id).or_insert_with(|| {
+                let s = hot.sig_id as usize;
+                self.comb_dep_edges[offs[s] as usize..offs[s + 1] as usize]
+                    .iter()
+                    .all(|d| d.mask != 0)
+            });
+            if !ok {
+                continue;
+            }
+            picked.push((
+                eidx,
+                CtlGate {
+                    op: *op,
+                    other,
+                    hot: hot.sig_id,
+                    pos: k as u32,
+                    npos: (k2 - k) as u32,
+                    smask,
+                    ctl,
+                },
+            ));
+        }
+        if picked.is_empty() {
+            return;
+        }
+        self.ctl_sig = vec![false; nsig];
+        for (eidx, g) in picked {
+            let slot = self.ctl_gates.len() as u32;
+            self.ctl_sig[g.hot as usize] = true;
+            let dst = match g.op {
+                FusedGate::Bin2 { dst, .. } => dst.sig_id,
+                _ => unreachable!(),
+            };
+            self.ctl_dsts.push((dst, slot));
+            self.ctl_gates.push(g);
+            self.comb_entries[eidx].item = CombItem::CtlGate { slot };
+        }
+        self.ctl_dsts.sort_unstable();
+        self.gate_lane_valid = false;
+        sim_dbg_eprintln!(
+            "[CTL-MASK] {} gates skip their high-fanout input while controlled",
+            self.ctl_gates.len()
+        );
+    }
+
+    /// Evaluate `CtlGate` `slot` and set the mask of its high-fanout edges
+    /// from the controlling input it just read. `edges` is the dependency
+    /// edge table (the settle's local, or `comb_dep_edges`). Returns the
+    /// destination when the commit changed it.
+    /// `in_settle`: record the change for the settle loop's post-entry
+    /// propagation (`ts_direct_dirty`) instead of marking it dirty.
+    #[inline(never)]
+    fn ctl_gate_exec(
+        &mut self,
+        slot: u32,
+        edges: &mut [DepEdge],
+        in_settle: bool,
+    ) -> Option<BitRef> {
+        let g = self.ctl_gates[slot as usize];
+        let (dst, new_bit) = self.fused_gate_eval(&g.op);
+        let o = self.signal_table[g.other.sig_id as usize].get_bit_code(g.other.bit as usize);
+        let m = if o == g.ctl { 0 } else { g.smask };
+        let (lo, hi) = (g.pos as usize, (g.pos + g.npos) as usize);
+        if let Some(es) = edges.get_mut(lo..hi) {
+            for e in es {
+                e.mask = m;
+            }
+        }
+        let sdf_any = !self.sdf_delays.is_empty();
+        if self.fused_bit_commit(dst, new_bit, sdf_any) {
+            if in_settle {
+                let chg = self.bit_chg_mask(dst.sig_id, dst.bit);
+                self.ts_direct_dirty(dst.sig_id as usize, chg);
+            }
+            Some(dst)
+        } else {
+            None
+        }
+    }
+
+    /// `ctl_gate_exec` outside the settle loop (which holds the edges).
+    fn ctl_gate_exec_self(&mut self, slot: u32) -> Option<BitRef> {
+        let mut edges = std::mem::take(&mut self.comb_dep_edges);
+        let r = if edges.len() == self.comb_dep_entries.len() {
+            self.ctl_gate_exec(slot, &mut edges, false)
+        } else {
+            // No edges to update (none yet, or the settle holds them). The
+            // mask stays as the last settle evaluation left it: a change of
+            // the controlling input since then has woken the gate through
+            // its own (never masked) edge, and that evaluation fixes it.
+            self.ctl_gate_exec(slot, &mut [], false)
+        };
+        self.comb_dep_edges = edges;
+        r
+    }
+
+    /// The fused gate behind a gate entry (`FusedGate` or `CtlGate`).
+    fn comb_item_gate<'a>(&'a self, item: &'a CombItem) -> Option<&'a FusedGate> {
+        match item {
+            CombItem::FusedGate { op } => Some(op),
+            CombItem::CtlGate { slot } => self.ctl_gates.get(*slot as usize).map(|g| &g.op),
+            _ => None,
+        }
+    }
+
+    /// An external write (deposit) to signal `id`: a `CtlGate` driving it
+    /// must see its high-fanout input again, so the next toggle re-evaluates
+    /// the gate and overwrites the deposit exactly as an unmasked gate does.
+    fn ctl_note_external_write(&mut self, id: usize) {
+        if self.ctl_dsts.is_empty() {
+            return;
+        }
+        let id = id as u32;
+        let start = self.ctl_dsts.partition_point(|&(d, _)| d < id);
+        let slots: Vec<u32> = self.ctl_dsts[start..]
+            .iter()
+            .take_while(|&&(d, _)| d == id)
+            .map(|&(_, s)| s)
+            .collect();
+        if self.comb_dep_edges.len() == self.comb_dep_entries.len() && !self.settling {
+            for s in slots {
+                self.ctl_rearm(s);
+            }
+        } else {
+            self.ctl_rearm_pending.extend(slots);
+        }
+    }
+
+    /// `$deposit(target, ...)`: re-arm the gates driving the target's
+    /// signal, or every gate when the target does not resolve statically.
+    fn ctl_note_deposit(&mut self, target: &Expression) {
+        if self.ctl_dsts.is_empty() {
+            return;
+        }
+        let mut root = target;
+        while let ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } = &root.kind {
+            root = expr;
+        }
+        match self.get_lhs_signal_id(root) {
+            Some(id) => self.ctl_note_external_write(id),
+            None => {
+                let all: Vec<u32> = self.ctl_dsts.iter().map(|&(d, _)| d).collect();
+                for d in all {
+                    self.ctl_note_external_write(d as usize);
+                }
+            }
+        }
+    }
+
+    fn ctl_rearm(&mut self, slot: u32) {
+        let g = self.ctl_gates[slot as usize];
+        let (lo, hi) = (g.pos as usize, (g.pos + g.npos) as usize);
+        if let Some(es) = self.comb_dep_edges.get_mut(lo..hi) {
+            for e in es {
+                e.mask = g.smask;
+            }
         }
     }
 
@@ -27015,7 +27874,19 @@ impl Simulator {
     /// ≤64-bit planes `(v, x)` over bits [hi:lo], then the same write
     /// bookkeeping as the inline stores. Untouched bits keep their value
     /// and X.
+    /// §6.11.1/§10.7: a two-state destination drops x/z on every write
+    /// (x/z bits read 0), as the four-state VM's stores do.
+    #[inline(always)]
+    pub(crate) fn ts_scrub_two_state(&self, id: usize, v: u64, x: u64) -> (u64, u64) {
+        if x != 0 && self.signal_two_state.get(id).copied().unwrap_or(false) {
+            (v & !x, 0)
+        } else {
+            (v, x)
+        }
+    }
+
     fn ts_wide_range_store(&mut self, id: usize, lo: u32, hi: u32, v: u64, x: u64) {
+        let (v, x) = self.ts_scrub_two_state(id, v, x);
         let n = (hi - lo + 1) as usize;
         if !self.signal_table[id].splice_bits64(lo as usize, v, x, n) {
             return;
@@ -27041,6 +27912,7 @@ impl Simulator {
         // the block was lowered: one unchecked entry reference replaces the
         // three bounds checks this helper paid per store.
         debug_assert!(id < self.signal_table.len());
+        let (v, x) = self.ts_scrub_two_state(id, v, x);
         let entry: &mut Value = unsafe { self.signal_table.get_unchecked_mut(id) };
         let (base_v, base_x) = entry.raw_bits();
         let (new_v, new_x) = Self::compose_inline_range_bits(base_v, base_x, v, x, lo, hi);
@@ -27070,6 +27942,7 @@ impl Simulator {
     /// Whole-signal blocking store of a folded 4-state constant. Mirrors
     /// `ts_store`'s bookkeeping but carries an x/z plane.
     pub(crate) fn ts_store_xz(&mut self, id: usize, v: u64, x: u64) {
+        let (v, x) = self.ts_scrub_two_state(id, v, x);
         let (dv, dx) = self.signal_table[id].raw_bits();
         if v == dv && x == dx {
             return;
@@ -27103,6 +27976,9 @@ impl Simulator {
     /// `sig[hi:lo] = {N{1'bx}}` / `{N{1'bz}}` on a wide signal: both planes
     /// filled, 64 bits at a time.
     fn ts_wide_range_fill_xz(&mut self, id: usize, lo: u32, hi: u32, vbit: u8) {
+        if self.signal_two_state.get(id).copied().unwrap_or(false) {
+            return self.ts_wide_range_fill(id, lo, hi, 0);
+        }
         let fill_v = if vbit != 0 { u64::MAX } else { 0 };
         let mut pos = lo as usize;
         let end = hi as usize + 1;
@@ -28465,12 +29341,44 @@ impl Simulator {
     }
 
     fn collapse_identity_port_nets(&mut self) {
+        use std::borrow::Cow;
+        // The flat name `resolve_hier_name_static` gives, borrowed for the
+        // overwhelmingly common single segment (no allocation per assign).
+        fn flat_name<'a>(h: &'a HierarchicalIdentifier, module: &ElaboratedModule) -> Cow<'a, str> {
+            let skip_root = usize::from(h.path.len() > 1 && h.path[0].name.name == "$root");
+            if h.path.len() == skip_root + 1 {
+                Cow::Borrowed(h.path[skip_root].name.name.as_str())
+            } else {
+                Cow::Owned(Simulator::resolve_hier_name_static(h, module))
+            }
+        }
+        let buf_collapse_on = !matches!(std::env::var("XEZIM_BUF_COLLAPSE").as_deref(), Ok("0"))
+            && self.sdf_delays.is_empty()
+            && self.module.dpi_imports.is_empty()
+            && configured_vpi_libs().is_empty()
+            && configured_dpi_libs().is_empty();
+        // The pass runs again at compile time. When the first run settled and
+        // nothing it reads has changed since (no name added or re-pointed, the
+        // same assign list and port aliases; widths and the two-state and
+        // gate-driven tables are fixed at construction), the second run would
+        // re-derive the same links and re-point nothing.
+        if let Some((generation, ca_len, ca_ptr, alias_len, buf_ran)) = self.collapse_settled {
+            if generation == self.signal_name_to_id.generation()
+                && ca_len == self.module.continuous_assigns.len()
+                && ca_ptr == self.module.continuous_assigns.as_ptr() as usize
+                && alias_len == self.module.port_aliases.len()
+                && (buf_ran || !buf_collapse_on)
+                && std::env::var_os("XEZIM_BUF_CENSUS").is_none()
+            {
+                return;
+            }
+        }
         let mut collapsed = 0usize;
         // A net the connect CA drives may have OTHER continuous drivers (a
         // hierarchical TB assign, a shorted second output). Dropping the
         // connect then loses multi-driver resolution, so only nets with
         // exactly one continuous driver — the connect itself — collapse.
-        let mut ca_driver_counts: HashMap<String, u32> = HashMap::default();
+        let mut ca_driver_counts: HashMap<Cow<'_, str>, u32> = HashMap::default();
         for ca in &self.module.continuous_assigns {
             let base = match &ca.lhs.kind {
                 ExprKind::Ident(h) => Some(h),
@@ -28481,12 +29389,9 @@ impl Simulator {
                 _ => None,
             };
             let Some(h) = base else { continue };
-            let name = if h.path.len() == 1 {
-                h.path[0].name.name.clone()
-            } else {
-                Self::resolve_hier_name_static(h, &self.module)
-            };
-            *ca_driver_counts.entry(name).or_insert(0) += 1;
+            *ca_driver_counts
+                .entry(flat_name(h, &self.module))
+                .or_insert(0) += 1;
         }
         // INPUT identity connects only (`u1.din = src`, rhs in parent
         // scope): the child name re-points at the parent's id. Output
@@ -28497,7 +29402,7 @@ impl Simulator {
         // observably wrong, not just unprofitable. These shape tests and the
         // resolved rhs name do not change between passes, so they are taken
         // once, in assign order.
-        let port_candidates: Vec<(&str, String)> = self
+        let port_candidates: Vec<(&str, Cow<'_, str>)> = self
             .module
             .continuous_assigns
             .iter()
@@ -28516,58 +29421,106 @@ impl Simulator {
                 {
                     return None;
                 }
-                Some((
-                    lh.path[0].name.name.as_str(),
-                    Self::resolve_hier_name_static(rh, &self.module),
-                ))
+                Some((lh.path[0].name.name.as_str(), flat_name(rh, &self.module)))
             })
             .collect();
+        // The passes below re-point names in `signal_name_to_id` and read
+        // back what earlier links wrote. They run on a local mirror of just
+        // the names involved (one hash probe per name instead of several per
+        // link per pass); the re-pointed names are written back in the order
+        // they first changed, which leaves both tables exactly as re-pointing
+        // them in place would.
+        // A key type of its own, so these compile-time maps share no
+        // monomorphized code with run-time ones.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        struct NameKey<'a>(&'a str);
+        struct Mirror<'a> {
+            slot: HashMap<NameKey<'a>, usize>,
+            names: Vec<&'a str>,
+            ids: Vec<Option<usize>>,
+            changed: Vec<bool>,
+            order: Vec<usize>,
+        }
+        impl<'a> Mirror<'a> {
+            fn new() -> Self {
+                Mirror {
+                    slot: HashMap::default(),
+                    names: Vec::new(),
+                    ids: Vec::new(),
+                    changed: Vec::new(),
+                    order: Vec::new(),
+                }
+            }
+            fn slot(&mut self, name: &'a str, map: &NameMap) -> usize {
+                if let Some(&s) = self.slot.get(&NameKey(name)) {
+                    return s;
+                }
+                let s = self.names.len();
+                self.slot.insert(NameKey(name), s);
+                self.names.push(name);
+                self.ids.push(map.get(name).copied());
+                self.changed.push(false);
+                s
+            }
+            fn repoint(&mut self, s: usize, id: usize) {
+                self.ids[s] = Some(id);
+                if !self.changed[s] {
+                    self.changed[s] = true;
+                    self.order.push(s);
+                }
+            }
+        }
+        let mut mirror = Mirror::new();
+        // Only connections the elaborator recorded as WHOLE-NET identity
+        // (the same predicate the dump-side fold trusts), driven by the
+        // connect alone (the net it drives is its CA lhs), between non-event
+        // names.
+        let mut port_links: Vec<(usize, usize)> = Vec::new();
+        for (lhs_name, rhs_name) in &port_candidates {
+            let (child, parent): (&str, &str) = (lhs_name, rhs_name);
+            if self.module.port_aliases.get(child).map(String::as_str) != Some(parent)
+                || ca_driver_counts.get(child).copied().unwrap_or(0) != 1
+                || self.module.events.contains(child)
+                || self.module.events.contains(parent)
+            {
+                continue;
+            }
+            let c = mirror.slot(child, &self.signal_name_to_id);
+            let p = mirror.slot(parent, &self.signal_name_to_id);
+            port_links.push((c, p));
+        }
         // Chains (leaf -> mid -> top) resolve over multiple passes; they are
         // short, and each pass only ever re-points names, so a small bound
         // is plenty.
+        let mut port_settled = false;
         for _ in 0..8 {
             let mut changed = false;
-            for (lhs_name, rhs_name) in &port_candidates {
-                let lhs_name: &str = lhs_name;
-                // Only connections the elaborator recorded as WHOLE-NET
-                // identity (the same predicate the dump-side fold trusts).
-                if self.module.port_aliases.get(lhs_name).map(String::as_str)
-                    != Some(rhs_name.as_str())
-                {
-                    continue;
-                }
-                let (child, parent) = (lhs_name, rhs_name.as_str());
-                // The net this connect drives is its CA lhs; require the
-                // connect to be that net's only continuous driver.
-                if ca_driver_counts.get(lhs_name).copied().unwrap_or(0) != 1 {
-                    continue;
-                }
-                let (Some(&cid), Some(&pid)) = (
-                    self.signal_name_to_id.get(child),
-                    self.signal_name_to_id.get(parent),
-                ) else {
+            for &(c, p) in &port_links {
+                let (Some(cid), Some(pid)) = (mirror.ids[c], mirror.ids[p]) else {
                     continue;
                 };
-                if cid == pid {
-                    continue;
-                }
-                if self.signal_widths[cid] != self.signal_widths[pid]
+                if cid == pid
+                    || self.signal_widths[cid] != self.signal_widths[pid]
                     || self.signal_real[cid] != self.signal_real[pid]
-                    || self.module.events.contains(child)
-                    || self.module.events.contains(parent)
                 {
                     continue;
                 }
-                self.signal_name_to_id.insert(child.into(), pid);
-                // The lhs is the name the dropped connect was driving; it
-                // stays wire-typed in dumps by NAME (the shared id can't say).
-                self.collapsed_port_children.insert(lhs_name.into());
+                mirror.repoint(c, pid);
                 collapsed += 1;
                 changed = true;
             }
             if !changed {
+                port_settled = true;
                 break;
             }
+        }
+        for &s in &mirror.order {
+            let name = mirror.names[s];
+            self.signal_name_to_id
+                .insert(name.into(), mirror.ids[s].unwrap());
+            // The lhs is the name the dropped connect was driving; it
+            // stays wire-typed in dumps by NAME (the shared id can't say).
+            self.collapsed_port_children.insert(name.into());
         }
         if collapsed > 0 && std::env::var("XEZIM_DEBUG").is_ok() {
             eprintln!("[NET-COLLAPSE] {} identity port nets collapsed", collapsed);
@@ -28591,11 +29544,11 @@ impl Simulator {
         // two-state-ness differs from the source (a 2-state copy must drop
         // X/Z), the design carries SDF delays, or a DPI/VPI backdoor may look
         // the folded name up by itself.
-        let buf_collapse_on = !matches!(std::env::var("XEZIM_BUF_COLLAPSE").as_deref(), Ok("0"))
-            && self.sdf_delays.is_empty()
-            && self.module.dpi_imports.is_empty()
-            && configured_vpi_libs().is_empty()
-            && configured_dpi_libs().is_empty();
+        let port_mirror = mirror;
+        // Settled when every pass that ran reached its fixed point and the
+        // buffer pass re-pointed no name a port link reads (which would give
+        // the port pass new work).
+        let mut settled = port_settled;
         if buf_collapse_on {
             // Same rule as the port pass above: never alias onto a source a
             // process WRITES. A reader parked on the same edge that writes
@@ -28606,18 +29559,22 @@ impl Simulator {
             // form, so the two name sets are collected on the FIRST call,
             // while every process body is still on the module, and kept.
             if self.buf_collapse_write_sets.is_none() {
-                self.buf_collapse_write_sets = Some((
-                    super::elaborate::collect_override_target_leaves(&self.module),
-                    super::elaborate::collect_procedural_write_names(&self.module),
-                ));
+                let (sets, lazy_writes) = self.write_target_census();
+                let mut sets = sets;
+                sets.1.extend(lazy_writes);
+                self.buf_collapse_write_sets = Some(sets);
             }
-            let (override_leaves, proc_writes) =
-                self.buf_collapse_write_sets.clone().unwrap_or_default();
-            let leaf_of = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+            let (override_leaves, proc_writes) = self
+                .buf_collapse_write_sets
+                .as_ref()
+                .expect("collected above");
+            fn leaf_of(n: &str) -> &str {
+                n.rsplit('.').next().unwrap_or(n)
+            }
             let mut buf_collapsed = 0usize;
             // Whole-net identity assigns and their resolved names: fixed
             // across passes, taken once in assign order.
-            let buf_candidates: Vec<(String, String)> = self
+            let buf_candidates: Vec<(Cow<'_, str>, Cow<'_, str>)> = self
                 .module
                 .continuous_assigns
                 .iter()
@@ -28634,43 +29591,58 @@ impl Simulator {
                     {
                         return None;
                     }
-                    Some((
-                        Self::resolve_hier_name_static(lh, &self.module),
-                        Self::resolve_hier_name_static(rh, &self.module),
-                    ))
+                    Some((flat_name(lh, &self.module), flat_name(rh, &self.module)))
                 })
                 .collect();
+            // The name-only conditions do not change between passes.
+            let mut mirror = Mirror::new();
+            let mut buf_links: Vec<(usize, usize)> = Vec::new();
+            for (ln, rn) in &buf_candidates {
+                let (ln, rn): (&str, &str) = (ln, rn);
+                if self.module.events.contains(ln)
+                    || self.module.events.contains(rn)
+                    || ca_driver_counts.get(ln).copied().unwrap_or(0) != 1
+                    || override_leaves.contains(leaf_of(ln))
+                    || override_leaves.contains(leaf_of(rn))
+                    || proc_writes.contains(rn)
+                {
+                    continue;
+                }
+                let l = mirror.slot(ln, &self.signal_name_to_id);
+                let r = mirror.slot(rn, &self.signal_name_to_id);
+                buf_links.push((l, r));
+            }
+            let mut buf_settled = false;
             for _ in 0..8 {
                 let mut changed = false;
-                for (ln, rn) in &buf_candidates {
-                    let (Some(&lid), Some(&rid)) = (
-                        self.signal_name_to_id.get(ln.as_str()),
-                        self.signal_name_to_id.get(rn.as_str()),
-                    ) else {
+                for &(l, r) in &buf_links {
+                    let (Some(lid), Some(rid)) = (mirror.ids[l], mirror.ids[r]) else {
                         continue;
                     };
                     if lid == rid
                         || self.signal_widths[lid] != self.signal_widths[rid]
                         || self.signal_real[lid] != self.signal_real[rid]
                         || self.signal_two_state[lid] != self.signal_two_state[rid]
-                        || self.module.events.contains(ln.as_str())
-                        || self.module.events.contains(rn.as_str())
-                        || ca_driver_counts.get(ln.as_str()).copied().unwrap_or(0) != 1
-                        || override_leaves.contains(&leaf_of(ln.as_str()))
-                        || override_leaves.contains(&leaf_of(rn.as_str()))
-                        || proc_writes.contains(rn.as_str())
                         || self.signal_gate_driven.get(lid).copied().unwrap_or(false)
                     {
                         continue;
                     }
-                    self.signal_name_to_id.insert(ln.as_str().into(), rid);
-                    self.collapsed_port_children.insert(ln.clone());
+                    mirror.repoint(l, rid);
                     buf_collapsed += 1;
                     changed = true;
                 }
                 if !changed {
+                    buf_settled = true;
                     break;
                 }
+            }
+            settled &= buf_settled;
+            for &s in &mirror.order {
+                let name = mirror.names[s];
+                settled &= !port_mirror.slot.contains_key(&NameKey(name));
+                self.signal_name_to_id
+                    .insert(name.into(), mirror.ids[s].unwrap());
+                self.collapsed_port_children.insert(name.to_string());
             }
             if buf_collapsed > 0 && std::env::var("XEZIM_DEBUG").is_ok() {
                 eprintln!(
@@ -28679,6 +29651,15 @@ impl Simulator {
                 );
             }
         }
+        self.collapse_settled = settled.then(|| {
+            (
+                self.signal_name_to_id.generation(),
+                self.module.continuous_assigns.len(),
+                self.module.continuous_assigns.as_ptr() as usize,
+                self.module.port_aliases.len(),
+                buf_collapse_on,
+            )
+        });
         // Census for the buffer-net collapse experiment: how many WHOLE-NET
         // identity continuous assigns (`assign y = x;`, equal widths, single
         // driver) remain after the port collapse above — the std-cell BUF
@@ -28724,12 +29705,156 @@ impl Simulator {
         }
     }
 
+    /// Does a compiled edge block still need its source statement after
+    /// compilation? Three kinds of later reader use it: the AST interpreter
+    /// (a block that did not compile), the writer census at simulation start
+    /// (a block whose bytecode holds fallback or whole-array writes) and the
+    /// §16.9.3 sampled-value registration (a `$rose`/`$fell`/`$stable`/
+    /// `$changed`/`$past` call). `--warn-x` and `XEZIM_TRACE_ALWAYS` derive
+    /// driver write sets from every statement at run time.
+    fn edge_body_needed(
+        &self,
+        cb: Option<&super::bytecode::CompiledBlock>,
+        body: &Statement,
+    ) -> bool {
+        use super::bytecode::Insn;
+        if self.warn_x || self.trace_always.is_some() {
+            return true;
+        }
+        let Some(cb) = cb else {
+            return true;
+        };
+        let census_reads_ast = cb.instructions.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::StmtFallback(..)
+                    | Insn::EvalExprFallback(..)
+                    | Insn::NbaAssignArray(..)
+                    | Insn::BlockingAssignArray(..)
+                    | Insn::NbaAssignArrayRange(..)
+                    | Insn::BlockingAssignArrayRange(..)
+            )
+        });
+        census_reads_ast || Self::stmt_has_sampled_call(body)
+    }
+
+    fn expr_has_sampled_call(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::SystemCall { name, args } => {
+                matches!(
+                    name.as_str(),
+                    "$rose" | "$fell" | "$stable" | "$changed" | "$past"
+                ) || args.iter().any(Self::expr_has_sampled_call)
+            }
+            ExprKind::Call { args, .. } => args.iter().any(Self::expr_has_sampled_call),
+            ExprKind::Binary { left, right, .. } => {
+                Self::expr_has_sampled_call(left) || Self::expr_has_sampled_call(right)
+            }
+            ExprKind::Unary { operand, .. } => Self::expr_has_sampled_call(operand),
+            ExprKind::Paren(inner) => Self::expr_has_sampled_call(inner),
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_has_sampled_call(condition)
+                    || Self::expr_has_sampled_call(then_expr)
+                    || Self::expr_has_sampled_call(else_expr)
+            }
+            ExprKind::Concatenation(items) => items.iter().any(Self::expr_has_sampled_call),
+            ExprKind::Index { expr, index } => {
+                Self::expr_has_sampled_call(expr) || Self::expr_has_sampled_call(index)
+            }
+            _ => false,
+        }
+    }
+
+    /// A sampled-value call anywhere `scan_sampled_stmt` and
+    /// `collect_sampled_sites_stmt` look (a superset of both).
+    fn stmt_has_sampled_call(st: &Statement) -> bool {
+        use crate::ast::stmt::StatementKind as SK;
+        match &st.kind {
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_has_sampled_call)
+            }
+            SK::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::expr_has_sampled_call(condition)
+                    || Self::stmt_has_sampled_call(then_stmt)
+                    || else_stmt
+                        .as_deref()
+                        .is_some_and(Self::stmt_has_sampled_call)
+            }
+            SK::TimingControl { stmt, .. } => Self::stmt_has_sampled_call(stmt),
+            SK::For { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body }
+            | SK::Foreach { body, .. } => Self::stmt_has_sampled_call(body),
+            SK::Case { expr, items, .. } => {
+                Self::expr_has_sampled_call(expr)
+                    || items.iter().any(|it| Self::stmt_has_sampled_call(&it.stmt))
+            }
+            SK::BlockingAssign { rvalue, .. } | SK::NonblockingAssign { rvalue, .. } => {
+                Self::expr_has_sampled_call(rvalue)
+            }
+            SK::Expr(e) => Self::expr_has_sampled_call(e),
+            _ => false,
+        }
+    }
+
+    /// Free the source statement of every edge block whose bytecode now
+    /// stands in for it everywhere (see `edge_body_needed`); a block folded
+    /// into a merged one never runs at all. Such a block keeps an empty
+    /// statement with the same span (diagnostics report the span). A lazy
+    /// block's body was already dropped, or kept, as it compiled.
+    fn drop_compiled_edge_block_asts(&mut self) {
+        let nb = self.edge_blocks.len();
+        let droppable: Vec<bool> = (0..nb)
+            .map(|bi| {
+                let retired = self.edge_block_retired.get(bi).copied().unwrap_or(false);
+                let cb = self.compiled_edge_blocks.get(bi).and_then(|c| c.as_ref());
+                let body = &self.edge_blocks[bi].stmt;
+                !matches!(body.kind, StatementKind::Null)
+                    && !(self.warn_x || self.trace_always.is_some())
+                    && (retired || !self.edge_body_needed(cb, body))
+            })
+            .collect();
+        if !droppable.iter().any(|&d| d) {
+            return;
+        }
+        // Shared (a worker holds the list): leave it rather than copy it.
+        let Some(blocks) = Arc::get_mut(&mut self.edge_blocks) else {
+            return;
+        };
+        for (b, drop) in blocks.iter_mut().zip(droppable) {
+            if drop {
+                let span = b.stmt.span;
+                b.stmt = Statement::new(StatementKind::Null, span);
+            }
+        }
+    }
+
     fn compile_edge_blocks(&mut self) {
         use super::bytecode::BytecodeCompiler;
         let mut compiled = Vec::with_capacity(self.edge_blocks.len());
         let mut bc_count = 0;
         let mut max_regs: u32 = 0;
-        for block in self.edge_blocks.iter() {
+        let bc_dump = std::env::var("XEZIM_BC_DUMP").ok();
+        // Bodies rebuilt for lazy blocks that must keep them (see
+        // `edge_body_needed`); the others are dropped right after compiling,
+        // so the bodies never all exist at once.
+        let mut kept_bodies: Vec<(usize, Statement)> = Vec::new();
+        let mut any_lazy = false;
+        for (bi, block) in self.edge_blocks.iter().enumerate() {
+            let lazy_body = block.lazy.as_ref().map(|l| l.materialize_body());
+            any_lazy |= lazy_body.is_some();
+            let body: &Statement = lazy_body.as_ref().unwrap_or(&block.stmt);
             // Scope hint for unqualified idents inside the block: the
             // block's own inlining scope when it has one, else derived from
             // the first sensitivity signal. (Sensitivity-only derivation
@@ -28758,12 +29883,7 @@ impl Simulator {
                     Some(d) => {
                         let mut reads: HashSet<String> = HashSet::default();
                         let mut writes: HashSet<String> = HashSet::default();
-                        Self::collect_stmt_reads(
-                            &block.stmt,
-                            &self.module,
-                            &mut reads,
-                            &mut writes,
-                        );
+                        Self::collect_stmt_reads(body, &self.module, &mut reads, &mut writes);
                         let top_resolvable = writes.iter().any(|w| {
                             !w.contains('.') && self.signal_name_to_id.contains_key(w.as_str())
                         });
@@ -28804,19 +29924,19 @@ impl Simulator {
             compiler.set_string_signals(&self.module.string_signals);
             compiler.set_signal_real(&self.signal_real);
             compiler.top_module_name = Some(self.module.name.clone());
-            let ok = compiler.compile_stmt(&block.stmt);
+            let ok = compiler.compile_stmt(body);
             if !ok && std::env::var_os("XEZIM_EDGE_BLOCK_STATS").is_some() {
                 eprintln!(
                     "[EDGE-BAIL] scope='{}' reason={} span={}..{}",
                     block.scope,
                     compiler.bail_reason.unwrap_or("unknown"),
-                    block.stmt.span.start,
-                    block.stmt.span.end
+                    body.span.start,
+                    body.span.end
                 );
             }
             if ok {
                 let cb = compiler.finish();
-                if let Ok(limit) = std::env::var("XEZIM_BC_DUMP") {
+                if let Some(limit) = &bc_dump {
                     let limit: usize = limit.parse().unwrap_or(0);
                     if compiled.len() < limit {
                         eprintln!(
@@ -28844,6 +29964,21 @@ impl Simulator {
                 compiled.push(Some(cb));
             } else {
                 compiled.push(None);
+            }
+            if let Some(body) = lazy_body {
+                let cb = compiled.last().and_then(|c| c.as_ref());
+                if self.edge_body_needed(cb, &body) {
+                    kept_bodies.push((bi, body));
+                }
+            }
+        }
+        if any_lazy {
+            let blocks = Arc::make_mut(&mut self.edge_blocks);
+            for b in blocks.iter_mut() {
+                b.lazy = None;
+            }
+            for (bi, body) in kept_bodies {
+                blocks[bi].stmt = body;
             }
         }
         self.compiled_edge_blocks = compiled;
@@ -33917,7 +35052,11 @@ impl Simulator {
                     let reason = payload.1.clone();
                     self.prof_fallback_insns += 1;
                     let (r, ctxw) = (*r as usize, *ctxw);
-                    let v = self.eval_expr_ctx(&e, ctxw);
+                    let v = if payload.2.is_empty() {
+                        self.eval_expr_ctx(&e, ctxw)
+                    } else {
+                        self.fb_eval_expr_with_locals(&payload.2, &e, ctxw)
+                    };
                     self.vm_regs[r] = v;
                     let ent = self
                         .prof_fallback_by_reason
@@ -33930,7 +35069,11 @@ impl Simulator {
                     self.prof_fallback_insns += 1;
                     let r = payload.1.clone();
                     let t0 = std::time::Instant::now();
-                    self.exec_statement(&s);
+                    if payload.2.is_empty() {
+                        self.exec_statement(&s);
+                    } else {
+                        self.fb_exec_stmt_with_locals(&payload.2, &s);
+                    }
                     let elapsed = t0.elapsed().as_nanos() as u64;
                     let e = self
                         .prof_fallback_by_reason
@@ -34656,6 +35799,12 @@ impl Simulator {
         unsafe {
             libc::malloc_trim(0);
         }
+        // Hand the pages freed by the comb build (the source ASTs, the
+        // ordering graph, the build's temporaries) back to the OS now: the
+        // allocator would otherwise keep them resident through the whole
+        // simulation (64k-cell DRAM: 1373 -> 857 MB steady RSS). The callee
+        // skips a small process, where purging only splits huge pages.
+        xezim_core::release_free_memory();
     }
 
     fn prepared_comb_cache_is_valid(&self, cache: &PreparedCombCache) -> bool {
@@ -34872,6 +36021,10 @@ impl Simulator {
         let mut ca_compile_fail: HashMap<&'static str, usize> = HashMap::default();
         let mut ca_compile_fail_samples = 0usize;
         let cont_loop_t0 = std::time::Instant::now();
+        // Read once, not per assign (a `getenv` scan per assign is
+        // measurable at 150k assigns).
+        let dump_ca_reads = std::env::var_os("XEZIM_DUMP_CA_READS").is_some();
+        let dump_unresolved = std::env::var_os("XEZIM_DUMP_UNRESOLVED").is_some();
         for mut ca in cas
             .into_iter()
             .chain({
@@ -34983,6 +36136,34 @@ impl Simulator {
                     }
                 }
             }
+            // A whole-name identity assign (`assign dst = src`, the shape of
+            // every port connect) resolves both ids up front: when a collapsed
+            // identity port net made it a self-copy (see
+            // `collapse_identity_port_nets`) it is dropped here, before any of
+            // the read/write/scope analysis below, none of which it needs.
+            let ident_copy_ids: Option<(usize, usize)> =
+                if explicit_delay == 0 && cov_counter.is_none() {
+                    if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) =
+                        (&ca.lhs.kind, &ca.rhs.kind)
+                    {
+                        let dst_name = Self::resolve_hier_name_static(lhs_hier, &self.module);
+                        let src_name = Self::resolve_hier_name_static(rhs_hier, &self.module);
+                        match (
+                            self.signal_name_to_id.get(dst_name.as_str()),
+                            self.signal_name_to_id.get(src_name.as_str()),
+                        ) {
+                            (Some(&dst_id), Some(&src_id)) => Some((dst_id, src_id)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+            if ident_copy_ids.is_some_and(|(dst_id, src_id)| dst_id == src_id) {
+                continue;
+            }
             reads.clear();
             writes.clear();
             Self::collect_expr_reads(&ca.rhs, &self.module, &mut reads);
@@ -35039,64 +36220,43 @@ impl Simulator {
                     .or_else(|| self.infer_scope_from_rw_sets(&writes, &reads))
             };
             // Detect identity assigns: assign dst = src (simple signal-to-signal copy)
-            let direct_copy = if explicit_delay == 0 && cov_counter.is_none() {
-                if let (ExprKind::Ident(lhs_hier), ExprKind::Ident(rhs_hier)) =
-                    (&ca.lhs.kind, &ca.rhs.kind)
-                {
-                    let dst_name = Self::resolve_hier_name_static(lhs_hier, &self.module);
-                    let src_name = Self::resolve_hier_name_static(rhs_hier, &self.module);
-                    if let (Some(&dst_id), Some(&src_id)) = (
-                        self.signal_name_to_id.get(dst_name.as_str()),
-                        self.signal_name_to_id.get(src_name.as_str()),
-                    ) {
-                        // A collapsed identity port net (see
-                        // `collapse_identity_port_nets`) leaves its connect
-                        // assign as a self-copy — drop it entirely.
-                        if dst_id == src_id {
-                            continue;
-                        }
-                        let width = self.signal_widths[dst_id];
-                        let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
-                        if width == self.signal_widths[src_id] {
-                            if width <= 64 && delay == 0 {
-                                Some(CombItem::FastDirectCopy { dst_id, src_id })
-                            } else if self
-                                .module_paths
-                                .as_ref()
-                                .is_some_and(|mp| mp.is_path_net(dst_id))
-                            {
-                                // §30.4 path-delayed output: the general
-                                // cont-assign path cancels a pending update
-                                // when the source reverts (§28.16 pulse
-                                // rejection); DirectCopy does not.
-                                None
-                            } else {
-                                Some(CombItem::DirectCopy {
-                                    dst_id,
-                                    src_id,
-                                    width,
-                                })
-                            }
-                        } else if delay == 0 {
-                            // Width-mismatched bare ident copy (e.g. a wider
-                            // parent net driving a narrower input port).
-                            // Resolve both ids statically here instead of
-                            // falling through to the bytecode compiler, whose
-                            // scope_hint can mis-resolve a parent-scope RHS to a
-                            // same-named local port signal (self-assign -> X).
-                            // DirectCopy resizes the source to `width` (the
-                            // destination width). (pr2224949)
-                            Some(CombItem::DirectCopy {
-                                dst_id,
-                                src_id,
-                                width,
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
+            let direct_copy = if let Some((dst_id, src_id)) = ident_copy_ids {
+                let width = self.signal_widths[dst_id];
+                let delay = self.sdf_delays.get(dst_id).copied().unwrap_or(0);
+                if width == self.signal_widths[src_id] {
+                    if width <= 64 && delay == 0 {
+                        Some(CombItem::FastDirectCopy { dst_id, src_id })
+                    } else if self
+                        .module_paths
+                        .as_ref()
+                        .is_some_and(|mp| mp.is_path_net(dst_id))
+                    {
+                        // §30.4 path-delayed output: the general
+                        // cont-assign path cancels a pending update
+                        // when the source reverts (§28.16 pulse
+                        // rejection); DirectCopy does not.
                         None
+                    } else {
+                        Some(CombItem::DirectCopy {
+                            dst_id,
+                            src_id,
+                            width,
+                        })
                     }
+                } else if delay == 0 {
+                    // Width-mismatched bare ident copy (e.g. a wider
+                    // parent net driving a narrower input port).
+                    // Resolve both ids statically here instead of
+                    // falling through to the bytecode compiler, whose
+                    // scope_hint can mis-resolve a parent-scope RHS to a
+                    // same-named local port signal (self-assign -> X).
+                    // DirectCopy resizes the source to `width` (the
+                    // destination width). (pr2224949)
+                    Some(CombItem::DirectCopy {
+                        dst_id,
+                        src_id,
+                        width,
+                    })
                 } else {
                     None
                 }
@@ -35684,7 +36844,7 @@ impl Simulator {
                             continue;
                         }
                     }
-                    if !found && std::env::var("XEZIM_DUMP_UNRESOLVED").is_ok() {
+                    if !found && dump_unresolved {
                         let leaf = r.rsplit('.').next().unwrap_or(r.as_str());
                         let near: Vec<&str> = self
                             .array_first_id
@@ -35702,7 +36862,7 @@ impl Simulator {
                     unresolved_count += 1;
                 }
             }
-            if std::env::var("XEZIM_DUMP_CA_READS").is_ok() {
+            if dump_ca_reads {
                 let rn: Vec<&str> = rids.iter().map(|&i| self.name_for_id(i)).collect();
                 eprintln!(
                     "[CA-READS] scope_hint={:?} reads={:?} rids={:?} lhs_abs={}",
@@ -35710,7 +36870,7 @@ impl Simulator {
                 );
             }
             let has_unresolved_reads = unresolved_count > 0;
-            if has_unresolved_reads && std::env::var("XEZIM_DUMP_UNRESOLVED").is_ok() {
+            if has_unresolved_reads && dump_unresolved {
                 let unresolved: Vec<&String> = reads
                     .iter()
                     .filter(|r| {
@@ -36189,10 +37349,6 @@ impl Simulator {
             // Store successors as a compact CSR adjacency list. The previous
             // `Vec<Vec<usize>>` paid a Vec header for every comb entry and
             // produced many small allocations on large flattened designs.
-            let mut indeg = vec![0usize; n];
-            // Use a temporary visited matrix row-by-row to avoid double-counting edges.
-            let mut seen_pred: Vec<u32> = vec![u32::MAX; n];
-            let mut edges: Vec<(u32, u32)> = Vec::new();
             // A single net with thousands of combinational writers is never real
             // RTL (one driver per net is the norm). It arises when a parameter
             // underflows so a `for i: assign bus[i] = …` generate-loop's index
@@ -36203,6 +37359,69 @@ impl Simulator {
             // fan-in from any such degenerate net; its entries still converge via
             // the unresolved-read re-fire path, just without precise topo order.
             const MAX_WRITERS_PER_NET: usize = 1024;
+            // A net with W writers and R readers contributes W × R
+            // writer -> reader edges. A vector written bit by bit and read
+            // whole by many entries makes that product explode (a DRAM mat's
+            // 128 per-row `rs[r]` drivers × 4,480 readers: 27 M edges at 64k
+            // cells, most of the compile's peak memory). Such a net gets ONE
+            // join node instead: writers -> join -> readers, W + R edges that
+            // carry exactly the same ordering constraints transitively. Join
+            // nodes are ordered like entries but never emitted. A reader that
+            // is itself one of the net's writers keeps its direct edges (a
+            // join edge back to it would close a false cycle). Nets below the
+            // product threshold keep the plain edges, so ordinary graphs, and
+            // their tie-breaks in cyclic regions, are unchanged.
+            const TOPO_JOIN_MIN_EDGES: usize = 1 << 14;
+            let topo_join_on = !matches!(std::env::var("XEZIM_TOPO_JOIN").as_deref(), Ok("0"));
+            // Keyed by a type of its own: sharing the monomorphized maps the
+            // run-time paths use (`HashMap<usize, u32>` is the NBA index)
+            // moved their inlining and cost the simulation ~1% on c906.
+            #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+            struct NetKey(usize);
+            // A multi-writer net's (writers, readers), then its join node:
+            // u32::MAX until the first reader creates it.
+            let mut join_of: HashMap<NetKey, u32> = HashMap::default();
+            if topo_join_on {
+                let mut counts: HashMap<NetKey, (usize, usize)> = HashMap::default();
+                for entry in entries.iter() {
+                    for &sid in &entry.cold.write_signal_ids {
+                        if sid < num_signals {
+                            counts.entry(NetKey(sid)).or_insert((0, 0)).0 += 1;
+                        }
+                    }
+                }
+                for entry in entries.iter() {
+                    for &sid in &entry.cold.read_signal_ids {
+                        if let Some(c) = counts.get_mut(&NetKey(sid)) {
+                            c.1 += 1;
+                        }
+                    }
+                }
+                for (key, (w, r)) in counts {
+                    if (2..=MAX_WRITERS_PER_NET).contains(&w)
+                        && w.saturating_mul(r) >= TOPO_JOIN_MIN_EDGES
+                    {
+                        join_of.insert(key, u32::MAX);
+                    }
+                }
+            }
+            // `writers` is ascending (pushed in entry order).
+            fn is_writer(writers: &[usize], b: usize) -> bool {
+                let (mut lo, mut hi) = (0usize, writers.len());
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if writers[mid] < b {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                lo < writers.len() && writers[lo] == b
+            }
+            let mut indeg = vec![0usize; n];
+            // Use a temporary visited matrix row-by-row to avoid double-counting edges.
+            let mut seen_pred: Vec<u32> = vec![u32::MAX; n];
+            let mut edges: Vec<(u32, u32)> = Vec::new();
             let mut capped_warned = false;
             for b in 0..n {
                 for &sid in &entries[b].cold.read_signal_ids {
@@ -36224,6 +37443,31 @@ impl Simulator {
                             }
                             continue;
                         }
+                        if let Some(slot) = join_of.get_mut(&NetKey(sid)) {
+                            if !is_writer(writers, b) {
+                                if *slot == u32::MAX {
+                                    let j = indeg.len();
+                                    *slot = j as u32;
+                                    indeg.push(0);
+                                    seen_pred.push(u32::MAX);
+                                    let mut prev = usize::MAX;
+                                    for &a in writers {
+                                        if a != prev {
+                                            edges.push((a as u32, j as u32));
+                                            indeg[j] += 1;
+                                            prev = a;
+                                        }
+                                    }
+                                }
+                                let j = *slot as usize;
+                                if seen_pred[j] != b as u32 {
+                                    seen_pred[j] = b as u32;
+                                    edges.push((j as u32, b as u32));
+                                    indeg[b] += 1;
+                                }
+                                continue;
+                            }
+                        }
                         for &a in writers {
                             if a == b {
                                 continue;
@@ -36238,7 +37482,20 @@ impl Simulator {
                     }
                 }
             }
-            let mut succ_offsets = vec![0u32; n + 1];
+            drop(join_of);
+            drop(seen_pred);
+            let n_nodes = indeg.len();
+            if std::env::var_os("XEZIM_COMPILE_PHASES").is_some() {
+                eprintln!(
+                    "[COMPILE-PHASE]   topo-order graph: {} entries, {} join nodes, {} edges ({:.1} MB)",
+                    n,
+                    n_nodes - n,
+                    edges.len(),
+                    edges.capacity() as f64 * 8.0 / 1048576.0
+                );
+            }
+            crate::rss_trace("bce: topo edges built");
+            let mut succ_offsets = vec![0u32; n_nodes + 1];
             for &(a, _) in &edges {
                 succ_offsets[a as usize + 1] += 1;
             }
@@ -36246,7 +37503,7 @@ impl Simulator {
                 succ_offsets[i] += succ_offsets[i - 1];
             }
             let mut succ_entries = vec![0u32; edges.len()];
-            let mut succ_cursor = succ_offsets[..n].to_vec();
+            let mut succ_cursor = succ_offsets[..n_nodes].to_vec();
             for (a, b) in edges {
                 let pos = succ_cursor[a as usize] as usize;
                 succ_entries[pos] = b;
@@ -36267,14 +37524,15 @@ impl Simulator {
             // lowest bucket that may hold a live node and only moves down when a
             // decrement creates a lower-degree node.
             let mut new_order: Vec<usize> = Vec::with_capacity(n);
-            let mut placed = vec![false; n];
+            let mut placed = vec![false; n_nodes];
             let max_d = indeg.iter().copied().max().unwrap_or(0);
             let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); max_d + 1];
-            for i in 0..n {
+            for i in 0..n_nodes {
                 buckets[indeg[i]].push(i as u32);
             }
             let mut min_d = 0usize;
-            while new_order.len() < n {
+            let mut n_placed = 0usize;
+            while n_placed < n_nodes {
                 // Advance to the lowest bucket holding a live (unplaced,
                 // current-indegree-matches) node, discarding stale entries.
                 let mut a = usize::MAX;
@@ -36298,7 +37556,10 @@ impl Simulator {
                     break;
                 }
                 placed[a] = true;
-                new_order.push(a);
+                n_placed += 1;
+                if a < n {
+                    new_order.push(a);
+                }
                 let lo = succ_offsets[a] as usize;
                 let hi = succ_offsets[a + 1] as usize;
                 for &b_u32 in &succ_entries[lo..hi] {
@@ -36315,6 +37576,12 @@ impl Simulator {
                         }
                     }
                 }
+            }
+            if std::env::var_os("XEZIM_COMPILE_PHASES").is_some() {
+                let h = new_order.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &i| {
+                    (h ^ i as u64).wrapping_mul(0x0100_0000_01b3)
+                });
+                eprintln!("[COMPILE-PHASE]   topo-order hash: {h:016x}");
             }
             // Apply permutation only if we got a real full permutation.
             let valid_permutation = if new_order.len() == n {
@@ -39126,11 +40393,19 @@ impl Simulator {
         }
         if std::env::var("XEZIM_LAYOUT").is_ok() {
             eprintln!(
-                "[LAYOUT] CombEntry={}B CombItem={}B Value={}B entries={}",
+                "[LAYOUT] CombEntry={}B CombItem={}B Value={}B entries={} SensitivityId={}B Expression={}B EdgeSensitiveBlock={}B edge_blocks={} sens_terms={}",
                 std::mem::size_of::<CombEntry>(),
                 std::mem::size_of::<CombItem>(),
                 std::mem::size_of::<Value>(),
-                entries.len()
+                entries.len(),
+                std::mem::size_of::<SensitivityId>(),
+                std::mem::size_of::<Expression>(),
+                std::mem::size_of::<EdgeSensitiveBlock>(),
+                self.edge_blocks.len(),
+                self.edge_blocks
+                    .iter()
+                    .map(|b| b.resolved_sensitivities.capacity())
+                    .sum::<usize>()
             );
         }
         self.comb_entries = entries;
@@ -39141,13 +40416,6 @@ impl Simulator {
         // the module is no longer read. Same for combinational always blocks
         // — edge-sensitive ones were moved into self.edge_blocks earlier.
         self.drop_comb_source_ast();
-        // Force the glibc allocator to return freed pages to the OS. On
-        // c906 hello the AST drops above release ~1.3 GB but glibc's arena
-        // retains it until a future large allocation triggers reuse —
-        // observed RSS staying at the elaborate-time peak of 2.7 GB through
-        // the entire time-0 settle phase, only dropping to 1.4 GB when the
-        // event loop's allocation pattern shifts. malloc_trim(0) forces
-        // an immediate release. No-op on non-glibc platforms.
     }
 
     /// `--primitive-verbose` terminal annotation: the net's current 4-state
@@ -42263,7 +43531,7 @@ impl Simulator {
                                     out.push(Sensitivity {
                                         signal_name: self.resolve_event_key(&key),
                                         edge,
-                                        iff: ee.iff.clone(),
+                                        iff: ee.iff.clone().map(Box::new),
                                         value_of: None,
                                     });
                                     continue;
@@ -42280,7 +43548,7 @@ impl Simulator {
                                 out.push(Sensitivity {
                                     signal_name: format!("{}[{}]", bn, value.replace('_', "")),
                                     edge,
-                                    iff: ee.iff.clone(),
+                                    iff: ee.iff.clone().map(Box::new),
                                     value_of: None,
                                 });
                                 continue;
@@ -42322,8 +43590,8 @@ impl Simulator {
                                 out.push(Sensitivity {
                                     signal_name: bn.into_owned(),
                                     edge,
-                                    iff: ee.iff.clone(),
-                                    value_of: Some(ee.expr.clone()),
+                                    iff: ee.iff.clone().map(Box::new),
+                                    value_of: Some(Box::new(ee.expr.clone())),
                                 });
                                 continue;
                             }
@@ -42349,7 +43617,7 @@ impl Simulator {
                                     out.push(Sensitivity {
                                         signal_name: hidden,
                                         edge: EdgeKind::AnyEdge,
-                                        iff: ee.iff.clone(),
+                                        iff: ee.iff.clone().map(Box::new),
                                         value_of: None,
                                     });
                                     continue;
@@ -42370,7 +43638,7 @@ impl Simulator {
                                 out.push(Sensitivity {
                                     signal_name: self.resolve_event_key(&key),
                                     edge,
-                                    iff: ee.iff.clone(),
+                                    iff: ee.iff.clone().map(Box::new),
                                     value_of: None,
                                 });
                                 continue;
@@ -42403,7 +43671,7 @@ impl Simulator {
                                         .get(&cb_key)
                                         .copied()
                                         .unwrap_or(EdgeKind::Posedge),
-                                    iff: ee.iff.clone(),
+                                    iff: ee.iff.clone().map(Box::new),
                                     value_of: None,
                                 });
                                 continue;
@@ -42424,8 +43692,8 @@ impl Simulator {
                                 out.push(Sensitivity {
                                     signal_name: base,
                                     edge,
-                                    iff: ee.iff.clone(),
-                                    value_of: Some(ee.expr.clone()),
+                                    iff: ee.iff.clone().map(Box::new),
+                                    value_of: Some(Box::new(ee.expr.clone())),
                                 });
                                 continue;
                             }
@@ -42433,7 +43701,7 @@ impl Simulator {
                         out.push(Sensitivity {
                             signal_name: sig.to_string(),
                             edge,
-                            iff: ee.iff.clone(),
+                            iff: ee.iff.clone().map(Box::new),
                             value_of: None,
                         });
                     }
@@ -42450,7 +43718,7 @@ impl Simulator {
                         )
                     {
                         for sens in out.iter_mut().skip(term_start) {
-                            sens.value_of = Some(ee.expr.clone());
+                            sens.value_of = Some(Box::new(ee.expr.clone()));
                         }
                     }
                     if selects {
@@ -42497,7 +43765,7 @@ impl Simulator {
                                     out.push(Sensitivity {
                                         signal_name: self.resolve_event_key(&k),
                                         edge: EdgeKind::AnyEdge,
-                                        iff: ee.iff.clone(),
+                                        iff: ee.iff.clone().map(Box::new),
                                         value_of: None,
                                     });
                                     continue;
@@ -42518,7 +43786,7 @@ impl Simulator {
                                         out.push(Sensitivity {
                                             signal_name: hidden,
                                             edge: EdgeKind::AnyEdge,
-                                            iff: ee.iff.clone(),
+                                            iff: ee.iff.clone().map(Box::new),
                                             value_of: None,
                                         });
                                         continue;
@@ -42542,7 +43810,7 @@ impl Simulator {
                                         out.push(Sensitivity {
                                             signal_name: format!("{}.{}", b, member.name),
                                             edge,
-                                            iff: ee.iff.clone(),
+                                            iff: ee.iff.clone().map(Box::new),
                                             value_of: None,
                                         });
                                     }
@@ -43032,7 +44300,7 @@ impl Simulator {
     /// process's frame is. Such a name cannot change while its process
     /// waits, so replace it by its value now.
     fn freeze_value_terms(&mut self, terms: &mut [SensitivityId]) {
-        let mut frozen: Vec<(crate::ast::Span, Option<Expression>)> = Vec::new();
+        let mut frozen: Vec<(crate::ast::Span, Option<Box<Expression>>)> = Vec::new();
         for t in terms.iter_mut() {
             let Some(span) = t.value_of.as_ref().map(|e| e.span) else {
                 continue;
@@ -43989,6 +45257,9 @@ impl Simulator {
                 if let Some(t) = t0 {
                     t_settle += t.elapsed().as_nanos() as u64;
                 }
+            }
+            if !self.delayed_updates.is_empty() {
+                self.apply_due_delayed_now();
             }
             let t0 = self.profile_timing.then(std::time::Instant::now);
             let edges_before = self.prof_edges_fired;
@@ -45186,6 +46457,9 @@ impl Simulator {
         let _t = profile_timing.then(std::time::Instant::now);
         if self.dirty_any {
             self.settle_combinatorial();
+            non_clock_change = true;
+        }
+        if !self.delayed_updates.is_empty() && self.apply_due_delayed_now() {
             non_clock_change = true;
         }
         if let Some(t) = _t {
@@ -47497,7 +48771,9 @@ impl Simulator {
                         };
                         self.name_for_id(branch.dst.sig_id as usize)
                     }
-                    CombItem::ContAssign { .. } | CombItem::CompiledContAssign { .. } => {
+                    CombItem::ContAssign { .. }
+                    | CombItem::CompiledContAssign { .. }
+                    | CombItem::CtlGate { .. } => {
                         if let Some(&id) = entry.cold.write_signal_ids.first() {
                             self.name_for_id(id)
                         } else {
@@ -48113,6 +49389,12 @@ impl Simulator {
             if self.dirty_any {
                 self.settle_combinatorial();
             }
+            // Zero-delay updates due now, before this pass's edge check
+            // (see `apply_due_delayed_now`).
+            let mut dly_applied = dly_applied;
+            if !self.delayed_updates.is_empty() && self.apply_due_delayed_now() {
+                dly_applied = true;
+            }
             // After advancing time and any clock/delay fires, check for
             // edge triggers so always_ff blocks fire within this delay
             // window, then re-snapshot for the next iter.
@@ -48296,17 +49578,17 @@ impl Simulator {
         let mut pending = std::mem::take(&mut self.deferred_comb);
         for (eidx, snap) in pending.iter() {
             let eidx = *eidx;
-            // Clone only the uncommon replayed entry. Keeping the canonical
-            // table installed lets a blocking write settle recursively.
-            let Some(entry) = self.comb_entries.get(eidx).cloned() else {
-                continue;
-            };
             let clobbered = snap
                 .iter()
                 .any(|(id, v)| self.signal_table.get(*id).is_some_and(|cur| cur != v));
             if !clobbered {
                 continue;
             }
+            // Clone only the uncommon replayed entry. Keeping the canonical
+            // table installed lets a blocking write settle recursively.
+            let Some(entry) = self.comb_entries.get(eidx).cloned() else {
+                continue;
+            };
             match &entry.item {
                 CombItem::AlwaysBlock { .. } => self.eval_ast_comb_entry(&entry),
                 CombItem::CompiledAlwaysBlock { compiled, .. } => {
@@ -50264,7 +51546,7 @@ impl Simulator {
                                     self.class_has_method(&cls, &h.path[0].name.name)
                                 });
                             if let Some(td) = (!is_this_method)
-                                .then(|| self.module.tasks.get(&h.path[0].name.name).cloned())
+                                .then(|| self.task_decl_rc(&h.path[0].name.name))
                                 .flatten()
                             {
                                 if self.stmts_have_blocking(&td.items) {
@@ -50322,7 +51604,7 @@ impl Simulator {
                         {
                             let full = self.resolve_hier_task_target(func);
                             if let Some(full) = full {
-                                let td = self.module.tasks.get(&full).cloned().unwrap();
+                                let td = self.task_decl_rc(&full).unwrap();
                                 if self.stmts_have_blocking(&td.items) {
                                     let scope = full
                                         .rsplit_once('.')
@@ -53954,6 +55236,28 @@ impl Simulator {
         applied
     }
 
+    /// §4.4, §30.4: a delayed update already due now (a module path or SDF
+    /// delay that rounds to zero ticks, or a path-delayed net with no enabled
+    /// path) is a change of this slot's Active region. Apply it, and any
+    /// zero-delay hop it causes in turn, then settle, so the caller's next
+    /// edge check sees it: an edge it raises (a clock through a zero-delay
+    /// library cell) must sample pre-NBA values, like the undelayed edge
+    /// beside it. It used to wait for the next pass of the time step, after
+    /// this slot's NBAs had committed. Out of line: callers test
+    /// `delayed_updates.is_empty()` first, so the common case costs one load.
+    #[inline(never)]
+    fn apply_due_delayed_now(&mut self) -> bool {
+        let mut applied = false;
+        let mut hops = 0;
+        while hops < 1024 && self.apply_delayed_updates() {
+            applied = true;
+            self.dirty_any = true;
+            self.settle_combinatorial();
+            hops += 1;
+        }
+        applied
+    }
+
     /// Get the next time a delayed update is due (for time advancement).
     fn next_delayed_time(&self) -> Option<u64> {
         let a = self.delayed_updates.iter().map(|(t, _, _)| *t).min();
@@ -54800,7 +56104,7 @@ impl Simulator {
             }
             // §9.4.2.3: `@(posedge clk iff en)` samples only while `en` holds.
             if let Some(iff) = triggered {
-                self.sample_covergroup_guarded(handle, iff.as_ref());
+                self.sample_covergroup_guarded(handle, iff.as_deref());
             }
         }
         if let Some(t) = _t_cg {
@@ -55303,8 +56607,9 @@ impl Simulator {
         // this runs the always blocks have already been compiled into edge
         // blocks and the module vec is empty, which is why procedural
         // `$rose`/`$fell` had no clock and silently never fired.
+        // Read through a second handle on the list instead of cloning every
+        // block's statement (the registration below needs `&mut self`).
         let blocks = Arc::clone(&self.edge_blocks);
-        let mut tagged: Vec<(Statement, u8, usize)> = Vec::new();
         for b in blocks.iter() {
             let clk = b.resolved_sensitivities.iter().find_map(|s| match s.edge {
                 EdgeKind::Posedge => Some((1u8, s.signal_id)),
@@ -55312,12 +56617,9 @@ impl Simulator {
                 _ => None,
             });
             if let Some((ec, cid)) = clk {
-                tagged.push((b.stmt.clone(), ec, cid));
+                self.record_sampled_sites(&b.stmt, ec, cid);
+                self.scan_sampled_stmt(&b.stmt);
             }
-        }
-        for (st, ec, cid) in tagged {
-            self.record_sampled_sites(&st, ec, cid);
-            self.scan_sampled_stmt(&st);
         }
     }
 
@@ -58824,6 +60126,11 @@ impl Simulator {
             CombItem::FusedGate { op } => {
                 self.exec_fused_gate(op);
             }
+            CombItem::CtlGate { slot } => {
+                if let Some(dst) = self.ctl_gate_exec_self(*slot) {
+                    self.mark_dirty_id(dst.sig_id as usize);
+                }
+            }
             CombItem::VectorGate { op } => {
                 self.exec_vector_gate(op);
             }
@@ -59272,13 +60579,20 @@ impl Simulator {
         self.settling = true;
         self.settle_calls += 1;
 
-        if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
-            self.build_gate_lane();
-        }
+        // Edges first: picking the controlling-value gates changes which
+        // entries the gate lane may take.
         if self.comb_dep_edges.len() != self.comb_dep_entries.len()
             || !self.bit_sens_pending.is_empty()
         {
             self.bit_sens_refresh();
+        }
+        if !self.ctl_rearm_pending.is_empty() {
+            for s in std::mem::take(&mut self.ctl_rearm_pending) {
+                self.ctl_rearm(s);
+            }
+        }
+        if !self.gate_lane_valid || self.gate_lane.len() != self.comb_entries.len() {
+            self.build_gate_lane();
         }
         if !self.quiet_valid || self.quiet_bits.len() != self.signal_table.len().div_ceil(64) {
             self.build_quiet_bits();
@@ -59303,7 +60617,7 @@ impl Simulator {
         self.settle_entries_view = (entries.as_ptr(), entries.len());
         let dep_offsets = std::mem::take(&mut self.comb_dep_offsets);
         let dep_entries = std::mem::take(&mut self.comb_dep_entries);
-        let dep_edges = std::mem::take(&mut self.comb_dep_edges);
+        let mut dep_edges = std::mem::take(&mut self.comb_dep_edges);
         debug_assert_eq!(dep_edges.len(), dep_entries.len());
         let tree_sig = std::mem::take(&mut self.is_clock_tree_signal);
         let tree_entry = std::mem::take(&mut self.is_clock_tree_entry);
@@ -59362,30 +60676,51 @@ impl Simulator {
         // with uninitialised inputs (see CombEntry::defer_at_time0).
         let skip_deferred_at_t0 = self.time == 0 && !self.comb_time0_fired;
         let seed_dirty_len = self.dirty_list.len();
-        for seed_idx in 0..seed_dirty_len {
-            let id = self.dirty_list[seed_idx];
-            if self.dirty_signals[id] {
-                self.dirty_signals[id] = false;
-                if id + 1 < dep_offsets.len() {
-                    let lo = dep_offsets[id] as usize;
-                    let hi = dep_offsets[id + 1] as usize;
-                    let tree_clk = tree_sig.get(id).copied().unwrap_or(false);
-                    for &eidx_u32 in &dep_entries[lo..hi] {
-                        let eidx = eidx_u32 as usize;
-                        if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
-                            continue;
-                        }
-                        // the eager clock-tree pass already evaluated these
-                        if tree_clk && tree_entry.get(eidx).copied().unwrap_or(false) {
-                            continue;
-                        }
-                        if !triggered[eidx] {
-                            triggered[eidx] = true;
-                            next_list.push(eidx);
+        // `$ctl`: whether a seeded signal's edges may carry a `CtlGate`
+        // mask (then a zero mask skips the dependent). Two instances, so a
+        // design without controlled gates runs the original loop.
+        macro_rules! seed_dirty {
+            ($ctl:expr) => {
+                for seed_idx in 0..seed_dirty_len {
+                    let id = self.dirty_list[seed_idx];
+                    if self.dirty_signals[id] {
+                        self.dirty_signals[id] = false;
+                        if id + 1 < dep_offsets.len() {
+                            let lo = dep_offsets[id] as usize;
+                            let hi = dep_offsets[id + 1] as usize;
+                            let tree_clk = tree_sig.get(id).copied().unwrap_or(false);
+                            let masked: bool = $ctl(id);
+                            for (j, &eidx_u32) in dep_entries[lo..hi].iter().enumerate() {
+                                let eidx = eidx_u32 as usize;
+                                if skip_deferred_at_t0 && entries[eidx].defer_at_time0 {
+                                    continue;
+                                }
+                                // A controlled `CtlGate` masked this edge
+                                // (static masks are never zero on such a
+                                // signal).
+                                if masked && dep_edges[lo + j].mask == 0 {
+                                    continue;
+                                }
+                                // the eager clock-tree pass already evaluated these
+                                if tree_clk && tree_entry.get(eidx).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                if !triggered[eidx] {
+                                    triggered[eidx] = true;
+                                    next_list.push(eidx);
+                                }
+                            }
                         }
                     }
                 }
-            }
+            };
+        }
+        if self.ctl_sig.is_empty() {
+            seed_dirty!(|_id: usize| false);
+        } else {
+            let ctl_sig = std::mem::take(&mut self.ctl_sig);
+            seed_dirty!(|id: usize| ctl_sig.get(id).copied().unwrap_or(false));
+            self.ctl_sig = ctl_sig;
         }
         self.dirty_list.clear();
         self.dirty_any = false;
@@ -60411,6 +61746,15 @@ impl Simulator {
                                 }
                                 note_toggle!(id);
                                 trigger_deps!(id, eidx, self.bit_chg_mask(dst.sig_id, dst.bit));
+                            }
+                            n_dc += 1;
+                        }
+                        // Out of line; a changed bit is recorded like a
+                        // two-state store and propagated by the shared
+                        // post-entry walk below (keeps this arm small).
+                        CombItem::CtlGate { slot } => {
+                            if let Some(dst) = self.ctl_gate_exec(*slot, &mut dep_edges, true) {
+                                note_toggle!(dst.sig_id as usize);
                             }
                             n_dc += 1;
                         }
@@ -64115,7 +65459,9 @@ impl Simulator {
                     // Check local stack
                     if !self.local_stack.is_empty() {
                         let last_idx = self.local_stack.len() - 1;
-                        if self.local_stack[last_idx].contains_key(name) {
+                        if let Some(prev_is_real) =
+                            self.local_stack[last_idx].get(name).map(|p| p.is_real)
+                        {
                             // §10.7: on assignment to a sized local, resize
                             // the RHS to the local's DECLARED width so a
                             // narrow signed literal sign-extends (e.g.
@@ -64135,7 +65481,12 @@ impl Simulator {
                             // text).
                             let is_str = self.string_signals.contains(name.as_str())
                                 || self.p_local_is_string(name);
-                            let fitted = if !val.is_real && !is_str {
+                            let fitted = if prev_is_real && !val.is_real && !is_str {
+                                // §6.12.2: an integral value assigned to a REAL
+                                // local converts; stored as integral bits, a
+                                // `real t; t = k; h = t / 2;` divided as integers.
+                                Value::from_f64(val.to_f64())
+                            } else if !val.is_real && !is_str {
                                 if let Some(&target_w) = self.widths.get(name) {
                                     let mut f = if val.width != target_w {
                                         val.resize_for_assign(target_w)
@@ -64154,12 +65505,7 @@ impl Simulator {
                                 } else {
                                     val.clone()
                                 }
-                            } else if val.is_real
-                                && !is_str
-                                && self.local_stack[last_idx]
-                                    .get(name)
-                                    .is_some_and(|p| !p.is_real)
-                            {
+                            } else if val.is_real && !is_str && !prev_is_real {
                                 // §6.12.2: a real assigned to an INTEGRAL local
                                 // rounds to the local's type — the module-variable
                                 // path did, the frame local kept the real, so an
@@ -77886,7 +79232,7 @@ impl Simulator {
                     }
                     self.auto_loop_vars.truncate(fe_auto_len);
                     self.restore_loop_vars(&fe_saved);
-                    if !self.return_flag {
+                    if !self.return_flag && self.disable_target.is_none() {
                         self.break_flag = false;
                     }
                     return;
@@ -77917,7 +79263,7 @@ impl Simulator {
                             self.exec_foreach_nested(&dims[..1], vars, body, None);
                             self.auto_loop_vars.truncate(fe_auto_len);
                             self.restore_loop_vars(&fe_saved);
-                            if !self.return_flag {
+                            if !self.return_flag && self.disable_target.is_none() {
                                 self.break_flag = false;
                             }
                             return;
@@ -77976,7 +79322,7 @@ impl Simulator {
                         }
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
-                        if !self.return_flag {
+                        if !self.return_flag && self.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         return;
@@ -78085,8 +79431,12 @@ impl Simulator {
                 self.restore_loop_vars(&fe_saved);
                 // A `break` inside the loop consumed the loop exit.
                 // Only a `return` (return_flag) should propagate to
-                // the enclosing function body (IEEE 1800-2023 §12.8).
-                if !self.return_flag {
+                // the enclosing function body (IEEE 1800-2023 §12.8) —
+                // and a `disable` (§9.6.2), which unwinds to the block or
+                // task it names: consuming it as a `break` finished the
+                // disabled task's remaining statements and left the target
+                // set for an unrelated later loop to trip over.
+                if !self.return_flag && self.disable_target.is_none() {
                     self.break_flag = false;
                 }
                 return;
@@ -78278,7 +79628,7 @@ impl Simulator {
                         self.exec_foreach_nested_dir(&dims, vars, body, None, Some(&descs));
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
-                        if !self.return_flag {
+                        if !self.return_flag && self.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         return;
@@ -78302,7 +79652,7 @@ impl Simulator {
                         self.exec_foreach_nested(&dims[..1], vars, body, None);
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
-                        if !self.return_flag {
+                        if !self.return_flag && self.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         return;
@@ -78396,7 +79746,7 @@ impl Simulator {
                         );
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
-                        if !self.return_flag {
+                        if !self.return_flag && self.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         return;
@@ -78473,7 +79823,7 @@ impl Simulator {
                         }
                         self.auto_loop_vars.truncate(fe_auto_len);
                         self.restore_loop_vars(&fe_saved);
-                        if !self.return_flag {
+                        if !self.return_flag && self.disable_target.is_none() {
                             self.break_flag = false;
                         }
                         return;
@@ -78728,7 +80078,7 @@ impl Simulator {
         }
         self.auto_loop_vars.truncate(fe_auto_len);
         self.restore_loop_vars(&fe_saved);
-        if !self.return_flag {
+        if !self.return_flag && self.disable_target.is_none() {
             self.break_flag = false;
         }
     }
@@ -82040,6 +83390,10 @@ impl Simulator {
                         self.forced_names.remove(name);
                     }
                     self.assign_value(lvalue, &v);
+                    // A net's gate must see the override (and, for a shape
+                    // degraded to a plain write, overwrite it on the next
+                    // input change exactly as before).
+                    self.ctl_note_deposit(lvalue);
                     match target {
                         Some((ref name, Some(id))) => {
                             self.force_cell(id, v);
@@ -83695,6 +85049,7 @@ impl Simulator {
                         v = v.resize(w);
                     }
                     self.assign_value(&args[0], &v);
+                    self.ctl_note_deposit(&args[0]);
                 } else {
                     eprintln!(
                         "Warning: $deposit expects (target, value) — got {} args",
@@ -88618,6 +89973,9 @@ impl Simulator {
                     if self.signal_name_to_id.contains_key(scoped.as_str()) {
                         return scoped;
                     }
+                    // An input-port net of this instance, left out as
+                    // unobserved, would have been found right here.
+                    self.signal_name_to_id.check_miss(scoped.as_str());
                 }
                 // No activation (build/detection eval): hint-first, the
                 // order those contexts are built around. A stale
@@ -88725,6 +90083,13 @@ impl Simulator {
         // On c910, this scan over 35.7M signals dominated time-0 settle
         // (575s / 11K probes).
         if hier.path.len() == 1 && !leaf.contains('.') {
+            // An elided input port with this leaf could have been the match
+            // this heuristic picked before the port was left out.
+            if !self.module.elided_port_leaves.is_empty()
+                && self.module.elided_port_leaves.contains(leaf.as_str())
+            {
+                names::report_elided_lookup(&leaf);
+            }
             // Use leaf-name reverse index — O(1) instead of O(N) scan.
             let candidates: Vec<&str> = self
                 .leaf_name_to_ids
@@ -89990,6 +91355,7 @@ impl Simulator {
                         }
                     }
                     CombItem::FusedGate { .. }
+                    | CombItem::CtlGate { .. }
                     | CombItem::FusedBufFanout { .. }
                     | CombItem::FusedAndFanout { .. }
                     | CombItem::GateRegion { .. }
@@ -91670,6 +93036,8 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
+        // §6.11.1: a two-state destination drops x/z, as the VM's stores do.
+        let (val_bits, xz_bits) = self.ts_scrub_two_state(id, val_bits, xz_bits);
         let sig_w = self.signal_widths[id];
         let w = if width == 0 { sig_w } else { width };
         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
@@ -91735,6 +93103,8 @@ impl Simulator {
         if id >= self.signal_table.len() {
             return;
         }
+        // §6.11.1: a two-state destination drops x/z, as the VM's stores do.
+        let (val_bits, xz_bits) = self.ts_scrub_two_state(id, val_bits, xz_bits);
         let sig_w = self.signal_widths[id];
         let w = if width == 0 { sig_w } else { width };
         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
@@ -96343,7 +97713,9 @@ impl Simulator {
             _ => "",
         };
         let scope_key: &str = tref.scope.as_ref().map(|s| s.name.as_str()).unwrap_or("");
-        let ncls = self.module.classes.len();
+        // A specialization's own class entry (`wrap_c<derived_c>`) is no
+        // name any source can spell, so making one does not stale an entry.
+        let ncls = self.module.classes.len() - self.spec_clone_origin.len();
         {
             let memo = self.typeref_class_memo.borrow();
             if let Some((n, hit)) = memo
@@ -97303,6 +98675,11 @@ impl Simulator {
         let child = chain[k - 1];
         let i = chain[k].param_order.iter().position(|p| p == name)?;
         let a = child.extends_type_args.get(i)?.trim();
+        if Self::spec_projection(a).is_some() {
+            return Self::carry_extends_arg(a, &|p| {
+                Self::carried_type_binding(bindings, chain, k - 1, p)
+            });
+        }
         Some(Self::carried_type_binding(bindings, chain, k - 1, a).unwrap_or_else(|| a.to_string()))
     }
 
@@ -98018,7 +99395,12 @@ impl Simulator {
         let mut v = match self.signals.get(name).cloned() {
             Some(v) => v,
             None => {
-                let alt = strip_genblk_segments(name)?;
+                let Some(alt) = strip_genblk_segments(name) else {
+                    // A name read at run time that nothing holds: an input
+                    // port net left out as unobserved would have held it.
+                    self.signal_name_to_id.check_miss(name);
+                    return None;
+                };
                 return self.get_signal_value_by_name(&alt);
             }
         };
@@ -103777,6 +105159,160 @@ impl Simulator {
         self.frame_gen
     }
 
+    /// Run a `StmtFallback` that names register-backed locals: they are
+    /// bound in a fresh interpreter frame for the statement's duration and
+    /// copied back to their registers afterwards (see `FbLocal`). A fresh
+    /// frame, not the caller's: a compiled block has no interpreter frame of
+    /// its own, and one that runs nested (a comb entry settling inside a
+    /// task) must not see — or write — the task's locals.
+    #[inline(never)]
+    fn fb_exec_stmt_with_locals(&mut self, locals: &[super::bytecode::FbLocal], s: &Statement) {
+        let at = self.fb_frame_push(locals);
+        self.exec_statement(s);
+        self.fb_frame_pop(locals, at);
+    }
+
+    /// `fb_exec_stmt_with_locals` for an `EvalExprFallback`.
+    #[inline(never)]
+    fn fb_eval_expr_with_locals(
+        &mut self,
+        locals: &[super::bytecode::FbLocal],
+        e: &Expression,
+        ctxw: u32,
+    ) -> Value {
+        let at = self.fb_frame_push(locals);
+        let v = self.eval_expr_ctx(e, ctxw);
+        self.fb_frame_pop(locals, at);
+        v
+    }
+
+    /// Bind each carried local to its register's value, retyped to the
+    /// declaration (the register may hold an unstamped flag), in a new
+    /// frame. The interpreter also types a local BY NAME — `widths` fits a
+    /// write, `signed_signals`/`real_signals` stamp it, `string_signals`
+    /// makes it text for `%p` and concatenation — registrations an
+    /// interpreted declaration makes and a compiled one never did; they are
+    /// set for the statement's duration and restored after it. Returns the
+    /// frame depth and the mark of the saved registrations.
+    fn fb_frame_push(&mut self, locals: &[super::bytecode::FbLocal]) -> (usize, usize) {
+        use super::bytecode::LocalKind;
+        let depth = self.local_stack.len();
+        let mark = self.fb_meta_saves.len();
+        let mut f = self.take_pooled_frame();
+        for l in locals {
+            let v = Self::fb_fit(self.vm_regs[l.reg as usize].clone(), l.kind);
+            f.insert(l.name.to_string(), v);
+            let name = l.name.as_ref();
+            let cur = (
+                self.widths.get(name).copied(),
+                self.signed_signals.contains(name),
+                self.real_signals.contains(name),
+                self.string_signals.contains(name),
+            );
+            let want = match l.kind {
+                LocalKind::Int { width, signed } => (Some(width), signed, false, false),
+                LocalKind::Real => (Some(64), false, true, false),
+                // Text is exempt from width fitting; leave `widths` alone.
+                LocalKind::Str => (cur.0, false, false, true),
+            };
+            if cur != want {
+                self.fb_meta_saves
+                    .push((name.to_string(), cur.0, cur.1, cur.2, cur.3));
+                self.fb_meta_apply(name, want);
+            }
+        }
+        self.push_local_frame(f);
+        (depth, mark)
+    }
+
+    fn fb_meta_apply(&mut self, name: &str, m: (Option<u32>, bool, bool, bool)) {
+        match m.0 {
+            Some(w) => {
+                self.widths.insert(name.to_string(), w);
+            }
+            None => {
+                self.widths.remove(name);
+            }
+        }
+        if m.1 {
+            self.signed_signals.insert(name.to_string());
+        } else {
+            self.signed_signals.remove(name);
+        }
+        if m.2 {
+            self.real_signals.insert(name.to_string());
+        } else {
+            self.real_signals.remove(name);
+        }
+        if m.3 {
+            self.string_signals.insert(name.to_string());
+        } else {
+            self.string_signals.remove(name);
+        }
+    }
+
+    /// Pop the frame `fb_frame_push` made and copy each local back to its
+    /// register, fitted to its declaration as a compiled assignment would.
+    fn fb_frame_pop(&mut self, locals: &[super::bytecode::FbLocal], at: (usize, usize)) {
+        let (depth, mark) = at;
+        while self.fb_meta_saves.len() > mark {
+            if let Some((name, w, sg, re, st)) = self.fb_meta_saves.pop() {
+                self.fb_meta_apply(&name, (w, sg, re, st));
+            }
+        }
+        // The statement ran to completion (no fallback that carries locals
+        // can suspend, return or disable an outer scope), so exactly our
+        // frame is on top; anything else is dropped rather than misread.
+        while self.local_stack.len() > depth + 1 {
+            self.pop_local_frame();
+        }
+        if self.local_stack.len() != depth + 1 {
+            return;
+        }
+        if let Some(mut f) = self.pop_local_frame_take() {
+            for l in locals {
+                if let Some(v) = f.remove(l.name.as_ref()) {
+                    let v = Self::fb_fit(v, l.kind);
+                    let slot = &mut self.vm_regs[l.reg as usize];
+                    if *slot != v {
+                        *slot = v;
+                    }
+                }
+            }
+            if self.frame_pool.len() < 64 {
+                f.clear();
+                self.frame_pool.push(f);
+            }
+        }
+    }
+
+    /// A value as the declared local holds it: integral at its width and
+    /// signedness, a real as a real (§6.12, §10.7).
+    fn fb_fit(v: Value, kind: super::bytecode::LocalKind) -> Value {
+        use super::bytecode::LocalKind;
+        match kind {
+            LocalKind::Int { width, signed } => {
+                let mut v = if v.is_real {
+                    Self::real_to_int(v.to_f64(), width.max(1))
+                } else if v.width != width || v.is_fill {
+                    v.resize_for_assign(width)
+                } else {
+                    v
+                };
+                v.is_signed = signed;
+                v
+            }
+            LocalKind::Real => {
+                if v.is_real {
+                    v
+                } else {
+                    Value::from_f64(v.to_f64())
+                }
+            }
+            LocalKind::Str => v,
+        }
+    }
+
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {
         if self.name_stats_on {
             self.name_stats[2].set(self.name_stats[2].get() + 1);
@@ -104034,10 +105570,46 @@ impl Simulator {
                     _ => None,
                 })
         });
-        declared_tn
+        if declared_tn
             .as_deref()
             .and_then(|tn| self.resolve_typeref_class_name_str(tn))
             .is_some()
+        {
+            return true;
+        }
+        // Class-PROPERTY rung (§6.20.2/§8.25): a bare name that is a property
+        // of the enclosing class context is a class-object channel when the
+        // property's CONCRETE type is a class. `class_prop_type_named` passes
+        // a type-parameter name through (§6.20.3), so resolve it against the
+        // running method's instance bindings first: a property declared with a
+        // class TYPE PARAMETER (`class p #(type CFG = cfg_c); CFG a;`) named no
+        // class, so `a.member = v` failed this receiver gate, fell out of the
+        // MemberAccess lvalue arm, and the write was silently dropped.
+        if let Some(ctx) = self.class_context_stack.last().cloned().flatten()
+            && let Some(tn) = self.class_prop_type_named(&ctx, name)
+        {
+            let mut concrete = tn;
+            if let Some(h) = self
+                .this_stack
+                .last()
+                .copied()
+                .flatten()
+                .filter(|&h| h != 0)
+            {
+                if let Some(bound) = self
+                    .heap
+                    .get(h)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|inst| inst.type_bindings.get(&concrete))
+                {
+                    concrete = bound.clone();
+                }
+            }
+            if self.resolve_typeref_class_name_str(&concrete).is_some() {
+                return true;
+            }
+        }
+        false
     }
 
     /// id-collision-in-heap guard, shared name-only segment ladder: do
@@ -104410,6 +105982,13 @@ impl Simulator {
             return format!("class {}", concrete);
         }
         if let Some(n) = concrete.split('#').next() {
+            if self.module.classes.contains_key(n) {
+                // A specialization (`box#(byte)`): every parameter listed,
+                // spelled as for a declared class type.
+                if let Some((b, sig)) = self.extract_spec_from_string(concrete) {
+                    return self.class_spec_typename(&b, Some(&sig));
+                }
+            }
             if self.module.classes.contains_key(n) || self.module.covergroups.contains_key(n) {
                 return format!("class {}", concrete);
             }
@@ -112624,12 +114203,607 @@ impl Simulator {
         }
     }
 
+    /// Whether `name` is a `dep_base` class (its base depends on its
+    /// parameters).
+    fn is_dep_class(&self, name: &str) -> bool {
+        if self.dep_names.len() <= 8 {
+            self.dep_names.iter().any(|d| d == name)
+        } else {
+            self.dep_base.contains_key(name)
+        }
+    }
+
+    /// The class a specialized class entry was made from (`"wrap_c<d>"` ->
+    /// `"wrap_c"`); any other name is its own origin.
+    fn class_origin<'a>(&'a self, name: &'a str) -> &'a str {
+        // Every specialized entry's name ends in `>`; anything else is its
+        // own origin without a lookup (hot: hierarchy walks call this).
+        if self.spec_clone_origin.is_empty() || !name.ends_with('>') {
+            return name;
+        }
+        self.class_origin_slow(name)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn class_origin_slow<'a>(&'a self, name: &'a str) -> &'a str {
+        self.spec_clone_origin
+            .get(name)
+            .map(|s| s.as_str())
+            .unwrap_or(name)
+    }
+
+    /// A type fragment naming a class (`derived_c`, `pbase#(8)`, or a typedef
+    /// of either) as `(class, specialization args)`.
+    #[inline(never)]
+    fn type_base_frag_class(&self, frag: &str) -> Option<(String, Vec<String>)> {
+        let frag = frag.trim();
+        let (b, args) = Self::strip_class_specialization(frag);
+        let args: Vec<String> = args
+            .map(|a| Self::split_spec_args(&a))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .collect();
+        if self.module.classes.contains_key(&b) {
+            return Some((b, args));
+        }
+        if !args.is_empty() {
+            return None;
+        }
+        if let Some((rb, rsig)) = self.resolve_typedef_spec(&b) {
+            if self.module.classes.contains_key(&rb) {
+                let a = Self::split_spec_args(&rsig)
+                    .into_iter()
+                    .map(|a| a.trim().to_string())
+                    .collect();
+                return Some((rb, a));
+            }
+        }
+        self.resolve_typeref_class_name_str(&b)
+            .filter(|r| self.module.classes.contains_key(r))
+            .map(|r| (r, Vec::new()))
+    }
+
+    /// The base link `(base class, base args)` of `dep_base` class `cname`
+    /// under the specialization fragments `args` (positional; a missing
+    /// position takes its declared default, §6.20.2). The base class is an
+    /// ORIGIN name; `spec_class_name` maps it to its specialized entry.
+    #[inline(never)]
+    fn spec_base_link(&self, cname: &str, args: &[String]) -> Option<(String, Vec<String>)> {
+        let (ext, ext_args) = self.dep_base.get(cname)?;
+        let cd = self.module.classes.get(cname)?;
+        let order = &cd.param_order;
+        let mut bound: Vec<String> = Vec::with_capacity(order.len());
+        for i in 0..order.len() {
+            let v = match args.get(i).map(|a| a.trim()).filter(|a| !a.is_empty()) {
+                Some(a) => a.to_string(),
+                None => match self.param_default_fragment(cd, i, &bound) {
+                    Some(v) => v,
+                    None => break,
+                },
+            };
+            bound.push(v);
+        }
+        let subst = |s: &str| {
+            let mut out = s.trim().to_string();
+            for (j, p) in order.iter().enumerate() {
+                if let Some(v) = bound.get(j) {
+                    out = Self::replace_ident_token(&out, p, v.trim());
+                }
+            }
+            out
+        };
+        let (b, bargs) = if cd.type_param_names.iter().any(|t| t == ext) {
+            let j = order.iter().position(|p| p == ext)?;
+            let supplied = args.get(j).is_some_and(|a| !a.trim().is_empty());
+            // The declared default keeps its own specialization
+            // (`type BASE = uvm_sequence #(uvm_reg_item)`); the textual
+            // default fragment drops it.
+            let dflt = (!supplied)
+                .then(|| self.type_param_default_spec_frag(cd, ext))
+                .flatten()
+                .map(|d| subst(&d));
+            match dflt {
+                Some(d) => self.type_base_frag_class(&d)?,
+                None => self.type_base_frag_class(bound.get(j)?)?,
+            }
+        } else {
+            let (b, _) = self.type_base_frag_class(ext)?;
+            (b, ext_args.iter().map(|a| subst(a)).collect())
+        };
+        let bargs = if self.class_is_parameterized(&b) && !bargs.is_empty() {
+            let canon = self.canonicalize_spec_sig(&b, &bargs.join(","));
+            Self::split_spec_args(&canon)
+                .into_iter()
+                .map(|a| a.trim().to_string())
+                .collect()
+        } else {
+            bargs
+        };
+        Some((b, bargs))
+    }
+
+    /// The type parameter a `dep_base` class extends (`BASE` in `class
+    /// wrap_c #(type BASE) extends BASE`); None for one extending a class.
+    fn dep_type_param(&self, cname: &str) -> Option<String> {
+        let (e, _) = self.dep_base.get(cname)?;
+        let cd = self.module.classes.get(cname)?;
+        cd.type_param_names
+            .iter()
+            .any(|t| t == e)
+            .then(|| e.clone())
+    }
+
+    /// The binding of type parameter `p` of `child`, a class on the chain of
+    /// an object of leaf entry `leaf` (declared class `origin`) under
+    /// construction: from the active specialization for the leaf itself,
+    /// else derived up the chain. Only a `BASE#[i]` projection asks.
+    #[cold]
+    #[inline(never)]
+    fn child_type_binding(
+        &self,
+        origin: &str,
+        leaf: &crate::compiler::elaborate::ElaboratedClass,
+        child: &crate::compiler::elaborate::ElaboratedClass,
+        p: &str,
+        type_args: Option<&[Expression]>,
+    ) -> Option<String> {
+        let explicit = type_args.is_some_and(|ta| !ta.is_empty());
+        let leaf_sig: Option<String> = if explicit {
+            let frags: Vec<String> = type_args
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|e| self.expr_to_spec_fragment(e))
+                .collect();
+            Some(self.canonicalize_spec_sig(origin, &frags.join(",")))
+        } else {
+            self.current_spec
+                .as_ref()
+                .filter(|(b, _)| b == origin)
+                .map(|(_, s)| s.clone())
+                .or_else(|| {
+                    self.class_is_parameterized(origin)
+                        .then(|| self.canonicalize_spec_sig(origin, ""))
+                })
+        };
+        let child_sig = if child.name == leaf.name {
+            leaf_sig?
+        } else {
+            match leaf_sig {
+                Some(ls) => self.ancestor_spec(origin, &ls, &child.name)?,
+                None => self.static_receiver_spec(&leaf.name, &child.name)?.1,
+            }
+        };
+        let j = child.param_order.iter().position(|x| x == p)?;
+        Self::spec_arg_at(&child_sig, j)
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+            .or_else(|| {
+                child
+                    .type_param_defaults
+                    .iter()
+                    .find(|(n, _)| n == p)
+                    .map(|(_, d)| d.clone())
+            })
+    }
+
+    /// The `extends` arguments of a class whose base is type parameter `tp`
+    /// bound to a specialization of `base`: argument `i` is `tp#[i]`, the
+    /// i-th argument of whatever `tp` is bound to (`spec_projection`).
+    fn base_projection_args(&self, tp: &str, base: &str) -> Vec<String> {
+        let n = self
+            .module
+            .classes
+            .get(base)
+            .map(|b| b.param_order.len())
+            .unwrap_or(0);
+        (0..n).map(|i| format!("{}#[{}]", tp, i)).collect()
+    }
+
+    /// `P#[i]` in an `extends` argument list: the i-th `#(...)` argument of
+    /// the specialization bound to type parameter `P`.
+    fn spec_projection(frag: &str) -> Option<(&str, usize)> {
+        let f = frag.trim();
+        if !f.ends_with(']') {
+            return None;
+        }
+        let (p, rest) = f.split_once("#[")?;
+        Some((p, rest.strip_suffix(']')?.parse().ok()?))
+    }
+
+    /// Argument `i` of specialization `binding` (`pbase#(8)`, 0 -> `8`).
+    /// None when the binding does not spell it (its default applies).
+    fn project_spec_arg(binding: &str, i: usize) -> Option<String> {
+        let (_, args) = Self::strip_class_specialization(binding.trim());
+        Self::split_spec_args(&args?)
+            .get(i)
+            .map(|a| a.trim().to_string())
+            .filter(|a| !a.is_empty())
+    }
+
+    /// One `extends` argument of a child class carried up a level:
+    /// a projection `P#[i]` reads the child's binding of `P` through
+    /// `lookup`; a bare name is looked up as a parameter of the child.
+    /// None when it is neither (the caller keeps it as written) or the
+    /// projected argument is not spelled.
+    fn carry_extends_arg(arg: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+        match Self::spec_projection(arg) {
+            Some((p, i)) => lookup(p).and_then(|b| Self::project_spec_arg(&b, i)),
+            None => lookup(arg.trim()),
+        }
+    }
+
+    /// The declared default of type parameter `tp` of `cd` as a fragment
+    /// WITH its `#(...)` arguments (`uvm_sequence#(uvm_reg_item)`), when it
+    /// is a specialized class type.
+    fn type_param_default_spec_frag(
+        &self,
+        cd: &crate::compiler::elaborate::ElaboratedClass,
+        tp: &str,
+    ) -> Option<String> {
+        let (_, dt) = cd.type_param_default_types.iter().find(|(n, _)| n == tp)?;
+        let DataType::TypeReference {
+            name, type_args, ..
+        } = dt
+        else {
+            return None;
+        };
+        if type_args.is_empty() {
+            return None;
+        }
+        let frags: Vec<String> = type_args
+            .iter()
+            .map(|a| self.expr_to_spec_fragment(a))
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!("{}#({})", name.name.name, frags.join(",")))
+    }
+
+    /// The class entry `new` builds for `dep_base` class `cname`: the one of
+    /// the specialization given by `#(...)`, else of the active one when it
+    /// is this class's (`typedef wrap_c #(derived_c) wd_t; wd_t w = new;`),
+    /// else of the default. None when that is `cname` itself.
+    #[cold]
+    #[inline(never)]
+    fn spec_entry_for_new(
+        &mut self,
+        cname: &str,
+        type_args: Option<&[Expression]>,
+        computed_spec: Option<&(String, String)>,
+    ) -> Option<std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>> {
+        let explicit = type_args.is_some_and(|ta| !ta.is_empty());
+        let active = self
+            .current_spec
+            .as_ref()
+            .filter(|(b, _)| !explicit && *b == cname);
+        let args: Vec<String> = active
+            .or(computed_spec)
+            .map(|(_, sig)| {
+                Self::split_spec_args(sig)
+                    .into_iter()
+                    .map(|a| a.trim().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let key = self.ensure_spec_class(cname, &args);
+        (key != cname)
+            .then(|| self.module.classes.get(&key).cloned())
+            .flatten()
+    }
+
+    /// The class entry of specialization `(base, sig)` if one was made, else
+    /// `base` itself.
+    fn spec_entry(&self, base: &str, sig: &str) -> String {
+        self.spec_entry_cow(base, sig).into_owned()
+    }
+
+    /// `spec_entry` without a copy when `base` is its own entry (hot: the
+    /// type-parameter and static-key resolvers call it per lookup).
+    fn spec_entry_cow<'a>(&self, base: &'a str, sig: &str) -> std::borrow::Cow<'a, str> {
+        if self.spec_clone_origin.is_empty() || !self.is_dep_class(base) {
+            return std::borrow::Cow::Borrowed(base);
+        }
+        std::borrow::Cow::Owned(self.spec_entry_slow(base, sig))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn spec_entry_slow(&self, base: &str, sig: &str) -> String {
+        let key = format!("{}\0{}", base, sig);
+        if let Some(hit) = self.spec_entry_cache.borrow().get(&key) {
+            return hit.clone();
+        }
+        let args: Vec<String> = Self::split_spec_args(sig)
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .collect();
+        let n = self.spec_class_name(base, &args);
+        // An entry not made yet may be made later: only a settled answer
+        // (the class itself, or an existing entry) is remembered.
+        if n == base || self.module.classes.contains_key(&n) {
+            self.spec_entry_cache.borrow_mut().insert(key, n.clone());
+            n
+        } else {
+            base.to_string()
+        }
+    }
+
+    /// §8.25: the class entry for specialization `args` of `cname`. A class
+    /// whose base does not depend on its parameters, and a specialization
+    /// whose base is the default one's class, is the class itself; any other
+    /// is `"<cname><<base entry>>"`, made by `ensure_spec_class`. The base's
+    /// own arguments are not part of the entry: they reach the base through
+    /// the specialization (`BASE#[i]`, see `spec_projection`).
+    fn spec_class_name(&self, cname: &str, args: &[String]) -> String {
+        self.spec_class_name_depth(cname, args, 0)
+    }
+
+    #[inline(never)]
+    fn spec_class_name_depth(&self, cname: &str, args: &[String], depth: usize) -> String {
+        if depth > 32 || !self.dep_base.contains_key(cname) {
+            return cname.to_string();
+        }
+        let Some(link) = self.spec_base_link(cname, args) else {
+            return cname.to_string();
+        };
+        let bkey = self.spec_class_name_depth(&link.0, &link.1, depth + 1);
+        if self.dep_default.get(cname) == Some(&bkey) {
+            return cname.to_string();
+        }
+        format!("{}<{}>", cname, bkey)
+    }
+
+    /// Make (once) the class entry `spec_class_name(cname, args)` names: a
+    /// copy of `cname` whose `extends` is this specialization's base, so
+    /// every walk up the hierarchy from an instance of it — construction,
+    /// inherited properties and their initializers, method lookup, `super.`,
+    /// `$cast` — sees the bound base class.
+    fn ensure_spec_class(&mut self, cname: &str, args: &[String]) -> String {
+        self.ensure_spec_class_depth(cname, args, 0)
+    }
+
+    #[inline(never)]
+    fn ensure_spec_class_depth(&mut self, cname: &str, args: &[String], depth: usize) -> String {
+        let name = self.spec_class_name(cname, args);
+        if name == cname || self.module.classes.contains_key(&name) || depth > 32 {
+            return name;
+        }
+        let Some((b, bargs)) = self.spec_base_link(cname, args) else {
+            return cname.to_string();
+        };
+        let bkey = self.ensure_spec_class_depth(&b, &bargs, depth + 1);
+        let Some(orig) = self.module.classes.get(cname) else {
+            return cname.to_string();
+        };
+        let mut c = (**orig).clone();
+        c.name = name.clone();
+        c.extends = Some(bkey);
+        if let Some(tp) = self.dep_type_param(cname) {
+            // A type parameter takes no `#(...)`: any `extends BASE(args)`
+            // arguments are the base constructor's (§8.7) and stay.
+            c.extends_type_args = self.base_projection_args(&tp, &b);
+        }
+        self.module
+            .classes
+            .insert(name.clone(), std::sync::Arc::new(c));
+        self.spec_clone_origin
+            .insert(name.clone(), cname.to_string());
+        name
+    }
+
+    /// §8.25 / §8.3: link every class whose base class depends on its
+    /// parameters. `class wrap_c #(type BASE = base_c) extends BASE;` stored
+    /// `extends = "BASE"`, which names no class, so every walk up the
+    /// hierarchy stopped at `wrap_c` — no base constructor, no inherited
+    /// properties or methods, an empty `super.`, a failing upcast. The class
+    /// entry takes its DEFAULT specialization's base; a specialization that
+    /// binds a base of another class gets its own entry (`ensure_spec_class`),
+    /// which `new` constructs and an `extends` clause naming it links to.
+    #[inline(never)]
+    fn link_type_param_bases(&mut self) {
+        let mut names: Vec<String> = self.module.classes.keys().cloned().collect();
+        names.sort();
+        // §6.20.3: a type parameter's default that is itself a specialization
+        // (`type BASE = uvm_sequence #(uvm_reg_item)`, `type B = box#(T)`)
+        // keeps its arguments. The textual default kept only the class name,
+        // so the unspecialized class bound the base's DEFAULT specialization.
+        for c in &names {
+            let Some(cd) = self.module.classes.get(c) else {
+                continue;
+            };
+            let mut fixed: Vec<(usize, String)> = Vec::new();
+            for (i, (tp, frag)) in cd.type_param_defaults.iter().enumerate() {
+                if frag.contains('#') {
+                    continue;
+                }
+                let Some(full) = self.type_param_default_spec_frag(cd, tp) else {
+                    continue;
+                };
+                // Arguments naming this class's own parameters stay as
+                // written: each specialization substitutes them.
+                let (b, args) = Self::strip_class_specialization(&full);
+                let args = args.unwrap_or_default();
+                let names_param = Self::split_spec_args(&args)
+                    .iter()
+                    .any(|a| cd.param_order.iter().any(|p| p == a.trim()));
+                let full = if names_param || !self.module.classes.contains_key(&b) {
+                    full
+                } else {
+                    format!("{}#({})", b, self.canonicalize_spec_sig(&b, &args))
+                };
+                fixed.push((i, full));
+            }
+            if fixed.is_empty() {
+                continue;
+            }
+            if let Some(cd) = self.module.classes.get_mut(c).map(std::sync::Arc::make_mut) {
+                for (i, full) in fixed {
+                    cd.type_param_defaults[i].1 = full;
+                }
+            }
+        }
+        for c in &names {
+            let Some(cd) = self.module.classes.get(c) else {
+                continue;
+            };
+            if let Some(e) = &cd.extends {
+                if cd.type_param_names.iter().any(|t| t == e) {
+                    self.dep_base
+                        .insert(c.clone(), (e.clone(), cd.extends_type_args.clone()));
+                }
+            }
+        }
+        if self.dep_base.is_empty() {
+            return;
+        }
+        // A class extending such a class with arguments naming its own
+        // parameters (`class wrap2_c #(type B) extends wrap_c #(B)`).
+        loop {
+            let mut added = false;
+            for c in &names {
+                if self.dep_base.contains_key(c) {
+                    continue;
+                }
+                let Some(cd) = self.module.classes.get(c) else {
+                    continue;
+                };
+                let Some(e) = cd.extends.clone() else {
+                    continue;
+                };
+                let Some((b, _)) = self.type_base_frag_class(&e) else {
+                    continue;
+                };
+                if !self.dep_base.contains_key(&b) {
+                    continue;
+                }
+                let names_param = cd.extends_type_args.iter().any(|a| {
+                    cd.param_order
+                        .iter()
+                        .any(|p| Self::replace_ident_token(a, p, "\u{1}") != *a)
+                });
+                if names_param {
+                    let ea = cd.extends_type_args.clone();
+                    self.dep_base.insert(c.clone(), (e, ea));
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        self.dep_names = self.dep_base.keys().cloned().collect();
+        // Default links, bases first.
+        let dep: Vec<String> = names
+            .iter()
+            .filter(|c| self.dep_base.contains_key(*c))
+            .cloned()
+            .collect();
+        for _ in 0..dep.len() + 1 {
+            let mut progress = false;
+            for c in &dep {
+                if self.dep_default.contains_key(c) {
+                    continue;
+                }
+                let Some(link) = self.spec_base_link(c, &[]) else {
+                    continue;
+                };
+                if self.dep_base.contains_key(&link.0) && !self.dep_default.contains_key(&link.0) {
+                    continue;
+                }
+                let bkey = self.ensure_spec_class(&link.0, &link.1);
+                let proj = self
+                    .dep_type_param(c)
+                    .map(|tp| self.base_projection_args(&tp, &link.0));
+                if let Some(cd) = self.module.classes.get_mut(c).map(std::sync::Arc::make_mut) {
+                    cd.extends = Some(bkey.clone());
+                    if let Some(proj) = proj {
+                        cd.extends_type_args = proj;
+                    }
+                }
+                self.dep_default.insert(c.clone(), bkey);
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+        // A class extending a specialization of one (`class leaf_c extends
+        // wrap_c #(derived_c)`, or through a typedef of it) links to that
+        // specialization's entry.
+        for c in &names {
+            if self.dep_base.contains_key(c) {
+                continue;
+            }
+            let Some(cd) = self.module.classes.get(c) else {
+                continue;
+            };
+            let Some(e) = cd.extends.clone() else {
+                continue;
+            };
+            let direct = self.module.classes.contains_key(&e);
+            let Some((b, targs)) = self.type_base_frag_class(&e) else {
+                continue;
+            };
+            if !self.dep_base.contains_key(&b) {
+                continue;
+            }
+            let args: Vec<String> = if direct {
+                cd.extends_type_args.clone()
+            } else {
+                targs
+            };
+            let args = if args.is_empty() {
+                args
+            } else {
+                Self::split_spec_args(&self.canonicalize_spec_sig(&b, &args.join(",")))
+                    .into_iter()
+                    .map(|a| a.trim().to_string())
+                    .collect()
+            };
+            let key = self.ensure_spec_class(&b, &args);
+            if let Some(cd) = self.module.classes.get_mut(c).map(std::sync::Arc::make_mut) {
+                if !direct && cd.extends_type_args.is_empty() {
+                    cd.extends_type_args = args;
+                }
+                cd.extends = Some(key);
+            }
+        }
+        let mut found: Vec<String> = Vec::new();
+        let typedefs = self.module.typedef_types.iter().chain(
+            self.module
+                .classes
+                .values()
+                .flat_map(|cd| cd.typedef_targets.iter()),
+        );
+        for (t, dt) in typedefs {
+            // Only a typedef naming a `dep_base` class with arguments can
+            // qualify; resolving every typedef of the design is not cheap.
+            let DataType::TypeReference {
+                name, type_args, ..
+            } = dt
+            else {
+                continue;
+            };
+            if type_args.is_empty() || !self.dep_base.contains_key(&name.name.name) {
+                continue;
+            }
+            if self
+                .spec_from_typedef_dt(dt)
+                .is_some_and(|(b, _)| self.dep_base.contains_key(&b))
+            {
+                found.push(t.clone());
+            }
+        }
+        self.dep_typedefs.extend(found);
+    }
+
     /// Break any cycle in the class `extends` graph. A self- or mutually-
     /// referential `extends` (which can arise from a parameterized class
     /// whose base resolves to the same name) would make every ancestor-
     /// chain walk loop forever. Walk each class's chain; the first edge
     /// that revisits an already-seen class is cleared to `None`.
     fn sanitize_class_hierarchy(&mut self) {
+        self.link_type_param_bases();
         let names: Vec<String> = self.module.classes.keys().cloned().collect();
         // Resolve each `extends` base that is a typedef ALIAS to its concrete
         // class key. `class d extends simple_lib` where `simple_lib` is
@@ -112866,7 +115040,7 @@ impl Simulator {
     fn class_extends(&self, derived: &str, ancestor: &str) -> bool {
         let mut cur: Option<&str> = Some(derived);
         while let Some(cname) = cur {
-            if cname == ancestor {
+            if cname == ancestor || self.class_origin(cname) == ancestor {
                 return true;
             }
             cur = self
@@ -112878,9 +115052,20 @@ impl Simulator {
 
     fn run_one_spec_statics(&mut self, base: &str, sig: &str) {
         // Collect all static-call initializers from the class hierarchy.
+        // §8.25: the chain of THIS specialization — its own class entry when
+        // its base is a bound type parameter.
+        let start = if self.dep_base.contains_key(base) {
+            let args: Vec<String> = Self::split_spec_args(sig)
+                .into_iter()
+                .map(|a| a.trim().to_string())
+                .collect();
+            self.ensure_spec_class(base, &args)
+        } else {
+            base.to_string()
+        };
         let inits: Vec<(String, String, Expression)> = {
             let mut acc = Vec::new();
-            let mut cur = Some(base.to_string());
+            let mut cur = Some(start);
             while let Some(cname) = cur {
                 if let Some(cd) = self.get_class_def(&cname) {
                     for (prop, expr) in &cd.property_inits {
@@ -112973,8 +115158,10 @@ impl Simulator {
                 }
             }
         }
-        // Walk the extends chain resolving type args at each hop.
-        let mut cur = leaf_class.to_string();
+        // Walk the extends chain resolving type args at each hop — from the
+        // specialization's own class entry when its base is a bound type
+        // parameter (§8.25).
+        let mut cur = self.spec_entry(leaf_class, leaf_sig);
         let mut guard = 0;
         loop {
             guard += 1;
@@ -113024,52 +115211,66 @@ impl Simulator {
                 }
                 nm.to_string()
             };
-            let parent_args: Vec<String> = if cd.extends_args.len() == cd.extends_type_args.len() {
-                cd.extends_args
-                    .iter()
-                    .map(|e| {
-                        if let crate::ast::expr::ExprKind::Ident(h) = &e.kind {
-                            if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                                return name_arg(&h.path[0].name.name);
+            let has_proj = cd
+                .extends_type_args
+                .iter()
+                .any(|t| Self::spec_projection(t).is_some());
+            let parent_args: Vec<String> =
+                if !has_proj && cd.extends_args.len() == cd.extends_type_args.len() {
+                    cd.extends_args
+                        .iter()
+                        .map(|e| {
+                            if let crate::ast::expr::ExprKind::Ident(h) = &e.kind {
+                                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                                    return name_arg(&h.path[0].name.name);
+                                }
                             }
-                        }
-                        // An EXPRESSION extends-arg (`extends Base#(N * 3)`)
-                        // must be evaluated with this class's bindings — the
-                        // raw fragment "N*3" matches no registered spec and
-                        // the ancestor silently fell back to its defaults.
-                        let mut ptab: HashMap<String, Value> = HashMap::default();
-                        for (k, v) in &bindings {
-                            if let Ok(n) = v.parse::<i64>() {
-                                ptab.insert(k.clone(), Value::from_u64(n as u64, 32));
+                            // An EXPRESSION extends-arg (`extends Base#(N * 3)`)
+                            // must be evaluated with this class's bindings — the
+                            // raw fragment "N*3" matches no registered spec and
+                            // the ancestor silently fell back to its defaults.
+                            let mut ptab: HashMap<String, Value> = HashMap::default();
+                            for (k, v) in &bindings {
+                                if let Ok(n) = v.parse::<i64>() {
+                                    ptab.insert(k.clone(), Value::from_u64(n as u64, 32));
+                                }
                             }
-                        }
-                        if let Some(n) =
-                            super::elaborate::const_eval_i64_with_params(e, Some(&ptab))
-                        {
-                            return n.to_string();
-                        }
-                        self.expr_to_spec_fragment(e).unwrap_or_default()
-                    })
-                    .collect()
-            } else {
-                // A type argument written as a keyword type (`#(byte, 4)`) is
-                // no expression, so `extends_args` skips it and every later
-                // argument would shift one slot left; the textual list keeps
-                // every position.
-                cd.extends_type_args
-                    .iter()
-                    .map(|t| {
+                            if let Some(n) =
+                                super::elaborate::const_eval_i64_with_params(e, Some(&ptab))
+                            {
+                                return n.to_string();
+                            }
+                            self.expr_to_spec_fragment(e).unwrap_or_default()
+                        })
+                        .collect()
+                } else {
+                    // A type argument written as a keyword type (`#(byte, 4)`) is
+                    // no expression, so `extends_args` skips it and every later
+                    // argument would shift one slot left; the textual list keeps
+                    // every position.
+                    let mut v: Vec<String> = Vec::with_capacity(cd.extends_type_args.len());
+                    for t in &cd.extends_type_args {
                         let t = t.trim();
+                        if Self::spec_projection(t).is_some() {
+                            // `BASE#[i]`: an argument of this class's binding of
+                            // its base type parameter; one it does not spell
+                            // (and every later one) takes the base's default.
+                            match Self::carry_extends_arg(t, &|p| Some(name_arg(p))) {
+                                Some(a) => v.push(a),
+                                None => break,
+                            }
+                            continue;
+                        }
                         let is_name = t
                             .chars()
                             .next()
                             .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                             && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-                        if is_name { name_arg(t) } else { t.to_string() }
-                    })
-                    .collect()
-            };
-            if parent == ancestor_class {
+                        v.push(if is_name { name_arg(t) } else { t.to_string() });
+                    }
+                    v
+                };
+            if parent == ancestor_class || self.class_origin(&parent) == ancestor_class {
                 return Some(parent_args.join(","));
             }
             // Update bindings for the parent class.
@@ -113550,13 +115751,17 @@ impl Simulator {
             return None;
         }
         let mut cur = Some(start_class.to_string());
-        while let Some(cname) = cur {
-            if let Some(cd) = self.module.classes.get(&cname) {
+        while let Some(entry) = cur {
+            if let Some(cd) = self.module.classes.get(&entry) {
                 if cd.static_properties.contains(prop)
                     // Class `localparam` constants are accessible as static class
                     // members even though they are stored in `param_defaults`.
                     || cd.param_defaults.iter().any(|(name, _)| name == prop)
                 {
+                    // A specialization's own class entry (`wrap_c<derived_c>`)
+                    // shares its statics' keys with the declared class: the
+                    // specialization signature tells them apart (§8.25).
+                    let cname = self.class_origin(&entry).to_string();
                     // Per-specialization keying: when a `C#(params)::...` access
                     // is active, each specialization gets its own static cell.
                     // This applies to statics declared in the spec's base class
@@ -113573,7 +115778,9 @@ impl Simulator {
                         .or_else(|| self.derive_static_spec(start_class, &cname));
                     let key = match active_spec {
                         Some((base, sig))
-                            if (base == cname || self.class_extends(&base, &cname))
+                            if (base == cname
+                                || self
+                                    .class_extends(&self.spec_entry_cow(&base, &sig), &cname))
                                 && self.class_is_parameterized(&cname) =>
                         {
                             // For inherited statics (cname != base), derive
@@ -113647,9 +115854,9 @@ impl Simulator {
                 return None;
             }
             let cd = self.module.classes.get(cn)?;
-            if cn == ancestor {
+            if cn == ancestor || self.class_origin(cn) == ancestor {
                 let sig = self.rebind_class_sig(&cd, &carried);
-                return Some((cn.to_string(), sig));
+                return Some((self.class_origin(cn).to_string(), sig));
             }
             // Move to the parent, rebinding its type params from this class's
             // extends type args.
@@ -113666,9 +115873,25 @@ impl Simulator {
                 // run unbroken: the scope a later default is evaluated in.
                 let mut bound: Vec<String> = Vec::with_capacity(order.len());
                 for (i, pname) in order.iter().enumerate() {
-                    let v = if let Some(arg) = cd.extends_type_args.get(i) {
+                    let v = if let Some(arg) = cd
+                        .extends_type_args
+                        .get(i)
+                        .filter(|a| Self::spec_projection(a).is_none())
+                    {
                         let a = arg.trim();
                         Some(carried.get(a).cloned().unwrap_or_else(|| a.to_string()))
+                    } else if let Some(arg) = cd.extends_type_args.get(i) {
+                        // `BASE#[i]`: the argument of this class's binding of
+                        // its base type parameter, else the parent's default.
+                        Self::carry_extends_arg(arg, &|p| {
+                            carried.get(p).cloned().or_else(|| {
+                                cd.type_param_defaults
+                                    .iter()
+                                    .find(|(n, _)| n == p)
+                                    .map(|(_, d)| d.clone())
+                            })
+                        })
+                        .or_else(|| self.param_default_fragment(pcd, i, &bound))
                     } else {
                         // IEEE 1800-2023 §6.20.2: an extends clause that omits a
                         // parameter leaves it at its DECLARED DEFAULT, evaluated
@@ -117943,7 +120166,7 @@ impl Simulator {
             if guard > 128 {
                 break;
             }
-            if strip(&c) == base {
+            if strip(&c) == base || self.class_origin(&c) == base {
                 return true;
             }
             let nxt = self
@@ -118058,6 +120281,19 @@ impl Simulator {
                 if !is_a {
                     return false;
                 }
+                // §8.25: specializations of a class whose base is a type
+                // parameter are distinct class entries; the source must
+                // derive from the destination's own specialization.
+                if self.is_dep_class(&resolved)
+                    && !self.cast_dep_spec_ok(
+                        &src_class,
+                        &resolved,
+                        spec_args_from_name.as_deref(),
+                        dest,
+                    )
+                {
+                    return false;
+                }
                 // Value-parameter specialization check: if the dest class
                 // has value parameters, src and dest must agree on every
                 // one (e.g. $cast(me[special_comp#(2)], a1[#1]) must fail).
@@ -118070,9 +120306,119 @@ impl Simulator {
                     self.cast_type_params_ok(&resolved, spec_args_from_name.as_deref(), dest, h);
                 vp_ok && tp_ok
             }
-            None => true, // unknown dest type — stay permissive
+            None => {
+                // §8.25: a destination declared through a typedef of a
+                // specialization of a class whose base is a type parameter
+                // (`typedef wrap_c #(derived_c) wd_t; wd_t t;`) takes only
+                // that specialization; any other unknown type stays
+                // permissive.
+                self.dep_typedefs.is_empty()
+                    || self.cast_dep_typedef_ok(&src_class, dest).unwrap_or(true)
+            }
         }
     }
+    /// §8.25: `src_class` derives from the destination's own specialization
+    /// of `dep_base` class `resolved` (each is a distinct class entry).
+    #[cold]
+    #[inline(never)]
+    fn cast_dep_spec_ok(
+        &self,
+        src_class: &str,
+        resolved: &str,
+        from_name: Option<&str>,
+        dest: &Expression,
+    ) -> bool {
+        let want = self.spec_class_name(resolved, &self.cast_dest_spec_args(from_name, dest));
+        self.class_chain_has_entry(src_class, &want)
+    }
+
+    /// `$cast` to a destination declared through a typedef of a `dep_base`
+    /// specialization; None when the destination is not one.
+    #[cold]
+    #[inline(never)]
+    fn cast_dep_typedef_ok(&self, src_class: &str, dest: &Expression) -> Option<bool> {
+        let ExprKind::Ident(hh) = &dest.kind else {
+            return None;
+        };
+        if hh.path.len() != 1 {
+            return None;
+        }
+        let v = &hh.path[0].name.name;
+        let t = self.var_class_types.get(v).cloned().or_else(|| {
+            self.signal_name_to_id
+                .get(v)
+                .and_then(|id| self.signal_type_names.get(id))
+                .cloned()
+        })?;
+        if !self.dep_typedefs.contains(&t) {
+            return None;
+        }
+        let (b, sig) = self.resolve_typedef_spec(&t)?;
+        if !self.dep_base.contains_key(&b) {
+            return None;
+        }
+        let args: Vec<String> = Self::split_spec_args(&sig)
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .collect();
+        let want = self.spec_class_name(&b, &args);
+        Some(self.class_chain_has_entry(src_class, &want))
+    }
+
+    /// The `#(...)` arguments a `$cast` destination's type carries: the
+    /// resolved type name's, else the variable's declared ones (none for an
+    /// unspecialized declaration, which is the default specialization).
+    fn cast_dest_spec_args(&self, from_name: Option<&str>, dest: &Expression) -> Vec<String> {
+        let text = match from_name {
+            Some(a) => Some(a.to_string()),
+            None => match &dest.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => {
+                    let dvar = &h.path[0].name.name;
+                    self.var_type_args
+                        .get(dvar)
+                        .or_else(|| self.module.class_type_args.get(dvar))
+                        .and_then(|ta| {
+                            let frags: Vec<String> = ta
+                                .iter()
+                                .filter_map(|e| self.expr_to_spec_fragment(e))
+                                .collect();
+                            (frags.len() == ta.len()).then(|| frags.join(","))
+                        })
+                }
+                _ => None,
+            },
+        };
+        text.map(|t| {
+            Self::split_spec_args(&t)
+                .into_iter()
+                .map(|a| a.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Whether class entry `entry` is `start` or one of its ancestors, by
+    /// exact entry name.
+    fn class_chain_has_entry(&self, start: &str, entry: &str) -> bool {
+        let mut cur: Option<&str> = Some(start);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            if guard > 128 {
+                break;
+            }
+            if c == entry {
+                return true;
+            }
+            cur = self
+                .module
+                .classes
+                .get(c)
+                .and_then(|cd| cd.extends.as_deref());
+        }
+        false
+    }
+
     /// Parse a value-parameter spec fragment (decimal or based literal)
     /// to a `u64`, for the `$cast` value-param comparison.
     fn spec_fragment_to_u64(t: &str) -> Option<u64> {
@@ -118914,7 +121260,7 @@ impl Simulator {
                             if let Some(fd) = self.fn_decl_rc(&name) {
                                 return self.exec_function_call(&fd, args);
                             }
-                            if let Some(td) = self.module.tasks.get(&name).cloned() {
+                            if let Some(td) = self.task_decl_rc(&name) {
                                 self.exec_task_call(&td, args);
                                 return Value::zero(32);
                             }
@@ -118951,7 +121297,7 @@ impl Simulator {
                     if let Some(fd) = self.fn_decl_rc(&joined) {
                         return self.exec_function_call(&fd, args);
                     }
-                    if let Some(td) = self.module.tasks.get(&joined).cloned() {
+                    if let Some(td) = self.task_decl_rc(&joined) {
                         self.task_clears_this = true;
                         self.exec_task_call(&td, args);
                         return Value::zero(32);
@@ -118970,7 +121316,7 @@ impl Simulator {
                             if let Some(fd) = self.fn_decl_rc(&scoped) {
                                 return self.exec_function_call(&fd, args);
                             }
-                            if let Some(td) = self.module.tasks.get(&scoped).cloned() {
+                            if let Some(td) = self.task_decl_rc(&scoped) {
                                 self.exec_task_call(&td, args);
                                 return Value::zero(32);
                             }
@@ -121791,7 +124137,7 @@ impl Simulator {
                     *self.name_resolve_hint.borrow_mut() = saved;
                     return r;
                 }
-                if let Some(td) = self.module.tasks.get(&full).cloned() {
+                if let Some(td) = self.task_decl_rc(&full) {
                     let saved = self.name_resolve_hint.borrow().clone();
                     *self.name_resolve_hint.borrow_mut() = scope.clone();
                     let saved_ts = self.timescale_scope_override.take();
@@ -121955,7 +124301,7 @@ impl Simulator {
                         self.pending_pkg_scope = Some(pkg);
                         return self.exec_function_call(&fd, args);
                     }
-                    if let Some(td) = self.module.tasks.get(&qual).cloned() {
+                    if let Some(td) = self.task_decl_rc(&qual) {
                         self.pending_pkg_scope = Some(pkg);
                         self.exec_task_call(&td, args);
                         return Value::zero(32);
@@ -121972,7 +124318,7 @@ impl Simulator {
                 return self.exec_let_call(&ld, args);
             }
             // Module-level task call
-            if let Some(td) = self.module.tasks.get(name).cloned() {
+            if let Some(td) = self.task_decl_rc(name) {
                 self.pending_pkg_scope = self.bare_call_pkg_scope(name, hier.path.len());
                 self.exec_task_call(&td, args);
                 return Value::zero(32);
@@ -123988,6 +126334,18 @@ impl Simulator {
         Some(rc)
     }
 
+    /// `fn_decl_rc` for tasks: the task table is never modified after
+    /// elaboration, so one shared copy per name serves every call.
+    fn task_decl_rc(&mut self, name: &str) -> Option<std::rc::Rc<TaskDeclaration>> {
+        if let Some(rc) = self.task_decl_cache.get(name) {
+            return Some(rc.clone());
+        }
+        let td = self.module.tasks.get(name)?.clone();
+        let rc = std::rc::Rc::new(td);
+        self.task_decl_cache.insert(name.to_string(), rc.clone());
+        Some(rc)
+    }
+
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
         self.signals.remove("__vif_return__");
         self.vif_return_pending = false;
@@ -124693,8 +127051,12 @@ impl Simulator {
         self.close_decl_shadow_frame();
         // §9.6.2: `disable <task>` terminates this invocation and no more —
         // the caller resumes. Clear the unwind signal here, or it would leak
-        // out and keep later loops from clearing `break_flag`.
-        if self.disable_target.as_deref() == Some(td.name.name.name.as_str()) {
+        // out and keep later loops from clearing `break_flag`. An instance's
+        // task is registered under its qualified name (`u0.early`) while the
+        // body's `disable early` names the leaf.
+        let tname = td.name.name.name.as_str();
+        let tleaf = tname.rsplit('.').next().unwrap_or(tname);
+        if matches!(self.disable_target.as_deref(), Some(t) if t == tname || t == tleaf) {
             self.disable_target = None;
             self.break_flag = false;
         }
@@ -125653,6 +128015,14 @@ impl Simulator {
                             &port.data_type,
                             &self.module.typedef_types,
                         );
+                    } else if super::elaborate::is_type_real(&port.data_type) {
+                        // §13.3.1: an integral actual CONVERTS to a real
+                        // formal (the function path and the compiled inline
+                        // both do); bound as integral bits, `dt / 2` divided
+                        // as integers.
+                        if !val.is_real {
+                            val = Value::from_f64(val.to_f64());
+                        }
                     } else if self.type_is_signed_concrete(&port.data_type) {
                         val.is_signed = true;
                     }
@@ -125835,7 +128205,7 @@ impl Simulator {
                 let differs = match self.current_spec.as_ref() {
                     None => true,
                     Some((b, s)) => {
-                        *b != cn
+                        *b != self.class_origin(&cn)
                             || inst
                                 .spec
                                 .as_ref()
@@ -126064,7 +128434,7 @@ impl Simulator {
                     self.cg_named_event_waiters
                         .entry(id)
                         .or_default()
-                        .push((handle, s.iff.clone()));
+                        .push((handle, s.iff.as_deref().cloned()));
                     continue;
                 }
                 resolved.push(SensitivityId {
@@ -128657,7 +131027,10 @@ impl Simulator {
             }
         }
         if let Some((base, sig)) = spec {
-            if let Some(cd) = self.get_class_def(base) {
+            // The specialization's own class entry: its `extends` is the
+            // bound base when that is a type parameter (§8.25).
+            let entry = self.spec_entry_cow(base, sig);
+            if let Some(cd) = self.get_class_def(&entry) {
                 if let Some(idx) = cd.type_param_names.iter().position(|p| p == tn) {
                     if let Some(v) = Self::spec_arg_at(sig, idx) {
                         let v = v.trim();
@@ -128705,7 +131078,12 @@ impl Simulator {
                     // value params interleaved). `extends_type_args` stores
                     // ALL args positionally, so we index by param_order.
                     if let Some(idx) = acd.param_order.iter().position(|p| p == tn) {
-                        if let Some(arg) = cur_type_args.get(idx) {
+                        // A projection `BASE#[i]` depends on the binding one
+                        // level down: the ancestor-spec path below derives it.
+                        if let Some(arg) = cur_type_args
+                            .get(idx)
+                            .filter(|a| Self::spec_projection(a).is_none())
+                        {
                             let arg = arg.trim();
                             if arg == "this_type" || arg == "this" {
                                 return Some(format!("{}#({})", base, sig));
@@ -128939,6 +131317,10 @@ impl Simulator {
             return Some(cd.clone());
         }
         for cd in self.module.classes.values() {
+            // A specialization's class entry repeats its origin's `type_id`.
+            if self.spec_clone_origin.contains_key(&cd.name) {
+                continue;
+            }
             if let Some(DataType::TypeReference {
                 name, type_args, ..
             }) = cd.typedef_targets.get("type_id")
@@ -129192,6 +131574,19 @@ impl Simulator {
                 }
             }
         }
+        // §8.25: a class whose base is a type parameter (`class wrap_c
+        // #(type BASE = base_c) extends BASE`) has its own class entry for
+        // each specialization binding another base (`wrap_c #(derived_c)`);
+        // the object is an instance of that entry, so every hierarchy walk
+        // from it sees the bound base. The specialization stays keyed by
+        // the declared class (statics, `$typename`).
+        let spec_entry = if self.is_dep_class(&class_name_owned) {
+            self.spec_entry_for_new(&class_name_owned, type_args, computed_spec.as_ref())
+        } else {
+            None
+        };
+        let class_def: &crate::compiler::elaborate::ElaboratedClass =
+            spec_entry.as_deref().unwrap_or(class_def);
         let handle = self.heap.len();
         let mut instance = ClassInstance {
             class_name: class_def.name.clone(),
@@ -129283,6 +131678,25 @@ impl Simulator {
                     };
                     let frag = frag.trim();
                     if frag.is_empty() {
+                        continue;
+                    }
+                    if let Some((p, k)) = Self::spec_projection(frag) {
+                        // `BASE#[k]`: argument k of the child's binding of its
+                        // base type parameter (`wrap_c #(pbase#(8))`).
+                        if let Some(v) = self
+                            .child_type_binding(&class_name_owned, class_def, child, p, type_args)
+                            .and_then(|b| Self::project_spec_arg(&b, k))
+                            .and_then(|f| Self::parse_spec_number(&f))
+                            .and_then(|lit| {
+                                let e = Expression::new(
+                                    ExprKind::Number(lit),
+                                    crate::ast::Span::dummy(),
+                                );
+                                crate::elaborate::const_eval_i64_with_params(&e, None)
+                            })
+                        {
+                            binds.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                        }
                         continue;
                     }
                     if let Some(lit) = Self::parse_spec_number(frag) {
@@ -129393,7 +131807,7 @@ impl Simulator {
                     let spec_matches = self
                         .current_spec
                         .as_ref()
-                        .is_some_and(|(b, _)| *b == class_def.name);
+                        .is_some_and(|(b, _)| *b == class_name_owned);
                     if spec_matches {
                         if let Some(v) = self.resolve_value_param_from_spec(pname) {
                             instance.properties.insert(pname.clone(), v);
@@ -129583,7 +131997,7 @@ impl Simulator {
         let spec_targets_this = self
             .current_spec
             .as_ref()
-            .is_some_and(|(b, _)| *b == class_def.name);
+            .is_some_and(|(b, _)| *b == class_name_owned);
         for tp_name in class_def.type_param_names.iter() {
             let mut bound: Option<String> = None;
             if let Some(ta) = arg_map.get(tp_name) {
@@ -129668,7 +132082,10 @@ impl Simulator {
         // value-parameter lookups in later virtual calls.
         let active_spec = self.current_spec.as_ref().or(computed_spec.as_ref());
         if let Some((b, sig)) = active_spec {
-            let c_base = class_def.name.split('#').next().unwrap_or(&class_def.name);
+            let c_base = class_name_owned
+                .split('#')
+                .next()
+                .unwrap_or(&class_name_owned);
             if b == c_base {
                 instance.spec = Some((b.clone(), sig.clone()));
             } else if self.class_extends(b, c_base) {
@@ -130663,7 +133080,14 @@ impl Simulator {
                 if arg.is_empty() {
                     continue;
                 }
-                let sub = nb.get(arg).cloned().unwrap_or_else(|| arg.to_string());
+                let sub = if Self::spec_projection(arg).is_some() {
+                    match Self::carry_extends_arg(arg, &|p| binds.get(p).cloned()) {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                } else {
+                    nb.get(arg).cloned().unwrap_or_else(|| arg.to_string())
+                };
                 nb.insert(pname.clone(), sub);
             }
         }
@@ -138469,6 +140893,8 @@ impl Simulator {
         class_name: &str,
         method_name: &str,
     ) -> Option<Arc<crate::ast::decl::ClassMethod>> {
+        // A specialization's class entry shares its origin's method bodies.
+        let class_name = self.class_origin(class_name);
         if let Some(cached) = self
             .class_method_cache
             .borrow()
@@ -138514,7 +140940,7 @@ impl Simulator {
             let mut static_or_param: HashSet<String> = HashSet::default();
             let mut string_methods: HashSet<String> = HashSet::default();
             for cd in self.module.classes.values() {
-                for (name, cm) in &cd.methods {
+                for (name, cm) in cd.methods.iter() {
                     if let crate::ast::decl::ClassMethodKind::Function(fd)
                     | crate::ast::decl::ClassMethodKind::Extern(fd)
                     | crate::ast::decl::ClassMethodKind::PureVirtual(fd) = &cm.kind
@@ -139634,7 +142060,7 @@ impl Simulator {
                         // the caller's (base_comp) cell, so typewide
                         // callbacks never propagate to derived types.
                         Some((b, s)) => {
-                            b != cn
+                            b != self.class_origin(cn)
                                 || inst
                                     .spec
                                     .as_ref()
@@ -143673,6 +146099,7 @@ impl Simulator {
     fn class_operand_typename(&mut self, arg: &Expression) -> Option<String> {
         if matches!(arg.kind, ExprKind::This) {
             let cls = self.class_context_stack.last().cloned().flatten()?;
+            let cls = self.class_origin(&cls).to_string();
             let sig = self
                 .this_stack
                 .last()
@@ -145741,7 +148168,7 @@ pub extern "C" fn vpi_iterate(type_: libc::c_int, refh: *mut libc::c_void) -> *m
                 .into_iter()
                 .filter(|(_, id)| *id != usize::MAX)
                 .filter_map(|(name, id)| {
-                    let dir = sim.vpi_port_directions.get(&name)?;
+                    let dir = sim.vpi_port_directions.get(name.as_str())?;
                     let leaf = name.rsplit('.').next().unwrap_or(&name).to_string();
                     let width = sim.signal_widths.get(id).copied().unwrap_or(1) as u32;
                     Some(VpiHandle::port(
@@ -146858,6 +149285,7 @@ pub extern "C" fn vpi_put_value(
                 }
                 sim.after_signal_write(sig_id);
             }
+            sim.ctl_note_external_write(sig_id);
             // Now mark as forced (after the write succeeded)
             sim.forced_signals.insert(sig_id, value);
             // §38.36.1 cbForce.
@@ -146867,6 +149295,7 @@ pub extern "C" fn vpi_put_value(
         } else {
             // Normal write - write_sig! will skip if signal is forced
             write_sig!(sim, sig_id, value);
+            sim.ctl_note_external_write(sig_id);
             // A VPI deposit is an EXTERNAL write: no HDL driver stands behind
             // it, so nothing else marks the signal dirty or re-snapshots it for
             // edge detection. Without this a cocotb-driven clock landed in the

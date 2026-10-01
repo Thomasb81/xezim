@@ -237,6 +237,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: trace constant propagation in elaboration",
     ),
     (
+        "XEZIM_CTL_MASK",
+        "Scheduling: an AND/OR gate whose other input holds the controlling value skips its high-fanout (clock) input; 0 disables",
+    ),
+    (
         "XEZIM_CYCLE_CENSUS",
         "Census: comb entries in combinational loops (SCCs) / self-loops and edge blocks on derived clocks — the exclusion set for single-pass cycle evaluation (=2 samples the largest SCCs)",
     ),
@@ -328,6 +332,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_ELAB_STATS",
         "Elab: print elaboration statistics (instances, signals, timing)",
+    ),
+    (
+        "XEZIM_ELIDE_STRICT",
+        "Debug: =1 panics when a name lookup reaches an input-port net left out by unobserved-port elision (default: one warning)",
     ),
     (
         "XEZIM_ENABLE_CACHE",
@@ -518,10 +526,18 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     ("XEZIM_JIT_XZ_BAIL", "JIT: trace X/Z-guard bailouts"),
     (
+        "XEZIM_KEEP_PORTS",
+        "Elab: =1 keeps the nets of substituted input ports that nothing can reach by name (turns unobserved-port elision off)",
+    ),
+    (
         "XEZIM_LARGE_ARRAY_NAME_THRESHOLD",
         "Elab: element-count threshold above which per-element names are lazy",
     ),
     ("XEZIM_LAYOUT", "Print signal-table memory layout summary"),
+    (
+        "XEZIM_LAZY_ALWAYS",
+        "Default on; =0 disables: keep instantiated `@(...)` always blocks as shared source plus instance context until they compile, instead of one materialized tree each",
+    ),
     (
         "XEZIM_LAZY_PROC_SETTLE",
         "Scheduling: defer comb settle across process boundaries (0/1)",
@@ -806,6 +822,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     (
         "XEZIM_TEMPLATE_CENSUS",
         "Profiling: group compiled blocks by canonical shape; report repeated-template dynamic coverage (wants COMB_PATHS + EDGE_BLOCK_STATS)",
+    ),
+    (
+        "XEZIM_TOPO_JOIN",
+        "Default on; =0 disables: order a comb net with a large writers x readers product through one join node instead of W x R edges",
     ),
     (
         "XEZIM_TRACE_ALWAYS",

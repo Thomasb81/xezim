@@ -17,6 +17,8 @@ mod packed_matrix_workload;
 
 #[path = "perf/design_shape_regression.rs"]
 mod design_shape_regression;
+#[path = "perf/front_end_levers.rs"]
+mod front_end_levers;
 #[path = "perf/loop_block_counters.rs"]
 mod loop_block_counters;
 #[path = "perf/packed_record_edge_loop.rs"]
