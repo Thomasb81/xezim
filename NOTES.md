@@ -149,6 +149,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   used to narrow a ternary divisor and read x.
 * A two-state variable no longer stores x or z when a value with x or z bits
   is written to it from compiled code.
+* A member write through a class property whose type is a type parameter
+  (`class p #(type CFG = cfg_c); CFG a; ... a.x = 1;`) reaches the object.
+  It used to be dropped without a diagnostic, along with compound,
+  nonblocking and nested writes through such a property. (PR #209 by eenky)
 
 **Performance**
 
