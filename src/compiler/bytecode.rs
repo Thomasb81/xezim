@@ -5454,6 +5454,10 @@ impl<'a> BytecodeCompiler<'a> {
                 // unsigned number).
                 let kv = kval(v);
                 let idx = kv.to_u64().map(|x| x as i64);
+                let trip_start = self.insns.len();
+                // The trip is one element load of the statement's width and
+                // unsigned: the operand scrub and resize would be no-ops.
+                let mut plain = false;
                 for (n, i) in template.iter().enumerate() {
                     match (i, elem_of[n]) {
                         (Insn::LoadArrayElem(d, ..), Some((first, lo, hi)))
@@ -5462,6 +5466,9 @@ impl<'a> BytecodeCompiler<'a> {
                         {
                             let eid = first + (idx.unwrap() - lo) as usize;
                             self.emit(Insn::LoadSignal(*d, eid as SigId));
+                            plain = *d == r
+                                && self.signal_widths[eid] == width
+                                && !self.signal_signed[eid];
                         }
                         (Insn::LoadArrayElem(_, _, t), Some(_)) => {
                             // Out of range: the generic read (x), as compiled.
@@ -5476,10 +5483,12 @@ impl<'a> BytecodeCompiler<'a> {
                         _ => self.emit(i.clone()),
                     }
                 }
-                if scrub_e {
-                    self.emit(Insn::ClearSigned(r));
+                if !(plain && self.insns.len() == trip_start + 1) {
+                    if scrub_e {
+                        self.emit(Insn::ClearSigned(r));
+                    }
+                    self.emit(Insn::Resize(r, width));
                 }
-                self.emit(Insn::Resize(r, width));
                 self.emit(match op {
                     BinaryOp::BitOr => Insn::BitOr(a, a, r),
                     _ => Insn::BitAnd(a, a, r),
@@ -17273,7 +17282,7 @@ fn ts_raw_hazard(
     insns: &[Insn],
     array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
 ) -> Result<Vec<u32>, ()> {
-    #[derive(PartialEq, Clone)]
+    #[derive(PartialEq, Eq, Hash, Clone)]
     enum Base {
         Sig(u32),
         Arr(usize),
@@ -17303,21 +17312,38 @@ fn ts_raw_hazard(
     let mut stores: Vec<Acc> = Vec::new();
     let mut reads: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut writes: Vec<Option<usize>> = vec![None; n];
-    fn intern(v: &mut Vec<Acc>, a: Acc) -> usize {
-        if let Some(i) = v.iter().position(|x| {
-            x.base == a.base && x.lo == a.lo && x.hi == a.hi && x.protects == a.protects
-        }) {
-            i
+    type AccKey = (Base, u32, u32, bool);
+    // Linear for the usual handful of access classes; past that through an
+    // index (an unrolled reduction loads one signal per trip), which covers
+    // a prefix of the append-only list.
+    fn intern(v: &mut Vec<Acc>, ix: &mut HashMap<AccKey, usize>, a: Acc) -> usize {
+        let found = if v.len() < 16 {
+            v.iter().position(|x| {
+                x.base == a.base && x.lo == a.lo && x.hi == a.hi && x.protects == a.protects
+            })
         } else {
-            v.push(a);
-            v.len() - 1
+            for (i, x) in v.iter().enumerate().skip(ix.len()) {
+                ix.entry((x.base.clone(), x.lo, x.hi, x.protects))
+                    .or_insert(i);
+            }
+            ix.get(&(a.base.clone(), a.lo, a.hi, a.protects)).copied()
+        };
+        match found {
+            Some(i) => i,
+            None => {
+                v.push(a);
+                v.len() - 1
+            }
         }
     }
+    let mut loads_ix: HashMap<AccKey, usize> = HashMap::default();
+    let mut stores_ix: HashMap<AccKey, usize> = HashMap::default();
     let rng = |a: u32, b: u32| -> (u32, u32) { (a.min(b), a.max(b)) };
     for (i, insn) in insns.iter().enumerate() {
         let mut ld = |base: Base, r: (u32, u32)| {
             reads[i].push(intern(
                 &mut loads,
+                &mut loads_ix,
                 Acc {
                     base,
                     lo: r.0,
@@ -17373,7 +17399,7 @@ fn ts_raw_hazard(
             _ => None,
         };
         if let Some(a) = st {
-            writes[i] = Some(intern(&mut stores, a));
+            writes[i] = Some(intern(&mut stores, &mut stores_ix, a));
         }
     }
     if stores.is_empty() || loads.is_empty() {
@@ -17992,6 +18018,10 @@ pub fn lower_two_state(
     let mut idx_map: Vec<u32> = Vec::with_capacity(n + 1);
     // ≤64-bit signals are checked whole (one raw_bits each) regardless of
     // which part is read; only WIDE signals get slice entries.
+    // A block reading many signals (an unrolled reduction reads one per
+    // trip) looks them up through an index instead of a linear scan; the
+    // list only ever grows, so the index covers a prefix of it.
+    let mut rw_index: HashMap<u32, usize> = HashMap::default();
     let mut note_read = |sig: usize,
                          lo: u32,
                          w: u32,
@@ -18001,10 +18031,17 @@ pub fn lower_two_state(
                          rs_: &mut Vec<(u32, u16, u16, bool)>| {
         if narrow {
             let s32 = sig as u32;
-            if let Some(e) = rw_.iter_mut().find(|(x, _)| *x == s32) {
-                e.1 &= skip;
+            let hit = if rw_.len() < 16 {
+                rw_.iter().position(|(x, _)| *x == s32)
             } else {
-                rw_.push((s32, skip));
+                for (i, &(x, _)) in rw_.iter().enumerate().skip(rw_index.len()) {
+                    rw_index.entry(x).or_insert(i);
+                }
+                rw_index.get(&s32).copied()
+            };
+            match hit {
+                Some(i) => rw_[i].1 &= skip,
+                None => rw_.push((s32, skip)),
             }
         } else {
             let t = (sig as u32, lo as u16, w as u16);
