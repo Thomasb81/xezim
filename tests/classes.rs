@@ -116,6 +116,8 @@ mod class_name_method_shadow;
 mod class_output_handle_copyback;
 #[path = "classes/class_packed_and_type_params.rs"]
 mod class_packed_and_type_params;
+#[path = "classes/class_param_property_widths.rs"]
+mod class_param_property_widths;
 #[path = "classes/class_param_siblings.rs"]
 mod class_param_siblings;
 #[path = "classes/class_program_test.rs"]

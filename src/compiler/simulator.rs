@@ -5783,6 +5783,9 @@ pub struct Simulator {
     /// parameter-binding fingerprint)` → re-resolved width, so the packed
     /// range is const-eval'd once per specialization instead of per store.
     spec_prop_width_cache: std::cell::RefCell<HashMap<(String, String, String), Option<u32>>>,
+    /// `static_cell_width` per static cell key (class tables are fixed at
+    /// run time, and a key names one specialization).
+    static_cell_width_cache: std::cell::RefCell<HashMap<String, Option<(u32, bool)>>>,
     /// Tracks class names currently being constructed via the `type_id::create()`
     /// shortcut, to prevent infinite recursion when a parameterized
     /// class's constructor or static initializers re-enter `type_id::create()`
@@ -11090,6 +11093,7 @@ impl Simulator {
             prof_clock_tree_evals: 0,
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
+            static_cell_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
             initialized_spec_statics: std::collections::HashSet::default(),
             factory_reg_in_progress: std::collections::HashSet::default(),
@@ -67284,6 +67288,18 @@ impl Simulator {
                                     }
                                 }
                                 if found_member {
+                                    // §20.6.2: a fixed-size UNPACKED array
+                                    // member is element_bits × the element
+                                    // count; its per-instance storage is
+                                    // `<handle>#<name>`, not one value.
+                                    let scoped = format!("{}#{}", this_h, name);
+                                    if !self.module.dynamic_arrays.contains(&scoped) {
+                                        if let Some(&(lo, hi, ew)) = self.module.arrays.get(&scoped)
+                                        {
+                                            let n = (hi - lo).unsigned_abs() + 1;
+                                            return Value::from_u64(n * ew as u64, 32);
+                                        }
+                                    }
                                     return Value::from_u64(self.eval_expr(arg).width as u64, 32);
                                 }
                             }
@@ -68336,6 +68352,7 @@ impl Simulator {
                             w.max(1)
                         } else if self.module.parameters.contains_key(nm)
                             || self.get_signal_value_by_name(nm).is_some()
+                            || self.class_value_param_in_scope(nm)
                         {
                             self.eval_expr(&args[0]).to_u64().unwrap_or(32).max(1) as u32
                         } else {
@@ -68415,6 +68432,7 @@ impl Simulator {
                     // behaviour) rather than resizing to a garbage width.
                     if self.module.parameters.contains_key(&nm)
                         || self.get_signal_value_by_name(&nm).is_some()
+                        || self.class_value_param_in_scope(&nm)
                     {
                         let n = self.eval_expr(&args[0]).to_u64().unwrap_or(32) as u32;
                         return inner_v.resize(n.max(1));
@@ -79041,11 +79059,20 @@ impl Simulator {
         lifetime: &Option<crate::ast::types::Lifetime>,
         declarators: &[VarDeclarator],
     ) {
-        let w0 = super::elaborate::resolve_type_width(
-            data_type,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        );
+        // §6.20.2 / §8.25: a local typed by a TYPE PARAMETER of the method's
+        // class (`T tmp;`) has the type bound in this specialization.
+        let tp_concrete = self.local_type_param_concrete(data_type);
+        let tp_width = tp_concrete
+            .as_deref()
+            .and_then(|c| self.concrete_type_width(c));
+        let w0 = match tp_width {
+            Some(w) => w,
+            None => super::elaborate::resolve_type_width(
+                data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            ),
+        };
         // A class-handle-typed variable holds a 32-bit handle, not
         // the class's content layout (which `resolve_type_width`
         // may report as 0 for a class with only methods/statics).
@@ -79064,7 +79091,13 @@ impl Simulator {
         // whole register write). A class handle defaults to null either
         // way.
         let two_state = !plain_class
-            && super::elaborate::is_type_two_state_resolved(data_type, &self.module.typedef_types);
+            && match tp_concrete.as_deref().filter(|_| tp_width.is_some()) {
+                Some(c) => self.concrete_type_two_state(c),
+                None => super::elaborate::is_type_two_state_resolved(
+                    data_type,
+                    &self.module.typedef_types,
+                ),
+            };
         // LRM §8.4: an uninitialized class handle defaults to
         // `null`. Treat class-handle types and `chandle` as
         // two-state-zero so `if (h == null)` works without an
@@ -103362,7 +103395,7 @@ impl Simulator {
                 .insert(prop.to_string(), v);
         };
         let cd = self.module.classes.get(decl_class)?;
-        let dt = cd.property_types.get(prop);
+        let dt = self.class_prop_decl_type(cd, prop);
         let dims = match dt {
             Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
                 dimensions
@@ -103562,7 +103595,7 @@ impl Simulator {
         // `respec_packed_width` answers only for a range that is not constant
         // on its own (its classification, without the instance).
         let respec = self.module.classes.get(cn.as_str()).is_none_or(|c| {
-            let dims = match c.property_types.get(prop) {
+            let dims = match self.class_prop_decl_type(c, prop) {
                 Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
                     dimensions
                 }
@@ -105347,25 +105380,65 @@ impl Simulator {
     /// declared `STRUCT_T st;` looked up the literal name `STRUCT_T` in the
     /// typedef table, missed, and read back x for every field even though the
     /// raw storage was correct.
+    ///
+    /// A parameter of an ANCESTOR (`class d extends comp_base #(byte)`, the
+    /// property declared in `comp_base`) is bound by the `extends` clause, not
+    /// by the object's own bindings, which only name the leaf class's
+    /// parameters: carry it down the chain (`carried_type_binding`). Reading
+    /// the leaf's bindings alone found nothing, so `T data` kept the width of
+    /// `T`'s default type in every derived class (§8.25, §6.20.2).
     fn class_prop_type_name(&self, handle: usize, prop: &str) -> Option<String> {
         let inst = self.heap.get(handle)?.as_ref()?;
-        let mut cur = Some(inst.class_name.clone());
-        let mut seen: HashSet<String> = HashSet::default();
-        while let Some(cn) = cur {
-            if !seen.insert(cn.clone()) {
-                break;
-            }
-            let cd = self.module.classes.get(&cn)?;
+        // The chain walked so far, on the stack: this runs on property
+        // stores, and a heap Vec per call showed up in the UVM A/B.
+        let first = self.module.classes.get(inst.class_name.as_str())?.as_ref();
+        let mut buf: [&super::elaborate::ElaboratedClass; 32] = [first; 32];
+        let mut n = 0usize;
+        let mut cd = first;
+        loop {
+            buf[n] = cd;
+            n += 1;
+            let chain = &buf[..n];
             if let Some(sig) = cd.properties.get(prop) {
                 let tn = sig.type_name.as_ref()?;
                 if cd.type_param_names.iter().any(|t| t == tn) {
+                    let k = chain.len() - 1;
+                    if k > 0 {
+                        if let Some(b) =
+                            Self::carried_type_binding(&inst.type_bindings, chain, k, tn)
+                        {
+                            // A fragment naming a type parameter of the
+                            // object's own class that the object leaves
+                            // unbound stays unresolved, as before.
+                            if inst.type_bindings.get(&b).is_none()
+                                && chain[0].type_param_names.iter().any(|t| *t == b)
+                            {
+                                return None;
+                            }
+                            return Some(b);
+                        }
+                        // `extends comp_base` with the argument left out:
+                        // the parameter's declared default (§6.20.2).
+                        if let Some(b) = inst.type_bindings.get(tn) {
+                            return Some(b.clone());
+                        }
+                        return cd
+                            .type_param_defaults
+                            .iter()
+                            .find(|(n, _)| n == tn)
+                            .map(|(_, d)| d.trim().to_string())
+                            .filter(|d| !d.is_empty() && !cd.type_param_names.contains(d));
+                    }
                     return inst.type_bindings.get(tn).cloned();
                 }
                 return Some(tn.clone());
             }
-            cur = cd.extends.clone();
+            let e = cd.extends.as_deref()?;
+            if n == buf.len() || chain.iter().any(|c| c.name == e) {
+                return None;
+            }
+            cd = self.module.classes.get(e)?.as_ref();
         }
-        None
     }
 
     /// Width to clamp a value to when a property's concrete type is `name`.
@@ -105390,6 +105463,11 @@ impl Simulator {
             return None;
         }
         if let Some(w) = atom_type_keyword_width(name) {
+            return Some(w);
+        }
+        // A vector argument that kept its literal range (`bit[5:0]`, the
+        // form `extends C #(bit [5:0])` records).
+        if let Some(w) = vector_fragment_width(name) {
             return Some(w);
         }
         if let Some(&w) = self.module.typedefs.get(name) {
@@ -108673,7 +108751,11 @@ impl Simulator {
             .copied()
             .unwrap_or((0, 63, 32));
         for (i, item) in elems.iter().enumerate() {
-            let v = self.eval_expr(item);
+            let mut v = self.eval_expr(item);
+            // §5.7.1: an unsized fill element takes the element width.
+            if v.is_fill && !v.is_real {
+                v = v.resize(w.max(1));
+            }
             self.set_signal_value_by_name(&format!("{}[{}]", scoped_q, i), v);
             self.widths.insert(format!("{}[{}]", scoped_q, i), w);
         }
@@ -108878,7 +108960,16 @@ impl Simulator {
                 }
             }
         }
-        let val = self.queue_eval_arg(obj_name, arg);
+        let mut val = self.queue_eval_arg(obj_name, arg);
+        // §5.7.1: an unsized fill (`q.push_back('1)`) takes the element's
+        // width, not one bit.
+        if val.is_fill && !val.is_real {
+            if let Some(&(_, _, w)) = self.module.arrays.get(obj_name) {
+                if w > 0 {
+                    val = val.resize(w);
+                }
+            }
+        }
         self.set_signal_value_by_name(elem, val);
     }
 
@@ -114940,6 +115031,24 @@ impl Simulator {
                 }
             };
             let init = init_val.unwrap_or_else(|| Value::zero(32));
+            // A static WITHOUT an initializer holds its type's default
+            // (x for 4-state, 0 for 2-state) at the cell's own width —
+            // widening the default-width seed would zero-fill the new bits.
+            let has_init = self.module.classes.get(decl_class).is_some_and(|cd| {
+                cd.property_inits.contains_key(prop) || !cd.properties.contains_key(prop)
+            });
+            let init = match self.static_cell_width(&key, prop) {
+                Some((w, signed)) if !has_init && !init.is_real && w != init.width => {
+                    let mut d = if init.has_xz() {
+                        Value::new(w)
+                    } else {
+                        Value::zero(w)
+                    };
+                    d.is_signed = signed;
+                    d
+                }
+                _ => self.fit_static_cell(&key, prop, init),
+            };
             self.class_statics.insert(key.clone(), init);
         }
         self.class_statics.get(&key).cloned()
@@ -117189,6 +117298,7 @@ impl Simulator {
 
     fn class_static_set(&mut self, start_class: &str, prop: &str, val: Value) -> bool {
         if let Some(key) = self.static_prop_key(start_class, prop) {
+            let val = self.fit_static_cell(&key, prop, val);
             self.class_statics.insert(key, val);
             true
         } else {
@@ -125314,11 +125424,22 @@ impl Simulator {
         // VarDecl), instead of leaving a 32-bit value that drops the high
         // bits on subsequent bit-select writes.
         let ret_name = fd.name.name.name.clone();
-        let ret_w = super::elaborate::resolve_type_width(
-            &fd.return_type,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        )
+        // §6.20.2 / §8.25: a method returning a TYPE PARAMETER (`function T
+        // get();`) returns the type bound in this specialization.
+        let ret_tp = self
+            .local_type_param_concrete(&fd.return_type)
+            .and_then(|c| Some((self.concrete_type_width(&c)?, c)));
+        let ret_w = match &ret_tp {
+            Some((w, _)) => *w,
+            None => match self.class_param_sized_width(&fd.return_type) {
+                Some(w) => w,
+                None => super::elaborate::resolve_type_width(
+                    &fd.return_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                ),
+            },
+        }
         .max(1);
         self.widths.insert(ret_name.clone(), ret_w);
         // §6.11.1: the return variable carries the return type's SIGNEDNESS —
@@ -125326,7 +125447,11 @@ impl Simulator {
         // `signed_signals`, so an unregistered signed return type (`function
         // integer f`) silently went unsigned and `f >>>= 3` shifted
         // logically (ivtest cfunc_assign_op_vec asr3).
-        if super::elaborate::is_type_signed(&fd.return_type) {
+        let ret_signed = match &ret_tp {
+            Some((_, c)) => self.concrete_type_signed(c).unwrap_or(false),
+            None => super::elaborate::is_type_signed(&fd.return_type),
+        };
+        if ret_signed {
             self.signed_signals.insert(ret_name.clone());
         } else {
             self.signed_signals.remove(&ret_name);
@@ -125337,7 +125462,10 @@ impl Simulator {
         // 'bx (ivtest br_gh337); seeding zero unconditionally masked that.
         let ret_init = if super::elaborate::is_type_real(&fd.return_type) {
             Value::from_f64(0.0)
-        } else if super::elaborate::is_type_two_state(&fd.return_type) {
+        } else if match &ret_tp {
+            Some((_, c)) => self.concrete_type_two_state(c),
+            None => super::elaborate::is_type_two_state(&fd.return_type),
+        } {
             Value::zero(ret_w)
         } else {
             Value::new(ret_w)
@@ -129914,6 +130042,7 @@ impl Simulator {
         handle: usize,
         pname: &str,
         init: &Expression,
+        fit: bool,
     ) -> bool {
         // Guard: evaluating a field initializer may itself construct objects.
         // Cap the depth so a pathological self-referential field init can't
@@ -129922,8 +130051,17 @@ impl Simulator {
             return false;
         }
         self.construct_init_depth += 1;
-        let v = self.eval_expr(init);
+        let mut v = self.eval_expr(init);
         self.construct_init_depth -= 1;
+        // An initializer is an assignment to the property (§8.7, §10.7): it
+        // takes the property's width in this specialization, as a store from
+        // a method body does — `bit [W-1:0] pc = W'(5)` is W bits wide.
+        // Only a parameterized chain (`fit`) can need it: elsewhere the
+        // stores were never fitted here and the common UVM handle
+        // initializers stay on the cheap path.
+        if fit && !v.is_real && !pname.contains("::") {
+            v = self.fit_class_prop(handle, pname, &v);
+        }
         if let Some(Some(inst)) = self.heap.get_mut(handle) {
             inst.properties.insert(pname.to_string(), v);
         }
@@ -130298,11 +130436,36 @@ impl Simulator {
                 }
             }
             let mut out: HashMap<String, HashMap<String, Value>> = HashMap::default();
-            for pair in classes_to_init.windows(2) {
+            for (wi, pair) in classes_to_init.windows(2).enumerate() {
                 let (child, parent) = (&pair[0], &pair[1]);
                 if child.extends_type_args.is_empty() {
                     continue;
                 }
+                // The child's own parameter values, against which a bare
+                // name or expression in its `extends B #(N)` resolves: the
+                // leaf's, or — one level further up (`class leaf extends
+                // mid #(8); class mid #(int N) extends base #(N);`) — the
+                // values the hop below bound, else the child's defaults.
+                // Resolving only against the leaf's parameters dropped `N`,
+                // so `base`'s properties kept the default width (§8.25).
+                let child_params: std::borrow::Cow<HashMap<String, Value>> = if wi == 0 {
+                    std::borrow::Cow::Borrowed(&leaf_params)
+                } else {
+                    let mut m = out.get(&child.name).cloned().unwrap_or_default();
+                    for (pname, pdefault) in child.param_defaults.iter() {
+                        if m.contains_key(pname) {
+                            continue;
+                        }
+                        if let Some(v) = pdefault
+                            .as_ref()
+                            .and_then(|e| crate::elaborate::const_eval_i64_with_params(e, Some(&m)))
+                        {
+                            m.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                        }
+                    }
+                    std::borrow::Cow::Owned(m)
+                };
+                let leaf_params: &HashMap<String, Value> = &child_params;
                 let mut binds: HashMap<String, Value> = HashMap::default();
                 for (i, pname) in parent.param_order.iter().enumerate() {
                     if parent.type_param_names.iter().any(|t| t == pname) {
@@ -130492,6 +130655,7 @@ impl Simulator {
         let chain_has_params = classes_to_init.iter().any(|c| !c.param_defaults.is_empty());
         for cdef in classes_to_init.iter().filter(|_| chain_has_params) {
             for (prop, dt) in &cdef.property_types {
+                let dt = self.class_prop_decl_type(cdef, prop).unwrap_or(dt);
                 let dims = match dt {
                     DataType::IntegerVector { dimensions, .. } if !dimensions.is_empty() => {
                         dimensions
@@ -130731,6 +130895,18 @@ impl Simulator {
             }
         }
         self.heap.push(Some(instance));
+        // §8.25 / §6.20.2: the ELEMENT width of a fixed-array or queue member
+        // follows this specialization too (`bit [W-1:0] a[2]`, `T q[$]`).
+        // The per-instance storage registered above used the class table's
+        // default-parameter width; now that the object carries its parameter
+        // and type bindings, re-register any member whose width moved.
+        let chain_is_param = chain_has_params
+            || classes_to_init
+                .iter()
+                .any(|c| !c.type_param_names.is_empty());
+        if chain_is_param {
+            self.respec_member_elem_widths(handle, &classes_to_init);
+        }
         // Per-instance TYPE-PARAM-BOUND collection members
         // (`#(type T=int) data;` instantiated with T bound to a queue/array
         // typedef such as `typedef int a_i[];`). These live only in
@@ -131022,11 +131198,19 @@ impl Simulator {
                         let elems = self.pattern_elems(items, &indices);
                         for (k, e) in elems.into_iter().enumerate() {
                             if let Some(e) = e {
-                                let v = self.eval_expr(e);
-                                self.set_signal_value_by_name(
-                                    &format!("{}[{}]", scoped, indices[k]),
-                                    v,
-                                );
+                                let en = format!("{}[{}]", scoped, indices[k]);
+                                let mut v = self.eval_expr(e);
+                                // Each element is assigned (§10.9.1): it
+                                // takes the element's width — an unsized
+                                // fill `'1` too (§5.7.1).
+                                if !v.is_real && !self.is_string_collection(&scoped) {
+                                    if let Some(&w) = self.widths.get(&en) {
+                                        if w > 0 && w != v.width {
+                                            v = v.resize_for_assign(w);
+                                        }
+                                    }
+                                }
+                                self.set_signal_value_by_name(&en, v);
                             }
                         }
                     }
@@ -131037,12 +131221,32 @@ impl Simulator {
                 // the PROPERTY's declared signedness and width, not the
                 // literal's. `bit [15:0] u = -1;` otherwise stored a signed
                 // value and `c.u > 0` compared as -1 rather than 65535.
+                //
+                // §8.25 / §6.20.2: the width is THIS specialization's —
+                // `bit [W-1:0] pv = '1` in `pbase #(8)` is 8 bits of 1s
+                // (§5.7.1 fills to the target), and `T data = '1` follows the
+                // type `T` is bound to — not the default-parameter width the
+                // class table records.
                 if let Some(sig) = cdef.properties.get(&pname) {
                     if !sig.is_real && !val.is_real {
-                        if sig.width > 0 && val.width != sig.width {
-                            val = val.resize(sig.width);
+                        let w = if chain_is_param {
+                            self.class_prop_width_impl(&cdef.name, Some(handle), &pname)
+                                .unwrap_or(sig.width)
+                        } else {
+                            sig.width
+                        };
+                        if w > 0 && val.width != w {
+                            val = val.resize(w);
                         }
-                        val.is_signed = sig.is_signed;
+                        val.is_signed = if sig
+                            .type_name
+                            .as_ref()
+                            .is_some_and(|t| cdef.type_param_names.contains(t))
+                        {
+                            self.class_prop_signed_of(handle, &pname)
+                        } else {
+                            sig.is_signed
+                        };
                     }
                 }
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
@@ -131068,7 +131272,7 @@ impl Simulator {
                     order.iter().position(|p| p == pname).unwrap_or(usize::MAX)
                 });
                 for (_, init, slot) in &deferred_call_inits {
-                    self.evaluate_call_init_at_construct(handle, slot, init);
+                    self.evaluate_call_init_at_construct(handle, slot, init, chain_is_param);
                 }
             }
             self.class_context_stack.pop();
@@ -136354,7 +136558,9 @@ impl Simulator {
     /// Declared width of `prop` on the object `handle` points at (class chain).
     fn class_prop_width_of(&self, handle: usize, prop: &str) -> Option<u32> {
         let cn = &self.heap.get(handle)?.as_ref()?.class_name;
-        self.class_prop_width(cn, prop)
+        // The object's own specialization (§8.25): a member sized by a class
+        // parameter or typed by a type parameter has THIS object's width.
+        self.class_prop_width_impl(cn, Some(handle), prop)
     }
 
     /// §18.4: re-validate the constraints declared inside every `rand` object
@@ -136435,11 +136641,559 @@ impl Simulator {
                 return false;
             };
             if let Some(sig) = cd.properties.get(prop) {
+                // §6.20.2: a property typed by a TYPE PARAMETER takes the
+                // signedness of the type bound on this object (`byte` for
+                // `comp_base #(byte)`), not of the parameter's default.
+                if sig
+                    .type_name
+                    .as_ref()
+                    .is_some_and(|t| cd.type_param_names.contains(t))
+                {
+                    if let Some(s) = self
+                        .class_prop_type_name(handle, prop)
+                        .and_then(|c| self.concrete_type_signed(&c))
+                    {
+                        return s;
+                    }
+                }
                 return sig.is_signed;
             }
             cur = cd.extends.clone();
         }
         false
+    }
+
+    /// Element width of the fixed-array / queue member `prop` declared by
+    /// `cdef`, in the specialization the object `handle` was built as, when
+    /// that depends on a class parameter: a packed range sized by a value
+    /// parameter, or a type parameter (§8.25, §6.20.2). `None` keeps the
+    /// class table's width.
+    fn spec_member_elem_width(
+        &self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        handle: usize,
+        prop: &str,
+    ) -> Option<u32> {
+        let sig = cdef.properties.get(prop)?;
+        if sig
+            .type_name
+            .as_ref()
+            .is_some_and(|t| cdef.type_param_names.contains(t))
+        {
+            let concrete = self.class_prop_type_name(handle, prop)?;
+            return self.concrete_type_width(&concrete);
+        }
+        self.respec_packed_width(&cdef.name, handle, prop)
+    }
+
+    /// `[i][j]...` suffixes of every element of a fixed N-D shape (empty
+    /// for an oversized one, which construction leaves lazy too).
+    fn nd_index_suffixes(shape: &[(i64, i64)]) -> Vec<String> {
+        let total: i64 = shape.iter().map(|&(lo, hi)| (hi - lo + 1).max(0)).product();
+        if shape.is_empty() || total <= 0 || total > 65536 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(total as usize);
+        let mut idx: Vec<i64> = shape.iter().map(|d| d.0).collect();
+        loop {
+            let mut sfx = String::new();
+            for v in &idx {
+                sfx.push_str(&format!("[{}]", v));
+            }
+            out.push(sfx);
+            let mut k = shape.len();
+            loop {
+                if k == 0 {
+                    return out;
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] <= shape[k].1 {
+                    break;
+                }
+                idx[k] = shape[k].0;
+            }
+        }
+    }
+
+    /// Re-register the per-instance storage of collection members whose
+    /// element width depends on the object's parameters — see the call in
+    /// `instantiate_class_with_type_args`.
+    fn respec_member_elem_widths(
+        &mut self,
+        handle: usize,
+        chain: &[std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>],
+    ) {
+        for cdef in chain {
+            for (prop, &(lo, hi, width)) in &cdef.array_properties {
+                let Some(w) = self.spec_member_elem_width(cdef, handle, prop) else {
+                    continue;
+                };
+                if w == width || w == 0 {
+                    continue;
+                }
+                let scoped = format!("{}#{}", handle, prop);
+                self.module.arrays.insert(scoped.clone(), (lo, hi, w));
+                for i in lo..=hi {
+                    let en = format!("{}[{}]", scoped, i);
+                    self.signals.insert(en.clone(), Value::zero(w));
+                    self.widths.insert(en, w);
+                }
+            }
+            for (prop, (shape, width)) in &cdef.array_nd_properties {
+                let Some(w) = self.spec_member_elem_width(cdef, handle, prop) else {
+                    continue;
+                };
+                if w == *width || w == 0 {
+                    continue;
+                }
+                let scoped = format!("{}#{}", handle, prop);
+                if let Some(e) = self.module.arrays_2d.get_mut(&scoped) {
+                    e.2 = w;
+                }
+                if let Some(e) = self.module.arrays_nd.get_mut(&scoped) {
+                    e.1 = w;
+                }
+                for suffix in Self::nd_index_suffixes(shape) {
+                    let en = format!("{}{}", scoped, suffix);
+                    if self.widths.contains_key(&en) {
+                        self.signals.insert(en.clone(), Value::zero(w));
+                        self.widths.insert(en, w);
+                    }
+                }
+            }
+            for (prop, &(width, _)) in &cdef.queue_properties {
+                let Some(w) = self.spec_member_elem_width(cdef, handle, prop) else {
+                    continue;
+                };
+                if w == width || w == 0 {
+                    continue;
+                }
+                let scoped = format!("{}#{}", handle, prop);
+                if let Some(e) = self.module.arrays.get_mut(&scoped) {
+                    e.2 = w;
+                }
+            }
+        }
+    }
+
+    /// Declared width (and signedness) of the static property cell `key`
+    /// (`Decl::prop` or `Decl#<sig>::prop`), in the specialization the key
+    /// names (§8.25: each specialization has its own statics). A packed range
+    /// sized by a value parameter resolves against the signature's arguments;
+    /// a type-parameter type takes the bound type. `None` for a real, string,
+    /// class handle or anything not resolvable, which keeps the value as is.
+    fn static_cell_width(&self, key: &str, prop: &str) -> Option<(u32, bool)> {
+        if let Some(hit) = self.static_cell_width_cache.borrow().get(key) {
+            return *hit;
+        }
+        let out = self.static_cell_width_uncached(key, prop);
+        self.static_cell_width_cache
+            .borrow_mut()
+            .insert(key.to_string(), out);
+        out
+    }
+
+    fn static_cell_width_uncached(&self, key: &str, prop: &str) -> Option<(u32, bool)> {
+        let head = key.rsplit_once("::").map(|(h, _)| h).unwrap_or(key);
+        let (decl, sig) = match head.split_once('#') {
+            Some((d, s)) => (d, Some(s)),
+            None => (head, None),
+        };
+        let cd = self.module.classes.get(decl)?;
+        let ps = cd.properties.get(prop)?;
+        if ps.is_real
+            || cd.string_properties.contains(prop)
+            || ps
+                .type_name
+                .as_ref()
+                .is_some_and(|t| self.module.classes.contains_key(t))
+            || cd.queue_properties.contains_key(prop)
+            || cd.assoc_properties.contains_key(prop)
+            || cd.array_properties.contains_key(prop)
+            || cd.array_nd_properties.contains_key(prop)
+        {
+            return None;
+        }
+        let args: Vec<String> = sig.map(Self::split_spec_args).unwrap_or_default();
+        let arg_of = |name: &str| -> Option<String> {
+            let i = cd.param_order.iter().position(|p| p == name)?;
+            args.get(i)
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+        };
+        if let Some(tn) = ps
+            .type_name
+            .as_ref()
+            .filter(|t| cd.type_param_names.contains(t))
+        {
+            let concrete = arg_of(tn).or_else(|| {
+                cd.type_param_defaults
+                    .iter()
+                    .find(|(n, _)| n == tn)
+                    .map(|(_, d)| d.trim().to_string())
+            })?;
+            let w = self.concrete_type_width(&concrete)?;
+            return Some((w, self.concrete_type_signed(&concrete).unwrap_or(false)));
+        }
+        let pdt = self.class_prop_decl_type(cd, prop);
+        let dims = match pdt {
+            Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
+                dimensions
+            }
+            Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => dimensions,
+            // Only plain integral declarations are sized here; a typedef,
+            // struct, enum, interface or container handle keeps its value.
+            Some(DataType::IntegerVector { .. } | DataType::IntegerAtom { .. }) => {
+                return Some((ps.width, ps.is_signed)).filter(|(w, _)| *w > 0);
+            }
+            _ => return None,
+        };
+        // Value parameters in declaration order: the signature's argument,
+        // else the default evaluated against the parameters before it.
+        let mut params: HashMap<String, Value> = HashMap::default();
+        for (pname, pdefault) in &cd.param_defaults {
+            let v = match arg_of(pname).and_then(|a| Self::parse_spec_number(&a)) {
+                Some(lit) => {
+                    let e = Expression::new(ExprKind::Number(lit), crate::ast::Span::dummy());
+                    crate::elaborate::const_eval_i64_with_params(&e, None)
+                }
+                None => pdefault
+                    .as_ref()
+                    .and_then(|e| crate::elaborate::const_eval_i64_with_params(e, Some(&params))),
+            };
+            if let Some(v) = v {
+                params.insert(pname.clone(), Value::from_u64(v as u64, 32));
+            }
+        }
+        let all_resolved = dims.iter().all(|d| match d {
+            crate::ast::types::PackedDimension::Range { left, right, .. } => {
+                crate::elaborate::const_eval_i64_with_params(left, Some(&params)).is_some()
+                    && crate::elaborate::const_eval_i64_with_params(right, Some(&params)).is_some()
+            }
+            _ => true,
+        });
+        if !all_resolved {
+            return Some((ps.width, ps.is_signed)).filter(|(w, _)| *w > 0);
+        }
+        let dt = pdt?;
+        let w = crate::elaborate::resolve_type_width(dt, Some(&params), None);
+        Some((w, ps.is_signed)).filter(|(w, _)| *w > 0)
+    }
+
+    /// `v` sized and signed for the static cell `key` (an initializer or a
+    /// store is an assignment to it, §10.7; an unsized fill takes the
+    /// cell's width, §5.7.1).
+    fn fit_static_cell(&self, key: &str, prop: &str, v: Value) -> Value {
+        if v.is_real {
+            return v;
+        }
+        match self.static_cell_width(key, prop) {
+            Some((w, signed)) if w != v.width => {
+                let mut out = v.resize_for_assign(w);
+                out.is_signed = signed;
+                out
+            }
+            _ => v,
+        }
+    }
+
+    /// The concrete type a method LOCAL declared with a bare type-parameter
+    /// name (`T tmp;`) denotes: the binding of the executing method's class
+    /// parameter on `this` — carried down the `extends` chain when the
+    /// method's class is an ancestor bound by `extends C #(byte)` — else the
+    /// active specialization's. `None` for any other type.
+    fn local_type_param_concrete(&self, dt: &DataType) -> Option<String> {
+        let ctx = self.class_context_stack.last()?.as_deref()?;
+        self.type_param_concrete_in(dt, ctx)
+    }
+
+    /// `local_type_param_concrete` for a method of class `ctx`.
+    fn type_param_concrete_in(&self, dt: &DataType, ctx: &str) -> Option<String> {
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+        else {
+            return None;
+        };
+        if !dimensions.is_empty() || !type_args.is_empty() || name.scope.is_some() {
+            return None;
+        }
+        let tn = name.name.name.as_str();
+        // A class or a typedef name (the common case) is no parameter.
+        if !self.class_member_names().params.contains(tn)
+            || self.module.classes.contains_key(tn)
+            || self.module.typedefs.contains_key(tn)
+            || self.module.typedef_types.contains_key(tn)
+        {
+            return None;
+        }
+        // The class declaring `tn` as a type parameter, at or above the
+        // method's class.
+        let mut decl: Option<&str> = None;
+        let mut cur: Option<&str> = Some(ctx);
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            let cd = self.module.classes.get(cn)?;
+            if cd.type_param_names.iter().any(|t| t == tn) {
+                decl = Some(cn);
+                break;
+            }
+            if cd.typedef_names.iter().any(|t| t == tn) {
+                return None;
+            }
+            cur = cd.extends.as_deref();
+        }
+        let decl = decl?;
+        if let Some(h) = self.this_stack.last().copied().flatten() {
+            if let Some(first) = self
+                .heap
+                .get(h)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| Some((i, self.module.classes.get(i.class_name.as_str())?)))
+            {
+                let (inst, first) = (first.0, first.1.as_ref());
+                // On the stack: this runs for every `T`-typed local.
+                let mut buf: [&super::elaborate::ElaboratedClass; 32] = [first; 32];
+                let mut n = 0usize;
+                let mut cur: Option<&super::elaborate::ElaboratedClass> = Some(first);
+                while let Some(cd) = cur {
+                    if n == buf.len() {
+                        break;
+                    }
+                    buf[n] = cd;
+                    n += 1;
+                    let chain = &buf[..n];
+                    if cd.name == decl || self.class_origin(&cd.name) == decl {
+                        let k = n - 1;
+                        if k == 0 {
+                            if let Some(b) = inst.type_bindings.get(tn) {
+                                return Some(b.clone());
+                            }
+                            break;
+                        }
+                        if let Some(b) =
+                            Self::carried_type_binding(&inst.type_bindings, chain, k, tn)
+                        {
+                            if inst.type_bindings.get(&b).is_none()
+                                && chain[0].type_param_names.iter().any(|t| *t == b)
+                            {
+                                return None;
+                            }
+                            return Some(b);
+                        }
+                        break;
+                    }
+                    cur = cd
+                        .extends
+                        .as_deref()
+                        .and_then(|e| self.module.classes.get(e))
+                        .map(|a| a.as_ref());
+                }
+            }
+        }
+        // No object (a static method): the active specialization, else the
+        // one `ctx` binds its ancestor `decl` to (`class e extends
+        // sb #(byte)` calling `e::f()`).
+        self.resolve_type_param_binding(tn).or_else(|| {
+            (ctx != decl)
+                .then(|| self.static_receiver_spec(ctx, decl))
+                .flatten()
+                .and_then(|sp| self.resolve_type_param_with(tn, &Some(sp)))
+        })
+    }
+
+    /// Width of `dt` — a packed range sized by a class VALUE parameter
+    /// (`function bit [W-1:0] f();`) — inside a method of the executing
+    /// class with no object, i.e. a static method (§8.25): the active
+    /// specialization's values, else those the class binds through its
+    /// `extends`, else the declared defaults. `None` for any other type,
+    /// or outside a class.
+    fn class_param_sized_width(&mut self, dt: &DataType) -> Option<u32> {
+        // Outside a class (every RTL function call) there is nothing to do.
+        if !matches!(self.class_context_stack.last(), Some(Some(_))) {
+            return None;
+        }
+        let dims = match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }
+                if !dimensions.is_empty() =>
+            {
+                dimensions
+            }
+            _ => return None,
+        };
+        let range_ok = |d: &crate::ast::types::PackedDimension,
+                        p: Option<&HashMap<String, Value>>| match d {
+            crate::ast::types::PackedDimension::Range { left, right, .. } => {
+                crate::elaborate::const_eval_i64_with_params(left, p).is_some()
+                    && crate::elaborate::const_eval_i64_with_params(right, p).is_some()
+            }
+            _ => true,
+        };
+        // A literal range needs nothing here.
+        if dims.iter().all(|d| range_ok(d, None)) {
+            return None;
+        }
+        let ctx = self.class_context_stack.last().cloned().flatten()?;
+        let spec = match &self.current_spec {
+            Some((b, _)) if *b == ctx || self.class_extends(&ctx, b) => self.current_spec.clone(),
+            _ => self.inherited_param_spec(&ctx),
+        };
+        let saved = std::mem::replace(&mut self.current_spec, spec);
+        let from_spec = self.params_with_class_spec();
+        self.current_spec = saved;
+        let mut m = from_spec.unwrap_or_else(|| self.module.parameters.clone());
+        let mut cur = Some(ctx);
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            for (pname, pdefault) in &cd.param_defaults {
+                if m.contains_key(pname) {
+                    continue;
+                }
+                if let Some(v) = pdefault
+                    .as_ref()
+                    .and_then(|e| crate::elaborate::const_eval_i64_with_params(e, Some(&m)))
+                {
+                    m.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                }
+            }
+            cur = cd.extends.clone();
+        }
+        if !dims.iter().all(|d| range_ok(d, Some(&m))) {
+            return None;
+        }
+        Some(crate::elaborate::resolve_type_width(
+            dt,
+            Some(&m),
+            Some(&self.module.typedefs),
+        ))
+        .filter(|w| *w > 0)
+    }
+
+    /// Whether the type named by a type-parameter binding is 2-state.
+    fn concrete_type_two_state(&self, name: &str) -> bool {
+        match name {
+            "byte" | "shortint" | "int" | "longint" | "bit" => return true,
+            "logic" | "reg" | "integer" | "time" => return false,
+            _ => {}
+        }
+        if vector_fragment_width(name).is_some() {
+            return name.starts_with("bit");
+        }
+        self.module.typedef_types.get(name).is_some_and(|dt| {
+            super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
+        })
+    }
+
+    /// The declared type of property `prop` of `cd`, with a CLASS-LOCAL
+    /// typedef followed to its target (`typedef bit [W-1:0] word_t; word_t
+    /// w;`): the target's packed range is what depends on the class
+    /// parameters (§6.18, §8.25). A design-level typedef, or any other type,
+    /// comes back as declared.
+    fn class_prop_decl_type<'a>(
+        &'a self,
+        cd: &'a super::elaborate::ElaboratedClass,
+        prop: &str,
+    ) -> Option<&'a DataType> {
+        let mut dt = cd.property_types.get(prop)?;
+        for _ in 0..8 {
+            let DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } = dt
+            else {
+                break;
+            };
+            if !dimensions.is_empty() || !type_args.is_empty() || name.scope.is_some() {
+                break;
+            }
+            let tn = name.name.name.as_str();
+            let mut hit: Option<&'a DataType> = None;
+            let mut cur: Option<&'a super::elaborate::ElaboratedClass> = Some(cd);
+            let mut guard = 0;
+            while let Some(c) = cur {
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+                if let Some(t) = c.typedef_targets.get(tn) {
+                    hit = Some(t);
+                    break;
+                }
+                cur = c
+                    .extends
+                    .as_deref()
+                    .and_then(|e| self.module.classes.get(e))
+                    .map(|a| a.as_ref());
+            }
+            match hit {
+                Some(t) => dt = t,
+                None => break,
+            }
+        }
+        Some(dt)
+    }
+
+    /// Whether `name` is a VALUE parameter (or body localparam) of the class
+    /// whose scope is executing, or of one of its ancestors. A size cast
+    /// `W'(5)` in a class (§6.24.1) names one of these: it lives on the
+    /// object, not in the module parameter table, so the cast passed the
+    /// operand through unsized.
+    fn class_value_param_in_scope(&self, name: &str) -> bool {
+        let Some(Some(ctx)) = self.class_context_stack.last() else {
+            return false;
+        };
+        let mut cur: Option<&str> = Some(ctx.as_str());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if cd.param_defaults.iter().any(|(n, _)| n == name) {
+                return true;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    /// Signedness of the integral type a type parameter is bound to, by
+    /// name: a built-in atom or a typedef. `None` when it cannot be told.
+    fn concrete_type_signed(&self, name: &str) -> Option<bool> {
+        match name {
+            "byte" | "shortint" | "int" | "longint" | "integer" => return Some(true),
+            "bit" | "logic" | "reg" | "time" => return Some(false),
+            _ => {}
+        }
+        if vector_fragment_width(name).is_some() {
+            return Some(name.contains("signed"));
+        }
+        let dt = self.module.typedef_types.get(name)?;
+        let dt = Self::resolve_type_ref(dt, &self.module.typedef_types);
+        Some(super::elaborate::is_type_signed_resolved(
+            &dt,
+            &self.module.typedef_types,
+        ))
     }
 
     /// Set property `name` on `handle` to `val`, returning whether the value
@@ -140831,6 +141585,38 @@ impl Simulator {
                 if method_name == "new" {
                     self.ctor_class_stack.push((handle, cname.clone()));
                 }
+                // A function returning a bare type-parameter name: the
+                // width and signedness of the type bound on this object, for
+                // the return fit below (§6.20.2).
+                let tp_ret_fit: Option<(u32, Option<bool>)> = match &method.kind {
+                    ClassMethodKind::Function(f) => match &f.return_type {
+                        DataType::TypeReference { name, .. }
+                            if self.class_member_names().params.contains(&name.name.name) =>
+                        {
+                            self.type_param_concrete_in(&f.return_type, &cname)
+                                .and_then(|c| {
+                                    Some((
+                                        self.concrete_type_width(&c)?,
+                                        self.concrete_type_signed(&c),
+                                    ))
+                                })
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                // A STATIC call (no object) of a function whose return is
+                // sized by a class parameter: the call's specialization
+                // sizes it, there being no instance to read it from.
+                let static_dyn_w: Option<u32> = match &dyn_ret_type {
+                    Some(rt) if self.heap.get(handle).and_then(|o| o.as_ref()).is_none() => {
+                        self.class_context_stack.push(Some(cname.clone()));
+                        let w = self.class_param_sized_width(rt);
+                        self.class_context_stack.pop();
+                        w
+                    }
+                    _ => None,
+                };
                 self.class_context_stack.push(Some(cname));
                 self.local_iface_aliases.push(iface_alias_frame);
                 // §13.4: a FUNCTION method may return a collection (queue /
@@ -140961,11 +141747,27 @@ impl Simulator {
                 // last assignment happened to carry.
                 if let Some(rt) = &dyn_ret_type {
                     if !ret.is_real {
-                        let scope = self.instance_param_scope(handle);
-                        let w = resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs));
+                        let w = match static_dyn_w {
+                            Some(w) => w,
+                            None => {
+                                let scope = self.instance_param_scope(handle);
+                                resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs))
+                            }
+                        };
                         if w > 0 && w != ret.width {
                             ret = ret.resize_for_assign(w);
                         }
+                    }
+                }
+                // §6.20.2 / §8.25: a return typed by a TYPE PARAMETER
+                // (`function T get();`) takes the type bound on this object
+                // — `return '1` is eight 1s for `T = byte`, not one.
+                if let Some((w, sg)) = tp_ret_fit.filter(|_| !ret.is_real) {
+                    if w != ret.width || ret.is_fill {
+                        ret = ret.resize_for_assign(w);
+                    }
+                    if let Some(sg) = sg {
+                        ret.is_signed = sg;
                     }
                 }
                 // §13.4.1: a class method's return takes its DECLARED type,
