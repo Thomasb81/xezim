@@ -11,7 +11,7 @@
 //! `@(dq[g])` on an `inout [7:0] dq` wired to `bus[d*8 +: 8]` reaches the
 //! simulator as `bus[d*8 +: 8][g]` — a select OF a select, which neither
 //! path recognized: each such block ran as an interpreted process parked on
-//! the whole bus. `fold_port_select_events` resolves those shapes, before
+//! the whole bus. `fold_event_term` resolves those shapes, before
 //! classification, to the one bit (or contiguous run of bits) of the net
 //! they denote, spelled `net[label]` / `net[l:r]` with the net's own
 //! declared labels.
@@ -406,45 +406,31 @@ fn fold_event_expr(
     })
 }
 
-/// Rewrite every always block's select-of-select event terms to the net
-/// bits they denote (see the module docs). Runs on the materialized always
-/// blocks, before the edge-select alias pass and classification.
-pub(super) fn fold_port_select_events(module: &mut ElaboratedModule) {
-    let dbg = std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some();
-    let mut blocks = std::mem::take(&mut module.always_blocks);
-    for ab in &mut blocks {
-        let control = match &mut ab.stmt.kind {
-            StatementKind::TimingControl { control, .. } => Some(control),
-            StatementKind::SeqBlock { stmts, .. } => match stmts.first_mut().map(|s| &mut s.kind) {
-                Some(StatementKind::TimingControl { control, .. }) => Some(control),
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some(TimingControl::Event(EventControl::EventExpr(exprs))) = control else {
-            continue;
-        };
-        for ee in exprs.iter_mut() {
-            if let Some(f) = fold_event_expr(module, &ee.expr, ee.edge.is_some(), &ab.scope) {
-                if dbg {
-                    let net = match &f.kind {
-                        ExprKind::Index { expr, index } => {
-                            format!(
-                                "{:?}[{:?}]",
-                                ident_name(expr),
-                                Simulator::try_const_u64(index)
-                            )
-                        }
-                        ExprKind::RangeSelect { expr, .. } => format!("{:?}[..]", ident_name(expr)),
-                        _ => String::new(),
-                    };
-                    eprintln!("[EVFOLD] scope='{}' -> {}", ab.scope, net);
-                }
-                ee.expr = f;
+/// Event term `e` of an always block in `scope`, spelled as the net bits it
+/// reads when it is a select of a select (see the module docs); None to
+/// keep it. `edge` is set for `posedge`/`negedge`/`edge` terms.
+pub(super) fn fold_event_term(
+    module: &ElaboratedModule,
+    e: &Expression,
+    edge: bool,
+    scope: &str,
+) -> Option<Expression> {
+    let f = fold_event_expr(module, e, edge, scope)?;
+    if std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some() {
+        let net = match &f.kind {
+            ExprKind::Index { expr, index } => {
+                format!(
+                    "{:?}[{:?}]",
+                    ident_name(expr),
+                    Simulator::try_const_u64(index)
+                )
             }
-        }
+            ExprKind::RangeSelect { expr, .. } => format!("{:?}[..]", ident_name(expr)),
+            _ => String::new(),
+        };
+        eprintln!("[EVFOLD] scope='{}' -> {}", scope, net);
     }
-    module.always_blocks = blocks;
+    Some(f)
 }
 
 fn ident_name(e: &Expression) -> Option<&str> {

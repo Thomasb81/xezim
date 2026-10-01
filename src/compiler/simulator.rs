@@ -9232,9 +9232,6 @@ impl Simulator {
             }
             deferred.push(DeferredAlways::Eager(p.materialize()));
         }
-        // Port substitution leaves `@(dq[3])` as a select of the connection
-        // (`bus[15:8][3]`); spell such terms as the net bit they read first.
-        event_bits::fold_port_select_events(module);
         let params = &module.parameters;
         let headers = always
             .iter_mut()
@@ -9271,6 +9268,17 @@ impl Simulator {
                 continue;
             };
             for (term, ee) in exprs.iter_mut().enumerate() {
+                // Port substitution leaves `@(dq[3])` as a select of the
+                // connection (`bus[15:8][3]`); spell such a term as the net
+                // bit it reads first (see `event_bits`).
+                if let Some(f) =
+                    event_bits::fold_event_term(module, &ee.expr, ee.edge.is_some(), &scope)
+                {
+                    ee.expr = f;
+                    if let Some(p) = patched.as_mut() {
+                        p.push(term);
+                    }
+                }
                 if !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
                     continue;
                 }
