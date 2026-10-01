@@ -8843,17 +8843,21 @@ impl Simulator {
         let headers = always
             .iter_mut()
             .map(|ab| (&mut ab.stmt, ab.scope.clone(), None))
-            .chain(deferred.iter_mut().map(|d| match d {
-                DeferredAlways::Eager(ab) => (&mut ab.stmt, ab.scope.clone(), None),
-                DeferredAlways::Lazy {
-                    lazy,
-                    header,
-                    patched,
-                } => (
-                    &mut **header.as_mut().expect("header kept until Simulator::new ends"),
-                    lazy.src.scope(),
-                    Some(patched),
-                ),
+            .chain(deferred.iter_mut().map(|d| {
+                match d {
+                    DeferredAlways::Eager(ab) => (&mut ab.stmt, ab.scope.clone(), None),
+                    DeferredAlways::Lazy {
+                        lazy,
+                        header,
+                        patched,
+                    } => (
+                        &mut **header
+                            .as_mut()
+                            .expect("header kept until Simulator::new ends"),
+                        lazy.src.scope(),
+                        Some(patched),
+                    ),
+                }
             }));
         for (stmt, scope, mut patched) in headers {
             let StatementKind::TimingControl {
@@ -8885,10 +8889,7 @@ impl Simulator {
                     continue;
                 };
                 if dbg {
-                    eprintln!(
-                        "[EDGESEL] scope='{}' base={} idxs={:?}",
-                        scope, base, idxs
-                    );
+                    eprintln!("[EDGESEL] scope='{}' base={} idxs={:?}", scope, base, idxs);
                 }
                 if idxs.is_empty() {
                     continue;
@@ -9249,13 +9250,14 @@ impl Simulator {
                 }
             }
             let n_always = module.always_blocks.len();
-            let deferred_eager = deferred_always
-                .iter_mut()
-                .enumerate()
-                .filter_map(|(k, d)| match d {
-                    DeferredAlways::Eager(ab) => Some((n_always + k, ab)),
-                    DeferredAlways::Lazy { .. } => None,
-                });
+            let deferred_eager =
+                deferred_always
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(k, d)| match d {
+                        DeferredAlways::Eager(ab) => Some((n_always + k, ab)),
+                        DeferredAlways::Lazy { .. } => None,
+                    });
             for (i, ab) in module
                 .always_blocks
                 .iter_mut()
@@ -21465,7 +21467,9 @@ impl Simulator {
                     self.bitsel_sid_bits[w] |= 1u64 << b;
                 }
                 static DUMP_EDGE_SENS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *DUMP_EDGE_SENS.get_or_init(|| std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some()) {
+                if *DUMP_EDGE_SENS
+                    .get_or_init(|| std::env::var_os("XEZIM_DUMP_EDGE_SENS").is_some())
+                {
                     let terms: Vec<String> = resolved
                         .iter()
                         .map(|si| {
@@ -21903,8 +21907,7 @@ impl Simulator {
     /// write through a port or interface) is materialized for the walk.
     #[allow(clippy::type_complexity)]
     fn write_target_census(&self) -> ((HashSet<String>, HashSet<String>), Vec<String>) {
-        let mut by_source: HashMap<usize, (HashSet<String>, HashSet<String>)> =
-            HashMap::default();
+        let mut by_source: HashMap<usize, (HashSet<String>, HashSet<String>)> = HashMap::default();
         let mut extra_writes: Vec<String> = Vec::new();
         let mut walk_lazy: Vec<&LazyAlways> = Vec::new();
         for d in &self.deferred_always {
@@ -29019,7 +29022,9 @@ impl Simulator {
                 _ => None,
             };
             let Some(h) = base else { continue };
-            *ca_driver_counts.entry(flat_name(h, &self.module)).or_insert(0) += 1;
+            *ca_driver_counts
+                .entry(flat_name(h, &self.module))
+                .or_insert(0) += 1;
         }
         // INPUT identity connects only (`u1.din = src`, rhs in parent
         // scope): the child name re-points at the parent's id. Output
@@ -29413,7 +29418,9 @@ impl Simulator {
             } => {
                 Self::expr_has_sampled_call(condition)
                     || Self::stmt_has_sampled_call(then_stmt)
-                    || else_stmt.as_deref().is_some_and(Self::stmt_has_sampled_call)
+                    || else_stmt
+                        .as_deref()
+                        .is_some_and(Self::stmt_has_sampled_call)
             }
             SK::TimingControl { stmt, .. } => Self::stmt_has_sampled_call(stmt),
             SK::For { body, .. }
@@ -29509,12 +29516,7 @@ impl Simulator {
                     Some(d) => {
                         let mut reads: HashSet<String> = HashSet::default();
                         let mut writes: HashSet<String> = HashSet::default();
-                        Self::collect_stmt_reads(
-                            body,
-                            &self.module,
-                            &mut reads,
-                            &mut writes,
-                        );
+                        Self::collect_stmt_reads(body, &self.module, &mut reads, &mut writes);
                         let top_resolvable = writes.iter().any(|w| {
                             !w.contains('.') && self.signal_name_to_id.contains_key(w.as_str())
                         });

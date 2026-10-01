@@ -568,7 +568,11 @@ pub fn sort_lexicographic<S: AsRef<str>>(names: &mut Vec<S>) {
         sort_from(&mut items, &bytes, 0);
     }
     let mut slots: Vec<Option<S>> = std::mem::take(names).into_iter().map(Some).collect();
-    names.extend(items.into_iter().map(|(_, i)| slots[i as usize].take().unwrap()));
+    names.extend(
+        items
+            .into_iter()
+            .map(|(_, i)| slots[i as usize].take().unwrap()),
+    );
 }
 
 #[cfg(test)]
@@ -600,7 +604,9 @@ mod tests {
             }
             input.push(n);
         }
-        for extra in ["", "a", "a.b", "a_b", "a.b.c", "a\0", "a\0b", "tb", "tb.", "zz"] {
+        for extra in [
+            "", "a", "a.b", "a_b", "a.b.c", "a\0", "a\0b", "tb", "tb.", "zz",
+        ] {
             input.push(extra.to_string());
             input.push(extra.to_string());
         }
@@ -609,10 +615,17 @@ mod tests {
         let mut got = input.clone();
         sort_lexicographic(&mut got);
         assert_eq!(got, want);
-        let mut borrowed: Vec<std::borrow::Cow<'_, str>> =
-            input.iter().map(|s| std::borrow::Cow::Borrowed(s.as_str())).collect();
+        let mut borrowed: Vec<std::borrow::Cow<'_, str>> = input
+            .iter()
+            .map(|s| std::borrow::Cow::Borrowed(s.as_str()))
+            .collect();
         sort_lexicographic(&mut borrowed);
-        assert!(borrowed.iter().map(|c| c.as_ref()).eq(want.iter().map(|s| s.as_str())));
+        assert!(
+            borrowed
+                .iter()
+                .map(|c| c.as_ref())
+                .eq(want.iter().map(|s| s.as_str()))
+        );
     }
 
     #[test]

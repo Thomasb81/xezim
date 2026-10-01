@@ -28,7 +28,13 @@ fn run(name: &str, src: &str, env: &[(&str, &str)]) -> String {
     let path = dir.join(format!("{name}.sv"));
     std::fs::write(&path, src).expect("write temporary design");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
-    cmd.args(["--simulate", "-s", "tb", "--no-cache", path.to_str().unwrap()]);
+    cmd.args([
+        "--simulate",
+        "-s",
+        "tb",
+        "--no-cache",
+        path.to_str().unwrap(),
+    ]);
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -407,8 +413,14 @@ fn identity_chains_collapse_in_any_order() {
         "{out}"
     );
     // Same re-pointing work as the in-place passes did.
-    assert!(out.contains("[NET-COLLAPSE] 2 identity port nets collapsed"), "{out}");
-    assert!(out.contains("[BUF-COLLAPSE] 24 identity buffer nets collapsed"), "{out}");
+    assert!(
+        out.contains("[NET-COLLAPSE] 2 identity port nets collapsed"),
+        "{out}"
+    );
+    assert!(
+        out.contains("[BUF-COLLAPSE] 24 identity buffer nets collapsed"),
+        "{out}"
+    );
 }
 
 #[test]
