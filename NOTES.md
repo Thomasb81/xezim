@@ -1,7 +1,8 @@
 # xezim technical notes
 
-Release notes, verified workloads and compliance results. The user guide
-and the development workflow are in [README.md](README.md).
+Release notes, verified workloads and compliance results. The user guide is
+in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
+[docs/building.md](docs/building.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 # What's new in 0.11
 
@@ -1244,7 +1245,7 @@ and pinned with a regression test citing the LRM section:
 * **Per-module timescales** — `$time`/`$realtime` scale to the calling module's
   unit; `timeunit`/`timeprecision` declarations scale delays; `$timeformat`/`%t`
   and `$printtimescale` honored; sub-ns precision down to `fs`; new
-  [`--module-timescale`](#module-timescale-extension) CLI extension for
+  [`--module-timescale`](docs/user-guide.md#module-timescale-extension) CLI extension for
   legacy RTL with no source-level timescale.
 * **String & aggregate conformance fixes** — `s[i]` read/write on string
   variables (§11.4.13), `ref`/`output` queue arguments copy back on return
