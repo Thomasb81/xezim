@@ -6259,6 +6259,10 @@ pub struct Simulator {
     /// Specialized class entry name -> the class it was specialized from
     /// (`"wrap_c<derived_c>"` -> `"wrap_c"`).
     spec_clone_origin: HashMap<String, String>,
+    /// Typedef names whose target is a specialization of a `dep_base` class
+    /// (`typedef wrap_c #(derived_c) wd_t;`): `$cast` checks a destination
+    /// declared through one against that specialization.
+    dep_typedefs: HashSet<String>,
     /// Scratch key for the property-initializer loop of instantiation.
     inst_key_scratch: String,
     /// Instantiation templates by leaf class name (see `InstTemplate`).
@@ -11177,6 +11181,7 @@ impl Simulator {
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),
             spec_clone_origin: HashMap::default(),
+            dep_typedefs: HashSet::default(),
             inst_templates: std::cell::RefCell::new(HashMap::default()),
             inst_key_scratch: String::new(),
             settling: false,
@@ -104671,6 +104676,13 @@ impl Simulator {
             return format!("class {}", concrete);
         }
         if let Some(n) = concrete.split('#').next() {
+            if self.module.classes.contains_key(n) {
+                // A specialization (`box#(byte)`): every parameter listed,
+                // spelled as for a declared class type.
+                if let Some((b, sig)) = self.extract_spec_from_string(concrete) {
+                    return self.class_spec_typename(&b, Some(&sig));
+                }
+            }
             if self.module.classes.contains_key(n) || self.module.covergroups.contains_key(n) {
                 return format!("class {}", concrete);
             }
@@ -112888,7 +112900,9 @@ impl Simulator {
     /// The class a specialized class entry was made from (`"wrap_c<d>"` ->
     /// `"wrap_c"`); any other name is its own origin.
     fn class_origin<'a>(&'a self, name: &'a str) -> &'a str {
-        if self.spec_clone_origin.is_empty() {
+        // Every specialized entry's name ends in `>`; anything else is its
+        // own origin without a lookup (hot: hierarchy walks call this).
+        if self.spec_clone_origin.is_empty() || !name.ends_with('>') {
             return name;
         }
         self.spec_clone_origin
@@ -112958,7 +112972,18 @@ impl Simulator {
         };
         let (b, bargs) = if cd.type_param_names.iter().any(|t| t == ext) {
             let j = order.iter().position(|p| p == ext)?;
-            self.type_base_frag_class(bound.get(j)?)?
+            let supplied = args.get(j).is_some_and(|a| !a.trim().is_empty());
+            // The declared default keeps its own specialization
+            // (`type BASE = uvm_sequence #(uvm_reg_item)`); the textual
+            // default fragment drops it.
+            let dflt = (!supplied)
+                .then(|| self.type_param_default_spec_frag(cd, ext))
+                .flatten()
+                .map(|d| subst(&d));
+            match dflt {
+                Some(d) => self.type_base_frag_class(&d)?,
+                None => self.type_base_frag_class(bound.get(j)?)?,
+            }
         } else {
             let (b, _) = self.type_base_frag_class(ext)?;
             (b, ext_args.iter().map(|a| subst(a)).collect())
@@ -112975,12 +113000,47 @@ impl Simulator {
         Some((b, bargs))
     }
 
+    /// The declared default of type parameter `tp` of `cd` as a fragment
+    /// WITH its `#(...)` arguments (`uvm_sequence#(uvm_reg_item)`), when it
+    /// is a specialized class type.
+    fn type_param_default_spec_frag(
+        &self,
+        cd: &crate::compiler::elaborate::ElaboratedClass,
+        tp: &str,
+    ) -> Option<String> {
+        let (_, dt) = cd.type_param_default_types.iter().find(|(n, _)| n == tp)?;
+        let DataType::TypeReference {
+            name, type_args, ..
+        } = dt
+        else {
+            return None;
+        };
+        if type_args.is_empty() {
+            return None;
+        }
+        let frags: Vec<String> = type_args
+            .iter()
+            .map(|a| self.expr_to_spec_fragment(a))
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!("{}#({})", name.name.name, frags.join(",")))
+    }
+
     /// The class entry of specialization `(base, sig)` if one was made, else
     /// `base` itself.
     fn spec_entry(&self, base: &str, sig: &str) -> String {
-        if !self.dep_base.contains_key(base) {
-            return base.to_string();
+        self.spec_entry_cow(base, sig).into_owned()
+    }
+
+    /// `spec_entry` without a copy when `base` is its own entry (hot: the
+    /// type-parameter and static-key resolvers call it per lookup).
+    fn spec_entry_cow<'a>(&self, base: &'a str, sig: &str) -> std::borrow::Cow<'a, str> {
+        if self.spec_clone_origin.is_empty() || !self.dep_base.contains_key(base) {
+            return std::borrow::Cow::Borrowed(base);
         }
+        std::borrow::Cow::Owned(self.spec_entry_slow(base, sig))
+    }
+
+    fn spec_entry_slow(&self, base: &str, sig: &str) -> String {
         let args: Vec<String> = Self::split_spec_args(sig)
             .into_iter()
             .map(|a| a.trim().to_string())
@@ -113075,6 +113135,45 @@ impl Simulator {
     fn link_type_param_bases(&mut self) {
         let mut names: Vec<String> = self.module.classes.keys().cloned().collect();
         names.sort();
+        // §6.20.3: a type parameter's default that is itself a specialization
+        // (`type BASE = uvm_sequence #(uvm_reg_item)`, `type B = box#(T)`)
+        // keeps its arguments. The textual default kept only the class name,
+        // so the unspecialized class bound the base's DEFAULT specialization.
+        for c in &names {
+            let Some(cd) = self.module.classes.get(c) else {
+                continue;
+            };
+            let mut fixed: Vec<(usize, String)> = Vec::new();
+            for (i, (tp, frag)) in cd.type_param_defaults.iter().enumerate() {
+                if frag.contains('#') {
+                    continue;
+                }
+                let Some(full) = self.type_param_default_spec_frag(cd, tp) else {
+                    continue;
+                };
+                // Arguments naming this class's own parameters stay as
+                // written: each specialization substitutes them.
+                let (b, args) = Self::strip_class_specialization(&full);
+                let args = args.unwrap_or_default();
+                let names_param = Self::split_spec_args(&args)
+                    .iter()
+                    .any(|a| cd.param_order.iter().any(|p| p == a.trim()));
+                let full = if names_param || !self.module.classes.contains_key(&b) {
+                    full
+                } else {
+                    format!("{}#({})", b, self.canonicalize_spec_sig(&b, &args))
+                };
+                fixed.push((i, full));
+            }
+            if fixed.is_empty() {
+                continue;
+            }
+            if let Some(cd) = self.module.classes.get_mut(c).map(std::sync::Arc::make_mut) {
+                for (i, full) in fixed {
+                    cd.type_param_defaults[i].1 = full;
+                }
+            }
+        }
         for c in &names {
             let Some(cd) = self.module.classes.get(c) else {
                 continue;
@@ -113207,6 +113306,22 @@ impl Simulator {
                 cd.extends = Some(key);
             }
         }
+        let mut found: Vec<String> = Vec::new();
+        let typedefs = self.module.typedef_types.iter().chain(
+            self.module
+                .classes
+                .values()
+                .flat_map(|cd| cd.typedef_targets.iter()),
+        );
+        for (t, dt) in typedefs {
+            if self
+                .spec_from_typedef_dt(dt)
+                .is_some_and(|(b, _)| self.dep_base.contains_key(&b))
+            {
+                found.push(t.clone());
+            }
+        }
+        self.dep_typedefs.extend(found);
     }
 
     /// Break any cycle in the class `extends` graph. A self- or mutually-
@@ -114177,11 +114292,8 @@ impl Simulator {
                     let key = match active_spec {
                         Some((base, sig))
                             if (base == cname
-                                || if self.dep_base.is_empty() {
-                                    self.class_extends(&base, &cname)
-                                } else {
-                                    self.class_extends(&self.spec_entry(&base, &sig), &cname)
-                                })
+                                || self
+                                    .class_extends(&self.spec_entry_cow(&base, &sig), &cname))
                                 && self.class_is_parameterized(&cname) =>
                         {
                             // For inherited statics (cname != base), derive
@@ -118662,7 +118774,7 @@ impl Simulator {
                 // (`typedef wrap_c #(derived_c) wd_t; wd_t t;`) takes only
                 // that specialization.
                 let tn = match &dest.kind {
-                    ExprKind::Ident(hh) if hh.path.len() == 1 && !self.dep_base.is_empty() => {
+                    ExprKind::Ident(hh) if hh.path.len() == 1 && !self.dep_typedefs.is_empty() => {
                         let v = &hh.path[0].name.name;
                         self.var_class_types.get(v).cloned().or_else(|| {
                             self.signal_name_to_id
@@ -118673,7 +118785,10 @@ impl Simulator {
                     }
                     _ => None,
                 };
-                match tn.and_then(|t| self.resolve_typedef_spec(&t)) {
+                match tn
+                    .filter(|t| self.dep_typedefs.contains(t))
+                    .and_then(|t| self.resolve_typedef_spec(&t))
+                {
                     Some((b, sig)) if self.dep_base.contains_key(&b) => {
                         let args: Vec<String> = Self::split_spec_args(&sig)
                             .into_iter()
@@ -129306,7 +129421,10 @@ impl Simulator {
             }
         }
         if let Some((base, sig)) = spec {
-            if let Some(cd) = self.get_class_def(base) {
+            // The specialization's own class entry: its `extends` is the
+            // bound base when that is a type parameter (§8.25).
+            let entry = self.spec_entry_cow(base, sig);
+            if let Some(cd) = self.get_class_def(&entry) {
                 if let Some(idx) = cd.type_param_names.iter().position(|p| p == tn) {
                     if let Some(v) = Self::spec_arg_at(sig, idx) {
                         let v = v.trim();
@@ -141881,6 +141999,7 @@ impl Simulator {
     fn class_operand_typename(&mut self, arg: &Expression) -> Option<String> {
         if matches!(arg.kind, ExprKind::This) {
             let cls = self.class_context_stack.last().cloned().flatten()?;
+            let cls = self.class_origin(&cls).to_string();
             let sig = self
                 .this_stack
                 .last()

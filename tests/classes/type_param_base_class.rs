@@ -414,6 +414,115 @@ endmodule
     );
 }
 
+/// A type-parameter base whose DEFAULT is itself a specialization
+/// (`type BASE = comp_base#(byte)`): the unspecialized class binds `comp_base#(byte)`, not
+/// `comp_base`'s own default, for statics, `$typename` and `$cast`.
+#[test]
+fn type_param_base_specialized_default() {
+    const SRC: &str = r#"
+class comp_base #(type T = int);
+  T data;
+  static int sc;
+  function new(); sc++; endfunction
+  virtual function string who(); return $sformatf("comp_base#(%s)", $typename(T)); endfunction
+endclass
+class wrap_d #(type BASE = comp_base#(byte)) extends BASE;
+  virtual function string who(); return {"wrap_d/", super.who()}; endfunction
+endclass
+class user_d extends wrap_d #(comp_base#(byte));
+endclass
+class user_s extends wrap_d #(comp_base#(shortint));
+endclass
+module tb;
+  wrap_d w; user_d u; user_s s; comp_base#(byte) cb;
+  initial begin
+    w = new(); u = new(); s = new();
+    $display("T| %s", w.who());
+    $display("T| %s", u.who());
+    $display("T| %s", s.who());
+    $display("T| sc %0d %0d %0d", comp_base#(byte)::sc, comp_base#(shortint)::sc, comp_base#()::sc);
+    $display("T| cast %0d %0d", $cast(cb, w), $cast(cb, u));
+    $display("T| tn %s", $typename(w));
+  end
+endmodule
+"#;
+    check(
+        "t7",
+        SRC,
+        &[
+            "T| wrap_d/comp_base#(byte)",
+            "T| wrap_d/comp_base#(byte)",
+            "T| wrap_d/comp_base#(shortint)",
+            "T| sc 2 1 0",
+            "T| cast 1 1",
+            "T| tn class wrap_d #(class comp_base #(byte))",
+        ],
+    );
+}
+
+/// §6.20.3: any type-parameter default written as a specialization (`type B = box#(T)`,
+/// `type D = box#(shortint)`) keeps its arguments, following earlier parameters.
+#[test]
+fn specialized_type_param_default_keeps_its_arguments() {
+    const SRC: &str = r#"
+class box #(type T = int); T v; endclass
+class C #(type T = byte, type B = box#(T), type D = box#(shortint));
+  function string s(); return {$typename(B), " / ", $typename(D)}; endfunction
+endclass
+module tb;
+  C c; C#(int) ci;
+  initial begin c = new(); ci = new(); $display("T| %s", c.s()); $display("T| %s", ci.s()); end
+endmodule
+"#;
+    check(
+        "t8",
+        SRC,
+        &[
+            "T| class box #(byte) / class box #(shortint)",
+            "T| class box #(int) / class box #(shortint)",
+        ],
+    );
+}
+
+/// `$typename(this)`, a local of the base type parameter, and `this_type` construction
+/// inside a method of a non-default specialization.
+#[test]
+fn type_param_base_typename_this_and_this_type() {
+    const SRC: &str = r#"
+class base_c;
+  virtual function string who(); return "base_c"; endfunction
+endclass
+class derived_c extends base_c;
+  virtual function string who(); return "derived_c"; endfunction
+endclass
+class wrap_c #(type BASE = base_c) extends BASE;
+  typedef wrap_c #(BASE) this_type;
+  function string tn(); return $typename(this); endfunction
+  function string bn(); BASE b; return $typename(b); endfunction
+  function this_type cp(); this_type t; t = new(); return t; endfunction
+endclass
+module tb;
+  wrap_c w; wrap_c #(derived_c) wd; wrap_c #(derived_c) wd2;
+  initial begin
+    w = new(); wd = new();
+    $display("T| %s | %s", w.tn(), wd.tn());
+    $display("T| %s | %s", w.bn(), wd.bn());
+    wd2 = wd.cp();
+    $display("T| cp %s %s", wd2.who(), wd2.tn());
+  end
+endmodule
+"#;
+    check(
+        "t9",
+        SRC,
+        &[
+            "T| class wrap_c #(class base_c) | class wrap_c #(class derived_c)",
+            "T| class base_c | class derived_c",
+            "T| cp derived_c class wrap_c #(class derived_c)",
+        ],
+    );
+}
+
 /// `this_type` construction in a static method, a value parameter beside the type parameter,
 /// a named `extends wrap_c #(.BASE(B))`, a typedef default, a specialization made inside
 /// another parameterized class, a nested `wrap_c #(wrap_c #(derived_c))`, and
