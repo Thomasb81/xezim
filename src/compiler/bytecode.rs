@@ -17620,13 +17620,21 @@ impl<'a> BytecodeCompiler<'a> {
         }
         let fwd_only = !Self::has_backward_branch(insns);
         for i in 0..insns.len() - 1 {
-            if is_target[i + 1] {
+            if matches!(insns[i], Insn::Nop) {
+                continue;
+            }
+            // Find next non-Nop instruction:
+            let mut j = i + 1;
+            while j < insns.len() && matches!(insns[j], Insn::Nop) && !is_target[j] {
+                j += 1;
+            }
+            if j >= insns.len() || is_target[j] {
                 continue;
             }
             // cmp ; BranchIfFalse — the compare's dest must have no reader
             // other than the branch (backward jumps make a linear liveness
             // scan unsound, so the whole block is checked).
-            if let Insn::BranchIfFalse(c, t) = insns[i + 1] {
+            if let Insn::BranchIfFalse(c, t) = insns[j] {
                 let kind = match &insns[i] {
                     Insn::Eq(d, ..) if *d == c => Some(CmpKind::Eq),
                     Insn::Neq(d, ..) if *d == c => Some(CmpKind::Neq),
@@ -17639,12 +17647,12 @@ impl<'a> BytecodeCompiler<'a> {
                 };
                 if let Some(kind) = kind {
                     let only_reader = if fwd_only {
-                        insns[i + 2..].iter().all(|x| !Self::insn_reads_reg(x, c))
+                        insns[j + 1..].iter().all(|x| !Self::insn_reads_reg(x, c))
                     } else {
                         insns
                             .iter()
                             .enumerate()
-                            .all(|(j, x)| j == i || j == i + 1 || !Self::insn_reads_reg(x, c))
+                            .all(|(k, x)| k == i || k == j || !Self::insn_reads_reg(x, c))
                     };
                     if only_reader {
                         let (l, r) = match &insns[i] {
@@ -17658,39 +17666,39 @@ impl<'a> BytecodeCompiler<'a> {
                             _ => unreachable!(),
                         };
                         insns[i] = Insn::CmpBranch(kind, l, r, c, t);
-                        insns[i + 1] = Insn::Nop;
+                        insns[j] = Insn::Nop;
                         continue;
                     }
                 }
             }
             // Move ; Resize of the same dest.
-            if let (&Insn::Move(d, sr), &Insn::Resize(rd, w)) = (&insns[i], &insns[i + 1]) {
+            if let (&Insn::Move(d, sr), &Insn::Resize(rd, w)) = (&insns[i], &insns[j]) {
                 if rd == d && d != sr {
                     insns[i] = Insn::MoveResize(d, sr, w);
-                    insns[i + 1] = Insn::Nop;
+                    insns[j] = Insn::Nop;
                     continue;
                 }
             }
             // Resize ; Move where the resized register dies at the Move:
             // the fused form reads the PRE-resize value and resizes it into
             // the Move's dest — identical result, and `a` stays stale-but-dead.
-            if let (&Insn::Resize(a, w), &Insn::Move(d, ms)) = (&insns[i], &insns[i + 1]) {
+            if let (&Insn::Resize(a, w), &Insn::Move(d, ms)) = (&insns[i], &insns[j]) {
                 if ms == a && d != a {
                     // The Resize itself reads `a` in place (the pre-resize
                     // value the fused form also reads), so it is excluded
                     // like the Move; counting it kept every loop body's
                     // `i = i + 1` on three instructions.
                     let only_reader = if fwd_only {
-                        insns[i + 2..].iter().all(|x| !Self::insn_reads_reg(x, a))
+                        insns[j + 1..].iter().all(|x| !Self::insn_reads_reg(x, a))
                     } else {
                         insns
                             .iter()
                             .enumerate()
-                            .all(|(j, x)| j == i || j == i + 1 || !Self::insn_reads_reg(x, a))
+                            .all(|(k, x)| k == i || k == j || !Self::insn_reads_reg(x, a))
                     };
                     if only_reader {
                         insns[i] = Insn::MoveResize(d, a, w);
-                        insns[i + 1] = Insn::Nop;
+                        insns[j] = Insn::Nop;
                         continue;
                     }
                 }

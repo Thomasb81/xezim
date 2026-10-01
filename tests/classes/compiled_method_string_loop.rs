@@ -84,7 +84,7 @@ endmodule
 fn string_verb_calls_inside_vardecl_for_match_reference() {
     gate_on();
     let sim = simulate(HOT_SRC, 100).expect("compiled simulation should run");
-    // Reference-validated (QuestaSim) and byte-identical across gate ON/OFF:
+    // Reference-validated (reference simulator) and byte-identical across gate ON/OFF:
     // TAG a=-1598707712 b=7762830. `a` folded a 16-char UVM body through the
     // *31+k*7 checksum, overflowing a 32-bit int into the reference value
     // (as a u64 signal read that is 2^32 + (-1598707712) = 2696259584); both

@@ -288,6 +288,13 @@ enum FastCallState {
     Entry(std::rc::Rc<FastCallEntry>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FastAccessor {
+    None,
+    Getter(Box<str>),
+    Setter(Box<str>),
+}
+
 /// class-perf P3: everything a direct VM->VM `CallMethod` needs to run a
 /// compiled callee without materializing args or re-entering the
 /// interpreter's binding loop. Mirrors `try_run_compiled_method`'s seeding
@@ -311,6 +318,7 @@ struct FastCallEntry {
     result_signed: bool,
     is_class_result: bool,
     is_void_result: bool,
+    accessor: FastAccessor,
 }
 
 /// class-perf P3: is the direct VM->VM dispatch enabled? (XEZIM_FAST_CALLS=0
@@ -132738,6 +132746,46 @@ impl Simulator {
                 return res;
             }
         }
+        if compiled_methods_enabled() {
+            if let Some(md) = self.method_defining_class(&class_name, method_name) {
+                if let Some(entry) = self.vm_fast_entry_for(&md.class, method_name, &md.method) {
+                    match &entry.accessor {
+                        FastAccessor::Getter(field) if args.is_empty() => {
+                            let value = self
+                                .heap
+                                .get(handle)
+                                .and_then(|o| o.as_ref())
+                                .and_then(|inst| inst.properties.get(field.as_ref()))
+                                .cloned()
+                                .unwrap_or_else(|| Value::zero(1));
+                            let mut result = value;
+                            if entry.result_width > 0 && result.width != entry.result_width {
+                                result = result.resize_for_assign(entry.result_width);
+                            }
+                            if !entry.is_class_result && !entry.is_void_result && !result.is_real {
+                                result.is_signed = entry.result_signed;
+                            }
+                            return result;
+                        }
+                        FastAccessor::Setter(field) if args.len() == 1 => {
+                            let arg_val = self.eval_expr(&args[0]);
+                            let fitted = {
+                                let mut v = arg_val;
+                                if let Some(w) = entry.coerce.first().map(|c| c.1) && w > 0 && v.width != w {
+                                    v = v.resize_for_assign(w);
+                                }
+                                self.fit_class_prop(handle, field.as_ref(), &v)
+                            };
+                            if let Some(o) = self.heap.get_mut(handle).and_then(|o| o.as_mut()) {
+                                o.properties.insert(field.to_string(), fitted);
+                            }
+                            return Value::zero(32);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         self.exec_method_in_class_hierarchy(handle, &class_name, method_name, args)
     }
 
@@ -142257,9 +142305,6 @@ impl Simulator {
                 // the same heap / register file the AST path uses). Gated off
                 // by default.
                 if let Some(cval) = compiled_methods_enabled().then(|| {
-                    if SAMPLER_READY.load(Ordering::Relaxed) {
-                        CUR_METHOD_COMPILED.store(true, Ordering::Relaxed);
-                    }
                     self.try_run_compiled_method(
                         handle,
                         &cname,
@@ -142273,9 +142318,6 @@ impl Simulator {
                 }).flatten() {
                     self.return_value = Some(cval);
                 } else {
-                    if SAMPLER_READY.load(Ordering::Relaxed) {
-                        CUR_METHOD_COMPILED.store(false, Ordering::Relaxed);
-                    }
                 for stmt in body {
                     self.exec_statement(stmt);
                     if self.break_flag || self.return_flag {
@@ -144382,8 +144424,16 @@ impl Simulator {
                 self.var_class_types.insert(rn, cn);
             }
         }
+        let _prev_comp = if SAMPLER_READY.load(Ordering::Relaxed) {
+            Some(CUR_METHOD_COMPILED.swap(true, Ordering::Relaxed))
+        } else {
+            None
+        };
         // Run the block.
         self.exec_insns(&block.instructions);
+        if let Some(prev) = _prev_comp {
+            CUR_METHOD_COMPILED.store(prev, Ordering::Relaxed);
+        }
         let result = self
             .vm_regs
             .get(result_reg as usize)
@@ -144593,6 +144643,62 @@ impl Simulator {
                 Value::new(rw)
             }
         };
+        let meaningful: Vec<&Insn> = block
+            .instructions
+            .iter()
+            .filter(|i| !matches!(i, Insn::Nop) && !matches!(i, Insn::Move(d, s) if d == s))
+            .collect();
+        let getter_field = if coerce.is_empty() {
+            match meaningful.as_slice() {
+                [Insn::LoadClassMember(d, h, field)]
+                    if *h == rc_entry.this_reg && *d == rc_entry.result_reg =>
+                {
+                    Some(field.as_ref())
+                }
+                [Insn::LoadClassMember(d, h, field), Insn::Move(rd, s)]
+                    if *h == rc_entry.this_reg && *rd == rc_entry.result_reg && *s == *d =>
+                {
+                    Some(field.as_ref())
+                }
+                [Insn::LoadClassMember(d, h, field), Insn::Resize(rd, _)]
+                    if *h == rc_entry.this_reg && *rd == rc_entry.result_reg && *rd == *d =>
+                {
+                    Some(field.as_ref())
+                }
+                [Insn::LoadClassMember(d, h, field), Insn::Move(rd, s), Insn::Resize(rrd, _)]
+                    if *h == rc_entry.this_reg && *rd == rc_entry.result_reg && *s == *d && *rrd == *rd =>
+                {
+                    Some(field.as_ref())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let setter_field = if coerce.len() == 1 {
+            match meaningful.as_slice() {
+                [Insn::StoreClassMember(h, v, field)]
+                    if *h == rc_entry.this_reg && *v == rc_entry.this_reg + 1 =>
+                {
+                    Some(field.as_ref())
+                }
+                [Insn::Move(v2, v1), Insn::StoreClassMember(h, v, field)]
+                    if *h == rc_entry.this_reg && *v1 == rc_entry.this_reg + 1 && *v == *v2 =>
+                {
+                    Some(field.as_ref())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let accessor = if let Some(f) = getter_field {
+            FastAccessor::Getter(Box::from(f))
+        } else if let Some(f) = setter_field {
+            FastAccessor::Setter(Box::from(f))
+        } else {
+            FastAccessor::None
+        };
         let entry = std::rc::Rc::new(FastCallEntry {
             block,
             defining_class: dclass.to_string().into_boxed_str(),
@@ -144604,6 +144710,7 @@ impl Simulator {
             result_signed: pre.result_signed,
             is_class_result: pre.is_class_result,
             is_void_result: pre.is_void_result,
+            accessor,
         });
         self.compiled_fast_calls
             .insert((cid, mid), FastCallState::Entry(entry.clone()));
@@ -144675,6 +144782,47 @@ impl Simulator {
         };
         if self.is_static_method(&leaf, method) {
             return None;
+        }
+        // Fast-path accessor check: if the method is already compiled as a
+        // pure 1-statement getter or setter, execute it with zero allocations
+        // or frame setup, even before the tier threshold.
+        if let Some(entry) = self.vm_fast_entry_for(&md.class, method, &md.method) {
+            match &entry.accessor {
+                FastAccessor::Getter(field) if n == 0 => {
+                    let value = self
+                        .heap
+                        .get(handle)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|inst| inst.properties.get(field.as_ref()))
+                        .cloned()
+                        .unwrap_or_else(|| Value::zero(1));
+                    let mut result = value;
+                    if entry.result_width > 0 && result.width != entry.result_width {
+                        result = result.resize_for_assign(entry.result_width);
+                    }
+                    if !entry.is_class_result && !entry.is_void_result && !result.is_real {
+                        result.is_signed = entry.result_signed;
+                    }
+                    return Some(result);
+                }
+                FastAccessor::Setter(field) if n == 1 => {
+                    let Some(src) = self.vm_regs.get(arg_base) else {
+                        return None;
+                    };
+                    let fitted = {
+                        let mut v = src.clone();
+                        if let Some(w) = entry.coerce.first().map(|c| c.1) && w > 0 && v.width != w {
+                            v = v.resize_for_assign(w);
+                        }
+                        self.fit_class_prop(handle, field.as_ref(), &v)
+                    };
+                    if let Some(o) = self.heap.get_mut(handle).and_then(|o| o.as_mut()) {
+                        o.properties.insert(field.to_string(), fitted);
+                    }
+                    return Some(Value::zero(32));
+                }
+                _ => {}
+            }
         }
         // Same tier counter `try_run_compiled_method` bumps: the fast path
         // may only run a callee that has already crossed the threshold.

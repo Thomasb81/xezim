@@ -148,6 +148,8 @@ mod compiled_method_tiering;
 mod compiled_method_array_members;
 #[path = "classes/compiled_method_string_loop.rs"]
 mod compiled_method_string_loop;
+#[path = "classes/compiled_method_accessors.rs"]
+mod compiled_method_accessors;
 #[path = "classes/compiled_method_cast.rs"]
 mod compiled_method_cast;
 #[path = "classes/class_local_typedef_aa.rs"]
