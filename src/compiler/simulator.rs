@@ -62132,6 +62132,9 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
+        if let Some(ok) = self.assign_static_through_chain(lhs, val) {
+            return ok;
+        }
         if let ExprKind::MemberAccess { expr: b, .. }
         | ExprKind::Index { expr: b, .. }
         | ExprKind::RangeSelect { expr: b, .. } = &lhs.kind
@@ -64078,6 +64081,84 @@ impl Simulator {
                 return self.write_class_agg(&r, val);
             }
         }
+        // §8.9: assignment to a STATIC class property (`obj.static_prop = ...`,
+        // `this.static_prop = ...`) writes the single shared cell, not per-
+        // instance storage. A named reference resolves by its declared type
+        // and specialization (§8.25), so a null handle works and a derived
+        // object's same-named instance property is not mistaken for it; this
+        // arm runs before the instance-property arms below. A non-static
+        // member falls through to them.
+        {
+            let obj_prop: Option<(String, String)> = match &lhs.kind {
+                ExprKind::Ident(h)
+                    if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
+                }
+                ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                        Some((h.path[0].name.name.clone(), member.name.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((obj, prop)) = obj_prop {
+                if obj != "this" && obj != "super" {
+                    let handle = self.eval_ident_handle(&obj).unwrap_or(0);
+                    let resolved = match &lhs.kind {
+                        ExprKind::Ident(h) => {
+                            let head_id = HierarchicalIdentifier {
+                                root: h.root.clone(),
+                                path: vec![h.path[0].clone()],
+                                span: h.span,
+                                cached_signal_id: std::cell::Cell::new(None),
+                                cached_resolved_name: std::cell::OnceCell::new(),
+                            };
+                            Some(self.resolve_hier_name(&head_id).into_owned())
+                        }
+                        ExprKind::MemberAccess { expr, .. } => match &expr.kind {
+                            ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(ok) = self.static_write_via_handle(
+                        handle,
+                        Some(&obj),
+                        resolved.as_deref(),
+                        &prop,
+                        val.clone(),
+                    ) {
+                        return ok;
+                    }
+                }
+                let cn = if obj == "this" {
+                    self.this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .and_then(|h| self.heap.get(h))
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone())
+                } else {
+                    // A named reference was resolved above, by its
+                    // declared type.
+                    None
+                };
+                if let Some(cn) = cn {
+                    if self.static_prop_key(&cn, &prop).is_some() {
+                        let mut v = val.clone();
+                        if let Some(w) = self.class_prop_width(&cn, &prop) {
+                            if w != v.width && !v.is_real {
+                                v = v.resize_for_assign(w);
+                            }
+                        }
+                        return self.class_static_set(&cn, &prop, v);
+                    }
+                }
+            }
+        }
         // §7.8.6/§8.4: `coll[key].prop = v` where the element is a CLASS
         // HANDLE writes the heap object the handle points at — not a
         // composed `coll[key].prop` signal (which silently forks the
@@ -64214,50 +64295,6 @@ impl Simulator {
             {
                 if let Some(r) = self.class_packed_elem_ref(expr, index) {
                     return self.write_class_agg(&r, val);
-                }
-            }
-        }
-        // §8.9: assignment to a STATIC class property (`obj.static_prop = ...`,
-        // `this.static_prop = ...`) writes the single shared cell, not per-
-        // instance storage. static_prop_key is None for a non-static member, so
-        // ordinary property writes fall through to the arms below.
-        {
-            let obj_prop: Option<(String, String)> = match &lhs.kind {
-                ExprKind::Ident(h)
-                    if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
-                {
-                    Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
-                }
-                ExprKind::MemberAccess { expr, member } => match &expr.kind {
-                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                        Some((h.path[0].name.name.clone(), member.name.clone()))
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some((obj, prop)) = obj_prop {
-                let cn = if obj == "this" {
-                    self.this_stack
-                        .last()
-                        .copied()
-                        .flatten()
-                        .and_then(|h| self.heap.get(h))
-                        .and_then(|o| o.as_ref())
-                        .map(|i| i.class_name.clone())
-                } else {
-                    self.class_of_var(&obj)
-                };
-                if let Some(cn) = cn {
-                    if self.static_prop_key(&cn, &prop).is_some() {
-                        let mut v = val.clone();
-                        if let Some(w) = self.class_prop_width(&cn, &prop) {
-                            if w != v.width && !v.is_real {
-                                v = v.resize_for_assign(w);
-                            }
-                        }
-                        return self.class_static_set(&cn, &prop, v);
-                    }
                 }
             }
         }
@@ -66528,6 +66565,17 @@ impl Simulator {
                     let base = self.eval_expr(expr);
                     let handle = base.to_u64().unwrap_or(0) as usize;
                     if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
+                        // §8.9: a static reached through a handle chain
+                        // (`a.b.s = v`) is the class's shared cell.
+                        if let Some(ok) = self.static_write_via_handle(
+                            handle,
+                            None,
+                            None,
+                            &member.name,
+                            val.clone(),
+                        ) {
+                            return ok;
+                        }
                         // §8.x: a class property assignment truncates/sign-
                         // extends the rvalue to the property's declared type
                         // (`byte a; a = 'hfff;` ⇒ 8-bit 0xff, read -1 when
@@ -70037,7 +70085,49 @@ impl Simulator {
         // `obj = new`). Route to the shared cell. class_static_get
         // returns None for a non-static member, so ordinary reads fall
         // through unchanged.
-        let static_class: Option<String> = if handle != 0 && handle < self.heap.len() {
+        {
+            let (var, resolved) = match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => (
+                    Some(h.path[0].name.name.clone()),
+                    Some(self.resolve_hier_name(h).into_owned()),
+                ),
+                ExprKind::MemberAccess { .. } | ExprKind::Ident(_)
+                    if handle == 0
+                        && self
+                            .class_member_names()
+                            .statics
+                            .contains(member.name.as_str()) =>
+                {
+                    // §8.9: a static through a null property.
+                    if let Some((o, p)) = self.handle_chain_owner(expr) {
+                        if let Some((cn, spec)) =
+                            self.null_property_static_target(o, &p, &member.name)
+                        {
+                            if let Some(v) = self.static_read_in(&cn, spec, &member.name) {
+                                return v;
+                            }
+                        }
+                    }
+                    (None, None)
+                }
+                _ => (None, None),
+            };
+            let live = if handle < self.heap.len() { handle } else { 0 };
+            if let Some(v) =
+                self.static_read_via_handle(live, var.as_deref(), resolved.as_deref(), &member.name)
+            {
+                return v;
+            }
+        }
+        // A class constant (localparam) through the reference; a static
+        // property was resolved above, by the reference's declared type.
+        let static_class: Option<String> = if self
+            .class_member_names()
+            .statics
+            .contains(member.name.as_str())
+        {
+            None
+        } else if handle != 0 && handle < self.heap.len() {
             self.heap[handle].as_ref().map(|i| i.class_name.clone())
         } else if let ExprKind::Ident(h) = &expr.kind {
             let n = self.resolve_hier_name(h);
@@ -71102,6 +71192,43 @@ impl Simulator {
                         }
                     }
                 }
+                // §8.9: a static property through a handle, null or not,
+                // names the shared cell of the handle's declared class.
+                if hier.path.len() == 2
+                    && hier.path[1].selects.is_empty()
+                    && !self.module.classes.is_empty()
+                    && self
+                        .class_member_names()
+                        .statics
+                        .contains(hier.path[1].name.name.as_str())
+                {
+                    let mut head = hier.path[0].clone();
+                    head.selects.clear();
+                    let head_id = HierarchicalIdentifier {
+                        root: hier.root.clone(),
+                        path: vec![head],
+                        span: hier.span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    };
+                    let resolved = self.resolve_hier_name(&head_id).into_owned();
+                    let obj = &hier.path[0].name.name;
+                    let h = if hier.path[0].selects.is_empty() {
+                        self.eval_ident_handle(obj)
+                            .filter(|&h| h != 0 && h < self.heap.len())
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if let Some(v) = self.static_read_via_handle(
+                        h,
+                        Some(obj),
+                        Some(&resolved),
+                        &hier.path[1].name.name,
+                    ) {
+                        return v;
+                    }
+                }
                 if hier.path.len() == 2 {
                     // A variable holding a live object shadows any signal or
                     // instance of the same name: `core.n` with a local `core`
@@ -71179,9 +71306,14 @@ impl Simulator {
                     if let Some(mut h) = head_handle {
                         let mut ok = h != 0;
                         let last = hier.path.len() - 1;
-                        for seg in &hier.path[1..last] {
+                        // (owner, property) when the final hop holds null.
+                        let mut null_in: Option<(usize, &str)> = None;
+                        for (k, seg) in hier.path[1..last].iter().enumerate() {
                             if !ok {
                                 break;
+                            }
+                            if k == last - 2 {
+                                null_in = Some((h, seg.name.name.as_str()));
                             }
                             match self
                                 .heap
@@ -71202,7 +71334,31 @@ impl Simulator {
                                 _ => ok = false,
                             }
                         }
+                        if !ok {
+                            // §8.9: a static through a null property is the
+                            // property's declared class's shared cell.
+                            if let Some((owner, prop)) = null_in {
+                                let m = &hier.path[last].name.name;
+                                if let Some((cn, spec)) =
+                                    self.null_property_static_target(owner, prop, m)
+                                {
+                                    if let Some(v) = self.static_read_in(&cn, spec, m) {
+                                        return v;
+                                    }
+                                }
+                            }
+                        }
                         if ok {
+                            // §8.9: a static at the end of the chain is the
+                            // class's shared cell.
+                            if let Some(v) = self.static_read_via_handle(
+                                h,
+                                None,
+                                None,
+                                &hier.path[last].name.name,
+                            ) {
+                                return v;
+                            }
                             if let Some(v) =
                                 self.heap.get(h).and_then(|o| o.as_ref()).and_then(|inst| {
                                     inst.properties.get(&hier.path[last].name.name)
@@ -71871,7 +72027,15 @@ impl Simulator {
                                 break;
                             }
                             let member_name = &hier.path[i].name.name;
-                            if let Some(mval) = self.read_member_value(h, member_name) {
+                            // §8.9: a static property is the class's shared
+                            // cell, never the object's own storage.
+                            let via = (i == 1).then_some(obj_name.as_str());
+                            let mval = match self.static_read_via_handle(h, via, None, member_name)
+                            {
+                                Some(v) => Some(v),
+                                None => self.read_member_value(h, member_name),
+                            };
+                            if let Some(mval) = mval {
                                 if i == hier.path.len() - 1 {
                                     return mval;
                                 }
@@ -118684,6 +118848,690 @@ impl Simulator {
         None
     }
 
+    /// §8.9: whether `member`, looked up from class `cn` up its chain, is a
+    /// static property. The nearest declaration wins, so an instance
+    /// property of a derived class hides a same-named static of its base.
+    fn member_is_static_prop(&self, cn: &str, member: &str) -> bool {
+        if !self.class_member_names().statics.contains(member) {
+            return false;
+        }
+        let mut cur: Option<&str> = Some(cn);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let Some(cd) = self.module.classes.get(c) else {
+                return false;
+            };
+            if cd.static_properties.contains(member) {
+                return true;
+            }
+            if cd.properties.contains_key(member) || guard > 64 {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    /// The `#(...)` specialization signature of class `class_name` given
+    /// its declared arguments (none: the default specialization), keyed the
+    /// way an object constructed with those arguments keys its statics.
+    /// None for a class without parameters or arguments it cannot spell.
+    fn spec_sig_for_args(
+        &self,
+        class_name: &str,
+        type_args: Option<&[Expression]>,
+    ) -> Option<String> {
+        self.spec_sig_for_args_of(None, class_name, type_args)
+    }
+
+    /// `spec_sig_for_args` for a declaration made in the class of object
+    /// `owner` (see `concrete_spec_frags_of`).
+    fn spec_sig_for_args_of(
+        &self,
+        owner: Option<usize>,
+        class_name: &str,
+        type_args: Option<&[Expression]>,
+    ) -> Option<String> {
+        if !self.class_is_parameterized(class_name) {
+            return None;
+        }
+        let raw_sig = match type_args {
+            Some(ta) if !ta.is_empty() => {
+                // A bare parameter name stays a name here, for
+                // `concrete_spec_frags_of` to bind in its own scope.
+                let params = self.scope_params(owner);
+                let frags: Vec<String> = ta
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        ExprKind::Ident(h)
+                            if h.path.len() == 1
+                                && params.iter().any(|(n, _)| *n == h.path[0].name.name) =>
+                        {
+                            Some(h.path[0].name.name.clone())
+                        }
+                        _ => self.expr_to_spec_fragment(e),
+                    })
+                    .collect();
+                if frags.len() != ta.len() {
+                    return None;
+                }
+                self.concrete_spec_frags_of(owner, frags)?.join(",")
+            }
+            _ => String::new(),
+        };
+        let sig = self.canonicalize_spec_sig(class_name, &raw_sig);
+        let effective = if sig.is_empty() {
+            self.module
+                .classes
+                .get(class_name)
+                .map(|cd| {
+                    cd.type_param_defaults
+                        .iter()
+                        .map(|(_, d)| d.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default()
+        } else {
+            sig
+        };
+        (!effective.is_empty()).then_some(effective)
+    }
+
+    /// Record a class-typed formal's declared `#(...)` arguments, as a local
+    /// declaration records its own (§8.25: they name its specialization).
+    fn note_formal_type_args(&mut self, name: &str, type_args: &[Expression]) {
+        if !type_args.is_empty() {
+            self.var_type_args
+                .insert(name.to_string(), type_args.to_vec());
+        } else if !self.var_type_args.is_empty() {
+            self.var_type_args.remove(name);
+        }
+    }
+
+    /// The `#(...)` arguments variable `var` was declared with: a procedural
+    /// local or formal of the running frame, a module-scope variable, or a
+    /// property of `this`.
+    fn declared_type_args(&self, var: &str, resolved: Option<&str>) -> Option<Vec<Expression>> {
+        let in_frame = self.local_stack.last().is_some_and(|f| f.contains_key(var));
+        if in_frame {
+            if let Some(ta) = self.var_type_args.get(var) {
+                return Some(ta.clone());
+            }
+        }
+        if let Some(ta) = self.this_property_type_args(var) {
+            return Some(ta);
+        }
+        if let Some(ta) = resolved.and_then(|r| self.module.class_type_args.get(r)) {
+            return Some(ta.clone());
+        }
+        if let Some(ta) = self.module.class_type_args.get(var) {
+            return Some(ta.clone());
+        }
+        self.var_type_args.get(var).cloned()
+    }
+
+    /// The class variable `var` is declared with, and the specialization
+    /// that declaration names (§8.25), or None for a class without
+    /// parameters. The specialization is spelled `(class, canonical sig)`.
+    fn declared_class_own_spec(
+        &self,
+        var: &str,
+        resolved: Option<&str>,
+    ) -> Option<(String, Option<(String, String)>)> {
+        if let Some((b, spec, _)) = self.this_property_decl(var) {
+            return Some((b, spec));
+        }
+        let c = match self.class_of_var(var).or_else(|| {
+            resolved
+                .filter(|r| *r != var)
+                .and_then(|r| self.class_of_var(r))
+        }) {
+            Some(c) => c,
+            None => {
+                // A variable declared through a typedef of a specialization.
+                let t = self.var_class_types.get(var).cloned().or_else(|| {
+                    self.signal_name_to_id
+                        .get(resolved.unwrap_or(var))
+                        .or_else(|| self.signal_name_to_id.get(var))
+                        .and_then(|id| self.signal_type_names.get(id))
+                        .cloned()
+                })?;
+                let (b, sig) = self.resolve_typedef_spec(&t)?;
+                if !self.module.classes.contains_key(&b) {
+                    return None;
+                }
+                let spec = self
+                    .concrete_spec_sig(&sig)
+                    .map(|s| (b.clone(), self.canonicalize_spec_sig(&b, &s)));
+                return Some((b, spec));
+            }
+        };
+        let (base, args) = Self::strip_class_specialization(&c);
+        if !self.module.classes.contains_key(&base) {
+            return None;
+        }
+        let sig = match args {
+            Some(a) => self
+                .concrete_spec_sig(&a)
+                .map(|a| self.canonicalize_spec_sig(&base, &a)),
+            None => {
+                let ta = self.declared_type_args(var, resolved);
+                self.spec_sig_for_args(&base, ta.as_deref())
+            }
+        };
+        let spec = sig.map(|s| (base.clone(), s));
+        Some((base, spec))
+    }
+
+    /// A declared specialization's argument fragments with every parameter
+    /// of the running class context (`this_type`, `C#(T)` inside `C`)
+    /// replaced by its binding there. None when one cannot be resolved: the
+    /// spelling then names no concrete specialization.
+    fn concrete_spec_frags(&self, frags: Vec<String>) -> Option<Vec<String>> {
+        self.concrete_spec_frags_of(None, frags)
+    }
+
+    /// `concrete_spec_frags` for a declaration made in the class of object
+    /// `owner` (a property's type): its parameters resolve through that
+    /// object's bindings, or the running context's when it is `this`.
+    fn concrete_spec_frags_of(
+        &self,
+        owner: Option<usize>,
+        frags: Vec<String>,
+    ) -> Option<Vec<String>> {
+        let this_h = self.this_stack.last().copied().flatten();
+        let foreign = owner.filter(|o| Some(*o) != this_h);
+        let params = self.scope_params(owner);
+        frags
+            .into_iter()
+            .map(|f| {
+                let t = f.trim();
+                match params.iter().find(|(n, _)| *n == t) {
+                    Some((_, true)) => match foreign {
+                        Some(o) => self
+                            .heap
+                            .get(o)
+                            .and_then(|i| i.as_ref())
+                            .and_then(|i| i.type_bindings.get(t).cloned()),
+                        None => self.resolve_type_param_binding(t),
+                    },
+                    Some((_, false)) => {
+                        // A value parameter: the object's own value, held
+                        // as a property of it.
+                        let o = foreign.or(this_h)?;
+                        let v = self.heap.get(o)?.as_ref()?.properties.get(t)?;
+                        (!v.is_real && v.to_u64().is_some())
+                            .then(|| v.to_u64().unwrap().to_string())
+                    }
+                    None => Some(f),
+                }
+            })
+            .collect()
+    }
+
+    /// The parameters (name, is-type) in scope of a declaration made in the
+    /// class of object `owner`, or in the running class context.
+    fn scope_params(&self, owner: Option<usize>) -> Vec<(String, bool)> {
+        let this_h = self.this_stack.last().copied().flatten();
+        let scope: Option<String> = match owner.filter(|o| Some(*o) != this_h) {
+            Some(o) => self
+                .heap
+                .get(o)
+                .and_then(|i| i.as_ref())
+                .map(|i| i.class_name.clone()),
+            None => self.class_context_stack.last().cloned().flatten(),
+        };
+        let mut params: Vec<(String, bool)> = Vec::new();
+        let mut cur: Option<&str> = scope.as_deref();
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let Some(cd) = self.module.classes.get(c) else {
+                break;
+            };
+            params.extend(cd.type_param_names.iter().map(|n| (n.clone(), true)));
+            params.extend(cd.param_defaults.iter().map(|(n, _)| (n.clone(), false)));
+            if guard > 64 {
+                break;
+            }
+            cur = cd.extends.as_deref();
+        }
+        params
+    }
+
+    /// `concrete_spec_frags` over a comma-joined signature.
+    fn concrete_spec_sig(&self, sig: &str) -> Option<String> {
+        let frags: Vec<String> = Self::split_spec_args(sig)
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .collect();
+        Some(self.concrete_spec_frags(frags)?.join(","))
+    }
+
+    /// `declared_class_own_spec`, where a class without parameters of its
+    /// own that extends a specialization takes its inherited statics from
+    /// that one: what a static member reached through `var` refers to.
+    fn declared_class_spec(
+        &self,
+        var: &str,
+        resolved: Option<&str>,
+    ) -> Option<(String, Option<(String, String)>)> {
+        let (base, spec) = self.declared_class_own_spec(var, resolved)?;
+        let spec = spec.or_else(|| self.inherited_param_spec(&base));
+        Some((base, spec))
+    }
+
+    /// §8.25: the declared type of a `$cast` destination, spelled
+    /// `Class#(sig)` when the class has parameters, for a variable declared
+    /// anywhere: a local, a formal, a module-scope variable, a class property
+    /// (`obj.p`, `this.p`, bare `p` in a method) or through a typedef. An
+    /// unspecialized declaration names the default specialization, except
+    /// inside the class's own declaration, where it is left unspecialized.
+    /// None when the destination is not a recognized class variable.
+    fn cast_dest_declared_type(&self, dest: &Expression) -> Option<String> {
+        let spelled =
+            |sim: &Self, base: String, spec: Option<(String, String)>, explicit: bool| match spec {
+                Some((_, sig)) if explicit || !sim.inside_class_decl_of(&base) => {
+                    format!("{base}#({sig})")
+                }
+                _ => base,
+            };
+        match &dest.kind {
+            ExprKind::Ident(hh) if hh.path.len() == 1 => {
+                let n = &hh.path[0].name.name;
+                if let Some((b, spec, explicit)) = self.this_property_decl(n) {
+                    return Some(spelled(self, b, spec, explicit));
+                }
+                let dt = self.class_of_var(n);
+                // A type parameter or an already-specialized spelling keeps
+                // the caller's handling.
+                if let Some(c) = &dt {
+                    if c.contains('#')
+                        || !self.module.classes.contains_key(c)
+                        || !self.class_is_parameterized(c)
+                    {
+                        return dt;
+                    }
+                }
+                let resolved = self.resolve_hier_name(hh);
+                let explicit = self
+                    .declared_type_args(n, Some(resolved.as_ref()))
+                    .is_some()
+                    || dt.is_none();
+                match self.declared_class_own_spec(n, Some(resolved.as_ref())) {
+                    Some((base, spec)) => Some(spelled(self, base, spec, explicit)),
+                    None => dt,
+                }
+            }
+            ExprKind::Ident(hh) if hh.path.len() == 2 && hh.path[0].selects.is_empty() => {
+                let h = self.eval_ident_handle(&hh.path[0].name.name)?;
+                self.cast_dest_property_type(h, &hh.path[1].name.name)
+                    .map(|(b, spec, explicit)| spelled(self, b, spec, explicit))
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let h = self.eval_handle_expr(base)?;
+                self.cast_dest_property_type(h, &member.name)
+                    .map(|(b, spec, explicit)| spelled(self, b, spec, explicit))
+            }
+            _ => None,
+        }
+    }
+
+    /// The declared class, specialization and whether it was spelled out,
+    /// of property `prop` of the object `handle`.
+    fn cast_dest_property_type(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<(String, Option<(String, String)>, bool)> {
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let mut cur = Some(inst.class_name.as_str());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            let cd = self.module.classes.get(cn)?;
+            if let Some(sig) = cd.properties.get(prop) {
+                let tn = sig.type_name.as_deref()?;
+                // A typedef local to the owner's class (`this_type`) names
+                // the owner's own specialization: bind its arguments there.
+                if let Some(DataType::TypeReference {
+                    name, type_args, ..
+                }) = self.class_local_typedef(&inst.class_name, tn)
+                {
+                    let b = name.name.name.as_str();
+                    if self.module.classes.contains_key(b) {
+                        let spec = self
+                            .spec_sig_for_args_of(Some(handle), b, Some(type_args.as_slice()))
+                            .map(|s| (b.to_string(), s));
+                        return Some((b.to_string(), spec, true));
+                    }
+                }
+                if self.module.classes.contains_key(tn) {
+                    let ta = cd.property_type_args.get(prop);
+                    let spec = self
+                        .spec_sig_for_args_of(Some(handle), tn, ta.map(|v| v.as_slice()))
+                        .map(|s| (tn.to_string(), s));
+                    return Some((tn.to_string(), spec, ta.is_some_and(|v| !v.is_empty())));
+                }
+                let (b, s) = self.resolve_typedef_spec(tn)?;
+                if !self.module.classes.contains_key(&b) {
+                    return None;
+                }
+                let frags: Vec<String> = Self::split_spec_args(&s)
+                    .into_iter()
+                    .map(|a| a.trim().to_string())
+                    .collect();
+                let spec = self
+                    .concrete_spec_frags_of(Some(handle), frags)
+                    .map(|f| (b.clone(), self.canonicalize_spec_sig(&b, &f.join(","))));
+                return Some((b, spec, true));
+            }
+            if guard > 64 {
+                return None;
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
+    /// The target of typedef `tn` declared in class `cn` or an ancestor.
+    fn class_local_typedef(&self, cn: &str, tn: &str) -> Option<&DataType> {
+        let mut cur: Option<&str> = Some(cn);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let cd = self.module.classes.get(c)?;
+            if let Some(dt) = cd.typedef_targets.get(tn) {
+                return Some(dt);
+            }
+            if guard > 64 {
+                return None;
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
+    /// `cast_dest_property_type` for a bare name inside a method that is a
+    /// property of `this` and not a local or formal of the running frame.
+    fn this_property_decl(&self, var: &str) -> Option<(String, Option<(String, String)>, bool)> {
+        let h = self.this_stack.last().copied().flatten()?;
+        if self.local_stack.last().is_some_and(|f| f.contains_key(var)) {
+            return None;
+        }
+        self.cast_dest_property_type(h, var)
+    }
+
+    /// Whether the running code is inside the declaration of class `base`
+    /// or of a class derived from it, where the bare class name need not
+    /// mean its default specialization.
+    fn inside_class_decl_of(&self, base: &str) -> bool {
+        match self.class_context_stack.last() {
+            Some(Some(ctx)) => self.class_is_a(ctx, base),
+            _ => false,
+        }
+    }
+
+    /// §8.9: the class and specialization whose static `member` an object
+    /// reference names. The reference's declared type decides (`var`, when
+    /// the reference is a variable), so a static is reachable through a null
+    /// handle; a live object of an unrelated recorded type, or an object
+    /// reached through a chain, uses the object's own class. None when
+    /// `member` is not a static property of that class.
+    fn static_member_target(
+        &self,
+        handle: usize,
+        var: Option<&str>,
+        resolved: Option<&str>,
+        member: &str,
+    ) -> Option<(String, Option<(String, String)>)> {
+        if !self.class_member_names().statics.contains(member) {
+            return None;
+        }
+        let live = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .filter(|_| handle != 0);
+        let decl = var.and_then(|v| self.declared_class_spec(v, resolved));
+        let (cn, spec) = match (live, decl) {
+            (Some(inst), Some((dc, dspec))) if self.class_is_a(&inst.class_name, &dc) => {
+                // The object knows its specialization; the declaration's
+                // spelling may still name type parameters (`this_type h;`).
+                let from_obj = match &inst.spec {
+                    Some((b, sig)) if *b == dc => Some((b.clone(), sig.clone())),
+                    Some((b, sig)) => self
+                        .ancestor_spec(b, sig, &dc)
+                        .map(|a| (dc.clone(), self.canonicalize_spec_sig(&dc, &a))),
+                    None => None,
+                };
+                let spec = from_obj.or(dspec);
+                // The object's own entry for the declared class: a class
+                // whose base is a type parameter has one per specialization
+                // (`wrap_c<derived_c>`), each with its own base chain.
+                let entry = self.chain_entry_of(&inst.class_name, &dc).unwrap_or(dc);
+                (entry, spec)
+            }
+            (Some(inst), _) => (inst.class_name.clone(), inst.spec.clone()),
+            (None, Some((dc, spec))) => {
+                // A class whose base is a type parameter: the declared
+                // specialization's own entry carries its base chain.
+                let entry = match &spec {
+                    Some((_, sig)) if self.is_dep_class(&dc) => {
+                        let args: Vec<String> = Self::split_spec_args(sig)
+                            .into_iter()
+                            .map(|a| a.trim().to_string())
+                            .collect();
+                        let e = self.spec_class_name(&dc, &args);
+                        if self.module.classes.contains_key(&e) {
+                            e
+                        } else {
+                            dc
+                        }
+                    }
+                    _ => dc,
+                };
+                (entry, spec)
+            }
+            (None, None) => return None,
+        };
+        self.member_is_static_prop(&cn, member)
+            .then_some((cn, spec))
+    }
+
+    /// The nearest class entry on `start`'s chain made from class `origin`.
+    fn chain_entry_of(&self, start: &str, origin: &str) -> Option<String> {
+        let mut cur: Option<&str> = Some(start);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            if self.class_origin(c) == origin {
+                return Some(c.to_string());
+            }
+            cur = self
+                .module
+                .classes
+                .get(c)
+                .and_then(|cd| cd.extends.as_deref());
+        }
+        None
+    }
+
+    /// §8.9: read static property `member` through an object reference (see
+    /// `static_member_target`).
+    fn static_read_via_handle(
+        &mut self,
+        handle: usize,
+        var: Option<&str>,
+        resolved: Option<&str>,
+        member: &str,
+    ) -> Option<Value> {
+        let (cn, spec) = self.static_member_target(handle, var, resolved, member)?;
+        self.static_read_in(&cn, spec, member)
+    }
+
+    /// Read static `member` of class `cn` in specialization `spec`.
+    fn static_read_in(
+        &mut self,
+        cn: &str,
+        spec: Option<(String, String)>,
+        member: &str,
+    ) -> Option<Value> {
+        let saved = spec.map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+        let v = self.class_static_get(cn, member);
+        if let Some(s) = saved {
+            self.current_spec = s;
+        }
+        v
+    }
+
+    /// §8.9: the class and specialization of the static `member` reached
+    /// through property `prop` of object `owner` when that property holds
+    /// null: the property's declared type decides.
+    fn null_property_static_target(
+        &self,
+        owner: usize,
+        prop: &str,
+        member: &str,
+    ) -> Option<(String, Option<(String, String)>)> {
+        let (b, spec, _) = self.cast_dest_property_type(owner, prop)?;
+        if !self.member_is_static_prop(&b, member) {
+            return None;
+        }
+        let spec = spec.or_else(|| self.inherited_param_spec(&b));
+        Some((b, spec))
+    }
+
+    /// For a handle-chain expression `a.b.p` (either parse shape), the live
+    /// object `a.b` and the property name `p`.
+    fn handle_chain_owner(&self, e: &Expression) -> Option<(usize, String)> {
+        let live = |h: usize| h != 0 && self.heap.get(h).is_some_and(|o| o.is_some());
+        match &e.kind {
+            ExprKind::MemberAccess {
+                expr: owner,
+                member,
+            } => {
+                let o = self.eval_handle_expr(owner).filter(|&h| live(h))?;
+                Some((o, member.name.clone()))
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let n = h.path.len();
+                let mut o = self.eval_ident_handle(&h.path[0].name.name)?;
+                for seg in &h.path[1..n - 1] {
+                    if !live(o) {
+                        return None;
+                    }
+                    o = self.member_handle(o, &seg.name.name)?;
+                }
+                live(o).then(|| (o, h.path[n - 1].name.name.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// §8.9: `a.b.s = v` / `f.g.s = v` — a static property at the end of a
+    /// chain of handles is the shared cell of the last object's class. A
+    /// single-variable receiver (`h.s`) resolves by its declared type in the
+    /// `assign_value` arm instead. None when `lhs` is not such a write.
+    fn assign_static_through_chain(&mut self, lhs: &Expression, val: &Value) -> Option<bool> {
+        let statics = &self.class_member_names().statics;
+        if statics.is_empty() {
+            return None;
+        }
+        let live = |sim: &Self, h: usize| h != 0 && sim.heap.get(h).is_some_and(|o| o.is_some());
+        // (receiver handle, or the live owner and property holding null)
+        let (h, null_in, member) = match &lhs.kind {
+            ExprKind::MemberAccess { expr: recv, member } => {
+                if !statics.contains(member.name.as_str())
+                    || matches!(&recv.kind, ExprKind::Ident(rh) if rh.path.len() == 1)
+                {
+                    return None;
+                }
+                match self.eval_handle_expr(recv).filter(|&h| live(self, h)) {
+                    Some(h) => (h, None, &member.name),
+                    None => {
+                        let (o, p) = self.handle_chain_owner(recv)?;
+                        (0, Some((o, p)), &member.name)
+                    }
+                }
+            }
+            ExprKind::Ident(hier)
+                if hier.path.len() >= 3 && hier.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let n = hier.path.len();
+                if !statics.contains(hier.path[n - 1].name.name.as_str())
+                    || self.module.classes.contains_key(&hier.path[0].name.name)
+                {
+                    return None;
+                }
+                let mut h = self.eval_ident_handle(&hier.path[0].name.name)?;
+                let mut null_in = None;
+                for (k, seg) in hier.path[1..n - 1].iter().enumerate() {
+                    if !live(self, h) {
+                        return None;
+                    }
+                    let next = self.member_handle(h, &seg.name.name).unwrap_or(0);
+                    if !live(self, next) && k == n - 3 {
+                        null_in = Some((h, seg.name.name.clone()));
+                    }
+                    h = next;
+                }
+                (h, null_in, &hier.path[n - 1].name.name)
+            }
+            _ => return None,
+        };
+        if live(self, h) {
+            return self.static_write_via_handle(h, None, None, member, val.clone());
+        }
+        let (owner, prop) = null_in?;
+        let (cn, spec) = self.null_property_static_target(owner, &prop, member)?;
+        Some(self.static_write_in(&cn, spec, member, val.clone()))
+    }
+
+    /// §8.9: write static property `member` through an object reference
+    /// (see `static_member_target`). None when it is not a static.
+    fn static_write_via_handle(
+        &mut self,
+        handle: usize,
+        var: Option<&str>,
+        resolved: Option<&str>,
+        member: &str,
+        val: Value,
+    ) -> Option<bool> {
+        let (cn, spec) = self.static_member_target(handle, var, resolved, member)?;
+        Some(self.static_write_in(&cn, spec, member, val))
+    }
+
+    /// Write static `member` of class `cn` in specialization `spec`.
+    fn static_write_in(
+        &mut self,
+        cn: &str,
+        spec: Option<(String, String)>,
+        member: &str,
+        val: Value,
+    ) -> bool {
+        let cn = cn.to_string();
+        let mut v = val;
+        if let Some(w) = self.class_prop_width(&cn, member) {
+            if w != v.width && !v.is_real {
+                v = v.resize_for_assign(w);
+            }
+        }
+        let saved = spec.map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+        let ok = self.class_static_set(&cn, member, v);
+        if let Some(s) = saved {
+            self.current_spec = s;
+        }
+        ok
+    }
+
     /// Read `handle.member` as a VALUE (handle or scalar): instance property
     /// first, then the instance's CLASS static cell. Mirrors `member_handle`
     /// for the value-reading path used by `eval_expr`.
@@ -119016,10 +119864,7 @@ impl Simulator {
         // A module-scope class handle is not in `var_class_types` (only
         // procedural locals are), so it used to fall into the permissive
         // `None` branch and EVERY downcast reported success.
-        let dest_type = match &dest.kind {
-            ExprKind::Ident(hh) if hh.path.len() == 1 => self.class_of_var(&hh.path[0].name.name),
-            _ => None,
-        };
+        let dest_type = self.cast_dest_declared_type(dest);
         match dest_type {
             Some(dt) => {
                 // The dest may be a TYPE PARAMETER (e.g. `REQ param_t;` inside
@@ -119469,7 +120314,31 @@ impl Simulator {
                 .trim_matches('`')
                 .to_string()
         }
+        // A source class without parameters of its own binds the
+        // destination's type parameters through its extends chain
+        // (`class leaf extends pbase#(7, shortint)`), not on the object.
+        let chain_args: Vec<String> = if self.class_is_parameterized(&src_inst.class_name) {
+            Vec::new()
+        } else {
+            self.static_receiver_spec(&src_inst.class_name, dest_class)
+                .map(|(_, sig)| {
+                    Self::split_spec_args(&self.canonicalize_spec_sig(dest_class, &sig))
+                        .into_iter()
+                        .map(|a| a.trim().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // The base-class type parameter of a class whose base is a type
+        // parameter was checked by entry (`cast_dep_spec_ok`): the source may
+        // reach the destination's specialization at any level of its chain
+        // (`wrap_c#(wrap_c#(d))` is a `wrap_c#(d)`), while its binding of the
+        // name is the outermost one's.
+        let dep_tp = self.dep_type_param(dest_class);
         for (pos, tp) in &type_positions {
+            if dep_tp.as_deref() == Some(tp.as_str()) {
+                continue;
+            }
             let dfrag = match dest_args.get(*pos) {
                 Some(s) => s.trim(),
                 None => continue,
@@ -119477,7 +120346,11 @@ impl Simulator {
             if dfrag.is_empty() {
                 continue;
             }
-            let sval = match src_inst.type_bindings.get(tp) {
+            let sval = match src_inst
+                .type_bindings
+                .get(tp)
+                .or_else(|| chain_args.get(*pos).filter(|a| !a.is_empty()))
+            {
                 Some(v) => v,
                 None => continue,
             };
@@ -125362,7 +126235,12 @@ impl Simulator {
                 // in the body (e.g. `x /= 2`) is done in the real domain.
                 val = Value::from_f64(val.to_f64());
             }
-            if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+            if let DataType::TypeReference {
+                name: tn,
+                type_args,
+                ..
+            } = &port.data_type
+            {
                 let type_name = tn.name.name.clone();
                 // A class name can also key the typedef WIDTH table, so the
                 // class check must run FIRST — otherwise a class-typed formal
@@ -125372,6 +126250,7 @@ impl Simulator {
                     self.record_local_class_type(&port.name.name, &type_name);
                     self.var_class_types
                         .insert(port.name.name.clone(), type_name);
+                    self.note_formal_type_args(&port.name.name, type_args);
                 } else if self.module.enum_members.contains_key(&type_name)
                     || self.module.typedefs.contains_key(&type_name)
                 {
@@ -126416,7 +127295,9 @@ impl Simulator {
             .var_decl_types
             .insert(name.to_string(), dt.clone());
         if let DataType::TypeReference {
-            name: type_name, ..
+            name: type_name,
+            type_args,
+            ..
         } = dt
         {
             let type_name = type_name.name.name.clone();
@@ -126425,6 +127306,7 @@ impl Simulator {
             // typedef maps (`class_of_var` missed them).
             if self.module.classes.contains_key(&type_name) {
                 self.var_class_types.insert(name.to_string(), type_name);
+                self.note_formal_type_args(name, type_args);
             } else if self.module.enum_members.contains_key(&type_name)
                 || self.module.typedefs.contains_key(&type_name)
             {
@@ -137401,38 +138283,22 @@ impl Simulator {
         // create a per-instance copy (which then shadowed the static on every
         // later read from THAT instance while every other instance still saw
         // the old value).
-        if let Some(Some(inst)) = self.heap.get(handle) {
-            let cn = inst.class_name.clone();
-            if let Some(cd) = self.module.classes.get(&cn) {
-                // Only genuine `static` members — param_defaults (class
-                // localparams) also satisfy static_prop_key but are constants.
-                let is_static = {
-                    let mut cur = Some(cn.clone());
-                    let mut found = false;
-                    while let Some(c) = cur {
-                        match self.module.classes.get(&c) {
-                            Some(cdef) => {
-                                if cdef.static_properties.contains(name) {
-                                    found = true;
-                                    break;
-                                }
-                                cur = cdef.extends.clone();
-                            }
-                            None => break,
-                        }
-                    }
-                    let _ = cd;
-                    found
-                };
-                if is_static {
-                    if let Some(key) = self.static_prop_key(&cn, name) {
-                        let changed = self.class_statics.get(&key) != Some(&val);
-                        if changed {
-                            self.class_statics.insert(key, val);
-                        }
-                        return changed;
-                    }
+        // Only genuine `static` members — param_defaults (class localparams)
+        // also satisfy static_prop_key but are constants — and only when no
+        // nearer instance property hides it.
+        let static_of = match self.heap.get(handle) {
+            Some(Some(inst)) if self.member_is_static_prop(&inst.class_name, name) => {
+                Some((inst.class_name.clone(), inst.spec.clone()))
+            }
+            _ => None,
+        };
+        if let Some((cn, spec)) = static_of {
+            if let Some(key) = self.static_prop_key_spec(&cn, name, spec.as_ref()) {
+                let changed = self.class_statics.get(&key) != Some(&val);
+                if changed {
+                    self.class_statics.insert(key, val);
                 }
+                return changed;
             }
         }
         if let Some(Some(inst)) = self.heap.get_mut(handle) {
@@ -141161,7 +142027,12 @@ impl Simulator {
                     } else if plan.ports[i].signed {
                         val.is_signed = true;
                     }
-                    if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                    if let DataType::TypeReference {
+                        name: tn,
+                        type_args,
+                        ..
+                    } = &port.data_type
+                    {
                         let type_name = tn.name.name.clone();
                         // A plain class is a class here; a forward-declared
                         // one is registered as its typedef. Class check
@@ -141172,6 +142043,7 @@ impl Simulator {
                         let forward_declared = class_ref == Some(true);
                         if !forward_declared && self.module.classes.contains_key(&type_name) {
                             self.record_local_class_type(&port.name.name, &type_name);
+                            self.note_formal_type_args(&port.name.name, type_args);
                             if self.var_class_types.get(port.name.name.as_str()) != Some(&type_name)
                             {
                                 self.meta_note(&port.name.name);

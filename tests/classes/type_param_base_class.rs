@@ -665,7 +665,7 @@ endmodule
     );
 }
 
-/// §8.26.2: an interface class shall not extend a type parameter; the
+/// §8.26.4: an interface class shall not extend a type parameter; the
 /// reference rejects it at compile time.
 #[test]
 fn interface_class_extending_type_parameter_is_rejected() {

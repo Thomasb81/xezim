@@ -347,6 +347,8 @@ mod array_of_collections_property;
 mod array_query_handle_qualified_member;
 #[path = "classes/caller_local_shadows_this_cast.rs"]
 mod caller_local_shadows_this_cast;
+#[path = "classes/cast_dest_specialization.rs"]
+mod cast_dest_specialization;
 #[path = "classes/class_array_property_select.rs"]
 mod class_array_property_select;
 #[path = "classes/class_covergroups.rs"]
@@ -377,6 +379,8 @@ mod heap_id_collision_member_access;
 mod id_collision_in_heap;
 #[path = "classes/implication_joint_distribution.rs"]
 mod implication_joint_distribution;
+#[path = "classes/interface_class_extends_type_param.rs"]
+mod interface_class_extends_type_param;
 #[path = "classes/member_collection_runtime_class.rs"]
 mod member_collection_runtime_class;
 #[path = "classes/member_visibility_local_protected.rs"]
@@ -411,6 +415,8 @@ mod static_assoc_struct_pool;
 mod static_collection_qualified_access;
 #[path = "classes/static_instance_assoc_object.rs"]
 mod static_instance_assoc_object;
+#[path = "classes/static_property_through_handle.rs"]
+mod static_property_through_handle;
 #[path = "classes/struct_prop_whole_copy.rs"]
 mod struct_prop_whole_copy;
 #[path = "classes/type_param_replication_localparam.rs"]
