@@ -250,3 +250,56 @@ endmodule
         "{o}"
     );
 }
+
+/// §7.4.1 part-selects of ASCENDING vectors that are nets or live inside an
+/// instance read the declared labels (`v[0:3]` is the four MSBs). They read
+/// the bits mirrored, while bit-selects and top-level variables were right;
+/// a level event on such a part-select and a port bound to one follow.
+#[test]
+fn ascending_part_selects_in_instances_and_nets() {
+    let o = run(
+        "asc",
+        r#"
+`timescale 1ns/1ns
+module ch (input [7:0] src);
+  logic [0:7] av;
+  wire  [0:7] aw;
+  logic [3:10] ao;
+  assign aw = src;
+  always @* begin av = src; ao = src; end
+  final $display("T| ch av03=%b av47=%b aw03=%b aw47=%b av25=%b aw1=%b ao36=%b ao4=%b aw_up=%b aw_dn=%b",
+                 av[0:3], av[4:7], aw[0:3], aw[4:7], av[2:5], aw[1], ao[3:6], ao[4], aw[2 +: 3], aw[6 -: 2]);
+endmodule
+module dev (inout [3:0] dq);
+  int n1 = 0;
+  always @(dq[1]) n1++;
+  final $display("T| dev n1=%0d dq=%b", n1, dq);
+endmodule
+module tb;
+  logic [7:0] v;
+  wire [0:7] abus; assign abus = v;
+  int na = 0;
+  ch u (.src(v));
+  dev d0 (.dq(abus[0:3]));
+  always @(abus[2:3]) na++;
+  initial begin
+    #1 v = 0;
+    for (int i = 0; i < 16; i++) begin #1 v = 8'h11 * i; end
+    #1 v = 8'b0001_0010;
+    #1 $display("T| tb abus03=%b abus47=%b na=%0d", abus[0:3], abus[4:7], na);
+    $finish;
+  end
+endmodule
+"#,
+        &[],
+    );
+    assert_eq!(
+        t_lines(&o),
+        [
+            "T| tb abus03=0001 abus47=0010 na=17",
+            "T| ch av03=0001 av47=0010 aw03=0001 aw47=0010 av25=0100 aw1=0 ao36=0001 ao4=0 aw_up=010 aw_dn=01",
+            "T| dev n1=9 dq=0001",
+        ],
+        "{o}"
+    );
+}

@@ -59,6 +59,40 @@ pub(super) fn vector_decl_dim(
     Some((width as i64 - 1, 0))
 }
 
+/// §7.4.1: list every plain 1-D packed vector declared with an ASCENDING
+/// range (`logic [0:7] v`, `wire [4:7] w`) in `ascending_packed`, which the
+/// part-select paths consult. The elaborator records the range of every
+/// vector in `packed_full_dims` but put only top-level VARIABLES in
+/// `ascending_packed`, so a part-select of an ascending net, or of any
+/// ascending vector inside an instance, read its bits mirrored (`v[0:3]`
+/// returned the bits of `v[4:7]` reversed) while bit-selects were right.
+pub(super) fn complete_ascending_ranges(module: &mut ElaboratedModule) {
+    let mut add: Vec<(String, (i64, i64))> = Vec::new();
+    for (name, dims) in &module.packed_full_dims {
+        let [(l, r)] = dims.as_slice() else {
+            continue;
+        };
+        if l >= r
+            || module.ascending_packed.contains_key(name)
+            || module.packed_signal_elem_widths.contains_key(name)
+            || module.packed_struct_fields.contains_key(name)
+            || module.arrays.contains_key(name)
+            || module.arrays_2d.contains_key(name)
+            || module.arrays_nd.contains_key(name)
+        {
+            continue;
+        }
+        let Some(sig) = module.signals.get(name) else {
+            continue;
+        };
+        if sig.is_real || sig.width as i64 != r - l + 1 {
+            continue;
+        }
+        add.push((name.clone(), (*l, *r)));
+    }
+    module.ascending_packed.extend(add);
+}
+
 /// §7.4.1 physical bit (0 = LSB) of declared label `label`.
 pub(super) fn label_to_phys(dim: (i64, i64), label: i64) -> i64 {
     if dim.0 >= dim.1 {

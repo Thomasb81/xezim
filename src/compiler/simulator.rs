@@ -9557,6 +9557,7 @@ impl Simulator {
 
         let phase_materialize = crate::WallTimer::now();
         Self::materialize_implicit_contassign_nets(&mut module);
+        event_bits::complete_ascending_ranges(&mut module);
         // Lazy always blocks (see `LazyAlways`) everywhere except where a
         // pass reads every always-block body before classification: code
         // coverage instruments them, and opt-in signal placement walks them.
