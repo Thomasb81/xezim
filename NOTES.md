@@ -158,6 +158,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   passed through a zero-delay library cell (`(posedge A => (Y:1'b1)) = (0.01,
   100.0)` at 1ps precision) clocked its flops after that time step's
   nonblocking assignments had committed, so they sampled the new values.
+* A class whose base class is a type parameter
+  (`class wrap_c #(type BASE = base_c) extends BASE`) gets that base in every
+  specialization, including one that passes its parameter on
+  (`extends wrap_c #(B)`). It used to get no base at all: `super.new()` did not
+  run the base constructor, inherited properties read x, inherited methods and
+  `super.` calls returned nothing, and `$cast` upcasts failed. UVM's
+  `uvm_port_base` and `uvm_reg_sequence` extend a type parameter, so a `$cast`
+  from a TLM port to its interface base failed and register sequences never ran
+  their `body`. (#210)
 
 **Performance**
 
