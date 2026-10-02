@@ -134628,7 +134628,8 @@ impl Simulator {
     fn write_coll_elem(&mut self, key: &str, mut val: Value) {
         // Solver draws and repairs inherit the element declaration, not the
         // temporary value's signedness. Size shadows are not element values.
-        if key.ends_with(']')
+        if !val.is_real
+            && key.ends_with(']')
             && let Some((owner, element)) = key.split_once('#')
             && let Ok(handle) = owner.parse::<usize>()
             && let Some((prop, _)) = element.split_once('[')
@@ -141322,13 +141323,14 @@ impl Simulator {
                         let scoped_key = format!("{}#{}{}", handle, arr_name, suffix);
                         let elem_name = format!("{}{}", arr_name, suffix);
                         let saved = self.signals.get(&scoped_key).cloned();
+                        let signed = self.class_prop_signed_of(handle, &arr_name);
                         let mut ok = false;
                         // 24 draws: a satisfiable body (parity, bit tests)
                         // lands in a handful; an impossible one burns every
                         // draw for every pass of every trial, so the cap is
                         // what bounds the UNSAT give-up time.
                         for _ in 0..24 {
-                            let cand = if ranges.is_empty() {
+                            let mut cand = if ranges.is_empty() {
                                 let mask = if elem_w >= 64 {
                                     u64::MAX
                                 } else {
@@ -141344,6 +141346,7 @@ impl Simulator {
                                 };
                                 Value::from_u64(v as u64, elem_w)
                             };
+                            cand.is_signed = signed;
                             self.signals.insert(scoped_key.clone(), cand.clone());
                             self.set_signal_value_by_name(&elem_name, cand);
                             if self.item_holds(handle, body) {
