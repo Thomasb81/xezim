@@ -41,6 +41,8 @@ mod class_type_param_default_width;
 mod class_unpacked_struct_array_store;
 #[path = "classes/collection_of_handles_new.rs"]
 mod collection_of_handles_new;
+#[path = "classes/constraint_foreach_signed_indices.rs"]
+mod constraint_foreach_signed_indices;
 #[path = "classes/constructor_body_ports.rs"]
 mod constructor_body_ports;
 #[path = "classes/explicit_param_static_coll_read.rs"]

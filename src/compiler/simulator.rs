@@ -101894,7 +101894,7 @@ impl Simulator {
                         // index value.
                         let mut frame: HashMap<String, Value> = HashMap::default();
                         if let Some(iv) = &idx_var {
-                            frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
+                            frame.insert(iv.clone(), Self::signed_loop_val(i));
                         }
                         self.push_local_frame(frame);
                         self.solve_inline_foreach_elem(item, &arr_name, i, elem_w);
@@ -101918,7 +101918,7 @@ impl Simulator {
                     for i in 0..w as i64 {
                         let mut frame: HashMap<String, Value> = HashMap::default();
                         if let Some(iv) = &idx_var {
-                            frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
+                            frame.insert(iv.clone(), Self::signed_loop_val(i));
                         }
                         self.push_local_frame(frame);
                         self.apply_inline_constraint(item, targets);
@@ -134788,7 +134788,7 @@ impl Simulator {
                         continue;
                     };
                     let mut frame: HashMap<String, Value> = HashMap::default();
-                    frame.insert(idx_name, Value::from_u64(row.unwrap() as u64, 32));
+                    frame.insert(idx_name, Self::signed_loop_val(row.unwrap()));
                     self.push_local_frame(frame);
                     let mut inner = self.size_cons_in_item(&body, prop, true);
                     self.pop_local_frame();
@@ -135188,10 +135188,10 @@ impl Simulator {
                             for j in 0..inner {
                                 let mut frame: HashMap<String, Value> = HashMap::default();
                                 if let Some(Some(n)) = idx_names.first() {
-                                    frame.insert(n.clone(), Value::from_u64(i as u64, 32));
+                                    frame.insert(n.clone(), Self::signed_loop_val(i));
                                 }
                                 if let Some(Some(n)) = idx_names.get(1) {
-                                    frame.insert(n.clone(), Value::from_u64(j as u64, 32));
+                                    frame.insert(n.clone(), Self::signed_loop_val(j));
                                 }
                                 self.push_local_frame(frame);
                                 let ek = format!("{}[{}]", row, j);
@@ -135211,7 +135211,7 @@ impl Simulator {
                         }
                         let mut frame: HashMap<String, Value> = HashMap::default();
                         if let Some(Some(n)) = idx_names.first() {
-                            frame.insert(n.clone(), Value::from_u64(i as u64, 32));
+                            frame.insert(n.clone(), Self::signed_loop_val(i));
                         }
                         self.push_local_frame(frame);
                         // A 1-var foreach over a 2-D array constrains the ROW
@@ -136107,11 +136107,11 @@ impl Simulator {
                     for j in 0..inner_n {
                         let mut frame: HashMap<String, Value> = HashMap::default();
                         if let Some(Some(n)) = idx_names.first() {
-                            frame.insert(n.clone(), Value::from_u64(i as u64, 32));
+                            frame.insert(n.clone(), Self::signed_loop_val(i));
                         }
                         if c.nested && idx_names.len() >= 2 {
                             if let Some(Some(n)) = idx_names.get(1) {
-                                frame.insert(n.clone(), Value::from_u64(j as u64, 32));
+                                frame.insert(n.clone(), Self::signed_loop_val(j));
                             }
                         }
                         self.push_local_frame(frame);
@@ -139762,7 +139762,7 @@ impl Simulator {
                 for i in 0..w as i64 {
                     let mut frame: HashMap<String, Value> = HashMap::default();
                     if let Some(iv) = &idx_var {
-                        frame.insert(iv.clone(), Value::from_u64(i as u64, 32));
+                        frame.insert(iv.clone(), Self::signed_loop_val(i));
                     }
                     self.push_local_frame(frame);
                     self.apply_bit_body(handle, &body, rand_set);
@@ -141258,7 +141258,7 @@ impl Simulator {
                         let frame: HashMap<String, Value> = idx_names
                             .iter()
                             .zip(&idx)
-                            .map(|(nm, &i)| (nm.clone(), Value::from_u64(i as u64, 32)))
+                            .map(|(nm, &i)| (nm.clone(), Self::signed_loop_val(i)))
                             .collect();
                         self.push_local_frame(frame);
                         if self.solve_forced(handle, body, rand_set) {
@@ -141285,7 +141285,7 @@ impl Simulator {
                     let mut frame: HashMap<String, Value> = HashMap::default();
                     let mut suffix = String::new();
                     for (k, nm) in idx_names.iter().enumerate() {
-                        frame.insert(nm.clone(), Value::from_u64(idx[k] as u64, 32));
+                        frame.insert(nm.clone(), Self::signed_loop_val(idx[k]));
                         suffix.push_str(&format!("[{}]", idx[k]));
                     }
                     self.push_local_frame(frame);
@@ -141950,7 +141950,7 @@ impl Simulator {
         loop {
             let mut frame: HashMap<String, Value> = HashMap::default();
             for (k, nm) in idx_names.iter().enumerate() {
-                frame.insert(nm.clone(), Value::from_u64(idx[k] as u64, 32));
+                frame.insert(nm.clone(), Self::signed_loop_val(idx[k]));
             }
             self.push_local_frame(frame);
             let ok = self.item_holds(handle, &body);

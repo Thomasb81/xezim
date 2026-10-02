@@ -1855,8 +1855,8 @@ impl Simulator {
                 let mut out = Vec::with_capacity(arr.elems.len());
                 for (i, _) in &arr.elems {
                     let mut e2 = env.clone();
-                    // bound the way the checker binds a foreach index
-                    e2.binds.push((iv.clone(), Value::from_u64(*i as u64, 32)));
+                    // Ordinary array indices are signed ints, including negative bounds.
+                    e2.binds.push((iv.clone(), Self::signed_loop_val(*i)));
                     let n = self.csp_item(csp, body, &e2)?;
                     match n {
                         Node::True => {}
