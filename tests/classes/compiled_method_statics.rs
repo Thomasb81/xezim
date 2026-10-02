@@ -25,13 +25,8 @@
 //! touching methods decline and the output matches the interpreter.
 use xezim::simulate;
 
-fn gate_on() {
-    // Safety: tests run in one process; the env var leaks between tests,
-    // but every test in this file asserts gate-ON behavior only.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
@@ -48,7 +43,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 /// reference simulators.
 #[test]
 fn static_store_read_and_localparam() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 module top;
   class C;
@@ -89,7 +86,9 @@ endmodule
 /// formals. Verified byte-for-byte against reference simulators.
 #[test]
 fn new_constructs_declared_lhs_type() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 module top;
   class Node;
@@ -136,7 +135,9 @@ endmodule
 /// compiles. Verified byte-for-byte against reference simulators.
 #[test]
 fn singleton_static_handle_construct() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 module top;
   class S;
@@ -170,7 +171,9 @@ endmodule
 /// behavior exactly.
 #[test]
 fn static_shadows_inherited_member_parity() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 module top;
   class A;
@@ -200,7 +203,11 @@ endmodule
 "#;
     let sim = simulate(src, 100).expect("simulation should run");
     assert_eq!(u(&sim, "fa"), 1, "inherited instance member read");
-    assert_eq!(u(&sim, "fb"), 5, "ctor store hits the derived static (interp parity)");
+    assert_eq!(
+        u(&sim, "fb"),
+        5,
+        "ctor store hits the derived static (interp parity)"
+    );
     assert_eq!(u(&sim, "fc"), 10, "instance member + localparam");
     assert_eq!(u(&sim, "bx"), 5, "class-scope static written by ctor store");
 }

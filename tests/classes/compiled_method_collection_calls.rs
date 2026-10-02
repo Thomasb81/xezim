@@ -21,12 +21,8 @@
 //! compiled path.
 use xezim::simulate;
 
-fn gate_on() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
@@ -43,7 +39,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 /// qsz=3 q0=99 q1=20, aax=0 aay=2, iqsz=2 iak=42, TAG_PASS.
 #[test]
 fn collection_calls_all_receiver_shapes() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class inner_t;
   int iq[$];
@@ -152,7 +150,9 @@ endmodule
 /// the AST path. Reference: sz0=3, sz1=2 e0=1 e1=3, sz2=0.
 #[test]
 fn static_member_queue_bare_builtins() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class obj_t;
   static int sq[$];
@@ -186,8 +186,8 @@ endmodule
     // The static store is shared across instances, so observe the sequence
     // through separate runs (each ends with a distinct observable copy):
     // stage 1 — seed + drain, store has [1, 3];
-    let sim = simulate(src.replace("b.clear_all();", "").as_str(), 100)
-        .expect("simulation should run");
+    let sim =
+        simulate(src.replace("b.clear_all();", "").as_str(), 100).expect("simulation should run");
     let _ = &sim;
     // Final states are observed through dedicated result copies below.
     let src3 = r#"
@@ -276,7 +276,9 @@ endmodule
 /// same precedence for any shape that reaches it.
 #[test]
 fn user_method_named_like_builtin_wins() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class pair_t;
   int q[$];

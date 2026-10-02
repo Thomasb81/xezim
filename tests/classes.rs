@@ -113,18 +113,18 @@ mod compiled_method_step6_surface;
 #[path = "classes/compiled_method_string_forms.rs"]
 mod compiled_method_string_forms;
 
-#[path = "classes/compiled_method_string_members.rs"]
-mod compiled_method_string_members;
-#[path = "classes/compiled_method_enum_formals.rs"]
-mod compiled_method_enum_formals;
-#[path = "classes/compiled_method_ref_formals.rs"]
-mod compiled_method_ref_formals;
-#[path = "classes/compiled_method_collection_calls.rs"]
-mod compiled_method_collection_calls;
 #[path = "classes/compiled_method_coll_elems.rs"]
 mod compiled_method_coll_elems;
 #[path = "classes/compiled_method_coll_shadow.rs"]
 mod compiled_method_coll_shadow;
+#[path = "classes/compiled_method_collection_calls.rs"]
+mod compiled_method_collection_calls;
+#[path = "classes/compiled_method_enum_formals.rs"]
+mod compiled_method_enum_formals;
+#[path = "classes/compiled_method_ref_formals.rs"]
+mod compiled_method_ref_formals;
+#[path = "classes/compiled_method_string_members.rs"]
+mod compiled_method_string_members;
 
 #[path = "classes/compiled_method_foreach.rs"]
 mod compiled_method_foreach;
@@ -134,24 +134,6 @@ mod compiled_method_local_colls;
 #[path = "classes/compiled_method_void.rs"]
 mod compiled_method_void;
 
-#[path = "classes/compiled_method_super.rs"]
-mod compiled_method_super;
-#[path = "classes/compiled_method_static_scope.rs"]
-mod compiled_method_static_scope;
-#[path = "classes/compiled_method_statics.rs"]
-mod compiled_method_statics;
-#[path = "classes/compiled_method_pcache.rs"]
-mod compiled_method_pcache;
-#[path = "classes/compiled_method_tiering.rs"]
-mod compiled_method_tiering;
-#[path = "classes/compiled_method_array_members.rs"]
-mod compiled_method_array_members;
-#[path = "classes/compiled_method_string_loop.rs"]
-mod compiled_method_string_loop;
-#[path = "classes/compiled_method_accessors.rs"]
-mod compiled_method_accessors;
-#[path = "classes/compiled_method_cast.rs"]
-mod compiled_method_cast;
 #[path = "classes/class_local_typedef_aa.rs"]
 mod class_local_typedef_aa;
 #[path = "classes/class_local_typedef_resolution.rs"]
@@ -164,6 +146,8 @@ mod class_name_method_shadow;
 mod class_output_handle_copyback;
 #[path = "classes/class_packed_and_type_params.rs"]
 mod class_packed_and_type_params;
+#[path = "classes/class_param_property_widths.rs"]
+mod class_param_property_widths;
 #[path = "classes/class_param_siblings.rs"]
 mod class_param_siblings;
 #[path = "classes/class_program_test.rs"]
@@ -184,6 +168,24 @@ mod class_unpacked_struct_property;
 mod class_value_params;
 #[path = "classes/class_width_copy_fork.rs"]
 mod class_width_copy_fork;
+#[path = "classes/compiled_method_accessors.rs"]
+mod compiled_method_accessors;
+#[path = "classes/compiled_method_array_members.rs"]
+mod compiled_method_array_members;
+#[path = "classes/compiled_method_cast.rs"]
+mod compiled_method_cast;
+#[path = "classes/compiled_method_pcache.rs"]
+mod compiled_method_pcache;
+#[path = "classes/compiled_method_static_scope.rs"]
+mod compiled_method_static_scope;
+#[path = "classes/compiled_method_statics.rs"]
+mod compiled_method_statics;
+#[path = "classes/compiled_method_string_loop.rs"]
+mod compiled_method_string_loop;
+#[path = "classes/compiled_method_super.rs"]
+mod compiled_method_super;
+#[path = "classes/compiled_method_tiering.rs"]
+mod compiled_method_tiering;
 #[path = "classes/constraint_algebra_inherit.rs"]
 mod constraint_algebra_inherit;
 #[path = "classes/constraint_array_sum.rs"]
@@ -393,6 +395,8 @@ mod array_of_collections_property;
 mod array_query_handle_qualified_member;
 #[path = "classes/caller_local_shadows_this_cast.rs"]
 mod caller_local_shadows_this_cast;
+#[path = "classes/cast_dest_specialization.rs"]
+mod cast_dest_specialization;
 #[path = "classes/class_array_property_select.rs"]
 mod class_array_property_select;
 #[path = "classes/class_covergroups.rs"]
@@ -407,6 +411,10 @@ mod class_randomize_multidim;
 mod cls_agg_members_in_struct;
 #[path = "classes/cls_agg_members_matrix.rs"]
 mod cls_agg_members_matrix;
+#[path = "classes/compiled_method_admission_regression.rs"]
+mod compiled_method_admission_regression;
+#[path = "classes/compiled_method_test_env.rs"]
+mod compiled_method_test_env;
 #[path = "classes/condition_waiter_yields_to_inactive.rs"]
 mod condition_waiter_yields_to_inactive;
 #[path = "classes/covergroup_bin_arithmetic.rs"]
@@ -423,6 +431,8 @@ mod heap_id_collision_member_access;
 mod id_collision_in_heap;
 #[path = "classes/implication_joint_distribution.rs"]
 mod implication_joint_distribution;
+#[path = "classes/interface_class_extends_type_param.rs"]
+mod interface_class_extends_type_param;
 #[path = "classes/member_collection_runtime_class.rs"]
 mod member_collection_runtime_class;
 #[path = "classes/member_visibility_local_protected.rs"]
@@ -457,6 +467,8 @@ mod static_assoc_struct_pool;
 mod static_collection_qualified_access;
 #[path = "classes/static_instance_assoc_object.rs"]
 mod static_instance_assoc_object;
+#[path = "classes/static_property_through_handle.rs"]
+mod static_property_through_handle;
 #[path = "classes/struct_prop_whole_copy.rs"]
 mod struct_prop_whole_copy;
 #[path = "classes/type_param_replication_localparam.rs"]

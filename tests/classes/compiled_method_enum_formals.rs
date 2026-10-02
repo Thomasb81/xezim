@@ -13,9 +13,8 @@
 //! tier so a plain `cargo test` exercises the compiled path.
 use xezim::simulate;
 
-fn gate_on() {
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn n(sim: &xezim::compiler::Simulator, name: &str) -> i64 {
@@ -28,7 +27,9 @@ fn n(sim: &xezim::compiler::Simulator, name: &str) -> i64 {
 
 #[test]
 fn enum_formals_end_to_end() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 typedef enum { EC_A = 1, EC_B = 5, EC_C = 9 } ec_t;
 typedef enum bit [3:0] { EN_A = 4'h2, EN_B = 4'h9 } en_t;

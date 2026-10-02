@@ -40,7 +40,10 @@ fn run(src: &str, gate: bool, tag: &str) -> String {
         // Safety: environment is inherited by the child only.
         cmd.env("XEZIM_COMPILE_METHODS", "1")
             .env("XEZIM_METHOD_TIER", "0")
-            .env("XEZIM_METHOD_CACHE", format!("/tmp/wb_formal_mc_{tag}_{gate}"));
+            .env(
+                "XEZIM_METHOD_CACHE",
+                format!("/tmp/wb_formal_mc_{tag}_{gate}"),
+            );
     } else {
         cmd.env("XEZIM_COMPILE_METHODS", "0");
     }
@@ -57,7 +60,10 @@ fn check(name: &str, src: &str) {
     let off = run(src, false, name);
     let on = run(src, true, name);
     assert!(!off.is_empty(), "{name}: interpreter produced no output");
-    assert_eq!(off, on, "{name}: compiled ON != interpreter OFF\nOFF:\n{off}\nON:\n{on}");
+    assert_eq!(
+        off, on,
+        "{name}: compiled ON != interpreter OFF\nOFF:\n{off}\nON:\n{on}"
+    );
 }
 
 #[test]

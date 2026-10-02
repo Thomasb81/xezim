@@ -21,13 +21,8 @@
 //!   body keeps the handle (the sequencer create_item regression shape).
 use xezim::simulate;
 
-fn gate_on() {
-    // Safety: tests run in one process; the env var leaks between tests,
-    // but every test in this file asserts gate-ON behavior only.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
@@ -45,7 +40,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 /// byte-for-byte against reference simulators (a=20 b=10 d=42).
 #[test]
 fn class_scope_static_calls() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 module top;
   class Util;
@@ -92,7 +89,9 @@ endmodule
 /// (a=7 b=3 — a wrong baked default would give 4/4).
 #[test]
 fn param_spec_alias_receivers() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 module top;
   class C #(int W = 4);
@@ -127,7 +126,9 @@ endmodule
 /// reference simulators (a=1 b=1).
 #[test]
 fn alias_singleton_call_chain() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 module top;
   class C;
@@ -176,7 +177,9 @@ endmodule
 /// loop: a null create_item wedged every driver.
 #[test]
 fn class_result_cast_retains_handle() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 module top;
   class Item;

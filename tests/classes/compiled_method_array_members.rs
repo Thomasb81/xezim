@@ -25,11 +25,8 @@
 //! exercises the compiled path.
 use xezim::simulate;
 
-fn gate_on() {
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
@@ -42,7 +39,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 
 #[test]
 fn fixed_array_member_element_ops_compile() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class Hist;
   int h[4];          // fixed-size instance array member
@@ -90,7 +89,9 @@ endmodule
 
 #[test]
 fn fixed_array_member_two_instances_stay_isolated() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class Counter;
   int c[2];
@@ -117,12 +118,18 @@ endmodule
 "#;
     let sim = simulate(src, 100).expect("simulation should run");
     // x.c[0] = 5, y.c[0] = 0, y.c[1] = 1.
-    assert_eq!(u(&sim, "tot"), 501, "per-instance fixed-array storage isolation");
+    assert_eq!(
+        u(&sim, "tot"),
+        501,
+        "per-instance fixed-array storage isolation"
+    );
 }
 
 #[test]
 fn fixed_array_write_then_ast_and_compiled_agree() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class Buf;
   int d[3];
@@ -146,5 +153,9 @@ module top;
 endmodule
 "#;
     let sim = simulate(src, 100).expect("simulation should run");
-    assert_eq!(u(&sim, "sum"), 67, "compiled fixed-array store/load round trip");
+    assert_eq!(
+        u(&sim, "sum"),
+        67,
+        "compiled fixed-array store/load round trip"
+    );
 }

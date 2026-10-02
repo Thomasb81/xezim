@@ -18,11 +18,6 @@
 
 use xezim::simulate;
 
-fn gate_on() {
-    // Safety: tests run in one process; set/reset is sequential here.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-}
-
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
     sim.get_signal(n)
         .or_else(|| sim.get_signal(&format!("top.{}", n)))
@@ -93,33 +88,17 @@ fn run() -> (u64, u64, u64) {
 
 #[test]
 fn tiering_boundary_is_invisible() {
+    if !super::compiled_method_test_env::policies(&[("1", "100"), ("1", "0"), ("1", "1000000")]) {
+        return;
+    }
     let (want_total, want_hits, want_acc) = model();
     // Sanity: the model actually exercises the >1100 clamp.
     assert!(want_hits == 750, "model must make 750 step() calls");
 
-    // Pinned tier 100 (not the product default): the first 100 step()
-    // calls interpret, the remaining 650 run compiled — the boundary
-    // fires mid-run.
-    gate_on();
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "100") };
+    // Each policy runs in a fresh process. Tier 100 crosses the boundary
+    // mid-run; tier zero and the large tier check its compiled/AST controls.
     let a = run();
     assert_eq!(a, (want_total as u64, want_hits as u64, want_acc as u64));
-
-    // Tier 0: compiled from the very first call.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
-    let b = run();
-    assert_eq!(b, a, "tier 0 (all compiled) diverged from default tier");
-
-    // Huge tier: every call interpreted, gate effectively cold.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "1000000") };
-    let c = run();
-    assert_eq!(c, a, "huge tier (all interpreted) diverged");
-
-    // Reset so later tests in this process see the default policy.
-    unsafe {
-        std::env::remove_var("XEZIM_METHOD_TIER");
-        std::env::remove_var("XEZIM_COMPILE_METHODS");
-    }
 }
 
 // ---------------------------------------------------------------------------

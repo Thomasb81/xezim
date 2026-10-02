@@ -144,8 +144,7 @@ impl rand::RngCore for SvRng {
     }
 }
 
-thread_local! {
-}
+thread_local! {}
 thread_local! {
     /// Current `run_process_stmts` recursion depth. The suspend-aware loop
     /// handlers trampoline through the event queue (instead of recursing) once
@@ -179,7 +178,8 @@ static SAMPLER_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// 0 while it runs the AST interpreter. Sampled alongside the hash so the
 /// histogram can answer "of the time spent in method X, how much is already
 /// bytecode" — the input that ranks admission-expansion rows by heat.
-static CUR_METHOD_COMPILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CUR_METHOD_COMPILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static METHOD_SAMPLES: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, u64>>> =
     std::sync::OnceLock::new();
 static METHOD_SAMPLES_VM: std::sync::OnceLock<Mutex<std::collections::HashMap<u64, u64>>> =
@@ -271,7 +271,7 @@ fn method_tier_threshold() -> u32 {
 /// lowering, register allocation, block layout. Stale entries with an old
 /// salt hash to different keys and are simply recompiled; the safety net is
 /// the suite-level ON == OFF parity run against a warm cache.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3031;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3032;
 
 /// class-perf P3: direct-call eligibility for a compiled (cid, mid).
 #[derive(Clone)]
@@ -374,10 +374,15 @@ pub fn sampler_sample() {
 /// After the run, resolve hashes to names and print the histogram.
 pub fn sampler_report(top: usize) {
     let samples = METHOD_SAMPLES.get_or_init(Default::default).lock().unwrap();
-    let vm = METHOD_SAMPLES_VM.get_or_init(Default::default).lock().unwrap();
+    let vm = METHOD_SAMPLES_VM
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap();
     let names = METHOD_NAMES.get_or_init(Default::default).lock().unwrap();
     let mut v: Vec<u64> = samples.keys().chain(vm.keys()).copied().collect();
-    v.sort_by_key(|&h| std::cmp::Reverse(samples.get(&h).copied().unwrap_or(0) + vm.get(&h).copied().unwrap_or(0)));
+    v.sort_by_key(|&h| {
+        std::cmp::Reverse(samples.get(&h).copied().unwrap_or(0) + vm.get(&h).copied().unwrap_or(0))
+    });
     eprintln!("===== METHOD SAMPLE HISTOGRAM (top {}) =====", top);
     for k in v.iter().take(top) {
         let ast = samples.get(k).copied().unwrap_or(0);
@@ -6050,6 +6055,9 @@ pub struct Simulator {
     /// parameter-binding fingerprint)` → re-resolved width, so the packed
     /// range is const-eval'd once per specialization instead of per store.
     spec_prop_width_cache: std::cell::RefCell<HashMap<(String, String, String), Option<u32>>>,
+    /// `static_cell_width` per static cell key (class tables are fixed at
+    /// run time, and a key names one specialization).
+    static_cell_width_cache: std::cell::RefCell<HashMap<String, Option<(u32, bool)>>>,
     /// Tracks class names currently being constructed via the `type_id::create()`
     /// shortcut, to prevent infinite recursion when a parameterized
     /// class's constructor or static initializers re-enter `type_id::create()`
@@ -6215,7 +6223,8 @@ pub struct Simulator {
     /// execution mutates object state, never declarations, so sharing the
     /// parsed body avoids rebuilding a deep AST on every call.
     class_method_cache: std::cell::RefCell<
-        HashMap<String, HashMap<String, Option<Arc<crate::ast::decl::ClassMethod>>>>>,
+        HashMap<String, HashMap<String, Option<Arc<crate::ast::decl::ClassMethod>>>>,
+    >,
     /// class-perf Step 7: memoized `class_has_method` (whole-chain,
     /// declaration-presence only — includes PureVirtual/Extern prototypes,
     /// unlike `cached_class_method`). Same freeze argument as the
@@ -7030,10 +7039,10 @@ pub struct Simulator {
     /// so a cached block is always byte-identical to a fresh compile of the
     /// same instance. String keys are never cached (HashMaps intern to u32).
     compiled_class_method_ids: HashMap<String, u32>,
-    compiled_method_block_cache: HashMap<
-        (u32, u32, std::rc::Rc<Vec<u32>>, u32),
-        super::bytecode::CompiledMethodOutcome,
-    >,
+    compiled_method_block_cache:
+        HashMap<(u32, u32, std::rc::Rc<Vec<u32>>, u32), super::bytecode::CompiledMethodOutcome>,
+    compiled_method_admission: Option<std::rc::Rc<super::bytecode::MethodAdmission>>,
+    persisted_method_context_hash: Option<u64>,
     /// class-perf Step 7b: prebound compiled-method gates, keyed (cid, mid).
     /// Present only for methods that PASSED the compile gate; the per-call
     /// type-resolution work (return kind, formal seed widths) runs once at
@@ -7062,7 +7071,7 @@ pub struct Simulator {
     /// `Entry` runs the callee's block in-place with a fresh register
     /// file, skipping arg materialization + interpreter binding.
     compiled_fast_calls: HashMap<(u32, u32), FastCallState>,
-   /// `resolve_typeref_class_name` memo: name -> scope -> class ctx -> (class-table size, answer).
+    /// `resolve_typeref_class_name` memo: name -> scope -> class ctx -> (class-table size, answer).
     #[allow(clippy::type_complexity)]
     typeref_class_memo: std::cell::RefCell<
         HashMap<String, HashMap<String, HashMap<String, (usize, Option<String>)>>>,
@@ -8392,7 +8401,6 @@ enum ImpCons<'a> {
     Item(&'a ConstraintItem),
     Expr(&'a Expression),
 }
-
 
 impl Simulator {
     /// `XEZIM_MEM_CENSUS` end-of-run class-heap line: live object slots,
@@ -11420,6 +11428,7 @@ impl Simulator {
             prof_clock_tree_evals: 0,
             spec_prop_is_dyn: std::cell::RefCell::new(HashMap::default()),
             spec_prop_width_cache: std::cell::RefCell::new(HashMap::default()),
+            static_cell_width_cache: std::cell::RefCell::new(HashMap::default()),
             type_id_create_in_progress: HashSet::default(),
             initialized_spec_statics: std::collections::HashSet::default(),
             factory_reg_in_progress: std::collections::HashSet::default(),
@@ -11678,6 +11687,8 @@ impl Simulator {
             method_receiver_hint_ids: HashMap::default(),
             compiled_class_method_ids: HashMap::default(),
             compiled_method_block_cache: HashMap::default(),
+            compiled_method_admission: None,
+            persisted_method_context_hash: None,
             compiled_method_plans: HashMap::default(),
             compiled_method_skip: HashSet::default(),
             compiled_method_call_counts: HashMap::default(),
@@ -33568,9 +33579,7 @@ impl Simulator {
                 }
                 Insn::CallMethod(dest, handle_reg, method, arg_start, n_args) => {
                     let method: &str = &method.0;
-                    let handle = self.vm_regs[*handle_reg as usize]
-                        .to_u64()
-                        .unwrap_or(0) as usize;
+                    let handle = self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
                     let base = *arg_start as usize;
                     let n = *n_args as usize;
                     // class-perf P3: direct VM->VM dispatch when the callee
@@ -33583,42 +33592,40 @@ impl Simulator {
                         self.vm_regs[*dest as usize] = v;
                         local_count += 1;
                     } else {
-                    // class-perf row 2: resolve the callee once more for the
-                    // write-back temp set. A wrong guess here (ctor-stack
-                    // dispatch edge) merely keeps the constant wrapper —
-                    // the historic behavior — never a wrong write-back.
-                    let callee_class = self
-                        .heap
-                        .get(handle)
-                        .and_then(|i| i.as_ref().map(|inst| inst.class_name.clone()));
-                    let (args, temps) = match callee_class {
-                        Some(cn) => self.vm_args_with_writeback(&cn, method, base, n),
-                        None => {
-                            let mut a = Vec::with_capacity(n);
-                            for i in 0..n {
-                                let v = self
-                                    .vm_regs
-                                    .get(base + i)
-                                    .cloned()
-                                    .unwrap_or_else(|| Value::zero(32));
-                                a.push(self.value_method_arg_expr(&v));
+                        // class-perf row 2: resolve the callee once more for the
+                        // write-back temp set. A wrong guess here (ctor-stack
+                        // dispatch edge) merely keeps the constant wrapper —
+                        // the historic behavior — never a wrong write-back.
+                        let callee_class = self
+                            .heap
+                            .get(handle)
+                            .and_then(|i| i.as_ref().map(|inst| inst.class_name.clone()));
+                        let (args, temps) = match callee_class {
+                            Some(cn) => self.vm_args_with_writeback(&cn, method, base, n),
+                            None => {
+                                let mut a = Vec::with_capacity(n);
+                                for i in 0..n {
+                                    let v = self
+                                        .vm_regs
+                                        .get(base + i)
+                                        .cloned()
+                                        .unwrap_or_else(|| Value::zero(32));
+                                    a.push(self.value_method_arg_expr(&v));
+                                }
+                                (a, false)
                             }
-                            (a, false)
+                        };
+                        let result = self.exec_method_call(handle, method, &args);
+                        if temps {
+                            self.vm_drain_arg_temps(base, n);
                         }
-                    };
-                    let result = self.exec_method_call(handle, method, &args);
-                    if temps {
-                        self.vm_drain_arg_temps(base, n);
-                    }
-                    self.vm_regs[*dest as usize] = result;
-                    local_count += 1;
+                        self.vm_regs[*dest as usize] = result;
+                        local_count += 1;
                     }
                 }
                 Insn::CallScopedMethod(dest, this_reg, names, arg_start, n_args) => {
                     let (start_class, method) = (names.0.as_ref(), names.1.as_ref());
-                    let handle = self.vm_regs[*this_reg as usize]
-                        .to_u64()
-                        .unwrap_or(0) as usize;
+                    let handle = self.vm_regs[*this_reg as usize].to_u64().unwrap_or(0) as usize;
                     let base = *arg_start as usize;
                     let n = *n_args as usize;
                     // Value-const actuals + row-2 write-back temps, exactly
@@ -33710,7 +33717,12 @@ impl Simulator {
                     let base = *arg_start as usize;
                     let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
                     for i in 0..*n_args as usize {
-                        argvals.push(self.vm_regs.get(base + i).cloned().unwrap_or(Value::zero(32)));
+                        argvals.push(
+                            self.vm_regs
+                                .get(base + i)
+                                .cloned()
+                                .unwrap_or(Value::zero(32)),
+                        );
                     }
                     let args: Vec<Expression> = argvals
                         .iter()
@@ -33726,9 +33738,7 @@ impl Simulator {
                 }
                 Insn::CallCollMethod(dest, handle_reg, names, arg_start, n_args, bare) => {
                     let (member, method) = (names.0.as_ref(), names.1.as_ref());
-                    let handle = self.vm_regs[*handle_reg as usize]
-                        .to_u64()
-                        .unwrap_or(0) as usize;
+                    let handle = self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
                     let base = *arg_start as usize;
                     let n = *n_args as usize;
                     // Value-const actuals + row-2 write-back temps (the
@@ -33761,9 +33771,7 @@ impl Simulator {
                         // Null receiver: the AST funnel falls through to
                         // `Value::zero(32)` (no storage, no fault).
                         Value::zero(32)
-                    } else if let Some(bare_name) =
-                        Self::split_local_coll_marker(member)
-                    {
+                    } else if let Some(bare_name) = Self::split_local_coll_marker(member) {
                         // Row 3: a LOCAL collection declared in this body
                         // (the decl ran as a StmtFallback, registering the
                         // per-call `@name#id` key in the current frame).
@@ -33797,12 +33805,10 @@ impl Simulator {
                         // static keys.
                         let m: &str = &method;
                         match self.instance_assoc_member(member) {
-                            Some(scoped) => {
-                                match self.eval_builtin_method(&scoped, m, &args) {
-                                    Some(v) => v,
-                                    None => self.exec_method_call(handle, m, &args),
-                                }
-                            }
+                            Some(scoped) => match self.eval_builtin_method(&scoped, m, &args) {
+                                Some(v) => v,
+                                None => self.exec_method_call(handle, m, &args),
+                            },
                             // Not a member collection of `this` (unreachable
                             // for admitted shapes): keep the historic bare
                             // delegation so behavior never changes for the
@@ -33821,12 +33827,10 @@ impl Simulator {
                         // fire — pure storage ops.
                         let m: &str = &method;
                         match self.handle_collection_name(handle, member) {
-                            Some(scoped) => {
-                                match self.eval_builtin_method(&scoped, m, &args) {
-                                    Some(v) => v,
-                                    None => self.exec_method_call(handle, m, &args),
-                                }
-                            }
+                            Some(scoped) => match self.eval_builtin_method(&scoped, m, &args) {
+                                Some(v) => v,
+                                None => self.exec_method_call(handle, m, &args),
+                            },
                             // Undotted-scoped member (param-bound collection
                             // the plan set excluded): interpret the call as
                             // the ordinary funnel would.
@@ -33851,33 +33855,31 @@ impl Simulator {
                 // so dollar_bound is irrelevant).
                 Insn::LoadCollElem(dest, handle_reg, member, idx_reg) => {
                     let idx_val = self.vm_regs[*idx_reg as usize].clone();
-                    let store: Option<String> = if let Some(bare_name) =
-                        Self::split_local_coll_marker(member)
-                    {
-                        // Row 3: local collection — the interpreter's
-                        // per-call `@name#id` store (innermost frame wins;
-                        // a same-named `this` member is shadowed).
-                        Some(self.local_coll_store(bare_name))
-                    } else if *handle_reg == 0 {
-                        // Bare receiver: the collection is a member of
-                        // `this` — the interpreter's own resolution chain
-                        // (instance member, then static / param-bound
-                        // special keys). A None here is unreachable for
-                        // admitted shapes (the compile-side plan set is a
-                        // subset); interpret as zero, like a null read.
-                        self.instance_assoc_member(member)
-                    } else {
-                        let handle = self.vm_regs[*handle_reg as usize]
-                            .to_u64()
-                            .unwrap_or(0) as usize;
-                        // Dotted receiver: null handle reads zero, per the
-                        // funnel's fall-through (`Value::zero(32)`).
-                        if handle == 0 {
-                            None
+                    let store: Option<String> =
+                        if let Some(bare_name) = Self::split_local_coll_marker(member) {
+                            // Row 3: local collection — the interpreter's
+                            // per-call `@name#id` store (innermost frame wins;
+                            // a same-named `this` member is shadowed).
+                            Some(self.local_coll_store(bare_name))
+                        } else if *handle_reg == 0 {
+                            // Bare receiver: the collection is a member of
+                            // `this` — the interpreter's own resolution chain
+                            // (instance member, then static / param-bound
+                            // special keys). A None here is unreachable for
+                            // admitted shapes (the compile-side plan set is a
+                            // subset); interpret as zero, like a null read.
+                            self.instance_assoc_member(member)
                         } else {
-                            self.handle_collection_name(handle, member)
-                        }
-                    };
+                            let handle =
+                                self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
+                            // Dotted receiver: null handle reads zero, per the
+                            // funnel's fall-through (`Value::zero(32)`).
+                            if handle == 0 {
+                                None
+                            } else {
+                                self.handle_collection_name(handle, member)
+                            }
+                        };
                     let value = match store {
                         Some(an) => {
                             let key = self.assoc_key_str(&an, &idx_val);
@@ -33903,27 +33905,25 @@ impl Simulator {
                 Insn::StoreCollElem(handle_reg, member, idx_reg, val_reg) => {
                     let idx_val = self.vm_regs[*idx_reg as usize].clone();
                     let val = self.vm_regs[*val_reg as usize].clone();
-                    let store: Option<String> = if let Some(bare_name) =
-                        Self::split_local_coll_marker(member)
-                    {
-                        // Row 3: local collection — the interpreter's
-                        // per-call `@name#id` store (innermost frame wins;
-                        // a same-named `this` member is shadowed).
-                        Some(self.local_coll_store(bare_name))
-                    } else if *handle_reg == 0 {
-                        self.instance_assoc_member(member)
-                    } else {
-                        let handle = self.vm_regs[*handle_reg as usize]
-                            .to_u64()
-                            .unwrap_or(0) as usize;
-                        if handle == 0 {
-                            // Null-receiver store: the AST funnel's write
-                            // resolves no store and drops silently.
-                            None
+                    let store: Option<String> =
+                        if let Some(bare_name) = Self::split_local_coll_marker(member) {
+                            // Row 3: local collection — the interpreter's
+                            // per-call `@name#id` store (innermost frame wins;
+                            // a same-named `this` member is shadowed).
+                            Some(self.local_coll_store(bare_name))
+                        } else if *handle_reg == 0 {
+                            self.instance_assoc_member(member)
                         } else {
-                            self.handle_collection_name(handle, member)
-                        }
-                    };
+                            let handle =
+                                self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
+                            if handle == 0 {
+                                // Null-receiver store: the AST funnel's write
+                                // resolves no store and drops silently.
+                                None
+                            } else {
+                                self.handle_collection_name(handle, member)
+                            }
+                        };
                     if let Some(an) = store {
                         let key = self.assoc_key_str(&an, &idx_val);
                         let elem_name = format!("{}[{}]", an, key);
@@ -33938,9 +33938,7 @@ impl Simulator {
                         // §10.7: fit to the DECLARED element width when one
                         // was recorded; otherwise store as-is.
                         let fitted = match self.assoc_elem_width(&an) {
-                            Some(w) if w != val.width && !val.is_real => {
-                                val.resize_for_assign(w)
-                            }
+                            Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
                             _ => val.clone(),
                         };
                         let changed = self.signals.get(&elem_name) != Some(&fitted);
@@ -34017,8 +34015,7 @@ impl Simulator {
                                         v.resize(p.width)
                                     }
                                     Some(p) if !p.is_real && v.is_real => {
-                                        let mut f =
-                                            Self::real_to_int(v.to_f64(), p.width.max(1));
+                                        let mut f = Self::real_to_int(v.to_f64(), p.width.max(1));
                                         f.is_signed = p.is_signed;
                                         f
                                     }
@@ -34027,13 +34024,9 @@ impl Simulator {
                                 self.vm_regs[r] = fitted;
                             }
                             CastDest::Member(hreg, field) => {
-                                let h = self.vm_regs[*hreg as usize]
-                                    .to_u64()
-                                    .unwrap_or(0) as usize;
+                                let h = self.vm_regs[*hreg as usize].to_u64().unwrap_or(0) as usize;
                                 let fitted = self.fit_class_prop(h, field, &v);
-                                if let Some(o) =
-                                    self.heap.get_mut(h).and_then(|o| o.as_mut())
-                                {
+                                if let Some(o) = self.heap.get_mut(h).and_then(|o| o.as_mut()) {
                                     o.properties.insert(field.to_string(), fitted);
                                 }
                             }
@@ -34050,8 +34043,11 @@ impl Simulator {
                         self.record_output(m.clone());
                         self.stdout_writeln(&m);
                     }
-                    self.vm_regs[*out as usize] =
-                        if ok { Value::from_u64(1, 32) } else { Value::zero(32) };
+                    self.vm_regs[*out as usize] = if ok {
+                        Value::from_u64(1, 32)
+                    } else {
+                        Value::zero(32)
+                    };
                     local_count += 1;
                 }
                 // class-perf Step 9d: materialize the iteration keys of a
@@ -34065,28 +34061,26 @@ impl Simulator {
                 // key's loop-var Value is precomputed with the sync foreach
                 // arm's exact conversion so ForeachNext can only move it.
                 Insn::ForeachKeys(slot, handle_reg, member) => {
-                    let store: Option<String> = if let Some(bare_name) =
-                        Self::split_local_coll_marker(member)
-                    {
-                        // Row 3: local collection — the interpreter's
-                        // per-call `@name#id` store (innermost frame wins;
-                        // a same-named `this` member is shadowed).
-                        Some(self.local_coll_store(bare_name))
-                    } else if *handle_reg == 0 {
-                        self.instance_assoc_member(member)
-                    } else {
-                        let handle = self.vm_regs[*handle_reg as usize]
-                            .to_u64()
-                            .unwrap_or(0) as usize;
-                        if handle == 0 {
-                            // Null receiver: no store → no keys → zero
-                            // iterations, matching the interpreter's
-                            // expr_assoc_name fall-through.
-                            None
+                    let store: Option<String> =
+                        if let Some(bare_name) = Self::split_local_coll_marker(member) {
+                            // Row 3: local collection — the interpreter's
+                            // per-call `@name#id` store (innermost frame wins;
+                            // a same-named `this` member is shadowed).
+                            Some(self.local_coll_store(bare_name))
+                        } else if *handle_reg == 0 {
+                            self.instance_assoc_member(member)
                         } else {
-                            self.handle_collection_name(handle, member)
-                        }
-                    };
+                            let handle =
+                                self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
+                            if handle == 0 {
+                                // Null receiver: no store → no keys → zero
+                                // iterations, matching the interpreter's
+                                // expr_assoc_name fall-through.
+                                None
+                            } else {
+                                self.handle_collection_name(handle, member)
+                            }
+                        };
                     let (keys, is_str, kw, ks_sign) = match store {
                         Some(an) => {
                             let (ks, is_str) = self.array_iter_keys(&an);
@@ -34105,10 +34099,8 @@ impl Simulator {
                             if is_str {
                                 Value::from_string(key)
                             } else {
-                                let mut v = Value::from_u64(
-                                    key.parse::<i64>().unwrap_or(0) as u64,
-                                    kw,
-                                );
+                                let mut v =
+                                    Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
                                 v.is_signed = ks_sign;
                                 v
                             }
@@ -63189,6 +63181,14 @@ impl Simulator {
     }
 
     fn assign_value(&mut self, lhs: &Expression, val: &Value) -> bool {
+        if matches!(&lhs.kind, ExprKind::MemberAccess { expr, .. }
+                if !matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() == 1))
+            || matches!(&lhs.kind, ExprKind::Ident(h) if h.path.len() >= 3)
+        {
+            if let Some(ok) = self.assign_static_through_chain(lhs, val) {
+                return ok;
+            }
+        }
         if let ExprKind::MemberAccess { expr: b, .. }
         | ExprKind::Index { expr: b, .. }
         | ExprKind::RangeSelect { expr: b, .. } = &lhs.kind
@@ -65135,6 +65135,84 @@ impl Simulator {
                 return self.write_class_agg(&r, val);
             }
         }
+        // §8.9: assignment to a STATIC class property (`obj.static_prop = ...`,
+        // `this.static_prop = ...`) writes the single shared cell, not per-
+        // instance storage. A named reference resolves by its declared type
+        // and specialization (§8.25), so a null handle works and a derived
+        // object's same-named instance property is not mistaken for it; this
+        // arm runs before the instance-property arms below. A non-static
+        // member falls through to them.
+        {
+            let obj_prop: Option<(String, String)> = match &lhs.kind {
+                ExprKind::Ident(h)
+                    if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+                {
+                    Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
+                }
+                ExprKind::MemberAccess { expr, member } => match &expr.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                        Some((h.path[0].name.name.clone(), member.name.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some((obj, prop)) = obj_prop {
+                if obj != "this" && obj != "super" {
+                    let handle = self.eval_ident_handle(&obj).unwrap_or(0);
+                    let resolved = match &lhs.kind {
+                        ExprKind::Ident(h) => {
+                            let head_id = HierarchicalIdentifier {
+                                root: h.root.clone(),
+                                path: vec![h.path[0].clone()],
+                                span: h.span,
+                                cached_signal_id: std::cell::Cell::new(None),
+                                cached_resolved_name: std::cell::OnceCell::new(),
+                            };
+                            Some(self.resolve_hier_name(&head_id).into_owned())
+                        }
+                        ExprKind::MemberAccess { expr, .. } => match &expr.kind {
+                            ExprKind::Ident(h) => Some(self.resolve_hier_name(h).into_owned()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(ok) = self.static_write_via_handle(
+                        handle,
+                        Some(&obj),
+                        resolved.as_deref(),
+                        &prop,
+                        val.clone(),
+                    ) {
+                        return ok;
+                    }
+                }
+                let cn = if obj == "this" {
+                    self.this_stack
+                        .last()
+                        .copied()
+                        .flatten()
+                        .and_then(|h| self.heap.get(h))
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone())
+                } else {
+                    // A named reference was resolved above, by its
+                    // declared type.
+                    None
+                };
+                if let Some(cn) = cn {
+                    if self.static_prop_key(&cn, &prop).is_some() {
+                        let mut v = val.clone();
+                        if let Some(w) = self.class_prop_width(&cn, &prop) {
+                            if w != v.width && !v.is_real {
+                                v = v.resize_for_assign(w);
+                            }
+                        }
+                        return self.class_static_set(&cn, &prop, v);
+                    }
+                }
+            }
+        }
         // §7.8.6/§8.4: `coll[key].prop = v` where the element is a CLASS
         // HANDLE writes the heap object the handle points at — not a
         // composed `coll[key].prop` signal (which silently forks the
@@ -65271,50 +65349,6 @@ impl Simulator {
             {
                 if let Some(r) = self.class_packed_elem_ref(expr, index) {
                     return self.write_class_agg(&r, val);
-                }
-            }
-        }
-        // §8.9: assignment to a STATIC class property (`obj.static_prop = ...`,
-        // `this.static_prop = ...`) writes the single shared cell, not per-
-        // instance storage. static_prop_key is None for a non-static member, so
-        // ordinary property writes fall through to the arms below.
-        {
-            let obj_prop: Option<(String, String)> = match &lhs.kind {
-                ExprKind::Ident(h)
-                    if h.path.len() == 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
-                {
-                    Some((h.path[0].name.name.clone(), h.path[1].name.name.clone()))
-                }
-                ExprKind::MemberAccess { expr, member } => match &expr.kind {
-                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
-                        Some((h.path[0].name.name.clone(), member.name.clone()))
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some((obj, prop)) = obj_prop {
-                let cn = if obj == "this" {
-                    self.this_stack
-                        .last()
-                        .copied()
-                        .flatten()
-                        .and_then(|h| self.heap.get(h))
-                        .and_then(|o| o.as_ref())
-                        .map(|i| i.class_name.clone())
-                } else {
-                    self.class_of_var(&obj)
-                };
-                if let Some(cn) = cn {
-                    if self.static_prop_key(&cn, &prop).is_some() {
-                        let mut v = val.clone();
-                        if let Some(w) = self.class_prop_width(&cn, &prop) {
-                            if w != v.width && !v.is_real {
-                                v = v.resize_for_assign(w);
-                            }
-                        }
-                        return self.class_static_set(&cn, &prop, v);
-                    }
                 }
             }
         }
@@ -67585,6 +67619,17 @@ impl Simulator {
                     let base = self.eval_expr(expr);
                     let handle = base.to_u64().unwrap_or(0) as usize;
                     if handle != 0 && handle < self.heap.len() && self.heap[handle].is_some() {
+                        // §8.9: a static reached through a handle chain
+                        // (`a.b.s = v`) is the class's shared cell.
+                        if let Some(ok) = self.static_write_via_handle(
+                            handle,
+                            None,
+                            None,
+                            &member.name,
+                            val.clone(),
+                        ) {
+                            return ok;
+                        }
                         // §8.x: a class property assignment truncates/sign-
                         // extends the rvalue to the property's declared type
                         // (`byte a; a = 'hfff;` ⇒ 8-bit 0xff, read -1 when
@@ -68345,6 +68390,18 @@ impl Simulator {
                                     }
                                 }
                                 if found_member {
+                                    // §20.6.2: a fixed-size UNPACKED array
+                                    // member is element_bits × the element
+                                    // count; its per-instance storage is
+                                    // `<handle>#<name>`, not one value.
+                                    let scoped = format!("{}#{}", this_h, name);
+                                    if !self.module.dynamic_arrays.contains(&scoped) {
+                                        if let Some(&(lo, hi, ew)) = self.module.arrays.get(&scoped)
+                                        {
+                                            let n = (hi - lo).unsigned_abs() + 1;
+                                            return Value::from_u64(n * ew as u64, 32);
+                                        }
+                                    }
                                     return Value::from_u64(self.eval_expr(arg).width as u64, 32);
                                 }
                             }
@@ -69397,6 +69454,7 @@ impl Simulator {
                             w.max(1)
                         } else if self.module.parameters.contains_key(nm)
                             || self.get_signal_value_by_name(nm).is_some()
+                            || self.class_value_param_in_scope(nm)
                         {
                             self.eval_expr(&args[0]).to_u64().unwrap_or(32).max(1) as u32
                         } else {
@@ -69476,6 +69534,7 @@ impl Simulator {
                     // behaviour) rather than resizing to a garbage width.
                     if self.module.parameters.contains_key(&nm)
                         || self.get_signal_value_by_name(&nm).is_some()
+                        || self.class_value_param_in_scope(&nm)
                     {
                         let n = self.eval_expr(&args[0]).to_u64().unwrap_or(32) as u32;
                         return inner_v.resize(n.max(1));
@@ -71080,7 +71139,43 @@ impl Simulator {
         // `obj = new`). Route to the shared cell. class_static_get
         // returns None for a non-static member, so ordinary reads fall
         // through unchanged.
-        let static_class: Option<String> = if handle != 0 && handle < self.heap.len() {
+        let member_static = self
+            .class_member_names()
+            .statics
+            .contains(member.name.as_str());
+        if member_static {
+            let (var, resolved) = match &expr.kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => (
+                    Some(h.path[0].name.name.clone()),
+                    Some(self.resolve_hier_name(h).into_owned()),
+                ),
+                ExprKind::MemberAccess { .. } | ExprKind::Ident(_) if handle == 0 => {
+                    // §8.9: a static through a null property.
+                    if let Some((o, p)) = self.handle_chain_owner(expr) {
+                        if let Some((cn, spec)) =
+                            self.null_property_static_target(o, &p, &member.name)
+                        {
+                            if let Some(v) = self.static_read_in(&cn, spec, &member.name) {
+                                return v;
+                            }
+                        }
+                    }
+                    (None, None)
+                }
+                _ => (None, None),
+            };
+            let live = if handle < self.heap.len() { handle } else { 0 };
+            if let Some(v) =
+                self.static_read_via_handle(live, var.as_deref(), resolved.as_deref(), &member.name)
+            {
+                return v;
+            }
+        }
+        // A class constant (localparam) through the reference; a static
+        // property was resolved above, by the reference's declared type.
+        let static_class: Option<String> = if member_static {
+            None
+        } else if handle != 0 && handle < self.heap.len() {
             self.heap[handle].as_ref().map(|i| i.class_name.clone())
         } else if let ExprKind::Ident(h) = &expr.kind {
             let n = self.resolve_hier_name(h);
@@ -72145,6 +72240,43 @@ impl Simulator {
                         }
                     }
                 }
+                // §8.9: a static property through a handle, null or not,
+                // names the shared cell of the handle's declared class.
+                if hier.path.len() == 2
+                    && hier.path[1].selects.is_empty()
+                    && !self.module.classes.is_empty()
+                    && self
+                        .class_member_names()
+                        .statics
+                        .contains(hier.path[1].name.name.as_str())
+                {
+                    let mut head = hier.path[0].clone();
+                    head.selects.clear();
+                    let head_id = HierarchicalIdentifier {
+                        root: hier.root.clone(),
+                        path: vec![head],
+                        span: hier.span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    };
+                    let resolved = self.resolve_hier_name(&head_id).into_owned();
+                    let obj = &hier.path[0].name.name;
+                    let h = if hier.path[0].selects.is_empty() {
+                        self.eval_ident_handle(obj)
+                            .filter(|&h| h != 0 && h < self.heap.len())
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if let Some(v) = self.static_read_via_handle(
+                        h,
+                        Some(obj),
+                        Some(&resolved),
+                        &hier.path[1].name.name,
+                    ) {
+                        return v;
+                    }
+                }
                 if hier.path.len() == 2 {
                     // A variable holding a live object shadows any signal or
                     // instance of the same name: `core.n` with a local `core`
@@ -72222,9 +72354,14 @@ impl Simulator {
                     if let Some(mut h) = head_handle {
                         let mut ok = h != 0;
                         let last = hier.path.len() - 1;
-                        for seg in &hier.path[1..last] {
+                        // (owner, property) when the final hop holds null.
+                        let mut null_in: Option<(usize, &str)> = None;
+                        for (k, seg) in hier.path[1..last].iter().enumerate() {
                             if !ok {
                                 break;
+                            }
+                            if k == last - 2 {
+                                null_in = Some((h, seg.name.name.as_str()));
                             }
                             match self
                                 .heap
@@ -72245,7 +72382,31 @@ impl Simulator {
                                 _ => ok = false,
                             }
                         }
+                        if !ok {
+                            // §8.9: a static through a null property is the
+                            // property's declared class's shared cell.
+                            if let Some((owner, prop)) = null_in {
+                                let m = &hier.path[last].name.name;
+                                if let Some((cn, spec)) =
+                                    self.null_property_static_target(owner, prop, m)
+                                {
+                                    if let Some(v) = self.static_read_in(&cn, spec, m) {
+                                        return v;
+                                    }
+                                }
+                            }
+                        }
                         if ok {
+                            // §8.9: a static at the end of the chain is the
+                            // class's shared cell.
+                            if let Some(v) = self.static_read_via_handle(
+                                h,
+                                None,
+                                None,
+                                &hier.path[last].name.name,
+                            ) {
+                                return v;
+                            }
                             if let Some(v) =
                                 self.heap.get(h).and_then(|o| o.as_ref()).and_then(|inst| {
                                     inst.properties.get(&hier.path[last].name.name)
@@ -72914,7 +73075,15 @@ impl Simulator {
                                 break;
                             }
                             let member_name = &hier.path[i].name.name;
-                            if let Some(mval) = self.read_member_value(h, member_name) {
+                            // §8.9: a static property is the class's shared
+                            // cell, never the object's own storage.
+                            let via = (i == 1).then_some(obj_name.as_str());
+                            let mval = match self.static_read_via_handle(h, via, None, member_name)
+                            {
+                                Some(v) => Some(v),
+                                None => self.read_member_value(h, member_name),
+                            };
+                            if let Some(mval) = mval {
                                 if i == hier.path.len() - 1 {
                                     return mval;
                                 }
@@ -80102,11 +80271,20 @@ impl Simulator {
         lifetime: &Option<crate::ast::types::Lifetime>,
         declarators: &[VarDeclarator],
     ) {
-        let w0 = super::elaborate::resolve_type_width(
-            data_type,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        );
+        // §6.20.2 / §8.25: a local typed by a TYPE PARAMETER of the method's
+        // class (`T tmp;`) has the type bound in this specialization.
+        let tp_concrete = self.local_type_param_concrete(data_type);
+        let tp_width = tp_concrete
+            .as_deref()
+            .and_then(|c| self.concrete_type_width(c));
+        let w0 = match tp_width {
+            Some(w) => w,
+            None => super::elaborate::resolve_type_width(
+                data_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            ),
+        };
         // A class-handle-typed variable holds a 32-bit handle, not
         // the class's content layout (which `resolve_type_width`
         // may report as 0 for a class with only methods/statics).
@@ -80125,7 +80303,13 @@ impl Simulator {
         // whole register write). A class handle defaults to null either
         // way.
         let two_state = !plain_class
-            && super::elaborate::is_type_two_state_resolved(data_type, &self.module.typedef_types);
+            && match tp_concrete.as_deref().filter(|_| tp_width.is_some()) {
+                Some(c) => self.concrete_type_two_state(c),
+                None => super::elaborate::is_type_two_state_resolved(
+                    data_type,
+                    &self.module.typedef_types,
+                ),
+            };
         // LRM §8.4: an uninitialized class handle defaults to
         // `null`. Treat class-handle types and `chandle` as
         // two-state-zero so `if (h == null)` works without an
@@ -81004,7 +81188,7 @@ impl Simulator {
                         continue;
                     }
                 }
-               let class_name =
+                let class_name =
                     if let (true, crate::ast::types::DataType::TypeReference { name, .. }) =
                         (plain_class, data_type)
                     {
@@ -81369,7 +81553,7 @@ impl Simulator {
                 } else {
                     self.forget_string_flag(&d.name.name);
                 }
-               // Record a class-typed local's type so a later
+                // Record a class-typed local's type so a later
                 // separate `name = new();` knows what to construct.
                 // Covergroup-typed locals (§19.8) are recorded too:
                 // get_expr_type_name consults this map, and both the
@@ -104460,7 +104644,7 @@ impl Simulator {
                 .insert(prop.to_string(), v);
         };
         let cd = self.module.classes.get(decl_class)?;
-        let dt = cd.property_types.get(prop);
+        let dt = self.class_prop_decl_type(cd, prop);
         let dims = match dt {
             Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
                 dimensions
@@ -104660,7 +104844,7 @@ impl Simulator {
         // `respec_packed_width` answers only for a range that is not constant
         // on its own (its classification, without the instance).
         let respec = self.module.classes.get(cn.as_str()).is_none_or(|c| {
-            let dims = match c.property_types.get(prop) {
+            let dims = match self.class_prop_decl_type(c, prop) {
                 Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
                     dimensions
                 }
@@ -104998,7 +105182,8 @@ impl Simulator {
                         .contains_key(cn.split('#').next().unwrap_or(cn)));
             if cn_is_class {
                 self.record_local_class_type(name, cn);
-                self.var_class_types.insert(name.to_string(), cn.to_string());
+                self.var_class_types
+                    .insert(name.to_string(), cn.to_string());
                 // A typedef'd local (e.g. `table_q_t rq` where
                 // `table_q_t = shared#(Foo[$])`) resolves to
                 // `cn` but hides the type_args inside the
@@ -105006,12 +105191,8 @@ impl Simulator {
                 // `rq = new()` constructs the right
                 // specialization with type_bindings populated
                 // (§8.25 — otherwise `T` stays unbound).
-                if let crate::ast::types::DataType::TypeReference { name: tref, .. } =
-                    data_type
-                {
-                    if let Some((_, Some(ta))) =
-                        self.resolve_typeref_class_with_type_args(tref)
-                    {
+                if let crate::ast::types::DataType::TypeReference { name: tref, .. } = data_type {
+                    if let Some((_, Some(ta))) = self.resolve_typeref_class_with_type_args(tref) {
                         self.var_type_args.insert(name.to_string(), ta);
                     }
                 }
@@ -105034,7 +105215,8 @@ impl Simulator {
                 // `new()` could not resolve CB, and the return
                 // value came back null to the caller.
                 self.record_local_class_type(name, cn);
-                self.var_class_types.insert(name.to_string(), cn.to_string());
+                self.var_class_types
+                    .insert(name.to_string(), cn.to_string());
             }
         }
         // Record a parameterized local's declared `#(...)` type
@@ -105046,16 +105228,13 @@ impl Simulator {
         // them so the new() populates type_bindings (§8.25).
         // Clear a stale same-named entry when this decl has none.
         let resolved_ta =
-            if let crate::ast::types::DataType::TypeReference { name: tref, .. } =
-                data_type
-            {
+            if let crate::ast::types::DataType::TypeReference { name: tref, .. } = data_type {
                 self.resolve_typeref_class_with_type_args(tref)
                     .and_then(|(_, ta)| ta)
             } else {
                 None
             };
-        if let crate::ast::types::DataType::TypeReference { type_args, .. } = data_type
-        {
+        if let crate::ast::types::DataType::TypeReference { type_args, .. } = data_type {
             if !type_args.is_empty() {
                 self.var_type_args
                     .insert(name.to_string(), type_args.clone());
@@ -105089,10 +105268,8 @@ impl Simulator {
         // matches the interpreter's inline recording in
         // `exec_stmt_var_decl` byte-for-byte (a name the
         // class tables mark as a param/non-class skips it).
-        if let (
-            false,
-            crate::ast::types::DataType::TypeReference { name: tref, .. },
-        ) = (self.plain_class_ref(data_type) == Some(false), data_type)
+        if let (false, crate::ast::types::DataType::TypeReference { name: tref, .. }) =
+            (self.plain_class_ref(data_type) == Some(false), data_type)
         {
             let tn = tref.name.name.clone();
             // A local declared with a class TYPE PARAMETER
@@ -106643,25 +106820,65 @@ impl Simulator {
     /// declared `STRUCT_T st;` looked up the literal name `STRUCT_T` in the
     /// typedef table, missed, and read back x for every field even though the
     /// raw storage was correct.
+    ///
+    /// A parameter of an ANCESTOR (`class d extends comp_base #(byte)`, the
+    /// property declared in `comp_base`) is bound by the `extends` clause, not
+    /// by the object's own bindings, which only name the leaf class's
+    /// parameters: carry it down the chain (`carried_type_binding`). Reading
+    /// the leaf's bindings alone found nothing, so `T data` kept the width of
+    /// `T`'s default type in every derived class (§8.25, §6.20.2).
     fn class_prop_type_name(&self, handle: usize, prop: &str) -> Option<String> {
         let inst = self.heap.get(handle)?.as_ref()?;
-        let mut cur = Some(inst.class_name.clone());
-        let mut seen: HashSet<String> = HashSet::default();
-        while let Some(cn) = cur {
-            if !seen.insert(cn.clone()) {
-                break;
-            }
-            let cd = self.module.classes.get(&cn)?;
+        // The chain walked so far, on the stack: this runs on property
+        // stores, and a heap Vec per call showed up in the UVM A/B.
+        let first = self.module.classes.get(inst.class_name.as_str())?.as_ref();
+        let mut buf: [&super::elaborate::ElaboratedClass; 32] = [first; 32];
+        let mut n = 0usize;
+        let mut cd = first;
+        loop {
+            buf[n] = cd;
+            n += 1;
+            let chain = &buf[..n];
             if let Some(sig) = cd.properties.get(prop) {
                 let tn = sig.type_name.as_ref()?;
                 if cd.type_param_names.iter().any(|t| t == tn) {
+                    let k = chain.len() - 1;
+                    if k > 0 {
+                        if let Some(b) =
+                            Self::carried_type_binding(&inst.type_bindings, chain, k, tn)
+                        {
+                            // A fragment naming a type parameter of the
+                            // object's own class that the object leaves
+                            // unbound stays unresolved, as before.
+                            if inst.type_bindings.get(&b).is_none()
+                                && chain[0].type_param_names.iter().any(|t| *t == b)
+                            {
+                                return None;
+                            }
+                            return Some(b);
+                        }
+                        // `extends comp_base` with the argument left out:
+                        // the parameter's declared default (§6.20.2).
+                        if let Some(b) = inst.type_bindings.get(tn) {
+                            return Some(b.clone());
+                        }
+                        return cd
+                            .type_param_defaults
+                            .iter()
+                            .find(|(n, _)| n == tn)
+                            .map(|(_, d)| d.trim().to_string())
+                            .filter(|d| !d.is_empty() && !cd.type_param_names.contains(d));
+                    }
                     return inst.type_bindings.get(tn).cloned();
                 }
                 return Some(tn.clone());
             }
-            cur = cd.extends.clone();
+            let e = cd.extends.as_deref()?;
+            if n == buf.len() || chain.iter().any(|c| c.name == e) {
+                return None;
+            }
+            cd = self.module.classes.get(e)?.as_ref();
         }
-        None
     }
 
     /// Width to clamp a value to when a property's concrete type is `name`.
@@ -106686,6 +106903,11 @@ impl Simulator {
             return None;
         }
         if let Some(w) = atom_type_keyword_width(name) {
+            return Some(w);
+        }
+        // A vector argument that kept its literal range (`bit[5:0]`, the
+        // form `extends C #(bit [5:0])` records).
+        if let Some(w) = vector_fragment_width(name) {
             return Some(w);
         }
         if let Some(&w) = self.module.typedefs.get(name) {
@@ -109969,7 +110191,11 @@ impl Simulator {
             .copied()
             .unwrap_or((0, 63, 32));
         for (i, item) in elems.iter().enumerate() {
-            let v = self.eval_expr(item);
+            let mut v = self.eval_expr(item);
+            // §5.7.1: an unsized fill element takes the element width.
+            if v.is_fill && !v.is_real {
+                v = v.resize(w.max(1));
+            }
             self.set_signal_value_by_name(&format!("{}[{}]", scoped_q, i), v);
             self.widths.insert(format!("{}[{}]", scoped_q, i), w);
         }
@@ -110174,7 +110400,16 @@ impl Simulator {
                 }
             }
         }
-        let val = self.queue_eval_arg(obj_name, arg);
+        let mut val = self.queue_eval_arg(obj_name, arg);
+        // §5.7.1: an unsized fill (`q.push_back('1)`) takes the element's
+        // width, not one bit.
+        if val.is_fill && !val.is_real {
+            if let Some(&(_, _, w)) = self.module.arrays.get(obj_name) {
+                if w > 0 {
+                    val = val.resize(w);
+                }
+            }
+        }
         self.set_signal_value_by_name(elem, val);
     }
 
@@ -114594,6 +114829,10 @@ impl Simulator {
         self.module
             .classes
             .insert(name.clone(), std::sync::Arc::new(c));
+        // A newly materialized inheritance chain changes compile-time facts
+        // and the design context used by subsequent persistent cache probes.
+        self.compiled_method_admission = None;
+        self.persisted_method_context_hash = None;
         self.spec_clone_origin
             .insert(name.clone(), cname.to_string());
         name
@@ -116236,6 +116475,24 @@ impl Simulator {
                 }
             };
             let init = init_val.unwrap_or_else(|| Value::zero(32));
+            // A static WITHOUT an initializer holds its type's default
+            // (x for 4-state, 0 for 2-state) at the cell's own width —
+            // widening the default-width seed would zero-fill the new bits.
+            let has_init = self.module.classes.get(decl_class).is_some_and(|cd| {
+                cd.property_inits.contains_key(prop) || !cd.properties.contains_key(prop)
+            });
+            let init = match self.static_cell_width(&key, prop) {
+                Some((w, signed)) if !has_init && !init.is_real && w != init.width => {
+                    let mut d = if init.has_xz() {
+                        Value::new(w)
+                    } else {
+                        Value::zero(w)
+                    };
+                    d.is_signed = signed;
+                    d
+                }
+                _ => self.fit_static_cell(&key, prop, init),
+            };
             self.class_statics.insert(key.clone(), init);
         }
         self.class_statics.get(&key).cloned()
@@ -118485,6 +118742,7 @@ impl Simulator {
 
     fn class_static_set(&mut self, start_class: &str, prop: &str, val: Value) -> bool {
         if let Some(key) = self.static_prop_key(start_class, prop) {
+            let val = self.fit_static_cell(&key, prop, val);
             self.class_statics.insert(key, val);
             true
         } else {
@@ -119870,6 +120128,690 @@ impl Simulator {
         None
     }
 
+    /// §8.9: whether `member`, looked up from class `cn` up its chain, is a
+    /// static property. The nearest declaration wins, so an instance
+    /// property of a derived class hides a same-named static of its base.
+    fn member_is_static_prop(&self, cn: &str, member: &str) -> bool {
+        if !self.class_member_names().statics.contains(member) {
+            return false;
+        }
+        let mut cur: Option<&str> = Some(cn);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let Some(cd) = self.module.classes.get(c) else {
+                return false;
+            };
+            if cd.static_properties.contains(member) {
+                return true;
+            }
+            if cd.properties.contains_key(member) || guard > 64 {
+                return false;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    /// The `#(...)` specialization signature of class `class_name` given
+    /// its declared arguments (none: the default specialization), keyed the
+    /// way an object constructed with those arguments keys its statics.
+    /// None for a class without parameters or arguments it cannot spell.
+    fn spec_sig_for_args(
+        &self,
+        class_name: &str,
+        type_args: Option<&[Expression]>,
+    ) -> Option<String> {
+        self.spec_sig_for_args_of(None, class_name, type_args)
+    }
+
+    /// `spec_sig_for_args` for a declaration made in the class of object
+    /// `owner` (see `concrete_spec_frags_of`).
+    fn spec_sig_for_args_of(
+        &self,
+        owner: Option<usize>,
+        class_name: &str,
+        type_args: Option<&[Expression]>,
+    ) -> Option<String> {
+        if !self.class_is_parameterized(class_name) {
+            return None;
+        }
+        let raw_sig = match type_args {
+            Some(ta) if !ta.is_empty() => {
+                // A bare parameter name stays a name here, for
+                // `concrete_spec_frags_of` to bind in its own scope.
+                let params = self.scope_params(owner);
+                let frags: Vec<String> = ta
+                    .iter()
+                    .filter_map(|e| match &e.kind {
+                        ExprKind::Ident(h)
+                            if h.path.len() == 1
+                                && params.iter().any(|(n, _)| *n == h.path[0].name.name) =>
+                        {
+                            Some(h.path[0].name.name.clone())
+                        }
+                        _ => self.expr_to_spec_fragment(e),
+                    })
+                    .collect();
+                if frags.len() != ta.len() {
+                    return None;
+                }
+                self.concrete_spec_frags_of(owner, frags)?.join(",")
+            }
+            _ => String::new(),
+        };
+        let sig = self.canonicalize_spec_sig(class_name, &raw_sig);
+        let effective = if sig.is_empty() {
+            self.module
+                .classes
+                .get(class_name)
+                .map(|cd| {
+                    cd.type_param_defaults
+                        .iter()
+                        .map(|(_, d)| d.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default()
+        } else {
+            sig
+        };
+        (!effective.is_empty()).then_some(effective)
+    }
+
+    /// Record a class-typed formal's declared `#(...)` arguments, as a local
+    /// declaration records its own (§8.25: they name its specialization).
+    fn note_formal_type_args(&mut self, name: &str, type_args: &[Expression]) {
+        if !type_args.is_empty() {
+            self.var_type_args
+                .insert(name.to_string(), type_args.to_vec());
+        } else if !self.var_type_args.is_empty() {
+            self.var_type_args.remove(name);
+        }
+    }
+
+    /// The `#(...)` arguments variable `var` was declared with: a procedural
+    /// local or formal of the running frame, a module-scope variable, or a
+    /// property of `this`.
+    fn declared_type_args(&self, var: &str, resolved: Option<&str>) -> Option<Vec<Expression>> {
+        let in_frame = self.local_stack.last().is_some_and(|f| f.contains_key(var));
+        if in_frame {
+            if let Some(ta) = self.var_type_args.get(var) {
+                return Some(ta.clone());
+            }
+        }
+        if let Some(ta) = self.this_property_type_args(var) {
+            return Some(ta);
+        }
+        if let Some(ta) = resolved.and_then(|r| self.module.class_type_args.get(r)) {
+            return Some(ta.clone());
+        }
+        if let Some(ta) = self.module.class_type_args.get(var) {
+            return Some(ta.clone());
+        }
+        self.var_type_args.get(var).cloned()
+    }
+
+    /// The class variable `var` is declared with, and the specialization
+    /// that declaration names (§8.25), or None for a class without
+    /// parameters. The specialization is spelled `(class, canonical sig)`.
+    fn declared_class_own_spec(
+        &self,
+        var: &str,
+        resolved: Option<&str>,
+    ) -> Option<(String, Option<(String, String)>)> {
+        if let Some((b, spec, _)) = self.this_property_decl(var) {
+            return Some((b, spec));
+        }
+        let c = match self.class_of_var(var).or_else(|| {
+            resolved
+                .filter(|r| *r != var)
+                .and_then(|r| self.class_of_var(r))
+        }) {
+            Some(c) => c,
+            None => {
+                // A variable declared through a typedef of a specialization.
+                let t = self.var_class_types.get(var).cloned().or_else(|| {
+                    self.signal_name_to_id
+                        .get(resolved.unwrap_or(var))
+                        .or_else(|| self.signal_name_to_id.get(var))
+                        .and_then(|id| self.signal_type_names.get(id))
+                        .cloned()
+                })?;
+                let (b, sig) = self.resolve_typedef_spec(&t)?;
+                if !self.module.classes.contains_key(&b) {
+                    return None;
+                }
+                let spec = self
+                    .concrete_spec_sig(&sig)
+                    .map(|s| (b.clone(), self.canonicalize_spec_sig(&b, &s)));
+                return Some((b, spec));
+            }
+        };
+        let (base, args) = Self::strip_class_specialization(&c);
+        if !self.module.classes.contains_key(&base) {
+            return None;
+        }
+        let sig = match args {
+            Some(a) => self
+                .concrete_spec_sig(&a)
+                .map(|a| self.canonicalize_spec_sig(&base, &a)),
+            None => {
+                let ta = self.declared_type_args(var, resolved);
+                self.spec_sig_for_args(&base, ta.as_deref())
+            }
+        };
+        let spec = sig.map(|s| (base.clone(), s));
+        Some((base, spec))
+    }
+
+    /// A declared specialization's argument fragments with every parameter
+    /// of the running class context (`this_type`, `C#(T)` inside `C`)
+    /// replaced by its binding there. None when one cannot be resolved: the
+    /// spelling then names no concrete specialization.
+    fn concrete_spec_frags(&self, frags: Vec<String>) -> Option<Vec<String>> {
+        self.concrete_spec_frags_of(None, frags)
+    }
+
+    /// `concrete_spec_frags` for a declaration made in the class of object
+    /// `owner` (a property's type): its parameters resolve through that
+    /// object's bindings, or the running context's when it is `this`.
+    fn concrete_spec_frags_of(
+        &self,
+        owner: Option<usize>,
+        frags: Vec<String>,
+    ) -> Option<Vec<String>> {
+        let this_h = self.this_stack.last().copied().flatten();
+        let foreign = owner.filter(|o| Some(*o) != this_h);
+        let params = self.scope_params(owner);
+        frags
+            .into_iter()
+            .map(|f| {
+                let t = f.trim();
+                match params.iter().find(|(n, _)| *n == t) {
+                    Some((_, true)) => match foreign {
+                        Some(o) => self
+                            .heap
+                            .get(o)
+                            .and_then(|i| i.as_ref())
+                            .and_then(|i| i.type_bindings.get(t).cloned()),
+                        None => self.resolve_type_param_binding(t),
+                    },
+                    Some((_, false)) => {
+                        // A value parameter: the object's own value, held
+                        // as a property of it.
+                        let o = foreign.or(this_h)?;
+                        let v = self.heap.get(o)?.as_ref()?.properties.get(t)?;
+                        (!v.is_real && v.to_u64().is_some())
+                            .then(|| v.to_u64().unwrap().to_string())
+                    }
+                    None => Some(f),
+                }
+            })
+            .collect()
+    }
+
+    /// The parameters (name, is-type) in scope of a declaration made in the
+    /// class of object `owner`, or in the running class context.
+    fn scope_params(&self, owner: Option<usize>) -> Vec<(String, bool)> {
+        let this_h = self.this_stack.last().copied().flatten();
+        let scope: Option<String> = match owner.filter(|o| Some(*o) != this_h) {
+            Some(o) => self
+                .heap
+                .get(o)
+                .and_then(|i| i.as_ref())
+                .map(|i| i.class_name.clone()),
+            None => self.class_context_stack.last().cloned().flatten(),
+        };
+        let mut params: Vec<(String, bool)> = Vec::new();
+        let mut cur: Option<&str> = scope.as_deref();
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let Some(cd) = self.module.classes.get(c) else {
+                break;
+            };
+            params.extend(cd.type_param_names.iter().map(|n| (n.clone(), true)));
+            params.extend(cd.param_defaults.iter().map(|(n, _)| (n.clone(), false)));
+            if guard > 64 {
+                break;
+            }
+            cur = cd.extends.as_deref();
+        }
+        params
+    }
+
+    /// `concrete_spec_frags` over a comma-joined signature.
+    fn concrete_spec_sig(&self, sig: &str) -> Option<String> {
+        let frags: Vec<String> = Self::split_spec_args(sig)
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .collect();
+        Some(self.concrete_spec_frags(frags)?.join(","))
+    }
+
+    /// `declared_class_own_spec`, where a class without parameters of its
+    /// own that extends a specialization takes its inherited statics from
+    /// that one: what a static member reached through `var` refers to.
+    fn declared_class_spec(
+        &self,
+        var: &str,
+        resolved: Option<&str>,
+    ) -> Option<(String, Option<(String, String)>)> {
+        let (base, spec) = self.declared_class_own_spec(var, resolved)?;
+        let spec = spec.or_else(|| self.inherited_param_spec(&base));
+        Some((base, spec))
+    }
+
+    /// §8.25: the declared type of a `$cast` destination, spelled
+    /// `Class#(sig)` when the class has parameters, for a variable declared
+    /// anywhere: a local, a formal, a module-scope variable, a class property
+    /// (`obj.p`, `this.p`, bare `p` in a method) or through a typedef. An
+    /// unspecialized declaration names the default specialization, except
+    /// inside the class's own declaration, where it is left unspecialized.
+    /// None when the destination is not a recognized class variable.
+    fn cast_dest_declared_type(&self, dest: &Expression) -> Option<String> {
+        let spelled =
+            |sim: &Self, base: String, spec: Option<(String, String)>, explicit: bool| match spec {
+                Some((_, sig)) if explicit || !sim.inside_class_decl_of(&base) => {
+                    format!("{base}#({sig})")
+                }
+                _ => base,
+            };
+        match &dest.kind {
+            ExprKind::Ident(hh) if hh.path.len() == 1 => {
+                let n = &hh.path[0].name.name;
+                let dt = self.class_of_var(n);
+                // A class without parameters, a type parameter or an
+                // already-specialized spelling keeps the caller's handling.
+                if let Some(c) = &dt {
+                    if c.contains('#')
+                        || !self.module.classes.contains_key(c)
+                        || !self.class_is_parameterized(c)
+                    {
+                        return dt;
+                    }
+                }
+                if let Some((b, spec, explicit)) = self.this_property_decl(n) {
+                    return Some(spelled(self, b, spec, explicit));
+                }
+                let resolved = self.resolve_hier_name(hh);
+                let explicit = self
+                    .declared_type_args(n, Some(resolved.as_ref()))
+                    .is_some()
+                    || dt.is_none();
+                match self.declared_class_own_spec(n, Some(resolved.as_ref())) {
+                    Some((base, spec)) => Some(spelled(self, base, spec, explicit)),
+                    None => dt,
+                }
+            }
+            ExprKind::Ident(hh) if hh.path.len() == 2 && hh.path[0].selects.is_empty() => {
+                let h = self.eval_ident_handle(&hh.path[0].name.name)?;
+                self.cast_dest_property_type(h, &hh.path[1].name.name)
+                    .map(|(b, spec, explicit)| spelled(self, b, spec, explicit))
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                let h = self.eval_handle_expr(base)?;
+                self.cast_dest_property_type(h, &member.name)
+                    .map(|(b, spec, explicit)| spelled(self, b, spec, explicit))
+            }
+            _ => None,
+        }
+    }
+
+    /// The declared class, specialization and whether it was spelled out,
+    /// of property `prop` of the object `handle`.
+    fn cast_dest_property_type(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<(String, Option<(String, String)>, bool)> {
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let mut cur = Some(inst.class_name.as_str());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            let cd = self.module.classes.get(cn)?;
+            if let Some(sig) = cd.properties.get(prop) {
+                let tn = sig.type_name.as_deref()?;
+                // A typedef local to the owner's class (`this_type`) names
+                // the owner's own specialization: bind its arguments there.
+                if let Some(DataType::TypeReference {
+                    name, type_args, ..
+                }) = self.class_local_typedef(&inst.class_name, tn)
+                {
+                    let b = name.name.name.as_str();
+                    if self.module.classes.contains_key(b) {
+                        let spec = self
+                            .spec_sig_for_args_of(Some(handle), b, Some(type_args.as_slice()))
+                            .map(|s| (b.to_string(), s));
+                        return Some((b.to_string(), spec, true));
+                    }
+                }
+                if self.module.classes.contains_key(tn) {
+                    let ta = cd.property_type_args.get(prop);
+                    let spec = self
+                        .spec_sig_for_args_of(Some(handle), tn, ta.map(|v| v.as_slice()))
+                        .map(|s| (tn.to_string(), s));
+                    return Some((tn.to_string(), spec, ta.is_some_and(|v| !v.is_empty())));
+                }
+                let (b, s) = self.resolve_typedef_spec(tn)?;
+                if !self.module.classes.contains_key(&b) {
+                    return None;
+                }
+                let frags: Vec<String> = Self::split_spec_args(&s)
+                    .into_iter()
+                    .map(|a| a.trim().to_string())
+                    .collect();
+                let spec = self
+                    .concrete_spec_frags_of(Some(handle), frags)
+                    .map(|f| (b.clone(), self.canonicalize_spec_sig(&b, &f.join(","))));
+                return Some((b, spec, true));
+            }
+            if guard > 64 {
+                return None;
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
+    /// The target of typedef `tn` declared in class `cn` or an ancestor.
+    fn class_local_typedef(&self, cn: &str, tn: &str) -> Option<&DataType> {
+        let mut cur: Option<&str> = Some(cn);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            let cd = self.module.classes.get(c)?;
+            if let Some(dt) = cd.typedef_targets.get(tn) {
+                return Some(dt);
+            }
+            if guard > 64 {
+                return None;
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
+    /// `cast_dest_property_type` for a bare name inside a method that is a
+    /// property of `this` and not a local or formal of the running frame.
+    fn this_property_decl(&self, var: &str) -> Option<(String, Option<(String, String)>, bool)> {
+        let h = self.this_stack.last().copied().flatten()?;
+        if self.local_stack.last().is_some_and(|f| f.contains_key(var)) {
+            return None;
+        }
+        self.cast_dest_property_type(h, var)
+    }
+
+    /// Whether the running code is inside the declaration of class `base`
+    /// or of a class derived from it, where the bare class name need not
+    /// mean its default specialization.
+    fn inside_class_decl_of(&self, base: &str) -> bool {
+        match self.class_context_stack.last() {
+            Some(Some(ctx)) => self.class_is_a(ctx, base),
+            _ => false,
+        }
+    }
+
+    /// §8.9: the class and specialization whose static `member` an object
+    /// reference names. The reference's declared type decides (`var`, when
+    /// the reference is a variable), so a static is reachable through a null
+    /// handle; a live object of an unrelated recorded type, or an object
+    /// reached through a chain, uses the object's own class. None when
+    /// `member` is not a static property of that class.
+    fn static_member_target(
+        &self,
+        handle: usize,
+        var: Option<&str>,
+        resolved: Option<&str>,
+        member: &str,
+    ) -> Option<(String, Option<(String, String)>)> {
+        if !self.class_member_names().statics.contains(member) {
+            return None;
+        }
+        let live = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .filter(|_| handle != 0);
+        let decl = var.and_then(|v| self.declared_class_spec(v, resolved));
+        let (cn, spec) = match (live, decl) {
+            (Some(inst), Some((dc, dspec))) if self.class_is_a(&inst.class_name, &dc) => {
+                // The object knows its specialization; the declaration's
+                // spelling may still name type parameters (`this_type h;`).
+                let from_obj = match &inst.spec {
+                    Some((b, sig)) if *b == dc => Some((b.clone(), sig.clone())),
+                    Some((b, sig)) => self
+                        .ancestor_spec(b, sig, &dc)
+                        .map(|a| (dc.clone(), self.canonicalize_spec_sig(&dc, &a))),
+                    None => None,
+                };
+                let spec = from_obj.or(dspec);
+                // The object's own entry for the declared class: a class
+                // whose base is a type parameter has one per specialization
+                // (`wrap_c<derived_c>`), each with its own base chain.
+                let entry = self.chain_entry_of(&inst.class_name, &dc).unwrap_or(dc);
+                (entry, spec)
+            }
+            (Some(inst), _) => (inst.class_name.clone(), inst.spec.clone()),
+            (None, Some((dc, spec))) => {
+                // A class whose base is a type parameter: the declared
+                // specialization's own entry carries its base chain.
+                let entry = match &spec {
+                    Some((_, sig)) if self.is_dep_class(&dc) => {
+                        let args: Vec<String> = Self::split_spec_args(sig)
+                            .into_iter()
+                            .map(|a| a.trim().to_string())
+                            .collect();
+                        let e = self.spec_class_name(&dc, &args);
+                        if self.module.classes.contains_key(&e) {
+                            e
+                        } else {
+                            dc
+                        }
+                    }
+                    _ => dc,
+                };
+                (entry, spec)
+            }
+            (None, None) => return None,
+        };
+        self.member_is_static_prop(&cn, member)
+            .then_some((cn, spec))
+    }
+
+    /// The nearest class entry on `start`'s chain made from class `origin`.
+    fn chain_entry_of(&self, start: &str, origin: &str) -> Option<String> {
+        let mut cur: Option<&str> = Some(start);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            if self.class_origin(c) == origin {
+                return Some(c.to_string());
+            }
+            cur = self
+                .module
+                .classes
+                .get(c)
+                .and_then(|cd| cd.extends.as_deref());
+        }
+        None
+    }
+
+    /// §8.9: read static property `member` through an object reference (see
+    /// `static_member_target`).
+    fn static_read_via_handle(
+        &mut self,
+        handle: usize,
+        var: Option<&str>,
+        resolved: Option<&str>,
+        member: &str,
+    ) -> Option<Value> {
+        let (cn, spec) = self.static_member_target(handle, var, resolved, member)?;
+        self.static_read_in(&cn, spec, member)
+    }
+
+    /// Read static `member` of class `cn` in specialization `spec`.
+    fn static_read_in(
+        &mut self,
+        cn: &str,
+        spec: Option<(String, String)>,
+        member: &str,
+    ) -> Option<Value> {
+        let saved = spec.map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+        let v = self.class_static_get(cn, member);
+        if let Some(s) = saved {
+            self.current_spec = s;
+        }
+        v
+    }
+
+    /// §8.9: the class and specialization of the static `member` reached
+    /// through property `prop` of object `owner` when that property holds
+    /// null: the property's declared type decides.
+    fn null_property_static_target(
+        &self,
+        owner: usize,
+        prop: &str,
+        member: &str,
+    ) -> Option<(String, Option<(String, String)>)> {
+        let (b, spec, _) = self.cast_dest_property_type(owner, prop)?;
+        if !self.member_is_static_prop(&b, member) {
+            return None;
+        }
+        let spec = spec.or_else(|| self.inherited_param_spec(&b));
+        Some((b, spec))
+    }
+
+    /// For a handle-chain expression `a.b.p` (either parse shape), the live
+    /// object `a.b` and the property name `p`.
+    fn handle_chain_owner(&self, e: &Expression) -> Option<(usize, String)> {
+        let live = |h: usize| h != 0 && self.heap.get(h).is_some_and(|o| o.is_some());
+        match &e.kind {
+            ExprKind::MemberAccess {
+                expr: owner,
+                member,
+            } => {
+                let o = self.eval_handle_expr(owner).filter(|&h| live(h))?;
+                Some((o, member.name.clone()))
+            }
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let n = h.path.len();
+                let mut o = self.eval_ident_handle(&h.path[0].name.name)?;
+                for seg in &h.path[1..n - 1] {
+                    if !live(o) {
+                        return None;
+                    }
+                    o = self.member_handle(o, &seg.name.name)?;
+                }
+                live(o).then(|| (o, h.path[n - 1].name.name.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// §8.9: `a.b.s = v` / `f.g.s = v` — a static property at the end of a
+    /// chain of handles is the shared cell of the last object's class. A
+    /// single-variable receiver (`h.s`) resolves by its declared type in the
+    /// `assign_value` arm instead. None when `lhs` is not such a write.
+    fn assign_static_through_chain(&mut self, lhs: &Expression, val: &Value) -> Option<bool> {
+        let statics = &self.class_member_names().statics;
+        if statics.is_empty() {
+            return None;
+        }
+        let live = |sim: &Self, h: usize| h != 0 && sim.heap.get(h).is_some_and(|o| o.is_some());
+        // (receiver handle, or the live owner and property holding null)
+        let (h, null_in, member) = match &lhs.kind {
+            ExprKind::MemberAccess { expr: recv, member } => {
+                if !statics.contains(member.name.as_str())
+                    || matches!(&recv.kind, ExprKind::Ident(rh) if rh.path.len() == 1)
+                {
+                    return None;
+                }
+                match self.eval_handle_expr(recv).filter(|&h| live(self, h)) {
+                    Some(h) => (h, None, &member.name),
+                    None => {
+                        let (o, p) = self.handle_chain_owner(recv)?;
+                        (0, Some((o, p)), &member.name)
+                    }
+                }
+            }
+            ExprKind::Ident(hier)
+                if hier.path.len() >= 3 && hier.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let n = hier.path.len();
+                if !statics.contains(hier.path[n - 1].name.name.as_str())
+                    || self.module.classes.contains_key(&hier.path[0].name.name)
+                {
+                    return None;
+                }
+                let mut h = self.eval_ident_handle(&hier.path[0].name.name)?;
+                let mut null_in = None;
+                for (k, seg) in hier.path[1..n - 1].iter().enumerate() {
+                    if !live(self, h) {
+                        return None;
+                    }
+                    let next = self.member_handle(h, &seg.name.name).unwrap_or(0);
+                    if !live(self, next) && k == n - 3 {
+                        null_in = Some((h, seg.name.name.clone()));
+                    }
+                    h = next;
+                }
+                (h, null_in, &hier.path[n - 1].name.name)
+            }
+            _ => return None,
+        };
+        if live(self, h) {
+            return self.static_write_via_handle(h, None, None, member, val.clone());
+        }
+        let (owner, prop) = null_in?;
+        let (cn, spec) = self.null_property_static_target(owner, &prop, member)?;
+        Some(self.static_write_in(&cn, spec, member, val.clone()))
+    }
+
+    /// §8.9: write static property `member` through an object reference
+    /// (see `static_member_target`). None when it is not a static.
+    fn static_write_via_handle(
+        &mut self,
+        handle: usize,
+        var: Option<&str>,
+        resolved: Option<&str>,
+        member: &str,
+        val: Value,
+    ) -> Option<bool> {
+        let (cn, spec) = self.static_member_target(handle, var, resolved, member)?;
+        Some(self.static_write_in(&cn, spec, member, val))
+    }
+
+    /// Write static `member` of class `cn` in specialization `spec`.
+    fn static_write_in(
+        &mut self,
+        cn: &str,
+        spec: Option<(String, String)>,
+        member: &str,
+        val: Value,
+    ) -> bool {
+        let cn = cn.to_string();
+        let mut v = val;
+        if let Some(w) = self.class_prop_width(&cn, member) {
+            if w != v.width && !v.is_real {
+                v = v.resize_for_assign(w);
+            }
+        }
+        let saved = spec.map(|s| std::mem::replace(&mut self.current_spec, Some(s)));
+        let ok = self.class_static_set(&cn, member, v);
+        if let Some(s) = saved {
+            self.current_spec = s;
+        }
+        ok
+    }
+
     /// Read `handle.member` as a VALUE (handle or scalar): instance property
     /// first, then the instance's CLASS static cell. Mirrors `member_handle`
     /// for the value-reading path used by `eval_expr`.
@@ -120236,9 +121178,9 @@ impl Simulator {
         let dest_type = match &dest.kind {
             ExprKind::Ident(hh) if hh.path.len() == 1 => match ovr {
                 Some(c) => Some(c.to_string()),
-                None => self.class_of_var(&hh.path[0].name.name),
+                None => self.cast_dest_declared_type(dest),
             },
-            _ => None,
+            _ => self.cast_dest_declared_type(dest),
         };
         match dest_type {
             Some(dt) => {
@@ -120689,7 +121631,31 @@ impl Simulator {
                 .trim_matches('`')
                 .to_string()
         }
+        // A source class without parameters of its own binds the
+        // destination's type parameters through its extends chain
+        // (`class leaf extends pbase#(7, shortint)`), not on the object.
+        let chain_args: Vec<String> = if self.class_is_parameterized(&src_inst.class_name) {
+            Vec::new()
+        } else {
+            self.static_receiver_spec(&src_inst.class_name, dest_class)
+                .map(|(_, sig)| {
+                    Self::split_spec_args(&self.canonicalize_spec_sig(dest_class, &sig))
+                        .into_iter()
+                        .map(|a| a.trim().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // The base-class type parameter of a class whose base is a type
+        // parameter was checked by entry (`cast_dep_spec_ok`): the source may
+        // reach the destination's specialization at any level of its chain
+        // (`wrap_c#(wrap_c#(d))` is a `wrap_c#(d)`), while its binding of the
+        // name is the outermost one's.
+        let dep_tp = self.dep_type_param(dest_class);
         for (pos, tp) in &type_positions {
+            if dep_tp.as_deref() == Some(tp.as_str()) {
+                continue;
+            }
             let dfrag = match dest_args.get(*pos) {
                 Some(s) => s.trim(),
                 None => continue,
@@ -120697,7 +121663,11 @@ impl Simulator {
             if dfrag.is_empty() {
                 continue;
             }
-            let sval = match src_inst.type_bindings.get(tp) {
+            let sval = match src_inst
+                .type_bindings
+                .get(tp)
+                .or_else(|| chain_args.get(*pos).filter(|a| !a.is_empty()))
+            {
                 Some(v) => v,
                 None => continue,
             };
@@ -122354,8 +123324,7 @@ impl Simulator {
                     && !self.signal_name_to_id.contains_key(name.as_ref())
                     && !self.signals.contains_key(&*name)
                 {
-                    if let Some(v) = self.exec_class_scope_static_call(name.as_ref(), mname, args)
-                    {
+                    if let Some(v) = self.exec_class_scope_static_call(name.as_ref(), mname, args) {
                         return v;
                     }
                 }
@@ -126625,7 +127594,12 @@ impl Simulator {
                 // in the body (e.g. `x /= 2`) is done in the real domain.
                 val = Value::from_f64(val.to_f64());
             }
-            if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+            if let DataType::TypeReference {
+                name: tn,
+                type_args,
+                ..
+            } = &port.data_type
+            {
                 let type_name = tn.name.name.clone();
                 // A class name can also key the typedef WIDTH table, so the
                 // class check must run FIRST — otherwise a class-typed formal
@@ -126635,6 +127609,7 @@ impl Simulator {
                     self.record_local_class_type(&port.name.name, &type_name);
                     self.var_class_types
                         .insert(port.name.name.clone(), type_name);
+                    self.note_formal_type_args(&port.name.name, type_args);
                 } else if self.module.enum_members.contains_key(&type_name)
                     || self.module.typedefs.contains_key(&type_name)
                 {
@@ -126687,11 +127662,22 @@ impl Simulator {
         // VarDecl), instead of leaving a 32-bit value that drops the high
         // bits on subsequent bit-select writes.
         let ret_name = fd.name.name.name.clone();
-        let ret_w = super::elaborate::resolve_type_width(
-            &fd.return_type,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        )
+        // §6.20.2 / §8.25: a method returning a TYPE PARAMETER (`function T
+        // get();`) returns the type bound in this specialization.
+        let ret_tp = self
+            .local_type_param_concrete(&fd.return_type)
+            .and_then(|c| Some((self.concrete_type_width(&c)?, c)));
+        let ret_w = match &ret_tp {
+            Some((w, _)) => *w,
+            None => match self.class_param_sized_width(&fd.return_type) {
+                Some(w) => w,
+                None => super::elaborate::resolve_type_width(
+                    &fd.return_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                ),
+            },
+        }
         .max(1);
         self.widths.insert(ret_name.clone(), ret_w);
         // §6.11.1: the return variable carries the return type's SIGNEDNESS —
@@ -126699,7 +127685,11 @@ impl Simulator {
         // `signed_signals`, so an unregistered signed return type (`function
         // integer f`) silently went unsigned and `f >>>= 3` shifted
         // logically (ivtest cfunc_assign_op_vec asr3).
-        if super::elaborate::is_type_signed(&fd.return_type) {
+        let ret_signed = match &ret_tp {
+            Some((_, c)) => self.concrete_type_signed(c).unwrap_or(false),
+            None => super::elaborate::is_type_signed(&fd.return_type),
+        };
+        if ret_signed {
             self.signed_signals.insert(ret_name.clone());
         } else {
             self.signed_signals.remove(&ret_name);
@@ -126710,7 +127700,10 @@ impl Simulator {
         // 'bx (ivtest br_gh337); seeding zero unconditionally masked that.
         let ret_init = if super::elaborate::is_type_real(&fd.return_type) {
             Value::from_f64(0.0)
-        } else if super::elaborate::is_type_two_state(&fd.return_type) {
+        } else if match &ret_tp {
+            Some((_, c)) => self.concrete_type_two_state(c),
+            None => super::elaborate::is_type_two_state(&fd.return_type),
+        } {
             Value::zero(ret_w)
         } else {
             Value::new(ret_w)
@@ -127661,7 +128654,9 @@ impl Simulator {
             .var_decl_types
             .insert(name.to_string(), dt.clone());
         if let DataType::TypeReference {
-            name: type_name, ..
+            name: type_name,
+            type_args,
+            ..
         } = dt
         {
             let type_name = type_name.name.name.clone();
@@ -127670,6 +128665,7 @@ impl Simulator {
             // typedef maps (`class_of_var` missed them).
             if self.module.classes.contains_key(&type_name) {
                 self.var_class_types.insert(name.to_string(), type_name);
+                self.note_formal_type_args(name, type_args);
             } else if self.module.enum_members.contains_key(&type_name)
                 || self.module.typedefs.contains_key(&type_name)
             {
@@ -131287,6 +132283,7 @@ impl Simulator {
         handle: usize,
         pname: &str,
         init: &Expression,
+        fit: bool,
     ) -> bool {
         // Guard: evaluating a field initializer may itself construct objects.
         // Cap the depth so a pathological self-referential field init can't
@@ -131295,8 +132292,17 @@ impl Simulator {
             return false;
         }
         self.construct_init_depth += 1;
-        let v = self.eval_expr(init);
+        let mut v = self.eval_expr(init);
         self.construct_init_depth -= 1;
+        // An initializer is an assignment to the property (§8.7, §10.7): it
+        // takes the property's width in this specialization, as a store from
+        // a method body does — `bit [W-1:0] pc = W'(5)` is W bits wide.
+        // Only a parameterized chain (`fit`) can need it: elsewhere the
+        // stores were never fitted here and the common UVM handle
+        // initializers stay on the cheap path.
+        if fit && !v.is_real && !pname.contains("::") {
+            v = self.fit_class_prop(handle, pname, &v);
+        }
         if let Some(Some(inst)) = self.heap.get_mut(handle) {
             inst.properties.insert(pname.to_string(), v);
         }
@@ -131671,11 +132677,36 @@ impl Simulator {
                 }
             }
             let mut out: HashMap<String, HashMap<String, Value>> = HashMap::default();
-            for pair in classes_to_init.windows(2) {
+            for (wi, pair) in classes_to_init.windows(2).enumerate() {
                 let (child, parent) = (&pair[0], &pair[1]);
                 if child.extends_type_args.is_empty() {
                     continue;
                 }
+                // The child's own parameter values, against which a bare
+                // name or expression in its `extends B #(N)` resolves: the
+                // leaf's, or — one level further up (`class leaf extends
+                // mid #(8); class mid #(int N) extends base #(N);`) — the
+                // values the hop below bound, else the child's defaults.
+                // Resolving only against the leaf's parameters dropped `N`,
+                // so `base`'s properties kept the default width (§8.25).
+                let child_params: std::borrow::Cow<HashMap<String, Value>> = if wi == 0 {
+                    std::borrow::Cow::Borrowed(&leaf_params)
+                } else {
+                    let mut m = out.get(&child.name).cloned().unwrap_or_default();
+                    for (pname, pdefault) in child.param_defaults.iter() {
+                        if m.contains_key(pname) {
+                            continue;
+                        }
+                        if let Some(v) = pdefault
+                            .as_ref()
+                            .and_then(|e| crate::elaborate::const_eval_i64_with_params(e, Some(&m)))
+                        {
+                            m.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                        }
+                    }
+                    std::borrow::Cow::Owned(m)
+                };
+                let leaf_params: &HashMap<String, Value> = &child_params;
                 let mut binds: HashMap<String, Value> = HashMap::default();
                 for (i, pname) in parent.param_order.iter().enumerate() {
                     if parent.type_param_names.iter().any(|t| t == pname) {
@@ -131865,6 +132896,7 @@ impl Simulator {
         let chain_has_params = classes_to_init.iter().any(|c| !c.param_defaults.is_empty());
         for cdef in classes_to_init.iter().filter(|_| chain_has_params) {
             for (prop, dt) in &cdef.property_types {
+                let dt = self.class_prop_decl_type(cdef, prop).unwrap_or(dt);
                 let dims = match dt {
                     DataType::IntegerVector { dimensions, .. } if !dimensions.is_empty() => {
                         dimensions
@@ -132104,6 +133136,18 @@ impl Simulator {
             }
         }
         self.heap.push(Some(instance));
+        // §8.25 / §6.20.2: the ELEMENT width of a fixed-array or queue member
+        // follows this specialization too (`bit [W-1:0] a[2]`, `T q[$]`).
+        // The per-instance storage registered above used the class table's
+        // default-parameter width; now that the object carries its parameter
+        // and type bindings, re-register any member whose width moved.
+        let chain_is_param = chain_has_params
+            || classes_to_init
+                .iter()
+                .any(|c| !c.type_param_names.is_empty());
+        if chain_is_param {
+            self.respec_member_elem_widths(handle, &classes_to_init);
+        }
         // Per-instance TYPE-PARAM-BOUND collection members
         // (`#(type T=int) data;` instantiated with T bound to a queue/array
         // typedef such as `typedef int a_i[];`). These live only in
@@ -132395,11 +133439,19 @@ impl Simulator {
                         let elems = self.pattern_elems(items, &indices);
                         for (k, e) in elems.into_iter().enumerate() {
                             if let Some(e) = e {
-                                let v = self.eval_expr(e);
-                                self.set_signal_value_by_name(
-                                    &format!("{}[{}]", scoped, indices[k]),
-                                    v,
-                                );
+                                let en = format!("{}[{}]", scoped, indices[k]);
+                                let mut v = self.eval_expr(e);
+                                // Each element is assigned (§10.9.1): it
+                                // takes the element's width — an unsized
+                                // fill `'1` too (§5.7.1).
+                                if !v.is_real && !self.is_string_collection(&scoped) {
+                                    if let Some(&w) = self.widths.get(&en) {
+                                        if w > 0 && w != v.width {
+                                            v = v.resize_for_assign(w);
+                                        }
+                                    }
+                                }
+                                self.set_signal_value_by_name(&en, v);
                             }
                         }
                     }
@@ -132410,12 +133462,32 @@ impl Simulator {
                 // the PROPERTY's declared signedness and width, not the
                 // literal's. `bit [15:0] u = -1;` otherwise stored a signed
                 // value and `c.u > 0` compared as -1 rather than 65535.
+                //
+                // §8.25 / §6.20.2: the width is THIS specialization's —
+                // `bit [W-1:0] pv = '1` in `pbase #(8)` is 8 bits of 1s
+                // (§5.7.1 fills to the target), and `T data = '1` follows the
+                // type `T` is bound to — not the default-parameter width the
+                // class table records.
                 if let Some(sig) = cdef.properties.get(&pname) {
                     if !sig.is_real && !val.is_real {
-                        if sig.width > 0 && val.width != sig.width {
-                            val = val.resize(sig.width);
+                        let w = if chain_is_param {
+                            self.class_prop_width_impl(&cdef.name, Some(handle), &pname)
+                                .unwrap_or(sig.width)
+                        } else {
+                            sig.width
+                        };
+                        if w > 0 && val.width != w {
+                            val = val.resize(w);
                         }
-                        val.is_signed = sig.is_signed;
+                        val.is_signed = if sig
+                            .type_name
+                            .as_ref()
+                            .is_some_and(|t| cdef.type_param_names.contains(t))
+                        {
+                            self.class_prop_signed_of(handle, &pname)
+                        } else {
+                            sig.is_signed
+                        };
                     }
                 }
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
@@ -132441,7 +133513,7 @@ impl Simulator {
                     order.iter().position(|p| p == pname).unwrap_or(usize::MAX)
                 });
                 for (_, init, slot) in &deferred_call_inits {
-                    self.evaluate_call_init_at_construct(handle, slot, init);
+                    self.evaluate_call_init_at_construct(handle, slot, init, chain_is_param);
                 }
             }
             self.class_context_stack.pop();
@@ -132771,7 +133843,10 @@ impl Simulator {
                             let arg_val = self.eval_expr(&args[0]);
                             let fitted = {
                                 let mut v = arg_val;
-                                if let Some(w) = entry.coerce.first().map(|c| c.1) && w > 0 && v.width != w {
+                                if let Some(w) = entry.coerce.first().map(|c| c.1)
+                                    && w > 0
+                                    && v.width != w
+                                {
                                     v = v.resize_for_assign(w);
                                 }
                                 self.fit_class_prop(handle, field.as_ref(), &v)
@@ -137767,7 +138842,9 @@ impl Simulator {
     /// Declared width of `prop` on the object `handle` points at (class chain).
     fn class_prop_width_of(&self, handle: usize, prop: &str) -> Option<u32> {
         let cn = &self.heap.get(handle)?.as_ref()?.class_name;
-        self.class_prop_width(cn, prop)
+        // The object's own specialization (§8.25): a member sized by a class
+        // parameter or typed by a type parameter has THIS object's width.
+        self.class_prop_width_impl(cn, Some(handle), prop)
     }
 
     /// §18.4: re-validate the constraints declared inside every `rand` object
@@ -137848,11 +138925,559 @@ impl Simulator {
                 return false;
             };
             if let Some(sig) = cd.properties.get(prop) {
+                // §6.20.2: a property typed by a TYPE PARAMETER takes the
+                // signedness of the type bound on this object (`byte` for
+                // `comp_base #(byte)`), not of the parameter's default.
+                if sig
+                    .type_name
+                    .as_ref()
+                    .is_some_and(|t| cd.type_param_names.contains(t))
+                {
+                    if let Some(s) = self
+                        .class_prop_type_name(handle, prop)
+                        .and_then(|c| self.concrete_type_signed(&c))
+                    {
+                        return s;
+                    }
+                }
                 return sig.is_signed;
             }
             cur = cd.extends.clone();
         }
         false
+    }
+
+    /// Element width of the fixed-array / queue member `prop` declared by
+    /// `cdef`, in the specialization the object `handle` was built as, when
+    /// that depends on a class parameter: a packed range sized by a value
+    /// parameter, or a type parameter (§8.25, §6.20.2). `None` keeps the
+    /// class table's width.
+    fn spec_member_elem_width(
+        &self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        handle: usize,
+        prop: &str,
+    ) -> Option<u32> {
+        let sig = cdef.properties.get(prop)?;
+        if sig
+            .type_name
+            .as_ref()
+            .is_some_and(|t| cdef.type_param_names.contains(t))
+        {
+            let concrete = self.class_prop_type_name(handle, prop)?;
+            return self.concrete_type_width(&concrete);
+        }
+        self.respec_packed_width(&cdef.name, handle, prop)
+    }
+
+    /// `[i][j]...` suffixes of every element of a fixed N-D shape (empty
+    /// for an oversized one, which construction leaves lazy too).
+    fn nd_index_suffixes(shape: &[(i64, i64)]) -> Vec<String> {
+        let total: i64 = shape.iter().map(|&(lo, hi)| (hi - lo + 1).max(0)).product();
+        if shape.is_empty() || total <= 0 || total > 65536 {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(total as usize);
+        let mut idx: Vec<i64> = shape.iter().map(|d| d.0).collect();
+        loop {
+            let mut sfx = String::new();
+            for v in &idx {
+                sfx.push_str(&format!("[{}]", v));
+            }
+            out.push(sfx);
+            let mut k = shape.len();
+            loop {
+                if k == 0 {
+                    return out;
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] <= shape[k].1 {
+                    break;
+                }
+                idx[k] = shape[k].0;
+            }
+        }
+    }
+
+    /// Re-register the per-instance storage of collection members whose
+    /// element width depends on the object's parameters — see the call in
+    /// `instantiate_class_with_type_args`.
+    fn respec_member_elem_widths(
+        &mut self,
+        handle: usize,
+        chain: &[std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>],
+    ) {
+        for cdef in chain {
+            for (prop, &(lo, hi, width)) in &cdef.array_properties {
+                let Some(w) = self.spec_member_elem_width(cdef, handle, prop) else {
+                    continue;
+                };
+                if w == width || w == 0 {
+                    continue;
+                }
+                let scoped = format!("{}#{}", handle, prop);
+                self.module.arrays.insert(scoped.clone(), (lo, hi, w));
+                for i in lo..=hi {
+                    let en = format!("{}[{}]", scoped, i);
+                    self.signals.insert(en.clone(), Value::zero(w));
+                    self.widths.insert(en, w);
+                }
+            }
+            for (prop, (shape, width)) in &cdef.array_nd_properties {
+                let Some(w) = self.spec_member_elem_width(cdef, handle, prop) else {
+                    continue;
+                };
+                if w == *width || w == 0 {
+                    continue;
+                }
+                let scoped = format!("{}#{}", handle, prop);
+                if let Some(e) = self.module.arrays_2d.get_mut(&scoped) {
+                    e.2 = w;
+                }
+                if let Some(e) = self.module.arrays_nd.get_mut(&scoped) {
+                    e.1 = w;
+                }
+                for suffix in Self::nd_index_suffixes(shape) {
+                    let en = format!("{}{}", scoped, suffix);
+                    if self.widths.contains_key(&en) {
+                        self.signals.insert(en.clone(), Value::zero(w));
+                        self.widths.insert(en, w);
+                    }
+                }
+            }
+            for (prop, &(width, _)) in &cdef.queue_properties {
+                let Some(w) = self.spec_member_elem_width(cdef, handle, prop) else {
+                    continue;
+                };
+                if w == width || w == 0 {
+                    continue;
+                }
+                let scoped = format!("{}#{}", handle, prop);
+                if let Some(e) = self.module.arrays.get_mut(&scoped) {
+                    e.2 = w;
+                }
+            }
+        }
+    }
+
+    /// Declared width (and signedness) of the static property cell `key`
+    /// (`Decl::prop` or `Decl#<sig>::prop`), in the specialization the key
+    /// names (§8.25: each specialization has its own statics). A packed range
+    /// sized by a value parameter resolves against the signature's arguments;
+    /// a type-parameter type takes the bound type. `None` for a real, string,
+    /// class handle or anything not resolvable, which keeps the value as is.
+    fn static_cell_width(&self, key: &str, prop: &str) -> Option<(u32, bool)> {
+        if let Some(hit) = self.static_cell_width_cache.borrow().get(key) {
+            return *hit;
+        }
+        let out = self.static_cell_width_uncached(key, prop);
+        self.static_cell_width_cache
+            .borrow_mut()
+            .insert(key.to_string(), out);
+        out
+    }
+
+    fn static_cell_width_uncached(&self, key: &str, prop: &str) -> Option<(u32, bool)> {
+        let head = key.rsplit_once("::").map(|(h, _)| h).unwrap_or(key);
+        let (decl, sig) = match head.split_once('#') {
+            Some((d, s)) => (d, Some(s)),
+            None => (head, None),
+        };
+        let cd = self.module.classes.get(decl)?;
+        let ps = cd.properties.get(prop)?;
+        if ps.is_real
+            || cd.string_properties.contains(prop)
+            || ps
+                .type_name
+                .as_ref()
+                .is_some_and(|t| self.module.classes.contains_key(t))
+            || cd.queue_properties.contains_key(prop)
+            || cd.assoc_properties.contains_key(prop)
+            || cd.array_properties.contains_key(prop)
+            || cd.array_nd_properties.contains_key(prop)
+        {
+            return None;
+        }
+        let args: Vec<String> = sig.map(Self::split_spec_args).unwrap_or_default();
+        let arg_of = |name: &str| -> Option<String> {
+            let i = cd.param_order.iter().position(|p| p == name)?;
+            args.get(i)
+                .map(|a| a.trim().to_string())
+                .filter(|a| !a.is_empty())
+        };
+        if let Some(tn) = ps
+            .type_name
+            .as_ref()
+            .filter(|t| cd.type_param_names.contains(t))
+        {
+            let concrete = arg_of(tn).or_else(|| {
+                cd.type_param_defaults
+                    .iter()
+                    .find(|(n, _)| n == tn)
+                    .map(|(_, d)| d.trim().to_string())
+            })?;
+            let w = self.concrete_type_width(&concrete)?;
+            return Some((w, self.concrete_type_signed(&concrete).unwrap_or(false)));
+        }
+        let pdt = self.class_prop_decl_type(cd, prop);
+        let dims = match pdt {
+            Some(DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {
+                dimensions
+            }
+            Some(DataType::Implicit { dimensions, .. }) if !dimensions.is_empty() => dimensions,
+            // Only plain integral declarations are sized here; a typedef,
+            // struct, enum, interface or container handle keeps its value.
+            Some(DataType::IntegerVector { .. } | DataType::IntegerAtom { .. }) => {
+                return Some((ps.width, ps.is_signed)).filter(|(w, _)| *w > 0);
+            }
+            _ => return None,
+        };
+        // Value parameters in declaration order: the signature's argument,
+        // else the default evaluated against the parameters before it.
+        let mut params: HashMap<String, Value> = HashMap::default();
+        for (pname, pdefault) in &cd.param_defaults {
+            let v = match arg_of(pname).and_then(|a| Self::parse_spec_number(&a)) {
+                Some(lit) => {
+                    let e = Expression::new(ExprKind::Number(lit), crate::ast::Span::dummy());
+                    crate::elaborate::const_eval_i64_with_params(&e, None)
+                }
+                None => pdefault
+                    .as_ref()
+                    .and_then(|e| crate::elaborate::const_eval_i64_with_params(e, Some(&params))),
+            };
+            if let Some(v) = v {
+                params.insert(pname.clone(), Value::from_u64(v as u64, 32));
+            }
+        }
+        let all_resolved = dims.iter().all(|d| match d {
+            crate::ast::types::PackedDimension::Range { left, right, .. } => {
+                crate::elaborate::const_eval_i64_with_params(left, Some(&params)).is_some()
+                    && crate::elaborate::const_eval_i64_with_params(right, Some(&params)).is_some()
+            }
+            _ => true,
+        });
+        if !all_resolved {
+            return Some((ps.width, ps.is_signed)).filter(|(w, _)| *w > 0);
+        }
+        let dt = pdt?;
+        let w = crate::elaborate::resolve_type_width(dt, Some(&params), None);
+        Some((w, ps.is_signed)).filter(|(w, _)| *w > 0)
+    }
+
+    /// `v` sized and signed for the static cell `key` (an initializer or a
+    /// store is an assignment to it, §10.7; an unsized fill takes the
+    /// cell's width, §5.7.1).
+    fn fit_static_cell(&self, key: &str, prop: &str, v: Value) -> Value {
+        if v.is_real {
+            return v;
+        }
+        match self.static_cell_width(key, prop) {
+            Some((w, signed)) if w != v.width => {
+                let mut out = v.resize_for_assign(w);
+                out.is_signed = signed;
+                out
+            }
+            _ => v,
+        }
+    }
+
+    /// The concrete type a method LOCAL declared with a bare type-parameter
+    /// name (`T tmp;`) denotes: the binding of the executing method's class
+    /// parameter on `this` — carried down the `extends` chain when the
+    /// method's class is an ancestor bound by `extends C #(byte)` — else the
+    /// active specialization's. `None` for any other type.
+    fn local_type_param_concrete(&self, dt: &DataType) -> Option<String> {
+        let ctx = self.class_context_stack.last()?.as_deref()?;
+        self.type_param_concrete_in(dt, ctx)
+    }
+
+    /// `local_type_param_concrete` for a method of class `ctx`.
+    fn type_param_concrete_in(&self, dt: &DataType, ctx: &str) -> Option<String> {
+        let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+        else {
+            return None;
+        };
+        if !dimensions.is_empty() || !type_args.is_empty() || name.scope.is_some() {
+            return None;
+        }
+        let tn = name.name.name.as_str();
+        // A class or a typedef name (the common case) is no parameter.
+        if !self.class_member_names().params.contains(tn)
+            || self.module.classes.contains_key(tn)
+            || self.module.typedefs.contains_key(tn)
+            || self.module.typedef_types.contains_key(tn)
+        {
+            return None;
+        }
+        // The class declaring `tn` as a type parameter, at or above the
+        // method's class.
+        let mut decl: Option<&str> = None;
+        let mut cur: Option<&str> = Some(ctx);
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            let cd = self.module.classes.get(cn)?;
+            if cd.type_param_names.iter().any(|t| t == tn) {
+                decl = Some(cn);
+                break;
+            }
+            if cd.typedef_names.iter().any(|t| t == tn) {
+                return None;
+            }
+            cur = cd.extends.as_deref();
+        }
+        let decl = decl?;
+        if let Some(h) = self.this_stack.last().copied().flatten() {
+            if let Some(first) = self
+                .heap
+                .get(h)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| Some((i, self.module.classes.get(i.class_name.as_str())?)))
+            {
+                let (inst, first) = (first.0, first.1.as_ref());
+                // On the stack: this runs for every `T`-typed local.
+                let mut buf: [&super::elaborate::ElaboratedClass; 32] = [first; 32];
+                let mut n = 0usize;
+                let mut cur: Option<&super::elaborate::ElaboratedClass> = Some(first);
+                while let Some(cd) = cur {
+                    if n == buf.len() {
+                        break;
+                    }
+                    buf[n] = cd;
+                    n += 1;
+                    let chain = &buf[..n];
+                    if cd.name == decl || self.class_origin(&cd.name) == decl {
+                        let k = n - 1;
+                        if k == 0 {
+                            if let Some(b) = inst.type_bindings.get(tn) {
+                                return Some(b.clone());
+                            }
+                            break;
+                        }
+                        if let Some(b) =
+                            Self::carried_type_binding(&inst.type_bindings, chain, k, tn)
+                        {
+                            if inst.type_bindings.get(&b).is_none()
+                                && chain[0].type_param_names.iter().any(|t| *t == b)
+                            {
+                                return None;
+                            }
+                            return Some(b);
+                        }
+                        break;
+                    }
+                    cur = cd
+                        .extends
+                        .as_deref()
+                        .and_then(|e| self.module.classes.get(e))
+                        .map(|a| a.as_ref());
+                }
+            }
+        }
+        // No object (a static method): the active specialization, else the
+        // one `ctx` binds its ancestor `decl` to (`class e extends
+        // sb #(byte)` calling `e::f()`).
+        self.resolve_type_param_binding(tn).or_else(|| {
+            (ctx != decl)
+                .then(|| self.static_receiver_spec(ctx, decl))
+                .flatten()
+                .and_then(|sp| self.resolve_type_param_with(tn, &Some(sp)))
+        })
+    }
+
+    /// Width of `dt` — a packed range sized by a class VALUE parameter
+    /// (`function bit [W-1:0] f();`) — inside a method of the executing
+    /// class with no object, i.e. a static method (§8.25): the active
+    /// specialization's values, else those the class binds through its
+    /// `extends`, else the declared defaults. `None` for any other type,
+    /// or outside a class.
+    fn class_param_sized_width(&mut self, dt: &DataType) -> Option<u32> {
+        // Outside a class (every RTL function call) there is nothing to do.
+        if !matches!(self.class_context_stack.last(), Some(Some(_))) {
+            return None;
+        }
+        let dims = match dt {
+            DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. }
+                if !dimensions.is_empty() =>
+            {
+                dimensions
+            }
+            _ => return None,
+        };
+        let range_ok = |d: &crate::ast::types::PackedDimension,
+                        p: Option<&HashMap<String, Value>>| match d {
+            crate::ast::types::PackedDimension::Range { left, right, .. } => {
+                crate::elaborate::const_eval_i64_with_params(left, p).is_some()
+                    && crate::elaborate::const_eval_i64_with_params(right, p).is_some()
+            }
+            _ => true,
+        };
+        // A literal range needs nothing here.
+        if dims.iter().all(|d| range_ok(d, None)) {
+            return None;
+        }
+        let ctx = self.class_context_stack.last().cloned().flatten()?;
+        let spec = match &self.current_spec {
+            Some((b, _)) if *b == ctx || self.class_extends(&ctx, b) => self.current_spec.clone(),
+            _ => self.inherited_param_spec(&ctx),
+        };
+        let saved = std::mem::replace(&mut self.current_spec, spec);
+        let from_spec = self.params_with_class_spec();
+        self.current_spec = saved;
+        let mut m = from_spec.unwrap_or_else(|| self.module.parameters.clone());
+        let mut cur = Some(ctx);
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            for (pname, pdefault) in &cd.param_defaults {
+                if m.contains_key(pname) {
+                    continue;
+                }
+                if let Some(v) = pdefault
+                    .as_ref()
+                    .and_then(|e| crate::elaborate::const_eval_i64_with_params(e, Some(&m)))
+                {
+                    m.insert(pname.clone(), Value::from_u64(v as u64, 32));
+                }
+            }
+            cur = cd.extends.clone();
+        }
+        if !dims.iter().all(|d| range_ok(d, Some(&m))) {
+            return None;
+        }
+        Some(crate::elaborate::resolve_type_width(
+            dt,
+            Some(&m),
+            Some(&self.module.typedefs),
+        ))
+        .filter(|w| *w > 0)
+    }
+
+    /// Whether the type named by a type-parameter binding is 2-state.
+    fn concrete_type_two_state(&self, name: &str) -> bool {
+        match name {
+            "byte" | "shortint" | "int" | "longint" | "bit" => return true,
+            "logic" | "reg" | "integer" | "time" => return false,
+            _ => {}
+        }
+        if vector_fragment_width(name).is_some() {
+            return name.starts_with("bit");
+        }
+        self.module.typedef_types.get(name).is_some_and(|dt| {
+            super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
+        })
+    }
+
+    /// The declared type of property `prop` of `cd`, with a CLASS-LOCAL
+    /// typedef followed to its target (`typedef bit [W-1:0] word_t; word_t
+    /// w;`): the target's packed range is what depends on the class
+    /// parameters (§6.18, §8.25). A design-level typedef, or any other type,
+    /// comes back as declared.
+    fn class_prop_decl_type<'a>(
+        &'a self,
+        cd: &'a super::elaborate::ElaboratedClass,
+        prop: &str,
+    ) -> Option<&'a DataType> {
+        let mut dt = cd.property_types.get(prop)?;
+        for _ in 0..8 {
+            let DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                ..
+            } = dt
+            else {
+                break;
+            };
+            if !dimensions.is_empty() || !type_args.is_empty() || name.scope.is_some() {
+                break;
+            }
+            let tn = name.name.name.as_str();
+            let mut hit: Option<&'a DataType> = None;
+            let mut cur: Option<&'a super::elaborate::ElaboratedClass> = Some(cd);
+            let mut guard = 0;
+            while let Some(c) = cur {
+                guard += 1;
+                if guard > 64 {
+                    break;
+                }
+                if let Some(t) = c.typedef_targets.get(tn) {
+                    hit = Some(t);
+                    break;
+                }
+                cur = c
+                    .extends
+                    .as_deref()
+                    .and_then(|e| self.module.classes.get(e))
+                    .map(|a| a.as_ref());
+            }
+            match hit {
+                Some(t) => dt = t,
+                None => break,
+            }
+        }
+        Some(dt)
+    }
+
+    /// Whether `name` is a VALUE parameter (or body localparam) of the class
+    /// whose scope is executing, or of one of its ancestors. A size cast
+    /// `W'(5)` in a class (§6.24.1) names one of these: it lives on the
+    /// object, not in the module parameter table, so the cast passed the
+    /// operand through unsized.
+    fn class_value_param_in_scope(&self, name: &str) -> bool {
+        let Some(Some(ctx)) = self.class_context_stack.last() else {
+            return false;
+        };
+        let mut cur: Option<&str> = Some(ctx.as_str());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if cd.param_defaults.iter().any(|(n, _)| n == name) {
+                return true;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    /// Signedness of the integral type a type parameter is bound to, by
+    /// name: a built-in atom or a typedef. `None` when it cannot be told.
+    fn concrete_type_signed(&self, name: &str) -> Option<bool> {
+        match name {
+            "byte" | "shortint" | "int" | "longint" | "integer" => return Some(true),
+            "bit" | "logic" | "reg" | "time" => return Some(false),
+            _ => {}
+        }
+        if vector_fragment_width(name).is_some() {
+            return Some(name.contains("signed"));
+        }
+        let dt = self.module.typedef_types.get(name)?;
+        let dt = Self::resolve_type_ref(dt, &self.module.typedef_types);
+        Some(super::elaborate::is_type_signed_resolved(
+            &dt,
+            &self.module.typedef_types,
+        ))
     }
 
     /// Set property `name` on `handle` to `val`, returning whether the value
@@ -138060,38 +139685,22 @@ impl Simulator {
         // create a per-instance copy (which then shadowed the static on every
         // later read from THAT instance while every other instance still saw
         // the old value).
-        if let Some(Some(inst)) = self.heap.get(handle) {
-            let cn = inst.class_name.clone();
-            if let Some(cd) = self.module.classes.get(&cn) {
-                // Only genuine `static` members — param_defaults (class
-                // localparams) also satisfy static_prop_key but are constants.
-                let is_static = {
-                    let mut cur = Some(cn.clone());
-                    let mut found = false;
-                    while let Some(c) = cur {
-                        match self.module.classes.get(&c) {
-                            Some(cdef) => {
-                                if cdef.static_properties.contains(name) {
-                                    found = true;
-                                    break;
-                                }
-                                cur = cdef.extends.clone();
-                            }
-                            None => break,
-                        }
-                    }
-                    let _ = cd;
-                    found
-                };
-                if is_static {
-                    if let Some(key) = self.static_prop_key(&cn, name) {
-                        let changed = self.class_statics.get(&key) != Some(&val);
-                        if changed {
-                            self.class_statics.insert(key, val);
-                        }
-                        return changed;
-                    }
+        // Only genuine `static` members — param_defaults (class localparams)
+        // also satisfy static_prop_key but are constants — and only when no
+        // nearer instance property hides it.
+        let static_of = match self.heap.get(handle) {
+            Some(Some(inst)) if self.member_is_static_prop(&inst.class_name, name) => {
+                Some((inst.class_name.clone(), inst.spec.clone()))
+            }
+            _ => None,
+        };
+        if let Some((cn, spec)) = static_of {
+            if let Some(key) = self.static_prop_key_spec(&cn, name, spec.as_ref()) {
+                let changed = self.class_statics.get(&key) != Some(&val);
+                if changed {
+                    self.class_statics.insert(key, val);
                 }
+                return changed;
             }
         }
         if let Some(Some(inst)) = self.heap.get_mut(handle) {
@@ -140973,8 +142582,7 @@ impl Simulator {
         method
     }
 
-
-   fn class_member_names(&self) -> &ClassMemberNames {
+    fn class_member_names(&self) -> &ClassMemberNames {
         self.class_member_names_cell.get_or_init(|| {
             let mut statics: HashSet<String> = HashSet::default();
             let mut vif_props: HashSet<String> = HashSet::default();
@@ -141821,7 +143429,12 @@ impl Simulator {
                     } else if plan.ports[i].signed {
                         val.is_signed = true;
                     }
-                    if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                    if let DataType::TypeReference {
+                        name: tn,
+                        type_args,
+                        ..
+                    } = &port.data_type
+                    {
                         let type_name = tn.name.name.clone();
                         // A plain class is a class here; a forward-declared
                         // one is registered as its typedef. Class check
@@ -141832,6 +143445,7 @@ impl Simulator {
                         let forward_declared = class_ref == Some(true);
                         if !forward_declared && self.module.classes.contains_key(&type_name) {
                             self.record_local_class_type(&port.name.name, &type_name);
+                            self.note_formal_type_args(&port.name.name, type_args);
                             if self.var_class_types.get(port.name.name.as_str()) != Some(&type_name)
                             {
                                 self.meta_note(&port.name.name);
@@ -142245,6 +143859,38 @@ impl Simulator {
                 if method_name == "new" {
                     self.ctor_class_stack.push((handle, cname.clone()));
                 }
+                // A function returning a bare type-parameter name: the
+                // width and signedness of the type bound on this object, for
+                // the return fit below (§6.20.2).
+                let tp_ret_fit: Option<(u32, Option<bool>)> = match &method.kind {
+                    ClassMethodKind::Function(f) => match &f.return_type {
+                        DataType::TypeReference { name, .. }
+                            if self.class_member_names().params.contains(&name.name.name) =>
+                        {
+                            self.type_param_concrete_in(&f.return_type, &cname)
+                                .and_then(|c| {
+                                    Some((
+                                        self.concrete_type_width(&c)?,
+                                        self.concrete_type_signed(&c),
+                                    ))
+                                })
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                // A STATIC call (no object) of a function whose return is
+                // sized by a class parameter: the call's specialization
+                // sizes it, there being no instance to read it from.
+                let static_dyn_w: Option<u32> = match &dyn_ret_type {
+                    Some(rt) if self.heap.get(handle).and_then(|o| o.as_ref()).is_none() => {
+                        self.class_context_stack.push(Some(cname.clone()));
+                        let w = self.class_param_sized_width(rt);
+                        self.class_context_stack.pop();
+                        w
+                    }
+                    _ => None,
+                };
                 self.class_context_stack.push(Some(cname.clone()));
                 self.local_iface_aliases.push(iface_alias_frame);
                 // §13.4: a FUNCTION method may return a collection (queue /
@@ -142304,26 +143950,29 @@ impl Simulator {
                 // (the compiled block reads `this` members and locals from
                 // the same heap / register file the AST path uses). Gated off
                 // by default.
-                if let Some(cval) = compiled_methods_enabled().then(|| {
-                    self.try_run_compiled_method(
-                        handle,
-                        &cname,
-                        method_name,
-                        ports,
-                        body,
-                        fn_ret_name,
-                        ret_is_string,
-                        &method.kind,
-                    )
-                }).flatten() {
+                if let Some(cval) = compiled_methods_enabled()
+                    .then(|| {
+                        self.try_run_compiled_method(
+                            handle,
+                            &cname,
+                            method_name,
+                            ports,
+                            body,
+                            fn_ret_name,
+                            ret_is_string,
+                            &method.kind,
+                        )
+                    })
+                    .flatten()
+                {
                     self.return_value = Some(cval);
                 } else {
-                for stmt in body {
-                    self.exec_statement(stmt);
-                    if self.break_flag || self.return_flag {
-                        break;
+                    for stmt in body {
+                        self.exec_statement(stmt);
+                        if self.break_flag || self.return_flag {
+                            break;
+                        }
                     }
-                }
                 } // end else: AST interpreter path
                 if let Some(prev) = _prev_meth {
                     CUR_METHOD_HASH.store(prev, Ordering::Relaxed);
@@ -142424,11 +144073,27 @@ impl Simulator {
                 // last assignment happened to carry.
                 if let Some(rt) = &dyn_ret_type {
                     if !ret.is_real {
-                        let scope = self.instance_param_scope(handle);
-                        let w = resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs));
+                        let w = match static_dyn_w {
+                            Some(w) => w,
+                            None => {
+                                let scope = self.instance_param_scope(handle);
+                                resolve_type_width(rt, Some(&scope), Some(&self.module.typedefs))
+                            }
+                        };
                         if w > 0 && w != ret.width {
                             ret = ret.resize_for_assign(w);
                         }
+                    }
+                }
+                // §6.20.2 / §8.25: a return typed by a TYPE PARAMETER
+                // (`function T get();`) takes the type bound on this object
+                // — `return '1` is eight 1s for `T = byte`, not one.
+                if let Some((w, sg)) = tp_ret_fit.filter(|_| !ret.is_real) {
+                    if w != ret.width || ret.is_fill {
+                        ret = ret.resize_for_assign(w);
+                    }
+                    if let Some(sg) = sg {
+                        ret.is_signed = sg;
                     }
                 }
                 // §13.4.1: a class method's return takes its DECLARED type,
@@ -142750,7 +144415,9 @@ impl Simulator {
                             }
                         }
                     }
-                    if chain_count == 1 && descendant_decls.get(p.as_str()).copied().unwrap_or(0) == 0 {
+                    if chain_count == 1
+                        && descendant_decls.get(p.as_str()).copied().unwrap_or(0) == 0
+                    {
                         names.insert(p.clone());
                     }
                 }
@@ -142898,17 +144565,20 @@ impl Simulator {
                     ),
                     // Task or pure-virtual prototype: a task has no return
                     // value, disqualify the name outright.
-                    crate::ast::decl::ClassMethodKind::Task(t) => {
-                        (t.name.name.name.clone(), false)
-                    }
+                    crate::ast::decl::ClassMethodKind::Task(t) => (t.name.name.name.clone(), false),
                     crate::ast::decl::ClassMethodKind::PureVirtual(f) => {
                         (f.name.name.name.clone(), false)
                     }
                 };
-                rets.entry(name).and_modify(|v| *v &= is_str).or_insert(is_str);
+                rets.entry(name)
+                    .and_modify(|v| *v &= is_str)
+                    .or_insert(is_str);
             }
         }
-        rets.into_iter().filter(|(_, v)| *v).map(|(k, _)| k).collect()
+        rets.into_iter()
+            .filter(|(_, v)| *v)
+            .map(|(k, _)| k)
+            .collect()
     }
 
     fn class_handle_member_types(&self) -> HashMap<String, HashMap<String, String>> {
@@ -143008,7 +144678,8 @@ impl Simulator {
         if w == 0 {
             return None;
         }
-        let signed = super::elaborate::is_type_signed_resolved(&resolved, &self.module.typedef_types);
+        let signed =
+            super::elaborate::is_type_signed_resolved(&resolved, &self.module.typedef_types);
         Some((w, signed))
     }
 
@@ -143030,7 +144701,11 @@ impl Simulator {
         use crate::ast::stmt::StatementKind as SK;
         let mut out: Vec<&Statement> = Vec::new();
         match &st.kind {
-            SK::If { then_stmt, else_stmt, .. } => {
+            SK::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
                 out.push(then_stmt);
                 if let Some(e) = else_stmt {
                     out.push(e);
@@ -143047,9 +144722,7 @@ impl Simulator {
             | SK::ForeverTail { body, .. }
             | SK::TimingControl { stmt: body, .. }
             | SK::Wait { stmt: body, .. } => out.push(body),
-            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
-                out.extend(stmts.iter())
-            }
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => out.extend(stmts.iter()),
             _ => {}
         }
         out
@@ -143067,14 +144740,22 @@ impl Simulator {
         fn walk(st: &Statement, sim: &Simulator, out: &mut Vec<(String, String)>) {
             use crate::ast::stmt::StatementKind as SK;
             match &st.kind {
-                SK::VarDecl { data_type, declarators, .. } => {
+                SK::VarDecl {
+                    data_type,
+                    declarators,
+                    ..
+                } => {
                     if let Some(cls) = sim.typeref_class_name(data_type) {
                         for d in declarators {
                             out.push((d.name.name.clone(), cls.clone()));
                         }
                     }
                 }
-                SK::If { then_stmt, else_stmt, .. } => {
+                SK::If {
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => {
                     walk(then_stmt, sim, out);
                     if let Some(e) = else_stmt {
                         walk(e, sim, out);
@@ -143372,79 +145053,54 @@ impl Simulator {
         out
     }
 
-    /// class-perf Step 4b: compile and run a class-FUNCTION method body as
-    /// bytecode, all-or-nothing. Returns `None` (fall back to the AST
-    /// interpreter) unless EVERYTHING lowerable: the method is a scalar-
-    /// integral- OR class-handle-returning Function with no ref/output/inout
-    /// formals, no string/collection result, and a body `compile_class_method`
-    /// fully lowers. The block only reads `this` members (heap) plus seeded
-    /// formal/this registers — byte-identical to the AST path by construction.
-    /// Content key for the persistent compiled-method cache: a hash over
-    /// everything the compiled lowering of THIS (class, method, widths)
-    /// depends on that lives outside the cache entry itself:
-    /// - the compiler salt (bumped on any compiler change),
-    /// - the FULL Debug dump of the class chain (each class's members,
-    ///   typedefs, method set, and every other declaration the admission
-    ///   walks read),
-    /// - the method name and the formal/result width vector (the memory
-    ///   cache key),
-    /// - the module-scope typedef aliases that can name a class
-    ///   (scope_static_receivers) and the class/module-signal NAME CLASHES
-    ///   that remove receivers — both tiny sets, included so an unrelated
-    ///   design that agrees where it matters still shares UVM entries.
-    /// A design change that alters any of these hashes to a different key
-    /// and recompiles; hash collisions are astronomically unlikely
-    /// (DefaultHasher, 64-bit) and covered by the suite parity safety net.
+    /// Persistent method keys include the complete elaborated design context,
+    /// the compiler version salt, and the method's resolved width signature.
+    /// The shared context digest is lazy: disk caching pays once per simulator,
+    /// while ordinary in-memory method caching never serializes the design.
     fn persisted_method_key(
-        &self,
+        &mut self,
         cname: &str,
         method_name: &str,
         formal_widths: &[u32],
         result_width: u32,
-    ) -> u64 {
+    ) -> Option<u64> {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         METHOD_CACHE_COMPILER_SALT.hash(&mut h);
-        let mut cur = cname.to_string();
-        let mut depth = 0usize;
-        while let Some(cd) = self.module.classes.get(&cur) {
-            cur.hash(&mut h);
-            format!("{:?}", cd).hash(&mut h);
-            match cd.extends.clone() {
-                Some(parent) => {
-                    depth += 1;
-                    if depth >= 64 {
-                        break;
-                    }
-                    cur = parent;
+        // Methods embed package constants, typedef targets, foreign class
+        // metadata and signal IDs, not just their own class declaration.
+        // Hash the elaborated context once, only when disk caching is used.
+        // Stream serialization into the hasher to avoid a design-sized buffer.
+        let context = if let Some(context) = self.persisted_method_context_hash {
+            context
+        } else {
+            struct HashWriter(std::collections::hash_map::DefaultHasher);
+            impl std::io::Write for HashWriter {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.0.write(bytes);
+                    Ok(bytes.len())
                 }
-                None => break,
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
             }
-        }
+            let mut writer = HashWriter(std::collections::hash_map::DefaultHasher::new());
+            bincode::serialize_into(&mut writer, &self.module).ok()?;
+            let mut signals: Vec<_> = self.signal_name_to_id.iter().collect();
+            signals.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            signals.hash(&mut writer.0);
+            self.signal_widths.hash(&mut writer.0);
+            self.signal_signed.hash(&mut writer.0);
+            let context = writer.0.finish();
+            self.persisted_method_context_hash = Some(context);
+            context
+        };
+        context.hash(&mut h);
+        cname.hash(&mut h);
         method_name.hash(&mut h);
         formal_widths.hash(&mut h);
         result_width.hash(&mut h);
-        let mut aliases: Vec<&str> = self
-            .module
-            .typedef_types
-            .iter()
-            .filter(|(_, t)| {
-                matches!(t, crate::ast::types::DataType::TypeReference { .. })
-            })
-            .map(|(n, _)| n.as_str())
-            .collect();
-        aliases.sort_unstable();
-        aliases.hash(&mut h);
-        let mut clashes: Vec<&str> = self
-            .module
-            .classes
-            .keys()
-            .filter(|n| self.signal_name_to_id.contains_key(n.as_str()))
-            .map(|n| n.as_str())
-            .collect();
-        clashes.sort_unstable();
-        clashes.hash(&mut h);
-        h.finish()
+        Some(h.finish())
     }
 
     /// Disk probe for one method-cache entry. Any error (missing file,
@@ -143459,11 +145115,7 @@ impl Simulator {
     /// Best-effort atomic store (tmp file + rename; the pid suffix keeps
     /// concurrent workers from clobbering each other's tmp files). A failed
     /// write NEVER fails the simulation — the next run just recompiles.
-    fn store_persisted_method(
-        &self,
-        key: u64,
-        outcome: &super::bytecode::PersistedMethodOutcome,
-    ) {
+    fn store_persisted_method(&self, key: u64, outcome: &super::bytecode::PersistedMethodOutcome) {
         let Some(dir) = method_cache_dir() else {
             return;
         };
@@ -143494,11 +145146,14 @@ impl Simulator {
         ret_is_string: bool,
         kind: &crate::ast::decl::ClassMethodKind,
     ) -> Option<Value> {
+        use super::bytecode::BytecodeCompiler;
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::PortDirection;
-        use super::bytecode::BytecodeCompiler;
-        if std::env::var("XEZIM_FALLBACK_SITES").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) && (method_name.contains("m_drop") || method_name.contains("get_schedule")) {
-        }
+        if std::env::var("XEZIM_FALLBACK_SITES")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+            && (method_name.contains("m_drop") || method_name.contains("get_schedule"))
+        {}
         // COLD-PATH FIRST (class-perf P0 + adaptive tiering): the tier
         // counter used to run before the skip cache — every class-function
         // call paid an inline FNV hash + HashMap probe even for the ~90% of
@@ -143640,15 +145295,13 @@ impl Simulator {
             // implicit local so a never-written cell reads back exactly the
             // AST value, and an (illegal-SV) `f = x` write even mirrors
             // last-write-wins.
-            let is_void_result = matches!(
-                &_f.return_type,
-                crate::ast::types::DataType::Void(_)
-            ) || (_f.name.name.name == "new"
-                && matches!(
-                    &_f.return_type,
-                    crate::ast::types::DataType::Implicit { dimensions, .. }
-                        if dimensions.is_empty()
-                ));
+            let is_void_result = matches!(&_f.return_type, crate::ast::types::DataType::Void(_))
+                || (_f.name.name.name == "new"
+                    && matches!(
+                        &_f.return_type,
+                        crate::ast::types::DataType::Implicit { dimensions, .. }
+                            if dimensions.is_empty()
+                    ));
             // Determine the return "kind". Either a SCALAR-INTEGRAL result (the
             // original pilot surface), a CLASS-HANDLE result (a TypeReference
             // naming a class: the value is a heap index passed through untouched),
@@ -143738,11 +145391,7 @@ impl Simulator {
                     let keep_source = !matches!(port.data_type, DT::TypeReference { .. })
                         && !matches!(port.data_type, DT::IntegerAtom { .. })
                         && !Self::packed_dims_are_literal(&port.data_type);
-                    if keep_source {
-                        0
-                    } else {
-                        pw
-                    }
+                    if keep_source { 0 } else { pw }
                 };
                 if is_class {
                     class_formals.insert(port.name.name.clone());
@@ -143759,7 +145408,10 @@ impl Simulator {
             let param_able_result = !is_class_result
                 && !is_string_result
                 && !is_void_result
-                && !matches!(&_f.return_type, crate::ast::types::DataType::IntegerAtom { .. })
+                && !matches!(
+                    &_f.return_type,
+                    crate::ast::types::DataType::IntegerAtom { .. }
+                )
                 && !Self::packed_dims_are_literal(&_f.return_type);
             let pre = std::rc::Rc::new(super::bytecode::PreboundCompiledMethod {
                 formal_widths: std::rc::Rc::new(formals.iter().map(|f| f.1).collect()),
@@ -143771,10 +145423,8 @@ impl Simulator {
                 is_void_result,
                 string_formals: std::rc::Rc::new(string_formals),
                 coll_members: std::rc::Rc::new(self.class_coll_member_names(cname)),
-                static_coll_members: std::rc::Rc::new(self
-                    .class_static_coll_member_names(cname)),
-                coll_elem_members: std::rc::Rc::new(self
-                    .class_coll_elem_member_names(cname)),
+                static_coll_members: std::rc::Rc::new(self.class_static_coll_member_names(cname)),
+                coll_elem_members: std::rc::Rc::new(self.class_coll_elem_member_names(cname)),
                 writeback_formals: std::rc::Rc::new(writeback_formals),
                 static_result_width,
                 result_signed,
@@ -143788,11 +145438,7 @@ impl Simulator {
         // returns, else the static width from the plan.
         let result_width = if pre.param_able_result {
             let scope = self.instance_param_scope(handle);
-            let w = resolve_type_width(
-                &pre.return_type,
-                Some(&scope),
-                Some(&self.module.typedefs),
-            );
+            let w = resolve_type_width(&pre.return_type, Some(&scope), Some(&self.module.typedefs));
             if w > 0 { w } else { pre.static_result_width }
         } else {
             pre.static_result_width
@@ -143817,7 +145463,7 @@ impl Simulator {
                 // chain + widths + salt), not the elaboration-local memory
                 // key. A miss falls through to compile-and-store below; a
                 // garbage/corrupt payload is just a miss.
-                let disk_key = method_cache_dir().map(|_| {
+                let disk_key = method_cache_dir().and_then(|_| {
                     self.persisted_method_key(cname, method_name, &pre.formal_widths, result_width)
                 });
                 if let Some(k) = disk_key {
@@ -143840,10 +145486,8 @@ impl Simulator {
                             break 'disk rc;
                         }
                         Some(super::bytecode::PersistedMethodOutcome::Nil) => {
-                            self.compiled_method_block_cache.insert(
-                                key,
-                                super::bytecode::CompiledMethodOutcome::Nil,
-                            );
+                            self.compiled_method_block_cache
+                                .insert(key, super::bytecode::CompiledMethodOutcome::Nil);
                             return None;
                         }
                         None => {} // miss: compile below
@@ -143900,7 +145544,11 @@ impl Simulator {
                 // bare-call targets (first defining class per method name,
                 // exactly the AST fallback's nonvirtual_target_class;
                 // statics keep the virtual dispatch they have today).
-                let class_parent = self.module.classes.get(cname).and_then(|cd| cd.extends.clone());
+                let class_parent = self
+                    .module
+                    .classes
+                    .get(cname)
+                    .and_then(|cd| cd.extends.clone());
                 // Step 9g: static-member admission. Walk the parent chain
                 // collecting `static_properties` (which ALSO contains class
                 // localparams) and `param_defaults` (localparam names). A
@@ -143992,9 +145640,10 @@ impl Simulator {
                     .package_enum_members
                     .iter()
                     .flat_map(|(pkg, members)| {
-                        members.iter().filter(|(_, (_, w))| *w <= 64).map(
-                            move |(m, (v, w))| (format!("{}::{}", pkg, m), (*v, *w)),
-                        )
+                        members
+                            .iter()
+                            .filter(|(_, (_, w))| *w <= 64)
+                            .map(move |(m, (v, w))| (format!("{}::{}", pkg, m), (*v, *w)))
                     })
                     .collect();
                 // class-perf P2: Rc snapshot of the free-function table
@@ -144037,14 +145686,17 @@ impl Simulator {
                             }
                             let cd = sim.module.classes.get(&cn)?;
                             if let Some(dt) = cd.property_types.get(member)
-                                && let crate::ast::types::DataType::TypeReference { name: tn, .. } =
-                                    dt
+                                && let crate::ast::types::DataType::TypeReference {
+                                    name: tn, ..
+                                } = dt
                                 && let Some(dims) =
                                     sim.module.typedef_unpacked_dims.get(&tn.name.name)
-                                && let [crate::ast::types::UnpackedDimension::Associative {
-                                    data_type: Some(key),
-                                    ..
-                                }] = dims.as_slice()
+                                && let [
+                                    crate::ast::types::UnpackedDimension::Associative {
+                                        data_type: Some(key),
+                                        ..
+                                    },
+                                ] = dims.as_slice()
                             {
                                 return sim.typeref_class_name(key);
                             }
@@ -144070,11 +145722,7 @@ impl Simulator {
                                     .get(h.path[0].name.name.as_str())
                                     .cloned()
                                     .or_else(|| {
-                                        member_assoc_key_class(
-                                            sim,
-                                            cname,
-                                            &h.path[0].name.name,
-                                        )
+                                        member_assoc_key_class(sim, cname, &h.path[0].name.name)
                                     });
                                 if let Some(cls) = elem_or_key
                                     && let Some(Some(v)) = vars.first()
@@ -144088,7 +145736,13 @@ impl Simulator {
                         }
                     }
                     for st in body {
-                        walk_foreach(st, member_elem_classes, &mut handle_local_types, self, cname);
+                        walk_foreach(
+                            st,
+                            member_elem_classes,
+                            &mut handle_local_types,
+                            self,
+                            cname,
+                        );
                     }
                 }
                 // class-perf P2: unanimous string-returning method names
@@ -144160,8 +145814,7 @@ impl Simulator {
                         }
                         if let Some(cd) = self.module.classes.get(&cn) {
                             scope_static_receivers.extend(cd.typedef_targets.keys().cloned());
-                            scope_static_receivers
-                                .extend(cd.type_param_names.iter().cloned());
+                            scope_static_receivers.extend(cd.type_param_names.iter().cloned());
                             cur = cd.extends.clone();
                         } else {
                             break;
@@ -144169,18 +145822,43 @@ impl Simulator {
                     }
                 }
                 for (tn, dt) in self.module.typedef_types.iter() {
-                    if matches!(
-                        dt,
-                        crate::ast::types::DataType::TypeReference { .. }
-                    ) {
+                    if matches!(dt, crate::ast::types::DataType::TypeReference { .. }) {
                         scope_static_receivers.insert(tn.clone());
                     }
                 }
                 for nm in shadow_names.iter().chain(bare_members.iter()) {
                     scope_static_receivers.remove(nm);
                 }
-                scope_static_receivers
-                    .retain(|n| !self.signal_name_to_id.contains_key(n.as_str()));
+                scope_static_receivers.retain(|n| !self.signal_name_to_id.contains_key(n.as_str()));
+                let admission = self.compiled_method_admission.clone().unwrap_or_else(|| {
+                    let mut facts = super::bytecode::MethodAdmission::default();
+                    for (class, declaration) in &self.module.classes {
+                        let mut fields = self.class_member_access_safe_names(class);
+                        fields.extend(self.class_string_member_names(class));
+                        facts.instance_fields.insert(class.clone(), fields);
+                        for method in declaration.methods.values() {
+                            use crate::ast::decl::ClassMethodKind as Kind;
+                            let (name, ports) = match &method.kind {
+                                Kind::Function(f) | Kind::Extern(f) | Kind::PureVirtual(f) => {
+                                    (&f.name.name.name, &f.ports)
+                                }
+                                Kind::Task(t) => (&t.name.name.name, &t.ports),
+                            };
+                            for (index, port) in ports.iter().enumerate() {
+                                if port.direction != PortDirection::Input {
+                                    facts
+                                        .writeback_positions
+                                        .entry(name.clone())
+                                        .or_default()
+                                        .insert(index);
+                                }
+                            }
+                        }
+                    }
+                    let facts = std::rc::Rc::new(facts);
+                    self.compiled_method_admission = Some(facts.clone());
+                    facts
+                });
                 let compiled = {
                     let mut compiler = BytecodeCompiler::new(
                         &self.signal_name_to_id,
@@ -144189,48 +145867,47 @@ impl Simulator {
                         &self.module.arrays,
                         &self.widths,
                     );
+                    compiler.method_admission = Some(admission);
                     if std::env::var_os("XEZIM_FALLBACK_SITES").is_some() {
                         compiler.scope_hint = Some(format!("{}.{}", cname, method_name));
                     }
                     let body_refs: Vec<&crate::ast::stmt::Statement> = body.iter().collect();
-                    let compiler_outcome =
-                        compiler
-                            .compile_class_method(
-                                &pre.formals,
-                                &pre.class_formals,
-                                &class_locals,
-                                &method_name_set,
-                                &super_method_set,
-                                &class_parent,
-                                &bare_targets,
-                                &static_members,
-                                &const_names,
-                                &new_type_map,
-                                &scope_static_receivers,
-                                &handle_local_types,
-                                &string_method_names,
-                                &free_fn_table,
-                                &pkg_enum_consts,
-                                cname,
-                                &handle_member_types,
-                                &shadow_names,
-                                &member_safe,
-                                &bare_members,
-                                &member_classes,
-                                &string_members,
-                                &pre.coll_members,
-                                &pre.static_coll_members,
-                                &pre.coll_elem_members,
-                                &pre.string_formals,
-                                &pre.writeback_formals,
-                                Some((
-                                    &pre.fn_ret_name,
-                                    result_width,
-                                    pre.is_class_result,
-                                    pre.is_string_result,
-                                )),
-                                &body_refs,
-                            );
+                    let compiler_outcome = compiler.compile_class_method(
+                        &pre.formals,
+                        &pre.class_formals,
+                        &class_locals,
+                        &method_name_set,
+                        &super_method_set,
+                        &class_parent,
+                        &bare_targets,
+                        &static_members,
+                        &const_names,
+                        &new_type_map,
+                        &scope_static_receivers,
+                        &handle_local_types,
+                        &string_method_names,
+                        &free_fn_table,
+                        &pkg_enum_consts,
+                        cname,
+                        &handle_member_types,
+                        &shadow_names,
+                        &member_safe,
+                        &bare_members,
+                        &member_classes,
+                        &string_members,
+                        &pre.coll_members,
+                        &pre.static_coll_members,
+                        &pre.coll_elem_members,
+                        &pre.string_formals,
+                        &pre.writeback_formals,
+                        Some((
+                            &pre.fn_ret_name,
+                            result_width,
+                            pre.is_class_result,
+                            pre.is_string_result,
+                        )),
+                        &body_refs,
+                    );
                     compiler_outcome
                 };
 
@@ -144246,10 +145923,8 @@ impl Simulator {
                 // package globals, e.g. `set_default`) still compile.
                 let is_static = self.is_static_method(cname, method_name);
                 let Some((block, this_reg, result_reg, _rv_reg)) = compiled else {
-                    self.compiled_method_block_cache.insert(
-                        key,
-                        super::bytecode::CompiledMethodOutcome::Nil,
-                    );
+                    self.compiled_method_block_cache
+                        .insert(key, super::bytecode::CompiledMethodOutcome::Nil);
                     if let Some(k) = disk_key {
                         self.store_persisted_method(
                             k,
@@ -144272,10 +145947,8 @@ impl Simulator {
                     }
                 };
                 if is_static && block.instructions.iter().any(uses_this) {
-                    self.compiled_method_block_cache.insert(
-                        key,
-                        super::bytecode::CompiledMethodOutcome::Nil,
-                    );
+                    self.compiled_method_block_cache
+                        .insert(key, super::bytecode::CompiledMethodOutcome::Nil);
                     if let Some(k) = disk_key {
                         self.store_persisted_method(
                             k,
@@ -144309,7 +145982,10 @@ impl Simulator {
                     result_reg: result_reg?,
                 };
                 let rc = std::rc::Rc::new(entry);
-                self.compiled_method_block_cache.insert(key, super::bytecode::CompiledMethodOutcome::Block(rc.clone()));
+                self.compiled_method_block_cache.insert(
+                    key,
+                    super::bytecode::CompiledMethodOutcome::Block(rc.clone()),
+                );
                 rc
             }
         };
@@ -144324,8 +146000,7 @@ impl Simulator {
             static SEEN: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
                 OnceLock::new();
             let key = format!("{}.{}", cname, method_name);
-            SEEN
-                .get_or_init(Default::default)
+            SEEN.get_or_init(Default::default)
                 .lock()
                 .unwrap()
                 .insert(key.clone())
@@ -144398,11 +146073,7 @@ impl Simulator {
                 let cn = self.derive_var_decl_class_name(data_type);
                 for d in declarators {
                     if d.dimensions.is_empty() {
-                        self.record_var_decl_type_metadata(
-                            data_type,
-                            &d.name.name,
-                            cn.as_deref(),
-                        );
+                        self.record_var_decl_type_metadata(data_type, &d.name.name, cn.as_deref());
                     }
                 }
             }
@@ -144535,12 +146206,7 @@ impl Simulator {
             never(self);
             return None;
         }
-        let key = (
-            cid,
-            mid,
-            pre.formal_widths.clone(),
-            pre.static_result_width,
-        );
+        let key = (cid, mid, pre.formal_widths.clone(), pre.static_result_width);
         let Some(super::bytecode::CompiledMethodOutcome::Block(rc_entry)) =
             self.compiled_method_block_cache.get(&key).cloned()
         else {
@@ -144665,8 +146331,14 @@ impl Simulator {
                 {
                     Some(field.as_ref())
                 }
-                [Insn::LoadClassMember(d, h, field), Insn::Move(rd, s), Insn::Resize(rrd, _)]
-                    if *h == rc_entry.this_reg && *rd == rc_entry.result_reg && *s == *d && *rrd == *rd =>
+                [
+                    Insn::LoadClassMember(d, h, field),
+                    Insn::Move(rd, s),
+                    Insn::Resize(rrd, _),
+                ] if *h == rc_entry.this_reg
+                    && *rd == rc_entry.result_reg
+                    && *s == *d
+                    && *rrd == *rd =>
                 {
                     Some(field.as_ref())
                 }
@@ -144811,7 +146483,10 @@ impl Simulator {
                     };
                     let fitted = {
                         let mut v = src.clone();
-                        if let Some(w) = entry.coerce.first().map(|c| c.1) && w > 0 && v.width != w {
+                        if let Some(w) = entry.coerce.first().map(|c| c.1)
+                            && w > 0
+                            && v.width != w
+                        {
                             v = v.resize_for_assign(w);
                         }
                         self.fit_class_prop(handle, field.as_ref(), &v)
@@ -144970,8 +146645,8 @@ impl Simulator {
     /// callee-binding code (defaults, ref/output write-backs, vif handling)
     /// run unchanged.
     fn value_method_arg_expr(&self, v: &Value) -> Expression {
-        use crate::ast::expr::NumberLiteral;
         use crate::ast::expr::NumberBase;
+        use crate::ast::expr::NumberLiteral;
         if v.is_real {
             return Expression::new(
                 ExprKind::Number(NumberLiteral::Real(v.to_f64())),
@@ -145121,10 +146796,7 @@ impl Simulator {
         }
         for i in 0..n {
             let name = format!("\u{0}vmarg{i}");
-            let picked = self
-                .local_stack
-                .last_mut()
-                .and_then(|fr| fr.remove(&name));
+            let picked = self.local_stack.last_mut().and_then(|fr| fr.remove(&name));
             if let Some(v) = picked {
                 if let Some(slot) = self.vm_regs.get_mut(base + i) {
                     *slot = v;

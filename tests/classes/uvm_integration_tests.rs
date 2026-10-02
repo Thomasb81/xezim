@@ -165,6 +165,7 @@ fn uvm_1800_2_2020_bare_run_phase_completes() {
     bare_run_completes_on("1800.2-2020");
 }
 
+
 /// Full driver/sequencer/monitor/scoreboard bench on UVM 1800.2-2020: the
 /// sequence drives 10 transactions through the sequencer/driver TLM
 /// handshake; the monitor's analysis port fans out to the scoreboard. Pins
@@ -206,6 +207,15 @@ fn uvm_2020_complete_bench_runs_traffic() {
         out.join("\n")
     );
     assert_eq!(sim.time, 100, "test drops its objection at t=100");
+}
+
+/// Phase completion must not depend on interpreted versus compiled methods.
+#[test]
+fn uvm_2020_traffic_is_independent_of_method_policy() {
+    if !super::compiled_method_test_env::policies(&[("0", "0"), ("1", "0"), ("1", "1000")]) {
+        return;
+    }
+    uvm_2020_complete_bench_runs_traffic();
 }
 
 /// UVM 1800.2-2020 `uvm_config_db#(int)`: a value set at the top against

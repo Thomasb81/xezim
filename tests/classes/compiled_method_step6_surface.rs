@@ -30,12 +30,8 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
         .unwrap_or_else(|| panic!("{} is x/z", n))
 }
 
-fn gate_on() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 /// The `uvm_phase::get_schedule` shape: class-typed local seeded from `this`,
@@ -44,7 +40,9 @@ fn gate_on() {
 /// flavor. Reference simulator: `TAG_SCHED pass=2` for this exact topology.
 #[test]
 fn class_local_walk_enum_return_and_chain_calls() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 typedef enum int { PH_NODE = 0, PH_SCHED = 1, PH_DOM = 2 } phase_type_e;
 class phase;
@@ -100,9 +98,21 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "r_hier"), 10, "hier walk from the node reaches the root");
-    assert_eq!(u(&sim, "r_nohier"), 20, "no-walk on a node returns its (non-domain) parent");
-    assert_eq!(u(&sim, "r_from_node"), 10, "walk from the middle schedule reaches the root");
+    assert_eq!(
+        u(&sim, "r_hier"),
+        10,
+        "hier walk from the node reaches the root"
+    );
+    assert_eq!(
+        u(&sim, "r_nohier"),
+        20,
+        "no-walk on a node returns its (non-domain) parent"
+    );
+    assert_eq!(
+        u(&sim, "r_from_node"),
+        10,
+        "walk from the middle schedule reaches the root"
+    );
     assert_eq!(u(&sim, "r_ptype"), 0, "enum return = PH_NODE");
     assert_eq!(u(&sim, "r_null"), 1, "root's parent is null");
 }
@@ -112,7 +122,9 @@ endmodule
 /// the compiled Load/StoreClassMember sequence must agree with the AST path.
 #[test]
 fn chain_store_and_read_through_handle_member() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class node;
   int id;
@@ -147,7 +159,9 @@ endmodule
 /// whole method and the AST interpreter must answer the queue builtin.
 #[test]
 fn queue_member_size_stays_interpreted() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class iq;
   int q[$];

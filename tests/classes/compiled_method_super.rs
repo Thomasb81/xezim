@@ -22,13 +22,8 @@
 //! falling back to the AST interpreter with identical semantics.
 use xezim::simulate;
 
-fn gate_on() {
-    // Safety: tests run in one process; the env var leaks between tests,
-    // but every test in this file asserts gate-ON behavior only.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
@@ -41,7 +36,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 
 #[test]
 fn super_calls_compile_and_chain() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class A;
   string nm;
@@ -136,7 +133,9 @@ endmodule
 /// the baked target; virtual methods keep virtual CallMethod dispatch.
 #[test]
 fn nonvirtual_bare_call_binds_statically() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class base7;
   int log;
@@ -196,7 +195,9 @@ endmodule
 /// fallback must produce the identical result to gate-OFF.
 #[test]
 fn super_unrouted_shape_falls_back() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class P;
   function int f(int v);

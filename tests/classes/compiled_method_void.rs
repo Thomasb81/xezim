@@ -29,12 +29,8 @@
 //! compiled path.
 use xezim::simulate;
 
-fn gate_on() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 /// Subprocess stdout capture — for the `$display`-containing void body
@@ -59,7 +55,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 
 #[test]
 fn void_methods_and_ctors_compile() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class vc;
   int cnt;
@@ -180,7 +178,11 @@ endmodule
     assert_eq!(u(&sim, "m1"), 1, "early-return branch");
     // local_ctl(4): acc = 0+1+2+3 = 6 > 4 -> marks += 4
     assert_eq!(u(&sim, "m2"), 5, "void method locals + while");
-    assert_eq!(u(&sim, "r5"), 9, "derived ctor via super.new (AST fallback)");
+    assert_eq!(
+        u(&sim, "r5"),
+        9,
+        "derived ctor via super.new (AST fallback)"
+    );
     assert_eq!(u(&sim, "r6"), 9, "derived extra store");
     // d_help(1): inherited bump(1) -> 10; early(10) not >10 -> marks|=2
     assert_eq!(u(&sim, "r7"), 10, "inherited bare call");
@@ -194,7 +196,9 @@ endmodule
 /// byte-identical, proving the clean-fallback contract.
 #[test]
 fn void_display_body_falls_back_cleanly() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class vc2;
   int x;

@@ -23,17 +23,6 @@
 //! compiled path.
 use xezim::simulate;
 
-fn gate_on() {
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
-}
-
-fn gate_off() {
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "0") };
-}
-
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
     sim.get_signal(n)
         .or_else(|| sim.get_signal(&format!("top.{}", n)))
@@ -82,26 +71,33 @@ endmodule
 
 #[test]
 fn string_verb_calls_inside_vardecl_for_match_reference() {
-    gate_on();
+    if !super::compiled_method_test_env::eager() {
+        return;
+    }
     let sim = simulate(HOT_SRC, 100).expect("compiled simulation should run");
     // Reference-validated (reference simulator) and byte-identical across gate ON/OFF:
     // TAG a=-1598707712 b=7762830. `a` folded a 16-char UVM body through the
     // *31+k*7 checksum, overflowing a 32-bit int into the reference value
     // (as a u64 signal read that is 2^32 + (-1598707712) = 2696259584); both
     // are pinned exactly as the reference simulator prints.
-    assert_eq!(u(&sim, "a"), 2696259584, "compiled a must equal the reference checksum");
-    assert_eq!(u(&sim, "b"), 7762830, "compiled b must equal the reference checksum");
+    assert_eq!(
+        u(&sim, "a"),
+        2696259584,
+        "compiled a must equal the reference checksum"
+    );
+    assert_eq!(
+        u(&sim, "b"),
+        7762830,
+        "compiled b must equal the reference checksum"
+    );
 }
 
 #[test]
 fn string_verb_for_loop_gate_on_off_byte_identical() {
-    // Gate OFF (AST interpreter) first, in an isolated process, then gate ON.
-    gate_off();
-    let off_a = u(&simulate(HOT_SRC, 100).expect("AST simulation should run"), "a");
-    let off_b = u(&simulate(HOT_SRC, 100).expect("AST simulation should run"), "b");
-    gate_on();
-    let on_a = u(&simulate(HOT_SRC, 100).expect("compiled simulation should run"), "a");
-    let on_b = u(&simulate(HOT_SRC, 100).expect("compiled simulation should run"), "b");
-    assert_eq!(on_a, off_a, "compiled checksum must match AST interpreter (a)");
-    assert_eq!(on_b, off_b, "compiled checksum must match AST interpreter (b)");
+    if !super::compiled_method_test_env::policies(&[("0", "0"), ("1", "0")]) {
+        return;
+    }
+    let sim = simulate(HOT_SRC, 100).expect("simulation should run");
+    assert_eq!(u(&sim, "a"), 2696259584);
+    assert_eq!(u(&sim, "b"), 7762830);
 }

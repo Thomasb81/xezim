@@ -63,7 +63,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "p"), 10, "chained get_child().get_parent() dispatch");
+    assert_eq!(
+        u(&sim, "p"),
+        10,
+        "chained get_child().get_parent() dispatch"
+    );
     assert_eq!(u(&sim, "ia"), 10);
     assert_eq!(u(&sim, "ib"), 20, "the returned handle is b, unchanged");
     assert_eq!(u(&sim, "ic"), 30);
@@ -100,10 +104,22 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "e1"), 0, "base method reads ITS copy (bare key vs shadow key)");
+    assert_eq!(
+        u(&sim, "e1"),
+        0,
+        "base method reads ITS copy (bare key vs shadow key)"
+    );
     assert_eq!(u(&sim, "e2"), 0);
-    assert_eq!(u(&sim, "e3"), 0, "external leaf write must not leak into the base copy");
-    assert_eq!(u(&sim, "e4"), 0, "external write must land on the leaf copy");
+    assert_eq!(
+        u(&sim, "e3"),
+        0,
+        "external leaf write must not leak into the base copy"
+    );
+    assert_eq!(
+        u(&sim, "e4"),
+        0,
+        "external write must land on the leaf copy"
+    );
 }
 
 /// Array members must keep AST semantics even when the enclosing method has

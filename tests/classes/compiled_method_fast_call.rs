@@ -35,7 +35,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 /// caller invocation on, the callee runs through the direct path.
 #[test]
 fn nested_call_result_and_arg_passing() {
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+    if !super::compiled_method_test_env::eager() {
+        return;
+    }
     let src = r#"
 class C;
   function int add3(int a, int b, int c); return a + b + c; endfunction
@@ -61,7 +63,9 @@ endmodule
 /// formals; the fast path must apply the same coercion.
 #[test]
 fn formal_coercion_signed_and_width() {
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+    if !super::compiled_method_test_env::eager() {
+        return;
+    }
     let src = r#"
 class C;
   // byte formal: 8-bit signed - a 32-bit -1 must arrive as -1 (8'hff)
@@ -84,7 +88,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "e0"), 0xFFFF_FFFF, "interpreter route byte coercion");
+    assert_eq!(
+        u(&sim, "e0"),
+        0xFFFF_FFFF,
+        "interpreter route byte coercion"
+    );
     assert_eq!(u(&sim, "e1"), 0xFFFF_FFFF, "direct-path byte coercion");
     assert_eq!(u(&sim, "e2"), 1, "interpreter route signed stamp");
     assert_eq!(u(&sim, "e3"), 1, "direct-path signed stamp");
@@ -94,7 +102,9 @@ endmodule
 /// `wrap(h).inner().id()` chains three compiled frames.
 #[test]
 fn handle_formals_and_chained_handle_results() {
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+    if !super::compiled_method_test_env::eager() {
+        return;
+    }
     let src = r#"
 class node;
   int id;
@@ -119,7 +129,11 @@ module tb;
 endmodule
 "#;
     let sim = simulate(src, 50).expect("simulate failed");
-    assert_eq!(u(&sim, "r0"), 11, "handle arg + handle result + chained call");
+    assert_eq!(
+        u(&sim, "r0"),
+        11,
+        "handle arg + handle result + chained call"
+    );
     assert_eq!(u(&sim, "r1"), 22);
     assert_eq!(u(&sim, "r2"), 11);
 }
@@ -128,7 +142,9 @@ endmodule
 /// instead of the sized-hex constant round-trip.
 #[test]
 fn string_formal_through_direct_path() {
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+    if !super::compiled_method_test_env::eager() {
+        return;
+    }
     let src = r#"
 class C;
   function string dup(string s); return {s, s}; endfunction
@@ -154,7 +170,9 @@ endmodule
 /// member stores still visible).
 #[test]
 fn void_callee_side_effects_visible() {
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+    if !super::compiled_method_test_env::eager() {
+        return;
+    }
     let src = r#"
 class C;
   int acc;
@@ -182,7 +200,9 @@ endmodule
 /// route and bind the default exactly.
 #[test]
 fn default_formal_binds_through_interpreter_route() {
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+    if !super::compiled_method_test_env::eager() {
+        return;
+    }
     let src = r#"
 class C;
   function int f(int a, int b = 40); return a + b; endfunction
@@ -209,7 +229,9 @@ endmodule
 /// register file, mirroring `try_run_compiled_method`).
 #[test]
 fn recursion_through_direct_path() {
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+    if !super::compiled_method_test_env::eager() {
+        return;
+    }
     let src = r#"
 class C;
   function int fib(int n);

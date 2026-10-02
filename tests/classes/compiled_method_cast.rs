@@ -21,12 +21,8 @@
 //! compiled path.
 use xezim::simulate;
 
-fn gate_on() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
@@ -39,7 +35,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 
 #[test]
 fn cast_all_shapes() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class base_c;
   int id;
@@ -212,7 +210,9 @@ endmodule
 /// directly to capture stdout.
 #[test]
 fn cast_stmt_form_failure_prints_error_gate_on() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class base_c;
   int id;

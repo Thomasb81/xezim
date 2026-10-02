@@ -24,12 +24,8 @@
 //! path.
 use xezim::simulate;
 
-fn gate_on() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
@@ -51,7 +47,9 @@ fn s(sim: &xezim::compiler::Simulator, n: &str) -> String {
 /// pass-through to nested calls, defaults.
 #[test]
 fn string_forms_end_to_end() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class C;
   string name;
@@ -107,7 +105,9 @@ endmodule
 /// width coercion cannot fake a pass.
 #[test]
 fn empty_string_actual_round_trips() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class D;
   function string echo(string s);
@@ -139,7 +139,9 @@ endmodule
 /// simulator (validated shape).
 #[test]
 fn string_formal_len_stays_interpreted() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class E;
   function int len_of(string s);

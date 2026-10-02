@@ -14,12 +14,8 @@
 //! plain `cargo test` exercises the compiled path.
 use xezim::simulate;
 
-fn gate_on() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    // Eager tier (0): these tests pin the COMPILED path; the default
-    // tiering threshold would keep cold bodies on the interpreter.
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn s(sim: &xezim::compiler::Simulator, n: &str) -> String {
@@ -33,7 +29,9 @@ fn s(sim: &xezim::compiler::Simulator, n: &str) -> String {
 /// string equality against a member, reads through a handle formal.
 #[test]
 fn string_member_reads_end_to_end() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class base_obj;
   string m_leaf_name;
@@ -102,7 +100,9 @@ endmodule
 /// `m_leaf_name` there.
 #[test]
 fn string_member_read_through_inherited_chain() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class base_obj;
   string m_leaf_name;
@@ -134,7 +134,9 @@ endmodule
 /// string member, so the bytes round-trip).
 #[test]
 fn string_member_written_by_ast_read_by_compiled() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class base_obj;
   string m_leaf_name;

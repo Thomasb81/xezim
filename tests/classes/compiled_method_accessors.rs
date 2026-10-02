@@ -16,9 +16,8 @@
 
 use xezim::simulate;
 
-fn gate_on() {
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
@@ -31,7 +30,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 
 #[test]
 fn fast_accessor_getters_and_setters_roundtrip() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class Box;
   int val;
@@ -63,7 +64,9 @@ endmodule
 
 #[test]
 fn fast_accessor_polymorphism_override_preserved() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class Base;
   int x;

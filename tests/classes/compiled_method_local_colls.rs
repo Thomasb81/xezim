@@ -25,10 +25,8 @@
 //! (row-3b surface) — parity holds by the all-or-nothing contract.
 use xezim::simulate;
 
-fn gate_on() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("XEZIM_COMPILE_METHODS", "1") };
-    unsafe { std::env::set_var("XEZIM_METHOD_TIER", "0") };
+fn gate_on() -> bool {
+    super::compiled_method_test_env::eager()
 }
 
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
@@ -41,7 +39,9 @@ fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
 
 #[test]
 fn local_coll_queues_all_shapes() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     let src = r#"
 class C;
   int mq[$];
@@ -171,7 +171,9 @@ endmodule
 
 #[test]
 fn local_coll_string_elems() {
-    gate_on();
+    if !gate_on() {
+        return;
+    }
     // The STRING-ELEMENT surface: reads/writes of string queue elements
     // and foreach over them, checked through stdout (string values are
     // invisible to `get_signal`).
@@ -209,12 +211,7 @@ endmodule
     };
     let off = run("0");
     let on = run("1");
-    for line in [
-        "s0=alpha s1=beta n=2",
-        "S 0 alpha",
-        "S 1 beta",
-        "s1b=gamma",
-    ] {
+    for line in ["s0=alpha s1=beta n=2", "S 0 alpha", "S 1 beta", "s1b=gamma"] {
         assert!(off.contains(line), "OFF missing {line}:\n{off}");
         assert!(on.contains(line), "ON missing {line}:\n{on}");
     }

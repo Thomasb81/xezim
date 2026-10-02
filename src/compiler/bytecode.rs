@@ -13,6 +13,13 @@ use xezim_core::hasher::{HashMap, HashSet};
 
 const MAX_INLINE_DEPTH: usize = 8;
 
+/// Immutable admission facts shared by all method compiles in one design.
+#[derive(Default)]
+pub(crate) struct MethodAdmission {
+    pub writeback_positions: HashMap<String, HashSet<usize>>,
+    pub instance_fields: HashMap<String, HashSet<String>>,
+}
+
 /// A register in the bytecode VM. Registers hold Values. The compact u16
 /// encoding keeps each instruction at 24 bytes; the allocator uses a wider
 /// counter and falls back before an ID would overflow this representation.
@@ -1156,15 +1163,10 @@ impl Insn {
             // non-offsettable (side effects / interpreter re-entry).
             LoadClassStatic(a, _) => *a += rb,
             LoadProcessLocal(..) | Format(..) | CaseJump(..) | CaseMaskJump(..)
-            | StmtFallback(..) | EvalExprFallback(..)
-            | WaitDelayReg(..) | WaitEdge(..)
-            | CallMethod(..) | CallCollMethod(..)
-            | LoadCollElem(..) | StoreCollElem(..)
-            | CallScopedMethod(..)
-            | StoreClassStatic(..)
-            | ConstructObject(..)
-            | CallStaticScoped(..)
-            | CallFreeFunction(..) => return false,
+            | StmtFallback(..) | EvalExprFallback(..) | WaitDelayReg(..) | WaitEdge(..)
+            | CallMethod(..) | CallCollMethod(..) | LoadCollElem(..) | StoreCollElem(..)
+            | CallScopedMethod(..) | StoreClassStatic(..) | ConstructObject(..)
+            | CallStaticScoped(..) | CallFreeFunction(..) => return false,
         }
         true
     }
@@ -1529,6 +1531,7 @@ pub struct BytecodeCompiler<'a> {
     /// type (plan-provided), for TYPED handle-chain admission on DISPATCH
     /// receivers. See `method_handle_chain_class`.
     handle_member_types: Option<&'a HashMap<String, HashMap<String, String>>>,
+    pub(crate) method_admission: Option<std::rc::Rc<MethodAdmission>>,
     /// Register holding the (implicit) function result cell, so `return` and
     /// `f = ...` writes land where the method-mode prologue reads the result.
     method_result_reg: Option<RegId>,
@@ -1863,6 +1866,7 @@ impl<'a> BytecodeCompiler<'a> {
             scope_static_receivers: HashSet::default(),
             method_class: None,
             handle_member_types: None,
+            method_admission: None,
             method_result_reg: None,
             method_return_val_reg: None,
             method_result_width: None,
@@ -3011,8 +3015,7 @@ impl<'a> BytecodeCompiler<'a> {
                         // register — default null (0), no resize (handles
                         // round-trip untouched), and the name joins
                         // `method_handle_names` so `.member` is a heap access.
-                        if self.class_local_names.contains(&d.name.name)
-                            && d.dimensions.is_empty()
+                        if self.class_local_names.contains(&d.name.name) && d.dimensions.is_empty()
                         {
                             let slot = self.alloc_reg();
                             match &d.init {
@@ -4460,7 +4463,35 @@ impl<'a> BytecodeCompiler<'a> {
     /// runtime's arg-temp drain writes the callee's final value into the
     /// slot and this Move lands it in the local — the same write the AST
     /// path performs on the actual after the epilogue.
-    fn emit_arg_slot_writeback(&mut self, args: &[Expression], arg_start: RegId) {
+    fn emit_arg_slot_writeback(
+        &mut self,
+        args: &[Expression],
+        arg_start: RegId,
+        method: Option<&str>,
+    ) -> Option<()> {
+        // The VM only returns argument slots to bare register-backed locals.
+        // Keep other writable actuals on the AST path, which retains their
+        // lvalue expression for the interpreter's argument binding.
+        if let Some(method) = method {
+            let Some(admission) = self.method_admission.as_ref() else {
+                self.bail("method_writeback_metadata");
+                return None;
+            };
+            if admission
+                .writeback_positions
+                .get(method)
+                .is_some_and(|positions| {
+                    positions.iter().any(|&i| {
+                        args.get(i).is_some_and(|arg| {
+                    !matches!(&arg.kind, ExprKind::Ident(h) if self.local_var_reg_of(h).is_some())
+                })
+                    })
+                })
+            {
+                self.bail("method_writeback_actual");
+                return None;
+            }
+        }
         for (i, a) in args.iter().enumerate() {
             let ExprKind::Ident(h) = &a.kind else {
                 continue;
@@ -4473,6 +4504,19 @@ impl<'a> BytecodeCompiler<'a> {
                 self.emit(Insn::Move(src, slot));
             }
         }
+        Some(())
+    }
+
+    fn method_instance_field_ok(&self, base: &Expression, member: &str) -> bool {
+        let Some(class) = self.method_handle_chain_class(base) else {
+            return false;
+        };
+        self.method_admission.as_ref().is_some_and(|admission| {
+            admission
+                .instance_fields
+                .get(&class)
+                .is_some_and(|fields| fields.contains(member))
+        })
     }
 
     /// class-perf method-mode: when `base` denotes the receiving object
@@ -4495,10 +4539,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// (never statics/arrays/strings). Returns None for anything else; the
     /// caller falls back to `compile_expr(base, 0)` for chains (after the
     /// pure `method_handle_chain_ok` gate).
-    fn method_member_handle_reg(
-        &mut self,
-        base: &crate::ast::expr::Expression,
-    ) -> Option<RegId> {
+    fn method_member_handle_reg(&mut self, base: &crate::ast::expr::Expression) -> Option<RegId> {
         if !self.method_mode {
             return None;
         }
@@ -4514,9 +4555,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // The member must ALSO be class-typed: a bare integral
                 // member is loadable as a VALUE but is not a dispatch
                 // handle (see `member_class_names`).
-                if self.bare_member_names.contains(name)
-                    && self.member_class_names.contains(name)
-                {
+                if self.bare_member_names.contains(name) && self.member_class_names.contains(name) {
                     let this = self.method_this_reg?;
                     let r = self.alloc_reg();
                     self.emit(Insn::LoadClassMember(
@@ -4546,9 +4585,7 @@ impl<'a> BytecodeCompiler<'a> {
         match &expr.kind {
             crate::ast::expr::ExprKind::This => true,
             crate::ast::expr::ExprKind::Ident(h)
-                if h.root.is_none()
-                    && h.path.len() == 1
-                    && h.path[0].selects.is_empty() =>
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
             {
                 let name = h.path[0].name.name.as_str();
                 // Chain roots: (a) a handle local/formal/result cell — always
@@ -4560,7 +4597,10 @@ impl<'a> BytecodeCompiler<'a> {
                     || (self.bare_member_names.contains(name)
                         && self.member_class_names.contains(name))
             }
-            crate::ast::expr::ExprKind::MemberAccess { expr: inner, member } => {
+            crate::ast::expr::ExprKind::MemberAccess {
+                expr: inner,
+                member,
+            } => {
                 let m = member.name.as_str();
                 let loadable =
                     !(self.class_shadow_names.contains(m) && !self.member_safe_names.contains(m));
@@ -4592,9 +4632,7 @@ impl<'a> BytecodeCompiler<'a> {
         match &expr.kind {
             crate::ast::expr::ExprKind::This => self.method_class.clone(),
             crate::ast::expr::ExprKind::Ident(h)
-                if h.root.is_none()
-                    && h.path.len() == 1
-                    && h.path[0].selects.is_empty() =>
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
             {
                 let name = h.path[0].name.name.as_str();
                 // Handle locals/formals/result: a legal single-hop root.
@@ -4622,11 +4660,7 @@ impl<'a> BytecodeCompiler<'a> {
                         return None;
                     }
                     let cls = self.method_class.as_deref()?;
-                    return self
-                        .handle_member_types?
-                        .get(cls)?
-                        .get(name)
-                        .cloned();
+                    return self.handle_member_types?.get(cls)?.get(name).cloned();
                 }
                 None
             }
@@ -4657,7 +4691,10 @@ impl<'a> BytecodeCompiler<'a> {
                 let crate::ast::expr::ExprKind::Ident(h) = &func.kind else {
                     return None;
                 };
-                if h.root.is_some() || h.path.is_empty() || h.path.last().unwrap().selects.is_empty() == false {
+                if h.root.is_some()
+                    || h.path.is_empty()
+                    || h.path.last().unwrap().selects.is_empty() == false
+                {
                     return None;
                 }
                 // Package-qualified spellings (`uvm_pkg::uvm_get_report_object()`)
@@ -4671,7 +4708,10 @@ impl<'a> BytecodeCompiler<'a> {
                 }
                 None
             }
-            crate::ast::expr::ExprKind::MemberAccess { expr: inner, member } => {
+            crate::ast::expr::ExprKind::MemberAccess {
+                expr: inner,
+                member,
+            } => {
                 let cur = self.method_handle_chain_class(inner)?;
                 if cur == UNTYPED {
                     return None;
@@ -4685,10 +4725,7 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     return None;
                 }
-                self.handle_member_types?
-                    .get(&cur)?
-                    .get(mname)
-                    .cloned()
+                self.handle_member_types?.get(&cur)?.get(mname).cloned()
             }
             _ => None,
         }
@@ -4746,8 +4783,15 @@ impl<'a> BytecodeCompiler<'a> {
     ) -> Option<RegId> {
         if !matches!(
             meth,
-            "size" | "num" | "pop_front" | "pop_back" | "exists" | "delete" | "push_back"
-                | "push_front" | "insert"
+            "size"
+                | "num"
+                | "pop_front"
+                | "pop_back"
+                | "exists"
+                | "delete"
+                | "push_back"
+                | "push_front"
+                | "insert"
         ) {
             return None;
         }
@@ -4787,7 +4831,10 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // `obj.coll.meth()` / `this.coll.meth()` — the receiver is the
             // collection `coll` on the object the base evaluates to.
-            crate::ast::expr::ExprKind::MemberAccess { expr: inner, member } => {
+            crate::ast::expr::ExprKind::MemberAccess {
+                expr: inner,
+                member,
+            } => {
                 // `this.coll` / provably class-typed chain only — TYPED
                 // (Step 9e): the base must really evaluate to a handle.
                 if self.method_handle_chain_class(inner).is_none() {
@@ -4844,7 +4891,7 @@ impl<'a> BytecodeCompiler<'a> {
             n,
             bare as u8,
         ));
-        self.emit_arg_slot_writeback(args, arg_start);
+        self.emit_arg_slot_writeback(args, arg_start, None)?;
         Some(dest)
     }
 
@@ -4950,9 +4997,7 @@ impl<'a> BytecodeCompiler<'a> {
         // EXCEPT a whole string-formal Ident (a plain register read; the
         // seeded byte-vector Value is exact, and `assoc_key_str`'s narrowing
         // is identical at runtime — the get_child unlock).
-        if self.touches_string_formal(index)
-            && !self.index_is_whole_string_formal(index)
-        {
+        if self.touches_string_formal(index) && !self.index_is_whole_string_formal(index) {
             return None;
         }
         // Dotted receiver: the handle register must be live BEFORE the
@@ -5018,9 +5063,7 @@ impl<'a> BytecodeCompiler<'a> {
         if matches!(index.kind, crate::ast::expr::ExprKind::Dollar) {
             return false;
         }
-        if self.touches_string_formal(index)
-            && !self.index_is_whole_string_formal(index)
-        {
+        if self.touches_string_formal(index) && !self.index_is_whole_string_formal(index) {
             return false;
         }
         let Some(idx_reg) = self.compile_expr(index, 0) else {
@@ -6111,23 +6154,23 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Binary { left, right, .. } => {
                 self.string_operand_unsafe(left) || self.string_operand_unsafe(right)
             }
-            ExprKind::Conditional { condition, then_expr, else_expr } => {
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 self.string_operand_unsafe(condition)
                     || self.string_operand_unsafe(then_expr)
                     || self.string_operand_unsafe(else_expr)
             }
-            ExprKind::Concatenation(parts) => {
-                parts.iter().any(|p| self.string_operand_unsafe(p))
-            }
+            ExprKind::Concatenation(parts) => parts.iter().any(|p| self.string_operand_unsafe(p)),
             // A CALL is only string-unsafe through its RESULT type — a
             // string FORMAL as an argument flows by value into the callee
             // and the operator sees the (integral) return
             // (`get_report_verbosity_level(sev, id) < verbosity`). A
             // string-returning callee (`get_name()`) in a non-eq operator
             // stays unsafe.
-            ExprKind::Call { .. } | ExprKind::SystemCall { .. } => {
-                self.expr_is_string_static(e)
-            }
+            ExprKind::Call { .. } | ExprKind::SystemCall { .. } => self.expr_is_string_static(e),
             _ => self.touches_string_formal(e),
         }
     }
@@ -6142,7 +6185,9 @@ impl<'a> BytecodeCompiler<'a> {
                 h.root.is_none()
                     && h.path.len() == 1
                     && h.path[0].selects.is_empty()
-                    && self.string_formal_names.contains(h.path[0].name.name.as_str())
+                    && self
+                        .string_formal_names
+                        .contains(h.path[0].name.name.as_str())
             }
             ExprKind::Paren(inner)
             | ExprKind::Unary { operand: inner, .. }
@@ -6152,37 +6197,40 @@ impl<'a> BytecodeCompiler<'a> {
             ExprKind::Binary { left, right, .. } => {
                 self.touches_string_formal(left) || self.touches_string_formal(right)
             }
-            ExprKind::Conditional { condition, then_expr, else_expr } => {
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 self.touches_string_formal(condition)
                     || self.touches_string_formal(then_expr)
                     || self.touches_string_formal(else_expr)
             }
             ExprKind::Concatenation(parts) => parts.iter().any(|p| self.touches_string_formal(p)),
-            ExprKind::AssignmentPattern(items) => items
-                .iter()
-                .any(|p| match p {
-                    crate::ast::expr::AssignmentPatternItem::Ordered(v) => {
-                        self.touches_string_formal(v)
-                    }
-                    crate::ast::expr::AssignmentPatternItem::Named(_, v) => {
-                        self.touches_string_formal(v)
-                    }
-                    crate::ast::expr::AssignmentPatternItem::Typed(_, v) => {
-                        self.touches_string_formal(v)
-                    }
-                    crate::ast::expr::AssignmentPatternItem::Default(v) => {
-                        self.touches_string_formal(v)
-                    }
-                    crate::ast::expr::AssignmentPatternItem::Keyed(k, v) => {
-                        self.touches_string_formal(k) || self.touches_string_formal(v)
-                    }
-                }),
+            ExprKind::AssignmentPattern(items) => items.iter().any(|p| match p {
+                crate::ast::expr::AssignmentPatternItem::Ordered(v) => {
+                    self.touches_string_formal(v)
+                }
+                crate::ast::expr::AssignmentPatternItem::Named(_, v) => {
+                    self.touches_string_formal(v)
+                }
+                crate::ast::expr::AssignmentPatternItem::Typed(_, v) => {
+                    self.touches_string_formal(v)
+                }
+                crate::ast::expr::AssignmentPatternItem::Default(v) => {
+                    self.touches_string_formal(v)
+                }
+                crate::ast::expr::AssignmentPatternItem::Keyed(k, v) => {
+                    self.touches_string_formal(k) || self.touches_string_formal(v)
+                }
+            }),
             ExprKind::Replication { count, exprs } => {
                 self.touches_string_formal(count)
                     || exprs.iter().any(|p| self.touches_string_formal(p))
             }
             ExprKind::Call { func, args } => {
-                self.touches_string_formal(func) || args.iter().any(|a| self.touches_string_formal(a))
+                self.touches_string_formal(func)
+                    || args.iter().any(|a| self.touches_string_formal(a))
             }
             _ => false,
         }
@@ -8021,7 +8069,9 @@ impl<'a> BytecodeCompiler<'a> {
                     && hier.root.is_none()
                     && hier.path.len() == 1
                     && hier.path[0].selects.is_empty()
-                    && self.class_shadow_names.contains(hier.path[0].name.name.as_str())
+                    && self
+                        .class_shadow_names
+                        .contains(hier.path[0].name.name.as_str())
                 {
                     return None;
                 }
@@ -9170,8 +9220,9 @@ impl<'a> BytecodeCompiler<'a> {
                     // resizes/stamps a non-integral (handle) return. The result
                     // width is therefore allowed to be absent when
                     // `method_result_is_class` is set.
-                    let w = if let Some(w) =
-                        self.method_result_reg.and_then(|_| self.method_result_width)
+                    let w = if let Some(w) = self
+                        .method_result_reg
+                        .and_then(|_| self.method_result_width)
                     {
                         w
                     } else if self.method_result_is_class || self.method_result_is_string {
@@ -9247,10 +9298,7 @@ impl<'a> BytecodeCompiler<'a> {
                         if self.method_mode
                             && decl.init.is_none()
                             && decl.dimensions.len() == 1
-                            && matches!(
-                                decl.dimensions[0],
-                                UD::Queue { .. } | UD::Unsized(_)
-                            )
+                            && matches!(decl.dimensions[0], UD::Queue { .. } | UD::Unsized(_))
                         {
                             let synth = Statement::new(
                                 StatementKind::VarDecl {
@@ -9270,8 +9318,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 Arc::from("VarDecl_local_coll"),
                                 Box::new([]),
                             ))));
-                            self.local_coll_names
-                                .insert(decl.name.name.clone());
+                            self.local_coll_names.insert(decl.name.name.clone());
                             continue;
                         }
                         // One constant-bounded unpacked dimension, small: a
@@ -9340,37 +9387,38 @@ impl<'a> BytecodeCompiler<'a> {
                     } else {
                         self.decl_width(data_type)
                     };
-                // Step 6: a CLASS-typed local holds a heap HANDLE in a
-                // register — default null (0), no resize (handles
-                // round-trip untouched), and the name joins
-                // `method_handle_names` so `.member` is a heap access.
-                if self.method_mode && self.class_local_names.contains(&decl.name.name) {
-                    let slot = self.alloc_reg();
-                    match &decl.init {
-                        Some(expr) => {
-                            let Some(value) = self.compile_expr(expr, 0) else {
-                                self.bail("VarDecl_init");
-                                return false;
-                            };
-                            self.emit(Insn::Move(slot, value));
+                    // Step 6: a CLASS-typed local holds a heap HANDLE in a
+                    // register — default null (0), no resize (handles
+                    // round-trip untouched), and the name joins
+                    // `method_handle_names` so `.member` is a heap access.
+                    if self.method_mode && self.class_local_names.contains(&decl.name.name) {
+                        let slot = self.alloc_reg();
+                        match &decl.init {
+                            Some(expr) => {
+                                let Some(value) = self.compile_expr(expr, 0) else {
+                                    self.bail("VarDecl_init");
+                                    return false;
+                                };
+                                self.emit(Insn::Move(slot, value));
+                            }
+                            None => {
+                                self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
+                            }
                         }
-                        None => {
-                            self.emit(Insn::LoadConst(slot, Box::new(Value::zero(32))));
-                        }
+                        self.local_var_regs
+                            .insert(decl.name.name.clone(), (slot, 0));
+                        self.method_handle_names.insert(decl.name.name.clone());
+                        self.decl_local_regs.insert(decl.name.name.clone());
+                        continue;
                     }
-                    self.local_var_regs.insert(decl.name.name.clone(), (slot, 0));
-                    self.method_handle_names.insert(decl.name.name.clone());
-                    self.decl_local_regs.insert(decl.name.name.clone());
-                    continue;
-                }
-                // §6.12: a `real` local holds a real, whatever its
-                // initializer (or its default, 0.0) is.
-                let is_real = crate::compiler::elaborate::is_type_real(data_type);
-                let kind = if is_string {
-                    Some(LocalKind::Str)
-                } else {
-                    self.local_kind_of(data_type, None)
-                };
+                    // §6.12: a `real` local holds a real, whatever its
+                    // initializer (or its default, 0.0) is.
+                    let is_real = crate::compiler::elaborate::is_type_real(data_type);
+                    let kind = if is_string {
+                        Some(LocalKind::Str)
+                    } else {
+                        self.local_kind_of(data_type, None)
+                    };
                     let slot = self.alloc_reg();
                     match kind {
                         Some(k) => {
@@ -9841,7 +9889,10 @@ impl<'a> BytecodeCompiler<'a> {
                                 let one = self.alloc_reg();
                                 self.emit(Insn::LoadConst(
                                     one,
-                                    Box::new(Value::from_u64(1, if width > 0 { width } else { 32 })),
+                                    Box::new(Value::from_u64(
+                                        1,
+                                        if width > 0 { width } else { 32 },
+                                    )),
                                 ));
                                 let result = self.alloc_reg();
                                 self.emit(Insn::Add(result, r, one));
@@ -9896,7 +9947,10 @@ impl<'a> BytecodeCompiler<'a> {
                                 let one = self.alloc_reg();
                                 self.emit(Insn::LoadConst(
                                     one,
-                                    Box::new(Value::from_u64(1, if width > 0 { width } else { 32 })),
+                                    Box::new(Value::from_u64(
+                                        1,
+                                        if width > 0 { width } else { 32 },
+                                    )),
                                 ));
                                 let result = self.alloc_reg();
                                 self.emit(Insn::Sub(result, r, one));
@@ -10818,10 +10872,7 @@ impl<'a> BytecodeCompiler<'a> {
                     && hier.path.len() == 2
                     && hier.path.iter().all(|seg| seg.selects.is_empty())
                 {
-                    let key = format!(
-                        "{}::{}",
-                        hier.path[0].name.name, hier.path[1].name.name
-                    );
+                    let key = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
                     if let Some(&(val, width)) = self.pkg_enum_consts.get(&key) {
                         let r = self.alloc_reg();
                         self.emit(Insn::LoadConst(
@@ -10839,10 +10890,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // members, class statics, enclosing-class members) the
                 // compiled path cannot model, so it bails (AST) rather than
                 // read the wrong (module) storage.
-                if self.method_mode
-                    && hier.root.is_none()
-                    && hier.path.len() == 1
-                {
+                if self.method_mode && hier.root.is_none() && hier.path.len() == 1 {
                     let bare = hier.path[0].name.name.as_str();
                     if !self.local_var_regs.contains_key(bare) {
                         if hier.path[0].selects.is_empty()
@@ -10877,7 +10925,10 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::LoadClassStatic(
                                 dest,
                                 Box::new(NamePair(
-                                    self.method_class.clone().unwrap_or_default().into_boxed_str(),
+                                    self.method_class
+                                        .clone()
+                                        .unwrap_or_default()
+                                        .into_boxed_str(),
                                     bare.to_string().into_boxed_str(),
                                 )),
                             ));
@@ -11441,8 +11492,7 @@ impl<'a> BytecodeCompiler<'a> {
                     && !self.touches_string_formal(expr)
                     && self.index_is_whole_string_formal(index);
                 if !relaxed_formal_index
-                    && (self.touches_string_formal(expr)
-                        || self.touches_string_formal(index))
+                    && (self.touches_string_formal(expr) || self.touches_string_formal(index))
                 {
                     self.bail("string_formal_index");
                     return None;
@@ -12510,6 +12560,10 @@ impl<'a> BytecodeCompiler<'a> {
                         None
                     };
                     if let Some(handle_reg) = base_reg {
+                        if !self.method_instance_field_ok(base, &member.name) {
+                            self.bail("method_receiver_field");
+                            return None;
+                        }
                         // The interpreter's dotted read uses the instance's
                         // runtime key (`properties["m"]`) — the same key
                         // LoadClassMember reads — so an extends-chain INSTANCE
@@ -12532,7 +12586,11 @@ impl<'a> BytecodeCompiler<'a> {
                             return None;
                         }
                         let dest = self.alloc_reg();
-                        self.emit(Insn::LoadClassMember(dest, handle_reg, member.name.clone().into_boxed_str()));
+                        self.emit(Insn::LoadClassMember(
+                            dest,
+                            handle_reg,
+                            member.name.clone().into_boxed_str(),
+                        ));
                         return Some(dest);
                     }
                 }
@@ -12790,7 +12848,7 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
-                        self.emit_arg_slot_writeback(args, arg_start);
+                        self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }
                     self.insns.truncate(call_start);
@@ -12808,8 +12866,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // gate) => falls through to the pre-existing paths unchanged.
                 if self.method_mode
                     && let ExprKind::MemberAccess { expr: base, member } = &func.kind
-                    && let Some(r) =
-                        self.compile_coll_method_call(base, member.name.as_str(), args)
+                    && let Some(r) = self.compile_coll_method_call(base, member.name.as_str(), args)
                 {
                     return Some(r);
                 }
@@ -12868,7 +12925,7 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
-                        self.emit_arg_slot_writeback(args, arg_start);
+                        self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }
                     self.insns.truncate(call_start);
@@ -12900,7 +12957,9 @@ impl<'a> BytecodeCompiler<'a> {
                     && let ExprKind::Ident(h) = &func.kind
                     && h.path.len() == 1
                     && h.path[0].selects.is_empty()
-                    && self.class_method_names.contains(h.path[0].name.name.as_str())
+                    && self
+                        .class_method_names
+                        .contains(h.path[0].name.name.as_str())
                 {
                     let Some(this_reg) = self.method_this_reg else {
                         self.bail("bare_call_no_this");
@@ -12955,7 +13014,11 @@ impl<'a> BytecodeCompiler<'a> {
                                 arg_start,
                                 n,
                             ));
-                            self.emit_arg_slot_writeback(args, arg_start);
+                            self.emit_arg_slot_writeback(
+                                args,
+                                arg_start,
+                                Some(&h.path[0].name.name),
+                            )?;
                             return Some(dest);
                         }
                         self.emit(Insn::CallMethod(
@@ -12965,7 +13028,7 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
-                        self.emit_arg_slot_writeback(args, arg_start);
+                        self.emit_arg_slot_writeback(args, arg_start, Some(&h.path[0].name.name))?;
                         return Some(dest);
                     }
                     self.insns.truncate(call_start);
@@ -12989,12 +13052,13 @@ impl<'a> BytecodeCompiler<'a> {
                         .functions
                         .and_then(|f| f.get(h.path[0].name.name.as_str()))
                     && fd.ports.len() == args.len()
-                    && fd.ports.iter().all(|p| {
-                        matches!(p.direction, crate::ast::types::PortDirection::Input)
-                    })
-                    && !args.iter().any(|a| {
-                        matches!(a.kind, ExprKind::NamedArg { .. })
-                    })
+                    && fd
+                        .ports
+                        .iter()
+                        .all(|p| matches!(p.direction, crate::ast::types::PortDirection::Input))
+                    && !args
+                        .iter()
+                        .any(|a| matches!(a.kind, ExprKind::NamedArg { .. }))
                 {
                     let name = h.path[0].name.name.clone();
                     let call_start = self.insns.len();
@@ -13087,10 +13151,18 @@ impl<'a> BytecodeCompiler<'a> {
                     && h.root.is_none()
                     && h.path.len() == 1
                     && h.path[0].selects.is_empty()
-                    && !self.local_var_regs.contains_key(h.path[0].name.name.as_str())
-                    && !self.local_array_regs.contains_key(h.path[0].name.name.as_str())
-                    && !self.bare_member_names.contains(h.path[0].name.name.as_str())
-                    && self.scope_static_receivers.contains(h.path[0].name.name.as_str())
+                    && !self
+                        .local_var_regs
+                        .contains_key(h.path[0].name.name.as_str())
+                    && !self
+                        .local_array_regs
+                        .contains_key(h.path[0].name.name.as_str())
+                    && !self
+                        .bare_member_names
+                        .contains(h.path[0].name.name.as_str())
+                    && self
+                        .scope_static_receivers
+                        .contains(h.path[0].name.name.as_str())
                     && !args.iter().any(arg_could_be_ref_bound)
                 {
                     let call_start = self.insns.len();
@@ -13130,7 +13202,7 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
-                        self.emit_arg_slot_writeback(args, arg_start);
+                        self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }
                     self.insns.truncate(call_start);
@@ -14021,9 +14093,11 @@ impl<'a> BytecodeCompiler<'a> {
                     CastDest::Scope
                 }
             }
-            ExprKind::MemberAccess { expr: base, member }
-                if self.method_handle_chain_ok(base) =>
-            {
+            ExprKind::MemberAccess { expr: base, member } if self.method_handle_chain_ok(base) => {
+                if !self.method_instance_field_ok(base, &member.name) {
+                    self.bail("cast_receiver_field");
+                    return None;
+                }
                 // Same store gate as the BlockingAssign member arm: a
                 // member the heap cannot round-trip refuses.
                 if self.class_shadow_names.contains(member.name.as_str())
@@ -14075,9 +14149,7 @@ impl<'a> BytecodeCompiler<'a> {
             && h.path[0].selects.is_empty()
         {
             let bare = h.path[0].name.name.as_str();
-            if !self.local_var_regs.contains_key(bare)
-                && self.string_member_names.contains(bare)
-            {
+            if !self.local_var_regs.contains_key(bare) && self.string_member_names.contains(bare) {
                 let Some(this) = self.method_this_reg else {
                     return false;
                 };
@@ -14093,6 +14165,7 @@ impl<'a> BytecodeCompiler<'a> {
         if let ExprKind::MemberAccess { expr: base, member } = &lhs.kind
             && self.method_mode
             && self.method_handle_chain_ok(base)
+            && self.method_instance_field_ok(base, &member.name)
             && self.string_member_names.contains(member.name.as_str())
             && !(self.class_shadow_names.contains(member.name.as_str())
                 && !self.member_safe_names.contains(member.name.as_str()))
@@ -14403,6 +14476,10 @@ impl<'a> BytecodeCompiler<'a> {
             && let ExprKind::MemberAccess { expr: base, member } = &lhs.kind
             && self.method_handle_chain_ok(base)
         {
+            if !self.method_instance_field_ok(base, &member.name) {
+                self.bail("method_receiver_field");
+                return false;
+            }
             // Step 6: the base may be a chain (`a.b.c = v`) or a bare member
             // (`m.f = v` stores through this.m, loaded here) — lower it to
             // its handle register first.
@@ -14423,7 +14500,11 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("method_member_noload");
                 return false;
             }
-            self.emit(Insn::StoreClassMember(handle_reg, val_reg, member.name.clone().into_boxed_str()));
+            self.emit(Insn::StoreClassMember(
+                handle_reg,
+                val_reg,
+                member.name.clone().into_boxed_str(),
+            ));
             return true;
         }
         // Packed element WRITE on a register-backed local (`y[i] = v` on a
@@ -14688,7 +14769,10 @@ impl<'a> BytecodeCompiler<'a> {
                     {
                         self.emit(Insn::StoreClassStatic(
                             Box::new(NamePair(
-                                self.method_class.clone().unwrap_or_default().into_boxed_str(),
+                                self.method_class
+                                    .clone()
+                                    .unwrap_or_default()
+                                    .into_boxed_str(),
                                 bare.to_string().into_boxed_str(),
                             )),
                             val_reg,
@@ -16396,7 +16480,11 @@ impl<'a> BytecodeCompiler<'a> {
             // text to 1024 bits and every .len() downstream saw 128 —
             // 7515_printer's columns blew out). Mirrors the task-call
             // formal site (`let w = if formal_is_string { 0 }`).
-            let w = if string_formals.contains(name.as_str()) { 0 } else { *w };
+            let w = if string_formals.contains(name.as_str()) {
+                0
+            } else {
+                *w
+            };
             if self.local_var_regs.insert(name.clone(), (r, w)).is_some() {
                 // A duplicated formal name (defensive) bails.
                 self.bail("method_dup_formal");
@@ -19535,7 +19623,10 @@ mod tests {
         let formals = vec![("delta".to_string(), 32u32)];
         let class_formals: HashSet<String> = Default::default();
         let stmt_store = Statement::new(
-            StatementKind::BlockingAssign { lvalue: this_member("acc"), rvalue: num(5) },
+            StatementKind::BlockingAssign {
+                lvalue: this_member("acc"),
+                rvalue: num(5),
+            },
             span(),
         );
         let stmt_ret = Statement::new(StatementKind::Return(Some(this_member("acc"))), span());
@@ -19548,9 +19639,44 @@ mod tests {
         let widths: HashMap<String, u32> = Default::default();
         let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
 
+        let mut admission = MethodAdmission::default();
+        admission
+            .instance_fields
+            .insert(String::new(), ["acc".to_string()].into_iter().collect());
+        compiler.method_admission = Some(std::rc::Rc::new(admission));
+
         let empty_fns: HashMap<String, FunctionDeclaration> = HashMap::default();
-        let out =
-            compiler.compile_class_method(&formals, &class_formals, &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &empty_fns, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body);
+        let out = compiler.compile_class_method(
+            &formals,
+            &class_formals,
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &None,
+            &HashMap::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashMap::default(),
+            &HashSet::default(),
+            &HashMap::default(),
+            &HashSet::default(),
+            &empty_fns,
+            &HashMap::default(),
+            "",
+            &HashMap::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &[],
+            Some(("f", 32, false, false)),
+            &body,
+        );
         let (block, this_reg, _result_reg, _ret_reg) =
             out.expect("simple this.member body should compile all-or-nothing");
         // `this` occupies the method's first allocated register (slot 0).
@@ -19613,18 +19739,61 @@ mod tests {
         let arrays: HashMap<String, (i64, i64, u32)> = Default::default();
         let widths: HashMap<String, u32> = Default::default();
         let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
+        compiler.method_admission = Some(std::rc::Rc::new(MethodAdmission::default()));
 
         let empty_fns: HashMap<String, FunctionDeclaration> = HashMap::default();
-        let out = compiler.compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &empty_fns, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body);
-        let compiled = out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
+        let out = compiler.compile_class_method(
+            &[],
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &None,
+            &HashMap::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashMap::default(),
+            &HashSet::default(),
+            &HashMap::default(),
+            &HashSet::default(),
+            &empty_fns,
+            &HashMap::default(),
+            "",
+            &HashMap::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &[],
+            Some(("f", 32, false, false)),
+            &body,
+        );
+        let compiled =
+            out.expect("a body whose only call is this.compute(1) must now compile (CallMethod)");
         let cm = compiled
             .0
             .instructions
             .iter()
-            .filter(|i| matches!(i, Insn::CallMethod(..) | Insn::CallCollMethod(..) | Insn::LoadCollElem(..) | Insn::StoreCollElem(..)))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Insn::CallMethod(..)
+                        | Insn::CallCollMethod(..)
+                        | Insn::LoadCollElem(..)
+                        | Insn::StoreCollElem(..)
+                )
+            })
             .count();
         assert_eq!(cm, 1, "expected one CallMethod, got {cm}");
-        assert!(!compiled.0.has_fallback, "method body must have no AST fallback");
+        assert!(
+            !compiled.0.has_fallback,
+            "method body must have no AST fallback"
+        );
     }
 
     // class-perf Step 4b: a bare Ident that names a member/static of the
@@ -19650,12 +19819,41 @@ mod tests {
         // Without the shadow set the bare `os` lowers as a module signal; with
         // `os` listed as a class-scope name it must bail all-or-nothing.
         let shadow: HashSet<String> = ["os".to_string()].into_iter().collect();
-        let mut compiler =
-            BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
+        let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         let empty_fns: HashMap<String, FunctionDeclaration> = HashMap::default();
         assert!(
             compiler
-                .compile_class_method(&[], &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &None, &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &HashMap::default(), &HashSet::default(), &empty_fns, &HashMap::default(), "", &HashMap::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &HashSet::default(), &[], Some(("f", 32, false, false)), &body)
+                .compile_class_method(
+                    &[],
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &None,
+                    &HashMap::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &HashMap::default(),
+                    &HashSet::default(),
+                    &HashMap::default(),
+                    &HashSet::default(),
+                    &empty_fns,
+                    &HashMap::default(),
+                    "",
+                    &HashMap::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &HashSet::default(),
+                    &[],
+                    Some(("f", 32, false, false)),
+                    &body
+                )
                 .is_none(),
             "bare Ident in the class-shadow set must bail, not read a module signal"
         );
@@ -20908,7 +21106,6 @@ thread_local! {
 pub fn ts_last_bail() -> (usize, &'static str) {
     TS_BAIL_AT.with(|c| c.get())
 }
-
 
 thread_local! {
     /// Fine-grained reason for the last bail, for arms that carry several
@@ -24201,4 +24398,3 @@ pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
 pub(crate) fn system_function_carries_arg(name: &str) -> bool {
     matches!(name, "$signed" | "$unsigned" | "$past" | "$sampled")
 }
-
