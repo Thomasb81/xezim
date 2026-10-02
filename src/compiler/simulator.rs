@@ -114936,6 +114936,13 @@ impl Simulator {
                 }
             }
         }
+        // A.4.1.1: place a named `extends` list (`extends wrap_c #(.BASE(BASE))`)
+        // by position before any argument text is substituted. Substituting
+        // `BASE` in `.BASE(BASE)` rewrote the parameter NAME as well
+        // (`.base_c(base_c)`), so the base fell back to its default.
+        for c in &names {
+            self.place_named_extends_args(c);
+        }
         for c in &names {
             let Some(cd) = self.module.classes.get(c) else {
                 continue;

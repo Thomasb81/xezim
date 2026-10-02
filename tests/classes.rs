@@ -79,6 +79,8 @@ mod this_collection_struct_members;
 mod this_super_member;
 #[path = "classes/type_param_base_class.rs"]
 mod type_param_base_class;
+#[path = "classes/type_param_base_named_forward.rs"]
+mod type_param_base_named_forward;
 #[path = "classes/type_param_default_implicit_extends.rs"]
 mod type_param_default_implicit_extends;
 #[path = "classes/type_param_formal_stale_local.rs"]
