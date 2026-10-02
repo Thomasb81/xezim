@@ -33395,10 +33395,553 @@ impl Simulator {
         }
     }
 
+    /// Keep class-only dispatch out of the common VM loop.
+    #[inline(never)]
+    fn exec_class_opcode(&mut self, insn: &super::bytecode::Insn) -> u64 {
+        use super::bytecode::{CastDest, Insn};
+        let mut local_count = 0;
+        match insn {
+            Insn::CallMethod(dest, handle_reg, method, arg_start, n_args) => {
+                let method: &str = &method.0;
+                let handle = self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
+                let base = *arg_start as usize;
+                let n = *n_args as usize;
+                // class-perf P3: direct VM->VM dispatch when the callee
+                // itself has a compiled fast-call entry — skips arg
+                // materialization (the sized-hex round-trip) and the
+                // interpreter's binding loop. Guards inside return
+                // None for every shape the interpreter handles
+                // specially; the historic path below is unchanged.
+                if let Some(v) = self.vm_try_direct_call(handle, method, base, n) {
+                    self.vm_regs[*dest as usize] = v;
+                    local_count += 1;
+                } else {
+                    // class-perf row 2: resolve the callee once more for the
+                    // write-back temp set. A wrong guess here (ctor-stack
+                    // dispatch edge) merely keeps the constant wrapper —
+                    // the historic behavior — never a wrong write-back.
+                    let callee_class = self
+                        .heap
+                        .get(handle)
+                        .and_then(|i| i.as_ref().map(|inst| inst.class_name.clone()));
+                    let (args, temps) = match callee_class {
+                        Some(cn) => self.vm_args_with_writeback(&cn, method, base, n),
+                        None => {
+                            let mut a = Vec::with_capacity(n);
+                            for i in 0..n {
+                                let v = self
+                                    .vm_regs
+                                    .get(base + i)
+                                    .cloned()
+                                    .unwrap_or_else(|| Value::zero(32));
+                                a.push(self.value_method_arg_expr(&v));
+                            }
+                            (a, false)
+                        }
+                    };
+                    let result = self.exec_method_call(handle, method, &args);
+                    if temps {
+                        self.vm_drain_arg_temps(base, n);
+                    }
+                    self.vm_regs[*dest as usize] = result;
+                    local_count += 1;
+                }
+            }
+            Insn::CallScopedMethod(dest, this_reg, names, arg_start, n_args) => {
+                let (start_class, method) = (names.0.as_ref(), names.1.as_ref());
+                let handle = self.vm_regs[*this_reg as usize].to_u64().unwrap_or(0) as usize;
+                let base = *arg_start as usize;
+                let n = *n_args as usize;
+                // Value-const actuals + row-2 write-back temps, exactly
+                // like CallMethod. The start class was baked at compile
+                // time (§8.15 super / §8.20 non-virtual bare call): run
+                // the body via the hierarchy walk from that class —
+                // non-virtual, ctor chaining included.
+                let (args, temps) = self.vm_args_with_writeback(start_class, method, base, n);
+                let result = if handle == 0 {
+                    // Null receiver (unreachable for instance frames;
+                    // a static frame never lowers a scoped call).
+                    Value::zero(32)
+                } else {
+                    self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
+                };
+                if temps {
+                    self.vm_drain_arg_temps(base, n);
+                }
+                self.vm_regs[*dest as usize] = result;
+                local_count += 1;
+            }
+            Insn::CallFreeFunction(dest, fname, arg_start, n_args) => {
+                let base = *arg_start as usize;
+                let n = *n_args as usize;
+                // The callee resolves from the SAME table the compiler
+                // admitted it from; a vanishing entry (module swap)
+                // yields a benign zero like every other missing fn.
+                let fd = self.fn_decl_rc(&fname.0);
+                let mut args = Vec::with_capacity(n);
+                for i in 0..n {
+                    let v = self
+                        .vm_regs
+                        .get(base + i)
+                        .cloned()
+                        .unwrap_or_else(|| Value::zero(32));
+                    args.push(self.value_method_arg_expr(&v));
+                }
+                let result = match fd {
+                    Some(fd) => self.exec_function_call(&fd, &args),
+                    None => Value::zero(32),
+                };
+                self.vm_regs[*dest as usize] = result;
+                local_count += 1;
+            }
+            Insn::CallStaticScoped(dest, names, arg_start, n_args) => {
+                let (recv, method) = (names.0.as_ref(), names.1.as_ref());
+                // Step 9h: class-scope static call — marshal register
+                // args and re-enter the interpreter's SHARED resolution
+                // (type-param binding, embedded spec, class name, typedef
+                // aliases), exactly the AST member-call path.
+                let base = *arg_start as usize;
+                let n = *n_args as usize;
+                let (args, temps) = self.vm_args_with_writeback(recv, method, base, n);
+                let v = self
+                    .exec_class_scope_static_call(recv, method, &args)
+                    .unwrap_or_else(|| Value::zero(32));
+                if temps {
+                    self.vm_drain_arg_temps(base, n);
+                }
+                self.vm_regs[*dest as usize] = v;
+                local_count += 1;
+            }
+            Insn::LoadClassStatic(dest, names) => {
+                let (class, prop) = (names.0.as_ref(), names.1.as_ref());
+                // Step 9g: static-property read — class_static_get does
+                // the parent-chain walk AND the per-specialization
+                // keying from the baked defining class, mirroring the
+                // AST's unqualified-static fallback (lexical ctx).
+                let v = self
+                    .class_static_get(class, prop)
+                    .unwrap_or_else(|| Value::zero(32));
+                self.vm_regs[*dest as usize] = v;
+                local_count += 1;
+            }
+            Insn::StoreClassStatic(names, src) => {
+                let (class, prop) = (names.0.as_ref(), names.1.as_ref());
+                // Step 9g: static-property store — the Value is stored
+                // UNRESIZED (class_static_set semantics), immediately
+                // visible to the interpreter.
+                let v = self.vm_regs[*src as usize].clone();
+                self.class_static_set(class, prop, v);
+            }
+            Insn::ConstructObject(dest, class, arg_start, n_args) => {
+                let class: &str = &class.0;
+                // Step 9g: `new(args)` / bare `new` — §8.8 constructor
+                // of the baked DEFINING class. Allocation, property
+                // inits, and the ctor chain all stay in
+                // instantiate_class (interpreter-owned).
+                let base = *arg_start as usize;
+                let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
+                for i in 0..*n_args as usize {
+                    argvals.push(
+                        self.vm_regs
+                            .get(base + i)
+                            .cloned()
+                            .unwrap_or(Value::zero(32)),
+                    );
+                }
+                let args: Vec<Expression> = argvals
+                    .iter()
+                    .map(|v| self.value_method_arg_expr(v))
+                    .collect();
+                let v = if let Some(cd) = self.module.classes.get(class).cloned() {
+                    self.instantiate_class(&cd, &args)
+                } else {
+                    Value::zero(32)
+                };
+                self.vm_regs[*dest as usize] = v;
+                local_count += 1;
+            }
+            Insn::CallCollMethod(dest, handle_reg, names, arg_start, n_args, bare) => {
+                let (member, method) = (names.0.as_ref(), names.1.as_ref());
+                let handle = self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
+                let base = *arg_start as usize;
+                let n = *n_args as usize;
+                // Value-const actuals + row-2 write-back temps (the
+                // builtin arms read/eval them through the ordinary
+                // expression paths — §7.10.2.3 queue append, §15.5.5
+                // event keys, string keys — all carried).
+                let callee_class = self
+                    .heap
+                    .get(handle)
+                    .and_then(|i| i.as_ref().map(|inst| inst.class_name.clone()));
+                let (mut args, mut temps) = (Vec::with_capacity(n), false);
+                match callee_class {
+                    Some(cn) => {
+                        let (a, t) = self.vm_args_with_writeback(&cn, method, base, n);
+                        args = a;
+                        temps = t;
+                    }
+                    None => {
+                        for i in 0..n {
+                            let v = self
+                                .vm_regs
+                                .get(base + i)
+                                .cloned()
+                                .unwrap_or_else(|| Value::zero(32));
+                            args.push(self.value_method_arg_expr(&v));
+                        }
+                    }
+                }
+                let result = if handle == 0 {
+                    // Null receiver: the AST funnel falls through to
+                    // `Value::zero(32)` (no storage, no fault).
+                    Value::zero(32)
+                } else if let Some(bare_name) = Self::split_local_coll_marker(member) {
+                    // Row 3: a LOCAL collection declared in this body
+                    // (the decl ran as a StmtFallback, registering the
+                    // per-call `@name#id` key in the current frame).
+                    // Resolve the store through the interpreter's own
+                    // rename map — innermost frame first, a same-named
+                    // `this` member is SHADOWED — and dispatch the
+                    // builtin on it. The key contains `#`, so the
+                    // builtin's bare-name rewrites never fire.
+                    let m: &str = &method;
+                    let store = self.local_coll_store(bare_name);
+                    match self.eval_builtin_method(&store, m, &args) {
+                        Some(v) => v,
+                        None => self.exec_method_call(handle, m, &args),
+                    }
+                } else if *bare != 0 {
+                    // Bare receiver (`q.size()`): the receiver IS
+                    // `this`. Resolve the member's instance store FIRST
+                    // (`instance_assoc_member`, the same resolution the
+                    // AST funnel's `expr_assoc_name` does for a member
+                    // receiver) and hand the builtin dispatcher the
+                    // SCOPED name. Feeding the dispatcher the bare name
+                    // instead let its §8.10 rewrite consult
+                    // `dyn_name_lookup` first, so a same-named local of
+                    // an ENCLOSING interpreter frame (e.g. UVM report
+                    // hooks all declare `elements[$]`) hijacked the
+                    // member store and answered a foreign snapshot's
+                    // size. Scoped names contain `#`, so the rewrite
+                    // chain is skipped entirely — parity by delegation
+                    // to the exact store the funnel would use,
+                    // including param-bound collections and per-spec
+                    // static keys.
+                    let m: &str = &method;
+                    match self.instance_assoc_member(member) {
+                        Some(scoped) => match self.eval_builtin_method(&scoped, m, &args) {
+                            Some(v) => v,
+                            None => self.exec_method_call(handle, m, &args),
+                        },
+                        // Not a member collection of `this` (unreachable
+                        // for admitted shapes): keep the historic bare
+                        // delegation so behavior never changes for the
+                        // fallback.
+                        None => match self.eval_builtin_method(member, m, &args) {
+                            Some(v) => v,
+                            None => self.exec_method_call(handle, m, &args),
+                        },
+                    }
+                } else {
+                    // Dotted receiver (`obj.coll.meth()`): resolve the
+                    // instance-scoped store `<handle>#coll` exactly like
+                    // the funnel's `expr_assoc_name` receiver arm, then
+                    // dispatch the builtin on it. Scoped names contain
+                    // `#`, so the builtin's bare-name rewrites never
+                    // fire — pure storage ops.
+                    let m: &str = &method;
+                    match self.handle_collection_name(handle, member) {
+                        Some(scoped) => match self.eval_builtin_method(&scoped, m, &args) {
+                            Some(v) => v,
+                            None => self.exec_method_call(handle, m, &args),
+                        },
+                        // Undotted-scoped member (param-bound collection
+                        // the plan set excluded): interpret the call as
+                        // the ordinary funnel would.
+                        None => self.exec_method_call(handle, m, &args),
+                    }
+                };
+                if temps {
+                    self.vm_drain_arg_temps(base, n);
+                }
+                self.vm_regs[*dest as usize] = result;
+                local_count += 1;
+            }
+            // Step 9b-ii: element READ of a class member collection
+            // (`q[i]`, `aa[k]`, `this.aa[k]`, `obj.aa[k]`) inside a
+            // compiled method body. Mirrors the `expr_assoc_name` arm of
+            // the interpreter's Index eval (the only earlier guard that
+            // arm could take for these shapes is the `$` index reject,
+            // which the compiler refuses to emit): resolve the store,
+            // narrow the key (assoc_key_str), read `store[key]` with the
+            // zero(32) missing-key default, NO width fit (the compiler
+            // emitted Resize for the context width; `q[$]` is excluded
+            // so dollar_bound is irrelevant).
+            Insn::LoadCollElem(dest, handle_reg, member, idx_reg) => {
+                let idx_val = self.vm_regs[*idx_reg as usize].clone();
+                let store: Option<String> = if let Some(bare_name) =
+                    Self::split_local_coll_marker(member)
+                {
+                    // Row 3: local collection — the interpreter's
+                    // per-call `@name#id` store (innermost frame wins;
+                    // a same-named `this` member is shadowed).
+                    Some(self.local_coll_store(bare_name))
+                } else if *handle_reg == 0 {
+                    // Bare receiver: the collection is a member of
+                    // `this` — the interpreter's own resolution chain
+                    // (instance member, then static / param-bound
+                    // special keys). A None here is unreachable for
+                    // admitted shapes (the compile-side plan set is a
+                    // subset); interpret as zero, like a null read.
+                    self.instance_assoc_member(member)
+                } else {
+                    let handle = self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
+                    // Dotted receiver: null handle reads zero, per the
+                    // funnel's fall-through (`Value::zero(32)`).
+                    if handle == 0 {
+                        None
+                    } else {
+                        self.handle_collection_name(handle, member)
+                    }
+                };
+                let value = match store {
+                    Some(an) => {
+                        let key = self.assoc_key_str(&an, &idx_val);
+                        let elem = format!("{}[{}]", an, key);
+                        self.signals
+                            .get(&elem)
+                            .cloned()
+                            .unwrap_or_else(|| Value::zero(32))
+                    }
+                    None => Value::zero(32),
+                };
+                self.vm_regs[*dest as usize] = value;
+                local_count += 1;
+            }
+            // Element WRITE counterpart. Mirrors the `expr_assoc_name`
+            // arm of `assign_value_index` (51285): queue/dynamic-array
+            // append growth, §10.7 width fit off the live store, exact
+            // changed-detect insert, touch_queue on change — then the
+            // same waiter notify `assign_value` would run (the AST path
+            // reaches that check through the `assign_value` wrapper;
+            // a synthetic name-only lvalue walks exactly like the real
+            // one because the name collectors never inspect indexes).
+            Insn::StoreCollElem(handle_reg, member, idx_reg, val_reg) => {
+                let idx_val = self.vm_regs[*idx_reg as usize].clone();
+                let val = self.vm_regs[*val_reg as usize].clone();
+                let store: Option<String> = if let Some(bare_name) =
+                    Self::split_local_coll_marker(member)
+                {
+                    // Row 3: local collection — the interpreter's
+                    // per-call `@name#id` store (innermost frame wins;
+                    // a same-named `this` member is shadowed).
+                    Some(self.local_coll_store(bare_name))
+                } else if *handle_reg == 0 {
+                    self.instance_assoc_member(member)
+                } else {
+                    let handle = self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
+                    if handle == 0 {
+                        // Null-receiver store: the AST funnel's write
+                        // resolves no store and drops silently.
+                        None
+                    } else {
+                        self.handle_collection_name(handle, member)
+                    }
+                };
+                if let Some(an) = store {
+                    let key = self.assoc_key_str(&an, &idx_val);
+                    let elem_name = format!("{}[{}]", an, key);
+                    // §7.10.2.3: `q[i] = v` with `i >= size` APPENDS to
+                    // a queue / dynamic array (auto-grows to `i+1`).
+                    if !self.is_associative_array(&an) {
+                        let kval = idx_val.to_i64().unwrap_or(0);
+                        if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
+                            self.set_queue_size(&an, kval as u64 + 1);
+                        }
+                    }
+                    // §10.7: fit to the DECLARED element width when one
+                    // was recorded; otherwise store as-is.
+                    let fitted = match self.assoc_elem_width(&an) {
+                        Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
+                        _ => val.clone(),
+                    };
+                    let changed = self.signals.get(&elem_name) != Some(&fitted);
+                    self.signals.insert(elem_name, fitted);
+                    if changed {
+                        self.touch_queue(&an);
+                        // Waiter notify, as `assign_value` does for the
+                        // AST path. The synthetic lvalue is name-only —
+                        // the target-name collectors ignore indexes.
+                        if !self.condition_waiters.is_empty() {
+                            let lhs = Expression::new(
+                                ExprKind::Ident(HierarchicalIdentifier {
+                                    root: None,
+                                    path: vec![HierPathSegment {
+                                        name: crate::ast::Identifier {
+                                            name: member.to_string(),
+                                            span: crate::ast::Span::dummy(),
+                                        },
+                                        selects: Vec::new(),
+                                    }],
+                                    span: crate::ast::Span::dummy(),
+                                    cached_signal_id: std::cell::Cell::new(None),
+                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                }),
+                                crate::ast::Span::dummy(),
+                            );
+                            self.check_condition_waiters_for_write(&lhs);
+                        }
+                        // The AST statement route settles the comb
+                        // layer after every blocking element write
+                        // (`exec_stmt_blocking_assign` →
+                        // `settle_after_proc_write`), even when the
+                        // value did not change. Here the settle runs
+                        // only on a change: with no cell changed it is
+                        // a pure recompute (no observable effect), and
+                        // skipping it avoids paying a full comb pass
+                        // for same-value stores.
+                        self.settle_after_proc_write();
+                    }
+                }
+                local_count += 1;
+            }
+            // class-perf Step 9c: `$cast(dest, src)` — the runtime
+            // compatibility check runs the interpreter's own
+            // `cast_type_ok` on the carried dest AST (the type overlays
+            // it reads are LIVE during compiled exec: formals and the
+            // return cell were recorded by the binding loop, top-level
+            // body decls are pre-recorded at method entry). Assignment
+            // routes mirror the AST funnel: Reg = the frame arm's fit
+            // into the VM register; Member = StoreClassMember semantics
+            // (fit_class_prop + heap); Scope = `assign_value` on the
+            // carried AST. The §8.16 task form (stmt_form) prints the
+            // same runtime error on failure that the statement
+            // interpreter does; the function form is silent.
+            Insn::Cast(ci, src_reg, out) => {
+                let (dest, dest_expr, stmt_form) = (&ci.dest, &ci.expr, ci.stmt_form);
+                let v = self.vm_regs[*src_reg as usize].clone();
+                let ok = self.cast_type_ok_ex(dest_expr, &v, ci.decl_class.as_deref());
+                if ok {
+                    match dest {
+                        CastDest::Reg(r) => {
+                            // Frame-arm fit (assign_value's local slot):
+                            // resize against the slot's CURRENT
+                            // width/realness, real→int conversion
+                            // included — byte-identical to the AST
+                            // path's frame write.
+                            let r = *r as usize;
+                            let prev = Some(self.vm_regs[r].clone());
+                            let fitted = match prev.as_ref() {
+                                Some(p) if p.is_real && !v.is_real => Value::from_f64(v.to_f64()),
+                                Some(p) if !p.is_real && !v.is_real && p.width > 0 => {
+                                    v.resize(p.width)
+                                }
+                                Some(p) if !p.is_real && v.is_real => {
+                                    let mut f = Self::real_to_int(v.to_f64(), p.width.max(1));
+                                    f.is_signed = p.is_signed;
+                                    f
+                                }
+                                _ => v.clone(),
+                            };
+                            self.vm_regs[r] = fitted;
+                        }
+                        CastDest::Member(hreg, field) => {
+                            let h = self.vm_regs[*hreg as usize].to_u64().unwrap_or(0) as usize;
+                            let fitted = self.fit_class_prop(h, field, &v);
+                            if let Some(o) = self.heap.get_mut(h).and_then(|o| o.as_mut()) {
+                                o.properties.insert(field.to_string(), fitted);
+                            }
+                        }
+                        CastDest::Scope => {
+                            self.assign_value(dest_expr, &v);
+                        }
+                    }
+                } else if stmt_form {
+                    let m = format!(
+                        "[xezim][error] $cast: source object is not \
+                         assignment-compatible with the destination (t={})",
+                        self.time
+                    );
+                    self.record_output(m.clone());
+                    self.stdout_writeln(&m);
+                }
+                self.vm_regs[*out as usize] = if ok {
+                    Value::from_u64(1, 32)
+                } else {
+                    Value::zero(32)
+                };
+                local_count += 1;
+            }
+            // class-perf Step 9d: materialize the iteration keys of a
+            // member collection for a compiled foreach — the same store
+            // resolution as LoadCollElem (bare → `instance_assoc_member`,
+            // dotted → `handle_collection_name`, null receiver → no
+            // store), then the interpreter's OWN key walk: `array_iter_keys`
+            // (dense `.size` range for queue/dynamic, sparse first-key-seg
+            // scan for assoc, string vs numeric §7.9 ordering) and
+            // `assoc_index_width_for` (§7.8.2 key width/signedness). Each
+            // key's loop-var Value is precomputed with the sync foreach
+            // arm's exact conversion so ForeachNext can only move it.
+            Insn::ForeachKeys(slot, handle_reg, member) => {
+                let store: Option<String> = if let Some(bare_name) =
+                    Self::split_local_coll_marker(member)
+                {
+                    // Row 3: local collection — the interpreter's
+                    // per-call `@name#id` store (innermost frame wins;
+                    // a same-named `this` member is shadowed).
+                    Some(self.local_coll_store(bare_name))
+                } else if *handle_reg == 0 {
+                    self.instance_assoc_member(member)
+                } else {
+                    let handle = self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
+                    if handle == 0 {
+                        // Null receiver: no store → no keys → zero
+                        // iterations, matching the interpreter's
+                        // expr_assoc_name fall-through.
+                        None
+                    } else {
+                        self.handle_collection_name(handle, member)
+                    }
+                };
+                let (keys, is_str, kw, ks_sign) = match store {
+                    Some(an) => {
+                        let (ks, is_str) = self.array_iter_keys(&an);
+                        let (kw, ks_sign) = self.assoc_index_width_for(&an).unwrap_or((32, false));
+                        (ks, is_str, kw, ks_sign)
+                    }
+                    None => (Vec::new(), false, 32, false),
+                };
+                // Precompute each iteration's loop-var Value exactly as
+                // the sync foreach arm does (string → from_string;
+                // else signed parse at the declared key width).
+                let vals: Vec<Value> = keys
+                    .iter()
+                    .map(|key| {
+                        if is_str {
+                            Value::from_string(key)
+                        } else {
+                            let mut v = Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
+                            v.is_signed = ks_sign;
+                            v
+                        }
+                    })
+                    .collect();
+                let s = *slot as usize;
+                if s >= self.foreach_arena.len() {
+                    self.foreach_arena.resize(s + 1, (Vec::new(), 0));
+                }
+                self.foreach_arena[s] = (vals, 0);
+                local_count += 1;
+            }
+            _ => unreachable!("unexpected opcode in class executor"),
+        }
+        local_count
+    }
+
     /// Core bytecode VM loop.
     #[inline]
     fn exec_insns(&mut self, insns: &[super::bytecode::Insn]) {
-        use super::bytecode::{CastDest, Insn};
+        use super::bytecode::Insn;
         // Process-FSM resume point; 0 (the ordinary case) unless
         // `run_proc_fsm` set it just before this call.
         let mut pc: usize = std::mem::take(&mut self.fsm_start_pc) as usize;
@@ -33591,541 +34134,19 @@ impl Simulator {
                         o.properties.insert(field.to_string(), fitted);
                     }
                 }
-                Insn::CallMethod(dest, handle_reg, method, arg_start, n_args) => {
-                    let method: &str = &method.0;
-                    let handle = self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let base = *arg_start as usize;
-                    let n = *n_args as usize;
-                    // class-perf P3: direct VM->VM dispatch when the callee
-                    // itself has a compiled fast-call entry — skips arg
-                    // materialization (the sized-hex round-trip) and the
-                    // interpreter's binding loop. Guards inside return
-                    // None for every shape the interpreter handles
-                    // specially; the historic path below is unchanged.
-                    if let Some(v) = self.vm_try_direct_call(handle, method, base, n) {
-                        self.vm_regs[*dest as usize] = v;
-                        local_count += 1;
-                    } else {
-                        // class-perf row 2: resolve the callee once more for the
-                        // write-back temp set. A wrong guess here (ctor-stack
-                        // dispatch edge) merely keeps the constant wrapper —
-                        // the historic behavior — never a wrong write-back.
-                        let callee_class = self
-                            .heap
-                            .get(handle)
-                            .and_then(|i| i.as_ref().map(|inst| inst.class_name.clone()));
-                        let (args, temps) = match callee_class {
-                            Some(cn) => self.vm_args_with_writeback(&cn, method, base, n),
-                            None => {
-                                let mut a = Vec::with_capacity(n);
-                                for i in 0..n {
-                                    let v = self
-                                        .vm_regs
-                                        .get(base + i)
-                                        .cloned()
-                                        .unwrap_or_else(|| Value::zero(32));
-                                    a.push(self.value_method_arg_expr(&v));
-                                }
-                                (a, false)
-                            }
-                        };
-                        let result = self.exec_method_call(handle, method, &args);
-                        if temps {
-                            self.vm_drain_arg_temps(base, n);
-                        }
-                        self.vm_regs[*dest as usize] = result;
-                        local_count += 1;
-                    }
-                }
-                Insn::CallScopedMethod(dest, this_reg, names, arg_start, n_args) => {
-                    let (start_class, method) = (names.0.as_ref(), names.1.as_ref());
-                    let handle = self.vm_regs[*this_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let base = *arg_start as usize;
-                    let n = *n_args as usize;
-                    // Value-const actuals + row-2 write-back temps, exactly
-                    // like CallMethod. The start class was baked at compile
-                    // time (§8.15 super / §8.20 non-virtual bare call): run
-                    // the body via the hierarchy walk from that class —
-                    // non-virtual, ctor chaining included.
-                    let (args, temps) = self.vm_args_with_writeback(start_class, method, base, n);
-                    let result = if handle == 0 {
-                        // Null receiver (unreachable for instance frames;
-                        // a static frame never lowers a scoped call).
-                        Value::zero(32)
-                    } else {
-                        self.exec_method_in_class_hierarchy(handle, start_class, method, &args)
-                    };
-                    if temps {
-                        self.vm_drain_arg_temps(base, n);
-                    }
-                    self.vm_regs[*dest as usize] = result;
-                    local_count += 1;
-                }
-                Insn::CallFreeFunction(dest, fname, arg_start, n_args) => {
-                    let base = *arg_start as usize;
-                    let n = *n_args as usize;
-                    // The callee resolves from the SAME table the compiler
-                    // admitted it from; a vanishing entry (module swap)
-                    // yields a benign zero like every other missing fn.
-                    let fd = self.fn_decl_rc(&fname.0);
-                    let mut args = Vec::with_capacity(n);
-                    for i in 0..n {
-                        let v = self
-                            .vm_regs
-                            .get(base + i)
-                            .cloned()
-                            .unwrap_or_else(|| Value::zero(32));
-                        args.push(self.value_method_arg_expr(&v));
-                    }
-                    let result = match fd {
-                        Some(fd) => self.exec_function_call(&fd, &args),
-                        None => Value::zero(32),
-                    };
-                    self.vm_regs[*dest as usize] = result;
-                    local_count += 1;
-                }
-                Insn::CallStaticScoped(dest, names, arg_start, n_args) => {
-                    let (recv, method) = (names.0.as_ref(), names.1.as_ref());
-                    // Step 9h: class-scope static call — marshal register
-                    // args and re-enter the interpreter's SHARED resolution
-                    // (type-param binding, embedded spec, class name, typedef
-                    // aliases), exactly the AST member-call path.
-                    let base = *arg_start as usize;
-                    let n = *n_args as usize;
-                    let (args, temps) = self.vm_args_with_writeback(recv, method, base, n);
-                    let v = self
-                        .exec_class_scope_static_call(recv, method, &args)
-                        .unwrap_or_else(|| Value::zero(32));
-                    if temps {
-                        self.vm_drain_arg_temps(base, n);
-                    }
-                    self.vm_regs[*dest as usize] = v;
-                    local_count += 1;
-                }
-                Insn::LoadClassStatic(dest, names) => {
-                    let (class, prop) = (names.0.as_ref(), names.1.as_ref());
-                    // Step 9g: static-property read — class_static_get does
-                    // the parent-chain walk AND the per-specialization
-                    // keying from the baked defining class, mirroring the
-                    // AST's unqualified-static fallback (lexical ctx).
-                    let v = self
-                        .class_static_get(class, prop)
-                        .unwrap_or_else(|| Value::zero(32));
-                    self.vm_regs[*dest as usize] = v;
-                    local_count += 1;
-                }
-                Insn::StoreClassStatic(names, src) => {
-                    let (class, prop) = (names.0.as_ref(), names.1.as_ref());
-                    // Step 9g: static-property store — the Value is stored
-                    // UNRESIZED (class_static_set semantics), immediately
-                    // visible to the interpreter.
-                    let v = self.vm_regs[*src as usize].clone();
-                    self.class_static_set(class, prop, v);
-                }
-                Insn::ConstructObject(dest, class, arg_start, n_args) => {
-                    let class: &str = &class.0;
-                    // Step 9g: `new(args)` / bare `new` — §8.8 constructor
-                    // of the baked DEFINING class. Allocation, property
-                    // inits, and the ctor chain all stay in
-                    // instantiate_class (interpreter-owned).
-                    let base = *arg_start as usize;
-                    let mut argvals: Vec<Value> = Vec::with_capacity(*n_args as usize);
-                    for i in 0..*n_args as usize {
-                        argvals.push(
-                            self.vm_regs
-                                .get(base + i)
-                                .cloned()
-                                .unwrap_or(Value::zero(32)),
-                        );
-                    }
-                    let args: Vec<Expression> = argvals
-                        .iter()
-                        .map(|v| self.value_method_arg_expr(v))
-                        .collect();
-                    let v = if let Some(cd) = self.module.classes.get(class).cloned() {
-                        self.instantiate_class(&cd, &args)
-                    } else {
-                        Value::zero(32)
-                    };
-                    self.vm_regs[*dest as usize] = v;
-                    local_count += 1;
-                }
-                Insn::CallCollMethod(dest, handle_reg, names, arg_start, n_args, bare) => {
-                    let (member, method) = (names.0.as_ref(), names.1.as_ref());
-                    let handle = self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
-                    let base = *arg_start as usize;
-                    let n = *n_args as usize;
-                    // Value-const actuals + row-2 write-back temps (the
-                    // builtin arms read/eval them through the ordinary
-                    // expression paths — §7.10.2.3 queue append, §15.5.5
-                    // event keys, string keys — all carried).
-                    let callee_class = self
-                        .heap
-                        .get(handle)
-                        .and_then(|i| i.as_ref().map(|inst| inst.class_name.clone()));
-                    let (mut args, mut temps) = (Vec::with_capacity(n), false);
-                    match callee_class {
-                        Some(cn) => {
-                            let (a, t) = self.vm_args_with_writeback(&cn, method, base, n);
-                            args = a;
-                            temps = t;
-                        }
-                        None => {
-                            for i in 0..n {
-                                let v = self
-                                    .vm_regs
-                                    .get(base + i)
-                                    .cloned()
-                                    .unwrap_or_else(|| Value::zero(32));
-                                args.push(self.value_method_arg_expr(&v));
-                            }
-                        }
-                    }
-                    let result = if handle == 0 {
-                        // Null receiver: the AST funnel falls through to
-                        // `Value::zero(32)` (no storage, no fault).
-                        Value::zero(32)
-                    } else if let Some(bare_name) = Self::split_local_coll_marker(member) {
-                        // Row 3: a LOCAL collection declared in this body
-                        // (the decl ran as a StmtFallback, registering the
-                        // per-call `@name#id` key in the current frame).
-                        // Resolve the store through the interpreter's own
-                        // rename map — innermost frame first, a same-named
-                        // `this` member is SHADOWED — and dispatch the
-                        // builtin on it. The key contains `#`, so the
-                        // builtin's bare-name rewrites never fire.
-                        let m: &str = &method;
-                        let store = self.local_coll_store(bare_name);
-                        match self.eval_builtin_method(&store, m, &args) {
-                            Some(v) => v,
-                            None => self.exec_method_call(handle, m, &args),
-                        }
-                    } else if *bare != 0 {
-                        // Bare receiver (`q.size()`): the receiver IS
-                        // `this`. Resolve the member's instance store FIRST
-                        // (`instance_assoc_member`, the same resolution the
-                        // AST funnel's `expr_assoc_name` does for a member
-                        // receiver) and hand the builtin dispatcher the
-                        // SCOPED name. Feeding the dispatcher the bare name
-                        // instead let its §8.10 rewrite consult
-                        // `dyn_name_lookup` first, so a same-named local of
-                        // an ENCLOSING interpreter frame (e.g. UVM report
-                        // hooks all declare `elements[$]`) hijacked the
-                        // member store and answered a foreign snapshot's
-                        // size. Scoped names contain `#`, so the rewrite
-                        // chain is skipped entirely — parity by delegation
-                        // to the exact store the funnel would use,
-                        // including param-bound collections and per-spec
-                        // static keys.
-                        let m: &str = &method;
-                        match self.instance_assoc_member(member) {
-                            Some(scoped) => match self.eval_builtin_method(&scoped, m, &args) {
-                                Some(v) => v,
-                                None => self.exec_method_call(handle, m, &args),
-                            },
-                            // Not a member collection of `this` (unreachable
-                            // for admitted shapes): keep the historic bare
-                            // delegation so behavior never changes for the
-                            // fallback.
-                            None => match self.eval_builtin_method(member, m, &args) {
-                                Some(v) => v,
-                                None => self.exec_method_call(handle, m, &args),
-                            },
-                        }
-                    } else {
-                        // Dotted receiver (`obj.coll.meth()`): resolve the
-                        // instance-scoped store `<handle>#coll` exactly like
-                        // the funnel's `expr_assoc_name` receiver arm, then
-                        // dispatch the builtin on it. Scoped names contain
-                        // `#`, so the builtin's bare-name rewrites never
-                        // fire — pure storage ops.
-                        let m: &str = &method;
-                        match self.handle_collection_name(handle, member) {
-                            Some(scoped) => match self.eval_builtin_method(&scoped, m, &args) {
-                                Some(v) => v,
-                                None => self.exec_method_call(handle, m, &args),
-                            },
-                            // Undotted-scoped member (param-bound collection
-                            // the plan set excluded): interpret the call as
-                            // the ordinary funnel would.
-                            None => self.exec_method_call(handle, m, &args),
-                        }
-                    };
-                    if temps {
-                        self.vm_drain_arg_temps(base, n);
-                    }
-                    self.vm_regs[*dest as usize] = result;
-                    local_count += 1;
-                }
-                // Step 9b-ii: element READ of a class member collection
-                // (`q[i]`, `aa[k]`, `this.aa[k]`, `obj.aa[k]`) inside a
-                // compiled method body. Mirrors the `expr_assoc_name` arm of
-                // the interpreter's Index eval (the only earlier guard that
-                // arm could take for these shapes is the `$` index reject,
-                // which the compiler refuses to emit): resolve the store,
-                // narrow the key (assoc_key_str), read `store[key]` with the
-                // zero(32) missing-key default, NO width fit (the compiler
-                // emitted Resize for the context width; `q[$]` is excluded
-                // so dollar_bound is irrelevant).
-                Insn::LoadCollElem(dest, handle_reg, member, idx_reg) => {
-                    let idx_val = self.vm_regs[*idx_reg as usize].clone();
-                    let store: Option<String> =
-                        if let Some(bare_name) = Self::split_local_coll_marker(member) {
-                            // Row 3: local collection — the interpreter's
-                            // per-call `@name#id` store (innermost frame wins;
-                            // a same-named `this` member is shadowed).
-                            Some(self.local_coll_store(bare_name))
-                        } else if *handle_reg == 0 {
-                            // Bare receiver: the collection is a member of
-                            // `this` — the interpreter's own resolution chain
-                            // (instance member, then static / param-bound
-                            // special keys). A None here is unreachable for
-                            // admitted shapes (the compile-side plan set is a
-                            // subset); interpret as zero, like a null read.
-                            self.instance_assoc_member(member)
-                        } else {
-                            let handle =
-                                self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
-                            // Dotted receiver: null handle reads zero, per the
-                            // funnel's fall-through (`Value::zero(32)`).
-                            if handle == 0 {
-                                None
-                            } else {
-                                self.handle_collection_name(handle, member)
-                            }
-                        };
-                    let value = match store {
-                        Some(an) => {
-                            let key = self.assoc_key_str(&an, &idx_val);
-                            let elem = format!("{}[{}]", an, key);
-                            self.signals
-                                .get(&elem)
-                                .cloned()
-                                .unwrap_or_else(|| Value::zero(32))
-                        }
-                        None => Value::zero(32),
-                    };
-                    self.vm_regs[*dest as usize] = value;
-                    local_count += 1;
-                }
-                // Element WRITE counterpart. Mirrors the `expr_assoc_name`
-                // arm of `assign_value_index` (51285): queue/dynamic-array
-                // append growth, §10.7 width fit off the live store, exact
-                // changed-detect insert, touch_queue on change — then the
-                // same waiter notify `assign_value` would run (the AST path
-                // reaches that check through the `assign_value` wrapper;
-                // a synthetic name-only lvalue walks exactly like the real
-                // one because the name collectors never inspect indexes).
-                Insn::StoreCollElem(handle_reg, member, idx_reg, val_reg) => {
-                    let idx_val = self.vm_regs[*idx_reg as usize].clone();
-                    let val = self.vm_regs[*val_reg as usize].clone();
-                    let store: Option<String> =
-                        if let Some(bare_name) = Self::split_local_coll_marker(member) {
-                            // Row 3: local collection — the interpreter's
-                            // per-call `@name#id` store (innermost frame wins;
-                            // a same-named `this` member is shadowed).
-                            Some(self.local_coll_store(bare_name))
-                        } else if *handle_reg == 0 {
-                            self.instance_assoc_member(member)
-                        } else {
-                            let handle =
-                                self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
-                            if handle == 0 {
-                                // Null-receiver store: the AST funnel's write
-                                // resolves no store and drops silently.
-                                None
-                            } else {
-                                self.handle_collection_name(handle, member)
-                            }
-                        };
-                    if let Some(an) = store {
-                        let key = self.assoc_key_str(&an, &idx_val);
-                        let elem_name = format!("{}[{}]", an, key);
-                        // §7.10.2.3: `q[i] = v` with `i >= size` APPENDS to
-                        // a queue / dynamic array (auto-grows to `i+1`).
-                        if !self.is_associative_array(&an) {
-                            let kval = idx_val.to_i64().unwrap_or(0);
-                            if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
-                                self.set_queue_size(&an, kval as u64 + 1);
-                            }
-                        }
-                        // §10.7: fit to the DECLARED element width when one
-                        // was recorded; otherwise store as-is.
-                        let fitted = match self.assoc_elem_width(&an) {
-                            Some(w) if w != val.width && !val.is_real => val.resize_for_assign(w),
-                            _ => val.clone(),
-                        };
-                        let changed = self.signals.get(&elem_name) != Some(&fitted);
-                        self.signals.insert(elem_name, fitted);
-                        if changed {
-                            self.touch_queue(&an);
-                            // Waiter notify, as `assign_value` does for the
-                            // AST path. The synthetic lvalue is name-only —
-                            // the target-name collectors ignore indexes.
-                            if !self.condition_waiters.is_empty() {
-                                let lhs = Expression::new(
-                                    ExprKind::Ident(HierarchicalIdentifier {
-                                        root: None,
-                                        path: vec![HierPathSegment {
-                                            name: crate::ast::Identifier {
-                                                name: member.to_string(),
-                                                span: crate::ast::Span::dummy(),
-                                            },
-                                            selects: Vec::new(),
-                                        }],
-                                        span: crate::ast::Span::dummy(),
-                                        cached_signal_id: std::cell::Cell::new(None),
-                                        cached_resolved_name: std::cell::OnceCell::new(),
-                                    }),
-                                    crate::ast::Span::dummy(),
-                                );
-                                self.check_condition_waiters_for_write(&lhs);
-                            }
-                            // The AST statement route settles the comb
-                            // layer after every blocking element write
-                            // (`exec_stmt_blocking_assign` →
-                            // `settle_after_proc_write`), even when the
-                            // value did not change. Here the settle runs
-                            // only on a change: with no cell changed it is
-                            // a pure recompute (no observable effect), and
-                            // skipping it avoids paying a full comb pass
-                            // for same-value stores.
-                            self.settle_after_proc_write();
-                        }
-                    }
-                    local_count += 1;
-                }
-                // class-perf Step 9c: `$cast(dest, src)` — the runtime
-                // compatibility check runs the interpreter's own
-                // `cast_type_ok` on the carried dest AST (the type overlays
-                // it reads are LIVE during compiled exec: formals and the
-                // return cell were recorded by the binding loop, top-level
-                // body decls are pre-recorded at method entry). Assignment
-                // routes mirror the AST funnel: Reg = the frame arm's fit
-                // into the VM register; Member = StoreClassMember semantics
-                // (fit_class_prop + heap); Scope = `assign_value` on the
-                // carried AST. The §8.16 task form (stmt_form) prints the
-                // same runtime error on failure that the statement
-                // interpreter does; the function form is silent.
-                Insn::Cast(ci, src_reg, out) => {
-                    let (dest, dest_expr, stmt_form) = (&ci.dest, &ci.expr, ci.stmt_form);
-                    let v = self.vm_regs[*src_reg as usize].clone();
-                    let ok = self.cast_type_ok_ex(dest_expr, &v, ci.decl_class.as_deref());
-                    if ok {
-                        match dest {
-                            CastDest::Reg(r) => {
-                                // Frame-arm fit (assign_value's local slot):
-                                // resize against the slot's CURRENT
-                                // width/realness, real→int conversion
-                                // included — byte-identical to the AST
-                                // path's frame write.
-                                let r = *r as usize;
-                                let prev = Some(self.vm_regs[r].clone());
-                                let fitted = match prev.as_ref() {
-                                    Some(p) if p.is_real && !v.is_real => {
-                                        Value::from_f64(v.to_f64())
-                                    }
-                                    Some(p) if !p.is_real && !v.is_real && p.width > 0 => {
-                                        v.resize(p.width)
-                                    }
-                                    Some(p) if !p.is_real && v.is_real => {
-                                        let mut f = Self::real_to_int(v.to_f64(), p.width.max(1));
-                                        f.is_signed = p.is_signed;
-                                        f
-                                    }
-                                    _ => v.clone(),
-                                };
-                                self.vm_regs[r] = fitted;
-                            }
-                            CastDest::Member(hreg, field) => {
-                                let h = self.vm_regs[*hreg as usize].to_u64().unwrap_or(0) as usize;
-                                let fitted = self.fit_class_prop(h, field, &v);
-                                if let Some(o) = self.heap.get_mut(h).and_then(|o| o.as_mut()) {
-                                    o.properties.insert(field.to_string(), fitted);
-                                }
-                            }
-                            CastDest::Scope => {
-                                self.assign_value(dest_expr, &v);
-                            }
-                        }
-                    } else if stmt_form {
-                        let m = format!(
-                            "[xezim][error] $cast: source object is not \
-                             assignment-compatible with the destination (t={})",
-                            self.time
-                        );
-                        self.record_output(m.clone());
-                        self.stdout_writeln(&m);
-                    }
-                    self.vm_regs[*out as usize] = if ok {
-                        Value::from_u64(1, 32)
-                    } else {
-                        Value::zero(32)
-                    };
-                    local_count += 1;
-                }
-                // class-perf Step 9d: materialize the iteration keys of a
-                // member collection for a compiled foreach — the same store
-                // resolution as LoadCollElem (bare → `instance_assoc_member`,
-                // dotted → `handle_collection_name`, null receiver → no
-                // store), then the interpreter's OWN key walk: `array_iter_keys`
-                // (dense `.size` range for queue/dynamic, sparse first-key-seg
-                // scan for assoc, string vs numeric §7.9 ordering) and
-                // `assoc_index_width_for` (§7.8.2 key width/signedness). Each
-                // key's loop-var Value is precomputed with the sync foreach
-                // arm's exact conversion so ForeachNext can only move it.
-                Insn::ForeachKeys(slot, handle_reg, member) => {
-                    let store: Option<String> =
-                        if let Some(bare_name) = Self::split_local_coll_marker(member) {
-                            // Row 3: local collection — the interpreter's
-                            // per-call `@name#id` store (innermost frame wins;
-                            // a same-named `this` member is shadowed).
-                            Some(self.local_coll_store(bare_name))
-                        } else if *handle_reg == 0 {
-                            self.instance_assoc_member(member)
-                        } else {
-                            let handle =
-                                self.vm_regs[*handle_reg as usize].to_u64().unwrap_or(0) as usize;
-                            if handle == 0 {
-                                // Null receiver: no store → no keys → zero
-                                // iterations, matching the interpreter's
-                                // expr_assoc_name fall-through.
-                                None
-                            } else {
-                                self.handle_collection_name(handle, member)
-                            }
-                        };
-                    let (keys, is_str, kw, ks_sign) = match store {
-                        Some(an) => {
-                            let (ks, is_str) = self.array_iter_keys(&an);
-                            let (kw, ks_sign) =
-                                self.assoc_index_width_for(&an).unwrap_or((32, false));
-                            (ks, is_str, kw, ks_sign)
-                        }
-                        None => (Vec::new(), false, 32, false),
-                    };
-                    // Precompute each iteration's loop-var Value exactly as
-                    // the sync foreach arm does (string → from_string;
-                    // else signed parse at the declared key width).
-                    let vals: Vec<Value> = keys
-                        .iter()
-                        .map(|key| {
-                            if is_str {
-                                Value::from_string(key)
-                            } else {
-                                let mut v =
-                                    Value::from_u64(key.parse::<i64>().unwrap_or(0) as u64, kw);
-                                v.is_signed = ks_sign;
-                                v
-                            }
-                        })
-                        .collect();
-                    let s = *slot as usize;
-                    if s >= self.foreach_arena.len() {
-                        self.foreach_arena.resize(s + 1, (Vec::new(), 0));
-                    }
-                    self.foreach_arena[s] = (vals, 0);
-                    local_count += 1;
+                Insn::CallMethod(..)
+                | Insn::CallScopedMethod(..)
+                | Insn::CallFreeFunction(..)
+                | Insn::CallStaticScoped(..)
+                | Insn::LoadClassStatic(..)
+                | Insn::StoreClassStatic(..)
+                | Insn::ConstructObject(..)
+                | Insn::CallCollMethod(..)
+                | Insn::LoadCollElem(..)
+                | Insn::StoreCollElem(..)
+                | Insn::Cast(..)
+                | Insn::ForeachKeys(..) => {
+                    local_count += self.exec_class_opcode(&insns[pc]);
                 }
                 // Advance a compiled foreach: pop the slot's next key into
                 // the var register; `ok` = 0 at exhaustion (loop exit).

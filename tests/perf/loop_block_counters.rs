@@ -30,6 +30,9 @@ fn run_env(name: &str, src: &str, env: &[(&str, &str)]) -> String {
             "--no-cache",
             path.to_str().unwrap(),
         ])
+        // These work counters belong to the bytecode executor; native
+        // execution bypasses them even when the design's answers match.
+        .env("XEZIM_JIT", "0")
         .env("XEZIM_PROFILE_REPORT", "1")
         .env("XEZIM_EDGE_BLOCK_STATS", "1")
         .envs(env.iter().copied())
