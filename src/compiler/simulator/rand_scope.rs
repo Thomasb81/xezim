@@ -576,6 +576,18 @@ impl Simulator {
     }
 }
 
+/// What `rebase_expr` strips from an operand path: `prop.` for a rand handle
+/// member, or `prop[elem].` for one element of a rand handle collection.
+struct Rebase<'a> {
+    prop: &'a str,
+    /// Plain name of the randomize() receiver (`<receiver>.prop.…`).
+    recv: Option<&'a str>,
+    /// `Some(k)`: rebase onto element `k` of the collection `prop`.
+    elem: Option<u64>,
+    /// The `foreach (prop[i])` iterator, bound to `elem` (§18.5.8.1).
+    iter: Option<&'a str>,
+}
+
 impl Simulator {
     /// §18.5.9 — the constraint items of an enclosing solve that constrain
     /// ONLY the rand sub-object behind member `prop`, rewritten relative to
@@ -590,50 +602,89 @@ impl Simulator {
         prop: &str,
         constraints: &[ClassConstraint],
     ) -> Vec<ConstraintItem> {
-        let recv = self.rand_receiver.as_deref();
+        self.pushdown_into(prop, None, constraints)
+    }
+
+    /// §18.4/§18.5.9 — the same for element `elem` of a rand collection of
+    /// object handles (`rand obj arr[N]`): `arr[elem].fld …` items, and the
+    /// body of `foreach (arr[i])` with `i` bound to `elem`, constrain only
+    /// that element's object.
+    pub(super) fn pushdown_elem_items(
+        &self,
+        prop: &str,
+        elem: u64,
+        constraints: &[ClassConstraint],
+    ) -> Vec<ConstraintItem> {
+        self.pushdown_into(prop, Some(elem), constraints)
+    }
+
+    fn pushdown_into(
+        &self,
+        prop: &str,
+        elem: Option<u64>,
+        constraints: &[ClassConstraint],
+    ) -> Vec<ConstraintItem> {
+        let t = Rebase {
+            prop,
+            recv: self.rand_receiver.as_deref(),
+            elem,
+            iter: None,
+        };
         let mut out = Vec::new();
         for con in constraints {
             for it in &con.items {
-                Self::pushdown_item(it, prop, recv, &mut out);
+                Self::pushdown_item(it, &t, &mut out);
             }
         }
         out
     }
 
-    fn pushdown_item(
-        it: &ConstraintItem,
-        prop: &str,
-        recv: Option<&str>,
-        out: &mut Vec<ConstraintItem>,
-    ) {
+    fn pushdown_item(it: &ConstraintItem, t: &Rebase<'_>, out: &mut Vec<ConstraintItem>) {
         if let ConstraintItem::Block(items) = it {
             for i in items {
-                Self::pushdown_item(i, prop, recv, out);
+                Self::pushdown_item(i, t, out);
+            }
+            return;
+        }
+        // `foreach (prop[i]) body` over the collection itself: the body, with
+        // `i` bound to this element, is a candidate item for the element.
+        if let (
+            Some(_),
+            ConstraintItem::Foreach {
+                array, vars, item, ..
+            },
+        ) = (t.elem, it)
+        {
+            let over_prop = matches!(&array.kind, ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && h.path[0].name.name == t.prop);
+            if let ([Some(iter)], true) = (vars.as_slice(), over_prop) {
+                let ti = Rebase {
+                    iter: Some(&iter.name),
+                    ..*t
+                };
+                Self::pushdown_item(item, &ti, out);
             }
             return;
         }
         let mut c = it.clone();
         let mut hit = false;
-        if Self::rebase_item(&mut c, prop, recv, &mut hit) && hit {
+        if Self::rebase_item(&mut c, t, &mut hit) && hit {
             out.push(c);
         }
     }
 
-    fn rebase_item(
-        it: &mut ConstraintItem,
-        prop: &str,
-        recv: Option<&str>,
-        hit: &mut bool,
-    ) -> bool {
+    fn rebase_item(it: &mut ConstraintItem, t: &Rebase<'_>, hit: &mut bool) -> bool {
         match it {
-            ConstraintItem::Expr(e) => Self::rebase_expr(e, prop, recv, hit),
+            ConstraintItem::Expr(e) => Self::rebase_expr(e, t, hit),
             ConstraintItem::Inside { expr, range, .. } => {
-                Self::rebase_expr(expr, prop, recv, hit)
+                Self::rebase_expr(expr, t, hit)
                     && range.iter_mut().all(|r| match r {
-                        ConstraintRange::Value(v) => Self::rebase_expr(v, prop, recv, hit),
+                        ConstraintRange::Value(v) => Self::rebase_expr(v, t, hit),
                         ConstraintRange::Range { lo, hi } => {
-                            Self::rebase_expr(lo, prop, recv, hit)
-                                && Self::rebase_expr(hi, prop, recv, hit)
+                            Self::rebase_expr(lo, t, hit) && Self::rebase_expr(hi, t, hit)
                         }
                     })
             }
@@ -641,26 +692,21 @@ impl Simulator {
                 condition,
                 constraint,
                 ..
-            } => {
-                Self::rebase_expr(condition, prop, recv, hit)
-                    && Self::rebase_item(constraint, prop, recv, hit)
-            }
+            } => Self::rebase_expr(condition, t, hit) && Self::rebase_item(constraint, t, hit),
             ConstraintItem::IfElse {
                 condition,
                 then_item,
                 else_item,
                 ..
             } => {
-                Self::rebase_expr(condition, prop, recv, hit)
-                    && Self::rebase_item(then_item, prop, recv, hit)
+                Self::rebase_expr(condition, t, hit)
+                    && Self::rebase_item(then_item, t, hit)
                     && else_item
                         .as_mut()
-                        .is_none_or(|e| Self::rebase_item(e, prop, recv, hit))
+                        .is_none_or(|e| Self::rebase_item(e, t, hit))
             }
-            ConstraintItem::Soft(inner) => Self::rebase_item(inner, prop, recv, hit),
-            ConstraintItem::Block(items) => items
-                .iter_mut()
-                .all(|i| Self::rebase_item(i, prop, recv, hit)),
+            ConstraintItem::Soft(inner) => Self::rebase_item(inner, t, hit),
+            ConstraintItem::Block(items) => items.iter_mut().all(|i| Self::rebase_item(i, t, hit)),
             _ => false,
         }
     }
@@ -668,16 +714,46 @@ impl Simulator {
     /// Strip `prop.` (or `<receiver>.prop.`) from every operand path of `e`
     /// (`prop.x.y` parses as a member-access chain over `prop`); false when
     /// an operand is anything else a sub-object solve could not read the
-    /// same way (an enclosing member, a call, `this`).
-    fn rebase_expr(e: &mut Expression, prop: &str, recv: Option<&str>, hit: &mut bool) -> bool {
+    /// same way (an enclosing member, a call, `this`). For an element
+    /// rebase the prefix is `prop[elem].`, and a bound foreach iterator
+    /// becomes the element's index.
+    fn rebase_expr(e: &mut Expression, t: &Rebase<'_>, hit: &mut bool) -> bool {
+        if let Some(k) = t.elem {
+            if let ExprKind::Ident(h) = &e.kind
+                && t.iter.is_some_and(|i| {
+                    h.root.is_none()
+                        && h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name == i
+                })
+            {
+                *e = Self::literal_of(&Value::from_u64(k, 32), e.span);
+                return true;
+            }
+            if let Some(rest) = Self::elem_path_rest(e, t) {
+                return match rest {
+                    Some(names) => {
+                        *e = Self::chain_expr(&names, e.span);
+                        *hit = true;
+                        true
+                    }
+                    None => false,
+                };
+            }
+        }
         if matches!(e.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. }) {
+            // A plain `prop.x` path names no single element of a collection.
+            if t.elem.is_some() {
+                return false;
+            }
             let Some(names) = Self::member_chain(e) else {
                 return false;
             };
             let skip = usize::from(
-                recv.is_some_and(|r| names.len() >= 3 && names[0] == r && names[1] == prop),
+                t.recv
+                    .is_some_and(|r| names.len() >= 3 && names[0] == r && names[1] == t.prop),
             );
-            if names.len() < skip + 2 || names[skip] != prop {
+            if names.len() < skip + 2 || names[skip] != t.prop {
                 return false;
             }
             *e = Self::chain_expr(&names[skip + 1..], e.span);
@@ -687,44 +763,98 @@ impl Simulator {
         match &mut e.kind {
             ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
             ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
-                Self::rebase_expr(operand, prop, recv, hit)
+                Self::rebase_expr(operand, t, hit)
             }
             ExprKind::Binary { left, right, .. }
             | ExprKind::Range(left, right)
             | ExprKind::Index {
                 expr: left,
                 index: right,
-            } => {
-                Self::rebase_expr(left, prop, recv, hit)
-                    && Self::rebase_expr(right, prop, recv, hit)
-            }
+            } => Self::rebase_expr(left, t, hit) && Self::rebase_expr(right, t, hit),
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                Self::rebase_expr(condition, prop, recv, hit)
-                    && Self::rebase_expr(then_expr, prop, recv, hit)
-                    && Self::rebase_expr(else_expr, prop, recv, hit)
+                Self::rebase_expr(condition, t, hit)
+                    && Self::rebase_expr(then_expr, t, hit)
+                    && Self::rebase_expr(else_expr, t, hit)
             }
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
-                Self::rebase_expr(expr, prop, recv, hit)
-                    && Self::rebase_expr(left, prop, recv, hit)
-                    && Self::rebase_expr(right, prop, recv, hit)
+                Self::rebase_expr(expr, t, hit)
+                    && Self::rebase_expr(left, t, hit)
+                    && Self::rebase_expr(right, t, hit)
             }
-            ExprKind::Concatenation(parts) => parts
-                .iter_mut()
-                .all(|p| Self::rebase_expr(p, prop, recv, hit)),
+            ExprKind::Concatenation(parts) => {
+                parts.iter_mut().all(|p| Self::rebase_expr(p, t, hit))
+            }
             ExprKind::Inside { expr, ranges } => {
-                Self::rebase_expr(expr, prop, recv, hit)
-                    && ranges
-                        .iter_mut()
-                        .all(|r| Self::rebase_expr(r, prop, recv, hit))
+                Self::rebase_expr(expr, t, hit)
+                    && ranges.iter_mut().all(|r| Self::rebase_expr(r, t, hit))
             }
             _ => false,
         }
+    }
+
+    /// An operand path through an element of the collection `t.prop`
+    /// (`prop[idx].a.b`, or `<receiver>.prop[idx].a.b`). `None`: not such a
+    /// path. `Some(Some(rest))`: it names element `t.elem` — `rest` is the
+    /// member chain below it (`[a, b]`). `Some(None)`: it names another
+    /// element, an index unknown before the solve, or the element handle
+    /// itself, so it cannot be read inside that element's solve.
+    fn elem_path_rest(e: &Expression, t: &Rebase<'_>) -> Option<Option<Vec<String>>> {
+        let k = t.elem?;
+        let idx_is_elem = |idx: &Expression| {
+            let iter = matches!(&idx.kind, ExprKind::Ident(h)
+                if t.iter.is_some_and(|i| h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && h.path[0].name.name == i));
+            iter || Self::try_const_u64(idx) == Some(k)
+        };
+        // `prop[idx].a.b` as one identifier path whose first segment carries
+        // the select.
+        if let ExprKind::Ident(h) = &e.kind {
+            let first = h.path.first()?;
+            if h.root.is_some()
+                || first.name.name != t.prop
+                || first.selects.len() != 1
+                || h.path[1..].iter().any(|s| !s.selects.is_empty())
+            {
+                return None;
+            }
+            if h.path.len() < 2 || !idx_is_elem(&first.selects[0]) {
+                return Some(None);
+            }
+            return Some(Some(
+                h.path[1..].iter().map(|s| s.name.name.clone()).collect(),
+            ));
+        }
+        // `prop[idx].a.b` as a member-access chain over an index expression.
+        let mut names = Vec::new();
+        let mut cur = e;
+        while let ExprKind::MemberAccess { expr, member } = &cur.kind {
+            names.push(member.name.clone());
+            cur = expr;
+        }
+        let ExprKind::Index { expr: arr, index } = &cur.kind else {
+            return None;
+        };
+        let names_arr = Self::member_chain(arr)?;
+        let on_prop = names_arr == [t.prop]
+            || t.recv.is_some_and(|r| {
+                names_arr.len() == 2 && names_arr[0] == r && names_arr[1] == t.prop
+            });
+        if !on_prop {
+            return None;
+        }
+        if names.is_empty() || !idx_is_elem(index) {
+            return Some(None);
+        }
+        names.reverse();
+        Some(Some(names))
     }
 }
 

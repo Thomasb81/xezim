@@ -135477,7 +135477,20 @@ impl Simulator {
                         .get(prop)
                         .and_then(|sig| sig.type_name.clone())
                         .filter(|tn| self.module.enum_members.contains_key(tn));
-                    if let Some(&(lo, hi, w)) = class_def.array_properties.get(prop) {
+                    // A member typed by a class (a handle, or a collection of
+                    // handles) holds object references, not random values.
+                    let is_handle = class_def
+                        .properties
+                        .get(prop)
+                        .and_then(|s| s.type_name.clone())
+                        .is_some_and(|tn| self.module.classes.contains_key(&tn));
+                    // §18.4: the elements of a fixed `rand obj arr[N]` are
+                    // randomized recursively like any rand handle; drawing
+                    // them as integers overwrote every handle with a random
+                    // number, leaving the elements pointing at no object.
+                    if let Some(&(lo, hi, w)) = class_def.array_properties.get(prop)
+                        && !is_handle
+                    {
                         rand_arrays.push((
                             prop.clone(),
                             format!("{}#{}", handle, prop),
@@ -135487,7 +135500,9 @@ impl Simulator {
                             enum_t.clone(),
                         ));
                     }
-                    if let Some((shape, w)) = class_def.array_nd_properties.get(prop) {
+                    if let Some((shape, w)) = class_def.array_nd_properties.get(prop)
+                        && !is_handle
+                    {
                         rand_nd_arrays.push((
                             prop.clone(),
                             format!("{}#{}", handle, prop),
@@ -135501,11 +135516,6 @@ impl Simulator {
                     // it would only pollute the property map.
                     let is_coll = class_def.queue_properties.contains_key(prop)
                         || class_def.assoc_properties.contains_key(prop);
-                    let is_handle = class_def
-                        .properties
-                        .get(prop)
-                        .and_then(|s| s.type_name.clone())
-                        .is_some_and(|tn| self.module.classes.contains_key(&tn));
                     if is_handle {
                         // §18.4/§18.5.9: randomize the referenced object, never
                         // the handle itself (a random handle would be a dangling
@@ -136037,7 +136047,16 @@ impl Simulator {
                                     && self.randomize_depth < 8
                                     && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
                                 {
-                                    self.randomize_nested(sub);
+                                    // §18.5.9: `arr[i].fld …` items of this
+                                    // solve join element i's own solve, as
+                                    // for a single rand handle below.
+                                    let pushed = pushdown
+                                        .entry(format!("{}[{}]", p, i))
+                                        .or_insert_with(|| {
+                                            self.pushdown_elem_items(p, i, &constraints)
+                                        })
+                                        .clone();
+                                    self.randomize_nested_with(sub, &pushed);
                                 }
                             }
                         }
@@ -137394,14 +137413,24 @@ impl Simulator {
         rand_set: &HashSet<String>,
     ) -> Option<RandMemberTarget> {
         let (base, field) = Self::split_trailing_member(expr)?;
-        // The receiver must be a `rand` property of the object being solved.
-        let ExprKind::Ident(bh) = &base.kind else {
+        // The receiver must be a `rand` property of the object being solved,
+        // or an element of a rand collection of handles (`arr[i].fld`, §18.4).
+        let mut root = &base;
+        while let ExprKind::Index { expr: b, .. } = &root.kind {
+            root = b;
+        }
+        let ExprKind::Ident(bh) = &root.kind else {
             return None;
         };
         if bh.path.len() != 1 || !rand_set.contains(&bh.path[0].name.name) {
             return None;
         }
-        if let Some(r) = self.class_agg_member_parts(&base, &field) {
+        if !std::ptr::eq(root, &base) {
+            // Only a collection of handles: other indexed receivers keep
+            // their own element paths.
+            let this = self.this_stack.last().copied().flatten()?;
+            self.prop_class_type(this, &bh.path[0].name.name)?;
+        } else if let Some(r) = self.class_agg_member_parts(&base, &field) {
             return Some(RandMemberTarget::Agg(r));
         }
         // `rand` object handle: resolve it and target the sub-object's property.
@@ -139633,6 +139662,36 @@ impl Simulator {
                 }
                 let mut changed = false;
                 let mut idx: Vec<i64> = used.iter().map(|d| d.0).collect();
+                // §18.4: the elements of a rand collection of handles are
+                // object references, never values to draw. Solve the body
+                // with the iterators bound, so `arr[i].fld == …` reaches the
+                // member of element i's object.
+                if self.prop_class_type(handle, &arr_name).is_some() {
+                    loop {
+                        let frame: HashMap<String, Value> = idx_names
+                            .iter()
+                            .zip(&idx)
+                            .map(|(nm, &i)| (nm.clone(), Value::from_u64(i as u64, 32)))
+                            .collect();
+                        self.push_local_frame(frame);
+                        if self.solve_forced(handle, body, rand_set) {
+                            changed = true;
+                        }
+                        self.pop_local_frame();
+                        let mut k = used.len();
+                        loop {
+                            if k == 0 {
+                                return changed;
+                            }
+                            k -= 1;
+                            idx[k] += 1;
+                            if idx[k] <= used[k].1 {
+                                break;
+                            }
+                            idx[k] = used[k].0;
+                        }
+                    }
+                }
                 loop {
                     // Bind every index and address the element by its full
                     // index path — `arr[i][j]`, not just the first dimension.
