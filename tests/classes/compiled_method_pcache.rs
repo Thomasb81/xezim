@@ -64,9 +64,27 @@ fn run_cached(src: &PathBuf, cache: &PathBuf, tier: &str) -> String {
 }
 
 fn write_src(name: &str, body: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("xezim-pcache-{}.sv", name));
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT_SOURCE: AtomicUsize = AtomicUsize::new(0);
+    let p = std::env::temp_dir().join(format!(
+        "xezim-pcache-{}-{}-{}.sv",
+        name,
+        std::process::id(),
+        NEXT_SOURCE.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&p, body).expect("write src");
     p
+}
+
+#[test]
+fn source_files_are_isolated_between_invocations() {
+    let first = write_src("isolation", "first source");
+    let second = write_src("isolation", "second source");
+    assert_ne!(first, second);
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first source");
+    assert_eq!(std::fs::read_to_string(&second).unwrap(), "second source");
+    std::fs::remove_file(first).unwrap();
+    std::fs::remove_file(second).unwrap();
 }
 
 const WORKLOAD: &str = r#"

@@ -12,6 +12,330 @@
 use super::*;
 use crate::ast::decl::DistWeight;
 
+/// §18.6: only the active rand state of reachable child objects belongs to
+/// a solve transaction. Unrelated objects and non-rand callback state do not.
+pub(super) struct RandChildSnapshot {
+    handle: usize,
+    properties: Vec<(String, Option<Value>)>,
+    collections: Vec<(String, Vec<(String, Value)>)>,
+}
+
+pub(super) struct RandChildTransaction {
+    pub(super) owner: usize,
+    pub(super) children: Vec<RandChildSnapshot>,
+}
+
+impl Simulator {
+    /// Active rand members of a child object. A caller's member-subset list
+    /// applies only to the parent, not to the recursively randomized child.
+    fn active_child_rand_members(&self, handle: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let disabled = self.rand_mode_disabled.get(&handle);
+        if disabled.is_some_and(|d| d.contains("*")) {
+            return out;
+        }
+        let mut seen = HashSet::default();
+        let mut cls = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|o| o.class_name.as_str());
+        while let Some(name) = cls {
+            let Some(cd) = self.module.classes.get(name) else {
+                break;
+            };
+            for prop in &cd.property_order {
+                if seen.insert(prop.clone())
+                    && cd.random_properties.contains(prop)
+                    && !disabled.is_some_and(|d| d.contains(prop))
+                {
+                    out.push(prop.clone());
+                }
+            }
+            cls = cd.extends.as_deref();
+        }
+        out
+    }
+
+    /// Storage keys of a class collection, or None for a scalar property.
+    /// Fixed arrays use their declared labels, including inherited ranges.
+    fn rand_child_collection_keys(&self, handle: usize, prop: &str) -> Option<Vec<String>> {
+        let scoped = format!("{}#{}", handle, prop);
+        let mut cls = self
+            .heap
+            .get(handle)?
+            .as_ref()
+            .map(|o| o.class_name.as_str());
+        while let Some(name) = cls {
+            let cd = self.module.classes.get(name)?;
+            if let Some(&(lo, hi, _)) = cd.array_properties.get(prop) {
+                return Some((lo..=hi).map(|i| format!("{}[{}]", scoped, i)).collect());
+            }
+            if cd.array_nd_properties.contains_key(prop) {
+                let mut keys = self.signals.keys_with_elem_prefix(&format!("{}[", scoped));
+                keys.retain(|k| k.ends_with(']'));
+                keys.sort();
+                return Some(keys);
+            }
+            if cd.assoc_properties.contains_key(prop) {
+                return Some(
+                    self.assoc_key_strs(&scoped)
+                        .into_iter()
+                        .map(|k| format!("{}[{}]", scoped, k))
+                        .collect(),
+                );
+            }
+            if cd.queue_properties.contains_key(prop) {
+                return Some(
+                    (0..self.get_queue_size(&scoped))
+                        .map(|i| format!("{}[{}]", scoped, i))
+                        .collect(),
+                );
+            }
+            if cd.properties.contains_key(prop) {
+                return None;
+            }
+            cls = cd.extends.as_deref();
+        }
+        None
+    }
+
+    /// §18.5.9: enumerate reachable rand objects once, including elements of
+    /// handle collections. Shared handles and cycles must not duplicate work.
+    pub(super) fn rand_child_handles(&self, handle: usize, props: &[String]) -> Vec<usize> {
+        if props.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut seen = HashSet::default();
+        seen.insert(handle);
+        let mut pending = vec![(handle, props.to_vec())];
+        while let Some((owner, members)) = pending.pop() {
+            for prop in members {
+                if self.prop_class_type(owner, &prop).is_none() {
+                    continue;
+                }
+                let values: Vec<Value> = match self.rand_child_collection_keys(owner, &prop) {
+                    Some(keys) => keys.iter().filter_map(|k| self.read_coll_elem(k)).collect(),
+                    None => self
+                        .heap
+                        .get(owner)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|o| o.properties.get(&prop))
+                        .cloned()
+                        .into_iter()
+                        .collect(),
+                };
+                for v in values {
+                    let sub = v.to_u64().unwrap_or(0) as usize;
+                    if sub != 0
+                        && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
+                        && seen.insert(sub)
+                    {
+                        out.push(sub);
+                        pending.push((sub, self.active_child_rand_members(sub)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub(super) fn snapshot_rand_children(&self, handles: &[usize]) -> Vec<RandChildSnapshot> {
+        handles
+            .iter()
+            .map(|&handle| {
+                let mut properties = Vec::new();
+                let mut collections = Vec::new();
+                for prop in self.active_child_rand_members(handle) {
+                    if self.rand_child_collection_keys(handle, &prop).is_some() {
+                        let scoped = format!("{}#{}", handle, prop);
+                        let mut keys = self.signals.keys_with_elem_prefix(&format!("{}[", scoped));
+                        keys.push(format!("{}.size", scoped));
+                        let saved = keys
+                            .into_iter()
+                            .filter_map(|key| self.signals.get(&key).cloned().map(|v| (key, v)))
+                            .collect();
+                        collections.push((scoped, saved));
+                    } else {
+                        let mut keys = vec![prop.clone()];
+                        // Unpacked rand aggregates use separate property
+                        // slots for their declared rand/randc members.
+                        if let Some(tn) = self.class_prop_type_name(handle, &prop)
+                            && let Some(dt) = self.module.typedef_types.get(&tn)
+                            && let DataType::Struct(su) =
+                                Self::resolve_type_ref(dt, &self.module.typedef_types)
+                            && Self::spreads_member_wise(&su)
+                        {
+                            for member in &su.members {
+                                if member.rand_qualifier.is_some() {
+                                    keys.extend(
+                                        member
+                                            .declarators
+                                            .iter()
+                                            .map(|d| format!("{}.{}", prop, d.name.name)),
+                                    );
+                                }
+                            }
+                        }
+                        for key in keys {
+                            let value = self
+                                .heap
+                                .get(handle)
+                                .and_then(|o| o.as_ref())
+                                .and_then(|o| o.properties.get(&key))
+                                .cloned();
+                            properties.push((key, value));
+                        }
+                    }
+                }
+                RandChildSnapshot {
+                    handle,
+                    properties,
+                    collections,
+                }
+            })
+            .collect()
+    }
+
+    pub(super) fn restore_rand_children(&mut self, saved: Vec<RandChildSnapshot>) {
+        for snap in saved {
+            if let Some(Some(obj)) = self.heap.get_mut(snap.handle) {
+                for (prop, value) in snap.properties {
+                    match value {
+                        Some(v) => {
+                            obj.properties.insert(prop, v);
+                        }
+                        None => {
+                            obj.properties.remove(&prop);
+                        }
+                    }
+                }
+            }
+            for (scoped, values) in snap.collections {
+                for key in self.signals.keys_with_elem_prefix(&format!("{}[", scoped)) {
+                    self.signals.remove(&key);
+                }
+                self.signals.remove(&format!("{}.size", scoped));
+                for (key, value) in values {
+                    self.write_coll_elem(&key, value);
+                }
+            }
+        }
+    }
+
+    /// A callback's explicit writes are not solver draws. Preserve just its
+    /// changed rand slots in enclosing transactions, even if a solve fails.
+    pub(super) fn exec_pre_randomize_preserving_children(&mut self, handle: usize) {
+        let tracked = self.rand_child_snapshots.iter().any(|transaction| {
+            transaction
+                .children
+                .iter()
+                .any(|snapshot| snapshot.handle == handle)
+        });
+        let before = if tracked {
+            let members = self.active_child_rand_members(handle);
+            let mut handles = self.rand_child_handles(handle, &members);
+            handles.push(handle);
+            self.snapshot_rand_children(&handles)
+        } else {
+            Vec::new()
+        };
+        self.exec_method_call(handle, "pre_randomize", &[]);
+        // A callback may replace a rand handle. Its new graph joins the
+        // transaction at the post-callback state, before any solver draws.
+        if tracked {
+            let members = self.active_child_rand_members(handle);
+            let reachable = self.rand_child_handles(handle, &members);
+            let added = self.snapshot_rand_children(&reachable);
+            for transaction in &mut self.rand_child_snapshots {
+                if !transaction
+                    .children
+                    .iter()
+                    .any(|snapshot| snapshot.handle == handle)
+                {
+                    continue;
+                }
+                for snapshot in &added {
+                    if snapshot.handle != transaction.owner
+                        && !transaction
+                            .children
+                            .iter()
+                            .any(|saved| saved.handle == snapshot.handle)
+                    {
+                        transaction.children.push(RandChildSnapshot {
+                            handle: snapshot.handle,
+                            properties: snapshot.properties.clone(),
+                            collections: snapshot.collections.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        for prior in before {
+            let owner = prior.handle;
+            let mut properties = Vec::new();
+            for (key, old) in prior.properties {
+                let new = self
+                    .heap
+                    .get(owner)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|o| o.properties.get(&key))
+                    .cloned();
+                if old != new {
+                    properties.push((key, new));
+                }
+            }
+            let mut collections = Vec::new();
+            for (scoped, old) in prior.collections {
+                let mut keys = self.signals.keys_with_elem_prefix(&format!("{}[", scoped));
+                keys.push(format!("{}.size", scoped));
+                keys.extend(old.iter().map(|(key, _)| key.clone()));
+                keys.sort();
+                keys.dedup();
+                let mut changed = Vec::new();
+                for key in keys {
+                    let before = old.iter().find(|(k, _)| k == &key).map(|(_, v)| v);
+                    let after = self.signals.get(&key);
+                    if before != after {
+                        changed.push((key, after.cloned()));
+                    }
+                }
+                if !changed.is_empty() {
+                    collections.push((scoped, changed));
+                }
+            }
+            for transaction in &mut self.rand_child_snapshots {
+                for snapshot in transaction
+                    .children
+                    .iter_mut()
+                    .filter(|s| s.handle == owner)
+                {
+                    for (key, value) in &properties {
+                        if let Some((_, saved)) =
+                            snapshot.properties.iter_mut().find(|(k, _)| k == key)
+                        {
+                            *saved = value.clone();
+                        }
+                    }
+                    for (scoped, changed) in &collections {
+                        if let Some((_, values)) =
+                            snapshot.collections.iter_mut().find(|(s, _)| s == scoped)
+                        {
+                            for (key, value) in changed {
+                                values.retain(|(k, _)| k != key);
+                                if let Some(value) = value {
+                                    values.push((key.clone(), value.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Where the root name of an operand binds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Bind {
@@ -576,6 +900,18 @@ impl Simulator {
     }
 }
 
+/// What `rebase_expr` strips from an operand path: `prop.` for a rand handle
+/// member, or `prop[elem].` for one element of a rand handle collection.
+struct Rebase<'a> {
+    prop: &'a str,
+    /// Plain name of the randomize() receiver (`<receiver>.prop.…`).
+    recv: Option<&'a str>,
+    /// `Some(k)`: rebase onto element `k` of the collection `prop`.
+    elem: Option<u64>,
+    /// The `foreach (prop[i])` iterator, bound to `elem` (§18.5.8.1).
+    iter: Option<&'a str>,
+}
+
 impl Simulator {
     /// §18.5.9 — the constraint items of an enclosing solve that constrain
     /// ONLY the rand sub-object behind member `prop`, rewritten relative to
@@ -590,50 +926,89 @@ impl Simulator {
         prop: &str,
         constraints: &[ClassConstraint],
     ) -> Vec<ConstraintItem> {
-        let recv = self.rand_receiver.as_deref();
+        self.pushdown_into(prop, None, constraints)
+    }
+
+    /// §18.4/§18.5.9 — the same for element `elem` of a rand collection of
+    /// object handles (`rand obj arr[N]`): `arr[elem].fld …` items, and the
+    /// body of `foreach (arr[i])` with `i` bound to `elem`, constrain only
+    /// that element's object.
+    pub(super) fn pushdown_elem_items(
+        &self,
+        prop: &str,
+        elem: u64,
+        constraints: &[ClassConstraint],
+    ) -> Vec<ConstraintItem> {
+        self.pushdown_into(prop, Some(elem), constraints)
+    }
+
+    fn pushdown_into(
+        &self,
+        prop: &str,
+        elem: Option<u64>,
+        constraints: &[ClassConstraint],
+    ) -> Vec<ConstraintItem> {
+        let t = Rebase {
+            prop,
+            recv: self.rand_receiver.as_deref(),
+            elem,
+            iter: None,
+        };
         let mut out = Vec::new();
         for con in constraints {
             for it in &con.items {
-                Self::pushdown_item(it, prop, recv, &mut out);
+                Self::pushdown_item(it, &t, &mut out);
             }
         }
         out
     }
 
-    fn pushdown_item(
-        it: &ConstraintItem,
-        prop: &str,
-        recv: Option<&str>,
-        out: &mut Vec<ConstraintItem>,
-    ) {
+    fn pushdown_item(it: &ConstraintItem, t: &Rebase<'_>, out: &mut Vec<ConstraintItem>) {
         if let ConstraintItem::Block(items) = it {
             for i in items {
-                Self::pushdown_item(i, prop, recv, out);
+                Self::pushdown_item(i, t, out);
+            }
+            return;
+        }
+        // `foreach (prop[i]) body` over the collection itself: the body, with
+        // `i` bound to this element, is a candidate item for the element.
+        if let (
+            Some(_),
+            ConstraintItem::Foreach {
+                array, vars, item, ..
+            },
+        ) = (t.elem, it)
+        {
+            let over_prop = matches!(&array.kind, ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && h.path[0].name.name == t.prop);
+            if let ([Some(iter)], true) = (vars.as_slice(), over_prop) {
+                let ti = Rebase {
+                    iter: Some(&iter.name),
+                    ..*t
+                };
+                Self::pushdown_item(item, &ti, out);
             }
             return;
         }
         let mut c = it.clone();
         let mut hit = false;
-        if Self::rebase_item(&mut c, prop, recv, &mut hit) && hit {
+        if Self::rebase_item(&mut c, t, &mut hit) && hit {
             out.push(c);
         }
     }
 
-    fn rebase_item(
-        it: &mut ConstraintItem,
-        prop: &str,
-        recv: Option<&str>,
-        hit: &mut bool,
-    ) -> bool {
+    fn rebase_item(it: &mut ConstraintItem, t: &Rebase<'_>, hit: &mut bool) -> bool {
         match it {
-            ConstraintItem::Expr(e) => Self::rebase_expr(e, prop, recv, hit),
+            ConstraintItem::Expr(e) => Self::rebase_expr(e, t, hit),
             ConstraintItem::Inside { expr, range, .. } => {
-                Self::rebase_expr(expr, prop, recv, hit)
+                Self::rebase_expr(expr, t, hit)
                     && range.iter_mut().all(|r| match r {
-                        ConstraintRange::Value(v) => Self::rebase_expr(v, prop, recv, hit),
+                        ConstraintRange::Value(v) => Self::rebase_expr(v, t, hit),
                         ConstraintRange::Range { lo, hi } => {
-                            Self::rebase_expr(lo, prop, recv, hit)
-                                && Self::rebase_expr(hi, prop, recv, hit)
+                            Self::rebase_expr(lo, t, hit) && Self::rebase_expr(hi, t, hit)
                         }
                     })
             }
@@ -641,26 +1016,21 @@ impl Simulator {
                 condition,
                 constraint,
                 ..
-            } => {
-                Self::rebase_expr(condition, prop, recv, hit)
-                    && Self::rebase_item(constraint, prop, recv, hit)
-            }
+            } => Self::rebase_expr(condition, t, hit) && Self::rebase_item(constraint, t, hit),
             ConstraintItem::IfElse {
                 condition,
                 then_item,
                 else_item,
                 ..
             } => {
-                Self::rebase_expr(condition, prop, recv, hit)
-                    && Self::rebase_item(then_item, prop, recv, hit)
+                Self::rebase_expr(condition, t, hit)
+                    && Self::rebase_item(then_item, t, hit)
                     && else_item
                         .as_mut()
-                        .is_none_or(|e| Self::rebase_item(e, prop, recv, hit))
+                        .is_none_or(|e| Self::rebase_item(e, t, hit))
             }
-            ConstraintItem::Soft(inner) => Self::rebase_item(inner, prop, recv, hit),
-            ConstraintItem::Block(items) => items
-                .iter_mut()
-                .all(|i| Self::rebase_item(i, prop, recv, hit)),
+            ConstraintItem::Soft(inner) => Self::rebase_item(inner, t, hit),
+            ConstraintItem::Block(items) => items.iter_mut().all(|i| Self::rebase_item(i, t, hit)),
             _ => false,
         }
     }
@@ -668,16 +1038,46 @@ impl Simulator {
     /// Strip `prop.` (or `<receiver>.prop.`) from every operand path of `e`
     /// (`prop.x.y` parses as a member-access chain over `prop`); false when
     /// an operand is anything else a sub-object solve could not read the
-    /// same way (an enclosing member, a call, `this`).
-    fn rebase_expr(e: &mut Expression, prop: &str, recv: Option<&str>, hit: &mut bool) -> bool {
+    /// same way (an enclosing member, a call, `this`). For an element
+    /// rebase the prefix is `prop[elem].`, and a bound foreach iterator
+    /// becomes the element's index.
+    fn rebase_expr(e: &mut Expression, t: &Rebase<'_>, hit: &mut bool) -> bool {
+        if let Some(k) = t.elem {
+            if let ExprKind::Ident(h) = &e.kind
+                && t.iter.is_some_and(|i| {
+                    h.root.is_none()
+                        && h.path.len() == 1
+                        && h.path[0].selects.is_empty()
+                        && h.path[0].name.name == i
+                })
+            {
+                *e = Self::literal_of(&Value::from_u64(k, 32), e.span);
+                return true;
+            }
+            if let Some(rest) = Self::elem_path_rest(e, t) {
+                return match rest {
+                    Some(names) => {
+                        *e = Self::chain_expr(&names, e.span);
+                        *hit = true;
+                        true
+                    }
+                    None => false,
+                };
+            }
+        }
         if matches!(e.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. }) {
+            // A plain `prop.x` path names no single element of a collection.
+            if t.elem.is_some() {
+                return false;
+            }
             let Some(names) = Self::member_chain(e) else {
                 return false;
             };
             let skip = usize::from(
-                recv.is_some_and(|r| names.len() >= 3 && names[0] == r && names[1] == prop),
+                t.recv
+                    .is_some_and(|r| names.len() >= 3 && names[0] == r && names[1] == t.prop),
             );
-            if names.len() < skip + 2 || names[skip] != prop {
+            if names.len() < skip + 2 || names[skip] != t.prop {
                 return false;
             }
             *e = Self::chain_expr(&names[skip + 1..], e.span);
@@ -687,44 +1087,98 @@ impl Simulator {
         match &mut e.kind {
             ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
             ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
-                Self::rebase_expr(operand, prop, recv, hit)
+                Self::rebase_expr(operand, t, hit)
             }
             ExprKind::Binary { left, right, .. }
             | ExprKind::Range(left, right)
             | ExprKind::Index {
                 expr: left,
                 index: right,
-            } => {
-                Self::rebase_expr(left, prop, recv, hit)
-                    && Self::rebase_expr(right, prop, recv, hit)
-            }
+            } => Self::rebase_expr(left, t, hit) && Self::rebase_expr(right, t, hit),
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
             } => {
-                Self::rebase_expr(condition, prop, recv, hit)
-                    && Self::rebase_expr(then_expr, prop, recv, hit)
-                    && Self::rebase_expr(else_expr, prop, recv, hit)
+                Self::rebase_expr(condition, t, hit)
+                    && Self::rebase_expr(then_expr, t, hit)
+                    && Self::rebase_expr(else_expr, t, hit)
             }
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
-                Self::rebase_expr(expr, prop, recv, hit)
-                    && Self::rebase_expr(left, prop, recv, hit)
-                    && Self::rebase_expr(right, prop, recv, hit)
+                Self::rebase_expr(expr, t, hit)
+                    && Self::rebase_expr(left, t, hit)
+                    && Self::rebase_expr(right, t, hit)
             }
-            ExprKind::Concatenation(parts) => parts
-                .iter_mut()
-                .all(|p| Self::rebase_expr(p, prop, recv, hit)),
+            ExprKind::Concatenation(parts) => {
+                parts.iter_mut().all(|p| Self::rebase_expr(p, t, hit))
+            }
             ExprKind::Inside { expr, ranges } => {
-                Self::rebase_expr(expr, prop, recv, hit)
-                    && ranges
-                        .iter_mut()
-                        .all(|r| Self::rebase_expr(r, prop, recv, hit))
+                Self::rebase_expr(expr, t, hit)
+                    && ranges.iter_mut().all(|r| Self::rebase_expr(r, t, hit))
             }
             _ => false,
         }
+    }
+
+    /// An operand path through an element of the collection `t.prop`
+    /// (`prop[idx].a.b`, or `<receiver>.prop[idx].a.b`). `None`: not such a
+    /// path. `Some(Some(rest))`: it names element `t.elem` — `rest` is the
+    /// member chain below it (`[a, b]`). `Some(None)`: it names another
+    /// element, an index unknown before the solve, or the element handle
+    /// itself, so it cannot be read inside that element's solve.
+    fn elem_path_rest(e: &Expression, t: &Rebase<'_>) -> Option<Option<Vec<String>>> {
+        let k = t.elem?;
+        let idx_is_elem = |idx: &Expression| {
+            let iter = matches!(&idx.kind, ExprKind::Ident(h)
+                if t.iter.is_some_and(|i| h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                    && h.path[0].name.name == i));
+            iter || Self::try_const_u64(idx) == Some(k)
+        };
+        // `prop[idx].a.b` as one identifier path whose first segment carries
+        // the select.
+        if let ExprKind::Ident(h) = &e.kind {
+            let first = h.path.first()?;
+            if h.root.is_some()
+                || first.name.name != t.prop
+                || first.selects.len() != 1
+                || h.path[1..].iter().any(|s| !s.selects.is_empty())
+            {
+                return None;
+            }
+            if h.path.len() < 2 || !idx_is_elem(&first.selects[0]) {
+                return Some(None);
+            }
+            return Some(Some(
+                h.path[1..].iter().map(|s| s.name.name.clone()).collect(),
+            ));
+        }
+        // `prop[idx].a.b` as a member-access chain over an index expression.
+        let mut names = Vec::new();
+        let mut cur = e;
+        while let ExprKind::MemberAccess { expr, member } = &cur.kind {
+            names.push(member.name.clone());
+            cur = expr;
+        }
+        let ExprKind::Index { expr: arr, index } = &cur.kind else {
+            return None;
+        };
+        let names_arr = Self::member_chain(arr)?;
+        let on_prop = names_arr == [t.prop]
+            || t.recv.is_some_and(|r| {
+                names_arr.len() == 2 && names_arr[0] == r && names_arr[1] == t.prop
+            });
+        if !on_prop {
+            return None;
+        }
+        if names.is_empty() || !idx_is_elem(index) {
+            return Some(None);
+        }
+        names.reverse();
+        Some(Some(names))
     }
 }
 

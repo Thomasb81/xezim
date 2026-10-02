@@ -261,6 +261,8 @@ mod release_from_level_sensitive_block;
 mod static_recursion_shared_cell;
 #[path = "scheduling/sva_instances_and_sequences.rs"]
 mod sva_instances_and_sequences;
+#[path = "scheduling/sva_local_diagnostics.rs"]
+mod sva_local_diagnostics;
 #[path = "scheduling/sva_semantics_reference.rs"]
 mod sva_semantics_reference;
 #[path = "scheduling/waiter_cont_anyedge_wake.rs"]

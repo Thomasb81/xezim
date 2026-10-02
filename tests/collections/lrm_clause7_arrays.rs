@@ -89,6 +89,46 @@ module tb;
 endmodule
 "#;
 
+#[test]
+fn dynamic_copy_initializer_from_object_member() {
+    let src = r#"
+class leaf_record;
+  int words[] = '{21, 22};
+endclass
+class branch_record;
+  leaf_record child;
+  int visits;
+  function new(); child = new(); endfunction
+  function void grow(); child.words = new[3](child.words); endfunction
+  function leaf_record fetch(); visits++; return child; endfunction
+endclass
+module top;
+  initial begin
+    branch_record data_set = new();
+    leaf_record other = new();
+    data_set.grow();
+    $display("grow=%0d,%0d,%0d size=%0d", data_set.child.words[0], data_set.child.words[1], data_set.child.words[2], data_set.child.words.size());
+    other.words = new[4](data_set.fetch().words);
+    $display("copy=%0d,%0d,%0d,%0d size=%0d visits=%0d", other.words[0], other.words[1], other.words[2], other.words[3], other.words.size(), data_set.visits);
+    other.words = new[1](other.words);
+    $display("shrink=%0d size=%0d source=%0d,%0d size=%0d", other.words[0], other.words.size(), data_set.child.words[0], data_set.child.words[1], data_set.child.words.size());
+    $finish;
+  end
+endmodule
+"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    let out: Vec<&str> = sim.output.iter().map(|o| o.message.as_str()).collect();
+    assert_eq!(
+        out,
+        [
+            "grow=21,22,0 size=3",
+            "copy=21,22,0,0 size=4 visits=1",
+            "shrink=21 size=1 source=21,22 size=3",
+        ],
+        "{out:?}"
+    );
+}
+
 fn u(sim: &xezim::compiler::Simulator, n: &str) -> u64 {
     sim.get_signal(n)
         .or_else(|| sim.get_signal(&format!("tb.{}", n)))

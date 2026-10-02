@@ -215,6 +215,17 @@ fn compiled_methods_enabled() -> bool {
     })
 }
 
+/// Method diagnostics follow the same process-lifetime policy as compilation.
+/// Cached calls must not search the environment on every method invocation.
+fn method_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XEZIM_FALLBACK_SITES")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
+}
+
 /// class-perf ADAPTIVE tiering: with the gate on, a method body is compiled
 /// only once it has been CALLED *(cid, mid)* this many times
 /// (`XEZIM_METHOD_TIER`). "Adaptive" here is two structural properties, not
@@ -6151,6 +6162,8 @@ pub struct Simulator {
     /// for `rand` class-handle members (a cyclic object graph would otherwise
     /// recurse forever).
     randomize_depth: usize,
+    /// Active enclosing solves retain only their reachable children's rand state.
+    rand_child_snapshots: Vec<rand_scope::RandChildTransaction>,
     /// IEEE 1800-2017 §18.5.11 — a `static constraint` block is SHARED by every
     /// instance of the class: `constraint_mode()` on it through ANY instance
     /// (or through the class scope) sets one class-wide flag. Keyed by
@@ -11452,6 +11465,7 @@ impl Simulator {
             constraint_mode_disabled: HashMap::default(),
             static_constraint_disabled: HashSet::default(),
             randomize_depth: 0,
+            rand_child_snapshots: Vec::new(),
             randc_used: HashMap::default(),
             randc_pending: HashMap::default(),
             dist_decks: HashMap::default(),
@@ -76675,6 +76689,13 @@ impl Simulator {
                     // snapshot is needed.
                     let src = src_expr.and_then(|e| match &e.kind {
                         ExprKind::Ident(h) => {
+                            // Resolve flattened object members before the
+                            // hierarchy resolver adds a module/local prefix.
+                            if h.path.len() > 1
+                                && let Some(storage) = self.expr_assoc_name(e)
+                            {
+                                return Some(storage);
+                            }
                             let n = self.resolve_hier_name(h);
                             // A class-member source (`new[t+1](slices)`
                             // in a method) lives at `<h>#slices` — the
@@ -76682,15 +76703,18 @@ impl Simulator {
                             // silently dropped every existing element.
                             Some(self.resolve_locator_storage(&n))
                         }
+                        // `obj.member` and indexed/call-bearing owners are
+                        // collection operands, not scalar broadcast values.
+                        ExprKind::MemberAccess { .. } => self.expr_assoc_name(e),
                         _ => None,
                     });
                     let keep = match &src {
                         Some(sn) => self.get_queue_size(sn).min(n),
                         None => 0,
                     };
-                    if let Some(sn) = src {
+                    if let Some(sn) = &src {
                         for i in 0..keep {
-                            self.queue_copy_elem(&sn, i, &name, i);
+                            self.queue_copy_elem(sn, i, &name, i);
                         }
                     }
                     // `T a[][16]`: each slot is itself a fixed array
@@ -76791,7 +76815,9 @@ impl Simulator {
                     // assignment pattern (array literal), not just a
                     // named source array. Populate elements from it,
                     // mirroring a plain `arr = '{...}` pattern assign.
-                    if let Some(se) = src_expr {
+                    if let Some(se) = src_expr
+                        && src.is_none()
+                    {
                         match &se.kind {
                             ExprKind::AssignmentPattern(items) => {
                                 for (i, item) in items.iter().enumerate() {
@@ -136880,7 +136906,20 @@ impl Simulator {
                         .get(prop)
                         .and_then(|sig| sig.type_name.clone())
                         .filter(|tn| self.module.enum_members.contains_key(tn));
-                    if let Some(&(lo, hi, w)) = class_def.array_properties.get(prop) {
+                    // A member typed by a class (a handle, or a collection of
+                    // handles) holds object references, not random values.
+                    let is_handle = class_def
+                        .properties
+                        .get(prop)
+                        .and_then(|s| s.type_name.clone())
+                        .is_some_and(|tn| self.module.classes.contains_key(&tn));
+                    // §18.4: the elements of a fixed `rand obj arr[N]` are
+                    // randomized recursively like any rand handle; drawing
+                    // them as integers overwrote every handle with a random
+                    // number, leaving the elements pointing at no object.
+                    if let Some(&(lo, hi, w)) = class_def.array_properties.get(prop)
+                        && !is_handle
+                    {
                         rand_arrays.push((
                             prop.clone(),
                             format!("{}#{}", handle, prop),
@@ -136890,7 +136929,9 @@ impl Simulator {
                             enum_t.clone(),
                         ));
                     }
-                    if let Some((shape, w)) = class_def.array_nd_properties.get(prop) {
+                    if let Some((shape, w)) = class_def.array_nd_properties.get(prop)
+                        && !is_handle
+                    {
                         rand_nd_arrays.push((
                             prop.clone(),
                             format!("{}#{}", handle, prop),
@@ -136904,11 +136945,6 @@ impl Simulator {
                     // it would only pollute the property map.
                     let is_coll = class_def.queue_properties.contains_key(prop)
                         || class_def.assoc_properties.contains_key(prop);
-                    let is_handle = class_def
-                        .properties
-                        .get(prop)
-                        .and_then(|s| s.type_name.clone())
-                        .is_some_and(|tn| self.module.classes.contains_key(&tn));
                     if is_handle {
                         // §18.4/§18.5.9: randomize the referenced object, never
                         // the handle itself (a random handle would be a dangling
@@ -137146,9 +137182,22 @@ impl Simulator {
         self.class_context_stack.push(Some(class_name.clone()));
         // SV semantics: randomize() calls pre_randomize() before solving.
         if self.class_has_method(&class_name, "pre_randomize") {
-            self.exec_method_call(handle, "pre_randomize", &[]);
+            self.exec_pre_randomize_preserving_children(handle);
         }
         let has_post = self.class_has_method(&class_name, "post_randomize");
+
+        // §18.6: a failed enclosing solve restores the rand state of its
+        // reachable children as well as its own scalar/collection state.
+        let child_handles = self.rand_child_handles(handle, &rand_obj_props);
+        let has_rand_children = !child_handles.is_empty();
+        if has_rand_children {
+            let child_saved = self.snapshot_rand_children(&child_handles);
+            self.rand_child_snapshots
+                .push(rand_scope::RandChildTransaction {
+                    owner: handle,
+                    children: child_saved,
+                });
+        }
 
         // ---------------------------------------------------------------
         // IEEE 1800-2017 §18.5.10 — variable ordering.
@@ -137235,6 +137284,9 @@ impl Simulator {
                     }
                     self.this_stack.pop();
                     self.class_context_stack.pop();
+                    if has_rand_children {
+                        self.rand_child_snapshots.pop();
+                    }
                     return Value::from_u64(1, 32);
                 }
             }
@@ -137337,6 +137389,9 @@ impl Simulator {
                     }
                     self.this_stack.pop();
                     self.class_context_stack.pop();
+                    if has_rand_children {
+                        self.rand_child_snapshots.pop();
+                    }
                     return Value::from_u64(1, 32);
                 }
                 out => {
@@ -137440,7 +137495,16 @@ impl Simulator {
                                     && self.randomize_depth < 8
                                     && self.heap.get(sub).and_then(|o| o.as_ref()).is_some()
                                 {
-                                    self.randomize_nested(sub);
+                                    // §18.5.9: `arr[i].fld …` items of this
+                                    // solve join element i's own solve, as
+                                    // for a single rand handle below.
+                                    let pushed = pushdown
+                                        .entry(format!("{}[{}]", p, i))
+                                        .or_insert_with(|| {
+                                            self.pushdown_elem_items(p, i, &constraints)
+                                        })
+                                        .clone();
+                                    self.randomize_nested_with(sub, &pushed);
                                 }
                             }
                         }
@@ -138571,6 +138635,9 @@ impl Simulator {
                 }
                 self.this_stack.pop();
                 self.class_context_stack.pop();
+                if has_rand_children {
+                    self.rand_child_snapshots.pop();
+                }
                 return Value::from_u64(1, 32);
             }
 
@@ -138594,7 +138661,9 @@ impl Simulator {
                     false,
                     &sub_objs,
                 ) {
-                    rand_csp::CspOutcome::Sat => {
+                    rand_csp::CspOutcome::Sat
+                        if self.sub_object_constraints_ok(handle, &rand_obj_props) =>
+                    {
                         // The joint solve rewrote the sub-objects after
                         // their own post_randomize ran: run it on the final
                         // values.
@@ -138613,6 +138682,9 @@ impl Simulator {
                         }
                         self.this_stack.pop();
                         self.class_context_stack.pop();
+                        if has_rand_children {
+                            self.rand_child_snapshots.pop();
+                        }
                         return Value::from_u64(1, 32);
                     }
                     rand_csp::CspOutcome::Unsat if !sized => {
@@ -138683,6 +138755,11 @@ impl Simulator {
         }
         // §18.4: randomize() failed — no value was actually produced, so give
         // every tentatively-drawn randc value back to its permutation cycle.
+        if has_rand_children {
+            if let Some(transaction) = self.rand_child_snapshots.pop() {
+                self.restore_rand_children(transaction.children);
+            }
+        }
         self.randc_rollback_all();
         self.this_stack.pop();
         self.class_context_stack.pop();
@@ -138797,14 +138874,24 @@ impl Simulator {
         rand_set: &HashSet<String>,
     ) -> Option<RandMemberTarget> {
         let (base, field) = Self::split_trailing_member(expr)?;
-        // The receiver must be a `rand` property of the object being solved.
-        let ExprKind::Ident(bh) = &base.kind else {
+        // The receiver must be a `rand` property of the object being solved,
+        // or an element of a rand collection of handles (`arr[i].fld`, §18.4).
+        let mut root = &base;
+        while let ExprKind::Index { expr: b, .. } = &root.kind {
+            root = b;
+        }
+        let ExprKind::Ident(bh) = &root.kind else {
             return None;
         };
         if bh.path.len() != 1 || !rand_set.contains(&bh.path[0].name.name) {
             return None;
         }
-        if let Some(r) = self.class_agg_member_parts(&base, &field) {
+        if !std::ptr::eq(root, &base) {
+            // Only a collection of handles: other indexed receivers keep
+            // their own element paths.
+            let this = self.this_stack.last().copied().flatten()?;
+            self.prop_class_type(this, &bh.path[0].name.name)?;
+        } else if let Some(r) = self.class_agg_member_parts(&base, &field) {
             return Some(RandMemberTarget::Agg(r));
         }
         // `rand` object handle: resolve it and target the sub-object's property.
@@ -138818,6 +138905,17 @@ impl Simulator {
         while let Some(cn) = cur {
             let cd = self.module.classes.get(&cn)?;
             if cd.properties.contains_key(&field) {
+                // §18.3/§18.13: a rand handle does not make every property of
+                // its child random. Disabled fields remain state variables.
+                if !cd.random_properties.contains(&field)
+                    || self
+                        .rand_mode_disabled
+                        .get(&sub)
+                        .is_some_and(|d| d.contains("*") || d.contains(&field))
+                    || self.prop_class_type(sub, &field).is_some()
+                {
+                    return None;
+                }
                 return Some(RandMemberTarget::Sub(sub, field));
             }
             cur = cd.extends.clone();
@@ -138850,14 +138948,7 @@ impl Simulator {
     /// §18.4: re-validate the constraints declared inside every `rand` object
     /// handle of `handle` against the current (post-fixpoint) assignment.
     fn sub_object_constraints_ok(&mut self, handle: usize, obj_props: &[String]) -> bool {
-        for p in obj_props {
-            let sub = self
-                .heap
-                .get(handle)
-                .and_then(|o| o.as_ref())
-                .and_then(|i| i.properties.get(p))
-                .and_then(|v| v.to_u64())
-                .unwrap_or(0) as usize;
+        for sub in self.rand_child_handles(handle, obj_props) {
             let Some(sub_class) = self
                 .heap
                 .get(sub)
@@ -138882,6 +138973,10 @@ impl Simulator {
                     if !seen.insert(name.clone())
                         || disabled.contains("*")
                         || disabled.contains(name)
+                        || (con.is_static
+                            && self
+                                .static_constraint_disabled
+                                .contains(&(cn.clone(), name.clone())))
                     {
                         continue;
                     }
@@ -141036,6 +141131,36 @@ impl Simulator {
                 }
                 let mut changed = false;
                 let mut idx: Vec<i64> = used.iter().map(|d| d.0).collect();
+                // §18.4: the elements of a rand collection of handles are
+                // object references, never values to draw. Solve the body
+                // with the iterators bound, so `arr[i].fld == …` reaches the
+                // member of element i's object.
+                if self.prop_class_type(handle, &arr_name).is_some() {
+                    loop {
+                        let frame: HashMap<String, Value> = idx_names
+                            .iter()
+                            .zip(&idx)
+                            .map(|(nm, &i)| (nm.clone(), Value::from_u64(i as u64, 32)))
+                            .collect();
+                        self.push_local_frame(frame);
+                        if self.solve_forced(handle, body, rand_set) {
+                            changed = true;
+                        }
+                        self.pop_local_frame();
+                        let mut k = used.len();
+                        loop {
+                            if k == 0 {
+                                return changed;
+                            }
+                            k -= 1;
+                            idx[k] += 1;
+                            if idx[k] <= used[k].1 {
+                                break;
+                            }
+                            idx[k] = used[k].0;
+                        }
+                    }
+                }
                 loop {
                     // Bind every index and address the element by its full
                     // index path — `arr[i][j]`, not just the first dimension.
@@ -145149,11 +145274,6 @@ impl Simulator {
         use super::bytecode::BytecodeCompiler;
         use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::PortDirection;
-        if std::env::var("XEZIM_FALLBACK_SITES")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
-            && (method_name.contains("m_drop") || method_name.contains("get_schedule"))
-        {}
         // COLD-PATH FIRST (class-perf P0 + adaptive tiering): the tier
         // counter used to run before the skip cache — every class-function
         // call paid an inline FNV hash + HashMap probe even for the ~90% of
@@ -145227,15 +145347,12 @@ impl Simulator {
             // declines (these never reach BytecodeCompiler's tracer), so a
             // hot decliner can be attributed by method name.
             let trace_decline = |reason: &str| -> bool {
-                std::env::var("XEZIM_FALLBACK_SITES")
-                    .map(|v| v != "0" && !v.is_empty())
-                    .unwrap_or(false)
-                    && {
-                        eprintln!(
-                            "[FALLBACK] plan-decline reason={reason} scope={cname}.{method_name}"
-                        );
-                        true
-                    }
+                method_trace_enabled() && {
+                    eprintln!(
+                        "[FALLBACK] plan-decline reason={reason} scope={cname}.{method_name}"
+                    );
+                    true
+                }
             };
             let ClassMethodKind::Function(_f) = kind else {
                 trace_decline("task");
@@ -145868,7 +145985,7 @@ impl Simulator {
                         &self.widths,
                     );
                     compiler.method_admission = Some(admission);
-                    if std::env::var_os("XEZIM_FALLBACK_SITES").is_some() {
+                    if method_trace_enabled() {
                         compiler.scope_hint = Some(format!("{}.{}", cname, method_name));
                     }
                     let body_refs: Vec<&crate::ast::stmt::Statement> = body.iter().collect();
@@ -145992,10 +146109,7 @@ impl Simulator {
         let block = &entry.block;
         let this_reg = entry.this_reg;
         let result_reg = entry.result_reg;
-        if std::env::var("XEZIM_FALLBACK_SITES")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
-        {
+        if method_trace_enabled() {
             use std::sync::OnceLock;
             static SEEN: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
                 OnceLock::new();

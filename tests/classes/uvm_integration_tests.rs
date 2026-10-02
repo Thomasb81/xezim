@@ -165,6 +165,28 @@ fn uvm_1800_2_2020_bare_run_phase_completes() {
     bare_run_completes_on("1800.2-2020");
 }
 
+/// §16.5: concurrent assertions keep sampling during real UVM phases,
+/// including interface assertions and a configured virtual interface.
+#[test]
+fn uvm_2020_concurrent_assertions_sample_with_dpi() {
+    let source = include_str!("../uvm/assertion_clock_probe.sv").to_string();
+    let sim = run_uvm_opt("1800.2-2020", &[], source, "top", false)
+        .expect("UVM assertion probe failed to simulate");
+    let lines: Vec<&str> = sim
+        .output
+        .iter()
+        .flat_map(|entry| entry.message.lines())
+        .collect();
+    assert!(
+        lines.contains(&"T|bound=1"),
+        "virtual interface was not bound: {lines:?}"
+    );
+    assert!(
+        lines.contains(&"T|counts top=7 direct=7 inner=7"),
+        "all three assertion placements must evaluate: {lines:?}"
+    );
+    assert_eq!(sim.time, 16, "the UVM run must drain its objection");
+}
 
 /// Full driver/sequencer/monitor/scoreboard bench on UVM 1800.2-2020: the
 /// sequence drives 10 transactions through the sequencer/driver TLM
