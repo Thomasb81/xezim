@@ -114936,6 +114936,11 @@ impl Simulator {
                 }
             }
         }
+        // Place named inheritance arguments before substitution so a type
+        // parameter reference cannot rewrite the corresponding argument label.
+        for c in &names {
+            self.place_named_extends_args(c);
+        }
         for c in &names {
             let Some(cd) = self.module.classes.get(c) else {
                 continue;
@@ -116137,6 +116142,28 @@ impl Simulator {
     /// chain rebinding each parent's type params from `extends_type_args` until
     /// `ancestor` is bound, and return its `(base, sig)` so the caller can seed
     /// `current_spec`. Mirrors the assoc-key carry loop.
+    /// A method's type parameters belong to its declaring specialization,
+    /// even when a parameterized receiver reuses the same parameter names.
+    #[inline(never)]
+    fn inherited_method_spec(&self, handle: usize, declaring: &str) -> Option<(String, String)> {
+        let origin = self.class_origin(declaring);
+        if !self.class_is_parameterized(origin) {
+            return None;
+        }
+        let inst = self.heap.get(handle)?.as_ref()?;
+        if self.class_origin(&inst.class_name) == origin {
+            return None;
+        }
+        if let Some((base, sig)) = &inst.spec {
+            let inherited = self.ancestor_spec(base, sig, origin)?;
+            return Some((
+                origin.to_string(),
+                self.canonicalize_spec_sig(origin, &inherited),
+            ));
+        }
+        self.static_receiver_spec(&inst.class_name, origin)
+    }
+
     fn static_receiver_spec(&self, receiver: &str, ancestor: &str) -> Option<(String, String)> {
         let mut carried: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
@@ -129302,18 +129329,8 @@ impl Simulator {
         // `T::type_id::create`) resolved `T` to the unknown-type fallback,
         // `logic`, and every create returned null: the run reported UVM_ERROR 0
         // while driving no transactions at all. Mirror the function path here.
-        if let Some(h) = handle_opt {
-            if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
-                let leaf = inst.class_name.clone();
-                if !self.class_is_parameterized(&leaf)
-                    && self.class_is_parameterized(&mclass)
-                    && self.class_extends(&leaf, &mclass)
-                {
-                    if let Some(spec) = self.static_receiver_spec(&leaf, &mclass) {
-                        self.current_spec = Some(spec);
-                    }
-                }
-            }
+        if let Some(spec) = handle_opt.and_then(|h| self.inherited_method_spec(h, &mclass)) {
+            self.current_spec = Some(spec);
         }
     }
 
@@ -134608,7 +134625,17 @@ impl Simulator {
     /// (`m[i]`, for an array that was also materialised there) is kept in step.
     /// A missing alias is never created — that would shadow an unrelated
     /// module-scope array of the same name.
-    fn write_coll_elem(&mut self, key: &str, val: Value) {
+    fn write_coll_elem(&mut self, key: &str, mut val: Value) {
+        // Solver draws and repairs inherit the element declaration, not the
+        // temporary value's signedness. Size shadows are not element values.
+        if key.ends_with(']')
+            && let Some((owner, element)) = key.split_once('#')
+            && let Ok(handle) = owner.parse::<usize>()
+            && let Some((prop, _)) = element.split_once('[')
+            && self.class_prop_width_of(handle, prop).is_some()
+        {
+            val.is_signed = self.class_prop_signed_of(handle, prop);
+        }
         self.signals.insert(key.to_string(), val.clone());
         if let Some((_h, bare)) = key.split_once('#') {
             if self.signal_name_to_id.contains_key(bare) {
@@ -137382,10 +137409,11 @@ impl Simulator {
         // below cannot honour (see `rand_order_sensitive`) goes to the joint
         // solver first; the trials stay the fallback.
         let mut trials = 1000;
+        let has_soft = Self::rand_has_soft(&constraints);
         if csp_ok
             && rand_obj_props.is_empty()
             && !rand_colls.iter().any(|c| c.kind == CollKind::Dyn)
-            && self.rand_order_sensitive(&constraints)
+            && (has_soft || self.rand_order_sensitive(&constraints))
         {
             csp_runs += 1;
             let saved = self
@@ -137396,6 +137424,7 @@ impl Simulator {
             match self.rand_csp_solve(
                 handle,
                 &constraints,
+                &constraint_depth,
                 &rand_props,
                 &signed_rand_props,
                 &enum_prop_types,
@@ -138405,6 +138434,7 @@ impl Simulator {
             // `foreach !(elem inside {…})` exclusion, distinct across the array
             // (best-effort `unique{}`).
             for (prop, scoped, lo, hi, width, enum_t) in &rand_arrays {
+                let signed = self.class_prop_signed_of(handle, prop);
                 let excluded = self.collect_array_exclusions(prop, &constraints);
                 let pool: Vec<u64> = if let Some(et) = enum_t {
                     self.module
@@ -138440,11 +138470,12 @@ impl Simulator {
                     } else {
                         0
                     };
-                    let val = if !pool.is_empty() || *width <= 64 {
+                    let mut val = if !pool.is_empty() || *width <= 64 {
                         Value::from_u64(v, *width)
                     } else {
                         self.random_value_of_width(*width)
                     };
+                    val.is_signed = signed;
                     self.signals.insert(format!("{}[{}]", scoped, i), val);
                 }
             }
@@ -138453,6 +138484,7 @@ impl Simulator {
             // shape, unless a positive foreach body owns the array (same
             // skip-set as the 1-D pool pass above).
             for (prop, scoped, shape, width) in &rand_nd_arrays {
+                let signed = self.class_prop_signed_of(handle, prop);
                 if shape.iter().any(|&(lo, hi)| hi < lo) {
                     continue;
                 }
@@ -138470,11 +138502,12 @@ impl Simulator {
                         0
                     };
                     // Elements wider than 64 bits were left at zero.
-                    let val = if *width <= 64 {
+                    let mut val = if *width <= 64 {
                         Value::from_u64(v, *width)
                     } else {
                         self.random_value_of_width(*width)
                     };
+                    val.is_signed = signed;
                     self.signals.insert(format!("{}{}", scoped, suffix), val);
                     let mut k = shape.len();
                     loop {
@@ -138648,7 +138681,7 @@ impl Simulator {
                 all_ok = self.sub_object_constraints_ok(handle, &rand_obj_props);
             }
 
-            if all_ok {
+            if all_ok && !(has_soft && csp_ok) {
                 // SV semantics: randomize() calls post_randomize() on success
                 // (e.g. riscv_instr builds its imm_str / formats operands here).
                 if has_post {
@@ -138674,6 +138707,7 @@ impl Simulator {
                 match self.rand_csp_solve(
                     handle,
                     &constraints,
+                    &constraint_depth,
                     &rand_props,
                     &signed_rand_props,
                     &enum_prop_types,
@@ -138799,38 +138833,100 @@ impl Simulator {
     ) -> bool {
         for con in constraints {
             for item in &con.items {
-                // Constraints over a rand COLLECTION (its `.size()`, its
-                // `foreach` bodies, `unique {}` over it) ARE modeled — check
-                // them strictly, so an unsatisfied one retries the trial
-                // instead of being silently accepted.
-                if let Some(ok) = self.coll_item_check(handle, item, rand_colls) {
-                    if !ok {
-                        return false;
-                    }
-                    continue;
-                }
-                // Foreach over a FIXED-shape rand array: check strictly,
-                // so an unsatisfied body retries the trial and an
-                // UNSATISFIABLE one makes randomize() return 0 (§18.6.2)
-                // instead of being silently accepted with violating
-                // values.
-                if let Some(ok) = self.check_fixed_foreach_item(handle, item) {
-                    if !ok {
-                        *fe_failed = true;
-                        return false;
-                    }
-                    continue;
-                }
-                // Skip constraints the solver structurally cannot satisfy
-                // (dynamic-array size/sum/element relations, foreach, solve
-                // ordering) so they don't block an otherwise-valid config.
-                if Self::constraint_unmodeled(item) {
-                    continue;
-                }
-                if !self.check_constraint_item(handle, item) {
+                if !self.rand_item_accept(handle, item, rand_colls, fe_failed) {
                     return false;
                 }
             }
+        }
+        true
+    }
+
+    fn rand_has_soft(constraints: &[ClassConstraint]) -> bool {
+        fn contains(item: &ConstraintItem) -> bool {
+            match item {
+                ConstraintItem::Soft(_) => true,
+                ConstraintItem::Block(items) => items.iter().any(contains),
+                ConstraintItem::Foreach { item, .. } => contains(item),
+                ConstraintItem::Implication { constraint, .. } => contains(constraint),
+                ConstraintItem::IfElse {
+                    then_item,
+                    else_item,
+                    ..
+                } => contains(then_item) || else_item.as_ref().is_some_and(|item| contains(item)),
+                _ => false,
+            }
+        }
+        constraints.iter().any(|con| con.items.iter().any(contains))
+    }
+
+    fn rand_item_accept(
+        &mut self,
+        handle: usize,
+        item: &ConstraintItem,
+        rand_colls: &[RandColl],
+        fe_failed: &mut bool,
+    ) -> bool {
+        match item {
+            ConstraintItem::Soft(_) => return true,
+            ConstraintItem::Block(items) => {
+                return items
+                    .iter()
+                    .all(|item| self.rand_item_accept(handle, item, rand_colls, fe_failed));
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                return if self.eval_expr(condition).is_true() {
+                    self.rand_item_accept(handle, then_item, rand_colls, fe_failed)
+                } else {
+                    else_item.as_ref().is_none_or(|item| {
+                        self.rand_item_accept(handle, item, rand_colls, fe_failed)
+                    })
+                };
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                return !self.eval_expr(condition).is_true()
+                    || self.rand_item_accept(handle, constraint, rand_colls, fe_failed);
+            }
+            _ => {}
+        }
+        // Constraints over a rand COLLECTION (its `.size()`, its
+        // `foreach` bodies, `unique {}` over it) ARE modeled — check
+        // them strictly, so an unsatisfied one retries the trial
+        // instead of being silently accepted.
+        if let Some(ok) = self.coll_item_check(handle, item, rand_colls) {
+            if !ok {
+                return false;
+            }
+            return true;
+        }
+        // Foreach over a FIXED-shape rand array: check strictly,
+        // so an unsatisfied body retries the trial and an
+        // UNSATISFIABLE one makes randomize() return 0 (§18.6.2)
+        // instead of being silently accepted with violating
+        // values.
+        if let Some(ok) = self.check_fixed_foreach_item(handle, item) {
+            if !ok {
+                *fe_failed = true;
+                return false;
+            }
+            return true;
+        }
+        // Skip constraints the solver structurally cannot satisfy
+        // (dynamic-array size/sum/element relations, foreach, solve
+        // ordering) so they don't block an otherwise-valid config.
+        if Self::constraint_unmodeled(item) {
+            return true;
+        }
+        if !self.check_constraint_item(handle, item) {
+            return false;
         }
         true
     }
@@ -141686,7 +141782,7 @@ impl Simulator {
         self.get_signal_value_by_name(&format!("{}#{}{}", handle, arr_name, idx))
     }
 
-    fn class_elem_store(&mut self, handle: usize, arr_name: &str, idx: &str, v: Value) {
+    fn class_elem_store(&mut self, handle: usize, arr_name: &str, idx: &str, mut v: Value) {
         if let Some(dims) = self.class_prop_packed_dims(handle, arr_name) {
             let (Some(cur), Some(iv)) = (
                 self.read_member_value(handle, arr_name),
@@ -141707,6 +141803,7 @@ impl Simulator {
             }
             return;
         }
+        v.is_signed = self.class_prop_signed_of(handle, arr_name);
         self.signals
             .insert(format!("{}#{}{}", handle, arr_name, idx), v);
     }
@@ -143920,15 +144017,8 @@ impl Simulator {
                 // once the body runs a BARE static member like `m_singleton`.
                 // Seed current_spec from the concrete receiver's extends chain
                 // so the body's inner static access keys per specialization.
-                if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-                    if !self.class_is_parameterized(&inst.class_name)
-                        && self.class_is_parameterized(&cname)
-                        && self.class_extends(&inst.class_name, &cname)
-                    {
-                        if let Some(spec) = self.static_receiver_spec(&inst.class_name, &cname) {
-                            self.current_spec = Some(spec);
-                        }
-                    }
+                if let Some(spec) = self.inherited_method_spec(handle, &cname) {
+                    self.current_spec = Some(spec);
                 }
                 self.this_stack.push(Some(handle));
                 // §23.8 / §23.10.1: hierarchical names in the method body

@@ -79,6 +79,8 @@ mod this_collection_struct_members;
 mod this_super_member;
 #[path = "classes/type_param_base_class.rs"]
 mod type_param_base_class;
+#[path = "classes/type_param_base_named_forward.rs"]
+mod type_param_base_named_forward;
 #[path = "classes/type_param_default_implicit_extends.rs"]
 mod type_param_default_implicit_extends;
 #[path = "classes/type_param_formal_stale_local.rs"]
@@ -447,12 +449,16 @@ mod method_int_formal_zero_extends;
 mod method_local_base_per_process;
 #[path = "classes/module_scope_handle_access.rs"]
 mod module_scope_handle_access;
+#[path = "classes/named_base_forward_matrix.rs"]
+mod named_base_forward_matrix;
 #[path = "classes/nopack_member_array.rs"]
 mod nopack_member_array;
 #[path = "classes/package_class_nested_class.rs"]
 mod package_class_nested_class;
 #[path = "classes/parked_task_local_vif_alias.rs"]
 mod parked_task_local_vif_alias;
+#[path = "classes/rand_collection_element_signedness.rs"]
+mod rand_collection_element_signedness;
 #[path = "classes/randomize_joint_constraints.rs"]
 mod randomize_joint_constraints;
 #[path = "classes/randomize_obj_array_property.rs"]
@@ -461,6 +467,8 @@ mod randomize_obj_array_property;
 mod receiver_call_evaluated_once;
 #[path = "classes/ref_formal_shadows_property.rs"]
 mod ref_formal_shadows_property;
+#[path = "classes/soft_constraint_compatibility.rs"]
+mod soft_constraint_compatibility;
 #[path = "classes/sqr_zero_time_loop.rs"]
 mod sqr_zero_time_loop;
 #[path = "classes/static_assoc_struct_pool.rs"]

@@ -343,9 +343,10 @@ struct Csp {
     arrays: HashMap<String, CspArr>,
     srcs: Vec<Src>,
     nodes: Vec<Node>,
-    /// Whether any `soft` item was seen (translation with `with_soft`).
-    has_soft: bool,
-    with_soft: bool,
+    /// None enables all preferences; otherwise only the selected instances.
+    soft_enabled: Option<HashSet<usize>>,
+    soft_priority: Vec<(usize, usize, usize)>,
+    soft_rank: (usize, usize),
     dists: Vec<Dist>,
     /// `solve before after` as variable lists.
     order: Vec<(Vec<usize>, Vec<usize>)>,
@@ -563,6 +564,7 @@ impl Simulator {
         &mut self,
         handle: usize,
         constraints: &[ClassConstraint],
+        constraint_depth: &[usize],
         rand_props: &[(String, u32)],
         signed_props: &HashSet<String>,
         enum_props: &HashMap<String, String>,
@@ -607,28 +609,51 @@ impl Simulator {
             }
             &joint
         };
-        csp.with_soft = true;
-        if self.csp_translate(&mut csp, constraints).is_none() {
+        if self
+            .csp_translate(&mut csp, constraints, constraint_depth)
+            .is_none()
+        {
             return CspOutcome::NotApplicable;
         }
         if strict && csp.opaque {
             return CspOutcome::GaveUp;
         }
-        let mut out = self.csp_run(&csp, constraints, colls);
-        if !matches!(out, CspOutcome::Sat) && csp.has_soft {
-            // §18.5.14: soft constraints yield when the hard set cannot
-            // hold together with them.
-            csp.with_soft = false;
-            csp.srcs.clear();
-            csp.nodes.clear();
-            csp.dists.clear();
-            csp.order.clear();
-            if self.csp_translate(&mut csp, constraints).is_none() {
+        let out = self.csp_run(&csp, constraints, colls);
+        if !matches!(out, CspOutcome::Unsat) || csp.soft_priority.is_empty() {
+            return out;
+        }
+        // A preference is discarded only after proving a conflict with hard
+        // constraints or already accepted, higher-priority preferences.
+        let mut priority = csp.soft_priority.clone();
+        priority.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(b.2.cmp(&a.2)));
+        csp.soft_enabled = Some(HashSet::default());
+        if self
+            .csp_translate(&mut csp, constraints, constraint_depth)
+            .is_none()
+        {
+            return CspOutcome::NotApplicable;
+        }
+        let hard = self.csp_run(&csp, constraints, colls);
+        if !matches!(hard, CspOutcome::Sat) {
+            return hard;
+        }
+        for (_, _, id) in priority {
+            csp.soft_enabled.as_mut().unwrap().insert(id);
+            if self
+                .csp_translate(&mut csp, constraints, constraint_depth)
+                .is_none()
+            {
                 return CspOutcome::NotApplicable;
             }
-            out = self.csp_run(&csp, constraints, colls);
+            match self.csp_run(&csp, constraints, colls) {
+                CspOutcome::Sat => {}
+                CspOutcome::Unsat => {
+                    csp.soft_enabled.as_mut().unwrap().remove(&id);
+                }
+                other => return other,
+            }
         }
-        out
+        CspOutcome::Sat
     }
 
     /// Build the variable table: rand scalars and array elements.
@@ -649,8 +674,9 @@ impl Simulator {
             arrays: HashMap::default(),
             srcs: Vec::new(),
             nodes: Vec::new(),
-            has_soft: false,
-            with_soft: false,
+            soft_enabled: None,
+            soft_priority: Vec::new(),
+            soft_rank: (0, 0),
             dists: Vec::new(),
             order: Vec::new(),
             opaque: false,
@@ -729,9 +755,32 @@ impl Simulator {
         Some(csp)
     }
 
-    fn csp_translate(&mut self, csp: &mut Csp, constraints: &[ClassConstraint]) -> Option<()> {
+    fn csp_translate(
+        &mut self,
+        csp: &mut Csp,
+        constraints: &[ClassConstraint],
+        depths: &[usize],
+    ) -> Option<()> {
+        csp.srcs.clear();
+        csp.nodes.clear();
+        csp.dists.clear();
+        csp.order.clear();
+        csp.soft_priority.clear();
+        csp.opaque = false;
         let env = Env::default();
-        for con in constraints {
+        for (index, con) in constraints.iter().enumerate() {
+            csp.soft_rank = if con.name.name == "__inline__" {
+                (0, usize::MAX)
+            } else {
+                (
+                    depths
+                        .get(index)
+                        .copied()
+                        .unwrap_or(usize::MAX - 1)
+                        .saturating_add(1),
+                    con.span.start as usize,
+                )
+            };
             for it in &con.items {
                 let n = self.csp_item(csp, it, &env)?;
                 if !matches!(n, Node::True) {
@@ -1811,7 +1860,6 @@ impl Simulator {
                     let n = self.csp_item(csp, body, &e2)?;
                     match n {
                         Node::True => {}
-                        Node::False => return Some(Node::False),
                         n => out.push(n),
                     }
                 }
@@ -1836,10 +1884,23 @@ impl Simulator {
                 Some(Node::True)
             }
             ConstraintItem::Soft(inner) => {
-                csp.has_soft = true;
-                if csp.with_soft {
-                    self.csp_item(csp, inner, env)
+                let id = csp.soft_priority.len();
+                csp.soft_priority
+                    .push((csp.soft_rank.0, csp.soft_rank.1, id));
+                let enabled = csp
+                    .soft_enabled
+                    .as_ref()
+                    .is_none_or(|set| set.contains(&id));
+                let dist_len = csp.dists.len();
+                let order_len = csp.order.len();
+                let opaque = csp.opaque;
+                let node = self.csp_item(csp, inner, env)?;
+                if enabled {
+                    Some(node)
                 } else {
+                    csp.dists.truncate(dist_len);
+                    csp.order.truncate(order_len);
+                    csp.opaque = opaque;
                     Some(Node::True)
                 }
             }
@@ -1848,7 +1909,6 @@ impl Simulator {
                 for it in items {
                     match self.csp_item(csp, it, env)? {
                         Node::True => {}
-                        Node::False => return Some(Node::False),
                         n => out.push(n),
                     }
                 }
