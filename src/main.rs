@@ -729,6 +729,7 @@ fn split_filelist_line(line: &str) -> Vec<String> {
 fn process_command_file(
     path: &str,
     source_files: &mut Vec<String>,
+    top_modules: &mut Vec<String>,
     include_dirs: &mut Vec<String>,
     defines: &mut Vec<(String, Option<String>)>,
     lib_dirs: &mut Vec<String>,
@@ -787,6 +788,16 @@ fn process_command_file(
                 continue;
             }
             match t {
+                "-s" => {
+                    i += 1;
+                    let top = toks
+                        .get(i)
+                        .filter(|top| !top.is_empty() && !top.starts_with('-'))
+                        .ok_or_else(|| {
+                            format!("-s requires a top module (in args file '{}')", path)
+                        })?;
+                    top_modules.push(top.clone());
+                }
                 // `-c` with no file after it: batch-mode switch, nothing to do.
                 "-c" if !cli_compat::c_takes_file(
                     toks.get(i + 1).map(|s| s.as_str()),
@@ -838,6 +849,7 @@ fn process_command_file(
                         process_command_file(
                             &nested,
                             source_files,
+                            top_modules,
                             include_dirs,
                             defines,
                             lib_dirs,
@@ -868,6 +880,7 @@ fn process_command_file(
                     process_command_file(
                         &nested,
                         source_files,
+                        top_modules,
                         include_dirs,
                         defines,
                         lib_dirs,
@@ -949,6 +962,9 @@ fn process_command_file(
                 }
                 _ if t.starts_with("-seed=") => {
                     plusargs.push(format!("+seed={}", &t["-seed=".len()..]));
+                }
+                _ if t.starts_with("-s") && t.len() > 2 => {
+                    top_modules.push(t[2..].to_string());
                 }
                 _ if t.starts_with('+') => {
                     plusargs.push(t.to_string());
@@ -1643,7 +1659,6 @@ fn run_main() -> i32 {
     }
 
     let mut source_files: Vec<String> = Vec::new();
-    let mut top_module: Option<String> = None;
     // All `-s <top>` modules, in order. UVM testbenches commonly declare two
     // unconnected roots (e.g. `hdl_top` + `hvl_top`); when more than one is
     // given we synthesize a wrapper module that instantiates them all and
@@ -1814,12 +1829,10 @@ fn run_main() -> i32 {
             "-s" => {
                 i += 1;
                 if i < args.len() {
-                    top_module = Some(args[i].clone());
                     top_modules.push(args[i].clone());
                 }
             }
             _ if arg.starts_with("-s") && arg.len() > 2 => {
-                top_module = Some(arg[2..].to_string());
                 top_modules.push(arg[2..].to_string());
             }
             // `-c` with no file after it: batch-mode switch, nothing to do.
@@ -1836,6 +1849,7 @@ fn run_main() -> i32 {
                     match process_command_file(
                         &args[i],
                         &mut source_files,
+                        &mut top_modules,
                         &mut include_dirs,
                         &mut defines,
                         &mut lib_dirs,
@@ -1860,6 +1874,7 @@ fn run_main() -> i32 {
                 match process_command_file(
                     &arg[2..],
                     &mut source_files,
+                    &mut top_modules,
                     &mut include_dirs,
                     &mut defines,
                     &mut lib_dirs,
@@ -2562,7 +2577,6 @@ fn run_main() -> i32 {
             // A design-unit name that is not a file names a top, as `-s` does.
             _ => match cli_compat::bare_top_name(arg, &compat.libs) {
                 Some(top) => {
-                    top_module = Some(top.clone());
                     top_modules.push(top);
                 }
                 None => source_files.push(arg.clone()),
@@ -2986,6 +3000,7 @@ suppressed but the explicit SDF annotation still applies."
         }
     }
 
+    let mut top_module = top_modules.last().cloned();
     // Multi-top: synthesize a single wrapper root that instantiates every
     // requested `-s` top, so all of them elaborate (UVM hdl_top + hvl_top etc.).
     // Appended after the real sources so the instantiated modules are already

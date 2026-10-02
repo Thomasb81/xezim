@@ -393,6 +393,118 @@ fn bare_top_names_select_tops() {
     assert_eq!(ok_stdout(&d, &["-c", "files.f", "-s", "tb"]), one);
 }
 
+fn filelist_top_fixture(tag: &str) -> PathBuf {
+    let d = scratch(tag);
+    std::fs::write(
+        d.join("roots.sv"),
+        r#"
+module excluded_root;
+  initial begin $display("ROOT|excluded"); #1 $finish; end
+endmodule
+module chosen_root;
+  initial begin $display("ROOT|chosen"); #1 $finish; end
+endmodule
+module extra_root;
+  initial begin $display("ROOT|extra"); #1 $finish; end
+endmodule
+"#,
+    )
+    .unwrap();
+    d
+}
+
+fn assert_filelist_tops(dir: &Path, args: &[&str], expected: &[&str]) {
+    let (code, out, err) = run_in(dir, args);
+    assert_eq!(code, 0, "args={args:?}\n{out}{err}");
+    assert!(!err.contains("ignored unrecognized option"), "{err}");
+    let mut roots: Vec<_> = out
+        .lines()
+        .filter_map(|line| line.strip_prefix("ROOT|"))
+        .collect();
+    roots.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(roots, expected, "args={args:?}\n{out}{err}");
+}
+
+#[test]
+fn filelist_top_cli_control() {
+    let d = filelist_top_fixture("filelist_top_cli");
+    std::fs::write(d.join("files.f"), "roots.sv\n").unwrap();
+    assert_filelist_tops(&d, &["-f", "files.f", "-s", "chosen_root"], &["chosen"]);
+    assert_filelist_tops(&d, &["-schosen_root", "-ffiles.f"], &["chosen"]);
+}
+
+#[test]
+fn filelist_top_separate_argument() {
+    let d = filelist_top_fixture("filelist_top_separate");
+    std::fs::write(d.join("files.f"), "-s chosen_root\nroots.sv\n").unwrap();
+    for flag in ["-f", "-F", "-c", "-file"] {
+        assert_filelist_tops(&d, &[flag, "files.f"], &["chosen"]);
+    }
+    assert_filelist_tops(&d, &["-ffiles.f"], &["chosen"]);
+}
+
+#[test]
+fn filelist_top_attached_argument() {
+    let d = filelist_top_fixture("filelist_top_attached");
+    std::fs::write(d.join("files.f"), "roots.sv\n-schosen_root\n").unwrap();
+    for flag in ["-f", "-F", "-c", "-file"] {
+        assert_filelist_tops(&d, &[flag, "files.f"], &["chosen"]);
+    }
+}
+
+#[test]
+fn filelist_top_nested_selection() {
+    let d = filelist_top_fixture("filelist_top_nested");
+    std::fs::create_dir(d.join("nested")).unwrap();
+    for selection in ["-s chosen_root", "-schosen_root"] {
+        std::fs::write(
+            d.join("nested/inner.f"),
+            format!("{selection}\n../roots.sv\n"),
+        )
+        .unwrap();
+        for include in ["-f nested/inner.f", "-fnested/inner.f", "-F nested/inner.f"] {
+            std::fs::write(d.join("outer.f"), format!("{include}\n")).unwrap();
+            assert_filelist_tops(&d, &["-f", "outer.f"], &["chosen"]);
+        }
+    }
+}
+
+#[test]
+fn filelist_top_accumulates_with_cli_and_preserves_seed_flags() {
+    let d = filelist_top_fixture("filelist_top_multiple");
+    std::fs::write(
+        d.join("files.f"),
+        "-sv -svseed 19 -seed=23\n-s chosen_root\nroots.sv\n",
+    )
+    .unwrap();
+    assert_filelist_tops(
+        &d,
+        &["-s", "extra_root", "-f", "files.f"],
+        &["chosen", "extra"],
+    );
+    assert_filelist_tops(&d, &["-f", "files.f", "-sextra_root"], &["chosen", "extra"]);
+    std::fs::write(d.join("extra.f"), "-sextra_root\n").unwrap();
+    std::fs::write(d.join("outer.f"), "-f files.f\n-f extra.f\n").unwrap();
+    assert_filelist_tops(&d, &["-f", "outer.f"], &["chosen", "extra"]);
+}
+
+#[test]
+fn filelist_top_missing_argument_is_an_error() {
+    let d = filelist_top_fixture("filelist_top_missing");
+    for selection in ["-s", "-s -sv", "-s \"\""] {
+        std::fs::write(d.join("files.f"), format!("roots.sv\n{selection}\n")).unwrap();
+        let (code, out, err) = run_in(&d, &["-f", "files.f"]);
+        assert_ne!(code, 0, "{selection}: {out}{err}");
+        assert!(
+            err.contains("-s requires a top module") && err.contains("files.f"),
+            "{err}"
+        );
+        assert!(!out.contains("ROOT|"), "{out}");
+    }
+}
+
 #[test]
 fn g_overrides_parameter_defaults() {
     let d = scratch("gpar");
