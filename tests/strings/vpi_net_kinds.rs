@@ -129,6 +129,102 @@ void probe(void) {
 }
 "#;
 
+/// §37.11: simulator-created edge aliases are not public VPI objects, while
+/// the original nets remain enumerable, readable and callback-capable.
+#[test]
+fn edge_aliases_are_hidden_from_vpi_scope_members() {
+    let sv = r#"
+`timescale 1ns/1ns
+module observer(inout [3:0] link);
+  int rising = 0;
+  always @(posedge link[2]) rising++;
+endmodule
+module top;
+  logic [7:0] drive = 0;
+  wire [7:0] bus;
+  int local_edges = 0, computed_edges = 0;
+  assign bus = drive;
+  observer u(.link(bus[7:4]));
+  always @(posedge drive[1]) local_edges++;
+  always @(posedge (drive[1] && drive[6])) computed_edges++;
+  import "DPI-C" context function void inspect(input int phase);
+  initial begin
+    #2 inspect(0);
+    #2 drive = 8'h02;
+    #2 drive = 8'h42;
+    #2 inspect(1);
+    $display("T| edges port=%0d local=%0d computed=%0d", u.rising, local_edges, computed_edges);
+    $finish;
+  end
+endmodule
+"#;
+    let c = r#"
+#include <string.h>
+#include "vpi_user.h"
+static int callbacks;
+static s_vpi_value callback_value;
+static s_vpi_time callback_time;
+static PLI_INT32 changed(p_cb_data data) {
+    (void)data;
+    callbacks++;
+    return 0;
+}
+static void list_members(const char *scope, int kind) {
+    vpiHandle owner = vpi_handle_by_name((PLI_BYTE8 *)scope, NULL);
+    vpiHandle it = vpi_iterate(kind, owner), item;
+    while (it && (item = vpi_scan(it))) {
+        const char *name = vpi_get_str(vpiFullName, item);
+        if (kind == vpiNet) vpi_printf("NET|%s\n", name);
+        if (strstr(name, "__xz_")) vpi_printf("INTERNAL|%s\n", name);
+    }
+}
+static int read_integer(const char *name) {
+    vpiHandle h = vpi_handle_by_name((PLI_BYTE8 *)name, NULL);
+    if (!h) return -1;
+    s_vpi_value value;
+    value.format = vpiIntVal;
+    vpi_get_value(h, &value);
+    return value.value.integer;
+}
+void inspect(int phase) {
+    if (!phase) {
+        list_members("top", vpiNet);
+        list_members("top", vpiReg);
+        list_members("top.u", vpiNet);
+        list_members("top.u", vpiReg);
+        s_cb_data cb;
+        memset(&cb, 0, sizeof(cb));
+        callback_value.format = vpiIntVal;
+        callback_time.type = vpiSimTime;
+        cb.reason = cbValueChange;
+        cb.cb_rtn = changed;
+        cb.obj = vpi_handle_by_name("top.bus", NULL);
+        cb.value = &callback_value;
+        cb.time = &callback_time;
+        vpi_register_cb(&cb);
+        vpi_printf("T| initial bus=%d link=%d\n", read_integer("top.bus"), read_integer("top.u.link"));
+    } else {
+        vpi_printf("T| final bus=%d link=%d callbacks=%d\n", read_integer("top.bus"), read_integer("top.u.link"), callbacks);
+    }
+}
+"#;
+    let d = scratch("vpi_edge_alias_visibility");
+    let lib = shared_lib(&d, "edge_probe", c);
+    let text = run(&d, &lib, sv);
+    let _ = std::fs::remove_dir_all(&d);
+    let mut nets: Vec<&str> = text.lines().filter(|l| l.starts_with("NET|")).collect();
+    nets.sort_unstable();
+    assert_eq!(nets, ["NET|top.bus", "NET|top.u.link"], "{text}");
+    assert!(!text.contains("INTERNAL|"), "{text}");
+    for expected in [
+        "T| initial bus=0 link=0",
+        "T| final bus=66 link=4 callbacks=2",
+        "T| edges port=1 local=1 computed=1",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}`:\n{text}");
+    }
+}
+
 #[test]
 fn array_reads_add_no_net_and_implicit_ports_are_nets() {
     let d = scratch("vpi_net_kinds");
