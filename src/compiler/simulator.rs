@@ -8270,14 +8270,23 @@ pub struct Simulator {
     pending_t0_triggers: Vec<String>,
     /// True while the compile-time (pre-process) time-0 settle runs.
     in_pre_process_settle: bool,
-    /// Call-site (expression span start) → index into `sampled_watches`.
-    sampled_watch_site: HashMap<usize, usize>,
+    /// Call-site (expression span start) → per activation scope (see
+    /// `sampled_scope`) → index into `sampled_watches`. Every instance of a
+    /// child module shares the call's span, so the scope tells them apart.
+    sampled_watch_site: HashMap<usize, Vec<(Box<str>, usize)>>,
     /// §16.9.3: for a `$rose`/`$fell`/`$stable`/`$changed`/`$past` call with no
     /// explicit `@(...)` argument and no `default clocking`, the clocking event
     /// is inferred from the ENCLOSING procedural block's event control. Filled
     /// in by `register_sampled_watches` (call-site span → (edge code, clock
-    /// signal id)) so the history accumulates from time 0.
-    sampled_site_clock: HashMap<usize, (u8, usize)>,
+    /// signal id)) so the history accumulates from time 0. Keyed per
+    /// activation scope like `sampled_watch_site`.
+    sampled_site_clock: HashMap<usize, Vec<(Box<str>, (u8, usize))>>,
+    /// Edge-controlled always blocks that run as PROCESSES (blocking body)
+    /// and call a sampled-value function: (body, scope, edge code, clock id),
+    /// consumed by `register_sampled_watches` like the edge blocks.
+    proc_sampled_blocks: Vec<(Statement, String, u8, usize)>,
+    /// True while `register_sampled_watches` pre-registers the sites.
+    sampled_registering: bool,
 }
 
 /// One `$rose/$fell/$stable/$changed/$past(x, @(edge clk))` call site.
@@ -12124,6 +12133,8 @@ impl Simulator {
             sampled_watches: Vec::new(),
             sampled_watch_site: HashMap::default(),
             sampled_site_clock: HashMap::default(),
+            proc_sampled_blocks: Vec::new(),
+            sampled_registering: false,
             pending_t0_triggers: Vec::new(),
             in_pre_process_settle: false,
         };
@@ -21905,6 +21916,23 @@ impl Simulator {
                     // clk)` paced response streamed with zero latency).
                     || Self::stmt_contains_event_control(&body)
                 {
+                    // §16.9.3: the block's clocking event still clocks the
+                    // sampled-value calls in its body; registered with the
+                    // edge blocks' (`register_sampled_watches`).
+                    if Self::stmt_has_sampled_call(&body) {
+                        if let Some((ec, cid)) = resolved.iter().find_map(|s| match s.edge {
+                            EdgeKind::Posedge => Some((1u8, s.signal_id)),
+                            EdgeKind::Negedge => Some((2u8, s.signal_id)),
+                            _ => None,
+                        }) {
+                            self.proc_sampled_blocks.push((
+                                body.clone(),
+                                ab.scope.clone(),
+                                ec,
+                                cid,
+                            ));
+                        }
+                    }
                     // This body already leaves the edge path for the process path
                     // (§9.2.2: edges arriving mid-flight are missed). A compiled process
                     // FSM implements the same semantics without the per-activation AST
@@ -56533,6 +56561,32 @@ impl Simulator {
         }
     }
 
+    /// The activation scope a sampled-value call site's history belongs to:
+    /// the executing block's instance scope ("" at top level). One source
+    /// call in a child module is one site per INSTANCE — keyed by span alone,
+    /// every instance shared the first one's clock and history, so a
+    /// `$rose(x)` in a second instance clocked on another net never fired.
+    fn sampled_scope(&self) -> String {
+        self.activation_scope.borrow().clone().unwrap_or_default()
+    }
+
+    /// The entry recorded for `site` under `scope`, else — with `fallback`,
+    /// for a site seen from a single scope only — that one entry (a block
+    /// run outside its own activation scope). Registration passes no
+    /// fallback: there, a missing entry means another instance.
+    fn sampled_site_lookup<T: Copy>(
+        map: &HashMap<usize, Vec<(Box<str>, T)>>,
+        site: usize,
+        scope: &str,
+        fallback: bool,
+    ) -> Option<T> {
+        let v = map.get(&site)?;
+        v.iter()
+            .find(|(s, _)| **s == *scope)
+            .map(|(_, t)| *t)
+            .or_else(|| (fallback && v.len() == 1).then(|| v[0].1))
+    }
+
     /// §16.9.3 sampled-value function with an EXPLICIT clocking argument
     /// (`$rose(x, @(posedge clk))`) or, in a procedural context, the
     /// module's `default clocking`. Returns `(sample_at_latest_edge,
@@ -56565,7 +56619,12 @@ impl Simulator {
             // defaulted to `cur`, so $rose/$fell were ALWAYS 0 and $stable
             // ALWAYS 1, silently.
             if !self.clocking_meta.contains_key("__xz_default_clocking") {
-                let (ec, cid) = *self.sampled_site_clock.get(&expr.span.start)?;
+                let (ec, cid) = Self::sampled_site_lookup(
+                    &self.sampled_site_clock,
+                    expr.span.start,
+                    self.activation_scope.borrow().as_deref().unwrap_or(""),
+                    !self.sampled_registering,
+                )?;
                 let operand = args.first()?.clone();
                 let site = expr.span.start;
                 let widx = self.sampled_watch_for(site, &operand, ec, cid, n)?;
@@ -56628,11 +56687,16 @@ impl Simulator {
         if self.clocking_meta.is_empty() {
             // Explicit @(...) args can still appear; scan anyway.
         }
-        let mut stmts: Vec<Statement> = Vec::new();
+        // Each site registers under the activation scope it will run in
+        // (see `sampled_scope`), so install that scope around its scan.
+        let saved_activation_scope = self.activation_scope.borrow().clone();
+        self.sampled_registering = true;
+        let mut stmts: Vec<(Statement, String)> = Vec::new();
         for ib in &self.module.initial_blocks {
-            stmts.push(ib.stmt.clone());
+            stmts.push((ib.stmt.clone(), ib.scope.clone()));
         }
-        for st in stmts {
+        for (st, scope) in stmts {
+            *self.activation_scope.borrow_mut() = Some(scope);
             self.scan_sampled_stmt(&st);
         }
         // §16.9.3: an edge-sensitive always block supplies the inferred
@@ -56651,10 +56715,18 @@ impl Simulator {
                 _ => None,
             });
             if let Some((ec, cid)) = clk {
+                *self.activation_scope.borrow_mut() = Some(b.scope.clone());
                 self.record_sampled_sites(&b.stmt, ec, cid);
                 self.scan_sampled_stmt(&b.stmt);
             }
         }
+        for (st, scope, ec, cid) in std::mem::take(&mut self.proc_sampled_blocks) {
+            *self.activation_scope.borrow_mut() = Some(scope);
+            self.record_sampled_sites(&st, ec, cid);
+            self.scan_sampled_stmt(&st);
+        }
+        self.sampled_registering = false;
+        *self.activation_scope.borrow_mut() = saved_activation_scope;
     }
 
     /// Tag every sampled-value call site inside `st` with the block's clock.
@@ -56662,7 +56734,11 @@ impl Simulator {
         let mut sites: Vec<usize> = Vec::new();
         Self::collect_sampled_sites_stmt(st, &mut sites);
         for site in sites {
-            self.sampled_site_clock.entry(site).or_insert((ec, cid));
+            let scope = self.sampled_scope();
+            let v = self.sampled_site_clock.entry(site).or_default();
+            if !v.iter().any(|(s, _)| **s == *scope) {
+                v.push((scope.into(), (ec, cid)));
+            }
         }
     }
 
@@ -56882,7 +56958,12 @@ impl Simulator {
         clk_id: usize,
         depth: usize,
     ) -> Option<usize> {
-        if let Some(&i) = self.sampled_watch_site.get(&site) {
+        if let Some(i) = Self::sampled_site_lookup(
+            &self.sampled_watch_site,
+            site,
+            self.activation_scope.borrow().as_deref().unwrap_or(""),
+            !self.sampled_registering,
+        ) {
             if depth + 1 > self.sampled_watches[i].depth {
                 self.sampled_watches[i].depth = depth + 1;
             }
@@ -56925,7 +57006,11 @@ impl Simulator {
             depth: depth + 1,
             last_sample_time: None,
         });
-        self.sampled_watch_site.insert(site, i);
+        let scope = self.sampled_scope();
+        self.sampled_watch_site
+            .entry(site)
+            .or_default()
+            .push((scope.into(), i));
         Some(i)
     }
 

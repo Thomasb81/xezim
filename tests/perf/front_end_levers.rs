@@ -459,4 +459,8 @@ fn lazy_child_always_blocks_match_eager_trees() {
     // lazy blocks' targets exactly as it sees materialized ones.
     assert_eq!(keep(&lazy), keep(&eager), "lazy:\n{lazy}\neager:\n{eager}");
     assert!(lazy.contains("[BUF-COLLAPSE]"), "{lazy}");
+    // §16.9.3: `$rose(x)` in the clk-clocked instance keeps its own history
+    // although two sibling instances of the module run on other clocks (the
+    // reference counts 2; a span-keyed site shared the first one's clock).
+    assert!(lazy.contains("R|rc=2"), "{lazy}");
 }
