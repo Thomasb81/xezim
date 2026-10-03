@@ -43898,6 +43898,22 @@ impl Simulator {
             EventControl::EventExpr(exprs) => {
                 let mut out: Vec<Sensitivity> = Vec::with_capacity(exprs.len());
                 for ee in exprs {
+                    let edge = match ee.edge {
+                        Some(Edge::Posedge) => EdgeKind::Posedge,
+                        Some(Edge::Negedge) => EdgeKind::Negedge,
+                        Some(Edge::Edge) => EdgeKind::LsbEdge,
+                        None => EdgeKind::AnyEdge,
+                    };
+                    if let Some(key) = self.event_ref_key(&ee.expr) {
+                        let canon = self.resolve_event_key(&key);
+                        out.push(Sensitivity {
+                            signal_name: canon,
+                            edge,
+                            iff: ee.iff.clone().map(Box::new),
+                            value_of: None,
+                        });
+                        continue;
+                    }
                     // §25.8/§25.9: a term whose receiver is a bound virtual
                     // interface (`@(cfg.vif.data)`, `@(posedge d.vif.clk)`,
                     // `@(c.vif.cb)`) waits on the bound instance's signal.
@@ -84412,50 +84428,126 @@ impl Simulator {
         cur.to_string()
     }
 
-    /// If `e` is a plain reference to an event variable (optionally with a
-    /// constant/variable element select: `ev`, `ev_arr[i]`), return its
-    /// storage key (`ev` / `ev_arr[3]`). Detection is by the declared-events
-    /// set, so ordinary signals never take this path.
-    fn event_ref_key(&mut self, e: &Expression) -> Option<String> {
-        // Trailing element select parses as Index (`ev_arr[1]` as a full
-        // expression); mid-path selects live on the Ident segment
-        // (`ev_arr[1].triggered`). Accept both shapes.
-        if let ExprKind::Index { expr, index } = &e.kind {
-            if let ExprKind::Ident(h) = &expr.kind {
-                if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                    let base = h.path[0].name.name.as_str();
-                    if self.module.events.contains(base) {
-                        let base = base.to_string();
-                        let idx_expr = (**index).clone();
-                        let i = self.eval_expr(&idx_expr).to_i64().unwrap_or(0);
-                        return Some(format!("{}[{}]", base, i));
+    /// Evaluate a hierarchical expression or member chain into a dotted/indexed
+    /// signal name string (e.g. `u.ev`, `ua[0].ev`, `m.l.ev`, `vif.ev`).
+    fn hier_expr_to_string(&self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.path.is_empty() {
+                    return None;
+                }
+                let mut out = String::new();
+                let first = h.path[0].name.name.as_str();
+                let head = if let Some(bound) = self.iface_alias_for(first) {
+                    bound
+                } else if first == "this" {
+                    if let Some(Some(this_h)) = self.this_stack.last() {
+                        if h.path.len() >= 2 {
+                            let member = &h.path[1].name.name;
+                            if let Some((bound, _)) =
+                                self.virtual_iface_bindings.get(&(*this_h, member.clone()))
+                            {
+                                out.push_str(bound);
+                                for seg in &h.path[2..] {
+                                    out.push('.');
+                                    out.push_str(&seg.name.name);
+                                    for sel in &seg.selects {
+                                        let i = self.eval_scalar_self(sel).unwrap_or(0);
+                                        use std::fmt::Write as _;
+                                        let _ = write!(out, "[{}]", i);
+                                    }
+                                }
+                                return Some(out);
+                            }
+                        }
+                    }
+                    first.to_string()
+                } else if let Some(Some(this_h)) = self.this_stack.last() {
+                    if let Some((bound, _)) =
+                        self.virtual_iface_bindings.get(&(*this_h, first.to_string()))
+                    {
+                        bound.clone()
+                    } else {
+                        first.to_string()
+                    }
+                } else {
+                    first.to_string()
+                };
+                out.push_str(&head);
+                for sel in &h.path[0].selects {
+                    let i = self.eval_scalar_self(sel).unwrap_or(0);
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "[{}]", i);
+                }
+                for seg in &h.path[1..] {
+                    out.push('.');
+                    out.push_str(&seg.name.name);
+                    for sel in &seg.selects {
+                        let i = self.eval_scalar_self(sel).unwrap_or(0);
+                        use std::fmt::Write as _;
+                        let _ = write!(out, "[{}]", i);
                     }
                 }
+                Some(out)
             }
-            return None;
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && h.path[0].name.name == "this" {
+                        if let Some(Some(this_h)) = self.this_stack.last() {
+                            if let Some((bound, _)) =
+                                self.virtual_iface_bindings.get(&(*this_h, member.name.clone()))
+                            {
+                                return Some(bound.clone());
+                            }
+                        }
+                    }
+                }
+                let mut base = self.hier_expr_to_string(expr)?;
+                base.push('.');
+                base.push_str(&member.name);
+                Some(base)
+            }
+            ExprKind::Index { expr, index } => {
+                let mut base = self.hier_expr_to_string(expr)?;
+                let i = self.eval_scalar_self(index).unwrap_or(0);
+                use std::fmt::Write as _;
+                let _ = write!(base, "[{}]", i);
+                Some(base)
+            }
+            ExprKind::Paren(inner) => self.hier_expr_to_string(inner),
+            _ => None,
         }
-        let hier = match &e.kind {
-            ExprKind::Ident(h) => h,
-            _ => return None,
-        };
-        if hier.path.len() != 1 {
-            return None;
+    }
+
+    /// If `e` is a plain reference to an event variable (optionally with a
+    /// constant/variable element select: `ev`, `ev_arr[i]`, `u.ev`, `ua[0].ev`),
+    /// return its storage key (`ev` / `ev_arr[3]` / `u.ev`). Detection is by the
+    /// declared-events set, so ordinary signals never take this path.
+    fn event_ref_key(&self, e: &Expression) -> Option<String> {
+        let name = self.hier_expr_to_string(e)?;
+        let base = name.split('[').next().unwrap_or(&name);
+        if self.module.events.contains(&name) || self.module.events.contains(base) {
+            return Some(name);
         }
-        let seg = &hier.path[0];
-        let base = seg.name.name.as_str();
-        if !self.module.events.contains(base) {
-            return None;
+        let top_prefix = format!("{}.", self.module.name);
+        if let Some(rest) = base.strip_prefix(&top_prefix) {
+            if self.module.events.contains(rest) {
+                let rest_full = name.strip_prefix(&top_prefix).unwrap_or(&name);
+                return Some(rest_full.to_string());
+            }
         }
-        if seg.selects.is_empty() {
-            return Some(base.to_string());
+        if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
+            let scoped_base = format!("{}.{}", hint, base);
+            if self.module.events.contains(&scoped_base) {
+                return Some(format!("{}.{}", hint, name));
+            }
         }
-        let mut key = base.to_string();
-        let sels = seg.selects.clone();
-        for sel in &sels {
-            let i = self.eval_expr(sel).to_i64().unwrap_or(0);
-            key = format!("{}[{}]", key, i);
+        let canon = self.resolve_event_key(&name);
+        let canon_base = canon.split('[').next().unwrap_or(&canon);
+        if self.module.events.contains(&canon) || self.module.events.contains(canon_base) {
+            return Some(canon);
         }
-        Some(key)
+        None
     }
 
     /// §15.5.5 handle-assignment interception for `lhs = rhs` where `lhs`
