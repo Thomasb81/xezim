@@ -166,8 +166,10 @@ endmodule
     );
 }
 
-// §16.9.3: `$past` with no history yet yields the operand type's default
-// value at the OPERAND's width, and `$sampled(e)` is e's current value.
+// §16.9.3: `$past` with no history yet yields the operand's DEFAULT
+// sampled value at the operand's width — its declaration value, else its
+// type's default (x for an uninitialized `logic`) — and `$sampled(e)` is e's
+// current value. Reference-verified (the declaration value, not x, for `v`).
 #[test]
 fn past_default_has_operand_width_and_sampled_reads_current() {
     let msgs = messages(
@@ -176,10 +178,11 @@ module top;
   logic clk = 0;
   always #5 clk = ~clk;
   logic [7:0] v = 8'hA5;
+  logic [7:0] u;
   int n = 0;
   always @(posedge clk) begin
     n++;
-    if (n == 1) $display("PAST1=%b", $past(v));
+    if (n == 1) $display("PAST1=%b U=%b", $past(v), $past(u));
     if (n == 2) begin
       $display("PAST2=%h SAMPLED=%h", $past(v), $sampled(v));
       $finish;
@@ -188,7 +191,10 @@ module top;
 endmodule
 "#,
     );
-    assert!(msgs.iter().any(|m| m == "PAST1=xxxxxxxx"), "got {msgs:?}");
+    assert!(
+        msgs.iter().any(|m| m == "PAST1=10100101 U=xxxxxxxx"),
+        "got {msgs:?}"
+    );
     assert!(
         msgs.iter().any(|m| m == "PAST2=a5 SAMPLED=a5"),
         "got {msgs:?}"

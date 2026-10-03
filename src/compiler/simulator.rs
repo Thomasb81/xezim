@@ -8303,6 +8303,20 @@ struct SampledWatch {
     /// slot's sampler (an SVA site after it), so the reader checks whether the
     /// current edge is already at the front of `hist` before indexing.
     last_sample_time: Option<u64>,
+    /// §16.5.1: a simple-signal operand's value at the START of the time
+    /// slot (`slot_val` taken at `slot_time`'s first sampler pass, when the
+    /// delta snapshot still holds the previous slot's final values). A clock
+    /// that edges in a LATER delta of the slot than an operand change (a
+    /// port clock driven through a continuous assignment, `.ck(a & en)`)
+    /// must still sample the operand's preponed value, not the
+    /// previous delta's.
+    slot_val: Option<Value>,
+    slot_time: Option<u64>,
+    /// §16.9.3 default sampled value — what the operand held before time 0
+    /// (its declaration initializer, else its type's default) — used for a
+    /// tick before the first one. Known only for a watch registered before
+    /// the run starts.
+    default: Option<Value>,
 }
 
 /// Empty static used as fallback name for unnamed array-element ids
@@ -56561,6 +56575,23 @@ impl Simulator {
         }
     }
 
+    /// §16.9.3 `$rose`/`$fell`/`$stable`/`$changed` from the current and the
+    /// previous tick's sampled values. `$rose` is a least-significant bit
+    /// that is 1 now and was anything else (0, x or z) before, `$fell` the
+    /// same for 0; `$stable` compares the whole values with `===` (an x/z bit
+    /// must match exactly). With no previous sample nothing has changed.
+    fn sampled_change_fn(name: &str, cur: &Value, prev: Option<&Value>) -> bool {
+        let Some(prev) = prev else {
+            return name == "$stable";
+        };
+        match name {
+            "$rose" => cur.get_bit(0) == LogicBit::One && prev.get_bit(0) != LogicBit::One,
+            "$fell" => cur.get_bit(0) == LogicBit::Zero && prev.get_bit(0) != LogicBit::Zero,
+            "$stable" => cur.case_eq(prev).to_u64() == Some(1),
+            _ => cur.case_eq(prev).to_u64() != Some(1),
+        }
+    }
+
     /// The activation scope a sampled-value call site's history belongs to:
     /// the executing block's instance scope ("" at top level). One source
     /// call in a child module is one site per INSTANCE — keyed by span alone,
@@ -56659,12 +56690,22 @@ impl Simulator {
         n: usize,
     ) -> (Value, Option<Value>) {
         let sampled_this_slot = self.sampled_watches[widx].last_sample_time == Some(self.time);
-        let cur = match self.sampled_watches[widx].hist.front() {
+        // Off the clock's tick the current sample is still the operand's
+        // PREPONED value in this slot (§16.5.1), not its live one: an
+        // operand written earlier in the slot must not count yet.
+        let w = &self.sampled_watches[widx];
+        let cur = match w.hist.front() {
             Some(v) if sampled_this_slot => v.clone(),
-            _ => {
-                let op = operand.clone();
-                self.eval_expr(&op)
-            }
+            _ => match w.sig_id {
+                Some(_) if w.slot_time == Some(self.time) && w.slot_val.is_some() => {
+                    w.slot_val.clone().unwrap()
+                }
+                Some(sid) => self.preponed_value_of(sid),
+                None => {
+                    let op = operand.clone();
+                    self.eval_expr(&op)
+                }
+            },
         };
         let idx = if sampled_this_slot {
             n
@@ -56674,7 +56715,10 @@ impl Simulator {
         let past = if n == 0 {
             Some(cur.clone())
         } else {
-            self.sampled_watches[widx].hist.get(idx).cloned()
+            // §16.9.3: a tick before the first one samples the operand's
+            // default value (its declaration value, else its type's).
+            let w = &self.sampled_watches[widx];
+            w.hist.get(idx).or(w.default.as_ref()).cloned()
         };
         (cur, past)
     }
@@ -56996,6 +57040,14 @@ impl Simulator {
                 self.seed_prev_from_current(sid);
             }
         }
+        let default = if !self.sampled_registering {
+            None
+        } else {
+            match sig_id {
+                Some(sid) => self.signal_table.get(sid).cloned(),
+                None => Some(self.eval_expr(operand)),
+            }
+        };
         let i = self.sampled_watches.len();
         self.sampled_watches.push(SampledWatch {
             clk_id,
@@ -57005,6 +57057,9 @@ impl Simulator {
             hist: std::collections::VecDeque::new(),
             depth: depth + 1,
             last_sample_time: None,
+            slot_val: None,
+            slot_time: None,
+            default,
         });
         let scope = self.sampled_scope();
         self.sampled_watch_site
@@ -57018,6 +57073,14 @@ impl Simulator {
     /// PREPONED sample of the operand onto its history.
     fn tick_sampled_watches(&mut self) {
         for i in 0..self.sampled_watches.len() {
+            if self.sampled_watches[i].slot_time != Some(self.time) {
+                if let Some(sid) = self.sampled_watches[i].sig_id {
+                    let v = self.preponed_value_of(sid);
+                    let w = &mut self.sampled_watches[i];
+                    w.slot_val = Some(v);
+                    w.slot_time = Some(self.time);
+                }
+            }
             let (clk_id, edge) = {
                 let w = &self.sampled_watches[i];
                 (w.clk_id, w.edge)
@@ -57026,7 +57089,11 @@ impl Simulator {
                 continue;
             }
             self.sampled_watches[i].last_sample_time = Some(self.time);
-            let sample = match self.sampled_watches[i].sig_id {
+            let w = &self.sampled_watches[i];
+            let sample = match w.sig_id {
+                Some(_) if w.slot_time == Some(self.time) && w.slot_val.is_some() => {
+                    w.slot_val.clone().unwrap()
+                }
                 Some(sid) => self.preponed_value_of(sid),
                 None => {
                     let e = self.sampled_watches[i].expr.clone();
@@ -68285,20 +68352,7 @@ impl Simulator {
                 // clocking, procedural context): sample via the
                 // clock-edge watch history.
                 if let Some((cur, prev_opt)) = self.sampled_fn_via_watch(expr, args, 1) {
-                    let cur_bit = (cur.to_u64().unwrap_or(0) & 1) as u8;
-                    let prev_bit = prev_opt
-                        .as_ref()
-                        .map(|v| (v.to_u64().unwrap_or(0) & 1) as u8)
-                        .unwrap_or(cur_bit);
-                    let result = match name.as_str() {
-                        "$rose" => cur_bit == 1 && prev_bit == 0,
-                        "$fell" => cur_bit == 0 && prev_bit == 1,
-                        "$stable" => prev_opt.as_ref().is_none_or(|p| p.to_u64() == cur.to_u64()),
-                        "$changed" => prev_opt
-                            .as_ref()
-                            .is_some_and(|p| p.to_u64() != cur.to_u64()),
-                        _ => unreachable!(),
-                    };
+                    let result = Self::sampled_change_fn(&name, &cur, prev_opt.as_ref());
                     return if result {
                         Value::ones(1)
                     } else {
@@ -68318,19 +68372,7 @@ impl Simulator {
                         .and_then(|s| s.past_snapshots.get(&*sig_name))
                         .and_then(|r| r.get(1).cloned())
                 });
-                let cur_bit = (cur.to_u64().unwrap_or(0) & 1) as u8;
-                let prev_bit = prev_opt
-                    .as_ref()
-                    .map(|v| (v.to_u64().unwrap_or(0) & 1) as u8)
-                    .unwrap_or(cur_bit);
-                let result = match name.as_str() {
-                    "$rose" => cur_bit == 1 && prev_bit == 0,
-                    "$fell" => cur_bit == 0 && prev_bit == 1,
-                    "$stable" => prev_opt.is_none_or(|p| p.to_u64() == cur.to_u64()),
-                    "$changed" => prev_opt.is_some_and(|p| p.to_u64() != cur.to_u64()),
-                    _ => unreachable!(),
-                };
-                if result {
+                if Self::sampled_change_fn(&name, &cur, prev_opt.as_ref()) {
                     Value::ones(1)
                 } else {
                     Value::zero(1)

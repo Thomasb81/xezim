@@ -101,3 +101,120 @@ endmodule"#;
         ],
     );
 }
+
+/// The first tick of a clock that starts late reads the declaration value.
+#[test]
+fn first_tick_compares_with_the_default_value() {
+    const SRC: &str = r#"
+module edg(input ck, input x, input [3:0] v);
+  always @(posedge ck)
+    $display("T|%0t %m rose=%b fell=%b st=%b ch=%b past=%0d past2=%0d v=%0d", $time, $rose(x), $fell(x), $stable(v), $changed(v), $past(v), $past(v,2), v);
+endmodule
+module tb;
+  reg clk = 0; always #5 clk = ~clk;
+  reg x = 0, a = 0, en = 0;
+  reg [3:0] v = 0;
+  reg [3:0] bus = 0;
+  edg c1(.ck(bus[2]), .x(x), .v(v));
+  edg c2(.ck(a & en), .x(x), .v(v));
+  initial begin
+    for (int t = 0; t < 8; t++) begin
+      @(negedge clk);
+      bus = bus + 1;
+      a = t[0];
+      en = (t > 3);
+      x = (t == 2 || t == 3 || t == 7);
+      v = (t * 3) % 5 + 1;
+    end
+    #1 $finish;
+  end
+endmodule"#;
+    let sim = simulate(SRC, 1000).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        [
+            "T|40 tb.c1 rose=1 fell=0 st=0 ch=1 past=0 past2=0 v=5",
+            "T|60 tb.c2 rose=0 fell=0 st=0 ch=1 past=0 past2=0 v=1",
+            "T|80 tb.c2 rose=0 fell=0 st=0 ch=1 past=3 past2=0 v=2",
+        ],
+    );
+}
+
+/// x/z transitions: `$rose`/`$fell` on the least-significant bit, `$stable`
+/// with case equality.
+#[test]
+fn four_state_transitions() {
+    const SRC: &str = r#"
+module tb;
+  reg clk = 0; always #5 clk = ~clk;
+  reg [1:0] y;          // x until written
+  reg [1:0] w = 2'b10;  // declaration value
+  reg z0;
+  always @(posedge clk)
+    $display("T|%0t rose=%b fell=%b st=%b ch=%b past=%b | wr=%b wf=%b wst=%b wp=%b | zr=%b zf=%b", $time,
+             $rose(y), $fell(y), $stable(y), $changed(y), $past(y),
+             $rose(w), $fell(w), $stable(w), $past(w), $rose(z0), $fell(z0));
+  initial begin
+    @(negedge clk) y = 2'bx1; w = 2'b11; z0 = 1'bz;
+    @(negedge clk) y = 2'b01; w = 2'b00; z0 = 1'b0;
+    @(negedge clk) y = 2'b11; z0 = 1'bx;
+    @(negedge clk) y = 2'bz0; z0 = 1'b1;
+    @(negedge clk) y = 2'b10;
+    @(negedge clk) $finish;
+  end
+endmodule"#;
+    let sim = simulate(SRC, 1000).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        [
+            "T|5 rose=0 fell=0 st=1 ch=0 past=xx | wr=0 wf=0 wst=1 wp=10 | zr=0 zf=0",
+            "T|15 rose=1 fell=0 st=0 ch=1 past=xx | wr=1 wf=0 wst=0 wp=10 | zr=0 zf=0",
+            "T|25 rose=0 fell=0 st=0 ch=1 past=x1 | wr=0 wf=1 wst=0 wp=11 | zr=0 zf=1",
+            "T|35 rose=0 fell=0 st=0 ch=1 past=01 | wr=0 wf=0 wst=1 wp=00 | zr=0 zf=0",
+            "T|45 rose=0 fell=1 st=0 ch=1 past=11 | wr=0 wf=0 wst=1 wp=00 | zr=1 zf=0",
+            "T|55 rose=0 fell=0 st=0 ch=1 past=z0 | wr=0 wf=0 wst=1 wp=00 | zr=0 zf=0",
+        ],
+    );
+}
+
+/// An explicitly clocked `$rose` evaluated between its clock's ticks.
+#[test]
+fn explicit_clock_off_tick() {
+    const SRC: &str = r#"
+module edg(input ck, input x);
+  always @(negedge ck) $display("T|%0t %m cr=%b x=%b", $time, $rose(x, @(posedge ck)), x);
+  always @(posedge ck) $display("T|%0t %m pos x=%b", $time, x);
+endmodule
+module tb;
+  reg clk = 0; always #5 clk = ~clk;
+  reg x = 0, a = 0, en = 0;
+  edg c2(.ck(a & en), .x(x));
+  initial begin
+    for (int t = 0; t < 16; t++) begin
+      @(negedge clk);
+      a = t[0];
+      en = (t > 3);
+      x = (t == 2 || t == 3 || t == 7 || t == 9 || t == 12);
+    end
+    #1 $finish;
+  end
+endmodule"#;
+    let sim = simulate(SRC, 1000).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        [
+            "T|0 tb.c2 cr=0 x=0",
+            "T|60 tb.c2 pos x=0",
+            "T|70 tb.c2 cr=0 x=0",
+            "T|80 tb.c2 pos x=1",
+            "T|90 tb.c2 cr=1 x=0",
+            "T|100 tb.c2 pos x=1",
+            "T|110 tb.c2 cr=1 x=0",
+            "T|120 tb.c2 pos x=0",
+            "T|130 tb.c2 cr=0 x=1",
+            "T|140 tb.c2 pos x=0",
+            "T|150 tb.c2 cr=0 x=0",
+            "T|160 tb.c2 pos x=0",
+        ],
+    );
+}
