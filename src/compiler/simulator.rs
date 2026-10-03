@@ -444,6 +444,11 @@ const RPS_TRAMPOLINE_DEPTH: usize = 300;
 /// Internal marker retrieving a §9.4.5 intra-assignment RHS value captured in
 /// `Simulator::intra_saved` (see `make_intra_saved_expr`). Never user-visible.
 const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
+/// Internal `$__xz_vc_changed(idx, expr)`: true once `expr` differs from the
+/// value stashed in `Simulator::vc_saved[idx]` when a value-change event
+/// control (`@prop` on a non-event class property) was armed. Never
+/// user-visible.
+const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
@@ -7208,6 +7213,9 @@ pub struct Simulator {
     /// (removed) when the delayed assignment fires.
     intra_saved: HashMap<u64, Value>,
     intra_saved_next: u64,
+    /// Armed values of value-change waits on class properties (see
+    /// `VC_CHANGED_MARKER`); removed when the wait resumes.
+    vc_saved: HashMap<u64, Value>,
     /// LRM §15.5.3: per-named-event last-trigger time. `e.triggered`
     /// returns 1 iff this map's `time` matches the current simulation time
     /// (i.e. the event has been triggered in the same time slot as the
@@ -11791,6 +11799,7 @@ impl Simulator {
             semaphore_get_waiters: HashMap::default(),
             intra_saved: HashMap::default(),
             intra_saved_next: 0,
+            vc_saved: HashMap::default(),
             event_triggered_time: HashMap::default(),
             event_waiters: Vec::new(),
             instance_event_waiters: Vec::new(),
@@ -45233,6 +45242,11 @@ impl Simulator {
                     Self::collect_condition_read_names(p, out);
                 }
             }
+            ExprKind::SystemCall { name, args } if name == VC_CHANGED_MARKER => {
+                if let Some(a) = args.get(1) {
+                    Self::collect_condition_read_names(a, out);
+                }
+            }
             _ => {}
         }
     }
@@ -45413,6 +45427,9 @@ impl Simulator {
                     && self.cond_operand_gated(then_expr, this_h, this_cls)
                     && self.cond_operand_gated(else_expr, this_h, this_cls)
             }
+            ExprKind::SystemCall { name, args } if name == VC_CHANGED_MARKER => args
+                .get(1)
+                .is_some_and(|a| self.cond_operand_gated(a, this_h, this_cls)),
             _ => false,
         }
     }
@@ -52860,6 +52877,15 @@ impl Simulator {
                                 return;
                             }
                         }
+                        // `@prop` / `@(h.prop)` on a NON-event class property:
+                        // a value-change wait, resumed by an ordinary write
+                        // of the property (never by `->`).
+                        if let Some(cond) = self.class_prop_value_change_cond(event) {
+                            let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
+                            let cont = pc.pushed(vec![wait], pc.start + i + 1);
+                            self.park_condition_waiter(pid, cont, &cond);
+                            return;
+                        }
                         // §15.5 a DECLARED named event — including an array
                         // element (`@ev[1]`) and one reached through an alias
                         // (`e1 = e2; @e1`). Both need the resolved key rather
@@ -52958,6 +52984,7 @@ impl Simulator {
             } = &stmt.kind
             {
                 if self.wait_condition_true(condition) {
+                    self.vc_release(condition);
                     self.cond_progress = self.cond_progress.wrapping_add(1);
                     self.exec_statement(body);
                     i += 1;
@@ -68620,6 +68647,20 @@ impl Simulator {
                     .remove(&idx)
                     .unwrap_or_else(|| Value::zero(32))
             }
+            // `@prop` on a non-event class property: true once the property
+            // differs from the value captured when the wait was armed.
+            VC_CHANGED_MARKER => {
+                let idx = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0))
+                    .unwrap_or(0);
+                let cur = args
+                    .get(1)
+                    .map(|a| self.eval_expr(a))
+                    .unwrap_or_else(|| Value::zero(1));
+                let changed = self.vc_saved.get(&idx).is_none_or(|prev| *prev != cur);
+                Value::from_u64(changed as u64, 1)
+            }
             // §9.4.5 marker reached from a context that cannot suspend
             // (always-block settle, function body, bytecode fallback):
             // degrade to the RHS value with the delay ignored.
@@ -83521,6 +83562,13 @@ impl Simulator {
                                 return;
                             }
                         }
+                        if let Some(cond) = self.class_prop_value_change_cond(e) {
+                            let pid = self.current_pid;
+                            let wait = Self::vc_wait_stmt(cond.clone(), stmt, stmt.span);
+                            self.park_condition_waiter(pid, vec![wait].into(), &cond);
+                            self.break_flag = true;
+                            return;
+                        }
                         let sens = self.event_to_sens(e);
                         let is_clk_ev = self.is_clocking_event(e);
                         sim_dbg_eprintln!(
@@ -84584,11 +84632,116 @@ impl Simulator {
     fn resolve_this_event_field(&self, name: &str) -> Option<(usize, String)> {
         let handle = self.this_stack.last().copied().flatten()?;
         let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
-        if inst.properties.contains_key(name) {
+        if inst.properties.contains_key(name) && self.class_prop_is_event(handle, name) {
             Some((handle, name.to_string()))
         } else {
             None
         }
+    }
+
+    /// Is `field` of the class object `handle` declared `event` (searching
+    /// the `extends` chain)? A property with no recorded type is assumed to
+    /// be an event, as the callers always have been. A plain variable
+    /// (`bit on;`) is NOT: `@on` on it is a value-change wait, never woken
+    /// by `->` (see `class_prop_value_change_cond`).
+    fn class_prop_is_event(&self, handle: usize, field: &str) -> bool {
+        let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) else {
+            return false;
+        };
+        let mut cur = Some(inst.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            if let Some(dt) = cd.property_types.get(field) {
+                return matches!(
+                    dt,
+                    DataType::Simple {
+                        kind: crate::ast::types::SimpleType::Event,
+                        ..
+                    }
+                );
+            }
+            cur = cd.extends.clone();
+        }
+        true
+    }
+
+    /// `@prop` / `@(h.prop)` on a NON-event class property (§9.4.2: any
+    /// change of the expression value triggers). Returns a condition that
+    /// becomes true when the property differs from its value right now, to
+    /// be parked as a `wait` — the same wake path `wait(prop)` uses, driven
+    /// by ordinary property writes. `None` when the control is anything
+    /// else (an event property, a signal, an edge-qualified term, ...).
+    fn class_prop_value_change_cond(&mut self, event: &EventControl) -> Option<Expression> {
+        let expr = Self::event_control_single_expr(event)?;
+        let on_class_prop = if let Some(fname) = self.event_control_field_name(event) {
+            self.this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                .is_some_and(|inst| inst.properties.contains_key(fname.as_str()))
+        } else {
+            false
+        } || self.expr_handle_prop_any(&expr).is_some_and(|(h, f)| !self.class_prop_is_event(h, &f));
+        if !on_class_prop {
+            return None;
+        }
+        let val = self.eval_expr(&expr);
+        let idx = self.intra_saved_next;
+        self.intra_saved_next += 1;
+        self.vc_saved.insert(idx, val);
+        let span = expr.span;
+        Some(Expression::new(
+            ExprKind::SystemCall {
+                name: VC_CHANGED_MARKER.to_string(),
+                args: vec![
+                    Expression::new(
+                        ExprKind::Number(NumberLiteral::Integer {
+                            size: None,
+                            signed: false,
+                            base: NumberBase::Decimal,
+                            value: idx.to_string(),
+                            cached_val: Cell::new(None),
+                        }),
+                        span,
+                    ),
+                    expr,
+                ],
+            },
+            span,
+        ))
+    }
+
+    /// Drop the armed value of a resumed value-change wait.
+    fn vc_release(&mut self, cond: &Expression) {
+        if let ExprKind::SystemCall { name, args } = &cond.kind {
+            if name == VC_CHANGED_MARKER {
+                if let Some(ExprKind::Number(NumberLiteral::Integer { value, .. })) =
+                    args.first().map(|a| &a.kind)
+                {
+                    if let Ok(idx) = value.parse::<u64>() {
+                        self.vc_saved.remove(&idx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Wait statement a value-change waiter resumes into.
+    fn vc_wait_stmt(cond: Expression, body: &Statement, span: crate::ast::Span) -> Statement {
+        Statement::new(
+            StatementKind::Wait {
+                condition: cond,
+                stmt: Box::new(body.clone()),
+            },
+            span,
+        )
     }
 
     /// Extract the field name from an `@name` event control, whether it
@@ -84719,6 +84872,16 @@ impl Simulator {
     }
 
     fn resolve_handle_event_field(&mut self, dotted: &str) -> Option<(usize, String)> {
+        let (h, f) = self.resolve_handle_prop_any(dotted)?;
+        if self.class_prop_is_event(h, &f) {
+            Some((h, f))
+        } else {
+            None
+        }
+    }
+
+    /// `recv.field` -> `(handle, field)` for ANY property (event or not).
+    fn resolve_handle_prop_any(&mut self, dotted: &str) -> Option<(usize, String)> {
         let (recv, field) = dotted.rsplit_once('.')?;
         if recv.contains('.') {
             return None; // deeper chains are not modelled
@@ -84738,6 +84901,16 @@ impl Simulator {
 
     /// The same, from an EXPRESSION (`@(h.ce)`, `h.ce.triggered`).
     fn expr_handle_event_field(&mut self, e: &Expression) -> Option<(usize, String)> {
+        let (h, f) = self.expr_handle_prop_any(e)?;
+        if self.class_prop_is_event(h, &f) {
+            Some((h, f))
+        } else {
+            None
+        }
+    }
+
+    /// As `expr_handle_event_field`, for a property of any type.
+    fn expr_handle_prop_any(&mut self, e: &Expression) -> Option<(usize, String)> {
         let dotted = match &e.kind {
             ExprKind::MemberAccess { expr, member } => {
                 let recv = match &expr.kind {
@@ -84759,7 +84932,7 @@ impl Simulator {
             }
             _ => return None,
         };
-        self.resolve_handle_event_field(&dotted)
+        self.resolve_handle_prop_any(&dotted)
     }
 
     /// §15.5: an event CLASS PROPERTY reached through an ARBITRARY receiver
