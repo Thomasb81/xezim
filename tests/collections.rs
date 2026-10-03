@@ -49,6 +49,8 @@ mod dyn_array_of_mailboxes;
 mod fixed_array_member_initializer;
 #[path = "collections/fixed_array_member_pattern_forms.rs"]
 mod fixed_array_member_pattern_forms;
+#[path = "collections/foreach_assoc_key_types.rs"]
+mod foreach_assoc_key_types;
 #[path = "collections/foreach_blocking_resume.rs"]
 mod foreach_blocking_resume;
 #[path = "collections/foreach_negative_dims.rs"]
