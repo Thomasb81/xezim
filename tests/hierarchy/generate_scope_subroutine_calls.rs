@@ -12,12 +12,104 @@
 
 use xezim::simulate;
 
+/// §11.4/§8.6: speculative hierarchy lookup must not evaluate an object
+/// receiver's side-effectful selector when a module subroutine shares its name.
+#[test]
+fn indexed_object_calls_with_hierarchical_name_collisions() {
+    const SRC: &str = r#"
+class entry_t;
+  int data;
+  function new(int v); data = v; endfunction
+  function int value(); return data; endfunction
+  task bump(); data++; endtask
+endclass
+module leaf;
+  function int value(); return 99; endfunction
+  task bump(); endtask
+endmodule
+module tb;
+  for (genvar n = 0; n < 2; n++) begin : branches
+    leaf u_leaf();
+  end
+  entry_t entries[2];
+  int picks = 0, slot = 0, result;
+  function automatic int next_slot(); picks++; return 0; endfunction
+  task automatic nested_probe();
+    int result;
+    result = entries[next_slot()].value();
+    entries[slot++].bump();
+    $display("T|nested result=%0d picks=%0d slot=%0d data=%0d", result, picks, slot, entries[0].data);
+  endtask
+  initial begin
+    entries[0] = new(17);
+    entries[1] = new(40);
+    result = entries[next_slot()].value();
+    entries[slot++].bump();
+    $display("T|direct result=%0d picks=%0d slot=%0d data=%0d", result, picks, slot, entries[0].data);
+    slot = 0;
+    nested_probe();
+    $finish;
+  end
+endmodule"#;
+    let sim = simulate(SRC, 100).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        [
+            "T|direct result=17 picks=1 slot=1 data=18",
+            "T|nested result=18 picks=2 slot=1 data=19",
+        ],
+    );
+}
+
 fn t_lines(sim: &xezim::compiler::Simulator) -> Vec<String> {
     sim.output
         .iter()
         .map(|o| o.message.trim_end().to_string())
         .filter(|l| l.starts_with("T|"))
         .collect()
+}
+
+/// A selector rejected by speculative probes still receives unknown-index
+/// handling after its one real evaluation, at the array element's full width.
+#[test]
+fn side_effecting_unknown_array_selector_is_evaluated_once() {
+    const SRC: &str = r#"
+module tb;
+  logic [15:0] words[2];
+  int picks = 0;
+  function automatic logic [31:0] next_slot();
+    picks++;
+    return 'x;
+  endfunction
+  initial begin
+    words[0] = 16'h1234;
+    words[1] = 16'h5678;
+    $display("T|unknown=%h", words[next_slot()]);
+    $display("T|picks=%0d", picks);
+    $finish;
+  end
+endmodule"#;
+    let sim = simulate(SRC, 100).expect("sim");
+    assert_eq!(t_lines(&sim), ["T|unknown=xxxx", "T|picks=1"]);
+}
+
+#[test]
+fn scalar_assignment_selectors_are_evaluated_once() {
+    const SRC: &str = r#"
+module tb;
+  int words[2], picks = 0, slot = 0, result;
+  function automatic int next_slot(); picks++; return 0; endfunction
+  initial begin
+    words[0] = 51;
+    words[1] = 62;
+    result = words[next_slot()];
+    words[slot++] = result + 1;
+    $display("T|picks=%0d slot=%0d result=%0d words=%0d,%0d", picks, slot, result, words[0], words[1]);
+    $finish;
+  end
+endmodule"#;
+    let sim = simulate(SRC, 100).expect("sim");
+    assert_eq!(t_lines(&sim), ["T|picks=1 slot=1 result=51 words=52,62"]);
 }
 
 /// A local receiver named like the top module must not bind to a global

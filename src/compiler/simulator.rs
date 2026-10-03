@@ -51010,49 +51010,35 @@ impl Simulator {
     }
 
     /// Is this expression free of side effects, structurally? Conservative:
-    /// unknown shapes are NOT effect-free. Calls are allowed — the bytecode
-    /// compiler only inlines functions that are pure in their arguments, and
-    /// anything else fails the compile — but increments, decrements and
-    /// assignment expressions mutate state and must not be double-evaluated
-    /// by the self-audit. System calls are limited to pure value readers.
-    fn cond_expr_is_effect_free(e: &Expression) -> bool {
+    /// unknown shapes are NOT effect-free. Calls may be allowed only when
+    /// the bytecode compiler subsequently verifies their purity. Runtime
+    /// shape probes must reject them before evaluating an index speculatively.
+    /// System calls are limited to pure value readers.
+    fn cond_expr_is_effect_free(e: &Expression, compiler_checks_calls: bool) -> bool {
+        let pure = |expr: &Expression| Self::cond_expr_is_effect_free(expr, compiler_checks_calls);
         match &e.kind {
-            ExprKind::Number(_) | ExprKind::StringLiteral(_) | ExprKind::Ident(_) => true,
-            ExprKind::Paren(i) => Self::cond_expr_is_effect_free(i),
+            ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+            ExprKind::Ident(h) => h.path.iter().all(|seg| seg.selects.iter().all(pure)),
+            ExprKind::Paren(i) => pure(i),
             ExprKind::Unary { op, operand } => {
                 !matches!(
                     op,
                     UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
-                ) && Self::cond_expr_is_effect_free(operand)
+                ) && pure(operand)
             }
-            ExprKind::Binary { left, right, .. } => {
-                Self::cond_expr_is_effect_free(left) && Self::cond_expr_is_effect_free(right)
-            }
+            ExprKind::Binary { left, right, .. } => pure(left) && pure(right),
             ExprKind::Conditional {
                 condition,
                 then_expr,
                 else_expr,
-            } => {
-                Self::cond_expr_is_effect_free(condition)
-                    && Self::cond_expr_is_effect_free(then_expr)
-                    && Self::cond_expr_is_effect_free(else_expr)
-            }
-            ExprKind::Concatenation(xs) => xs.iter().all(Self::cond_expr_is_effect_free),
-            ExprKind::Replication { count, exprs } => {
-                Self::cond_expr_is_effect_free(count)
-                    && exprs.iter().all(Self::cond_expr_is_effect_free)
-            }
-            ExprKind::Index { expr, index } => {
-                Self::cond_expr_is_effect_free(expr) && Self::cond_expr_is_effect_free(index)
-            }
+            } => pure(condition) && pure(then_expr) && pure(else_expr),
+            ExprKind::Concatenation(xs) => xs.iter().all(pure),
+            ExprKind::Replication { count, exprs } => pure(count) && exprs.iter().all(pure),
+            ExprKind::Index { expr, index } => pure(expr) && pure(index),
             ExprKind::RangeSelect {
                 expr, left, right, ..
-            } => {
-                Self::cond_expr_is_effect_free(expr)
-                    && Self::cond_expr_is_effect_free(left)
-                    && Self::cond_expr_is_effect_free(right)
-            }
-            ExprKind::MemberAccess { expr, .. } => Self::cond_expr_is_effect_free(expr),
+            } => pure(expr) && pure(left) && pure(right),
+            ExprKind::MemberAccess { expr, .. } => pure(expr),
             ExprKind::SystemCall { name, args } => {
                 matches!(
                     name.as_str(),
@@ -51062,11 +51048,24 @@ impl Simulator {
                         | "$clog2"
                         | "$__xz_named_cast"
                         | "$__xz_size_cast"
-                ) && args.iter().all(Self::cond_expr_is_effect_free)
+                ) && args.iter().all(pure)
             }
             ExprKind::Call { func, args } => {
-                matches!(func.kind, ExprKind::Ident(_))
-                    && args.iter().all(Self::cond_expr_is_effect_free)
+                // §7.9/§7.10: a built-in collection QUERY (`q.size()`,
+                // `aa.num()`, `aa.exists(k)`, `s.len()`) only reads, so it
+                // stays probe-safe. `slices[slices.size()-1] = s` must keep
+                // its aggregate-shape probes or the struct copy is lost.
+                if let ExprKind::MemberAccess { expr, member } = &func.kind {
+                    if matches!(member.name.as_str(), "size" | "num" | "len" | "exists")
+                        && pure(expr)
+                        && args.iter().all(pure)
+                    {
+                        return true;
+                    }
+                }
+                compiler_checks_calls
+                    && matches!(func.kind, ExprKind::Ident(_))
+                    && args.iter().all(pure)
             }
             _ => false,
         }
@@ -51095,7 +51094,7 @@ impl Simulator {
         if !self.process_cond_bytecode.contains_key(&key) {
             // Side effects would DOUBLE-FIRE during the self-audit below —
             // only cache conditions that provably have none.
-            if !Self::cond_expr_is_effect_free(cond) {
+            if !Self::cond_expr_is_effect_free(cond, true) {
                 self.process_cond_bytecode.insert(key, None);
                 return None;
             }
@@ -74120,7 +74119,7 @@ impl Simulator {
                 // Only for a side-effect-free index, so the extra evaluation
                 // cannot run a call twice.
                 if let ExprKind::Ident(h) = &expr.kind
-                    && Self::cond_expr_is_effect_free(index)
+                    && Self::cond_expr_is_effect_free(index, false)
                 {
                     let nm = base_nm.as_deref().unwrap_or("");
                     if let Some(&(_, _, ew)) = self.module.arrays.get(nm) {
@@ -74681,6 +74680,14 @@ impl Simulator {
                         let idx_val = self.eval_expr(index);
                         if self.module.dynamic_arrays.contains(&*name) {
                             self.dollar_bound.pop();
+                        }
+                        // A side-effecting selector bypasses speculative
+                        // probes; validate its single evaluated result here
+                        // before either fixed-array storage lookup.
+                        if !self.is_associative_array(&name) && idx_val.has_xz() {
+                            if let Some(ew) = self.module.arrays.get(&*name).map(|a| a.2) {
+                                return Value::new(ew.max(1));
+                            }
                         }
                         // Fast path for 1-D arrays: compute signal_id directly
                         // via `array_first_id`. Critical for LARGE arrays
@@ -76880,8 +76887,15 @@ impl Simulator {
         // the same at every probe below: compute it once.
         let l_pure = self.flat_name_pure(lvalue);
         let r_pure = self.flat_name_pure(rvalue);
-        let mut lflat = self.flat_member_name(lvalue);
-        let rflat = self.flat_member_name(rvalue);
+        // These are aggregate-shape probes, not the actual assignment.
+        // Leave mutating selectors for the eventual read/write path.
+        let l_probe_safe = Self::cond_expr_is_effect_free(lvalue, false);
+        let mut lflat = l_probe_safe
+            .then(|| self.flat_member_name(lvalue))
+            .flatten();
+        let rflat = Self::cond_expr_is_effect_free(rvalue, false)
+            .then(|| self.flat_member_name(rvalue))
+            .flatten();
         if let (Some(dst), Some(src)) = (&lflat, &rflat) {
             if dst != src {
                 let su_opt =
@@ -76912,7 +76926,7 @@ impl Simulator {
                 }
             }
         }
-        if !l_pure {
+        if !l_pure && l_probe_safe {
             lflat = self.flat_member_name(lvalue);
         }
         // `s = q.pop_front()` on a queue of unpacked structs: the popped
@@ -76986,7 +77000,7 @@ impl Simulator {
             }
         }
         if self.queue_pop_call(rvalue).is_none() {
-            if !l_pure {
+            if !l_pure && l_probe_safe {
                 lflat = self.flat_member_name(lvalue);
             }
             if let Some(dst) = &lflat {
@@ -77033,7 +77047,7 @@ impl Simulator {
         // container nobody ever reads — `y = x` left every member of `y`
         // at X. Covers struct variables, array/queue elements and
         // struct members, in any combination.
-        if !l_pure {
+        if !l_pure && l_probe_safe {
             lflat = self.flat_member_name(lvalue);
         }
         if let Some(dst) = lflat {
@@ -118916,12 +118930,14 @@ impl Simulator {
         if self.no_class_objects() {
             return None;
         }
-        // Collect the index chain innermost-first: base may be
-        // Index{Index{recv, i}, j} for deeper shapes.
-        let mut idxs: Vec<i64> = vec![self.eval_expr(outer_index).to_i64()?];
+        // Collect the index expressions without evaluating them. This probe
+        // runs for every indexed read/write while class objects exist, and
+        // must not consume a selector's side effects before establishing
+        // that the receiver really owns an N-D fixed-array property (§7.4.2).
+        let mut idxs: Vec<&Expression> = vec![outer_index];
         let mut cur = base;
         while let ExprKind::Index { expr: b, index } = &cur.kind {
-            idxs.push(self.eval_expr(index).to_i64()?);
+            idxs.push(index);
             cur = b;
         }
         // The receiver: `obj.m` / `this.m` (MemberAccess or 2-seg Ident), or a
@@ -119005,7 +119021,8 @@ impl Simulator {
             return None;
         }
         let mut name = format!("{}#{}", handle, member);
-        for i in idxs.iter().rev() {
+        for index in idxs.iter().rev() {
+            let i = self.eval_expr(index).to_i64()?;
             name.push_str(&format!("[{}]", i));
         }
         Some(name)
@@ -126344,13 +126361,13 @@ impl Simulator {
     fn struct_member_elem_leaf(&mut self, base: &Expression, index: &Expression) -> Option<String> {
         if !matches!(base.kind, ExprKind::Index { .. })
             || !self.multidim_members_possible()
-            || !Self::cond_expr_is_effect_free(index)
+            || !Self::cond_expr_is_effect_free(index, false)
         {
             return None;
         }
         let mut cur = base;
         while let ExprKind::Index { expr, index } = &cur.kind {
-            if !Self::cond_expr_is_effect_free(index) {
+            if !Self::cond_expr_is_effect_free(index, false) {
                 return None;
             }
             cur = expr;
