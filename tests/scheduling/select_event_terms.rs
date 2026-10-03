@@ -295,6 +295,49 @@ endmodule
     );
 }
 
+/// §9.4.2: a whole-vector edge term does not turn a neighboring bit's
+/// any-change term into an any-change term for every bit of the vector.
+#[test]
+fn mixed_bit_and_whole_edge_terms_keep_the_bit_mask() {
+    let o = run(
+        "mixed_edge_masks",
+        r#"
+`timescale 1ns/1ns
+module tb;
+  logic [3:0] bus;
+  int rising = 0, falling = 0, edged = 0, whole = 0;
+  always @(bus[1] or posedge bus) rising++;
+  always @(bus[1] or negedge bus) falling++;
+  always @(bus[1] or edge bus) edged++;
+  always @(bus[1] or bus) whole++;
+  initial begin
+    #1 bus = 0;
+    #1 rising = 0; falling = 0; edged = 0; whole = 0;
+    #1 bus[3] = 1'b1;
+    #1 $display("T| siblings rising=%0d falling=%0d edged=%0d whole=%0d", rising, falling, edged, whole);
+    bus[0] = 1'b1;
+    #1 bus[3] = 1'b0;
+    #1 bus[0] = 1'bx;
+    #1 bus[0] = 1'bz;
+    #1 bus[1] = 1'b1;
+    #1 bus[0] = 1'b0;
+    #1 $display("T| selected rising=%0d falling=%0d edged=%0d whole=%0d", rising, falling, edged, whole);
+    $finish;
+  end
+endmodule
+"#,
+        &[],
+    );
+    assert_eq!(
+        t_lines(&o),
+        [
+            "T| siblings rising=0 falling=0 edged=0 whole=1",
+            "T| selected rising=2 falling=3 edged=4 whole=7",
+        ],
+        "{o}"
+    );
+}
+
 /// Bit and part selects of local vectors: ascending and non-zero-based
 /// ranges read through their declared labels, two bits of one vector, a
 /// bit next to the whole vector, a parameter index, `+:`, an element of a

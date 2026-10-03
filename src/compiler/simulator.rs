@@ -22152,6 +22152,11 @@ impl Simulator {
                 let mut narrowed: Vec<(usize, u64)> = Vec::new();
                 let mut whole: Vec<usize> = Vec::new();
                 for s in &sens {
+                    // Edge-qualified terms use the LSB edge fanout and must
+                    // not widen a level-select term on the same signal.
+                    if s.edge != EdgeKind::AnyEdge {
+                        continue;
+                    }
                     let Some(sid) = self.sens_term_sid(&s.signal_name, &ab.scope) else {
                         continue;
                     };
