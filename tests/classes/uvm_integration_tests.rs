@@ -165,6 +165,29 @@ fn uvm_1800_2_2020_bare_run_phase_completes() {
     bare_run_completes_on("1800.2-2020");
 }
 
+/// §13.3: a sequence calling a blocking task through a local queue
+/// cannot return from that call before the task finishes.
+#[test]
+fn uvm_queued_completion_wait_remains_blocked() {
+    let source = include_str!("../uvm/queued_completion_wait.sv");
+    for version in ["1.2", "1800.2-2017", "1800.2-2020"] {
+        let sim = run_uvm_opt(version, &[], source.to_string(), "top", false)
+            .unwrap_or_else(|err| panic!("{version}: {err}"));
+        assert!(
+            sim.output
+                .iter()
+                .flat_map(|entry| entry.message.lines())
+                .any(|line| line == "T|queued sent=1 returned=0"),
+            "{version}: queued task must remain blocked: {:?}",
+            sim.output
+        );
+        assert_eq!(
+            sim.time, 5,
+            "{version}: phase must finish at the watchdog time"
+        );
+    }
+}
+
 /// §16.5: concurrent assertions keep sampling during real UVM phases,
 /// including interface assertions and a configured virtual interface.
 #[test]

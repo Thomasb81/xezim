@@ -11,6 +11,9 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "scheduling/property_wait_shapes.rs"]
+mod property_wait_shapes;
+
 #[path = "scheduling/active_region_fifo.rs"]
 mod active_region_fifo;
 #[path = "scheduling/adaptive_edge_skip.rs"]

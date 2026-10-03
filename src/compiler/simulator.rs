@@ -52910,10 +52910,16 @@ impl Simulator {
                         // (`@(m_events[obj].all_dropped)` — the UVM objection
                         // wait, #109) and chained handles.
                         if let Some(expr) = Self::event_control_single_expr(event) {
-                            if let Some(key) = self
-                                .expr_handle_event_field(&expr)
-                                .or_else(|| self.expr_instance_event_field_general(&expr))
-                            {
+                            if let Some(key) = self.expr_instance_prop_field_general(&expr) {
+                                // §9.4.2: a selected or nested ordinary
+                                // property waits for a value change, too.
+                                if !self.class_prop_is_event(key.0, &key.1) {
+                                    let cond = self.value_change_cond(expr);
+                                    let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
+                                    let cont = pc.pushed(vec![wait], pc.start + i + 1);
+                                    self.park_condition_waiter(pid, cont, &cond);
+                                    return;
+                                }
                                 let cont = vec![*body.clone()];
                                 // Chain the caller's tail rather than copying it.
                                 let cont = pc.pushed(cont, pc.start + i + 1);
@@ -84881,12 +84887,16 @@ impl Simulator {
         if !on_class_prop {
             return None;
         }
+        Some(self.value_change_cond(expr))
+    }
+
+    fn value_change_cond(&mut self, expr: Expression) -> Expression {
         let val = self.eval_expr(&expr);
         let idx = self.intra_saved_next;
         self.intra_saved_next += 1;
         self.vc_saved.insert(idx, (self.current_pid, val));
         let span = expr.span;
-        Some(Expression::new(
+        Expression::new(
             ExprKind::SystemCall {
                 name: VC_CHANGED_MARKER.to_string(),
                 args: vec![
@@ -84904,7 +84914,7 @@ impl Simulator {
                 ],
             },
             span,
-        ))
+        )
     }
 
     /// Drop the armed value of a resumed value-change wait.
@@ -84944,32 +84954,16 @@ impl Simulator {
     /// Returns the leaf name when the control targets a single unqualified
     /// name, else `None` (multi-segment paths, event expressions, `*`).
     fn event_control_field_name(&self, event: &EventControl) -> Option<String> {
-        match event {
-            EventControl::Identifier(id) => Some(id.name.clone()),
-            EventControl::HierIdentifier(expr) => {
-                if let ExprKind::Ident(h) = &expr.kind {
-                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                        return Some(h.path[0].name.name.clone());
-                    }
-                }
-                None
-            }
-            // `@(field)` — parenthesized form parses as a single-term
-            // EventExpr with no edge. Inside a class method this is the
-            // same this-relative named-event wait as the bare `@field` above.
-            EventControl::EventExpr(terms) if terms.len() == 1 => {
-                let te = &terms[0];
-                if te.edge.is_none() {
-                    if let ExprKind::Ident(h) = &te.expr.kind {
-                        if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                            return Some(h.path[0].name.name.clone());
-                        }
-                    }
-                }
-                None
-            }
-            _ => None,
+        if let EventControl::Identifier(id) = event {
+            return Some(id.name.clone());
         }
+        let expr = Self::event_control_single_expr(event)?;
+        if let ExprKind::Ident(h) = &expr.kind {
+            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                return Some(h.path[0].name.name.clone());
+            }
+        }
+        None
     }
 
     /// The identity key of an event-valued operand, for `==`/`!=` (§15.5.4):
@@ -85143,6 +85137,14 @@ impl Simulator {
     /// declared `event` property of the object's class — a non-event member
     /// keeps its existing (value-change) path.
     fn expr_instance_event_field_general(&mut self, e: &Expression) -> Option<(usize, String)> {
+        let key = self.expr_instance_prop_field_general(e)?;
+        self.class_prop_is_event(key.0, &key.1).then_some(key)
+    }
+
+    /// Resolve a property through a nested or selected object receiver.
+    /// Classification is separate so ordinary properties cannot accidentally
+    /// fall through to the unsuspendable event fallback.
+    fn expr_instance_prop_field_general(&mut self, e: &Expression) -> Option<(usize, String)> {
         // Split <receiver-expr>.<field>: a MemberAccess head, or a
         // multi-segment hierarchical ident whose LAST segment is select-free.
         let (recv_expr, field): (Expression, String) = match &e.kind {
@@ -85178,33 +85180,6 @@ impl Simulator {
         let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
         if !inst.properties.contains_key(&field) {
             return None;
-        }
-        // Walk the class hierarchy: accept only a declared `event` property.
-        // A missing property_types entry (older registration paths) falls back
-        // to accepting property existence, matching resolve_this_event_field.
-        let mut cur = Some(inst.class_name.clone());
-        let mut seen: HashSet<String> = HashSet::default();
-        while let Some(cn) = cur {
-            if !seen.insert(cn.clone()) {
-                break;
-            }
-            let Some(cd) = self.module.classes.get(&cn) else {
-                break;
-            };
-            if let Some(dt) = cd.property_types.get(&field) {
-                return if matches!(
-                    dt,
-                    DataType::Simple {
-                        kind: crate::ast::types::SimpleType::Event,
-                        ..
-                    }
-                ) {
-                    Some((handle, field))
-                } else {
-                    None
-                };
-            }
-            cur = cd.extends.clone();
         }
         Some((handle, field))
     }
@@ -85328,13 +85303,18 @@ impl Simulator {
     /// The single un-edged expression of an event control (`@e`, `@(e)`,
     /// `@ev[1]`, `@(h.ce)`), or None for edge terms / multi-term lists / `*`.
     fn event_control_single_expr(event: &EventControl) -> Option<Expression> {
-        match event {
-            EventControl::HierIdentifier(e) => Some((*e).clone()),
+        let mut expr = match event {
+            EventControl::HierIdentifier(e) => e,
             EventControl::EventExpr(terms) if terms.len() == 1 && terms[0].edge.is_none() => {
-                Some(terms[0].expr.clone())
+                &terms[0].expr
             }
-            _ => None,
+            _ => return None,
+        };
+        // §9.4.2: redundant parentheses cannot change the kind of wait.
+        while let ExprKind::Paren(inner) = &expr.kind {
+            expr = inner;
         }
+        Some(expr.clone())
     }
 
     /// If this event control names a single DECLARED event variable — `@ev`,
