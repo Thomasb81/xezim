@@ -175,6 +175,8 @@ mod ranged_port_connections_and_nba_freeze;
 mod sampled_value_inferred_clock;
 #[path = "scheduling/sampled_value_per_instance.rs"]
 mod sampled_value_per_instance;
+#[path = "scheduling/select_event_terms.rs"]
+mod select_event_terms;
 #[path = "scheduling/sequential_event_waits.rs"]
 mod sequential_event_waits;
 #[path = "scheduling/shared_edge_outputs.rs"]

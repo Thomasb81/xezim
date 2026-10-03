@@ -2042,6 +2042,17 @@ pub fn install_hang_report_handler() {
 #[cfg(not(unix))]
 pub fn install_hang_report_handler() {}
 
+/// See `Simulator::event_list_shape`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventListShape {
+    /// `@*`, `always_comb`, a named event, or no leading event control.
+    Implicit,
+    /// An explicit list whose every term is a plain identifier.
+    Plain,
+    /// An explicit list with a select, concatenation or expression term.
+    NonPlain,
+}
+
 #[derive(Debug, Clone)]
 struct EventWaiter {
     pid: usize,
@@ -2534,6 +2545,7 @@ impl NbaFastIndex {
 }
 
 mod code_cov;
+mod event_bits;
 mod module_paths;
 mod names;
 mod rand_csp;
@@ -4332,10 +4344,15 @@ fn lsb_edge_fires(edge: EdgeKind, pv: u64, px: u64, cv: u64, cx: u64) -> bool {
     let pb_one = (pv & 1) == 1 && (px & 1) == 0;
     let pb_zero = (pv & 1) == 0 && (px & 1) == 0;
     match edge {
-        EdgeKind::Posedge => !pb_one && cb_one,
-        EdgeKind::Negedge => !pb_zero && cb_zero,
+        EdgeKind::Posedge => (pb_zero && !cb_zero) || (!pb_one && cb_one),
+        EdgeKind::Negedge => (pb_one && !cb_one) || (!pb_zero && cb_zero),
         EdgeKind::AnyEdge => cv != pv || cx != px,
-        EdgeKind::LsbEdge => (!pb_one && cb_one) || (!pb_zero && cb_zero),
+        EdgeKind::LsbEdge => {
+            (pb_zero && !cb_zero)
+                || (!pb_one && cb_one)
+                || (pb_one && !cb_one)
+                || (!pb_zero && cb_zero)
+        }
     }
 }
 
@@ -6606,14 +6623,17 @@ pub struct Simulator {
     /// re-triggers itself through its own delay could recurse without bound.
     /// Bounded by `EDGE_PASS_DEPTH_LIMIT`.
     edge_pass_depth: u32,
-    /// §9.4.2 bit-select event terms: `(signal_id, block_idx) -> bit`, for
-    /// `always @(v[3])` / `@(posedge v[3])`. Edge sensitivity is otherwise
-    /// tracked per SIGNAL, so a block watching `v[0]` also woke on a change to
-    /// `v[3]`. Kept as a sparse side map rather than a field on `SensitivityId`
-    /// because bit-select terms are rare and the dispatch loop is the hottest
-    /// path in the simulator: when this map is empty the extra work is a single
-    /// already-hot bool test.
-    bitsel_edge_sens: HashMap<(usize, usize), u32>,
+    /// §9.4.2 bit- and part-select level event terms: `(signal_id,
+    /// block_idx) -> mask` of the PHYSICAL bits the block's terms on that
+    /// signal watch, for `always @(v[3] or v[7:5])`. Edge sensitivity is
+    /// otherwise tracked per SIGNAL, so a block watching `v[0]` also woke on
+    /// a change to `v[3]`. Applies to the any-change fanout only; an entry
+    /// exists only when every term of the block on that signal is such a
+    /// select (see `narrow_event_mask`). Kept as a sparse side map rather
+    /// than a field on `SensitivityId` because select terms are rare and the
+    /// dispatch loop is the hottest path in the simulator: when this map is
+    /// empty the extra work is a single already-hot bool test.
+    bitsel_edge_sens: HashMap<(usize, usize), u64>,
     /// Bitset over signal ids: bit set ⇔ `bitsel_edge_sens` has ≥1 entry for
     /// that sid. Lets the edge dispatch loop skip the per-(sid, block) tuple
     /// hash for the overwhelmingly common signals with no bit-select
@@ -9288,6 +9308,17 @@ impl Simulator {
                 continue;
             };
             for (term, ee) in exprs.iter_mut().enumerate() {
+                // Port substitution leaves `@(dq[3])` as a select of the
+                // connection (`bus[15:8][3]`); spell such a term as the net
+                // bit it reads first (see `event_bits`).
+                if let Some(f) =
+                    event_bits::fold_event_term(module, &ee.expr, ee.edge.is_some(), &scope)
+                {
+                    ee.expr = f;
+                    if let Some(p) = patched.as_mut() {
+                        p.push(term);
+                    }
+                }
                 if !matches!(ee.edge, Some(Edge::Posedge) | Some(Edge::Negedge)) {
                     continue;
                 }
@@ -9566,6 +9597,7 @@ impl Simulator {
 
         let phase_materialize = crate::WallTimer::now();
         Self::materialize_implicit_contassign_nets(&mut module);
+        event_bits::complete_ascending_ranges(&mut module);
         // Lazy always blocks (see `LazyAlways`) everywhere except where a
         // pass reads every always-block body before classification: code
         // coverage instruments them, and opt-in signal placement walks them.
@@ -21157,103 +21189,318 @@ impl Simulator {
         walk(stmt)
     }
 
-    /// True when every term of an explicit event control is a PLAIN identifier
-    /// (edge qualifier allowed). A term carrying a select or an expression —
-    /// `@(vco_tap[c_ph_val[0]])`, `@(sig[5:0])`, `@({a,b})` — collapses to just
-    /// its base identifier in `event_to_sens`, which drops the signals that
-    /// appear in the INDEX. Such a block genuinely needs the comb path's
-    /// read-set sensitivity so it re-evaluates when the index changes
-    /// (tests/prtest/pr2011429.v: `c_ph_val[0]` selects which tap is watched).
-    /// Only for all-plain lists is the explicit list a complete description of
-    /// what may trigger the block, and only then may we require the read set to
-    /// stay within it.
-    fn event_terms_all_plain_idents(stmt: &Statement) -> bool {
-        fn check(control: &TimingControl) -> bool {
+    /// The shape of an always block's leading event control. Only an
+    /// explicit list of PLAIN identifiers (edge qualifier allowed) can be
+    /// compared with the body's read set; a term carrying a select or an
+    /// expression (`@(vco_tap[c_ph_val[0]])`, `@(sig[5:0])`, `@({a,b})`) fires
+    /// on that value, which the edge path narrows or a value waiter
+    /// evaluates (tests/prtest/pr2011429.v: `c_ph_val[0]` selects which tap
+    /// is watched, so the waiter follows the index).
+    fn event_list_shape(stmt: &Statement) -> EventListShape {
+        fn check(control: &TimingControl) -> EventListShape {
             let TimingControl::Event(EventControl::EventExpr(exprs)) = control else {
                 // `@*`, a named event, or any other form: leave the existing
                 // routing untouched.
-                return false;
+                return EventListShape::Implicit;
             };
-            exprs.iter().all(|ee| {
+            let plain = exprs.iter().all(|ee| {
                 let mut e = &ee.expr;
                 while let ExprKind::Paren(inner) = &e.kind {
                     e = inner;
                 }
                 matches!(&e.kind, ExprKind::Ident(_))
-            })
+            });
+            if plain {
+                EventListShape::Plain
+            } else {
+                EventListShape::NonPlain
+            }
         }
         match &stmt.kind {
             StatementKind::TimingControl { control, .. } => check(control),
             StatementKind::SeqBlock { stmts, .. } => match stmts.first().map(|s| &s.kind) {
                 Some(StatementKind::TimingControl { control, .. }) => check(control),
-                _ => false,
+                _ => EventListShape::Implicit,
             },
-            _ => false,
+            _ => EventListShape::Implicit,
         }
     }
 
-    /// Constant bit-select event terms of an explicit event control, as
-    /// `(signal_id, bit)`. `@(v[3])`, `@(posedge v[3])` and `@(v[3] or w)` all
-    /// yield the pair for `v`; a non-constant index (`@(v[i])`) yields nothing,
-    /// so those keep whole-signal sensitivity — that block also needs to wake
-    /// when the INDEX moves.
-    fn const_bitselect_event_terms(&self, stmt: &Statement, scope: &str) -> Vec<(usize, u32)> {
-        let mut out: Vec<(usize, u32)> = Vec::new();
-        let control = match &stmt.kind {
-            StatementKind::TimingControl { control, .. } => Some(control),
-            StatementKind::SeqBlock { stmts, .. } => match stmts.first().map(|s| &s.kind) {
-                Some(StatementKind::TimingControl { control, .. }) => Some(control),
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some(TimingControl::Event(EventControl::EventExpr(exprs))) = control else {
-            return out;
-        };
-        let top_prefix = format!("{}.", self.module.name);
-        for ee in exprs {
-            let mut e = &ee.expr;
-            while let ExprKind::Paren(inner) = &e.kind {
-                e = inner;
+    /// §9.4.2: the PHYSICAL bits of signal `sid` a level event term `e`
+    /// watches, when `e` is a constant bit- or part-select of that signal as
+    /// a plain vector (`v[3]`, `v[W-1]`, `v[7:4]`, `v[b +: 2]`), read through
+    /// its declared range. None for every other shape — a runtime index, an
+    /// element of a packed multi-D vector or of an array, a bit past the
+    /// 64-bit word the edge scan compares — which must wait on the
+    /// expression's value instead.
+    fn narrow_event_mask(&self, e: &Expression, sid: usize, scope: &str) -> Option<u64> {
+        let mut e = e;
+        while let ExprKind::Paren(inner) = &e.kind {
+            e = inner;
+        }
+        match &e.kind {
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. }
+                if matches!(expr.kind, ExprKind::Ident(_)) => {}
+            _ => return None,
+        }
+        self.select_chain_bits(e, sid, scope)?
+            .into_iter()
+            .try_fold(0u64, |m, b| (b < 64).then(|| m | 1u64 << b))
+    }
+
+    /// The PHYSICAL bits of signal `sid` a constant select chain rooted at
+    /// it reads, LSB first: `v[7:4]`, or the port-substitution shapes
+    /// `v[32:0][31]` and `v[15:8][3:2]`, where an outer select counts
+    /// positions in the value of the inner one. None when an index is not
+    /// constant, a select leaves its operand, or the root is no plain vector.
+    fn select_chain_bits(&self, e: &Expression, sid: usize, scope: &str) -> Option<Vec<i64>> {
+        let (base, kind, l, r) = match &e.kind {
+            ExprKind::Paren(x) => return self.select_chain_bits(x, sid, scope),
+            ExprKind::Index { expr, index } => {
+                let k = self.event_const_index(index, scope)?;
+                (expr, RangeKind::Constant, k, k)
             }
-            let ExprKind::Index { expr: base, index } = &e.kind else {
-                continue;
-            };
-            let ExprKind::Ident(h) = &base.kind else {
-                continue;
-            };
-            // A select on an ARRAY picks an element, not a bit — leave it.
-            if self
-                .module
-                .arrays
-                .contains_key(Self::resolve_hier_name_static(h, &self.module).as_str())
-            {
-                continue;
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => (
+                expr,
+                *kind,
+                self.event_const_index(left, scope)?,
+                self.event_const_index(right, scope)?,
+            ),
+            _ => return None,
+        };
+        let mut b = &**base;
+        while let ExprKind::Paren(x) = &b.kind {
+            b = x;
+        }
+        if let ExprKind::Ident(h) = &b.kind {
+            if h.path.last().is_some_and(|s| !s.selects.is_empty()) {
+                return None;
             }
-            let Some(bit) = self
-                .event_const_index(index, scope)
-                .and_then(|b| u32::try_from(b).ok())
-            else {
-                continue;
-            };
-            let raw = Self::resolve_hier_name_static(h, &self.module);
-            let sid = self
-                .signal_name_to_id
-                .get(raw.as_str())
-                .copied()
-                .or_else(|| {
-                    raw.strip_prefix(&top_prefix)
-                        .and_then(|b| self.signal_name_to_id.get(b).copied())
-                });
-            if let Some(sid) = sid {
-                // Only bits the u64 fast path can test; wider selects keep the
-                // whole-signal superset.
-                if bit < 64 && (self.signal_widths.get(sid).copied().unwrap_or(0) as u32) > bit {
-                    out.push((sid, bit));
+            let width = *self.signal_widths.get(sid)?;
+            if self.signal_real.get(sid).copied().unwrap_or(false) {
+                return None;
+            }
+            let dim = event_bits::vector_decl_dim(&self.module, self.name_for_id(sid), width)?;
+            let (lo, hi) = event_bits::select_label_span(dim, kind, l, r)?;
+            let mut bits: Vec<i64> = Vec::new();
+            for label in lo..=hi {
+                let phys = event_bits::label_to_phys(dim, label);
+                if !(0..width as i64).contains(&phys) || bits.len() > 4096 {
+                    return None;
+                }
+                bits.push(phys);
+            }
+            bits.sort_unstable();
+            return Some(bits);
+        }
+        // A select of an unnamed value counts positions from its LSB.
+        let inner = self.select_chain_bits(b, sid, scope)?;
+        let (lo, hi) = event_bits::select_label_span((i64::MAX, 0), kind, l, r)?;
+        if lo < 0 || hi >= inner.len() as i64 {
+            return None;
+        }
+        Some(inner[lo as usize..=hi as usize].to_vec())
+    }
+
+    /// The bits each signal of an all-level event list is watched through:
+    /// `(signal id, mask)` for a signal named only by constant selects
+    /// (`@(a[1:0] or b)` gives `a`'s two bits; `b`, named whole, needs
+    /// none). None when some term is neither a plain name nor such a select
+    /// (`@(mem[i])`, `@(a + b)`) or names no signal.
+    fn comb_select_masks(
+        &self,
+        sens: &[Sensitivity],
+        scope: &str,
+    ) -> Option<Vec<(usize, Vec<u64>)>> {
+        let mut masks: Vec<(usize, Vec<u64>)> = Vec::new();
+        let mut whole: Vec<usize> = Vec::new();
+        for s in sens {
+            let sid = self.sens_term_sid(&s.signal_name, scope)?;
+            match &s.value_of {
+                None => whole.push(sid),
+                Some(e) => {
+                    let bits = self.select_chain_bits(e, sid, scope)?;
+                    let words = (*self.signal_widths.get(sid)? as usize).div_ceil(64);
+                    let entry = match masks.iter().position(|(id, _)| *id == sid) {
+                        Some(k) => &mut masks[k].1,
+                        None => {
+                            masks.push((sid, vec![0u64; words]));
+                            &mut masks.last_mut().unwrap().1
+                        }
+                    };
+                    for b in bits {
+                        entry[b as usize / 64] |= 1u64 << (b % 64);
+                    }
                 }
             }
         }
-        out
+        masks.retain(|(id, _)| !whole.contains(id));
+        Some(masks)
+    }
+
+    /// Does an always body read the signals of `masks` only through
+    /// constant selects inside their masks, and do nothing a repeated run
+    /// could observe — only blocking/nonblocking assignments, `if` and
+    /// `case`, with no call other than a pure system function? `resolve`
+    /// maps a name the way the comb path's read set does.
+    fn body_reads_within_masks<'m>(
+        &self,
+        body: &Statement,
+        masks: &'m [(usize, Vec<u64>)],
+        scope: &str,
+        resolve: &dyn Fn(&str) -> Vec<usize>,
+    ) -> bool {
+        let masked = |h: &HierarchicalIdentifier| -> Option<(usize, &'m [u64])> {
+            let raw = Self::resolve_hier_name_static(h, &self.module);
+            resolve(&raw).into_iter().find_map(|id| {
+                masks
+                    .iter()
+                    .find(|(m, _)| *m == id)
+                    .map(|(m, w)| (*m, w.as_slice()))
+            })
+        };
+        fn expr_ok<'m>(
+            sim: &Simulator,
+            e: &Expression,
+            masks: &'m [(usize, Vec<u64>)],
+            scope: &str,
+            masked: &dyn Fn(&HierarchicalIdentifier) -> Option<(usize, &'m [u64])>,
+        ) -> bool {
+            let ok = |x: &Expression| expr_ok(sim, x, masks, scope, masked);
+            match &e.kind {
+                ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+                ExprKind::Ident(h) => masked(h).is_none(),
+                ExprKind::Paren(x) => ok(x),
+                ExprKind::Unary { operand, .. } => ok(operand),
+                ExprKind::Binary { left, right, .. } => ok(left) && ok(right),
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => ok(condition) && ok(then_expr) && ok(else_expr),
+                ExprKind::Concatenation(parts) => parts.iter().all(ok),
+                ExprKind::Replication { count, exprs } => ok(count) && exprs.iter().all(ok),
+                ExprKind::Inside { expr, ranges } => ok(expr) && ranges.iter().all(ok),
+                ExprKind::Range(l, r) => ok(l) && ok(r),
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. } => {
+                    // A select chain rooted at a listed signal may read only
+                    // listed bits; any other select is an ordinary read.
+                    let mut root = e;
+                    loop {
+                        match &root.kind {
+                            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                                root = expr
+                            }
+                            ExprKind::Paren(x) => root = x,
+                            _ => break,
+                        }
+                    }
+                    match &root.kind {
+                        ExprKind::Ident(h) if masked(h).is_some() => {
+                            let (sid, want) = masked(h).unwrap();
+                            sim.select_chain_bits(e, sid, scope).is_some_and(|bits| {
+                                bits.iter()
+                                    .all(|&b| want[b as usize / 64] >> (b % 64) & 1 == 1)
+                            })
+                        }
+                        _ => match &e.kind {
+                            ExprKind::Index { expr, index } => ok(expr) && ok(index),
+                            ExprKind::RangeSelect {
+                                expr, left, right, ..
+                            } => ok(expr) && ok(left) && ok(right),
+                            _ => false,
+                        },
+                    }
+                }
+                ExprKind::SystemCall { name, args } => {
+                    matches!(
+                        name.as_str(),
+                        "$signed"
+                            | "$unsigned"
+                            | "$bits"
+                            | "$clog2"
+                            | "$countones"
+                            | "$onehot"
+                            | "$onehot0"
+                            | "$isunknown"
+                    ) && args.iter().all(ok)
+                }
+                _ => false,
+            }
+        }
+        fn stmt_ok<'m>(
+            sim: &Simulator,
+            st: &Statement,
+            masks: &'m [(usize, Vec<u64>)],
+            scope: &str,
+            masked: &dyn Fn(&HierarchicalIdentifier) -> Option<(usize, &'m [u64])>,
+        ) -> bool {
+            let e_ok = |x: &Expression| expr_ok(sim, x, masks, scope, masked);
+            let s_ok = |x: &Statement| stmt_ok(sim, x, masks, scope, masked);
+            // A target's indices are reads; the target itself must not be a
+            // listed signal.
+            let lv_ok = |lv: &Expression| -> bool {
+                fn base_and_indices<'a>(
+                    e: &'a Expression,
+                    idx: &mut Vec<&'a Expression>,
+                ) -> Option<&'a HierarchicalIdentifier> {
+                    match &e.kind {
+                        ExprKind::Ident(h) => Some(h),
+                        ExprKind::Paren(x) => base_and_indices(x, idx),
+                        ExprKind::Index { expr, index } => {
+                            idx.push(index);
+                            base_and_indices(expr, idx)
+                        }
+                        ExprKind::RangeSelect {
+                            expr, left, right, ..
+                        } => {
+                            idx.push(left);
+                            idx.push(right);
+                            base_and_indices(expr, idx)
+                        }
+                        _ => None,
+                    }
+                }
+                let parts: Vec<&Expression> = match &lv.kind {
+                    ExprKind::Concatenation(parts) => parts.iter().collect(),
+                    _ => vec![lv],
+                };
+                parts.into_iter().all(|p| {
+                    let mut idx = Vec::new();
+                    base_and_indices(p, &mut idx)
+                        .is_some_and(|h| masked(h).is_none() && idx.into_iter().all(e_ok))
+                })
+            };
+            match &st.kind {
+                StatementKind::Null => true,
+                StatementKind::BlockingAssign { lvalue, rvalue } => lv_ok(lvalue) && e_ok(rvalue),
+                StatementKind::NonblockingAssign {
+                    lvalue,
+                    delay: None,
+                    rvalue,
+                } => lv_ok(lvalue) && e_ok(rvalue),
+                StatementKind::SeqBlock { stmts, .. } => stmts.iter().all(s_ok),
+                StatementKind::If {
+                    condition,
+                    then_stmt,
+                    else_stmt,
+                    ..
+                } => e_ok(condition) && s_ok(then_stmt) && else_stmt.as_deref().is_none_or(s_ok),
+                StatementKind::Case { expr, items, .. } => {
+                    e_ok(expr)
+                        && items.iter().all(|it| {
+                            it.pattern.is_none() && it.patterns.iter().all(e_ok) && s_ok(&it.stmt)
+                        })
+                }
+                _ => false,
+            }
+        }
+        stmt_ok(self, body, masks, scope, &masked)
     }
 
     /// Count the statement-level timing controls in a subtree (waits an FSM
@@ -21726,74 +21973,117 @@ impl Simulator {
                     && !self.stmt_is_blocking(&body)
                     && !self.stmt_calls_blocking_task(&body, &ab.scope, 3)
                     && !sens.iter().any(|s| self.sens_unnamed_cell(s))
-                    && (
-                        // Index-dependent / select / concat sensitivity: the
-                        // list does not name everything that may trigger the
-                        // block, so the read-set superset is the intended
-                        // behaviour.
-                        !Self::event_terms_all_plain_idents(&ab.stmt) || {
-                            let mut b_reads: HashSet<String> = HashSet::default();
-                            let mut b_writes: HashSet<String> = HashSet::default();
-                            Self::collect_stmt_reads(
-                                &body,
-                                &self.module,
-                                &mut b_reads,
-                                &mut b_writes,
-                            );
-                            let scope_hint = self.infer_scope_from_rw_sets(&b_writes, &b_reads);
-                            let name_to_id = &self.signal_name_to_id;
-                            let resolve_ids = |name: &str| -> Vec<usize> {
-                                let mut out: Vec<usize> = Vec::new();
-                                if let Some(scope) = &scope_hint {
-                                    if let Some(&id) =
-                                        name_to_id.get(format!("{}.{}", scope, name).as_str())
-                                    {
-                                        out.push(id);
-                                    }
+                    && match Self::event_list_shape(&ab.stmt) {
+                        // `@*` and the other implicit forms ARE the read set.
+                        EventListShape::Implicit => true,
+                        // §9.4.2: an explicit term that selects, concatenates
+                        // or computes (`@(a[1])`, `@(mem[i])`, `@(a + b)`)
+                        // fires on that VALUE alone — never on whatever else
+                        // the body happens to read (a select-listed block
+                        // whose body called a task woke on every signal the
+                        // body read). The comb path, which wakes on any change
+                        // of a whole signal the body reads, is faithful only
+                        // when every term is a plain name or constant bits of
+                        // one, the body reads those signals only within the
+                        // listed bits, and it has nothing but assignments to
+                        // repeat: then a wake on a sibling bit recomputes the
+                        // very same values. Everything else goes to the edge
+                        // path, or to a value waiter below.
+                        shape => {
+                            let select_masks = match shape {
+                                EventListShape::NonPlain => {
+                                    self.comb_select_masks(&sens, &ab.scope)
                                 }
-                                if let Some(&id) = name_to_id.get(name) {
-                                    out.push(id);
-                                } else if let Some(stripped) = name.strip_prefix(&top_prefix) {
-                                    if let Some(&id) = name_to_id.get(stripped) {
-                                        out.push(id);
-                                    }
-                                }
-                                out
+                                _ => Some(Vec::new()),
                             };
-                            let mut sens_ids: Vec<usize> = Vec::new();
-                            for s in &sens {
-                                for id in resolve_ids(s.signal_name.as_str()) {
-                                    if !sens_ids.contains(&id) {
-                                        sens_ids.push(id);
+                            select_masks.is_some_and(|select_masks| {
+                                let mut b_reads: HashSet<String> = HashSet::default();
+                                let mut b_writes: HashSet<String> = HashSet::default();
+                                Self::collect_stmt_reads(
+                                    &body,
+                                    &self.module,
+                                    &mut b_reads,
+                                    &mut b_writes,
+                                );
+                                let scope_hint = self.infer_scope_from_rw_sets(&b_writes, &b_reads);
+                                let name_to_id = &self.signal_name_to_id;
+                                let resolve_ids = |name: &str| -> Vec<usize> {
+                                    let mut out: Vec<usize> = Vec::new();
+                                    if let Some(scope) = &scope_hint {
+                                        if let Some(&id) =
+                                            name_to_id.get(format!("{}.{}", scope, name).as_str())
+                                        {
+                                            out.push(id);
+                                        }
+                                    }
+                                    if let Some(&id) = name_to_id.get(name) {
+                                        out.push(id);
+                                    } else if let Some(stripped) = name.strip_prefix(&top_prefix) {
+                                        if let Some(&id) = name_to_id.get(stripped) {
+                                            out.push(id);
+                                        }
+                                    }
+                                    out
+                                };
+                                let mut sens_ids: Vec<usize> = Vec::new();
+                                for s in &sens {
+                                    for id in resolve_ids(s.signal_name.as_str()) {
+                                        if !sens_ids.contains(&id) {
+                                            sens_ids.push(id);
+                                        }
                                     }
                                 }
-                            }
-                            // Mirror the comb path's `sens_reads = reads - writes`.
-                            // The union of the resolved ids is built ONCE and
-                            // both directions are answered from it: `for all r,
-                            // for all id in resolve_ids(r)` is by construction
-                            // the same as `for all id in union` (the union is
-                            // exactly that flat_map), so this is the same test
-                            // the two separate passes used to run.
-                            let read_id_union: std::collections::HashSet<usize> = b_reads
-                                .difference(&b_writes)
-                                .flat_map(|r| resolve_ids(r.as_str()))
-                                .collect();
-                            let reads_covered =
-                                read_id_union.iter().all(|id| sens_ids.contains(id));
-                            // The reverse must hold too: every LISTED signal has to be
-                            // in the derived read set, or the comb path silently drops
-                            // it from the sensitivity. `always @(a) t = $time;` reads
-                            // no signal at all, so the containment above passes
-                            // VACUOUSLY, the entry's read set came out empty, and the
-                            // block fired exactly once (at t0) — every later edge of
-                            // `a` was missed and the captured time stayed 0. Routing
-                            // the not-equal case to the edge path costs a little speed
-                            // for an unusual shape and follows §9.4.2 exactly.
-                            let sens_covered = sens_ids.iter().all(|id| read_id_union.contains(id));
-                            reads_covered && sens_covered
+                                // Mirror the comb path's `sens_reads = reads - writes`.
+                                // The union of the resolved ids is built ONCE and
+                                // both directions are answered from it: `for all r,
+                                // for all id in resolve_ids(r)` is by construction
+                                // the same as `for all id in union` (the union is
+                                // exactly that flat_map), so this is the same test
+                                // the two separate passes used to run.
+                                // A select list used to take this path unchecked, and
+                                // generated netlists list every operand but the
+                                // parameters (`case (cur_st) IDLE:`). A parameter
+                                // never changes, so it adds no wake; for those lists
+                                // a read of one does not count.
+                                let params = &self.module.parameters;
+                                let is_param = |r: &str| {
+                                    shape == EventListShape::NonPlain
+                                        && (params.contains_key(r)
+                                            || scope_hint.as_ref().is_some_and(|sc| {
+                                                params
+                                                    .contains_key(format!("{}.{}", sc, r).as_str())
+                                            }))
+                                };
+                                let read_id_union: std::collections::HashSet<usize> = b_reads
+                                    .difference(&b_writes)
+                                    .filter(|r| !is_param(r.as_str()))
+                                    .flat_map(|r| resolve_ids(r.as_str()))
+                                    .collect();
+                                let reads_covered =
+                                    read_id_union.iter().all(|id| sens_ids.contains(id));
+                                // The reverse must hold too: every LISTED signal has to be
+                                // in the derived read set, or the comb path silently drops
+                                // it from the sensitivity. `always @(a) t = $time;` reads
+                                // no signal at all, so the containment above passes
+                                // VACUOUSLY, the entry's read set came out empty, and the
+                                // block fired exactly once (at t0) — every later edge of
+                                // `a` was missed and the captured time stayed 0. Routing
+                                // the not-equal case to the edge path costs a little speed
+                                // for an unusual shape and follows §9.4.2 exactly.
+                                let sens_covered =
+                                    sens_ids.iter().all(|id| read_id_union.contains(id));
+                                reads_covered
+                                    && sens_covered
+                                    && (select_masks.is_empty()
+                                        || self.body_reads_within_masks(
+                                            &body,
+                                            &select_masks,
+                                            &ab.scope,
+                                            &resolve_ids,
+                                        ))
+                            })
                         }
-                    )
+                    }
                 {
                     return Some(AlwaysBlock {
                         kind: ab.kind,
@@ -21889,14 +22179,41 @@ impl Simulator {
                     );
                 }
                 let block_idx = self.edge_blocks.len();
-                // §9.4.2: record constant bit-select event terms (`@(v[3])`).
-                // `event_to_sens` walks past the select and yields the BASE
-                // signal, so without this the block would wake on a change to
-                // any bit of `v`. `check_edges_inner` narrows the wake to this
-                // bit; terms whose index is not a constant keep the (safe,
-                // superset) whole-signal behaviour.
-                for (sid, bit) in self.const_bitselect_event_terms(&ab.stmt, &ab.scope) {
-                    self.bitsel_edge_sens.insert((sid, block_idx), bit);
+                // §9.4.2: record constant bit/part-select level terms
+                // (`@(v[3])`, `@(v[7:4])`). `event_to_sens` walks past the
+                // select and yields the BASE signal, so without this the block
+                // would wake on a change to any bit of `v`. `check_edges_inner`
+                // narrows the any-change wake to these bits. A signal the block
+                // also watches whole (`@(v[3] or v)`) keeps the whole-signal
+                // wake; every other select went to a value waiter above.
+                let mut narrowed: Vec<(usize, u64)> = Vec::new();
+                let mut whole: Vec<usize> = Vec::new();
+                for s in &sens {
+                    // Edge-qualified terms use the LSB edge fanout and must
+                    // not widen a level-select term on the same signal.
+                    if s.edge != EdgeKind::AnyEdge {
+                        continue;
+                    }
+                    let Some(sid) = self.sens_term_sid(&s.signal_name, &ab.scope) else {
+                        continue;
+                    };
+                    let mask = match (&s.value_of, s.edge) {
+                        (Some(e), EdgeKind::AnyEdge) => self.narrow_event_mask(e, sid, &ab.scope),
+                        _ => None,
+                    };
+                    match mask {
+                        Some(m) => match narrowed.iter_mut().find(|(id, _)| *id == sid) {
+                            Some(entry) => entry.1 |= m,
+                            None => narrowed.push((sid, m)),
+                        },
+                        None => whole.push(sid),
+                    }
+                }
+                for (sid, mask) in narrowed {
+                    if whole.contains(&sid) {
+                        continue;
+                    }
+                    self.bitsel_edge_sens.insert((sid, block_idx), mask);
                     let (w, b) = (sid >> 6, sid & 63);
                     if w >= self.bitsel_sid_bits.len() {
                         self.bitsel_sid_bits.resize(w + 1, 0);
@@ -43455,37 +43772,53 @@ impl Simulator {
 
     /// §9.4.2: must an always block with this event list run as a process
     /// (a waiter that evaluates the event expressions) rather than as an
-    /// edge block? An edge block watches whole signals, narrowed at most to
-    /// one constant bit (`@(posedge v[3])`, see
-    /// `const_bitselect_event_terms`). A term that selects through a runtime
-    /// index (`@(mem[i])`, `@(posedge v[i])`), selects a part or a bit of an
-    /// array element (`@(mem[3][1])`), or names an element of a memory
-    /// stored without element names (`@(big[5])`: no signal slot, no edge
-    /// snapshot) has nothing an edge block can watch.
+    /// edge block? An edge block watches whole signals; a level term on
+    /// constant bits of a plain vector (`@(v[3])`, `@(v[7:4])`) is narrowed
+    /// to those bits (`narrow_event_mask`), and an edge on one bit
+    /// (`@(posedge v[3])`) was given an alias net before classification. Any
+    /// other select — a runtime index (`@(mem[i])`, `@(posedge v[i])`), a
+    /// part or bit of an array element (`@(mem[3][1])`), an edge left on a
+    /// select, an element of a memory stored without element names
+    /// (`@(big[5])`: no signal slot, no edge snapshot) — has nothing an edge
+    /// block can watch.
     fn event_needs_value_waiter(&self, sens: &[Sensitivity], scope: &str) -> bool {
         sens.iter().any(|s| {
             let name = s.signal_name.as_str();
-            if self.signal_name_to_id.contains_key(name) {
+            if let Some(sid) = self.sens_term_sid(name, scope) {
                 let Some(e) = &s.value_of else {
                     return false;
                 };
                 if !Self::event_expr_selects(e) {
                     return false;
                 }
-                // The one select shape an edge block narrows exactly.
-                let mut e = e;
-                while let ExprKind::Paren(inner) = &e.kind {
-                    e = inner;
-                }
-                return !matches!(
-                    &e.kind,
-                    ExprKind::Index { expr, index }
-                        if matches!(expr.kind, ExprKind::Ident(_))
-                            && self.event_const_index(index, scope).is_some()
-                );
+                return s.edge != EdgeKind::AnyEdge
+                    || self.narrow_event_mask(e, sid, scope).is_none();
             }
             self.sens_unnamed_cell(s) || (s.value_of.is_some() && self.unpacked_dims_of(name) > 0)
         })
+    }
+
+    /// The signal an always block's sensitivity term names: as spelled,
+    /// without the top module's prefix, or under the block's instance scope
+    /// (an inlined child whose rewrite left the leaf bare) — the order the
+    /// edge-block registration resolves terms in.
+    fn sens_term_sid(&self, name: &str, scope: &str) -> Option<usize> {
+        if let Some(&id) = self.signal_name_to_id.get(name) {
+            return Some(id);
+        }
+        let top_prefix = format!("{}.", self.module.name);
+        if let Some(&id) = name
+            .strip_prefix(top_prefix.as_str())
+            .and_then(|b| self.signal_name_to_id.get(b))
+        {
+            return Some(id);
+        }
+        if scope.is_empty() {
+            return None;
+        }
+        self.signal_name_to_id
+            .get(format!("{}.{}", scope, name).as_str())
+            .copied()
     }
 
     /// Does event term `s` watch a memory cell that has no per-element name —
@@ -44806,10 +45139,15 @@ impl Simulator {
         let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
         let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
         match edge {
-            EdgeKind::Posedge => !pb_one && cb_one,
-            EdgeKind::Negedge => !pb_zero && cb_zero,
+            EdgeKind::Posedge => (pb_zero && !cb_zero) || (!pb_one && cb_one),
+            EdgeKind::Negedge => (pb_one && !cb_one) || (!pb_zero && cb_zero),
             EdgeKind::AnyEdge => cur_v != prev_v || cur_x != prev_x,
-            EdgeKind::LsbEdge => (!pb_one && cb_one) || (!pb_zero && cb_zero),
+            EdgeKind::LsbEdge => {
+                (pb_zero && !cb_zero)
+                    || (!pb_one && cb_one)
+                    || (pb_one && !cb_one)
+                    || (!pb_zero && cb_zero)
+            }
         }
     }
 
@@ -55756,8 +56094,8 @@ impl Simulator {
         let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
         let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
         match edge {
-            EdgeKind::Posedge => !pb_one && cb_one,
-            EdgeKind::Negedge => !pb_zero && cb_zero,
+            EdgeKind::Posedge => (pb_zero && !cb_zero) || (!pb_one && cb_one),
+            EdgeKind::Negedge => (pb_one && !cb_one) || (!pb_zero && cb_zero),
             EdgeKind::AnyEdge => {
                 if self.signal_widths[id] > 64 {
                     if let Some(p) = prev_wide {
@@ -55767,7 +56105,12 @@ impl Simulator {
                 cur_v != prev_v || cur_x != prev_x
             }
             // §9.4.2 `@(edge x)`: posedge OR negedge of the LSB.
-            EdgeKind::LsbEdge => (!pb_one && cb_one) || (!pb_zero && cb_zero),
+            EdgeKind::LsbEdge => {
+                (pb_zero && !cb_zero)
+                    || (!pb_one && cb_one)
+                    || (pb_one && !cb_one)
+                    || (!pb_zero && cb_zero)
+            }
         }
     }
 
@@ -57356,7 +57699,7 @@ impl Simulator {
         // fanout events.
         let blk_armed: &[u8] = &self.edge_block_armed;
         let bitsel_sid_bits: &[u64] = &self.bitsel_sid_bits;
-        let bitsel_edge_sens: &HashMap<(usize, usize), u32> = &self.bitsel_edge_sens;
+        let bitsel_edge_sens: &HashMap<(usize, usize), u64> = &self.bitsel_edge_sens;
         let prefilter_seen: &mut [u32] = &mut self.edge_prefilter_seen;
         let stats_on = self.edge_block_stats_enabled;
         let scan_stats = self.edge_scan_stats;
@@ -57440,12 +57783,22 @@ impl Simulator {
                     let (cur_v, cur_x) = signal_table[sid].raw_bits();
                     let prev_v = prev_val_t[sid];
                     let prev_x = prev_xz_t[sid];
-                    let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
-                    let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
-                    let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
-                    let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
-                    let fires_pos = !pb_one && cb_one;
-                    let fires_neg = !pb_zero && cb_zero;
+                    let (fires_pos, fires_neg) = if (cur_x | prev_x) & 1 == 0 {
+                        // Known clock levels need only a change and polarity.
+                        let changed = (cur_v ^ prev_v) & 1 != 0;
+                        (changed && cur_v & 1 != 0, changed && cur_v & 1 == 0)
+                    } else {
+                        // §9.4.2 includes known-to-X/Z transitions, not only
+                        // transitions ending at a known zero or one.
+                        let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
+                        let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
+                        let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
+                        let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
+                        (
+                            (pb_zero && !cb_zero) || (!pb_one && cb_one),
+                            (pb_one && !cb_one) || (!pb_zero && cb_zero),
+                        )
+                    };
                     let fires_any = if widths_t[sid] > 64 {
                         prev_wide_t
                             .get(&sid)
@@ -57568,31 +57921,15 @@ impl Simulator {
             macro_rules! dispatch_block {
                 ($block_idx:expr_2021, $kind:expr_2021) => {{
                     let block_idx = $block_idx;
-                    // §9.4.2 bit-select term (`@(v[3])`): detection above is per
-                    // SIGNAL, so re-test the one bit this block actually watches
-                    // and drop the wake when only a sibling bit moved. Mirrors
-                    // the whole-signal formulas, on bit `b` instead of bit 0.
+                    // §9.4.2 bit/part-select level term (`@(v[3])`): detection
+                    // above is per SIGNAL, so re-test the bits this block
+                    // actually watches and drop the wake when only a sibling
+                    // bit moved. Edge terms never carry a mask.
                     let bitsel_ok = !sid_bitsel
+                        || !matches!($kind, EdgeKind::AnyEdge)
                         || match bitsel_edge_sens.get(&(sid, block_idx)) {
                             None => true,
-                            Some(&b) => {
-                                let cb = (cur_v >> b) & 1;
-                                let cx = (cur_x >> b) & 1;
-                                let pb = (prev_v >> b) & 1;
-                                let px = (prev_x >> b) & 1;
-                                let cur_one = cb == 1 && cx == 0;
-                                let cur_zero = cb == 0 && cx == 0;
-                                let prev_one = pb == 1 && px == 0;
-                                let prev_zero = pb == 0 && px == 0;
-                                match $kind {
-                                    EdgeKind::Posedge => !prev_one && cur_one,
-                                    EdgeKind::Negedge => !prev_zero && cur_zero,
-                                    EdgeKind::AnyEdge => cb != pb || cx != px,
-                                    EdgeKind::LsbEdge => {
-                                        (!prev_one && cur_one) || (!prev_zero && cur_zero)
-                                    }
-                                }
-                            }
+                            Some(&m) => ((cur_v ^ prev_v) | (cur_x ^ prev_x)) & m != 0,
                         };
                     if bitsel_ok
                         && block_idx < triggered_bitmap.len()
@@ -95159,7 +95496,8 @@ impl Simulator {
                 || enum_lits.contains(name)
                 || scope_names.contains(name)
                 || expanded_bases.contains(name)
-                || xezim_core::elaborate::is_delay_stage_net(name))
+                || xezim_core::elaborate::is_delay_stage_net(name)
+                || event_bits::is_edge_alias_net(name))
                 && Self::dump_name_selected(name, filters.as_deref(), depth)
         };
         for name in stored() {
@@ -150363,6 +150701,7 @@ fn vpi_scope_members(sim: &Simulator, scope: &str) -> Vec<(String, usize)> {
         if leaf.contains('[')
             || vpi_is_instance_name(sim, name)
             || xezim_core::elaborate::is_delay_stage_net(name)
+            || event_bits::is_edge_alias_net(name)
         {
             continue;
         }
