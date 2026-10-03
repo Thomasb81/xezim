@@ -36,6 +36,265 @@ fn t_lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
+/// §9.4.2 Table 9-2: all sixteen four-state transitions agree across
+/// direct signals, bit aliases and dynamic-select value waiters.
+#[test]
+fn four_state_event_transition_table() {
+    let o = run(
+        "edge_transition_table",
+        r#"
+`timescale 1ns/1ns
+module observer(inout [3:0] link);
+  int changed = 0, rising = 0, falling = 0, edged = 0;
+  always @(link[2]) changed++;
+  always @(posedge link[2]) rising++;
+  always @(negedge link[2]) falling++;
+  always @(edge link[2]) edged++;
+endmodule
+module tb;
+  logic level;
+  logic [15:0] drive;
+  wire [15:0] bus;
+  int pick = 10;
+  int changed = 0, rising = 0, falling = 0, edged = 0;
+  int waited = 0, wait_rising = 0, wait_falling = 0, wait_edged = 0;
+  assign bus = drive;
+  observer u(.link(bus[11:8]));
+  always @(level) changed++;
+  always @(posedge level) rising++;
+  always @(negedge level) falling++;
+  always @(edge level) edged++;
+  always @(bus[pick]) waited++;
+  always @(posedge bus[pick]) wait_rising++;
+  always @(negedge bus[pick]) wait_falling++;
+  always @(edge bus[pick]) wait_edged++;
+  function automatic logic state_value(input int code);
+    case (code)
+      0: return 1'b0;
+      1: return 1'b1;
+      2: return 1'bx;
+      default: return 1'bz;
+    endcase
+  endfunction
+  initial begin
+    drive = 0;
+    for (int from_code = 0; from_code < 4; from_code++) begin
+      for (int to_code = 0; to_code < 4; to_code++) begin
+        #2 level = state_value(from_code); drive[10] = state_value(from_code);
+        #2 changed = 0; rising = 0; falling = 0; edged = 0;
+        u.changed = 0; u.rising = 0; u.falling = 0; u.edged = 0;
+        waited = 0; wait_rising = 0; wait_falling = 0; wait_edged = 0;
+        #2 level = state_value(to_code); drive[10] = state_value(to_code);
+        #2 $display("T| %0d>%0d direct=%0d%0d%0d%0d alias=%0d%0d%0d%0d waiter=%0d%0d%0d%0d",
+          from_code, to_code, changed, rising, falling, edged,
+          u.changed, u.rising, u.falling, u.edged,
+          waited, wait_rising, wait_falling, wait_edged);
+      end
+    end
+    $finish;
+  end
+endmodule
+"#,
+        &[],
+    );
+    let mut expected = Vec::new();
+    for from in 0..4 {
+        for to in 0..4 {
+            let changed = usize::from(from != to);
+            let rising = usize::from((from == 0 && to != 0) || (from != 1 && to == 1));
+            let falling = usize::from((from == 1 && to != 1) || (from != 0 && to == 0));
+            let edged = usize::from(rising != 0 || falling != 0);
+            let counts = format!("{changed}{rising}{falling}{edged}");
+            expected.push(format!(
+                "T| {from}>{to} direct={counts} alias={counts} waiter={counts}"
+            ));
+        }
+    }
+    assert_eq!(t_lines(&o), expected, "{o}");
+}
+
+/// §9.4.2: high bits and ascending aliases preserve the transition table;
+/// a part-select spanning two storage words observes changes in both words.
+#[test]
+fn wide_ascending_alias_transition_table() {
+    let o = run(
+        "wide_alias_table",
+        r#"
+`timescale 1ns/1ns
+module observer(inout [7:0] link);
+  int changed = 0, rising = 0, falling = 0, edged = 0;
+  always @(link[2]) changed++;
+  always @(posedge link[2]) rising++;
+  always @(negedge link[2]) falling++;
+  always @(edge link[2]) edged++;
+endmodule
+module tb;
+  logic [127:0] drive;
+  logic [64:191] ascending;
+  wire [127:0] bus;
+  wire [64:191] ascending_bus;
+  int part_changes = 0;
+  assign bus = drive;
+  assign ascending_bus = ascending;
+  observer high_bit(.link(bus[79:72]));
+  observer ascending_bit(.link(ascending_bus[136:143]));
+  observer boundary_bit(.link(bus[69:62]));
+  always @(bus[65:62]) part_changes++;
+  function automatic logic state_value(input int code);
+    case (code)
+      0: return 1'b0;
+      1: return 1'b1;
+      2: return 1'bx;
+      default: return 1'bz;
+    endcase
+  endfunction
+  initial begin
+    drive = 0; ascending = 0;
+    for (int from_code = 0; from_code < 4; from_code++) begin
+      for (int to_code = 0; to_code < 4; to_code++) begin
+        #2 drive[74] = state_value(from_code); drive[64] = state_value(from_code);
+        ascending[141] = state_value(from_code);
+        #2 high_bit.changed = 0; high_bit.rising = 0; high_bit.falling = 0; high_bit.edged = 0;
+        ascending_bit.changed = 0; ascending_bit.rising = 0; ascending_bit.falling = 0; ascending_bit.edged = 0;
+        boundary_bit.changed = 0; boundary_bit.rising = 0; boundary_bit.falling = 0; boundary_bit.edged = 0;
+        part_changes = 0;
+        #2 drive[74] = state_value(to_code); drive[64] = state_value(to_code);
+        ascending[141] = state_value(to_code);
+        #2 $display("T| %0d>%0d high=%0d%0d%0d%0d ascending=%0d%0d%0d%0d boundary=%0d%0d%0d%0d part=%0d",
+          from_code, to_code, high_bit.changed, high_bit.rising, high_bit.falling, high_bit.edged,
+          ascending_bit.changed, ascending_bit.rising, ascending_bit.falling, ascending_bit.edged,
+          boundary_bit.changed, boundary_bit.rising, boundary_bit.falling, boundary_bit.edged, part_changes);
+      end
+    end
+    #2 drive = 0;
+    #2 part_changes = 0;
+    #2 drive[63] = 1'b1;
+    #2 drive[63] = 1'b0;
+    #2 drive[64] = 1'b1;
+    #2 drive[64] = 1'b0;
+    #2 $display("T| cross_word changes=%0d", part_changes);
+    $finish;
+  end
+endmodule
+"#,
+        &[],
+    );
+    let mut expected = Vec::new();
+    for from in 0..4 {
+        for to in 0..4 {
+            let changed = usize::from(from != to);
+            let rising = usize::from((from == 0 && to != 0) || (from != 1 && to == 1));
+            let falling = usize::from((from == 1 && to != 1) || (from != 0 && to == 0));
+            let edged = usize::from(rising != 0 || falling != 0);
+            let counts = format!("{changed}{rising}{falling}{edged}");
+            expected.push(format!(
+                "T| {from}>{to} high={counts} ascending={counts} boundary={counts} part={changed}"
+            ));
+        }
+    }
+    expected.push("T| cross_word changes=4".to_string());
+    assert_eq!(t_lines(&o), expected, "{o}");
+}
+
+/// §9.4.2: aliased bit events distinguish all four values, ignore sibling
+/// changes, and retain both the known-to-unknown and unknown-to-known edges.
+#[test]
+fn aliased_bit_events_preserve_four_state_transitions() {
+    let o = run(
+        "port_four_state",
+        r#"
+`timescale 1ns/1ns
+module observer(inout [3:0] link);
+  int changes = 0, rises = 0, falls = 0;
+  always @(link[2]) changes++;
+  always @(posedge link[2]) rises++;
+  always @(negedge link[2]) falls++;
+endmodule
+module tb;
+  logic [15:0] drive;
+  wire [15:0] bus;
+  assign bus = drive;
+  observer u(.link(bus[11:8]));
+  initial begin
+    #1 drive = 0;
+    #1 u.changes = 0; u.rises = 0; u.falls = 0;
+    #1 drive[9] = 1'bx;
+    #1 drive[9] = 1'bz;
+    #1 drive[15] = 1'b1;
+    #1 $display("T| siblings changes=%0d rises=%0d falls=%0d", u.changes, u.rises, u.falls);
+    drive[10] = 1'bx;
+    #1 drive[10] = 1'bx;
+    #1 drive[9] = 1'b0;
+    #1 drive[10] = 1'bz;
+    #1 drive[10] = 1'bz;
+    #1 drive[10] = 1'b1;
+    #1 drive[10] = 1'bx;
+    #1 drive[10] = 1'b0;
+    #1 drive[10] = 1'bz;
+    #1 drive[10] = 1'b0;
+    #1 drive[10] = 1'b1;
+    #1 drive[10] = 1'b0;
+    #1 $display("T| selected changes=%0d rises=%0d falls=%0d", u.changes, u.rises, u.falls);
+    $finish;
+  end
+endmodule
+"#,
+        &[],
+    );
+    assert_eq!(
+        t_lines(&o),
+        [
+            "T| siblings changes=0 rises=0 falls=0",
+            "T| selected changes=9 rises=4 falls=4",
+        ],
+        "{o}"
+    );
+}
+
+/// §9.4.2: high physical bits and ascending port actuals keep exact value
+/// waits when they cannot be represented by the edge dispatch mask.
+#[test]
+fn aliased_bit_events_fall_back_for_wide_and_ascending_nets() {
+    let o = run(
+        "port_fallback",
+        r#"
+`timescale 1ns/1ns
+module observer(inout [7:0] link);
+  int changes = 0;
+  always @(link[2]) changes++;
+endmodule
+module tb;
+  logic [127:0] descending;
+  logic [64:191] ascending;
+  wire [127:0] down_bus;
+  wire [64:191] up_bus;
+  assign down_bus = descending;
+  assign up_bus = ascending;
+  observer down(.link(down_bus[79:72]));
+  observer up(.link(up_bus[136:143]));
+  initial begin
+    #1 descending = 0; ascending = 0;
+    #1 down.changes = 0; up.changes = 0;
+    #1 descending[73] = 1'bx; ascending[137] = 1'bx;
+    #1 $display("T| siblings down=%0d up=%0d", down.changes, up.changes);
+    descending[74] = 1'bx; ascending[141] = 1'bx;
+    #1 descending[78] = 1'b1; ascending[136] = 1'bz;
+    #1 descending[74] = 1'bz; ascending[141] = 1'bz;
+    #1 descending[74] = 1'b1; ascending[141] = 1'b1;
+    #1 $display("T| selected down=%0d up=%0d", down.changes, up.changes);
+    $finish;
+  end
+endmodule
+"#,
+        &[],
+    );
+    assert_eq!(
+        t_lines(&o),
+        ["T| siblings down=0 up=0", "T| selected down=3 up=3"],
+        "{o}"
+    );
+}
+
 /// Bit and part selects of local vectors: ascending and non-zero-based
 /// ranges read through their declared labels, two bits of one vector, a
 /// bit next to the whole vector, a parameter index, `+:`, an element of a

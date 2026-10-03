@@ -4332,10 +4332,15 @@ fn lsb_edge_fires(edge: EdgeKind, pv: u64, px: u64, cv: u64, cx: u64) -> bool {
     let pb_one = (pv & 1) == 1 && (px & 1) == 0;
     let pb_zero = (pv & 1) == 0 && (px & 1) == 0;
     match edge {
-        EdgeKind::Posedge => !pb_one && cb_one,
-        EdgeKind::Negedge => !pb_zero && cb_zero,
+        EdgeKind::Posedge => (pb_zero && !cb_zero) || (!pb_one && cb_one),
+        EdgeKind::Negedge => (pb_one && !cb_one) || (!pb_zero && cb_zero),
         EdgeKind::AnyEdge => cv != pv || cx != px,
-        EdgeKind::LsbEdge => (!pb_one && cb_one) || (!pb_zero && cb_zero),
+        EdgeKind::LsbEdge => {
+            (pb_zero && !cb_zero)
+                || (!pb_one && cb_one)
+                || (pb_one && !cb_one)
+                || (!pb_zero && cb_zero)
+        }
     }
 }
 
@@ -45075,10 +45080,15 @@ impl Simulator {
         let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
         let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
         match edge {
-            EdgeKind::Posedge => !pb_one && cb_one,
-            EdgeKind::Negedge => !pb_zero && cb_zero,
+            EdgeKind::Posedge => (pb_zero && !cb_zero) || (!pb_one && cb_one),
+            EdgeKind::Negedge => (pb_one && !cb_one) || (!pb_zero && cb_zero),
             EdgeKind::AnyEdge => cur_v != prev_v || cur_x != prev_x,
-            EdgeKind::LsbEdge => (!pb_one && cb_one) || (!pb_zero && cb_zero),
+            EdgeKind::LsbEdge => {
+                (pb_zero && !cb_zero)
+                    || (!pb_one && cb_one)
+                    || (pb_one && !cb_one)
+                    || (!pb_zero && cb_zero)
+            }
         }
     }
 
@@ -56026,8 +56036,8 @@ impl Simulator {
         let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
         let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
         match edge {
-            EdgeKind::Posedge => !pb_one && cb_one,
-            EdgeKind::Negedge => !pb_zero && cb_zero,
+            EdgeKind::Posedge => (pb_zero && !cb_zero) || (!pb_one && cb_one),
+            EdgeKind::Negedge => (pb_one && !cb_one) || (!pb_zero && cb_zero),
             EdgeKind::AnyEdge => {
                 if self.signal_widths[id] > 64 {
                     if let Some(p) = prev_wide {
@@ -56037,7 +56047,12 @@ impl Simulator {
                 cur_v != prev_v || cur_x != prev_x
             }
             // §9.4.2 `@(edge x)`: posedge OR negedge of the LSB.
-            EdgeKind::LsbEdge => (!pb_one && cb_one) || (!pb_zero && cb_zero),
+            EdgeKind::LsbEdge => {
+                (pb_zero && !cb_zero)
+                    || (!pb_one && cb_one)
+                    || (pb_one && !cb_one)
+                    || (!pb_zero && cb_zero)
+            }
         }
     }
 
@@ -57600,12 +57615,22 @@ impl Simulator {
                     let (cur_v, cur_x) = signal_table[sid].raw_bits();
                     let prev_v = prev_val_t[sid];
                     let prev_x = prev_xz_t[sid];
-                    let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
-                    let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
-                    let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
-                    let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
-                    let fires_pos = !pb_one && cb_one;
-                    let fires_neg = !pb_zero && cb_zero;
+                    let (fires_pos, fires_neg) = if (cur_x | prev_x) & 1 == 0 {
+                        // Known clock levels need only a change and polarity.
+                        let changed = (cur_v ^ prev_v) & 1 != 0;
+                        (changed && cur_v & 1 != 0, changed && cur_v & 1 == 0)
+                    } else {
+                        // §9.4.2 includes known-to-X/Z transitions, not only
+                        // transitions ending at a known zero or one.
+                        let cb_one = (cur_v & 1) == 1 && (cur_x & 1) == 0;
+                        let cb_zero = (cur_v & 1) == 0 && (cur_x & 1) == 0;
+                        let pb_one = (prev_v & 1) == 1 && (prev_x & 1) == 0;
+                        let pb_zero = (prev_v & 1) == 0 && (prev_x & 1) == 0;
+                        (
+                            (pb_zero && !cb_zero) || (!pb_one && cb_one),
+                            (pb_one && !cb_one) || (!pb_zero && cb_zero),
+                        )
+                    };
                     let fires_any = if widths_t[sid] > 64 {
                         prev_wide_t
                             .get(&sid)
