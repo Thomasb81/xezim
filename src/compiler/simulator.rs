@@ -6633,7 +6633,7 @@ pub struct Simulator {
     /// than a field on `SensitivityId` because select terms are rare and the
     /// dispatch loop is the hottest path in the simulator: when this map is
     /// empty the extra work is a single already-hot bool test.
-    bitsel_edge_sens: HashMap<(usize, usize), u64>,
+    bitsel_edge_sens: HashMap<(usize, usize), event_bits::EventMask>,
     /// Bitset over signal ids: bit set ⇔ `bitsel_edge_sens` has ≥1 entry for
     /// that sid. Lets the edge dispatch loop skip the per-(sid, block) tuple
     /// hash for the overwhelmingly common signals with no bit-select
@@ -21230,10 +21230,14 @@ impl Simulator {
     /// watches, when `e` is a constant bit- or part-select of that signal as
     /// a plain vector (`v[3]`, `v[W-1]`, `v[7:4]`, `v[b +: 2]`), read through
     /// its declared range. None for every other shape — a runtime index, an
-    /// element of a packed multi-D vector or of an array, a bit past the
-    /// 64-bit word the edge scan compares — which must wait on the
+    /// element of a packed multi-D vector or of an array — which must wait on the
     /// expression's value instead.
-    fn narrow_event_mask(&self, e: &Expression, sid: usize, scope: &str) -> Option<u64> {
+    fn narrow_event_mask(
+        &self,
+        e: &Expression,
+        sid: usize,
+        scope: &str,
+    ) -> Option<event_bits::EventMask> {
         let mut e = e;
         while let ExprKind::Paren(inner) = &e.kind {
             e = inner;
@@ -21243,9 +21247,9 @@ impl Simulator {
                 if matches!(expr.kind, ExprKind::Ident(_)) => {}
             _ => return None,
         }
-        self.select_chain_bits(e, sid, scope)?
-            .into_iter()
-            .try_fold(0u64, |m, b| (b < 64).then(|| m | 1u64 << b))
+        Some(event_bits::EventMask::from_bits(
+            self.select_chain_bits(e, sid, scope)?,
+        ))
     }
 
     /// The PHYSICAL bits of signal `sid` a constant select chain rooted at
@@ -22186,7 +22190,7 @@ impl Simulator {
                 // narrows the any-change wake to these bits. A signal the block
                 // also watches whole (`@(v[3] or v)`) keeps the whole-signal
                 // wake; every other select went to a value waiter above.
-                let mut narrowed: Vec<(usize, u64)> = Vec::new();
+                let mut narrowed: Vec<(usize, event_bits::EventMask)> = Vec::new();
                 let mut whole: Vec<usize> = Vec::new();
                 for s in &sens {
                     // Edge-qualified terms use the LSB edge fanout and must
@@ -22203,7 +22207,7 @@ impl Simulator {
                     };
                     match mask {
                         Some(m) => match narrowed.iter_mut().find(|(id, _)| *id == sid) {
-                            Some(entry) => entry.1 |= m,
+                            Some(entry) => entry.1.union(m),
                             None => narrowed.push((sid, m)),
                         },
                         None => whole.push(sid),
@@ -57699,7 +57703,7 @@ impl Simulator {
         // fanout events.
         let blk_armed: &[u8] = &self.edge_block_armed;
         let bitsel_sid_bits: &[u64] = &self.bitsel_sid_bits;
-        let bitsel_edge_sens: &HashMap<(usize, usize), u64> = &self.bitsel_edge_sens;
+        let bitsel_edge_sens = &self.bitsel_edge_sens;
         let prefilter_seen: &mut [u32] = &mut self.edge_prefilter_seen;
         let stats_on = self.edge_block_stats_enabled;
         let scan_stats = self.edge_scan_stats;
@@ -57929,7 +57933,16 @@ impl Simulator {
                         || !matches!($kind, EdgeKind::AnyEdge)
                         || match bitsel_edge_sens.get(&(sid, block_idx)) {
                             None => true,
-                            Some(&m) => ((cur_v ^ prev_v) | (cur_x ^ prev_x)) & m != 0,
+                            Some(event_bits::EventMask::Low(m)) => {
+                                ((cur_v ^ prev_v) | (cur_x ^ prev_x)) & m != 0
+                            }
+                            Some(event_bits::EventMask::Wide(bits)) => {
+                                event_bits::wide_select_changed(
+                                    bits,
+                                    &signal_table[sid],
+                                    prev_wide_t.get(&sid),
+                                )
+                            }
                         };
                     if bitsel_ok
                         && block_idx < triggered_bitmap.len()
@@ -77033,9 +77046,10 @@ impl Simulator {
                     }
                     _ => (*rvalue).clone(),
                 };
-                let val = self.eval_expr(&new_rhs);
-                self.assign_value(&new_lhs, &val);
-                self.settle_after_proc_write();
+                // The frozen target can still be an unpacked aggregate.
+                // Keep its member-wise assignment paths instead of forcing
+                // the value-only scalar store.
+                self.exec_stmt_blocking_assign_body(stmt, &new_lhs, &new_rhs);
                 return;
             }
         }
@@ -99729,85 +99743,24 @@ impl Simulator {
         keys
     }
 
-    /// `a.b.c` where `a.b` is a signal carrying a bit layout (a nested packed
-    /// struct, or an untagged union whose members all sit at bit 0): the leaf's
-    /// `(container, offset, width)`. Such a dotted name parses as ONE
-    /// hierarchical identifier, so the field lookups that key off the ROOT
-    /// (`a`) never see it.
-    /// Does this expression contain an inc/dec side effect (`i++`, `--j`)
-    /// or an embedded assignment? Used to guarantee §11.4.1 single
-    /// evaluation of lvalue index expressions.
-    fn expr_has_incdec(e: &Expression) -> bool {
-        match &e.kind {
-            ExprKind::Unary { op, operand } => {
-                matches!(
-                    op,
-                    UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
-                ) || Self::expr_has_incdec(operand)
-            }
-            ExprKind::AssignExpr { .. } => true,
-            ExprKind::Binary { left, right, .. } => {
-                Self::expr_has_incdec(left) || Self::expr_has_incdec(right)
-            }
-            ExprKind::Paren(inner) => Self::expr_has_incdec(inner),
-            ExprKind::Index { expr, index } => {
-                Self::expr_has_incdec(expr) || Self::expr_has_incdec(index)
-            }
-            ExprKind::Conditional {
-                condition,
-                then_expr,
-                else_expr,
-            } => {
-                Self::expr_has_incdec(condition)
-                    || Self::expr_has_incdec(then_expr)
-                    || Self::expr_has_incdec(else_expr)
-            }
-            ExprKind::Concatenation(parts) => parts.iter().any(Self::expr_has_incdec),
-            _ => false,
-        }
-    }
-
-    /// Does an lvalue's INDEX position contain an inc/dec side effect
-    /// (`x[i++] = v`)?
+    /// Does an lvalue's index need single evaluation (§11.4.1), including
+    /// a function call whose purity is not known?
     fn lvalue_has_incdec_index(lhs: &Expression) -> bool {
         match &lhs.kind {
             ExprKind::Index { expr, index } => {
-                Self::expr_has_incdec(index) || Self::lvalue_has_incdec_index(expr)
+                !Self::cond_expr_is_effect_free(index, false) || Self::lvalue_has_incdec_index(expr)
             }
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => {
-                Self::expr_has_incdec(left)
-                    || Self::expr_has_incdec(right)
+                !Self::cond_expr_is_effect_free(left, false)
+                    || !Self::cond_expr_is_effect_free(right, false)
                     || Self::lvalue_has_incdec_index(expr)
             }
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => {
+                Self::lvalue_has_incdec_index(expr)
+            }
             _ => false,
-        }
-    }
-
-    /// Wrap an already-evaluated index value as a literal expression so the
-    /// original (side-effecting) index is not re-evaluated.
-    fn literal_index_expr(iv: i64, span: crate::ast::Span) -> Expression {
-        let mag = Expression::new(
-            ExprKind::Number(NumberLiteral::Integer {
-                size: None,
-                signed: false,
-                base: NumberBase::Decimal,
-                value: iv.unsigned_abs().to_string(),
-                cached_val: Cell::new(None),
-            }),
-            span,
-        );
-        if iv < 0 {
-            Expression::new(
-                ExprKind::Unary {
-                    op: UnaryOp::Minus,
-                    operand: Box::new(mag),
-                },
-                span,
-            )
-        } else {
-            mag
         }
     }
 
@@ -99819,19 +99772,13 @@ impl Simulator {
         match &lhs.kind {
             ExprKind::Index { expr, index } => {
                 let inner = self.rewrite_lvalue_index_side_effects(expr);
-                let idx_needs = Self::expr_has_incdec(index);
+                let idx_needs = !Self::cond_expr_is_effect_free(index, false);
                 if inner.is_none() && !idx_needs {
                     return None;
                 }
                 let new_base = inner.unwrap_or_else(|| (**expr).clone());
                 let new_index = if idx_needs {
-                    let v = self.eval_expr(index);
-                    let iv = if v.is_signed {
-                        v.to_i64().unwrap_or(0)
-                    } else {
-                        v.to_u64().unwrap_or(0) as i64
-                    };
-                    Self::literal_index_expr(iv, index.span)
+                    self.capture_index_literal(index, &new_base)
                 } else {
                     (**index).clone()
                 };
@@ -99850,21 +99797,15 @@ impl Simulator {
                 kind,
             } => {
                 let inner = self.rewrite_lvalue_index_side_effects(expr);
-                let l_needs = Self::expr_has_incdec(left);
-                let r_needs = Self::expr_has_incdec(right);
+                let l_needs = !Self::cond_expr_is_effect_free(left, false);
+                let r_needs = !Self::cond_expr_is_effect_free(right, false);
                 if inner.is_none() && !l_needs && !r_needs {
                     return None;
                 }
                 let new_base = inner.unwrap_or_else(|| (**expr).clone());
                 let mut fold = |e: &Expression, needs: bool| -> Expression {
                     if needs {
-                        let v = self.eval_expr(e);
-                        let iv = if v.is_signed {
-                            v.to_i64().unwrap_or(0)
-                        } else {
-                            v.to_u64().unwrap_or(0) as i64
-                        };
-                        Self::literal_index_expr(iv, e.span)
+                        self.capture_index_literal(e, &new_base)
                     } else {
                         e.clone()
                     }
@@ -99881,8 +99822,51 @@ impl Simulator {
                     lhs.span,
                 ))
             }
+            ExprKind::MemberAccess { expr, member } => {
+                let base = self.rewrite_lvalue_index_side_effects(expr)?;
+                Some(Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(base),
+                        member: member.clone(),
+                    },
+                    lhs.span,
+                ))
+            }
+            ExprKind::Paren(expr) => self.rewrite_lvalue_index_side_effects(expr),
             _ => None,
         }
+    }
+
+    /// Preserve strings, signedness, width and individual x/z bits while
+    /// capturing a selector once. Unknown selectors must not become zero.
+    fn capture_index_literal(&mut self, expr: &Expression, base: &Expression) -> Expression {
+        // §7.10: `$` belongs to the selected collection, for both index
+        // expressions and range bounds, including `q[$ - f()]`.
+        let bound = Self::expr_contains_dollar(expr)
+            .then(|| self.dollar_bound_for_base(base))
+            .flatten();
+        if let Some(bound) = bound {
+            self.dollar_bound.push(bound);
+        }
+        let is_string = self.expr_is_string_valued(expr);
+        let v = self.eval_expr(expr);
+        if bound.is_some() {
+            self.dollar_bound.pop();
+        }
+        let kind = if is_string {
+            ExprKind::StringLiteral(v.to_sv_string())
+        } else if v.is_real {
+            ExprKind::Number(NumberLiteral::Real(v.to_f64()))
+        } else {
+            ExprKind::Number(NumberLiteral::Integer {
+                size: Some(v.width.max(1)),
+                signed: v.is_signed,
+                base: NumberBase::Binary,
+                value: v.to_bin(),
+                cached_val: Cell::new(v.inline_bits().map(|(vbits, xz)| (vbits, xz, v.width))),
+            })
+        };
+        Expression::new(kind, expr.span)
     }
 
     /// Resolve a nested packed-vector index chain `base[i0][i1]...` (LRM

@@ -553,6 +553,51 @@ endmodule
     );
 }
 
+/// §9.4.2: high-bit and cross-word level selects stay on native edge
+/// dispatch. A union of low and high terms must retain both masks.
+#[test]
+fn wide_selects_are_narrowed_edge_blocks() {
+    let o = run(
+        "wide_native",
+        r#"
+module observer(inout [3:0] link);
+  int hits = 0;
+  always @(link[2]) hits++;
+endmodule
+module tb;
+  logic [127:0] drive;
+  wire [127:0] bus = drive;
+  int combined = 0, boundary = 0, whole = 0;
+  observer u(.link(bus[71:68]));
+  always @(bus[0] or bus[70]) combined++;
+  always @(bus[65:62]) boundary++;
+  always @(bus[70] or bus) whole++;
+  initial begin
+    #1 drive = 0;
+    #1 u.hits = 0; combined = 0; boundary = 0; whole = 0;
+    #1 drive[1] = 1;
+    #1 drive[70] = 1;
+    #1 drive[0] = 1;
+    #1 drive[63] = 1;
+    #1 drive[64] = 1;
+    #1 drive[70] = 1'bx;
+    #1 drive[70] = 1'bz;
+    #1 drive[70] = 0;
+    #1 $display("T|high=%0d union=%0d boundary=%0d whole=%0d", u.hits, combined, boundary, whole);
+    $finish;
+  end
+endmodule
+"#,
+        &[("XEZIM_DUMP_EDGE_SENS", "1")],
+    );
+    assert_eq!(t_lines(&o), ["T|high=4 union=5 boundary=2 whole=8"], "{o}");
+    assert_eq!(
+        o.lines().filter(|l| l.starts_with("[EDGE-SENS]")).count(),
+        4,
+        "{o}"
+    );
+}
+
 /// §7.4.1 part-selects of ASCENDING vectors that are nets or live inside an
 /// instance read the declared labels (`v[0:3]` is the four MSBs). They read
 /// the bits mirrored, while bit-selects and top-level variables were right;

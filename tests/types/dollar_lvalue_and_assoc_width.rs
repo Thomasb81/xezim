@@ -93,6 +93,44 @@ endmodule
     assert_eq!(u(&sim, "last"), 66, "q[$] is the last");
 }
 
+/// §7.10/§11.4.1: capture a mutating selector in the queue's `$` context,
+/// then retain the aggregate copy and evaluate the function only once.
+#[test]
+fn captured_queue_tail_selector_keeps_its_bound() {
+    let src = r#"
+module top;
+  typedef struct { int tag; string text; } record_t;
+  record_t records[$], source;
+  int words[$], calls = 0, first, last, copied, record_calls;
+  string copied_text;
+  function automatic int distance(); calls++; return 1; endfunction
+  initial begin
+    words = '{10, 20, 30};
+    words[$ - distance()] = 77;
+    first = words[1];
+    last = words[2];
+    source = '{11, "before"};
+    records.push_back(source);
+    records.push_back(source);
+    source = '{73, "after"};
+    records[$ - distance()] = source;
+    copied = records[0].tag;
+    copied_text = records[0].text;
+    record_calls = calls;
+    $finish;
+  end
+endmodule"#;
+    let sim = simulate(src, 100).expect("simulate failed");
+    assert_eq!(u(&sim, "first"), 77);
+    assert_eq!(u(&sim, "last"), 30);
+    assert_eq!(u(&sim, "copied"), 73);
+    assert_eq!(u(&sim, "record_calls"), 2);
+    assert_eq!(
+        sim.get_signal("copied_text").unwrap().to_sv_string(),
+        "after"
+    );
+}
+
 /// Assoc elements take their DECLARED width — narrow truncates, wide extends —
 /// and blocking and non-blocking agree.
 #[test]

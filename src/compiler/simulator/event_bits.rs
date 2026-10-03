@@ -23,6 +23,53 @@
 
 use super::*;
 
+/// A constant event select, compact for the common low-word case. Wide
+/// selects use the edge snapshot too, without an interpreted value waiter.
+pub(super) enum EventMask {
+    Low(u64),
+    Wide(Vec<u32>),
+}
+
+impl EventMask {
+    pub(super) fn from_bits(bits: Vec<i64>) -> Self {
+        if bits.iter().all(|&b| b < 64) {
+            Self::Low(bits.into_iter().fold(0, |m, b| m | 1u64 << b))
+        } else {
+            Self::Wide(bits.into_iter().map(|b| b as u32).collect())
+        }
+    }
+
+    fn into_bits(self) -> Vec<u32> {
+        match self {
+            Self::Low(m) => (0..64).filter(|b| m & (1u64 << b) != 0).collect(),
+            Self::Wide(bits) => bits,
+        }
+    }
+
+    pub(super) fn union(&mut self, other: Self) {
+        if let (Self::Low(a), Self::Low(b)) = (&mut *self, &other) {
+            *a |= b;
+            return;
+        }
+        let mut bits = std::mem::replace(self, Self::Low(0)).into_bits();
+        bits.extend(other.into_bits());
+        bits.sort_unstable();
+        bits.dedup();
+        *self = Self::Wide(bits);
+    }
+}
+
+/// Kept out of the common scalar edge scan; compare only selected bits,
+/// with x and z distinct, using the snapshot before this delta's writes.
+#[inline(never)]
+pub(super) fn wide_select_changed(bits: &[u32], current: &Value, previous: Option<&Value>) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    bits.iter()
+        .any(|&bit| current.get_bit(bit as usize) != previous.get_bit(bit as usize))
+}
+
 /// §7.4.1 declared `(left, right)` range of a plain 1-D packed vector of
 /// `width` bits, or None when a select on `name` does not address single
 /// bits by that range: an unpacked or associative collection, a packed

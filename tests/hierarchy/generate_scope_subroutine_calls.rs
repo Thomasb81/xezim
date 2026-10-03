@@ -112,6 +112,60 @@ endmodule"#;
     assert_eq!(t_lines(&sim), ["T|picks=1 slot=1 result=51 words=52,62"]);
 }
 
+/// §7.2/§11.4.1: capturing a selector must preserve the member-wise copy,
+/// including string members, rather than falling through to a scalar store.
+#[test]
+fn aggregate_assignment_captures_function_and_increment_selectors() {
+    const SRC: &str = r#"
+module tb;
+  typedef struct { int tag; string text; } record_t;
+  record_t entries[$], fixed_entries[2], source;
+  int calls = 0, slot = 0;
+  function automatic int pick(); calls++; return 0; endfunction
+  initial begin
+    source = '{10, "before"};
+    entries.push_back(source);
+    source = '{73, "after"};
+    entries[pick()] = source;
+    fixed_entries[slot++] = source;
+    $display("T|queue=%0d,%s calls=%0d", entries[0].tag, entries[0].text, calls);
+    $display("T|fixed=%0d,%s slot=%0d", fixed_entries[0].tag, fixed_entries[0].text, slot);
+    $finish;
+  end
+endmodule"#;
+    let sim = simulate(SRC, 100).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        ["T|queue=73,after calls=1", "T|fixed=73,after slot=1"]
+    );
+}
+
+/// §11.5.1/§7.8: single evaluation must preserve unknown and string keys.
+#[test]
+fn captured_assignment_selectors_preserve_their_value_kind() {
+    const SRC: &str = r#"
+module tb;
+  int words[2], mapping[string];
+  int unknown_calls = 0, text_calls = 0;
+  function automatic logic [31:0] unknown_slot(); unknown_calls++; return 'x; endfunction
+  function automatic string text_slot(); text_calls++; return "sample"; endfunction
+  initial begin
+    words[0] = 51;
+    words[1] = 62;
+    words[unknown_slot()] = 99;
+    mapping[text_slot()] = 73;
+    $display("T|words=%0d,%0d calls=%0d", words[0], words[1], unknown_calls);
+    $display("T|map=%0d calls=%0d size=%0d", mapping["sample"], text_calls, mapping.num());
+    $finish;
+  end
+endmodule"#;
+    let sim = simulate(SRC, 100).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        ["T|words=51,62 calls=1", "T|map=73 calls=1 size=1"]
+    );
+}
+
 /// A local receiver named like the top module must not bind to a global
 /// function when its method shares that function's name.
 #[test]
