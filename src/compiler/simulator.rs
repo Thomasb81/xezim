@@ -3234,6 +3234,18 @@ struct ClassMemberNames {
     ident_slow: HashSet<String>,
 }
 
+/// A foreach index variable's outer state, restored when the loop exits:
+/// (name, value, lived in a frame, typedef binding, trusted mark, packed
+/// struct layout).
+type LoopVarSnapshot = (
+    String,
+    Option<Value>,
+    bool,
+    Option<String>,
+    bool,
+    Option<Vec<(String, u32, u32)>>,
+);
+
 /// `instance_assoc_member`'s class-only verdict for a bare name inside a
 /// method of a given runtime class (class tables are fixed at run time).
 enum MemberCollKind {
@@ -79519,6 +79531,22 @@ impl Simulator {
                 })?;
             let v = vars.first()?.as_ref()?.name.clone();
             self.meta_note(&v);
+            // §7.8.2: a packed-struct key gives the index variable that
+            // struct's members (`foreach (m[k]) k.a`), as a local declared
+            // with the type would get (`exec_stmt_var_decl`). The layout is
+            // scoped to the loop by `restore_loop_vars`.
+            if let Some(dt) = self.module.typedef_types.get(&kt).cloned() {
+                if let Some(fields) = super::elaborate::packed_struct_field_layout(
+                    &dt,
+                    &self.module.parameters,
+                    &self.module.typedefs,
+                    &self.module.typedef_types,
+                )
+                .filter(|f| !f.is_empty())
+                {
+                    self.module.packed_struct_fields.insert(v.clone(), fields);
+                }
+            }
             self.var_typedef_types.insert(v.clone(), kt);
             // The loop var is a FRESH declaration (§12.7.3) — its type
             // binding shadows class properties and stale flat-map
@@ -100339,10 +100367,7 @@ impl Simulator {
     /// save/restore). A `foreach (arr[i])` index is loop-scoped in SV, so the
     /// outer `i` must be unchanged afterward — riscv-dv's
     /// `foreach(instr_list[i]) … ; while(i < size) …` depends on it.
-    fn snapshot_loop_vars(
-        &self,
-        names: &[String],
-    ) -> Vec<(String, Option<Value>, bool, Option<String>, bool)> {
+    fn snapshot_loop_vars(&self, names: &[String]) -> Vec<LoopVarSnapshot> {
         // `set_loop_var` writes local_stack when a frame exists, else signals;
         // snapshot from (and later restore to) that same location so the
         // foreach shadow is removed without clobbering the outer variable
@@ -100364,13 +100389,14 @@ impl Simulator {
                     has_frame,
                     self.var_typedef_types.get(n).cloned(),
                     self.fe_trusted_types.contains(n),
+                    self.module.packed_struct_fields.get(n).cloned(),
                 )
             })
             .collect()
     }
 
-    fn restore_loop_vars(&mut self, saved: &[(String, Option<Value>, bool, Option<String>, bool)]) {
-        for (n, cur, had_frame, prior_td, was_trusted) in saved {
+    fn restore_loop_vars(&mut self, saved: &[LoopVarSnapshot]) {
+        for (n, cur, had_frame, prior_td, was_trusted, prior_ps) in saved {
             self.meta_note(n);
             match prior_td {
                 Some(t) => {
@@ -100385,8 +100411,20 @@ impl Simulator {
             } else {
                 self.fe_trusted_types.remove(n);
             }
+            if self.module.packed_struct_fields.get(n) != prior_ps.as_ref() {
+                match prior_ps {
+                    Some(f) => {
+                        self.module
+                            .packed_struct_fields
+                            .insert(n.clone(), f.clone());
+                    }
+                    None => {
+                        self.module.packed_struct_fields.remove(n);
+                    }
+                }
+            }
         }
-        for (n, cur, had_frame, _, _) in saved {
+        for (n, cur, had_frame, _, _, _) in saved {
             if *had_frame {
                 if let Some(m) = self.local_stack.last_mut() {
                     match cur {

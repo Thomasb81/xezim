@@ -210,6 +210,33 @@ endmodule"#;
     );
 }
 
+/// A packed-struct key's members through the index variable, in a task and
+/// in an initial block.
+#[test]
+fn packed_struct_key_members() {
+    const SRC: &str = r#"
+typedef struct packed { logic [3:0] a; logic [5:0] b; } ks_t;
+module tb;
+  logic [7:0] mems [ks_t];
+  task report();
+    ks_t lv;
+    lv = 10'h0c5;
+    $display("T|lv a=%0d b=%0d", lv.a, lv.b);
+    foreach (mems[k]) $display("T|s key=%h a=%0d b=%0d", k, k.a, k.b);
+  endtask
+  initial begin
+    mems['{a:4'h3, b:6'h5}] = 2;
+    foreach (mems[k]) $display("T|i key=%h a=%0d b=%0d", k, k.a, k.b);
+    report();
+  end
+endmodule"#;
+    let sim = simulate(SRC, 100).expect("sim");
+    assert_eq!(
+        t_lines(&sim),
+        ["T|i key=0c5 a=3 b=5", "T|lv a=3 b=5", "T|s key=0c5 a=3 b=5",],
+    );
+}
+
 /// Class properties: a typedef'd key resolved through the installed typedef
 /// table (it fell back to 32 bits). A typedef'd SIGNED key on a class
 /// property still iterates unsigned (no typedef signedness during class
