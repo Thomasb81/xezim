@@ -227,6 +227,8 @@ mod always_value_change_after_edge_continuation;
 mod bare_randomize_in_method;
 #[path = "scheduling/class_event_member_wait.rs"]
 mod class_event_member_wait;
+#[path = "scheduling/class_nonevent_prop_wait.rs"]
+mod class_nonevent_prop_wait;
 #[path = "scheduling/clock_gen_dotted_target.rs"]
 mod clock_gen_dotted_target;
 #[path = "scheduling/clock_gen_fifo_rank.rs"]
@@ -243,6 +245,8 @@ mod delayed_write_pending_semantics;
 mod edge_skip_shared_output;
 #[path = "scheduling/finish_with_live_fork_child.rs"]
 mod finish_with_live_fork_child;
+#[path = "scheduling/hierarchical_event_wait.rs"]
+mod hierarchical_event_wait;
 #[path = "scheduling/inlined_call_rollback.rs"]
 mod inlined_call_rollback;
 #[path = "scheduling/intra_assignment_delay_in_always.rs"]
@@ -255,6 +259,8 @@ mod nba_array_elem_last_write_wins;
 mod nba_wait_for_region_yield;
 #[path = "scheduling/nested_delay_slot_servicing.rs"]
 mod nested_delay_slot_servicing;
+#[path = "scheduling/object_event_paths.rs"]
+mod object_event_paths;
 #[path = "scheduling/package_and_unit_delays_scale_by_timescale.rs"]
 mod package_and_unit_delays_scale_by_timescale;
 #[path = "scheduling/phase_jump_static_latch.rs"]

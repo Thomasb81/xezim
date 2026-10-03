@@ -85,6 +85,8 @@ mod this_super_member;
 mod type_param_base_class;
 #[path = "classes/type_param_base_named_forward.rs"]
 mod type_param_base_named_forward;
+#[path = "classes/type_param_base_typedef_arg.rs"]
+mod type_param_base_typedef_arg;
 #[path = "classes/type_param_default_implicit_extends.rs"]
 mod type_param_default_implicit_extends;
 #[path = "classes/type_param_formal_stale_local.rs"]
@@ -461,6 +463,8 @@ mod nopack_member_array;
 mod package_class_nested_class;
 #[path = "classes/parked_task_local_vif_alias.rs"]
 mod parked_task_local_vif_alias;
+#[path = "classes/pkg_class_scope_types.rs"]
+mod pkg_class_scope_types;
 #[path = "classes/rand_collection_element_signedness.rs"]
 mod rand_collection_element_signedness;
 #[path = "classes/randomize_joint_constraints.rs"]
@@ -473,6 +477,8 @@ mod receiver_call_evaluated_once;
 mod ref_formal_shadows_property;
 #[path = "classes/soft_constraint_compatibility.rs"]
 mod soft_constraint_compatibility;
+#[path = "classes/soft_constraint_matrix.rs"]
+mod soft_constraint_matrix;
 #[path = "classes/sqr_zero_time_loop.rs"]
 mod sqr_zero_time_loop;
 #[path = "classes/static_assoc_struct_pool.rs"]

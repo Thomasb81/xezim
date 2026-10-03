@@ -444,6 +444,11 @@ const RPS_TRAMPOLINE_DEPTH: usize = 300;
 /// Internal marker retrieving a §9.4.5 intra-assignment RHS value captured in
 /// `Simulator::intra_saved` (see `make_intra_saved_expr`). Never user-visible.
 const INTRA_SAVED_MARKER: &str = "$__xz_intra_saved";
+/// Internal `$__xz_vc_changed(idx, expr)`: true once `expr` differs from the
+/// value stashed in `Simulator::vc_saved[idx]` when a value-change event
+/// control (`@prop` on a non-event class property) was armed. Never
+/// user-visible.
+const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
@@ -6048,6 +6053,11 @@ pub struct Simulator {
     /// item in hand (an `unique {a, arr[0]}` re-pick used to blow `a inside
     /// {[1:10]}` wide open). Rebuilt at the top of every solver trial.
     rand_ranges: HashMap<String, Vec<(i128, i128)>>,
+    /// The same for the ELEMENTS of each rand array / collection property:
+    /// the hard `inside` domain its elements are constrained to (signed,
+    /// exact). Refreshed at the top of every repair pass, so a conditional
+    /// domain follows the current values of its condition.
+    rand_elem_ranges: HashMap<String, Vec<(i128, i128)>>,
     /// Static class properties — one shared cell per `Class::prop`,
     /// keyed `"ClassName::propname"` where ClassName is the class that
     /// declared the static property.
@@ -7208,6 +7218,9 @@ pub struct Simulator {
     /// (removed) when the delayed assignment fires.
     intra_saved: HashMap<u64, Value>,
     intra_saved_next: u64,
+    /// Armed values of value-change waits on class properties (see
+    /// `VC_CHANGED_MARKER`); removed when the wait resumes.
+    vc_saved: HashMap<u64, (usize, Value)>,
     /// LRM §15.5.3: per-named-event last-trigger time. `e.triggered`
     /// returns 1 iff this map's `time` matches the current simulation time
     /// (i.e. the event has been triggered in the same time slot as the
@@ -11462,6 +11475,7 @@ impl Simulator {
             locator_iter: "item".to_string(),
             dist_picked_once: HashSet::default(),
             rand_ranges: HashMap::default(),
+            rand_elem_ranges: HashMap::default(),
             class_statics: StaticMap::default(),
             local_type_stack: Vec::new(),
             current_spec: None,
@@ -11791,6 +11805,7 @@ impl Simulator {
             semaphore_get_waiters: HashMap::default(),
             intra_saved: HashMap::default(),
             intra_saved_next: 0,
+            vc_saved: HashMap::default(),
             event_triggered_time: HashMap::default(),
             event_waiters: Vec::new(),
             instance_event_waiters: Vec::new(),
@@ -43898,6 +43913,22 @@ impl Simulator {
             EventControl::EventExpr(exprs) => {
                 let mut out: Vec<Sensitivity> = Vec::with_capacity(exprs.len());
                 for ee in exprs {
+                    let edge = match ee.edge {
+                        Some(Edge::Posedge) => EdgeKind::Posedge,
+                        Some(Edge::Negedge) => EdgeKind::Negedge,
+                        Some(Edge::Edge) => EdgeKind::LsbEdge,
+                        None => EdgeKind::AnyEdge,
+                    };
+                    if let Some(key) = self.event_ref_key_static(&ee.expr) {
+                        let canon = self.resolve_event_key(&key);
+                        out.push(Sensitivity {
+                            signal_name: canon,
+                            edge,
+                            iff: ee.iff.clone().map(Box::new),
+                            value_of: None,
+                        });
+                        continue;
+                    }
                     // §25.8/§25.9: a term whose receiver is a bound virtual
                     // interface (`@(cfg.vif.data)`, `@(posedge d.vif.clk)`,
                     // `@(c.vif.cb)`) waits on the bound instance's signal.
@@ -45233,6 +45264,11 @@ impl Simulator {
                     Self::collect_condition_read_names(p, out);
                 }
             }
+            ExprKind::SystemCall { name, args } if name == VC_CHANGED_MARKER => {
+                if let Some(a) = args.get(1) {
+                    Self::collect_condition_read_names(a, out);
+                }
+            }
             _ => {}
         }
     }
@@ -45413,6 +45449,9 @@ impl Simulator {
                     && self.cond_operand_gated(then_expr, this_h, this_cls)
                     && self.cond_operand_gated(else_expr, this_h, this_cls)
             }
+            ExprKind::SystemCall { name, args } if name == VC_CHANGED_MARKER => args
+                .get(1)
+                .is_some_and(|a| self.cond_operand_gated(a, this_h, this_cls)),
             _ => false,
         }
     }
@@ -52068,8 +52107,9 @@ impl Simulator {
             // tasks with no top-level wait) keep the synchronous path.
             if let StatementKind::Expr(expr) = &stmt.kind {
                 if let ExprKind::Call { func, args } = &expr.kind {
-                    // The receiver handle when it came from a call result.
-                    let mut call_recv: Option<usize> = None;
+                    // Preserve receivers evaluated by this probe, including
+                    // selected elements, for the nonblocking fallback.
+                    let mut call_recv: Option<(usize, String)> = None;
                     let resolved: Option<(usize, String)> = match &func.kind {
                         // (receiver_handle, method_name)
                         ExprKind::Ident(h) if h.path.len() == 1 => self
@@ -52091,10 +52131,37 @@ impl Simulator {
                             let mut head = h.clone();
                             let last = head.path.pop().unwrap();
                             let recv = Expression::new(ExprKind::Ident(head), expr.span);
-                            self.eval_handle_expr(&recv).map(|hh| (hh, last.name.name))
+                            let selected = matches!(&recv.kind, ExprKind::Ident(hp)
+                                if hp.path.iter().any(|s| !s.selects.is_empty()));
+                            let handle = if selected {
+                                if self
+                                    .class_member_names()
+                                    .tasks
+                                    .contains(last.name.name.as_str())
+                                {
+                                    let handle = self.eval_live_object_receiver(&recv);
+                                    call_recv = handle.map(|hh| (hh, last.name.name.clone()));
+                                    handle
+                                } else {
+                                    None
+                                }
+                            } else {
+                                self.eval_handle_expr(&recv)
+                            };
+                            handle.map(|hh| (hh, last.name.name))
                         }
                         ExprKind::MemberAccess { expr: recv, member } => {
                             match self.eval_handle_expr(recv) {
+                                None if !matches!(&recv.kind, ExprKind::Call { .. })
+                                    && self
+                                        .class_member_names()
+                                        .tasks
+                                        .contains(member.name.as_str()) =>
+                                {
+                                    let handle = self.eval_live_object_receiver(recv);
+                                    call_recv = handle.map(|hh| (hh, member.name.clone()));
+                                    call_recv.clone()
+                                }
                                 Some(hh) => Some((hh, member.name.clone())),
                                 // A receiver reached through a call result
                                 // (`h.pool.get("done").wait_trigger()`) has no
@@ -52115,7 +52182,7 @@ impl Simulator {
                                                 v.to_u64().unwrap_or(0) as usize,
                                                 recv,
                                             );
-                                            call_recv = Some(hh);
+                                            call_recv = Some((hh, member.name.clone()));
                                             Some((hh, member.name.clone()))
                                         }
                                         None => None,
@@ -52171,15 +52238,13 @@ impl Simulator {
                     }
                     // Not inlined: run the call with the receiver value
                     // already computed above rather than evaluating it again.
-                    if let (Some(rh), ExprKind::MemberAccess { member, .. }) =
-                        (call_recv, &func.kind)
-                    {
+                    if let Some((rh, member)) = call_recv {
                         let is_obj = rh != 0
                             && self.heap.get(rh).is_some_and(|o| o.is_some())
                             && !self.mailboxes.contains_key(&rh)
                             && !self.semaphores.contains_key(&rh);
                         if is_obj && self.cg_index(rh).is_none() {
-                            self.exec_method_call(rh, &member.name, args);
+                            self.exec_method_call(rh, &member, args);
                             i += 1;
                             continue;
                         }
@@ -52860,6 +52925,15 @@ impl Simulator {
                                 return;
                             }
                         }
+                        // `@prop` / `@(h.prop)` on a NON-event class property:
+                        // a value-change wait, resumed by an ordinary write
+                        // of the property (never by `->`).
+                        if let Some(cond) = self.class_prop_value_change_cond(event) {
+                            let wait = Self::vc_wait_stmt(cond.clone(), body, stmt.span);
+                            let cont = pc.pushed(vec![wait], pc.start + i + 1);
+                            self.park_condition_waiter(pid, cont, &cond);
+                            return;
+                        }
                         // §15.5 a DECLARED named event — including an array
                         // element (`@ev[1]`) and one reached through an alias
                         // (`e1 = e2; @e1`). Both need the resolved key rather
@@ -52958,6 +53032,7 @@ impl Simulator {
             } = &stmt.kind
             {
                 if self.wait_condition_true(condition) {
+                    self.vc_release(condition);
                     self.cond_progress = self.cond_progress.wrapping_add(1);
                     self.exec_statement(body);
                     i += 1;
@@ -68620,6 +68695,20 @@ impl Simulator {
                     .remove(&idx)
                     .unwrap_or_else(|| Value::zero(32))
             }
+            // `@prop` on a non-event class property: true once the property
+            // differs from the value captured when the wait was armed.
+            VC_CHANGED_MARKER => {
+                let idx = args
+                    .first()
+                    .map(|a| self.eval_expr(a).to_u64().unwrap_or(0))
+                    .unwrap_or(0);
+                let cur = args
+                    .get(1)
+                    .map(|a| self.eval_expr(a))
+                    .unwrap_or_else(|| Value::zero(1));
+                let changed = self.vc_saved.get(&idx).is_none_or(|(_, prev)| *prev != cur);
+                Value::from_u64(changed as u64, 1)
+            }
             // §9.4.5 marker reached from a context that cannot suspend
             // (always-block settle, function body, bytecode fallback):
             // degrade to the RHS value with the delay ignored.
@@ -68855,6 +68944,19 @@ impl Simulator {
                         .max(1);
                         return Value::from_u64(w as u64, 32);
                     }
+                    // §8.23/§20.6.2: `$bits(pkg::cls::td)` — a `::`-chained
+                    // scoped TYPE name parses as nested member accesses, not
+                    // an Ident. Resolve it against the typedef tables by its
+                    // FULL qualified key (no suffix fallback: `$bits(s.m)` on
+                    // a real struct member must keep falling through to the
+                    // member paths below).
+                    if matches!(&arg.kind, ExprKind::MemberAccess { .. }) {
+                        if let Some(key) = Self::expr_scoped_chain_key(arg) {
+                            if let Some(&w) = self.module.typedefs.get(&key) {
+                                return Value::from_u64(w as u64, 32);
+                            }
+                        }
+                    }
                     if let ExprKind::Ident(hier) = &arg.kind {
                         let name = self.resolve_hier_name(hier);
                         // A bare TYPE PARAMETER of the enclosing class
@@ -68865,7 +68967,7 @@ impl Simulator {
                         if let Some(leaf) = hier.path.last().map(|s| s.name.name.clone()) {
                             let as_ty = crate::ast::types::DataType::TypeReference {
                                 name: crate::ast::types::TypeName {
-                                    scope: None,
+                                    scopes: Vec::new(),
                                     name: crate::ast::Identifier {
                                         name: leaf,
                                         span: arg.span,
@@ -81207,9 +81309,9 @@ impl Simulator {
                                 // scalar, so a later `ref` call saw
                                 // no collection to write back to.
                                 let start = name
-                                    .scope
-                                    .as_ref()
-                                    .map(|s| s.name.clone())
+                                    .scopes
+                                    .first()
+                                    .map(|s| s.name.name.clone())
                                     .or_else(|| self.class_context_stack.last().cloned().flatten())
                                     .or_else(|| {
                                         self.this_stack.last().copied().flatten().and_then(|h| {
@@ -83521,6 +83623,13 @@ impl Simulator {
                                 return;
                             }
                         }
+                        if let Some(cond) = self.class_prop_value_change_cond(e) {
+                            let pid = self.current_pid;
+                            let wait = Self::vc_wait_stmt(cond.clone(), stmt, stmt.span);
+                            self.park_condition_waiter(pid, vec![wait].into(), &cond);
+                            self.break_flag = true;
+                            return;
+                        }
                         let sens = self.event_to_sens(e);
                         let is_clk_ev = self.is_clocking_event(e);
                         sim_dbg_eprintln!(
@@ -83724,6 +83833,7 @@ impl Simulator {
                     if !to_kill.contains(&self.current_pid) {
                         for &pid in &to_kill {
                             self.killed_pids.insert(pid);
+                            self.vc_cancel_process(pid);
                             self.process_parents.remove(&pid);
                             self.process_contexts.remove(&pid);
                             // §9.6.2: purge the killed pid's future-time
@@ -83750,6 +83860,7 @@ impl Simulator {
                 if let Some(&pid) = self.disable_labels.get(&name.name) {
                     if pid != self.current_pid {
                         self.killed_pids.insert(pid);
+                        self.vc_cancel_process(pid);
                         self.process_parents.remove(&pid);
                         self.process_contexts.remove(&pid);
                         self.event_queue.remove_pid(pid);
@@ -83780,6 +83891,7 @@ impl Simulator {
                     if !to_kill.is_empty() {
                         for &pid in &to_kill {
                             self.killed_pids.insert(pid);
+                            self.vc_cancel_process(pid);
                             self.process_parents.remove(&pid);
                             self.process_contexts.remove(&pid);
                             // §9.6.2: purge the killed pid's future-time
@@ -83824,6 +83936,7 @@ impl Simulator {
                     // at dispatch, and purge every place the process can be
                     // parked so it never resumes and never satisfies a join.
                     self.killed_pids.insert(pid);
+                    self.vc_cancel_process(pid);
                     self.process_parents.remove(&pid);
                     self.process_contexts.remove(&pid);
                     // §9.6.2: incl. its future-time #delay (see above).
@@ -84287,7 +84400,11 @@ impl Simulator {
                     {
                         self.pending_nba_instance_triggers.push(key);
                     } else {
-                        self.pending_nba_triggers.push(name.name.clone());
+                        let key = target
+                            .as_ref()
+                            .and_then(|t| self.event_ref_key(t))
+                            .unwrap_or_else(|| name.name.clone());
+                        self.pending_nba_triggers.push(key);
                     }
                     return;
                 }
@@ -84316,6 +84433,12 @@ impl Simulator {
                     return;
                 }
                 // An event bound to a `ref` formal fires the CALLER's event.
+                // §15.5: the rewritten target retains an event-array select
+                // and its instance scope when the flattened name does not.
+                if let Some(key) = target.as_ref().and_then(|t| self.event_ref_key(t)) {
+                    self.fire_named_event(&key);
+                    return;
+                }
                 if !self.module.events.contains(name.name.as_str()) {
                     if let Some(k) = self.ref_bound_event_key(&name.name) {
                         self.fire_named_event(&k);
@@ -84412,50 +84535,162 @@ impl Simulator {
         cur.to_string()
     }
 
-    /// If `e` is a plain reference to an event variable (optionally with a
-    /// constant/variable element select: `ev`, `ev_arr[i]`), return its
-    /// storage key (`ev` / `ev_arr[3]`). Detection is by the declared-events
-    /// set, so ordinary signals never take this path.
-    fn event_ref_key(&mut self, e: &Expression) -> Option<String> {
-        // Trailing element select parses as Index (`ev_arr[1]` as a full
-        // expression); mid-path selects live on the Ident segment
-        // (`ev_arr[1].triggered`). Accept both shapes.
-        if let ExprKind::Index { expr, index } = &e.kind {
-            if let ExprKind::Ident(h) = &expr.kind {
-                if h.path.len() == 1 && h.path[0].selects.is_empty() {
-                    let base = h.path[0].name.name.as_str();
-                    if self.module.events.contains(base) {
-                        let base = base.to_string();
-                        let idx_expr = (**index).clone();
-                        let i = self.eval_expr(&idx_expr).to_i64().unwrap_or(0);
-                        return Some(format!("{}[{}]", base, i));
+    /// Evaluate a hierarchical expression or member chain into a dotted/indexed
+    /// signal name string (e.g. `u.ev`, `ua[0].ev`, `m.l.ev`, `vif.ev`).
+    fn hier_expr_to_string(&self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.path.is_empty() {
+                    return None;
+                }
+                let mut out = String::new();
+                let first = h.path[0].name.name.as_str();
+                let head = if let Some(bound) = self.iface_alias_for(first) {
+                    bound
+                } else if first == "this" {
+                    if let Some(Some(this_h)) = self.this_stack.last() {
+                        if h.path.len() >= 2 {
+                            let member = &h.path[1].name.name;
+                            if let Some((bound, _)) =
+                                self.virtual_iface_bindings.get(&(*this_h, member.clone()))
+                            {
+                                out.push_str(bound);
+                                for seg in &h.path[2..] {
+                                    out.push('.');
+                                    out.push_str(&seg.name.name);
+                                    for sel in &seg.selects {
+                                        let i = self.eval_scalar_self(sel)?;
+                                        use std::fmt::Write as _;
+                                        let _ = write!(out, "[{}]", i);
+                                    }
+                                }
+                                return Some(out);
+                            }
+                        }
+                    }
+                    first.to_string()
+                } else if let Some(Some(this_h)) = self.this_stack.last() {
+                    if let Some((bound, _)) = self
+                        .virtual_iface_bindings
+                        .get(&(*this_h, first.to_string()))
+                    {
+                        bound.clone()
+                    } else {
+                        first.to_string()
+                    }
+                } else {
+                    first.to_string()
+                };
+                out.push_str(&head);
+                for sel in &h.path[0].selects {
+                    let i = self.eval_scalar_self(sel)?;
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "[{}]", i);
+                }
+                for seg in &h.path[1..] {
+                    out.push('.');
+                    out.push_str(&seg.name.name);
+                    for sel in &seg.selects {
+                        let i = self.eval_scalar_self(sel)?;
+                        use std::fmt::Write as _;
+                        let _ = write!(out, "[{}]", i);
                     }
                 }
+                Some(out)
             }
-            return None;
+            ExprKind::MemberAccess { expr, member } => {
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 && h.path[0].name.name == "this" {
+                        if let Some(Some(this_h)) = self.this_stack.last() {
+                            if let Some((bound, _)) = self
+                                .virtual_iface_bindings
+                                .get(&(*this_h, member.name.clone()))
+                            {
+                                return Some(bound.clone());
+                            }
+                        }
+                    }
+                }
+                let mut base = self.hier_expr_to_string(expr)?;
+                base.push('.');
+                base.push_str(&member.name);
+                Some(base)
+            }
+            ExprKind::Index { expr, index } => {
+                let mut base = self.hier_expr_to_string(expr)?;
+                let i = self.eval_scalar_self(index)?;
+                use std::fmt::Write as _;
+                let _ = write!(base, "[{}]", i);
+                Some(base)
+            }
+            ExprKind::Paren(inner) => self.hier_expr_to_string(inner),
+            _ => None,
         }
-        let hier = match &e.kind {
-            ExprKind::Ident(h) => h,
-            _ => return None,
+    }
+
+    /// If `e` is a plain reference to an event variable (optionally with a
+    /// constant/variable element select: `ev`, `ev_arr[i]`, `u.ev`, `ua[0].ev`),
+    /// return its storage key (`ev` / `ev_arr[3]` / `u.ev`). Detection is by the
+    /// declared-events set, so ordinary signals never take this path.
+    fn event_ref_key(&mut self, e: &Expression) -> Option<String> {
+        // §15.5: a selected event is captured at arm time. Only evaluate
+        // runtime selectors after the base is known to be an event, so
+        // probing an ordinary expression cannot duplicate its side effects.
+        if let ExprKind::Index { expr, index } = &e.kind {
+            if let Some(base) = self.event_ref_key(expr) {
+                let index = self.eval_expr(index).to_i64()?;
+                return Some(format!("{base}[{index}]"));
+            }
+        }
+        if let ExprKind::Ident(h) = &e.kind {
+            if h.path.last().is_some_and(|p| !p.selects.is_empty()) {
+                let mut base = h.clone();
+                let selects = std::mem::take(&mut base.path.last_mut()?.selects);
+                let base_expr = Expression::new(ExprKind::Ident(base), e.span);
+                if let Some(mut key) = self.event_ref_key(&base_expr) {
+                    for select in selects {
+                        let index = self.eval_expr(&select).to_i64()?;
+                        use std::fmt::Write as _;
+                        let _ = write!(key, "[{index}]");
+                    }
+                    return Some(key);
+                }
+            }
+        }
+        self.event_ref_key_static(e)
+    }
+
+    /// Read-only classification for sensitivity construction. Runtime
+    /// selectors are evaluated only by the process arming the wait.
+    fn event_ref_key_static(&self, e: &Expression) -> Option<String> {
+        let name = self.hier_expr_to_string(e)?;
+        let declared = |key: &str| {
+            self.module.events.contains(key)
+                || (key.ends_with(']')
+                    && key
+                        .rfind('[')
+                        .is_some_and(|i| self.module.events.contains(&key[..i])))
         };
-        if hier.path.len() != 1 {
-            return None;
+        if declared(&name) {
+            return Some(name);
         }
-        let seg = &hier.path[0];
-        let base = seg.name.name.as_str();
-        if !self.module.events.contains(base) {
-            return None;
+        let top_prefix = format!("{}.", self.module.name);
+        if let Some(rest) = name.strip_prefix(&top_prefix) {
+            if declared(rest) {
+                return Some(rest.to_string());
+            }
         }
-        if seg.selects.is_empty() {
-            return Some(base.to_string());
+        if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
+            let scoped = format!("{}.{}", hint, name);
+            if declared(&scoped) {
+                return Some(scoped);
+            }
         }
-        let mut key = base.to_string();
-        let sels = seg.selects.clone();
-        for sel in &sels {
-            let i = self.eval_expr(sel).to_i64().unwrap_or(0);
-            key = format!("{}[{}]", key, i);
+        let canon = self.resolve_event_key(&name);
+        if declared(&canon) {
+            return Some(canon);
         }
-        Some(key)
+        None
     }
 
     /// §15.5.5 handle-assignment interception for `lhs = rhs` where `lhs`
@@ -84584,11 +84819,123 @@ impl Simulator {
     fn resolve_this_event_field(&self, name: &str) -> Option<(usize, String)> {
         let handle = self.this_stack.last().copied().flatten()?;
         let inst = self.heap.get(handle).and_then(|o| o.as_ref())?;
-        if inst.properties.contains_key(name) {
+        if inst.properties.contains_key(name) && self.class_prop_is_event(handle, name) {
             Some((handle, name.to_string()))
         } else {
             None
         }
+    }
+
+    /// Is `field` of the class object `handle` declared `event` (searching
+    /// the `extends` chain)? A property with no recorded type is assumed to
+    /// be an event, as the callers always have been. A plain variable
+    /// (`bit on;`) is NOT: `@on` on it is a value-change wait, never woken
+    /// by `->` (see `class_prop_value_change_cond`).
+    fn class_prop_is_event(&self, handle: usize, field: &str) -> bool {
+        let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) else {
+            return false;
+        };
+        let mut cur = Some(inst.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            if let Some(dt) = cd.property_types.get(field) {
+                return matches!(
+                    dt,
+                    DataType::Simple {
+                        kind: crate::ast::types::SimpleType::Event,
+                        ..
+                    }
+                );
+            }
+            cur = cd.extends.clone();
+        }
+        true
+    }
+
+    /// `@prop` / `@(h.prop)` on a NON-event class property (§9.4.2: any
+    /// change of the expression value triggers). Returns a condition that
+    /// becomes true when the property differs from its value right now, to
+    /// be parked as a `wait` — the same wake path `wait(prop)` uses, driven
+    /// by ordinary property writes. `None` when the control is anything
+    /// else (an event property, a signal, an edge-qualified term, ...).
+    fn class_prop_value_change_cond(&mut self, event: &EventControl) -> Option<Expression> {
+        let expr = Self::event_control_single_expr(event)?;
+        let on_class_prop = if let Some(fname) = self.event_control_field_name(event) {
+            self.this_stack
+                .last()
+                .copied()
+                .flatten()
+                .and_then(|h| self.heap.get(h).and_then(|o| o.as_ref()))
+                .is_some_and(|inst| inst.properties.contains_key(fname.as_str()))
+        } else {
+            false
+        } || self
+            .expr_handle_prop_any(&expr)
+            .is_some_and(|(h, f)| !self.class_prop_is_event(h, &f));
+        if !on_class_prop {
+            return None;
+        }
+        let val = self.eval_expr(&expr);
+        let idx = self.intra_saved_next;
+        self.intra_saved_next += 1;
+        self.vc_saved.insert(idx, (self.current_pid, val));
+        let span = expr.span;
+        Some(Expression::new(
+            ExprKind::SystemCall {
+                name: VC_CHANGED_MARKER.to_string(),
+                args: vec![
+                    Expression::new(
+                        ExprKind::Number(NumberLiteral::Integer {
+                            size: None,
+                            signed: false,
+                            base: NumberBase::Decimal,
+                            value: idx.to_string(),
+                            cached_val: Cell::new(None),
+                        }),
+                        span,
+                    ),
+                    expr,
+                ],
+            },
+            span,
+        ))
+    }
+
+    /// Drop the armed value of a resumed value-change wait.
+    fn vc_release(&mut self, cond: &Expression) {
+        if let ExprKind::SystemCall { name, args } = &cond.kind {
+            if name == VC_CHANGED_MARKER {
+                if let Some(ExprKind::Number(NumberLiteral::Integer { value, .. })) =
+                    args.first().map(|a| &a.kind)
+                {
+                    if let Ok(idx) = value.parse::<u64>() {
+                        self.vc_saved.remove(&idx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// §9.6.2/§9.7: canceled processes cannot resume their captured waits.
+    fn vc_cancel_process(&mut self, pid: usize) {
+        self.vc_saved.retain(|_, (owner, _)| *owner != pid);
+    }
+
+    /// The Wait statement a value-change waiter resumes into.
+    fn vc_wait_stmt(cond: Expression, body: &Statement, span: crate::ast::Span) -> Statement {
+        Statement::new(
+            StatementKind::Wait {
+                condition: cond,
+                stmt: Box::new(body.clone()),
+            },
+            span,
+        )
     }
 
     /// Extract the field name from an `@name` event control, whether it
@@ -84719,6 +85066,16 @@ impl Simulator {
     }
 
     fn resolve_handle_event_field(&mut self, dotted: &str) -> Option<(usize, String)> {
+        let (h, f) = self.resolve_handle_prop_any(dotted)?;
+        if self.class_prop_is_event(h, &f) {
+            Some((h, f))
+        } else {
+            None
+        }
+    }
+
+    /// `recv.field` -> `(handle, field)` for ANY property (event or not).
+    fn resolve_handle_prop_any(&mut self, dotted: &str) -> Option<(usize, String)> {
         let (recv, field) = dotted.rsplit_once('.')?;
         if recv.contains('.') {
             return None; // deeper chains are not modelled
@@ -84738,6 +85095,16 @@ impl Simulator {
 
     /// The same, from an EXPRESSION (`@(h.ce)`, `h.ce.triggered`).
     fn expr_handle_event_field(&mut self, e: &Expression) -> Option<(usize, String)> {
+        let (h, f) = self.expr_handle_prop_any(e)?;
+        if self.class_prop_is_event(h, &f) {
+            Some((h, f))
+        } else {
+            None
+        }
+    }
+
+    /// As `expr_handle_event_field`, for a property of any type.
+    fn expr_handle_prop_any(&mut self, e: &Expression) -> Option<(usize, String)> {
         let dotted = match &e.kind {
             ExprKind::MemberAccess { expr, member } => {
                 let recv = match &expr.kind {
@@ -84759,7 +85126,7 @@ impl Simulator {
             }
             _ => return None,
         };
-        self.resolve_handle_event_field(&dotted)
+        self.resolve_handle_prop_any(&dotted)
     }
 
     /// §15.5: an event CLASS PROPERTY reached through an ARBITRARY receiver
@@ -94954,7 +95321,7 @@ impl Simulator {
     /// Resolve a class name / typedef / specialization string to a class name.
     fn resolve_typeref_class_name_str(&self, s: &str) -> Option<String> {
         let tnname = crate::ast::types::TypeName {
-            scope: None,
+            scopes: Vec::new(),
             name: crate::ast::Identifier {
                 name: s.to_string(),
                 span: crate::ast::Span::dummy(),
@@ -96740,6 +97107,7 @@ impl Simulator {
         to_kill.extend(self.collect_fork_descendants(pid));
         for &p in &to_kill {
             self.killed_pids.insert(p);
+            self.vc_cancel_process(p);
             self.suspended_pids.remove(&p);
             self.suspended_proc_info.remove(&p);
             self.process_parents.remove(&p);
@@ -98472,7 +98840,12 @@ impl Simulator {
             Some(Some(c)) => c.as_str(),
             _ => "",
         };
-        let scope_key: &str = tref.scope.as_ref().map(|s| s.name.as_str()).unwrap_or("");
+        let scope_key_owned = if tref.scopes.is_empty() {
+            String::new()
+        } else {
+            tref.scope_prefix()
+        };
+        let scope_key: &str = &scope_key_owned;
         // A specialization's own class entry (`wrap_c<derived_c>`) is no
         // name any source can spell, so making one does not stale an entry.
         let ncls = self.module.classes.len() - self.spec_clone_origin.len();
@@ -98521,9 +98894,12 @@ impl Simulator {
         }
         // Find the typedef's target DataType.
         let mut target: Option<DataType> = None;
-        if let Some(scope) = &tref.scope {
-            if let Some(cls) = self.module.classes.get(&scope.name) {
+        for link in tref.scopes.iter().rev() {
+            if let Some(cls) = self.module.classes.get(&link.name.name) {
                 target = cls.typedef_targets.get(nm).cloned();
+                if target.is_some() {
+                    break;
+                }
             }
         }
         // A bare class-local typedef referenced inside a method (e.g.
@@ -98973,7 +99349,7 @@ impl Simulator {
                 // Resolve a type/class alias (e.g. `this_type`) to the
                 // concrete class name in the enclosing context.
                 let synth = crate::ast::types::TypeName {
-                    scope: None,
+                    scopes: Vec::new(),
                     name: crate::ast::Identifier {
                         name: nm.clone(),
                         span: crate::ast::Span::dummy(),
@@ -99121,7 +99497,7 @@ impl Simulator {
                 return None;
             }
             let synth = crate::ast::types::TypeName {
-                scope: None,
+                scopes: Vec::new(),
                 name: crate::ast::Identifier {
                     name: tn.name.name.clone(),
                     span: crate::ast::Span::dummy(),
@@ -99156,7 +99532,7 @@ impl Simulator {
                 return None;
             }
             let synth = crate::ast::types::TypeName {
-                scope: None,
+                scopes: Vec::new(),
                 name: crate::ast::Identifier {
                     name: tn.name.name.clone(),
                     span: crate::ast::Span::dummy(),
@@ -99213,7 +99589,7 @@ impl Simulator {
                 base
             } else {
                 let synth = crate::ast::types::TypeName {
-                    scope: None,
+                    scopes: Vec::new(),
                     name: crate::ast::Identifier {
                         name: base.clone(),
                         span: crate::ast::Span::dummy(),
@@ -115027,6 +115403,22 @@ impl Simulator {
     /// A type fragment naming a class (`derived_c`, `pbase#(8)`, or a typedef
     /// of either) as `(class, specialization args)`.
     #[inline(never)]
+    /// A type argument naming a typedef of a class specialization
+    /// (`my_s` for `typedef sbase #(my_cfg) my_s;`), spelled out as that
+    /// specialization (`sbase#(my_cfg)`); any other argument as written.
+    fn spell_typedef_spec(&self, arg: &str) -> String {
+        let a = arg.trim();
+        if a.contains('#') || self.module.classes.contains_key(a) {
+            return a.to_string();
+        }
+        match self.resolve_typedef_spec(a) {
+            Some((b, sig)) if !sig.trim().is_empty() && self.module.classes.contains_key(&b) => {
+                format!("{}#({})", b, sig)
+            }
+            _ => a.to_string(),
+        }
+    }
+
     fn type_base_frag_class(&self, frag: &str) -> Option<(String, Vec<String>)> {
         let frag = frag.trim();
         let (b, args) = Self::strip_class_specialization(frag);
@@ -115552,6 +115944,12 @@ impl Simulator {
             } else {
                 targs
             };
+            // §6.18: a typedef names the type it is declared as. The base
+            // entry reads its arguments back from the binding of the type
+            // parameter (`BASE#[i]`), which a bare typedef name does not
+            // spell — `wrap #(my_s)` with `typedef sbase #(my_cfg) my_s;`
+            // gave `sbase` its defaults — so spell the specialization out.
+            let args: Vec<String> = args.iter().map(|a| self.spell_typedef_spec(a)).collect();
             let args = if args.is_empty() {
                 args
             } else {
@@ -115562,7 +115960,7 @@ impl Simulator {
             };
             let key = self.ensure_spec_class(&b, &args);
             if let Some(cd) = self.module.classes.get_mut(c).map(std::sync::Arc::make_mut) {
-                if !direct && cd.extends_type_args.is_empty() {
+                if (!direct && cd.extends_type_args.is_empty()) || (direct && !args.is_empty()) {
                     cd.extends_type_args = args;
                 }
                 cd.extends = Some(key);
@@ -121500,6 +121898,17 @@ impl Simulator {
             .map(|h| h as usize)
     }
 
+    /// §13.3: selected object receivers must enter the suspend-aware task
+    /// path, not execute a blocking task through the synchronous fallback.
+    fn eval_live_object_receiver(&mut self, expr: &Expression) -> Option<usize> {
+        let handle = self.eval_expr(expr).to_u64()? as usize;
+        (handle != 0
+            && self.heap.get(handle).is_some_and(|o| o.is_some())
+            && !self.mailboxes.contains_key(&handle)
+            && !self.semaphores.contains_key(&handle))
+        .then_some(handle)
+    }
+
     /// Resolve a handle-valued expression (`h`, `arr[i]`) to its heap handle in
     /// a `&self` context, applying instance scoping for member-array bases.
     fn eval_handle_expr(&self, expr: &Expression) -> Option<usize> {
@@ -126132,31 +126541,71 @@ impl Simulator {
         Value::from_u64(f.round() as i64 as u64, width.max(1))
     }
 
-    /// The table key of a parser-lowered named cast's target (`T'(v)`,
-    /// `pkg::T'(v)`). A package-scoped name prefers its qualified `pkg::T`
-    /// registration, so a same-named module-local typedef cannot capture it.
-    fn named_cast_key(&self, e: &Expression) -> Option<String> {
-        match &e.kind {
-            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
-            ExprKind::MemberAccess { expr, member } => {
-                let ExprKind::Ident(h) = &expr.kind else {
-                    return None;
-                };
-                let key = format!("{}::{}", h.path.last()?.name.name, member.name);
-                let m = &self.module;
-                Some(
-                    if m.typedef_types.contains_key(&key)
-                        || m.typedefs.contains_key(&key)
-                        || m.parameters.contains_key(&key)
-                    {
-                        key
-                    } else {
-                        member.name.clone()
-                    },
-                )
+    /// The full `a::b::c` join of a pure `::`-chain expression (nested
+    /// member accesses rooted at a plain identifier), or `None` when the
+    /// expression is not a pure name chain. Unlike
+    /// [`Self::named_cast_key`] there is NO suffix fallback — used where a
+    /// partial match would capture a same-named local.
+    fn expr_scoped_chain_key(e: &Expression) -> Option<String> {
+        let mut links: Vec<String> = Vec::new();
+        let mut cur = e;
+        for _ in 0..16 {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    links.push(member.name.clone());
+                    cur = expr;
+                }
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                    links.push(h.path[0].name.name.clone());
+                    links.reverse();
+                    return Some(links.join("::"));
+                }
+                _ => return None,
             }
-            _ => None,
         }
+        None
+    }
+
+    /// The table key of a parser-lowered named cast's target (`T'(v)`,
+    /// `pkg::T'(v)`, `pkg::cls::T'(v)`). A scoped name prefers its
+    /// qualified registration (`pkg::T`, `pkg::cls::T`), so a same-named
+    /// module-local typedef cannot capture it; a `::`-chained scope
+    /// (§8.23) parses as nested member accesses and is joined the same
+    /// way, trying the longest chain first and falling back to shorter
+    /// suffixes then the bare leaf.
+    fn named_cast_key(&self, e: &Expression) -> Option<String> {
+        // Flatten the (possibly nested) member-access chain into
+        // [root, link..., leaf].
+        let mut links: Vec<String> = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, member } => {
+                    links.push(member.name.clone());
+                    cur = expr;
+                }
+                ExprKind::Ident(h) => {
+                    links.push(h.path.last()?.name.name.clone());
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        links.reverse();
+        let m = &self.module;
+        // Try the longest join first (`pkg::cls::T`), then shorter
+        // suffixes (`cls::T`), then the bare leaf — the old single-link
+        // behavior is the len==2 case.
+        for start in 0..links.len() {
+            let key = links[start..].join("::");
+            if m.typedef_types.contains_key(&key)
+                || m.typedefs.contains_key(&key)
+                || m.parameters.contains_key(&key)
+            {
+                return Some(key);
+            }
+        }
+        links.last().cloned()
     }
 
     /// The `1` that `++`/`--` add to or subtract from `v`, carrying `v`'s
@@ -126327,7 +126776,7 @@ impl Simulator {
         else {
             return None;
         };
-        if !dimensions.is_empty() || name.scope.is_some() {
+        if !dimensions.is_empty() || name.has_scope() {
             return None;
         }
         let mut cell = self.plain_class_types.borrow_mut();
@@ -129160,7 +129609,7 @@ impl Simulator {
                 },
             ) => {
                 n1.name.name == n2.name.name
-                    && n1.scope.as_ref().map(|s| &s.name) == n2.scope.as_ref().map(|s| &s.name)
+                    && n1.qualified() == n2.qualified()
                     && d1.is_empty()
                     && d2.is_empty()
                     && t1.is_empty()
@@ -138049,6 +138498,18 @@ impl Simulator {
         self.rand_tight_mode = false;
         // Per rand sub-object member: the items pushed into its solve.
         let mut pushdown: HashMap<String, Vec<ConstraintItem>> = HashMap::default();
+        // §18.5.14: a soft item that kept rewriting a value another item set
+        // back, in a trial that then failed, conflicts with a hard item; it is
+        // discarded for the remaining trials (keyed by the item's address).
+        let mut soft_dropped: HashSet<usize> = HashSet::default();
+        // The rand array / collection members whose element domain a `!=`
+        // re-pick must respect (see `rand_elem_ranges`).
+        let elem_range_props: Vec<String> = rand_arrays
+            .iter()
+            .map(|a| a.0.clone())
+            .chain(rand_nd_arrays.iter().map(|a| a.0.clone()))
+            .chain(rand_colls.iter().map(|c| c.prop.clone()))
+            .collect();
         for _trial in 0..trials {
             // Ctrl-C / SIGTERM: stop searching and let the run shut down.
             if interrupt_requested() {
@@ -138870,21 +139331,6 @@ impl Simulator {
                 .chain(rand_obj_props.iter().cloned())
                 .chain(unpacked_agg_props.iter().map(|(p, _)| p.clone()))
                 .collect();
-            // LRM §18.5.14: a `soft` constraint is overridden by any
-            // hard constraint on the same variable. Collect the set of
-            // variables targeted by HARD (non-soft) constraint items so
-            // soft items on those variables can be skipped during the
-            // fixpoint pass.
-            let mut hard_target_vars: HashSet<String> = HashSet::default();
-            for con in &constraints {
-                for item in &con.items {
-                    if !matches!(item, ConstraintItem::Soft(_)) {
-                        if let Some(v) = Self::constraint_item_target(item) {
-                            hard_target_vars.insert(v);
-                        }
-                    }
-                }
-            }
             // LRM §18.5.14.2/§18.5.14.3: soft constraints have a PRIORITY
             // order, and a higher-priority soft constraint DISCARDS a
             // conflicting lower-priority one instead of failing the solve.
@@ -138902,7 +139348,9 @@ impl Simulator {
             let mut soft_rank: HashMap<String, (usize, usize, usize)> = HashMap::default();
             for (bi, con) in constraints.iter().enumerate() {
                 for (ii, item) in con.items.iter().enumerate() {
-                    if !matches!(item, ConstraintItem::Soft(_)) {
+                    if !matches!(item, ConstraintItem::Soft(_))
+                        || soft_dropped.contains(&(item as *const ConstraintItem as usize))
+                    {
                         continue;
                     }
                     let v = match Self::constraint_item_target(item) {
@@ -138923,18 +139371,24 @@ impl Simulator {
                     }
                 }
             }
+            // Passes in which each soft item changed a value, per repair loop.
+            let mut soft_fights: HashMap<usize, u32> = HashMap::default();
             for _pass in 0..16 {
+                self.refresh_elem_ranges(&elem_range_props, &constraints);
                 let mut changed = false;
                 for (bi, con) in constraints.iter().enumerate() {
                     for (ii, item) in con.items.iter().enumerate() {
-                        // Skip a soft constraint whose target variable is
-                        // pinned by a hard constraint (the hard one wins),
-                        // or that lost the soft-priority contest above.
+                        let key = item as *const ConstraintItem as usize;
+                        let is_soft = Self::soft_only(item);
+                        if is_soft && soft_dropped.contains(&key) {
+                            continue;
+                        }
+                        // Skip a soft constraint that lost the soft-priority
+                        // contest above. One that conflicts with a hard item
+                        // is found by the repair itself and discarded
+                        // (`soft_dropped`); a compatible one must hold.
                         if let ConstraintItem::Soft(_) = item {
                             if let Some(v) = Self::constraint_item_target(item) {
-                                if hard_target_vars.contains(&v) {
-                                    continue;
-                                }
                                 if soft_winner
                                     .get(&v)
                                     .is_some_and(|&(wb, wi)| wb != bi || wi != ii)
@@ -138945,6 +139399,9 @@ impl Simulator {
                         }
                         if self.solve_forced(handle, item, &rand_set) {
                             changed = true;
+                            if is_soft {
+                                *soft_fights.entry(key).or_default() += 1;
+                            }
                         }
                     }
                 }
@@ -139141,7 +139598,9 @@ impl Simulator {
                         _ => false,
                     }
                 }
+                let mut fights: HashMap<usize, u32> = HashMap::default();
                 for _pass in 0..4 {
+                    self.refresh_elem_ranges(&elem_range_props, &constraints);
                     let mut changed = false;
                     for item in constraints
                         .iter()
@@ -139149,13 +139608,25 @@ impl Simulator {
                         .chain(inline.iter())
                         .filter(|it| !matches!(it, ConstraintItem::Soft(_)) || has_foreach(it))
                     {
+                        let key = item as *const ConstraintItem as usize;
+                        let is_soft = Self::soft_only(item);
+                        if is_soft && soft_dropped.contains(&key) {
+                            continue;
+                        }
                         if self.solve_forced(handle, item, &rand_set) {
                             changed = true;
+                            if is_soft {
+                                *fights.entry(key).or_default() += 1;
+                            }
                         }
                     }
                     if !changed {
                         break;
                     }
+                }
+                for (k, n) in fights {
+                    let e = soft_fights.entry(k).or_default();
+                    *e = (*e).max(n);
                 }
             }
             let mut pinned_elems: HashSet<String> = HashSet::default();
@@ -139258,6 +139729,19 @@ impl Simulator {
                 self.rand_items_accept(handle, &constraints, &rand_colls, &mut fe_failed);
             if fe_failed {
                 fixed_fe_fail_streak += 1;
+            }
+            // A soft item that changed a value in two passes of one repair
+            // loop was undone in between: it fights a hard item (§18.5.14).
+            // Discard it and retry even an accepted trial, so a lower-priority
+            // soft item on the same variable gets its turn.
+            let fought: Vec<usize> = soft_fights
+                .iter()
+                .filter(|&(k, &n)| n >= 2 && !soft_dropped.contains(k))
+                .map(|(&k, _)| k)
+                .collect();
+            if !fought.is_empty() {
+                soft_dropped.extend(fought);
+                all_ok = false;
             }
 
             // §18.4 concurrent solve: a `rand` object handle's OWN constraints
@@ -139456,8 +139940,12 @@ impl Simulator {
         rand_colls: &[RandColl],
         fe_failed: &mut bool,
     ) -> bool {
+        // §18.5.14: a soft item (or a foreach / block of them) is a
+        // preference, never a reason to reject a trial.
+        if Self::soft_only(item) {
+            return true;
+        }
         match item {
-            ConstraintItem::Soft(_) => return true,
             ConstraintItem::Block(items) => {
                 return items
                     .iter()
@@ -140005,7 +140493,7 @@ impl Simulator {
         else {
             return None;
         };
-        if !dimensions.is_empty() || !type_args.is_empty() || name.scope.is_some() {
+        if !dimensions.is_empty() || !type_args.is_empty() || name.has_scope() {
             return None;
         }
         let tn = name.name.name.as_str();
@@ -140206,7 +140694,7 @@ impl Simulator {
             else {
                 break;
             };
-            if !dimensions.is_empty() || !type_args.is_empty() || name.scope.is_some() {
+            if !dimensions.is_empty() || !type_args.is_empty() || name.has_scope() {
                 break;
             }
             let tn = name.name.name.as_str();
@@ -141592,6 +142080,31 @@ impl Simulator {
                             .unwrap_or(8)
                             .max(1);
                         let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        // §18.5.12: re-pick inside the element's hard domain,
+                        // or the `inside` item and this one undo each other.
+                        let prop = key
+                            .split_once('#')
+                            .map_or(key.as_str(), |(_, b)| b)
+                            .split('[')
+                            .next()
+                            .unwrap_or("");
+                        let domain = self.rand_elem_ranges.get(prop).cloned().unwrap_or_default();
+                        if !domain.is_empty() {
+                            for _try in 0..32 {
+                                let (lo, hi) = domain[self.cur_rng().gen_range(0..domain.len())];
+                                let v = if hi > lo {
+                                    self.cur_rng().gen_range(lo..=hi)
+                                } else {
+                                    lo
+                                };
+                                let cand = (v as u64) & mask;
+                                if cand != avoid & mask {
+                                    self.write_coll_elem(&key, Value::from_u64(cand, w));
+                                    return true;
+                                }
+                            }
+                            continue;
+                        }
                         for _try in 0..32 {
                             let cand = self.cur_rng().r#gen::<u64>() & mask;
                             if cand != avoid {
@@ -141792,6 +142305,13 @@ impl Simulator {
                 item: body,
                 ..
             } => {
+                // `foreach (arr[i]) soft …`: the caller already decided this
+                // soft item applies (`soft_dropped`, §18.5.14), so repair its
+                // body like a hard one.
+                let body = match body.as_ref() {
+                    ConstraintItem::Soft(inner) => inner,
+                    _ => body,
+                };
                 // Resolve the array's bare property name (`arr[i]` → "arr").
                 let arr_name = match &array.kind {
                     ExprKind::Index { expr: b, .. } => {
@@ -142228,9 +142748,20 @@ impl Simulator {
                             use rand::Rng;
                             let b = self.eval_expr(bound_side).to_i64().unwrap_or(0);
                             let cur_i = cur.and_then(|v| v.to_i64()).unwrap_or(0);
-                            // Unsigned element domain [0, 2^w - 1].
-                            let (mut lo, mut hi) =
-                                (0i64, if w >= 63 { i64::MAX } else { (1i64 << w) - 1 });
+                            // The element type's domain (§6.11): [0, 2^w - 1],
+                            // or [-2^(w-1), 2^(w-1) - 1] for a signed element —
+                            // an unsigned one rejected every negative value
+                            // (`q[i] >= -1` re-picked a legal -1 to >= 0).
+                            let signed = self.class_prop_signed_of(handle, arr_name);
+                            let (mut lo, mut hi) = if signed {
+                                if w >= 64 {
+                                    (i64::MIN, i64::MAX)
+                                } else {
+                                    (-(1i64 << (w - 1)), (1i64 << (w - 1)) - 1)
+                                }
+                            } else {
+                                (0i64, if w >= 63 { i64::MAX } else { (1i64 << w) - 1 })
+                            };
                             match eff {
                                 BinaryOp::Lt => hi = hi.min(b.saturating_sub(1)),
                                 BinaryOp::Leq => hi = hi.min(b),
@@ -142285,7 +142816,9 @@ impl Simulator {
                             if p == cur_i {
                                 return false;
                             }
-                            write_elem(self, Value::from_u64(p as u64, w));
+                            let mut v = Value::from_u64(p as u64, w);
+                            v.is_signed = signed;
+                            write_elem(self, v);
                             true
                         }
                         _ => false,
@@ -142577,6 +143110,126 @@ impl Simulator {
     /// whether a `soft` constraint is overridden by a hard
     /// constraint on the same variable. Returns None for
     /// multi-variable / structural items.
+    /// Rebuild `rand_elem_ranges` for `props` against the current values.
+    fn refresh_elem_ranges(&mut self, props: &[String], constraints: &[ClassConstraint]) {
+        self.rand_elem_ranges.clear();
+        for p in props {
+            let mut out = Vec::new();
+            for con in constraints {
+                for it in &con.items {
+                    self.collect_elem_domain(it, p, &mut out);
+                }
+            }
+            if !out.is_empty() {
+                self.rand_elem_ranges.insert(p.clone(), out);
+            }
+        }
+    }
+
+    /// The hard `inside` ranges `item` puts on the elements of `prop`
+    /// (`prop[i] inside {…}`, under a `foreach` over it, a block, or the
+    /// branch of a conditional that holds now). Soft items set no domain.
+    fn collect_elem_domain(
+        &mut self,
+        item: &ConstraintItem,
+        prop: &str,
+        out: &mut Vec<(i128, i128)>,
+    ) {
+        let on_elem = |e: &Expression| {
+            matches!(&e.kind, ExprKind::Index { expr: b, .. }
+                if matches!(&b.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1 && h.path[0].name.name == prop))
+        };
+        let mut ranges = |me: &mut Self, rs: &[ConstraintRange]| {
+            for r in rs {
+                let (lo, hi) = match r {
+                    ConstraintRange::Value(e) => (e, e),
+                    ConstraintRange::Range { lo, hi } => (lo, hi),
+                };
+                let to_i = |v: Value| {
+                    if v.is_signed {
+                        v.to_i64().map(i128::from)
+                    } else {
+                        v.to_u64().map(i128::from)
+                    }
+                };
+                if let (Some(l), Some(h)) = (to_i(me.eval_expr(lo)), to_i(me.eval_expr(hi))) {
+                    out.push((l.min(h), l.max(h)));
+                }
+            }
+        };
+        match item {
+            ConstraintItem::Expr(e) => {
+                if let ExprKind::Inside {
+                    expr: inner,
+                    ranges: rs,
+                } = &e.kind
+                    && on_elem(inner)
+                {
+                    let cr: Vec<ConstraintRange> = rs
+                        .iter()
+                        .map(|r| match &r.kind {
+                            ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                lo: (**lo).clone(),
+                                hi: (**hi).clone(),
+                            },
+                            _ => ConstraintRange::Value(r.clone()),
+                        })
+                        .collect();
+                    ranges(self, &cr);
+                }
+            }
+            ConstraintItem::Inside {
+                expr,
+                range,
+                is_dist,
+                ..
+            } if !*is_dist && on_elem(expr) => ranges(self, range),
+            ConstraintItem::Block(items) => {
+                for i in items {
+                    self.collect_elem_domain(i, prop, out);
+                }
+            }
+            ConstraintItem::Foreach {
+                array, item: body, ..
+            } if Self::foreach_base_name(array).as_deref() == Some(prop) => {
+                self.collect_elem_domain(body, prop, out);
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                if self.eval_expr(condition).is_true() {
+                    self.collect_elem_domain(then_item, prop, out);
+                } else if let Some(e) = else_item {
+                    self.collect_elem_domain(e, prop, out);
+                }
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } if self.eval_expr(condition).is_true() => {
+                self.collect_elem_domain(constraint, prop, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// A constraint item made only of soft constraints: `soft …`, or a
+    /// `foreach` / block whose every item is one (`foreach (q[i]) soft q[i]
+    /// == -1;`).
+    fn soft_only(item: &ConstraintItem) -> bool {
+        match item {
+            ConstraintItem::Soft(_) => true,
+            ConstraintItem::Foreach { item, .. } => Self::soft_only(item),
+            ConstraintItem::Block(items) => !items.is_empty() && items.iter().all(Self::soft_only),
+            _ => false,
+        }
+    }
+
     fn constraint_item_target(item: &ConstraintItem) -> Option<String> {
         fn ident_of(e: &Expression) -> Option<String> {
             match &e.kind {
@@ -147932,7 +148585,7 @@ impl Simulator {
                         // matched none of the cases above, returned None, and
                         // `new()` fell through to a wrong/empty construction.
                         let tn = crate::ast::types::TypeName {
-                            scope: None,
+                            scopes: Vec::new(),
                             name: crate::ast::Identifier {
                                 name: t.clone(),
                                 span: crate::ast::Span::dummy(),
@@ -152804,6 +153457,30 @@ fn vm_range_select(v: &Value, left: usize, right: usize) -> Option<(u64, u64, u3
 #[cfg(test)]
 mod vm_fastpath_tests {
     use super::*;
+
+    /// §9.6.2: terminating a parked process releases its captured value.
+    #[test]
+    fn canceled_property_waits_release_values() {
+        let sim = crate::simulate(
+            r#"
+class watch_cell; bit flag; endclass
+module top;
+  watch_cell watched = new();
+  initial begin
+    repeat (16) begin
+      fork begin @(watched.flag); $fatal(1, "unexpected wake"); end join_none
+      #1;
+      disable fork;
+    end
+    $finish;
+  end
+endmodule
+"#,
+            100,
+        )
+        .expect("simulate");
+        assert!(sim.vc_saved.is_empty(), "canceled value captures remain");
+    }
 
     /// Every 4-state pattern of `width` bits, as (val_bits, xz_bits).
     fn patterns(width: u32) -> Vec<(u64, u64)> {
