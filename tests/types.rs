@@ -293,6 +293,8 @@ mod vcd_param_as_wire;
 mod wide_arithmetic_past_128_bits;
 #[path = "types/wide_enum_values.rs"]
 mod wide_enum_values;
+#[path = "types/wide_reductions.rs"]
+mod wide_reductions;
 #[path = "types/wide_signed_arith_and_power.rs"]
 mod wide_signed_arith_and_power;
 #[path = "types/width_context_discipline.rs"]
