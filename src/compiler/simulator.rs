@@ -117499,8 +117499,84 @@ impl Simulator {
         self.is_interface_instance(&path).then_some(path)
     }
 
+    /// Does a `a[i].b.c` receiver chain (MemberAccess/Index/Ident) select
+    /// through an index anywhere?
+    fn member_chain_has_index(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Index { .. } => true,
+            ExprKind::Ident(h) => h.path.iter().any(|s| !s.selects.is_empty()),
+            ExprKind::MemberAccess { expr, .. } => Self::member_chain_has_index(expr),
+            _ => false,
+        }
+    }
+
+    /// The `module.functions`/`module.tasks` key a dotted subroutine path
+    /// names: the path itself (rooted at the top), else the path under the
+    /// executing scope or one of its ancestors (§23.8 upward resolution).
+    fn scoped_subroutine_key(&self, path: &str) -> Option<String> {
+        let explicit_root = path.starts_with("$root.");
+        let path = path.strip_prefix("$root.").unwrap_or(path);
+        let known =
+            |k: &str| self.module.functions.contains_key(k) || self.module.tasks.contains_key(k);
+        if known(path) {
+            return Some(path.to_string());
+        }
+        if let Some(rest) = path
+            .strip_prefix(self.module.name.as_str())
+            .and_then(|r| r.strip_prefix('.'))
+            .filter(|r| known(r))
+            // A same-named local/object receiver shadows the implicit top
+            // name, even when null. Only explicit $root bypasses that binding.
+            .filter(|_| {
+                explicit_root
+                    || (self.dyn_name_lookup(&self.module.name).is_none()
+                        && self.eval_ident_handle(&self.module.name).is_none())
+            })
+        {
+            return Some(rest.to_string());
+        }
+        // Only a path that ends some subroutine key can resolve below.
+        if !self.class_member_names().subroutine_suffixes.contains(path) {
+            return None;
+        }
+        let hint = self.name_resolve_hint.borrow().clone();
+        let mut scope = hint.as_deref()?;
+        loop {
+            let cand = format!("{}.{}", scope, path);
+            if known(&cand) {
+                return Some(cand);
+            }
+            scope = scope.rsplit_once('.')?.0;
+        }
+    }
+
+    /// Run the instance subroutine registered as `full` (a function's value,
+    /// or 0 after a task) with its instance as the resolution scope.
+    fn call_scoped_subroutine(&mut self, full: &str, args: &[Expression]) -> Value {
+        let scope = full.rsplit_once('.').map(|(s, _)| s.to_string());
+        let saved = self.name_resolve_hint.borrow().clone();
+        *self.name_resolve_hint.borrow_mut() = scope.clone();
+        // §20.3: `$time`/`%m` inside the body belong to the defining instance.
+        let saved_ts = self.timescale_scope_override.take();
+        self.timescale_scope_override = scope;
+        let r = if let Some(fd) = self.fn_decl_rc(full) {
+            self.exec_function_call(&fd, args)
+        } else if let Some(td) = self.task_decl_rc(full) {
+            self.task_clears_this = true;
+            self.exec_task_call(&td, args);
+            Value::zero(32)
+        } else {
+            Value::zero(32)
+        };
+        self.timescale_scope_override = saved_ts;
+        *self.name_resolve_hint.borrow_mut() = saved;
+        r
+    }
+
     /// The segments of a hierarchical reference with every select evaluated
     /// (`g[1].a.d` -> `["g[1]", "a", "d"]`); `None` for any other shape.
+    /// Selector probing is read-only: `eval_scalar_self` rejects calls and
+    /// increments so a class receiver fallback performs their effects once.
     fn hier_segments(&self, e: &Expression) -> Option<Vec<String>> {
         fn segs_of(sim: &Simulator, e: &Expression, out: &mut Vec<String>) -> Option<()> {
             match &e.kind {
@@ -118542,14 +118618,12 @@ impl Simulator {
         if let Some(rebased) = self.vif_rebase_expr(func) {
             return self.resolve_hier_task_target(&rebased);
         }
+        // The path itself, else under the executing scope and upward (§23.8).
         let in_tasks = |full: String| -> Option<String> {
             if self.module.tasks.contains_key(&full) {
                 Some(full)
             } else {
-                self.name_resolve_hint
-                    .borrow()
-                    .as_ref()
-                    .map(|hint| format!("{}.{}", hint, full))
+                self.scoped_subroutine_key(&full)
                     .filter(|p| self.module.tasks.contains_key(p))
             }
         };
@@ -122300,6 +122374,30 @@ impl Simulator {
                 return self.eval_call_inner(&f, args);
             }
         }
+        // §23.6/§27.6: a subroutine of an instance inside a generate scope or
+        // an instance array — `g_rank[1].g_dev[0].u.get()`, `g[1].u.report()`
+        // — is registered under its evaluated path. Such a callee parses as
+        // one Ident with selects, which the receiver arms below took for an
+        // object handle: a function call read 0 and a task call was dropped.
+        let selected_path_callee = match &func.kind {
+            ExprKind::Ident(hier) => (hier.path.len() >= 2
+                && hier.path.iter().any(|s| !s.selects.is_empty()))
+            .then(|| hier.path.last().unwrap().name.name.as_str()),
+            ExprKind::MemberAccess { expr: recv, member } => {
+                Self::member_chain_has_index(recv).then_some(member.name.as_str())
+            }
+            _ => None,
+        };
+        if let Some(m) = selected_path_callee {
+            if self.class_member_names().subroutine_suffixes.contains(m) {
+                if let Some(full) = self
+                    .hier_segments(func)
+                    .and_then(|segs| self.scoped_subroutine_key(&segs.join(".")))
+                {
+                    return self.call_scoped_subroutine(&full, args);
+                }
+            }
+        }
         // A subroutine declared in a named generate-for scope is addressed as
         // `block[index].task(...)`. Elaboration stores each iteration under
         // that exact hierarchical key.
@@ -125155,22 +125253,9 @@ impl Simulator {
                 // `m.l.deep`. When the bare dotted name is not itself a known
                 // subroutine, retry with the caller's resolve-hint scope
                 // prepended so the enclosing instance is honored.
-                let full = if self.module.functions.contains_key(&full)
-                    || self.module.tasks.contains_key(&full)
-                {
-                    full
-                } else if let Some(h) = self.name_resolve_hint.borrow().clone() {
-                    let prefixed = format!("{}.{}", h, full);
-                    if self.module.functions.contains_key(&prefixed)
-                        || self.module.tasks.contains_key(&prefixed)
-                    {
-                        prefixed
-                    } else {
-                        full
-                    }
-                } else {
-                    full
-                };
+                // §23.8: and from there upward through each enclosing scope
+                // (`sib.report()` in a child names its parent's sibling).
+                let full = self.scoped_subroutine_key(&full).unwrap_or(full);
                 let scope = full.rsplit_once('.').map(|(s, _)| s.to_string());
                 // Refcounted declaration (see `fn_decl_rc`): this arm cloned the
                 // whole FunctionDeclaration AST on every scoped call.

@@ -59,6 +59,8 @@ mod genblk_dotted_ref_nettype_none;
 mod generate_label_hier_roots;
 #[path = "hierarchy/generate_scope_names.rs"]
 mod generate_scope_names;
+#[path = "hierarchy/generate_scope_subroutine_calls.rs"]
+mod generate_scope_subroutine_calls;
 #[path = "hierarchy/generic_interface_ports.rs"]
 mod generic_interface_ports;
 #[path = "hierarchy/ifu_ibuf_32_instances_c910.rs"]
