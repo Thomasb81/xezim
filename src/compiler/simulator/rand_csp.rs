@@ -2116,6 +2116,116 @@ impl Simulator {
         }
     }
 
+    /// `(a >> k) REL c` -> `a inside [lo:hi]`, for a constant shift amount and
+    /// a constant right-hand side. Returns None when the shape does not apply,
+    /// leaving the caller's normal affine path untouched.
+    ///
+    /// Restricted to UNSIGNED `a` and the logical `>>`. For a signed value
+    /// `>>` still zero-fills (only `>>>` sign-fills), so the
+    /// `a >> k == floor(a / 2**k)` identity this relies on does not hold once
+    /// `a` can be negative.
+    #[allow(clippy::too_many_arguments)]
+    fn csp_shr_rel(
+        &mut self,
+        csp: &mut Csp,
+        whole: &Expression,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+        env: &Env,
+        neg: bool,
+    ) -> Option<Node> {
+        // Shift on one side, constant on the other; flip the relation when the
+        // shift is on the right so `c REL (a >> k)` reads the same way.
+        let (shift, other, op) = match &Self::unparen(left).kind {
+            ExprKind::Binary {
+                op: BinaryOp::ShiftRight,
+                ..
+            } => (left, right, op),
+            _ => match &Self::unparen(right).kind {
+                ExprKind::Binary {
+                    op: BinaryOp::ShiftRight,
+                    ..
+                } => (
+                    right,
+                    left,
+                    match op {
+                        BinaryOp::Lt => BinaryOp::Gt,
+                        BinaryOp::Leq => BinaryOp::Geq,
+                        BinaryOp::Gt => BinaryOp::Lt,
+                        BinaryOp::Geq => BinaryOp::Leq,
+                        o => o,
+                    },
+                ),
+                _ => return None,
+            },
+        };
+        let ExprKind::Binary {
+            left: base,
+            right: amt,
+            ..
+        } = &Self::unparen(shift).kind
+        else {
+            return None;
+        };
+        if !self.csp_free(csp, amt, env) || !self.csp_free(csp, other, env) {
+            return None;
+        }
+        let k = self.csp_const(amt, env)?.to_u64()?;
+        let c = i128::from(self.csp_const(other, env)?.to_i64()?);
+        if k >= 64 || c < 0 {
+            return None;
+        }
+        let a = self.csp_ae(csp, base, env)?;
+        let (w, sg) = Self::csp_ws(&a);
+        if sg || w == 0 || w > 64 {
+            return None;
+        }
+        let m: i128 = 1i128 << k;
+        let (_, amax) = ws_range(w, false);
+        // Each relation as one inclusive interval on `a`, before clamping.
+        let (mut lo, mut hi) = match op {
+            BinaryOp::Eq | BinaryOp::CaseEq | BinaryOp::Neq | BinaryOp::CaseNeq => {
+                (c * m, c * m + m - 1)
+            }
+            BinaryOp::Lt => (0, c * m - 1),
+            BinaryOp::Leq => (0, c * m + m - 1),
+            BinaryOp::Gt => (c * m + m, amax),
+            BinaryOp::Geq => (c * m, amax),
+            _ => return None,
+        };
+        lo = lo.max(0);
+        hi = hi.min(amax);
+        // `!=` is the complement of the `==` interval, which Node::In's own
+        // `neg` expresses; fold it together with the caller's negation.
+        let inv = matches!(
+            op,
+            BinaryOp::Neq | BinaryOp::CaseNeq
+        ) != neg;
+        let mut fits = Vec::new();
+        let lin = Self::csp_lin(&a, w, false, &mut fits)?;
+        fits.push(Fit {
+            lin: lin.clone(),
+            lo: 0,
+            hi: amax,
+        });
+        let set: Dom = if lo > hi { Vec::new() } else { vec![(lo, hi)] };
+        let mut deps: Vec<usize> = lin.t.iter().map(|t| t.0).collect();
+        for f in &fits {
+            deps.extend(f.lin.t.iter().map(|t| t.0));
+        }
+        deps.sort_unstable();
+        deps.dedup();
+        let src = self.csp_src(csp, SrcItem::Expr(whole.clone()), env, deps);
+        Some(Node::In {
+            lin,
+            set,
+            neg: inv,
+            fits,
+            src,
+        })
+    }
+
     /// `left op right` (§11.6.1: both sides extended to the context width
     /// and signedness).
     #[allow(clippy::too_many_arguments)]
@@ -2132,6 +2242,16 @@ impl Simulator {
         let fallback = |me: &mut Self, csp: &mut Csp| {
             me.csp_eval_node(csp, SrcItem::Expr(whole.clone()), env, neg)
         };
+        // `(a >> k) REL c` with a constant k and an unsigned `a` is a RANGE on
+        // `a`: the shift is floor division by 2**k, so each relation maps onto
+        // one interval. Without this the relation is not affine, csp_ae fails
+        // and the whole constraint drops to the trial loop — where
+        // `(x >> 8) == 0` on a 32-bit rand has probability 2**-24 and
+        // randomize() reports failure (issue #229) even though `x < 256`,
+        // its exact equivalent, solves instantly.
+        if let Some(n) = self.csp_shr_rel(csp, whole, op, left, right, env, neg) {
+            return Some(n);
+        }
         let (Some(a), Some(b)) = (self.csp_ae(csp, left, env), self.csp_ae(csp, right, env)) else {
             return fallback(self, csp);
         };
@@ -2619,6 +2739,28 @@ impl Simulator {
                 op: UnaryOp::Minus,
                 operand,
             } => return Some(Ae::Neg(Box::new(self.csp_ae(csp, operand, env)?))),
+            // `a << k` with a constant k is exactly `a * 2**k` (§11.4.10);
+            // `<<` and `<<<` agree on a left shift. The solver already models
+            // Mul, so this reuses its width/truncation handling rather than
+            // dropping the whole relation to the trial loop.
+            ExprKind::Binary {
+                op: BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft,
+                left,
+                right,
+            } if self.csp_free(csp, right, env) => {
+                if let Some(k) = self
+                    .csp_const(right, env)
+                    .and_then(|v| v.to_u64())
+                    .filter(|k| *k < 63)
+                {
+                    if let Some(a) = self.csp_ae(csp, left, env) {
+                        let (w, sg) = Self::csp_ws(&a);
+                        let mut m = Value::from_u64(1u64 << k, w.max(1));
+                        m.is_signed = sg;
+                        return Some(Ae::Mul(Box::new(a), Box::new(Ae::Const(m))));
+                    }
+                }
+            }
             ExprKind::Binary {
                 op: op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul),
                 left,

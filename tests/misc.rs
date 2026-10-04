@@ -475,3 +475,5 @@ mod virtual_array_names;
 mod while_continue_final_iter;
 #[path = "misc/zero_width_select_unselected_generate.rs"]
 mod zero_width_select_unselected_generate;
+#[path = "misc/uninstantiated_module_params.rs"]
+mod uninstantiated_module_params;
