@@ -73090,7 +73090,10 @@ impl Simulator {
                         .unwrap_or(false)
                 {
                     let mname = hier.path.last().unwrap().name.name.clone();
-                    if matches!(mname.as_str(), "num" | "first" | "last" | "next" | "prev") {
+                    if matches!(
+                        mname.as_str(),
+                        "num" | "first" | "last" | "next" | "prev" | "name"
+                    ) {
                         let head = hier_prefix(hier);
                         if head
                             .path
@@ -73103,11 +73106,36 @@ impl Simulator {
                                 .type_name_of_var(&bare)
                                 .map(|tn| self.module.enum_members.contains_key(&tn))
                                 .unwrap_or(false)
-                                || self.module.enum_members.contains_key(&bare);
+                                || self.module.enum_members.contains_key(&bare)
+                                // A PROCEDURAL local's enum typedef is only in
+                                // the typedef overlay/global —
+                                // `type_name_of_var` reads var_class_types and
+                                // the signal tables, none of which know it. So
+                                // `e_t l; l.name` fell through to a
+                                // hierarchical read (""), while the same
+                                // declaration at module scope worked. Frame
+                                // overlay first, as `local_class_type_of`
+                                // orders it; this is the map
+                                // `enum_typed_receiver` already keys on.
+                                || self
+                                    .local_typedef_type_of(&bare)
+                                    .or_else(|| self.var_typedef_types.get(&bare).cloned())
+                                    .is_some_and(|tn| {
+                                        self.module.enum_members.contains_key(&tn)
+                                    });
                             if is_enum_var {
                                 if let Some(v) = self.eval_builtin_method(&bare, &mname, &[]) {
                                     return v;
                                 }
+                                // `name` has no `BuiltinM` arm: §6.19.5.7's
+                                // enum-method evaluator lives on the CALL
+                                // path, which already decomposes this exact
+                                // multi-segment Ident. A parenless method is
+                                // the zero-argument call §13.5.5 says it is,
+                                // so dispatch it as one rather than reading
+                                // the name as hierarchical storage — that read
+                                // returned "" for `.name` at every scope.
+                                return self.eval_call_inner(expr, &[]);
                             }
                         }
                     }
@@ -76035,8 +76063,33 @@ impl Simulator {
                     Value::zero(32)
                 }
             }
-            ExprKind::MemberAccess { expr, member } => {
-                self.eval_expr_member_access(expr, member, ctx_width)
+            ExprKind::MemberAccess { expr: recv, member } => {
+                // §13.5.5: inside a function/task/class-method/final body a
+                // parenless zero-argument method parses as MemberAccess
+                // (module/initial/always scope yields a flat hierarchical
+                // Ident, handled in the Ident arm above). `eval_expr_member_access`
+                // has no enum-method arm, so these fell through to the
+                // object-property tail and read 0 — `last` never matched, and
+                // a `while` loop exiting on `e == e.last` never terminated.
+                // Dispatch it as the zero-argument call §13.5.5 says it is.
+                if matches!(
+                    member.name.as_str(),
+                    "num" | "first" | "last" | "next" | "prev" | "name"
+                ) {
+                    if let Some(bare) = Self::plain_ident_name(recv) {
+                        let is_enum = self
+                            .local_typedef_type_of(&bare)
+                            .or_else(|| self.var_typedef_types.get(&bare).cloned())
+                            .is_some_and(|tn| self.module.enum_members.contains_key(&tn))
+                            || self
+                                .type_name_of_var(&bare)
+                                .is_some_and(|tn| self.module.enum_members.contains_key(&tn));
+                        if is_enum {
+                            return self.eval_call_inner(expr, &[]);
+                        }
+                    }
+                }
+                self.eval_expr_member_access(recv, member, ctx_width)
             }
             ExprKind::Call { func, args } => self.eval_call(func, args),
             ExprKind::Dollar => {

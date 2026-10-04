@@ -434,3 +434,5 @@ mod vector_type_arg_spec;
 mod zero_mask_call_elision;
 #[path = "types/zero_width_select_confidence.rs"]
 mod zero_width_select_confidence;
+#[path = "types/enum_method_parenless.rs"]
+mod enum_method_parenless;
