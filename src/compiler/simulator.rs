@@ -6184,6 +6184,14 @@ pub struct Simulator {
     next_dyn_id: u64,
     /// Built-in mailboxes (handle -> queue of values)
     mailboxes: HashMap<usize, std::collections::VecDeque<Value>>,
+    /// §15.4 aggregate messages. A queue slot holds one `Value`, which cannot
+    /// carry an UNPACKED struct — its members are separate leaf signals. Such
+    /// a message is copied member-wise into a shadow variable and the slot
+    /// holds the shadow's id instead. Ids are recycled as messages are
+    /// consumed, so the shadows are bounded by the deepest the box ever got
+    /// rather than growing with every message put.
+    mbx_msg_seq: u64,
+    mbx_free_ids: Vec<u64>,
     /// §15.4.1 bounded-mailbox capacity (handle -> bound). Absent or 0 means
     /// UNBOUNDED — `try_put` never fails and `put` never blocks. `new(N)` with
     /// N>0 records N here; a full box rejects `try_put` and parks `put`.
@@ -11540,6 +11548,8 @@ impl Simulator {
             string_signals: HashSet::default(),
             queue_frame_saves: Vec::new(),
             mailboxes: HashMap::default(),
+            mbx_msg_seq: 0,
+            mbx_free_ids: Vec::new(),
             mailbox_bound: HashMap::default(),
             mailbox_put_waiters: HashMap::default(),
             rand_mode_disabled: HashMap::default(),
@@ -96993,8 +97003,99 @@ impl Simulator {
                     self.time, pid, is_peek, handle
                 );
             }
-            self.deliver_to_mailbox_waiter(pid, &lvalue, front, cont);
+            self.deliver_to_mailbox_waiter(pid, &lvalue, front.clone(), cont);
+            if !is_peek {
+                self.mbx_release_msg(&front);
+            }
         }
+    }
+
+    /// The member-wise struct an aggregate mailbox message rides in, when
+    /// this argument names one. `None` for a packed struct or any scalar —
+    /// those round-trip through the queued `Value` as before.
+    fn mbx_struct_arg(
+        &mut self,
+        arg: &Expression,
+    ) -> Option<(String, crate::ast::types::StructUnionType)> {
+        let name = Self::plain_ident_name(arg)?;
+        let (resolved, su) = self.struct_copy_target(name.clone());
+        if let Some(s) = su {
+            return Some((resolved, s));
+        }
+        // A formal typed by a class TYPE PARAMETER — `mailbox #(T)` with
+        // `put(T t)` / `get(output T t)` inside `class box #(type T)`. Its
+        // declared type is the parameter NAME, which `struct_copy_target`
+        // cannot resolve, so the message fell back to the scalar path and the
+        // members never travelled. Resolve the binding under the active
+        // specialization first.
+        let dt = self.module.var_decl_types.get(&name).cloned()?;
+        let DataType::TypeReference { name: tn, .. } = &dt else {
+            return None;
+        };
+        let concrete = self.resolve_type_param_binding(&tn.name.name)?;
+        let base = concrete.split('#').next().unwrap_or(&concrete).to_string();
+        let tdt = self.module.typedef_types.get(&base).cloned()?;
+        self.unpacked_struct_of(&tdt).map(|su| (name, su))
+    }
+
+    /// Copy an unpacked-struct message into a shadow variable; the returned
+    /// value is the id that names it, to be queued in the message's place.
+    fn mbx_stash_struct(
+        &mut self,
+        src: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) -> Value {
+        let id = match self.mbx_free_ids.pop() {
+            Some(id) => id,
+            None => {
+                self.mbx_msg_seq += 1;
+                self.mbx_msg_seq
+            }
+        };
+        let shadow = format!("__mbx_msg_{id}");
+        self.copy_unpacked_struct(&shadow, src, su);
+        Value::from_u64(id, 64)
+    }
+
+    /// Copy a stashed message out into `dst`. Read-only in the stash, so a
+    /// `peek` can run any number of times before the message is consumed.
+    fn mbx_unstash_struct(
+        &mut self,
+        dst: &str,
+        su: &crate::ast::types::StructUnionType,
+        tok: &Value,
+    ) -> bool {
+        let Some(id) = tok.to_u64() else {
+            return false;
+        };
+        if id == 0 {
+            return false;
+        }
+        let shadow = format!("__mbx_msg_{id}");
+        self.copy_unpacked_struct(dst, &shadow, su);
+        true
+    }
+
+    /// A consumed slot releases its shadow id for the next `put`.
+    fn mbx_release_msg(&mut self, tok: &Value) {
+        if let Some(id) = tok.to_u64() {
+            if id != 0 && !self.mbx_free_ids.contains(&id) {
+                self.mbx_free_ids.push(id);
+            }
+        }
+    }
+
+    /// Write one delivered message into a parked waiter's lvalue, taking the
+    /// aggregate path when the destination is an unpacked struct. Must run
+    /// with the waiter's process context restored, so the lvalue's frame-local
+    /// name resolves to that process's storage.
+    fn mbx_assign_delivered(&mut self, lvalue: &Expression, v: &Value) {
+        if let Some((dst, su)) = self.mbx_struct_arg(lvalue) {
+            self.mbx_unstash_struct(&dst, &su, v);
+            return;
+        }
+        let width = self.infer_lhs_width(lvalue);
+        self.assign_value(lvalue, &v.resize(width));
     }
 
     fn deliver_to_mailbox_waiter(
@@ -97007,14 +97108,12 @@ impl Simulator {
         if let Some(ctx) = self.process_contexts.remove(&pid) {
             let saved = self.take_process_context();
             self.restore_process_context(ctx);
-            let width = self.infer_lhs_width(lvalue);
-            self.assign_value(lvalue, &v.resize(width));
+            self.mbx_assign_delivered(lvalue, &v);
             let ctx = self.take_process_context();
             self.process_contexts.insert(pid, ctx);
             self.restore_process_context(saved);
         } else {
-            let width = self.infer_lhs_width(lvalue);
-            self.assign_value(lvalue, &v.resize(width));
+            self.mbx_assign_delivered(lvalue, &v);
         }
         if !cont.is_empty() {
             self.event_queue.schedule(self.time, pid, cont);
@@ -134889,7 +134988,12 @@ impl Simulator {
             match method_name {
                 "put" => {
                     if let Some(arg) = args.first() {
-                        let v = self.eval_expr(arg);
+                        // An UNPACKED struct has no single value to queue;
+                        // stash it member-wise and queue its shadow id.
+                        let v = match self.mbx_struct_arg(arg) {
+                            Some((src, su)) => self.mbx_stash_struct(&src, &su),
+                            None => self.eval_expr(arg),
+                        };
                         // LRM §15.4.2: if a blocking get is waiting on this
                         // mailbox, hand the value directly to the waiter
                         // (skipping the queue) and reschedule its
@@ -134930,12 +135034,22 @@ impl Simulator {
                             );
                         }
                     }
-                    if let (Some(v), Some(arg)) = (val, args.first()) {
-                        let w = self.infer_lhs_width(arg);
-                        self.assign_value(arg, &v.resize(w));
+                    if let (Some(v), Some(arg)) = (&val, args.first()) {
+                        match self.mbx_struct_arg(arg) {
+                            Some((dst, su)) => {
+                                self.mbx_unstash_struct(&dst, &su, v);
+                            }
+                            None => {
+                                let w = self.infer_lhs_width(arg);
+                                self.assign_value(arg, &v.resize(w));
+                            }
+                        }
                     }
                     // A consuming `get` frees a slot — admit a parked producer.
                     if method_name == "get" {
+                        if let Some(v) = &val {
+                            self.mbx_release_msg(v);
+                        }
                         self.admit_mailbox_put_waiter(handle);
                     }
                     return Value::zero(32);
@@ -134952,7 +135066,10 @@ impl Simulator {
                                 return Value::zero(32);
                             }
                         }
-                        let v = self.eval_expr(arg);
+                        let v = match self.mbx_struct_arg(arg) {
+                            Some((src, su)) => self.mbx_stash_struct(&src, &su),
+                            None => self.eval_expr(arg),
+                        };
                         // Push-then-drain — see the blocking `put` arm.
                         self.mailboxes.get_mut(&handle).unwrap().push_back(v);
                         self.drain_mailbox_get_waiters(handle);
@@ -134965,10 +135082,18 @@ impl Simulator {
                     } else {
                         self.mailboxes.get(&handle).and_then(|q| q.front().cloned())
                     };
-                    if let (Some(v), Some(arg)) = (val, args.first()) {
-                        let w = self.infer_lhs_width(arg);
-                        self.assign_value(arg, &v.resize(w));
+                    if let (Some(v), Some(arg)) = (&val, args.first()) {
+                        match self.mbx_struct_arg(arg) {
+                            Some((dst, su)) => {
+                                self.mbx_unstash_struct(&dst, &su, v);
+                            }
+                            None => {
+                                let w = self.infer_lhs_width(arg);
+                                self.assign_value(arg, &v.resize(w));
+                            }
+                        }
                         if method_name == "try_get" {
+                            self.mbx_release_msg(v);
                             self.admit_mailbox_put_waiter(handle);
                         }
                         return Value::from_u64(1, 32);
