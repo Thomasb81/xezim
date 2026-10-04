@@ -97013,29 +97013,16 @@ impl Simulator {
     /// The member-wise struct an aggregate mailbox message rides in, when
     /// this argument names one. `None` for a packed struct or any scalar —
     /// those round-trip through the queued `Value` as before.
+    /// The member-wise struct an aggregate mailbox message rides in, when
+    /// this argument names one. `None` for a packed struct or any scalar —
+    /// those round-trip through the queued `Value` as before.
     fn mbx_struct_arg(
         &mut self,
         arg: &Expression,
     ) -> Option<(String, crate::ast::types::StructUnionType)> {
         let name = Self::plain_ident_name(arg)?;
-        let (resolved, su) = self.struct_copy_target(name.clone());
-        if let Some(s) = su {
-            return Some((resolved, s));
-        }
-        // A formal typed by a class TYPE PARAMETER — `mailbox #(T)` with
-        // `put(T t)` / `get(output T t)` inside `class box #(type T)`. Its
-        // declared type is the parameter NAME, which `struct_copy_target`
-        // cannot resolve, so the message fell back to the scalar path and the
-        // members never travelled. Resolve the binding under the active
-        // specialization first.
-        let dt = self.module.var_decl_types.get(&name).cloned()?;
-        let DataType::TypeReference { name: tn, .. } = &dt else {
-            return None;
-        };
-        let concrete = self.resolve_type_param_binding(&tn.name.name)?;
-        let base = concrete.split('#').next().unwrap_or(&concrete).to_string();
-        let tdt = self.module.typedef_types.get(&base).cloned()?;
-        self.unpacked_struct_of(&tdt).map(|su| (name, su))
+        let (resolved, su) = self.struct_copy_target(name);
+        su.map(|s| (resolved, s))
     }
 
     /// Copy an unpacked-struct message into a shadow variable; the returned
