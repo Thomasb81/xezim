@@ -95823,6 +95823,29 @@ impl Simulator {
                     None
                 };
                 let name = self.resolve_hier_name(h);
+                // §6.19 a bare-leaf LHS naming an ACTIVE subroutine/block
+                // local shadows any same-named design signal — the lvalue's
+                // width is the LOCAL's, not the signal's. Without this, the
+                // multi-top wrapper's instance signals (`module __xezim_multi_top;
+                // top top();` registers a flat width-1 slot "top") leaked into
+                // `width` here, and a function-local `uvm_root top` in UVM's
+                // `m_uvm_get_root` inherited that 1-bit width — so `top = new()`
+                // truncated the constructed handle and `top != m_inst` fired
+                // `UVM/BAD_TOP` (infinite recursion) only under multi-top.
+                if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                    let leaf = &h.path[0].name.name;
+                    let is_active_local = self
+                        .local_stack
+                        .last()
+                        .is_some_and(|l| l.contains_key(leaf));
+                    if is_active_local {
+                        if let Some(w) = self.widths.get(&*name).copied() {
+                            if w > 0 {
+                                return w;
+                            }
+                        }
+                    }
+                }
                 if let Some(&id) = self.signal_name_to_id.get(name.as_ref()) {
                     h.cached_signal_id.set(Some(id));
                     if let Some(k) = leaf_key {
