@@ -99,25 +99,26 @@ What's left for the user:
   carries megabyte memories. (Known gap: NBAs into packed arrays commit
   immediately; designs whose RAM read ports read back the same element in
   the same timestep would see the new value a delta early.)
-- **`XEZIM_BUF_COLLAPSE=1`** — folds whole-net identity continuous assigns
+- **`XEZIM_BUF_COLLAPSE=0`** — buffer collapse is **ON by default**; this
+  turns it OFF. The pass folds whole-net identity continuous assigns
   (`assign y = x;`) onto their source net, the transform commercial
-  optimizers apply by default to clock and buffer trees. **The single
-  largest opt-in win available**: measured on wall-clock, c906 memcpy ×100
+  optimizers apply by default to clock and buffer trees. It was the largest
+  opt-in win while it was opt-in: measured on wall-clock, c906 memcpy ×100
   50.2 s → 42.7 s (−14.9%) and ibex CoreMark 48.2 s → 43.0 s (−10.8%);
   combined with `XEZIM_EDGE_MERGE=8`, c906 reaches 40.6 s (−19.1%). It also
   cuts combinational entries (c906 35,267 → 29,728; ibex 1,553 → 1,130).
-  Both designs stay bit-exact against the reference.
+  Both designs stay bit-exact against the reference. Those gains are in the
+  default build now — setting `=1` enables nothing that is not already on.
 
-  It stays OPT-IN for a measured reason, not caution. Forcing it on turns 7
-  suite tests red, and they name exactly what it trades: `force`/`release`
-  on a collapsed name now reaches the shared net (4 tests), a continuous
-  assign's Z pass-through stops being distinguishable from a `buf` gate,
-  a parked waiter sees the post-collapse value because the buffer's delta
-  step is gone, and a VPI/DPI backdoor can no longer find the folded name.
-  Those are the same properties that make it fast, so it cannot be both.
-  Reach for it on gate-level or clock-tree-heavy designs whose testbench
-  does not force, probe, or delta-observe buffer nets. Skipped automatically
-  under SDF, where a collapsed net would lose its annotated delay.
+  What made it opt-in is handled per net rather than per run. A net keeps
+  its own storage whenever aliasing would be observable: it is a
+  `force`/`release` or procedural-assign target anywhere in the design, its
+  two-state-ness differs from the source, or a DPI/VPI backdoor could look
+  the folded name up. The whole pass is skipped when the design carries SDF
+  delays (a collapsed net would lose its annotated delay), declares DPI
+  imports, or loads a `--dpi-lib`/VPI library. Reach for `=0` when you need
+  a buffer net's own delta step to stay observable, or to rule the pass out
+  while bisecting a mismatch.
 - **`XEZIM_EDGE_MERGE=<N>`** — merges edge blocks with identical
   sensitivities into one compiled block, at most `N` per block (8 measures
   best; large values lose more to coarser gating than they save in
