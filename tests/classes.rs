@@ -45,6 +45,8 @@ mod collection_of_handles_new;
 mod constraint_foreach_signed_indices;
 #[path = "classes/constructor_body_ports.rs"]
 mod constructor_body_ports;
+#[path = "classes/ctor_bare_member_dynarray_size.rs"]
+mod ctor_bare_member_dynarray_size;
 #[path = "classes/explicit_param_static_coll_read.rs"]
 mod explicit_param_static_coll_read;
 #[path = "classes/function_local_struct_return_shadow.rs"]

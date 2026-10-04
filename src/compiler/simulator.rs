@@ -77653,13 +77653,46 @@ impl Simulator {
                 // element cells are written. Restricted to
                 // non-associative collections (dynamic arrays /
                 // queues); `new[n]` is invalid for assoc arrays.
-                let name = target
-                    .filter(|n| self.module.dynamic_arrays.contains(n.as_ref()))
-                    .or_else(|| {
-                        self.expr_assoc_name(lvalue)
-                            .filter(|an| !self.is_associative_array(an))
-                            .map(std::borrow::Cow::Owned)
-                    });
+                //
+                // §8.9/§10 scope: an unqualified single-segment name in a
+                // class METHOD/constructor resolves to a class member of
+                // `this` BEFORE an ENCLOSING (inlined) frame's same-named
+                // dynamic-array local or `ref` formal. The current frame's
+                // OWN local/formal shadows the member (§8.10). Without
+                // this, a constructor's `value = new[1]` with `value` both
+                // a member of the new object and a live `ref` formal of
+                // the caller's task resolved the LHS to the caller's
+                // formal and sized the CALLER's array instead of the
+                // object's member (UVM 4251: burst_read's 64-element
+                // `value` collapsed to 1). Prefer the `this`-scoped member
+                // store over the enclosing-frame/renamed resolution below.
+                let member_store: Option<std::borrow::Cow<str>> =
+                    if let ExprKind::Ident(lh) = &lvalue.kind
+                        && lh.path.len() == 1
+                        && lh.path[0].selects.is_empty()
+                    {
+                        let bare = &lh.path[0].name.name;
+                        let current_frame_local = self
+                            .dyn_name_lookup_innermost(bare)
+                            .is_some();
+                        if !current_frame_local {
+                            self.instance_assoc_member(bare)
+                                .map(std::borrow::Cow::Owned)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                let name = member_store.or_else(|| {
+                    target
+                        .filter(|n| self.module.dynamic_arrays.contains(n.as_ref()))
+                        .or_else(|| {
+                            self.expr_assoc_name(lvalue)
+                                .filter(|an| !self.is_associative_array(an))
+                                .map(std::borrow::Cow::Owned)
+                        })
+                });
                 if let Some(name) = name {
                     let n = self.eval_expr(n_expr).to_u64().unwrap_or(0);
                     // The source may be any array or queue. A self-copy
