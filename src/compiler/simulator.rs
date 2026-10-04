@@ -6209,6 +6209,12 @@ pub struct Simulator {
     /// for `rand` class-handle members (a cyclic object graph would otherwise
     /// recurse forever).
     randomize_depth: usize,
+    /// One work/time budget shared by an outer randomize call and every
+    /// recursive rand-object solve it starts.
+    randomize_budget_depth: usize,
+    randomize_budget_remaining: u64,
+    randomize_budget_deadline: Option<std::time::Instant>,
+    randomize_budget_exhausted: bool,
     /// Active enclosing solves retain only their reachable children's rand state.
     rand_child_snapshots: Vec<rand_scope::RandChildTransaction>,
     /// IEEE 1800-2017 §18.5.11 — a `static constraint` block is SHARED by every
@@ -11569,6 +11575,10 @@ impl Simulator {
             constraint_mode_disabled: HashMap::default(),
             static_constraint_disabled: HashSet::default(),
             randomize_depth: 0,
+            randomize_budget_depth: 0,
+            randomize_budget_remaining: 0,
+            randomize_budget_deadline: None,
+            randomize_budget_exhausted: false,
             rand_child_snapshots: Vec::new(),
             randc_used: HashMap::default(),
             randc_pending: HashMap::default(),
@@ -102507,6 +102517,7 @@ impl Simulator {
             .filter(|s| !s.is_empty());
         // §18.7: the inline constraints join the class's set for this call
         // (sizing, element solving, acceptance).
+        self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
         let prev_receiver = std::mem::replace(&mut self.rand_receiver, receiver);
         let prev_subset = std::mem::replace(&mut self.randomize_subset, subset);
@@ -102514,6 +102525,7 @@ impl Simulator {
         self.randomize_subset = prev_subset;
         self.rand_receiver = prev_receiver;
         self.obj_rng_stack.pop();
+        self.end_randomize_budget();
         r
     }
 
@@ -138700,15 +138712,82 @@ impl Simulator {
         true
     }
 
+    fn randomize_budget_setting(&self, key: &str, default: u64) -> u64 {
+        self.plusargs
+            .iter()
+            .find_map(|arg| {
+                arg.trim_start_matches('+')
+                    .strip_prefix(key)
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .filter(|value| *value != 0)
+            .unwrap_or(default)
+    }
+
+    fn begin_randomize_budget(&mut self) {
+        if self.randomize_budget_depth == 0 {
+            let trials = self.randomize_budget_setting("xezim_rand_trials=", 1000);
+            let timeout = self.randomize_budget_setting("xezim_rand_timeout=", 30);
+            self.randomize_budget_remaining = trials;
+            self.randomize_budget_deadline =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(timeout));
+            self.randomize_budget_exhausted = false;
+        }
+        self.randomize_budget_depth += 1;
+    }
+
+    fn end_randomize_budget(&mut self) {
+        self.randomize_budget_depth = self.randomize_budget_depth.saturating_sub(1);
+        if self.randomize_budget_depth == 0 {
+            self.randomize_budget_deadline = None;
+        }
+    }
+
+    fn take_randomize_budget(
+        &mut self,
+        handle: usize,
+        class_name: &str,
+        constraints: &[ClassConstraint],
+    ) -> bool {
+        let timed_out = self
+            .randomize_budget_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        if self.randomize_budget_exhausted || timed_out || self.randomize_budget_remaining == 0 {
+            if !self.randomize_budget_exhausted {
+                self.randomize_budget_exhausted = true;
+                let mut failed_names = Vec::new();
+                for constraint in constraints {
+                    if constraint.items.iter().any(|item| {
+                        !Self::constraint_unmodeled(item)
+                            && !self.check_constraint_item(handle, item)
+                    }) {
+                        failed_names.push(constraint.name.name.as_str());
+                    }
+                }
+                let names = failed_names.join(", ");
+                eprintln!(
+                    "[xezim][error] randomize budget exhausted in class {}; last failed constraints: {}; returning 0 and restoring prior values",
+                    class_name,
+                    if names.is_empty() { "<none>" } else { &names }
+                );
+            }
+            return false;
+        }
+        self.randomize_budget_remaining -= 1;
+        true
+    }
+
     /// §18.14.1: `obj.randomize()` draws from the OBJECT's random stream —
     /// mark it the active stream owner for the whole solve (constraints, dist
     /// picks, randc, pre/post_randomize) so every draw routes through
     /// `cur_rng()`. Nested randomize calls stack, so an inner object still
     /// uses its own stream.
     fn exec_randomize(&mut self, handle: usize) -> Value {
+        self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
         let r = self.exec_randomize_inner(handle, &[]);
         self.obj_rng_stack.pop();
+        self.end_randomize_budget();
         r
     }
 
@@ -139649,6 +139728,9 @@ impl Simulator {
                 }
             }
             for _ in 0..256 {
+                if !self.take_randomize_budget(handle, &class_name, &constraints) {
+                    break;
+                }
                 for (name, width) in &rand_props {
                     let v = if let Some(et) = enum_prop_types.get(name) {
                         let members = self
@@ -139693,7 +139775,7 @@ impl Simulator {
                         .iter()
                         .all(|it| self.check_constraint_item(handle, it))
                 });
-                if ok {
+                if ok && !self.randomize_budget_exhausted {
                     if has_post {
                         self.exec_method_call(handle, "post_randomize", &[]);
                     }
@@ -139800,7 +139882,7 @@ impl Simulator {
                 true,
                 &[],
             ) {
-                rand_csp::CspOutcome::Sat => {
+                rand_csp::CspOutcome::Sat if !self.randomize_budget_exhausted => {
                     if has_post {
                         self.exec_method_call(handle, "post_randomize", &[]);
                     }
@@ -139847,6 +139929,9 @@ impl Simulator {
                     self.time
                 );
                 self.finished = true;
+                break;
+            }
+            if !self.take_randomize_budget(handle, &class_name, &constraints) {
                 break;
             }
             self.rand_tight_mode = fixed_fe_fail_streak >= 4;
@@ -141083,7 +141168,7 @@ impl Simulator {
                 all_ok = self.sub_object_constraints_ok(handle, &rand_obj_props);
             }
 
-            if all_ok && !(has_soft && csp_ok) {
+            if all_ok && !(has_soft && csp_ok) && !self.randomize_budget_exhausted {
                 // SV semantics: randomize() calls post_randomize() on success
                 // (e.g. riscv_instr builds its imm_str / formats operands here).
                 if has_post {
@@ -141119,7 +141204,8 @@ impl Simulator {
                     &sub_objs,
                 ) {
                     rand_csp::CspOutcome::Sat
-                        if self.sub_object_constraints_ok(handle, &rand_obj_props) =>
+                        if !self.randomize_budget_exhausted
+                            && self.sub_object_constraints_ok(handle, &rand_obj_props) =>
                     {
                         // The joint solve rewrote the sub-objects after
                         // their own post_randomize ran: run it on the final

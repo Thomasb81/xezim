@@ -30,8 +30,8 @@ endmodule
 
 const NESTED_SRC: &str = r#"
 class leaf_c;
-  rand bit [7:0] x;
-  rand bit [7:0] y;
+  rand bit [31:0] x;
+  rand bit [31:0] y;
   constraint impossible_c { x % 7 == 3; y == x + 1; y % 7 == 5; }
 endclass
 class root_c;
@@ -50,13 +50,19 @@ module top;
 endmodule
 "#;
 
-fn run_with_deadline(source: &str, stem: &str) -> (std::process::ExitStatus, String, Duration) {
+fn run_with_deadline(
+    source: &str,
+    stem: &str,
+    plusargs: &[&str],
+) -> (std::process::ExitStatus, String, Duration) {
     let dir = std::env::temp_dir().join(format!("xezim_rand_budget_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temporary directory");
     let path = dir.join(format!("{stem}.sv"));
     std::fs::write(&path, source).expect("write design");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_xezim"))
-        .args(["--simulate", "--no-cache", path.to_str().unwrap()])
+    let mut command = Command::new(env!("CARGO_BIN_EXE_xezim"));
+    command.args(["--simulate", "--no-cache", path.to_str().unwrap()]);
+    command.args(plusargs);
+    let mut child = command
         .env("XEZIM_RAND_DBG", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -84,7 +90,7 @@ fn run_with_deadline(source: &str, stem: &str) -> (std::process::ExitStatus, Str
 
 #[test]
 fn infeasible_wide_set_fails_promptly() {
-    let (status, text, _) = run_with_deadline(SRC, "wide");
+    let (status, text, _) = run_with_deadline(SRC, "wide", &[]);
     assert!(status.success(), "run failed:\n{text}");
     // failed, and left the variables as they were (§18.6.2)
     assert!(text.contains("R r=0 x=11 y=22"), "{text}");
@@ -101,16 +107,44 @@ fn infeasible_wide_set_fails_promptly() {
 }
 
 #[test]
-fn nested_infeasible_object_fails_promptly_and_rolls_back() {
-    let (status, text, elapsed) = run_with_deadline(NESTED_SRC, "nested");
+fn nested_infeasible_object_obeys_shared_trial_budget() {
+    let (status, text, elapsed) = run_with_deadline(
+        NESTED_SRC,
+        "nested_trials",
+        &["+xezim_rand_trials=2", "+xezim_rand_timeout=30"],
+    );
     assert!(status.success(), "run failed:\n{text}");
     assert!(
-        elapsed < Duration::from_secs(30),
-        "nested randomization used its outer deadline: {elapsed:?}\n{text}"
+        elapsed < Duration::from_secs(10),
+        "nested randomization exceeded its shared trial budget: {elapsed:?}\n{text}"
     );
     assert!(text.contains("N result=0 x=17 y=29"), "{text}");
     assert!(
-        text.contains("randomize FAILED") || text.contains("joint solve gave up"),
+        text.contains("randomize budget exhausted"),
         "missing budget diagnostic:\n{text}"
+    );
+    assert!(
+        text.contains("last failed constraints: impossible_c"),
+        "missing failing constraint name:\n{text}"
+    );
+}
+
+#[test]
+fn nested_infeasible_object_obeys_wall_clock_budget() {
+    let (status, text, elapsed) = run_with_deadline(
+        NESTED_SRC,
+        "nested_timeout",
+        &["+xezim_rand_trials=100000000", "+xezim_rand_timeout=1"],
+    );
+    assert!(status.success(), "run failed:\n{text}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "nested randomization exceeded its wall-clock budget: {elapsed:?}\n{text}"
+    );
+    assert!(text.contains("N result=0 x=17 y=29"), "{text}");
+    assert!(text.contains("randomize budget exhausted"), "{text}");
+    assert!(
+        text.contains("last failed constraints: impossible_c"),
+        "missing failing constraint name:\n{text}"
     );
 }
