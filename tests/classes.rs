@@ -51,6 +51,10 @@ mod ctor_bare_member_dynarray_size;
 mod explicit_param_static_coll_read;
 #[path = "classes/function_local_struct_return_shadow.rs"]
 mod function_local_struct_return_shadow;
+#[path = "classes/foreach_cross_elem_whole_equality.rs"]
+mod foreach_cross_elem_whole_equality;
+#[path = "classes/foreach_packed_struct_member_inside.rs"]
+mod foreach_packed_struct_member_inside;
 #[path = "classes/implements_typedef_scope.rs"]
 mod implements_typedef_scope;
 #[path = "classes/inherited_local_member.rs"]

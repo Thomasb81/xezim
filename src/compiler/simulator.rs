@@ -143345,6 +143345,48 @@ impl Simulator {
         }
     }
 
+    /// §18.5 — a WHOLE (member-free) reference to an element of a rand
+    /// FIXED or DYNAMIC array property, e.g. `cfg[0][0]`. Returns `(name,
+    /// suffix)` where `name` is the bare rand property and `suffix` is the
+    /// `[i][j]…` index chain, matching `class_elem_store`'s `name+suffix`
+    /// key. Unlike `coll_elem_expr_key` this peels an arbitrary N-D index
+    /// chain for unpacked FIXED arrays, so a whole-struct cross-element
+    /// equality like `cfg[0][0] == cfg[1][0]` (the 5446 reg-map coupling)
+    /// is recognised on both sides.
+    fn rand_whole_elem_lvalue(
+        &mut self,
+        handle: usize,
+        expr: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> Option<(String, String)> {
+        // Peel trailing Index nodes, collecting `[i]` from the outside in.
+        let mut suffix = String::new();
+        let mut base = expr;
+        while let ExprKind::Index { expr: b, index } = &base.kind {
+            let i = self.eval_expr(index).to_i64()?;
+            suffix = format!("[{}]{}", i, suffix);
+            base = b;
+        }
+        if suffix.is_empty() {
+            return None;
+        }
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || !rand_set.contains(&h.path[0].name.name) {
+            return None;
+        }
+        let name = h.path[0].name.name.clone();
+        // Any array-shaped rand property (packed, fixed, or dynamic).
+        if self.class_prop_packed_dims(handle, &name).is_some()
+            || self.fixed_foreach_dims(handle, &name).is_some()
+            || self.module.dynamic_arrays.contains(&format!("{}#{}", handle, name))
+        {
+            return Some((name, suffix));
+        }
+        None
+    }
+
     fn solve_forced(
         &mut self,
         handle: usize,
@@ -143505,6 +143547,34 @@ impl Simulator {
                     if let Some((sub, field)) = self.cross_obj_lvalue(right) {
                         let val = self.eval_expr(left);
                         return self.set_prop_if_changed(sub, &field, val);
+                    }
+                    // §18.5 — whole-element equality between two elements of a
+                    // rand FIXED/DYNAMIC array property: `cfg[0][0] ==
+                    // cfg[1][0]` (the 5446 reg-map cross-element coupling).
+                    // Neither operand is a bare scalar rand prop nor a member
+                    // target, so copy RHS's element into LHS's element; the
+                    // surrounding fixpoint de-couples it from the member
+                    // `inside` repairs, and every trial is re-validated by the
+                    // satisfaction pass.
+                    let le = self.rand_whole_elem_lvalue(handle, left, rand_set);
+                    let re = self.rand_whole_elem_lvalue(handle, right, rand_set);
+                    if le.is_some() && re.is_some() {
+                        let lk = le.as_ref().map(|(a, b)| (a.clone(), b.clone()));
+                        let rk = re.as_ref().map(|(a, b)| (a.clone(), b.clone()));
+                        if lk == rk {
+                            return false; // `cfg[0][0]==cfg[0][0]`: tautology
+                        }
+                        let (la, ls) = le.unwrap();
+                        let (ra, rs) = re.unwrap();
+                        let src = self
+                            .class_elem_load(handle, &ra, &rs)
+                            .or_else(|| {
+                                self.get_signal_value_by_name(&format!("{}{}", ra, rs))
+                            })
+                            .unwrap_or_else(|| Value::zero(64));
+                        self.class_elem_store(handle, &la, &ls, src.clone());
+                        self.set_signal_value_by_name(&format!("{}{}", la, ls), src);
+                        return true;
                     }
                     // A rand COLLECTION element (`q[0] == 8'd99`).
                     let lk = self.coll_elem_expr_key(left);
@@ -143668,17 +143738,17 @@ impl Simulator {
                     expr: inner,
                     ranges,
                 } => {
+                    let cr: Vec<ConstraintRange> = ranges
+                        .iter()
+                        .map(|r| match &r.kind {
+                            ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                lo: (**lo).clone(),
+                                hi: (**hi).clone(),
+                            },
+                            _ => ConstraintRange::Value(r.clone()),
+                        })
+                        .collect();
                     if let Some(v) = self.rand_lvalue_name(inner, rand_set) {
-                        let cr: Vec<ConstraintRange> = ranges
-                            .iter()
-                            .map(|r| match &r.kind {
-                                ExprKind::Range(lo, hi) => ConstraintRange::Range {
-                                    lo: (**lo).clone(),
-                                    hi: (**hi).clone(),
-                                },
-                                _ => ConstraintRange::Value(r.clone()),
-                            })
-                            .collect();
                         let cur = self.eval_expr(inner);
                         if self.value_in_ranges(&cur, &cr) {
                             return false;
@@ -143686,6 +143756,22 @@ impl Simulator {
                         let width = cur.width.max(1);
                         if let Some(picked) = self.pick_from_ranges(&cr, width, cur.is_signed) {
                             return self.set_prop_if_changed(handle, &v, picked);
+                        }
+                    } else if let Some(t) = self.rand_member_target(inner, rand_set) {
+                        // §18.5.12: an `inside` constraint on the member of an
+                        // aggregate rand property (`packed_struc.au_bytes in
+                        // {1,2,4,8,16}`). The target is not a bare rand prop,
+                        // so re-pick the member's bit-slice into the aggregate
+                        // (read-modify-write preserving the other members),
+                        // mirroring how the `==` arm re-picks via
+                        // `rand_member_target`/`set_rand_member`.
+                        let cur = self.eval_expr(inner);
+                        if self.value_in_ranges(&cur, &cr) {
+                            return false;
+                        }
+                        let width = cur.width.max(1);
+                        if let Some(picked) = self.pick_from_ranges(&cr, width, cur.is_signed) {
+                            return self.set_rand_member(&t, picked);
                         }
                     }
                     false
@@ -144099,6 +144185,15 @@ impl Simulator {
         arr_name: &str,
         idx: &str,
     ) -> bool {
+        // §18.5.7 fixed-array foreach over a PACKED-STRUCT element: the body
+        // constrains a MEMBER of the element (`foreach (cfg[y]) cfg[y].au_bytes
+        // inside {1,2,4,8,16}`). `index_chain_root_is` only matches a bare
+        // `arr[i]`, so these fell through to the generate-and-test fallback,
+        // which draws the WHOLE element uniformly and can never hit a narrow
+        // member range — randomize() failed. Repair the member slice directly.
+        if let Some(changed) = self.solve_forced_array_elem_member(handle, item, arr_name, idx) {
+            return changed;
+        }
         // Handle `arr[i] inside { lo:hi }` directly so the range is
         // evaluated with the bound `i`. Other shapes can be added later.
         // Also handle the dedicated ConstraintItem::Inside variant.
@@ -144352,6 +144447,177 @@ impl Simulator {
             }
             _ => false,
         }
+    }
+
+    /// Repair a packed-struct MEMBER of a fixed-array element inside a foreach
+    /// body — `cfg[i].au_bytes inside {lo:hi}` or `cfg[i].byte_addressing == 1`.
+    /// `index_chain_root_is` (used by the bare-element arms) is blind to the
+    /// `MemberAccess` wrapping the `Index`, so these were previously dropped;
+    /// the generate-and-test fallback then drew the whole element uniformly
+    /// and could never land a narrow member sub-range. Returns `None` if `item`
+    /// is not a member-of-element Inside/equality constraint (caller falls
+    /// through), otherwise `Some(changed)` — the member slice is re-picked
+    /// within the constraint range and spliced back into the element.
+    fn solve_forced_array_elem_member(
+        &mut self,
+        handle: usize,
+        item: &ConstraintItem,
+        arr_name: &str,
+        idx: &str,
+    ) -> Option<bool> {
+        // Decompose a target of the shape `<arr>[<i>].<m1>.….<mk>` into the
+        // index suffix, the member-name chain, and the element Index expr.
+        fn split(
+            s: &mut Simulator,
+            e: &Expression,
+            arr_name: &str,
+        ) -> Option<(String, Vec<String>, Expression)> {
+            let ExprKind::MemberAccess { expr: base, member } = &e.kind else {
+                return None;
+            };
+            let mut names = vec![member.name.clone()];
+            // `base` is the ELEMENT (`cfg[x][y]`) when the member chain has a
+            // single level; returned so packed_struct_elem_type can resolve
+            // the element's struct layout.
+            let elem_expr = (**base).clone();
+            let mut cur = base;
+            while let ExprKind::MemberAccess { expr: b2, member: m2 } = &cur.kind {
+                names.push(m2.name.clone());
+                cur = b2;
+            }
+            names.reverse();
+            // Peel the nested multi-dimension Index chain, collecting each
+            // `[i]`; reversed to the element's left-to-right `[x][y]` order.
+            let mut suffixes: Vec<String> = Vec::new();
+            while let ExprKind::Index { expr: b, index } = &cur.kind {
+                suffixes.push(format!("[{}]", s.eval_expr(index).to_i64()?));
+                cur = b;
+            }
+            suffixes.reverse();
+            let ExprKind::Ident(h) = &cur.kind else {
+                return None;
+            };
+            if !(h.path.len() == 1 && h.path[0].name.name == arr_name) {
+                return None;
+            }
+            Some((suffixes.concat(), names, elem_expr))
+        }
+
+        // Which member is constrained, and by what? Returns (elem, idx-suffix,
+        // member chain, ranges) — or equality bound.
+        enum Op {
+            Inside(Vec<ConstraintRange>),
+            Eq(Expression),
+        }
+        let (target, op) = match item {
+            ConstraintItem::Inside {
+                expr: inner, range, ..
+            } => (Box::new((*inner).clone()), Op::Inside(range.clone())),
+            ConstraintItem::Expr(e) => match &e.kind {
+                ExprKind::Inside {
+                    expr: inner, ranges,
+                } => {
+                    let cr: Vec<ConstraintRange> = ranges
+                        .iter()
+                        .map(|r| match &r.kind {
+                            ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                lo: (**lo).clone(),
+                                hi: (**hi).clone(),
+                            },
+                            _ => ConstraintRange::Value(r.clone()),
+                        })
+                        .collect();
+                    (Box::new((**inner).clone()), Op::Inside(cr))
+                }
+                ExprKind::Binary {
+                    op: BinaryOp::Eq,
+                    left,
+                    right,
+                } => {
+                    // Normalize <member> == bound on either side.
+                    let (m_side, b_side) = if split(self, left, arr_name).is_some() {
+                        (left, right)
+                    } else if split(self, right, arr_name).is_some() {
+                        (right, left)
+                    } else {
+                        return None;
+                    };
+                    (Box::new((**m_side).clone()), Op::Eq((**b_side).clone()))
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let (idxs, names, elem_expr) = split(self, &target, arr_name)?;
+        if idxs != idx {
+            return None; // not this element's turn — another index handles it
+        }
+        // Resolve the whole struct element type + member bit layout. Must use
+        // the same width source as the member READ path (packed_agg_layout), so
+        // the splice lands on the bits that member-selections observe.
+        let su = self.packed_struct_elem_type(&elem_expr)?;
+        if Self::spreads_member_wise(&su) {
+            return None;
+        }
+        let (fields, _total) = self.packed_agg_layout(&su);
+        let (off, w) = {
+            let f = fields.iter().find(|(m, _, _)| m == &names[0])?;
+            // Nested struct member-of-member targets (aper.outer.inner) are not
+            // covered by the flat `packed_agg_layout` here — degenerate to the
+            // caller's fallback rather than splice the wrong bits.
+            if names.len() > 1 {
+                return None;
+            }
+            (f.1, f.2)
+        };
+        let elem = self
+            .class_elem_load(handle, arr_name, &idxs)
+            .unwrap_or_else(|| Value::zero((off + w).max(1)));
+        let signed = self.class_prop_signed_of(handle, arr_name);
+        let mcur = elem.range_select((off + w - 1) as usize, off as usize);
+        let changed = match op {
+            Op::Inside(cr) => {
+                if self.value_in_ranges(&mcur, &cr) {
+                    return None;
+                }
+                let width = mcur.width.max(1);
+                match self.pick_from_ranges(&cr, width, mcur.is_signed) {
+                    Some(picked) => {
+                        let same = picked.to_u64() == mcur.to_u64();
+                        self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, picked);
+                        !same
+                    }
+                    None => return None,
+                }
+            }
+            Op::Eq(bound) => {
+                let bv = self.eval_expr(&bound).resize(mcur.width.max(1));
+                let same = bv.to_u64() == mcur.to_u64();
+                let mut p = bv;
+                p.is_signed = signed;
+                self.splice_elem_member(elem, handle, arr_name, &idxs, off, w, p);
+                !same
+            }
+        };
+        Some(changed)
+    }
+
+    /// Bit-splice `member_val` (width `w`) into `elem` at bit offset `off` and
+    /// store the element back under `<handle>#<arr>[<idx>]`.
+    fn splice_elem_member(
+        &mut self,
+        mut elem: Value,
+        handle: usize,
+        arr_name: &str,
+        idx: &str,
+        off: u32,
+        w: u32,
+        member_val: Value,
+    ) {
+        for i in 0..w {
+            elem.set_bit((off + i) as usize, member_val.get_bit(i as usize));
+        }
+        self.class_elem_store(handle, arr_name, idx, elem);
     }
 
     /// The FIXED shape of a class rand array member, walking the inheritance
