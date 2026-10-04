@@ -44460,9 +44460,20 @@ impl Simulator {
             break;
         }
         if !found {
+            // Only clock generators, edge blocks and comb entries were
+            // searched — the three CONTINUOUS driver kinds. A variable written
+            // from an `initial` block or a non-edge `always` (every testbench
+            // reset `reg`) has none of those and lands here while being
+            // perfectly healthy, and `module.initial_blocks` is consumed at
+            // scheduling so there is nothing left to point at. Say what was
+            // checked rather than asserting a dropped instance: naming that as
+            // the cause sent readers hunting for a missing cell over a stable
+            // `rst_b` that an initial block had correctly driven.
             eprintln!(
-                "[xezim][hang-report]{}'{}' (now {}) has NO driver — undriven \
-                 (check for a dropped/unresolved instance driving it)",
+                "[xezim][hang-report]{}'{}' (now {}) has no continuous driver \
+                 (no clock generator, edge block or continuous assign writes it) \
+                 — normal for a variable driven from an initial/always block; \
+                 on a NET this is the signature of a dropped/unresolved instance",
                 pad,
                 self.name_for_id(sig_id),
                 self.hang_sig_value(sig_id)
@@ -47253,6 +47264,15 @@ impl Simulator {
         // a value > this mark means the signal genuinely moved since the window
         // opened (a live clock), suppressing the dead-clock false positive.
         let mut wd_ref_phase: u64 = self.event_phase;
+        // Did any monitored signal move while THIS window was open? The
+        // `sig_last_change` mark above is only stamped under
+        // `event_measure && !armed_edge`, and ARMED mode is the default on a
+        // design this size — there the array never advances, so it can never
+        // witness a live clock and every window looks frozen. Sampling the
+        // window's own signals on every loop iteration (below) is immune to
+        // that and to the phase aliasing the mark was added for: a toggling
+        // clock is caught whatever phase the periodic check lands on.
+        let mut wd_toggled = false;
         let mut wd_warned = false;
         // O1 flop-fire skip is default-ON (correct-by-construction snapshot
         // compare; ~1.1-1.6x on c910). Set XEZIM_EVENT_EDGE=0 to disable.
@@ -47294,6 +47314,17 @@ impl Simulator {
                 );
                 self.report_parked_waiters(12);
             }
+            // Dead-clock watchdog, liveness half: witness a toggle on the
+            // monitored signals EVERY iteration. The periodic check below only
+            // samples every 1024 iterations, and equal sampled bits do not mean
+            // frozen — a clock returns to the same value each period. At most a
+            // couple of signals, so this is noise next to a loop iteration.
+            if sc_enabled && !wd_warned && !wd_toggled && !wd_sigs.is_empty() {
+                wd_toggled = wd_sigs
+                    .iter()
+                    .zip(wd_bits.iter())
+                    .any(|(&id, &b)| self.term_raw_bits(id) != b);
+            }
             // Dead-clock watchdog: cheap periodic check (every 1024 iters).
             if sc_enabled && !wd_warned && (iters & 1023) == 0 && !self.event_waiters.is_empty() {
                 if let Some(w) = self.event_waiters.iter().min_by_key(|w| w.parked_time) {
@@ -47311,6 +47342,7 @@ impl Simulator {
                     // transition phase): if any awaited signal moved since the
                     // window opened, it is a LIVE clock — treat as progress.
                     let toggled_since_ref = self.event_measure
+                        && !self.armed_edge
                         && cur_sigs.iter().any(|&id| {
                             id < self.sig_last_change.len()
                                 && self.sig_last_change[id] > wd_ref_phase
@@ -47322,6 +47354,7 @@ impl Simulator {
                         && cur_sigs == wd_sigs
                         && cur_bits == wd_bits
                         && !toggled_since_ref
+                        && !wd_toggled
                     {
                         let d_ticks = self.time.saturating_sub(wd_ref_time);
                         let d_edges = self.prof_edges_fired.saturating_sub(wd_ref_edges);
@@ -47379,6 +47412,7 @@ impl Simulator {
                         wd_ref_edges = self.prof_edges_fired;
                         wd_ref_wall = sim_start.elapsed();
                         wd_ref_phase = self.event_phase;
+                        wd_toggled = false;
                     }
                 }
             }
