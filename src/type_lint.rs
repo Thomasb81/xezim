@@ -2795,6 +2795,47 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
         }
     }
 
+    // Module definitions the elaborated design actually reaches. §23
+    // elaboration starts at the top and walks instantiations, so a definition
+    // nothing reaches contributes no instance. Its parameter DEFAULTS are
+    // placeholders an instantiation would have supplied, and const-folding
+    // them invents errors no reference tool reports: issue #238's
+    // `parameter W = 0` feeding `{{(W - 1){1'b0}}}` read as a replication
+    // count of -1 and failed the run, while the module was never instantiated.
+    // The negative-default arm in `declare_param` already covers a parameter
+    // that is ITSELF negative; this covers a default that only becomes
+    // invalid once an expression uses it.
+    let mut inst_graph: HashMap<String, HashSet<String>> = HashMap::default();
+    for d in defs {
+        let (name, items) = match d {
+            SourceDefinition::Module(m) => (&m.name.name, &m.items),
+            SourceDefinition::Interface(m) => (&m.name.name, &m.items),
+            SourceDefinition::Program(m) => (&m.name.name, &m.items),
+            _ => continue,
+        };
+        let entry = inst_graph.entry(name.clone()).or_default();
+        let mut kids: HashSet<String> = HashSet::default();
+        instances(items, &mut kids);
+        entry.extend(kids);
+    }
+    let mut reached: HashSet<String> = HashSet::default();
+    let mut stack = vec![elab.name.clone()];
+    while let Some(n) = stack.pop() {
+        if !reached.insert(n.clone()) {
+            continue;
+        }
+        if let Some(kids) = inst_graph.get(&n) {
+            stack.extend(kids.iter().cloned());
+        }
+    }
+    // Only trust the walk when the top itself is one of these definitions.
+    // Elaborating something that is not a plain module definition would
+    // otherwise leave `reached` empty and silence every parameter-dependent
+    // check in the design, so fall back to the old predicate instead.
+    let reach_known = inst_graph.contains_key(&elab.name);
+    let params_fixed_for =
+        |n: &String| !instantiated.contains(n) && (!reach_known || reached.contains(n));
+
     // Phase 3: walk every body.
     let mut errs = Vec::new();
     let env = || Env {
@@ -2810,7 +2851,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             SourceDefinition::Module(m) => {
                 ck = Ck::new(env(), elab, &m.name.name);
                 ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
-                ck.params_fixed = !instantiated.contains(&m.name.name);
+                ck.params_fixed = params_fixed_for(&m.name.name);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
@@ -2826,7 +2867,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             SourceDefinition::Interface(m) => {
                 ck = Ck::new(env(), elab, &m.name.name);
                 ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
-                ck.params_fixed = !instantiated.contains(&m.name.name);
+                ck.params_fixed = params_fixed_for(&m.name.name);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
@@ -2842,7 +2883,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
             SourceDefinition::Program(m) => {
                 ck = Ck::new(env(), elab, &m.name.name);
                 ck.default_auto = m.lifetime == Some(Lifetime::Automatic);
-                ck.params_fixed = !instantiated.contains(&m.name.name);
+                ck.params_fixed = params_fixed_for(&m.name.name);
                 ck.push();
                 for p in &m.params {
                     ck.declare_param(p);
