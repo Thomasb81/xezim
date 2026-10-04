@@ -68877,6 +68877,14 @@ impl Simulator {
                             "[CAST] t={} FAIL src='{}' dest={:?} overlay={:?} global={:?} depth={}",
                             self.time, src_cls, dest_cls, ovl, glob, depth
                         );
+                        eprintln!(
+                            "[CAST]   method_local_base={:?} frames={:?}",
+                            self.method_local_base,
+                            self.local_type_stack
+                                .iter()
+                                .map(|(c, _)| c.iter().collect::<Vec<_>>())
+                                .collect::<Vec<_>>()
+                        );
                     }
                     if ok {
                         self.assign_value(&args[0], &v);
@@ -130127,6 +130135,44 @@ impl Simulator {
             }
         }
         self.push_local_frame(locals);
+        // §13.3: a class- or typedef-typed formal belongs to the CALLEE's
+        // frame overlay, and that frame only exists once the push above has
+        // happened — recording during the port loop would land in the
+        // CALLER's frame, which `local_class_type_of` never scans.
+        // `register_formal_type_metadata` there can only reach the
+        // by-bare-name globals, and those are shared by every process: a task
+        // suspended elsewhere holding a same-named local of an unrelated class
+        // overwrites the entry. After this task resumed from a timing control
+        // its formal then read THAT class, so `$cast` into the formal failed
+        // for a compatible object and SUCCEEDED for an incompatible one
+        // (issue #239).
+        for port in &td.ports {
+            if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                let type_name = tn.name.name.clone();
+                // Class check first: a class name can also key the typedef
+                // WIDTH table, which would misfile a class-typed formal into
+                // the typedef overlay (see the exec_function_call port loop).
+                if self.module.classes.contains_key(&type_name) {
+                    self.record_local_class_type(&port.name.name, &type_name);
+                } else if self.module.enum_members.contains_key(&type_name)
+                    || self.module.typedefs.contains_key(&type_name)
+                {
+                    self.record_local_typedef_type(&port.name.name, &type_name);
+                } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
+                    // Formal typed with a class TYPE PARAMETER (`IMP imp`):
+                    // record the resolved concrete class, as the function and
+                    // class-method port loops already do.
+                    let is_class = self.module.classes.contains_key(&concrete)
+                        || (concrete.contains('#')
+                            && self.module.classes.contains_key(
+                                concrete.split('#').next().unwrap_or(&concrete),
+                            ));
+                    if is_class {
+                        self.record_local_class_type(&port.name.name, &concrete);
+                    }
+                }
+            }
+        }
         // §6.21: open a static-local sync frame keyed by this task name.
         let sync_name = self.sync_frame_name(&td.name.name.name);
         self.static_local_syncs.push((sync_name, Vec::new()));
@@ -144912,7 +144958,18 @@ impl Simulator {
                         // typedef maps).
                         let forward_declared = class_ref == Some(true);
                         if !forward_declared && self.module.classes.contains_key(&type_name) {
-                            self.record_local_class_type(&port.name.name, &type_name);
+                            // Defer the overlay write to AFTER push_local_frame
+                            // (see frame_class_ports below). Recording here hit
+                            // the CALLER's frame, which `local_class_type_of`
+                            // never scans, so a class-typed formal lived only in
+                            // the by-bare-name global — and another process
+                            // suspended in a task holding a same-named local of
+                            // a different class overwrote it. The formal then
+                            // read that class: `$cast` into it failed for a
+                            // compatible object, and an INCOMPATIBLE one cast
+                            // successfully (issue #239).
+                            frame_class_ports
+                                .push((port.name.name.clone(), type_name.clone()));
                             self.note_formal_type_args(&port.name.name, type_args);
                             if self.var_class_types.get(port.name.name.as_str()) != Some(&type_name)
                             {
@@ -149229,11 +149286,22 @@ impl Simulator {
     fn class_declared_type_of(&self, expr: &Expression) -> Option<(String, Vec<Expression>)> {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
+            // Frame overlay first, exactly as `class_of_var` orders it (see
+            // `local_type_stack`). The `var_class_types` maps below are keyed
+            // by BARE name and shared by every process, so an unrelated task
+            // suspended with a same-named local of another class decided this
+            // name's type and `$typename` reported that class (issue #239).
+            let bname = &hier.path[0].name.name;
+            for key in [&*name, bname.as_str()] {
+                if let Some(base) = self.local_class_type_of(key) {
+                    let ta = self.var_type_args.get(key).cloned().unwrap_or_default();
+                    return Some((base, ta));
+                }
+            }
             if let Some(base) = self.var_class_types.get(&*name) {
                 let ta = self.var_type_args.get(&*name).cloned().unwrap_or_default();
                 return Some((base.clone(), ta));
             }
-            let bname = &hier.path[0].name.name;
             if let Some(base) = self.var_class_types.get(bname) {
                 let ta = self.var_type_args.get(bname).cloned().unwrap_or_default();
                 return Some((base.clone(), ta));
