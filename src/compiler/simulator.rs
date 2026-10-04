@@ -29948,18 +29948,19 @@ impl Simulator {
         if collapsed > 0 && std::env::var("XEZIM_DEBUG").is_ok() {
             eprintln!("[NET-COLLAPSE] {} identity port nets collapsed", collapsed);
         }
-        // XEZIM_BUF_COLLAPSE=1 (opt-in): collapse GENERAL whole-net identity
-        // continuous assigns (`assign y = x;` — the std-cell BUF fabric on
-        // gate-level SoCs; 5,939 of 25,850 CAs on the C906). Same mechanism
-        // as the port collapse above: re-point the lhs NAME at the rhs id
-        // before anything bakes ids, and the connect drops as a self-copy in
+        // Collapse GENERAL whole-net identity continuous assigns
+        // (`assign y = x;` — the std-cell BUF fabric on gate-level SoCs;
+        // 5,939 of 25,850 CAs on the C906). Same mechanism as the port
+        // collapse above: re-point the lhs NAME at the rhs id before
+        // anything bakes ids, and the connect drops as a self-copy in
         // build_comb_entries. Beyond deleting the entry evals, clock-buffer
         // chains merge onto their root, shrinking edge sensitivity fan-out.
-        // Opt-in because it removes the one-delta propagation step the
-        // buffer otherwise adds (the same transform the reference's
-        // optimizer applies), and a runtime force on the buffered name now
-        // reaches the shared net. Skipped entirely under SDF (a collapsed
-        // net would lose its annotated delay).
+        // It removes the one-delta propagation step the buffer otherwise
+        // adds (the same transform the reference's optimizer applies), which
+        // is why it was opt-in at first; the cases that makes observable are
+        // now excluded per net by the conditions below instead, so the pass
+        // runs by default. Skipped entirely under SDF (a collapsed net would
+        // lose its annotated delay).
         // Whole-net identity buffers (`assign y = x`) alias onto their source
         // by default; `XEZIM_BUF_COLLAPSE=0` turns the pass off. A net keeps
         // its own storage when aliasing would be observable: it is a force /
