@@ -265,7 +265,6 @@ fn test_sv_34_case_inside_ranges() {
 fn test_sv_35_disable_fork() {
     run_positive_compliance_test("tests_advanced", "35_disable_fork.sv");
 }
-#[ignore = "unimplemented feature (was dormant/unregistered before PR #48); un-ignore when implemented"]
 #[test]
 fn test_sv_36_tagged_union_patterns() {
     run_positive_compliance_test("tests_advanced", "36_tagged_union_patterns.sv");

@@ -7498,6 +7498,11 @@ pub struct Simulator {
     fst_id_to_trace: Vec<Vec<u32>>,
     /// Previous emitted value per `fst_trace` entry (parallel vector).
     fst_prev_signals: Vec<Value>,
+    /// SV event objects are pulses rather than levels, so they are kept out of
+    /// `fst_trace` and emitted once for each trigger.
+    fst_events: Vec<(usize, FstSignalId)>,
+    /// Last emitted trigger time for each `fst_events` entry.
+    fst_event_last: Vec<u64>,
     /// Pre-computed combinatorial entries with sensitivity sets.
     comb_entries: Vec<CombEntry>,
     /// Optional content-addressed cache for the compiled combinational
@@ -11906,6 +11911,8 @@ impl Simulator {
             fst_trace: Vec::new(),
             fst_id_to_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
+            fst_events: Vec::new(),
+            fst_event_last: Vec::new(),
             comb_entries: Vec::new(),
             prepared_comb_cache_path: None,
             comb_level: Vec::new(),
@@ -47057,10 +47064,7 @@ impl Simulator {
                 self.drain_reactive_region();
                 self.drain_nba_region_waiters();
                 late_passes += 1;
-                if self.finished
-                    || late_passes > 10_000
-                    || self.late_resume_epoch == epoch_before
-                {
+                if self.finished || late_passes > 10_000 || self.late_resume_epoch == epoch_before {
                     break;
                 }
             }
@@ -73901,6 +73905,60 @@ impl Simulator {
                         }
                     }
                 }
+                if hier.path.iter().all(|seg| seg.selects.is_empty()) {
+                    if hier.path.len() == 1 {
+                        let name = hier.path[0].name.name.as_str();
+                        if self.get_signal_value_by_name(name).is_none()
+                            && (self.module.functions.contains_key(name)
+                                || self.module.lets.contains_key(name))
+                        {
+                            return self.eval_call(expr, &[]);
+                        }
+                    } else {
+                        let leaf = hier.path.last().unwrap().name.name.as_str();
+                        let joined = hier
+                            .path
+                            .iter()
+                            .map(|seg| seg.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        let scoped = hier
+                            .path
+                            .iter()
+                            .map(|seg| seg.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::");
+                        let package_head = self.module.packages.contains(&hier.path[0].name.name);
+                        let package_fn = package_head
+                            && self.get_signal_value_by_name(leaf).is_none()
+                            && self.module.functions.contains_key(&scoped)
+                            && self
+                                .module
+                                .pkg_subr_owner
+                                .get(leaf)
+                                .is_some_and(|owner| owner == &hier.path[0].name.name);
+                        let instance_fn =
+                            !package_head && self.module.functions.contains_key(&joined);
+                        if package_fn || instance_fn {
+                            return self.eval_call(expr, &[]);
+                        }
+
+                        if Self::is_parenless_zero_arg_builtin(leaf) {
+                            let head = hier_prefix(hier);
+                            let recv = Expression::new(ExprKind::Ident(head), expr.span);
+                            let recv_name = self.expr_assoc_name(&recv).or_else(|| {
+                                Self::plain_ident_name(&recv).filter(|name| {
+                                    self.module.dynamic_arrays.contains(name)
+                                        || self.module.associative_arrays.contains_key(name)
+                                        || self.module.arrays.contains_key(name)
+                                })
+                            });
+                            if self.expr_is_string_valued(&recv) || recv_name.is_some() {
+                                return self.eval_call(expr, &[]);
+                            }
+                        }
+                    }
+                }
                 self.fast_signal_read(hier)
             }
             ExprKind::Unary { op, operand } => {
@@ -74118,7 +74176,10 @@ impl Simulator {
                                 for (a, b) in ls.iter().zip(rs.iter()) {
                                     let lv = self.get_signal_value_by_name(&format!("{}{}", lb, a));
                                     let rv = self.get_signal_value_by_name(&format!("{}{}", rb, b));
-                                    if lv.is_none() || rv.is_none() || self.coll_values_opt_eq(&lv, &rv, ew) == false {
+                                    if lv.is_none()
+                                        || rv.is_none()
+                                        || self.coll_values_opt_eq(&lv, &rv, ew) == false
+                                    {
                                         equal = false;
                                         break;
                                     }
@@ -76184,6 +76245,19 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr: recv, member } => {
+                if Self::is_parenless_zero_arg_builtin(&member.name) {
+                    let recv_name = self.expr_assoc_name(recv).or_else(|| {
+                        Self::plain_ident_name(recv).filter(|name| {
+                            self.module.dynamic_arrays.contains(name)
+                                || self.module.associative_arrays.contains_key(name)
+                                || self.module.arrays.contains_key(name)
+                        })
+                    });
+                    if self.expr_is_string_valued(recv) || recv_name.is_some() {
+                        return self.eval_call(expr, &[]);
+                    }
+                }
+
                 // §13.5.5: inside a function/task/class-method/final body a
                 // parenless zero-argument method parses as MemberAccess
                 // (module/initial/always scope yields a flat hierarchical
@@ -79196,9 +79270,8 @@ impl Simulator {
             // resolve it through the current instance's bindings to
             // the concrete class. A non-parameter name resolves to
             // None and passes through unchanged.
-            let type_name = type_name.map(|tn| {
-                self.resolve_type_param_binding(&tn).unwrap_or(tn.clone())
-            });
+            let type_name =
+                type_name.map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn.clone()));
             if let Some(tname) = type_name {
                 // §8.25: the type-parameter resolved to a SPECIALIZED
                 // class name `Base#(args)` (e.g. `T obj = new()` where
@@ -84056,7 +84129,8 @@ impl Simulator {
                         for q in self.semaphore_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
-                        self.await_waiters.retain(|w| !to_kill.contains(&w.waiter_pid));
+                        self.await_waiters
+                            .retain(|w| !to_kill.contains(&w.waiter_pid));
                         self.release_killed_from_join_waiters(&to_kill);
                         self.wake_await_waiters(&to_kill);
                         return;
@@ -84162,7 +84236,8 @@ impl Simulator {
                 for q in self.semaphore_get_waiters.values_mut() {
                     q.retain(|w| !to_kill.contains(&w.pid));
                 }
-                self.await_waiters.retain(|w| !to_kill.contains(&w.waiter_pid));
+                self.await_waiters
+                    .retain(|w| !to_kill.contains(&w.waiter_pid));
                 // A killed process must no longer hold back a join waiter: drop
                 // it from every waiter's expected children, and wake any waiter
                 // whose remaining children are now all accounted for.
@@ -97157,11 +97232,7 @@ impl Simulator {
 
     /// Copy an unpacked-struct message into a shadow variable; the returned
     /// value is the id that names it, to be queued in the message's place.
-    fn mbx_stash_struct(
-        &mut self,
-        src: &str,
-        su: &crate::ast::types::StructUnionType,
-    ) -> Value {
+    fn mbx_stash_struct(&mut self, src: &str, su: &crate::ast::types::StructUnionType) -> Value {
         let id = match self.mbx_free_ids.pop() {
             Some(id) => id,
             None => {
@@ -97435,7 +97506,8 @@ impl Simulator {
         for q in self.semaphore_get_waiters.values_mut() {
             q.retain(|w| !to_kill.contains(&w.pid));
         }
-        self.await_waiters.retain(|w| !to_kill.contains(&w.waiter_pid));
+        self.await_waiters
+            .retain(|w| !to_kill.contains(&w.waiter_pid));
         self.release_killed_from_join_waiters(&to_kill);
         // Wake any process that was awaiting the killed process.
         self.wake_await_waiters(&to_kill);
@@ -97447,8 +97519,8 @@ impl Simulator {
     /// dispatch should then stop executing the caller's current statement
     /// stream); false if the target is already terminated.
     fn proc_await(&mut self, target_pid: usize, caller_pid: usize, continuation: ProcCont) -> bool {
-        let terminated = self.killed_pids.contains(&target_pid)
-            || self.finished_pids.contains(&target_pid);
+        let terminated =
+            self.killed_pids.contains(&target_pid) || self.finished_pids.contains(&target_pid);
         if terminated {
             return false; // already done — caller continues
         }
@@ -98494,7 +98566,8 @@ impl Simulator {
         // storing the backing signal_table index per leaf.
         struct FstNode {
             children: BTreeMap<String, FstNode>,
-            signals: Vec<(String, u32, usize)>, // (leaf, width, signal_table idx)
+            // (display name, width, signal-table id, encoding, declaration kind, event)
+            signals: Vec<(String, u32, usize, FstSignalType, FstVarType, bool)>,
         }
         impl FstNode {
             fn new() -> Self {
@@ -98515,6 +98588,26 @@ impl Simulator {
                 _ => continue,
             };
             let width = self.lookup_signal_width(name).unwrap_or(1);
+            let own_id = self
+                .signal_name_to_id
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(tbl_id);
+            let kind = self.dump_var_kind(name, own_id);
+            let signal_type = if kind == VcdVarKind::Real {
+                FstSignalType::real()
+            } else {
+                FstSignalType::bit_vec(width.max(1))
+            };
+            let var_type = match kind {
+                VcdVarKind::Wire => FstVarType::Wire,
+                VcdVarKind::Reg => FstVarType::Reg,
+                VcdVarKind::Integer => FstVarType::Integer,
+                VcdVarKind::Time => FstVarType::Time,
+                VcdVarKind::Real => FstVarType::Real,
+                VcdVarKind::Event => FstVarType::Event,
+                VcdVarKind::Parameter => FstVarType::Parameter,
+            };
             let parts: Vec<&str> = name.split('.').collect();
             let (scope_parts, leaf) = if parts.len() > 1 {
                 (&parts[..parts.len() - 1], parts[parts.len() - 1])
@@ -98528,27 +98621,43 @@ impl Simulator {
                     .entry(part.to_string())
                     .or_insert_with(FstNode::new);
             }
-            node.signals.push((leaf.to_string(), width, tbl_id));
+            let display_name = match kind {
+                VcdVarKind::Real | VcdVarKind::Event => leaf.to_string(),
+                _ => match self.dump_var_range(name, width) {
+                    Some((left, right)) => format!("{leaf} [{left}:{right}]"),
+                    None => leaf.to_string(),
+                },
+            };
+            node.signals.push((
+                display_name,
+                width,
+                tbl_id,
+                signal_type,
+                var_type,
+                kind == VcdVarKind::Event,
+            ));
         }
 
         // DFS-emit scopes/vars, collecting (signal_table idx, FstSignalId).
         let mut trace: Vec<(usize, FstSignalId)> = Vec::new();
+        let mut events: Vec<(usize, FstSignalId)> = Vec::new();
         let mut id_to_fst: HashMap<usize, FstSignalId> = HashMap::default();
         fn emit<W: std::io::Write + std::io::Seek>(
             header: &mut FstHeaderWriter<W>,
             name: &str,
             node: &FstNode,
             trace: &mut Vec<(usize, FstSignalId)>,
+            events: &mut Vec<(usize, FstSignalId)>,
             id_to_fst: &mut HashMap<usize, FstSignalId>,
         ) {
             let _ = header.scope(name, "", FstScopeType::Module);
-            for (leaf, width, tbl_id) in &node.signals {
+            for (leaf, _width, tbl_id, signal_type, var_type, is_event) in &node.signals {
                 // Aliased nets (same signal_table id) reuse one FST id.
                 let alias = id_to_fst.get(tbl_id).copied();
                 let fid = match header.var(
                     leaf,
-                    FstSignalType::bit_vec((*width).max(1)),
-                    FstVarType::Wire,
+                    *signal_type,
+                    *var_type,
                     FstVarDirection::Implicit,
                     alias,
                 ) {
@@ -98557,11 +98666,15 @@ impl Simulator {
                 };
                 if alias.is_none() {
                     id_to_fst.insert(*tbl_id, fid);
-                    trace.push((*tbl_id, fid));
+                    if *is_event {
+                        events.push((*tbl_id, fid));
+                    } else {
+                        trace.push((*tbl_id, fid));
+                    }
                 }
             }
             for (child_name, child) in &node.children {
-                emit(header, child_name, child, trace, id_to_fst);
+                emit(header, child_name, child, trace, events, id_to_fst);
             }
             let _ = header.up_scope();
         }
@@ -98572,14 +98685,35 @@ impl Simulator {
                     children: BTreeMap::new(),
                     signals: std::mem::take(&mut root.signals),
                 };
-                emit(&mut header, "$unit", &unit, &mut trace, &mut id_to_fst);
+                emit(
+                    &mut header,
+                    "$unit",
+                    &unit,
+                    &mut trace,
+                    &mut events,
+                    &mut id_to_fst,
+                );
             }
             for (child_name, child) in &root.children {
-                emit(&mut header, child_name, child, &mut trace, &mut id_to_fst);
+                emit(
+                    &mut header,
+                    child_name,
+                    child,
+                    &mut trace,
+                    &mut events,
+                    &mut id_to_fst,
+                );
             }
         } else {
             let top_name = self.module.name.clone();
-            emit(&mut header, &top_name, &root, &mut trace, &mut id_to_fst);
+            emit(
+                &mut header,
+                &top_name,
+                &root,
+                &mut trace,
+                &mut events,
+                &mut id_to_fst,
+            );
         }
 
         let mut body = match header.finish() {
@@ -98597,9 +98731,12 @@ impl Simulator {
         let _ = body.time_change(self.time);
         let mut prev: Vec<Value> = Vec::with_capacity(trace.len());
         for (tbl_id, fid) in &trace {
-            let val = self.signal_table[*tbl_id].clone();
+            let val = self.dump_value(*tbl_id);
             let _ = body.signal_change(*fid, &Self::fst_format_value(&val));
-            prev.push(val);
+            prev.push(self.signal_table[*tbl_id].clone());
+        }
+        for (_, fid) in &events {
+            let _ = body.signal_change(*fid, b"0");
         }
 
         // Incremental change detection, shared with the VCD and XTrace writers
@@ -98608,6 +98745,8 @@ impl Simulator {
         self.enable_dump_dirty_tracking();
         self.fst_trace = trace;
         self.fst_prev_signals = prev;
+        self.fst_event_last = vec![u64::MAX; events.len()];
+        self.fst_events = events;
         self.fst_path = Some(filename.to_string());
         self.fst_writer = Some(if self.dump_writer_threaded() {
             super::fst_sink::FstSink::threaded(body)
@@ -98637,7 +98776,7 @@ impl Simulator {
                 let tbl_id = self.fst_trace[idx].0;
                 let val = &self.signal_table[tbl_id];
                 if self.fst_prev_signals[idx] != *val {
-                    changes.push((self.fst_trace[idx].1, val.clone()));
+                    changes.push((self.fst_trace[idx].1, self.dump_value(tbl_id)));
                     self.fst_prev_signals[idx] = val.clone();
                 }
             }};
@@ -98652,6 +98791,21 @@ impl Simulator {
                 for idx in 0..self.fst_trace.len() {
                     check_fst_slot!(idx);
                 }
+            }
+        }
+        let now = self.time;
+        for idx in 0..self.fst_events.len() {
+            let id = self.fst_events[idx].0;
+            let fired = self
+                .name_opt(id)
+                .and_then(|name| self.event_triggered_time.get(name))
+                .copied()
+                == Some(now);
+            if fired && self.fst_event_last[idx] != now {
+                self.fst_event_last[idx] = now;
+                let fid = self.fst_events[idx].1;
+                changes.push((fid, Value::ones(1)));
+                changes.push((fid, Value::zero(1)));
             }
         }
         if changes.is_empty() {
@@ -102008,6 +102162,41 @@ impl Simulator {
                 | "xor"
                 | "exists"
                 | "num"
+        )
+    }
+
+    fn is_parenless_zero_arg_builtin(m: &str) -> bool {
+        matches!(
+            m,
+            "first"
+                | "last"
+                | "num"
+                | "next"
+                | "prev"
+                | "name"
+                | "size"
+                | "len"
+                | "pop_front"
+                | "pop_back"
+                | "sort"
+                | "rsort"
+                | "reverse"
+                | "shuffle"
+                | "sum"
+                | "product"
+                | "and"
+                | "or"
+                | "xor"
+                | "min"
+                | "max"
+                | "unique"
+                | "unique_index"
+                | "tolower"
+                | "toupper"
+                | "atoi"
+                | "atohex"
+                | "atooct"
+                | "atobin"
         )
     }
 
@@ -113442,12 +113631,7 @@ impl Simulator {
     /// may be unset). Missing either side makes the pair unequal; an unknown
     /// element is treated as unequal (multi-dimensional-array reference
     /// semantics collapse an x element to a non-match).
-    fn coll_values_opt_eq(
-        &self,
-        a: &Option<Value>,
-        b: &Option<Value>,
-        ew: Option<u32>,
-    ) -> bool {
+    fn coll_values_opt_eq(&self, a: &Option<Value>, b: &Option<Value>, ew: Option<u32>) -> bool {
         match (a.as_ref(), b.as_ref()) {
             (Some(av), Some(bv)) => self.coll_values_eq(av, bv, ew),
             _ => false,
@@ -113502,7 +113686,9 @@ impl Simulator {
             // Compare at the declared element width so a differing storage
             // slot (width/signedness) does not decide the pair (the packed/
             // unpacked element-table family) — bits are what matter.
-            let ew = self.coll_elem_width(&ln).or_else(|| self.coll_elem_width(&rn));
+            let ew = self
+                .coll_elem_width(&ln)
+                .or_else(|| self.coll_elem_width(&rn));
             if !self.coll_values_eq(&lv, &rv, ew) {
                 equal = false;
             }
@@ -113600,7 +113786,9 @@ impl Simulator {
         let mut equal = size_eq;
         if equal {
             let rset: std::collections::HashSet<&String> = rkeys.iter().collect();
-            let ew = self.coll_elem_width(&ln).or_else(|| self.coll_elem_width(&rn));
+            let ew = self
+                .coll_elem_width(&ln)
+                .or_else(|| self.coll_elem_width(&rn));
             for k in &lkeys {
                 if !rset.contains(k) {
                     equal = false;
@@ -116278,7 +116466,10 @@ impl Simulator {
         }
         let name = format!("{}<{}>", base, sig);
         if let Some(hit) = self.module.classes.get(&name) {
-            return self.spec_clone_origin.contains_key(&name).then(|| hit.clone());
+            return self
+                .spec_clone_origin
+                .contains_key(&name)
+                .then(|| hit.clone());
         }
         let orig = self.module.classes.get(base)?.clone();
         let adds = self.param_vif_props(&orig, sig);
@@ -116291,7 +116482,8 @@ impl Simulator {
         self.module
             .classes
             .insert(name.clone(), std::sync::Arc::new(c));
-        self.spec_clone_origin.insert(name.clone(), base.to_string());
+        self.spec_clone_origin
+            .insert(name.clone(), base.to_string());
         self.class_member_names_cell = std::cell::OnceCell::new();
         self.compiled_method_admission = None;
         self.persisted_method_context_hash = None;
@@ -118376,7 +118568,11 @@ impl Simulator {
                 // handle-valued member, not of a bare variable): resolve
                 // the receiver chain to its object handle and classify from
                 // that object's class chain.
-                if self.class_member_names().vif_props.contains(member.name.as_str()) {
+                if self
+                    .class_member_names()
+                    .vif_props
+                    .contains(member.name.as_str())
+                {
                     if let Some(oh) = self.chain_handle(expr) {
                         return self.vif_operand_handle_prop(oh, &member.name);
                     }
@@ -118441,9 +118637,7 @@ impl Simulator {
     /// caller falls back to its non-vif path.
     fn chain_handle(&self, expr: &Expression) -> Option<usize> {
         match &expr.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 => {
-                self.eval_ident_handle(&h.path[0].name.name)
-            }
+            ExprKind::Ident(h) if h.path.len() == 1 => self.eval_ident_handle(&h.path[0].name.name),
             ExprKind::Ident(h) if h.path.len() > 1 => {
                 // A packed multi-segment path (`e.d`): the head names the
                 // object, each following segment an instance-property read.
@@ -124192,13 +124386,10 @@ impl Simulator {
                     } else {
                         n0
                     };
-                    let mid_is_scope_chain = fh.path[1..fh.path.len() - 1]
-                        .iter()
-                        .all(|s| {
-                            !self
-                                .member_is_static_coll(cls_for_members, &s.name.name)
-                                && !self.is_associative_array(&s.name.name)
-                        });
+                    let mid_is_scope_chain = fh.path[1..fh.path.len() - 1].iter().all(|s| {
+                        !self.member_is_static_coll(cls_for_members, &s.name.name)
+                            && !self.is_associative_array(&s.name.name)
+                    });
                     if !self.local_stack.last().is_some_and(|m| m.contains_key(n0))
                         && !self.signal_name_to_id.contains_key(n0)
                         && (self.module.packages.contains(n0)
@@ -124295,8 +124486,7 @@ impl Simulator {
                             }
                             if let Some(td) = self.task_decl_rc(&scoped) {
                                 let saved = self.name_resolve_hint.borrow().clone();
-                                *self.name_resolve_hint.borrow_mut() =
-                                    Some(scope.to_string());
+                                *self.name_resolve_hint.borrow_mut() = Some(scope.to_string());
                                 let saved_ts = self.timescale_scope_override.take();
                                 self.timescale_scope_override = Some(scope.to_string());
                                 self.exec_task_call(&td, args);
@@ -127163,7 +127353,10 @@ impl Simulator {
                     let recv = hier_prefix(hier);
                     let recv_expr = Expression::new(ExprKind::Ident(recv), func.span);
                     let h = self.eval_expr(&recv_expr).to_u64().unwrap_or(0) as usize;
-                    if h != 0 && (self.heap.get(h).and_then(|o| o.as_ref()).is_some() || h as u64 >= PROCESS_HANDLE_BASE) {
+                    if h != 0
+                        && (self.heap.get(h).and_then(|o| o.as_ref()).is_some()
+                            || h as u64 >= PROCESS_HANDLE_BASE)
+                    {
                         let mname = hier.path.last().unwrap().name.name.clone();
                         return self.exec_method_call(h, &mname, args);
                     }
@@ -134781,8 +134974,7 @@ impl Simulator {
                 .clone()
                 .filter(|(b, _)| *b == class_name_owned)
                 .or_else(|| computed_spec.clone());
-            active
-                .and_then(|(b, sig)| self.ensure_param_vif_class(&b, &sig))
+            active.and_then(|(b, sig)| self.ensure_param_vif_class(&b, &sig))
         };
         let class_def: &crate::compiler::elaborate::ElaboratedClass = param_vif_entry
             .as_deref()

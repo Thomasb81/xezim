@@ -28,19 +28,40 @@ module top;
 endmodule
 "#;
 
-#[test]
-fn infeasible_wide_set_fails_promptly() {
+const NESTED_SRC: &str = r#"
+class leaf_c;
+  rand bit [7:0] x;
+  rand bit [7:0] y;
+  constraint impossible_c { x % 7 == 3; y == x + 1; y % 7 == 5; }
+endclass
+class root_c;
+  rand leaf_c child;
+  function new(); child = new; endfunction
+endclass
+module top;
+  initial begin
+    root_c cfg = new;
+    int result;
+    cfg.child.x = 17;
+    cfg.child.y = 29;
+    result = cfg.randomize();
+    $display("N result=%0d x=%0d y=%0d", result, cfg.child.x, cfg.child.y);
+  end
+endmodule
+"#;
+
+fn run_with_deadline(source: &str, stem: &str) -> (std::process::ExitStatus, String, Duration) {
     let dir = std::env::temp_dir().join(format!("xezim_rand_budget_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temporary directory");
-    let path = dir.join("budget.sv");
-    std::fs::write(&path, SRC).expect("write design");
+    let path = dir.join(format!("{stem}.sv"));
+    std::fs::write(&path, source).expect("write design");
     let mut child = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .args(["--simulate", "--no-cache", path.to_str().unwrap()])
         .env("XEZIM_RAND_DBG", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("run xezim");
+        .expect("run randomization case");
     let start = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait") {
@@ -48,15 +69,22 @@ fn infeasible_wide_set_fails_promptly() {
         }
         if start.elapsed() > Duration::from_secs(120) {
             let _ = child.kill();
-            panic!("an infeasible randomize() did not finish in 120 s");
+            panic!("{stem} did not finish in 120 s");
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    let elapsed = start.elapsed();
     let mut text = String::new();
     use std::io::Read;
     child.stdout.take().unwrap().read_to_string(&mut text).ok();
     child.stderr.take().unwrap().read_to_string(&mut text).ok();
     let _ = std::fs::remove_dir_all(&dir);
+    (status, text, elapsed)
+}
+
+#[test]
+fn infeasible_wide_set_fails_promptly() {
+    let (status, text, _) = run_with_deadline(SRC, "wide");
     assert!(status.success(), "run failed:\n{text}");
     // failed, and left the variables as they were (§18.6.2)
     assert!(text.contains("R r=0 x=11 y=22"), "{text}");
@@ -69,5 +97,20 @@ fn infeasible_wide_set_fails_promptly() {
     assert!(
         nodes.iter().all(|&n| n < 20_000),
         "the search ran on its node budget: {nodes:?}"
+    );
+}
+
+#[test]
+fn nested_infeasible_object_fails_promptly_and_rolls_back() {
+    let (status, text, elapsed) = run_with_deadline(NESTED_SRC, "nested");
+    assert!(status.success(), "run failed:\n{text}");
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "nested randomization used its outer deadline: {elapsed:?}\n{text}"
+    );
+    assert!(text.contains("N result=0 x=17 y=29"), "{text}");
+    assert!(
+        text.contains("randomize FAILED") || text.contains("joint solve gave up"),
+        "missing budget diagnostic:\n{text}"
     );
 }

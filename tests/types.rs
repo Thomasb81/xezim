@@ -366,6 +366,8 @@ mod class_type_param_struct_prop;
 mod data_decl_param_spec_type_arg;
 #[path = "types/decode_helper_assign_compiles.rs"]
 mod decode_helper_assign_compiles;
+#[path = "types/enum_method_parenless.rs"]
+mod enum_method_parenless;
 #[path = "types/field_init_call_singletons.rs"]
 mod field_init_call_singletons;
 #[path = "types/formal_metadata_shadow_roundtrip.rs"]
@@ -374,6 +376,8 @@ mod formal_metadata_shadow_roundtrip;
 mod grouped_class_fields;
 #[path = "types/inside_const_members.rs"]
 mod inside_const_members;
+#[path = "types/issue_233_parenless_calls.rs"]
+mod issue_233_parenless_calls;
 #[path = "types/multi_dim_unpacked_arrays.rs"]
 mod multi_dim_unpacked_arrays;
 #[path = "types/nettype_struct_variable_driver.rs"]
@@ -434,5 +438,3 @@ mod vector_type_arg_spec;
 mod zero_mask_call_elision;
 #[path = "types/zero_width_select_confidence.rs"]
 mod zero_width_select_confidence;
-#[path = "types/enum_method_parenless.rs"]
-mod enum_method_parenless;

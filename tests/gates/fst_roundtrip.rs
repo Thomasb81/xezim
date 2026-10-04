@@ -26,10 +26,8 @@
 //! width, an alias, or a value. Decoding is also what a viewer does, which is
 //! the behaviour worth pinning.
 //!
-//! Three declaration-level gaps are known and NOT yet fixed; their tests are
-//! `#[ignore]`d with the reason on each, so they gate the fix rather than
-//! silently blessing the current output. Run them with
-//! `cargo test --test gates -- --ignored`.
+//! Declaration metadata, real values, and event pulses are decoded here as
+//! active regression checks alongside the end-of-run cases.
 
 use std::collections::HashMap;
 use std::io::BufReader;
@@ -462,15 +460,12 @@ fn scope_filter_restricts_the_dump_to_the_named_subtree() {
     );
 }
 
-// ── known gaps: these gate the fix, they do not bless the current output ──
-
 /// FST hardcodes `FstVarType::Wire` for every var and emits no bit range,
 /// discarding the classification `dump_var_kind()` already computes for VCD.
 /// `logic [15:8] hi` renumbers to `[7:0]` and an ascending `logic [0:7]` loses
 /// its bit order. FST carries the range inside the var name (`hi [15:8]`) —
 /// the form Verilator writes.
 #[test]
-#[ignore = "F5: all FST vars are typed Wire with no bit range (fix pending)"]
 fn var_declarations_carry_the_right_type_and_bit_range() {
     let fst = dump("vartype", KITCHEN);
     assert_eq!(fst.var("top.hi").tpe, FstVarType::Reg);
@@ -487,7 +482,6 @@ fn var_declarations_carry_the_right_type_and_bit_range() {
 /// as 0x3FF4000000000000. VCD and XTrace both carry explicit fixes for this;
 /// `fst-writer` exposes `FstSignalType::real()`.
 #[test]
-#[ignore = "F3: real is dumped as its raw IEEE-754 bit pattern (fix pending)"]
 fn real_variables_decode_as_reals() {
     let fst = dump("real", KITCHEN);
     assert_eq!(fst.var("top.r").tpe, FstVarType::Real);
@@ -501,7 +495,6 @@ fn real_variables_decode_as_reals() {
 /// trigger rate, and a trigger whose 0→1→0 cancels inside one time slot
 /// vanishes. VCD emits a `1<id>` pulse per trigger, XTrace an `X,event` record.
 #[test]
-#[ignore = "F4: event is traced as a level, so triggers cancel (fix pending)"]
 fn an_event_emits_a_pulse_at_every_trigger() {
     let fst = dump("event", KITCHEN);
     assert_eq!(fst.var("top.ev").tpe, FstVarType::Event);

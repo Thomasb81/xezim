@@ -1,11 +1,8 @@
 //! Stress regression: large-scale generated designs from `examples/stress_*.sv`.
 //!
-//! These exist to exercise the dual-store / signal-table / comb-entry code
-//! paths at scale. They are **slow** (10s–60s wall each on release builds)
-//! and are gated behind `#[ignore]` so the default `cargo test` stays fast.
-//!
-//! Run with:
-//!   cargo test --release --test stress_tests -- --ignored
+//! These exercise the dual-store / signal-table / comb-entry code paths at
+//! scale. The generated-instance case uses a CI-safe default size; set
+//! `XEZIM_FULL_STRESS=1` to retain its original 131072-instance scale.
 //!
 //! Each test asserts that:
 //!   1. Parsing + elaboration succeed for the entire generated design.
@@ -18,8 +15,14 @@ use xezim::simulate;
 
 fn run_stress(file: &str, top: &str, max_time: u64) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
-    let src =
+    let mut src =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    if file.ends_with("stress_signals.sv") && std::env::var_os("XEZIM_FULL_STRESS").is_none() {
+        src = src.replace(
+            "parameter integer N        = 131072;",
+            "parameter integer N        = 4096;",
+        );
+    }
     // simulate() takes a source string and a max time (ns). The stress
     // designs all $finish themselves at MAX_TIME, so a generous cap is fine.
     let _ = top; // simulate() picks the last module by default; stress files put `top` last.
@@ -34,7 +37,6 @@ fn run_stress(file: &str, top: &str, max_time: u64) {
 }
 
 #[test]
-#[ignore]
 fn stress_signals_131k_named() {
     // 131072 named bit-cell instances + 1 clock cycle settling.
     // Exercises name → id maps and signal_table sizing without
@@ -43,7 +45,6 @@ fn stress_signals_131k_named() {
 }
 
 #[test]
-#[ignore]
 fn stress_comb_continuous_assigns() {
     // Comb-heavy: every cell is `assign sum/diff/xor_out = …`. Stresses the
     // continuous-assign compile path and write_signal_ids on comb_entries.
@@ -51,7 +52,6 @@ fn stress_comb_continuous_assigns() {
 }
 
 #[test]
-#[ignore]
 fn stress_explicit_instances() {
     // Generated explicit instantiations (no genvar/generate). Stresses the
     // elaborator's instantiation-binding path at large fan-out.
