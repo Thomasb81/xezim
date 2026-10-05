@@ -100258,6 +100258,36 @@ impl Simulator {
         false
     }
 
+    /// The concrete class bound to a TYPE-PARAMETER-typed property of an
+    /// object. `class_prop_type_named` hands back the parameter NAME for such a
+    /// property — `REQ req;` in `uvm_driver #(type REQ = uvm_sequence_item)` —
+    /// and leaves the resolution to its callers. The binding sits in the
+    /// object's own `type_bindings`, or in an `extends base #(item)` somewhere
+    /// between the object's class and the class declaring the property, so
+    /// the chain is walked to the declaring class and the name carried back
+    /// down it.
+    fn bound_prop_class(&self, inst: &ClassInstance, prop: &str, param: &str) -> Option<String> {
+        let owners = self.prop_owners(&inst.class_name);
+        let owner = owners.get(prop)?.0.as_str();
+        let mut chain: Vec<&super::elaborate::ElaboratedClass> = Vec::new();
+        let mut cur: Option<&str> = Some(inst.class_name.as_str());
+        while let Some(cn) = cur {
+            if chain.len() == 16 {
+                return None;
+            }
+            let cd = self.module.classes.get(cn)?;
+            chain.push(cd.as_ref());
+            if cn == owner {
+                let k = chain.len() - 1;
+                let c = Self::carried_type_binding(&inst.type_bindings, &chain, k, param)?;
+                let base = c.split('#').next().unwrap_or(&c);
+                return self.module.classes.contains_key(base).then_some(c);
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
     /// The binding of type parameter `name` of `chain[k]` for an object whose
     /// class is `chain[0]` with `bindings`: level 0 reads the bindings;
     /// each level above takes the child's `extends_type_args` entry at the
@@ -107120,6 +107150,12 @@ impl Simulator {
                 if let Some(tn) = self.class_prop_type_named(&inst.class_name, vname) {
                     if self.module.classes.contains_key(&tn) || tn.contains('#') {
                         return Some(tn);
+                    }
+                    // A property typed by a class TYPE PARAMETER comes back as
+                    // the parameter's NAME, which is no class. Resolve it, as
+                    // `class_prop_type_named` leaves to its callers.
+                    if let Some(c) = self.bound_prop_class(inst, vname, &tn) {
+                        return Some(c);
                     }
                 }
             }
@@ -130732,18 +130768,14 @@ impl Simulator {
         if top.saves.iter().any(|d| d.meta.name == name) {
             return;
         }
-        // Only a variable still live outside this activation — in the signal
-        // maps or a caller's frame — can observe the stale entries; a name
-        // left over from an earlier, finished call has nothing to protect.
-        let n = self.local_stack.len();
-        if !(self.signals.contains_key(name)
-            || self.signal_name_to_id.contains_key(name)
-            || self.local_stack[..n.saturating_sub(1)]
-                .iter()
-                .any(|f| f.contains_key(name)))
-        {
-            return;
-        }
+        // No liveness filter: the displaced entries may belong to a task
+        // SUSPENDED in another process (its frames are swapped out, so
+        // neither `local_stack` nor the signal maps show them). A function
+        // run meanwhile — a predictor's `uvm_reg_bus_op rw` while a
+        // register task holds `uvm_reg_item rw` — would otherwise leave its
+        // struct layout behind, and the task's `rw.status = ...` then wrote
+        // a bit slice into the handle. Putting back a finished call's stale
+        // entries is harmless: it is the state from before this call.
         let save = DeclShadow {
             width: self.widths.get(name).copied(),
             signed: self.signed_signals.contains(name),

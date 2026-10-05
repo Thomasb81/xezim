@@ -533,5 +533,13 @@ mod vif_static_roundtrip;
 mod constraint_shift_bounds;
 #[path = "classes/formal_class_type_frame_scoped.rs"]
 mod formal_class_type_frame_scoped;
+#[path = "classes/concurrent_function_struct_local_shadow.rs"]
+mod concurrent_function_struct_local_shadow;
+#[path = "classes/type_param_prop_member_write.rs"]
+mod type_param_prop_member_write;
 #[path = "classes/uvm_feature_coverage.rs"]
 mod uvm_feature_coverage;
+#[path = "classes/uvm_ral_coverage.rs"]
+mod uvm_ral_coverage;
+#[path = "classes/uvm_tlm_coverage.rs"]
+mod uvm_tlm_coverage;
