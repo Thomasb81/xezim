@@ -24,6 +24,101 @@ fn tagged(src: &str) -> Vec<String> {
         .collect()
 }
 
+/// Failed forcing restores existing values; disabling the offending block
+/// then allows the next call to solve at the declared width.
+#[test]
+fn inherited_width_failure_rolls_back_and_next_call_recovers() {
+    let out = tagged(
+        r#"
+class narrow_base;
+  rand bit [3:0] token;
+endclass
+class narrow_child extends narrow_base;
+  rand logic [127:0] padding;
+  constraint limit_block { token == 32'd31; }
+endclass
+module probe;
+  initial begin
+    narrow_child obj = new();
+    int result;
+    obj.token = 9;
+    obj.padding = 128'h112233445566778899aabbccddeeff00;
+    result = obj.randomize();
+    $display("T failed=%0d token=%0d restored=%0d", result, obj.token,
+             obj.padding == 128'h112233445566778899aabbccddeeff00);
+    obj.limit_block.constraint_mode(0);
+    result = obj.randomize() with { token == 6; };
+    $display("T recovered=%0d token=%0d", result, obj.token);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(out, ["T failed=0 token=9 restored=1", "T recovered=1 token=6"]);
+}
+
+/// Reversed operands and strict bounds take the same sum-repair path.
+#[test]
+fn mirrored_member_sum_bounds_keep_pinned_terms() {
+    let out = tagged(
+        r#"
+typedef struct packed {
+  bit [7:0] first;
+  bit [7:0] second;
+  bit [127:0] padding;
+} bundle_t;
+class sum_probe;
+  rand bundle_t bundle;
+  constraint bounds {
+    bundle.first == 2;
+    3 >= ({1'b0, bundle.first} + {1'b0, bundle.second});
+    3 > ({1'b0, bundle.first} + {1'b0, bundle.second});
+  }
+endclass
+module probe;
+  initial begin
+    sum_probe obj = new();
+    int failures, invalid;
+    repeat (64) begin
+      if (!obj.randomize()) failures++;
+      else if (obj.bundle.first != 2 || obj.bundle.second != 0) invalid++;
+    end
+    $display("T failures=%0d invalid=%0d", failures, invalid);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(out, ["T failures=0 invalid=0"]);
+}
+
+#[test]
+fn impossible_zero_sum_strict_bound_restores_the_bundle() {
+    let out = tagged(
+        r#"
+typedef struct packed {
+  bit [3:0] first;
+  bit [3:0] second;
+  bit [127:0] padding;
+} saved_bundle_t;
+class impossible_sum;
+  rand saved_bundle_t bundle;
+  constraint bounds { ({1'b0, bundle.first} + {1'b0, bundle.second}) < 0; }
+endclass
+module probe;
+  initial begin
+    impossible_sum obj = new();
+    saved_bundle_t saved;
+    int result;
+    saved = {4'd3, 4'd5, 128'habcdef0123456789};
+    obj.bundle = saved;
+    result = obj.randomize();
+    $display("T result=%0d restored=%0d", result, obj.bundle === saved);
+  end
+endmodule
+"#,
+    );
+    assert_eq!(out, ["T result=0 restored=1"]);
+}
+
 /// Section A: `==` with a right-hand side wider than the variable. With
 /// `tot == 0` the right side is 2^40-1, which no 32-bit `ma` equals once
 /// both are extended to 40 bits — randomize() must fail and leave `ma`.

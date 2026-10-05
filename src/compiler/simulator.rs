@@ -2607,6 +2607,29 @@ mod store_write_mask_tests {
         let first = std::thread::spawn(take_store_writes).join().unwrap();
         assert_eq!(first, u64::MAX);
     }
+
+    #[test]
+    fn simultaneous_drains_preserve_each_threads_mask() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for name in ["worker_left", "worker_right"] {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let _ = take_store_writes();
+                    let mut mismatches = 0;
+                    for _ in 0..64 {
+                        note_store_write(name_bit(name));
+                        barrier.wait();
+                        let observed = take_store_writes();
+                        barrier.wait();
+                        mismatches += usize::from(observed != name_bit(name));
+                        mismatches += usize::from(take_store_writes() != 0);
+                    }
+                    assert_eq!(mismatches, 0);
+                });
+            }
+        });
+    }
 }
 
 #[cfg(test)]
