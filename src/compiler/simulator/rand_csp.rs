@@ -34,6 +34,13 @@ use crate::ast::decl::DistWeight;
 use crate::compiler::elaborate::{is_type_real, is_type_signed, resolve_type_width};
 use rand::Rng;
 
+thread_local! {
+    /// Set while a `std::randomize` (scope) solve runs: the solver's
+    /// evaluation frames then extend the caller's locals instead of hiding
+    /// them (see `csp_frame`).
+    static CSP_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Sorted, disjoint, inclusive integer intervals.
 type Dom = Vec<(i128, i128)>;
 
@@ -265,6 +272,19 @@ enum Node {
         src: usize,
         neg: bool,
     },
+    /// `var OP other` where `other` is an expression the linear model
+    /// cannot express (a select of a variable, an element of a state array
+    /// indexed by variables, …). Once every variable `other` reads is fixed
+    /// it is evaluated and narrows `var` — `==` fixes it — instead of
+    /// waiting for `var` to be guessed. `whole` is the original relation
+    /// (negated when `neg`), judged once everything is fixed.
+    Fun {
+        var: usize,
+        op: BinaryOp,
+        other: usize,
+        whole: usize,
+        neg: bool,
+    },
     And(Vec<Node>),
     Or(Vec<Node>),
     If {
@@ -356,6 +376,10 @@ struct Csp {
     opaque: bool,
     /// Rand sub-object scalars are variables too (`csp_add_sub`).
     has_subs: bool,
+    /// `std::randomize(…) with {…}` (§18.12): the variables are the
+    /// caller's own — written through these lvalues (scalars) and by
+    /// element name (arrays) — and the solve runs in the caller's scope.
+    scope: Option<HashMap<String, Expression>>,
 }
 
 /// Translation scope: bound `foreach` indices and the `with` iterator.
@@ -529,6 +553,13 @@ impl Node {
             }
             Node::AllDiff(vs) => out.extend(vs.iter().copied()),
             Node::Eval { src, .. } => out.extend(srcs[*src].deps.iter().copied()),
+            Node::Fun {
+                var, other, whole, ..
+            } => {
+                out.push(*var);
+                out.extend(srcs[*other].deps.iter().copied());
+                out.extend(srcs[*whole].deps.iter().copied());
+            }
             Node::And(ns) | Node::Or(ns) => ns.iter().for_each(|n| n.deps(srcs, out)),
             Node::If {
                 cond, then, els, ..
@@ -656,6 +687,111 @@ impl Simulator {
         CspOutcome::Sat
     }
 
+    /// §18.12: solve `std::randomize(…) with {items}` jointly. `scalars`
+    /// are (name, lvalue, width, signed, enum values); `arrays` are (name,
+    /// element indices, width, signed, enum values) of collections already
+    /// sized. The solution is written to the caller's variables and checked
+    /// with the inline-constraint checker.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn rand_csp_solve_scope(
+        &mut self,
+        items: &[ConstraintItem],
+        scalars: &[(String, Expression, u32, bool, Option<Vec<u64>>)],
+        arrays: &[(String, Vec<i64>, u32, bool, Option<Vec<u64>>)],
+    ) -> CspOutcome {
+        let mut csp = Csp {
+            handle: usize::MAX,
+            vars: Vec::new(),
+            dom0: Vec::new(),
+            scalars: HashMap::default(),
+            arrays: HashMap::default(),
+            srcs: Vec::new(),
+            nodes: Vec::new(),
+            soft_enabled: None,
+            soft_priority: Vec::new(),
+            soft_rank: (0, 0),
+            dists: Vec::new(),
+            order: Vec::new(),
+            opaque: false,
+            has_subs: false,
+            scope: Some(HashMap::default()),
+        };
+        let dom_of = |w: u32, s: bool, members: &Option<Vec<u64>>| -> Dom {
+            match members {
+                Some(m) if !m.is_empty() => {
+                    dom_norm(m.iter().map(|&v| (v as i128, v as i128)).collect())
+                }
+                _ => {
+                    let (lo, hi) = ws_range(w, s);
+                    vec![(lo, hi)]
+                }
+            }
+        };
+        for (name, idx, w, s, members) in arrays {
+            if *w == 0 || *w > 64 {
+                return CspOutcome::NotApplicable;
+            }
+            let dom = dom_of(*w, *s, members);
+            let mut elems = Vec::with_capacity(idx.len());
+            for &i in idx {
+                elems.push((i, csp.vars.len()));
+                csp.vars.push(CspVar {
+                    key: VarKey::Elem(format!("{}[{}]", name, i)),
+                    width: *w,
+                    signed: *s,
+                });
+                csp.dom0.push(dom.clone());
+            }
+            csp.arrays.insert(
+                name.clone(),
+                CspArr {
+                    elems,
+                    width: *w,
+                    signed: *s,
+                },
+            );
+        }
+        for (name, lv, w, s, members) in scalars {
+            if *w == 0 || *w > 64 || csp.arrays.contains_key(name) {
+                return CspOutcome::NotApplicable;
+            }
+            csp.scalars.insert(name.clone(), csp.vars.len());
+            csp.vars.push(CspVar {
+                key: VarKey::Prop(name.clone()),
+                width: *w,
+                signed: *s,
+            });
+            csp.dom0.push(dom_of(*w, *s, members));
+            if let Some(l) = csp.scope.as_mut() {
+                l.insert(name.clone(), lv.clone());
+            }
+        }
+        if csp.vars.is_empty() || csp.vars.len() > MAX_VARS {
+            return CspOutcome::NotApplicable;
+        }
+        let constraints = vec![ClassConstraint {
+            is_static: false,
+            is_extern: false,
+            has_body: true,
+            name: crate::ast::Identifier {
+                name: "__inline__".to_string(),
+                span: crate::ast::Span::dummy(),
+            },
+            items: items.to_vec(),
+            span: crate::ast::Span::dummy(),
+        }];
+        let prev = CSP_SCOPE.with(|c| c.replace(true));
+        let prev_receiver = self.rand_receiver.take();
+        let out = if self.csp_translate(&mut csp, &constraints, &[]).is_none() {
+            CspOutcome::NotApplicable
+        } else {
+            self.csp_run(&csp, &constraints, &[])
+        };
+        self.rand_receiver = prev_receiver;
+        CSP_SCOPE.with(|c| c.set(prev));
+        out
+    }
+
     /// Build the variable table: rand scalars and array elements.
     fn csp_vars(
         &mut self,
@@ -681,6 +817,7 @@ impl Simulator {
             order: Vec::new(),
             opaque: false,
             has_subs: false,
+            scope: None,
         };
         let enum_dom = |me: &Self, tn: &str| -> Option<Dom> {
             let members = me.module.enum_members.get(tn)?;
@@ -846,7 +983,14 @@ impl Simulator {
             let x = st.fixed(v).unwrap_or(0);
             self.csp_write(csp, v, x);
         }
-        if self.rand_items_accept(csp.handle, constraints, colls, &mut false) {
+        let accepted = if csp.scope.is_some() {
+            let items: Vec<ConstraintItem> =
+                constraints.iter().flat_map(|c| c.items.iter().cloned()).collect();
+            self.inline_constraints_satisfied(&items)
+        } else {
+            self.rand_items_accept(csp.handle, constraints, colls, &mut false)
+        };
+        if accepted {
             CspOutcome::Sat
         } else {
             if std::env::var_os("XEZIM_RAND_DBG").is_some() {
@@ -1154,6 +1298,29 @@ impl Simulator {
                 _ => {}
             }
         }
+        // A `Fun` variable is decided after the variables its value is a
+        // function of, so it is narrowed rather than guessed.
+        fn funs(n: &Node, srcs: &[Src], aux: &mut Aux) {
+            match n {
+                Node::And(ns) | Node::Or(ns) => ns.iter().for_each(|m| funs(m, srcs, aux)),
+                Node::If { then, els, .. } => {
+                    funs(then, srcs, aux);
+                    funs(els, srcs, aux);
+                }
+                Node::Fun { var, other, .. } => {
+                    for &d in &srcs[*other].deps {
+                        if d != *var && !aux.preds[*var].contains(&d) {
+                            aux.preds[*var].push(d);
+                            aux.succs[d].push(*var);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for nd in &csp.nodes {
+            funs(nd, &csp.srcs, &mut aux);
+        }
         let mut gv = Vec::new();
         for nd in &csp.nodes {
             conds(nd, &csp.srcs, &mut gv);
@@ -1319,6 +1486,50 @@ impl Simulator {
             Node::Eval { src, neg } => {
                 !self.csp_src_fixed(csp, st, *src) || self.csp_eval_src(csp, st, *src) != *neg
             }
+            Node::Fun {
+                var,
+                op,
+                other,
+                whole,
+                neg,
+            } => {
+                if !self.csp_src_fixed(csp, st, *other) {
+                    return true;
+                }
+                if self.csp_src_fixed(csp, st, *whole) {
+                    return self.csp_eval_src(csp, st, *whole) != *neg;
+                }
+                let c = self.csp_eval_value(csp, st, *other);
+                if c.has_unknown() {
+                    // §11.4.4: a relation with an x/z operand is not true.
+                    return false;
+                }
+                let (vw, vs) = (csp.vars[*var].width, csp.vars[*var].signed);
+                let k: i128 = match (vs, c.is_signed) {
+                    (false, false) => match c.to_u64() {
+                        Some(x) => x as i128,
+                        None => return true,
+                    },
+                    (true, true) if c.width <= 64 => {
+                        let x = c.to_u64().unwrap_or(0);
+                        let sh = 64 - c.width.max(1);
+                        (((x << sh) as i64) >> sh) as i128
+                    }
+                    // Mixed signedness: leave it to the final judgement.
+                    _ => return true,
+                };
+                let _ = vw;
+                const BIG: i128 = i128::MAX / 4;
+                let nd = match op {
+                    BinaryOp::Eq | BinaryOp::CaseEq => dom_meet(&st.d[*var], &vec![(k, k)]),
+                    BinaryOp::Neq | BinaryOp::CaseNeq => dom_minus(&st.d[*var], &vec![(k, k)]),
+                    BinaryOp::Lt => dom_clip(&st.d[*var], -BIG, k - 1),
+                    BinaryOp::Leq => dom_clip(&st.d[*var], -BIG, k),
+                    BinaryOp::Gt => dom_clip(&st.d[*var], k + 1, BIG),
+                    _ => dom_clip(&st.d[*var], k, BIG),
+                };
+                st.set(*var, nd)
+            }
             Node::And(ns) => ns.iter().all(|m| self.csp_enforce(csp, m, st)),
             Node::Or(ns) => {
                 let mut open: Option<&Node> = None;
@@ -1427,7 +1638,10 @@ impl Simulator {
                 xs.sort_unstable();
                 Some(xs.windows(2).all(|w| w[0] != w[1]))
             }
-            Node::Eval { src, neg } => {
+            Node::Eval { src, neg }
+            | Node::Fun {
+                whole: src, neg, ..
+            } => {
                 if self.csp_src_fixed(csp, st, *src) {
                     Some(self.csp_eval_src(csp, st, *src) != *neg)
                 } else {
@@ -1476,6 +1690,19 @@ impl Simulator {
         st.all_fixed(&csp.srcs[src].deps)
     }
 
+    /// The local frame to evaluate under with `binds` (foreach indices)
+    /// bound. A class solve runs in the object's method frame, which holds
+    /// nothing else; a scope solve keeps the caller's locals visible.
+    fn csp_frame(&self, binds: &[(String, Value)]) -> HashMap<String, Value> {
+        let mut frame: HashMap<String, Value> = if CSP_SCOPE.with(|c| c.get()) {
+            self.local_stack.last().cloned().unwrap_or_default()
+        } else {
+            HashMap::default()
+        };
+        frame.extend(binds.iter().cloned());
+        frame
+    }
+
     /// Judge a source constraint with the ordinary evaluator: the fixed
     /// variables it reads are written to the object first.
     fn csp_eval_src(&mut self, csp: &Csp, st: &St, src: usize) -> bool {
@@ -1485,7 +1712,7 @@ impl Simulator {
                 self.csp_write(csp, v, x);
             }
         }
-        let frame: HashMap<String, Value> = s.binds.iter().cloned().collect();
+        let frame = self.csp_frame(&s.binds);
         self.push_local_frame(frame);
         let ok = match &s.item {
             SrcItem::Expr(e) => self.cons_expr_true(e),
@@ -1495,10 +1722,41 @@ impl Simulator {
         ok
     }
 
+    /// The value of a source expression with its fixed variables written.
+    fn csp_eval_value(&mut self, csp: &Csp, st: &St, src: usize) -> Value {
+        let s = &csp.srcs[src];
+        for &v in &s.deps {
+            if let Some(x) = st.fixed(v) {
+                self.csp_write(csp, v, x);
+            }
+        }
+        let frame = self.csp_frame(&s.binds);
+        self.push_local_frame(frame);
+        let v = match &s.item {
+            SrcItem::Expr(e) => self.eval_expr(e),
+            SrcItem::Item(_) => Value::new(1),
+        };
+        self.pop_local_frame();
+        v
+    }
+
     fn csp_write(&mut self, csp: &Csp, v: usize, x: i128) {
         let var = &csp.vars[v];
         let mut val = Value::from_u64(Self::bits_at(x, var.width) as u64, var.width);
         val.is_signed = var.signed;
+        if let Some(lvals) = &csp.scope {
+            match &var.key {
+                VarKey::Prop(n) => {
+                    if let Some(lv) = lvals.get(n) {
+                        let lv = lv.clone();
+                        self.assign_value(&lv, &val);
+                    }
+                }
+                VarKey::Elem(k) => self.set_signal_value_by_name(k, val),
+                VarKey::Sub(..) => {}
+            }
+            return;
+        }
         match &var.key {
             VarKey::Prop(n) => {
                 if let Some(Some(inst)) = self.heap.get_mut(csp.handle) {
@@ -1956,7 +2214,7 @@ impl Simulator {
             return;
         };
         let (vlo, vhi) = ws_range(w, s);
-        let frame: HashMap<String, Value> = env.binds.iter().cloned().collect();
+        let frame = self.csp_frame(&env.binds);
         self.push_local_frame(frame);
         let mut items = Vec::with_capacity(ranges.len());
         let mut ok = true;
@@ -2239,8 +2497,11 @@ impl Simulator {
         env: &Env,
         neg: bool,
     ) -> Option<Node> {
-        let fallback = |me: &mut Self, csp: &mut Csp| {
-            me.csp_eval_node(csp, SrcItem::Expr(whole.clone()), env, neg)
+        let fallback = |me: &mut Self, csp: &mut Csp| match me
+            .csp_rel_fun(csp, whole, op, left, right, env, neg)
+        {
+            Some(n) => Some(n),
+            None => me.csp_eval_node(csp, SrcItem::Expr(whole.clone()), env, neg),
         };
         // `(a >> k) REL c` with a constant k and an unsigned `a` is a RANGE on
         // `a`: the shift is floor division by 2**k, so each relation maps onto
@@ -2318,6 +2579,91 @@ impl Simulator {
             fits,
             src,
             sneg: neg,
+        })
+    }
+
+    /// `x OP e` (either way round) with `x` a solver variable and `e` an
+    /// expression of OTHER variables the linear model cannot express: a
+    /// `Fun` node (see there). None when no side qualifies.
+    #[allow(clippy::too_many_arguments)]
+    fn csp_rel_fun(
+        &mut self,
+        csp: &mut Csp,
+        whole: &Expression,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+        env: &Env,
+        neg: bool,
+    ) -> Option<Node> {
+        if !matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::CaseEq
+                | BinaryOp::Neq
+                | BinaryOp::CaseNeq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+        ) {
+            return None;
+        }
+        let op = if neg {
+            match op {
+                BinaryOp::Eq | BinaryOp::CaseEq => BinaryOp::Neq,
+                BinaryOp::Neq | BinaryOp::CaseNeq => BinaryOp::Eq,
+                BinaryOp::Lt => BinaryOp::Geq,
+                BinaryOp::Leq => BinaryOp::Gt,
+                BinaryOp::Gt => BinaryOp::Leq,
+                _ => BinaryOp::Lt,
+            }
+        } else {
+            op
+        };
+        let mirror = |o: BinaryOp| match o {
+            BinaryOp::Lt => BinaryOp::Gt,
+            BinaryOp::Leq => BinaryOp::Geq,
+            BinaryOp::Gt => BinaryOp::Lt,
+            BinaryOp::Geq => BinaryOp::Leq,
+            o => o,
+        };
+        let plain_var = |me: &mut Self, csp: &Csp, e: &Expression| match me.csp_ae(csp, e, env) {
+            Some(Ae::Var(v, ..)) => Some(v),
+            _ => None,
+        };
+        let reads = |me: &Self, csp: &Csp, e: &Expression| -> Option<Vec<usize>> {
+            let mut d = Vec::new();
+            me.csp_refs(csp, e, env, &mut d).then_some(d)
+        };
+        let mut pick = None;
+        if let Some(v) = plain_var(self, csp, left) {
+            if let Some(d) = reads(self, csp, right).filter(|d| !d.is_empty() && !d.contains(&v)) {
+                pick = Some((v, right, op, d));
+            }
+        }
+        if pick.is_none() {
+            if let Some(v) = plain_var(self, csp, right) {
+                if let Some(d) = reads(self, csp, left).filter(|d| !d.is_empty() && !d.contains(&v))
+                {
+                    pick = Some((v, left, mirror(op), d));
+                }
+            }
+        }
+        let (var, other, op, mut deps) = pick?;
+        deps.sort_unstable();
+        deps.dedup();
+        let other_src = self.csp_src(csp, SrcItem::Expr(other.clone()), env, deps.clone());
+        deps.push(var);
+        deps.sort_unstable();
+        deps.dedup();
+        let whole_src = self.csp_src(csp, SrcItem::Expr(whole.clone()), env, deps);
+        Some(Node::Fun {
+            var,
+            op,
+            other: other_src,
+            whole: whole_src,
+            neg,
         })
     }
 
@@ -2404,7 +2750,7 @@ impl Simulator {
         let Some(lin) = lin else {
             return self.csp_eval_node(csp, whole, env, neg);
         };
-        let frame: HashMap<String, Value> = env.binds.iter().cloned().collect();
+        let frame = self.csp_frame(&env.binds);
         self.push_local_frame(frame);
         let set = dom_norm(self.cons_ranges_i128(ranges));
         self.pop_local_frame();
@@ -2524,6 +2870,10 @@ impl Simulator {
                     // this object through an alias; stay conservative.
                     if h.path.len() == 1 {
                         push_name(&seg.name.name, out);
+                    } else if csp.scalars.contains_key(&h.path[0].name.name) {
+                        // A field of a packed-struct variable (`s.lo`) reads
+                        // the variable.
+                        push_name(&h.path[0].name.name, out);
                     }
                 }
                 true
@@ -2691,7 +3041,7 @@ impl Simulator {
 
     /// Evaluate a variable-free expression with the foreach indices bound.
     fn csp_const_any(&mut self, e: &Expression, env: &Env) -> Value {
-        let frame: HashMap<String, Value> = env.binds.iter().cloned().collect();
+        let frame = self.csp_frame(&env.binds);
         self.push_local_frame(frame);
         let v = self.eval_expr(e);
         self.pop_local_frame();
