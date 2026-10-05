@@ -139016,9 +139016,12 @@ impl Simulator {
                         !Self::constraint_unmodeled(item)
                             && !self.check_constraint_item(handle, item)
                     }) {
-                        failed_names.push(constraint.name.name.as_str());
+                        failed_names.push(constraint.name.name.clone());
                     }
                 }
+                failed_names.extend(self.failed_child_constraint_names(handle));
+                failed_names.sort();
+                failed_names.dedup();
                 let names = failed_names.join(", ");
                 eprintln!(
                     "[xezim][error] randomize budget exhausted in class {}; last failed constraints: {}; returning 0 and restoring prior values",

@@ -208,7 +208,13 @@ fn uvm_2020_concurrent_assertions_sample_with_dpi() {
         lines.contains(&"T|counts top=7 direct=7 inner=7"),
         "all three assertion placements must evaluate: {lines:?}"
     );
-    assert_eq!(sim.time, 16, "the UVM run must drain its objection");
+    let start: u64 = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("T|run_start="))
+        .expect("run phase must start")
+        .parse()
+        .expect("numeric run start");
+    assert_eq!(sim.time, start + 16, "the UVM run must drain its objection");
 }
 
 /// Full driver/sequencer/monitor/scoreboard bench on UVM 1800.2-2020: the

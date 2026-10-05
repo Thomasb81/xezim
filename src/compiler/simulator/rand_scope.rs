@@ -26,6 +26,59 @@ pub(super) struct RandChildTransaction {
 }
 
 impl Simulator {
+    /// Budget exhaustion can occur in the parent after a child rolled back.
+    /// Include active child constraints when identifying the failed solve.
+    pub(super) fn failed_child_constraint_names(&mut self, handle: usize) -> Vec<String> {
+        let members = self.active_child_rand_members(handle);
+        let children = self.rand_child_handles(handle, &members);
+        let mut names = Vec::new();
+        for child in children {
+            let class = self
+                .heap
+                .get(child)
+                .and_then(|o| o.as_ref())
+                .map(|o| o.class_name.clone());
+            let disabled = self
+                .constraint_mode_disabled
+                .get(&child)
+                .cloned()
+                .unwrap_or_default();
+            let mut current = class.clone();
+            let mut seen = HashSet::default();
+            let mut constraints = Vec::new();
+            while let Some(name) = current {
+                let Some(def) = self.module.classes.get(&name) else {
+                    break;
+                };
+                for (key, constraint) in &def.constraints {
+                    if seen.insert(key.clone())
+                        && !disabled.contains("*")
+                        && !disabled.contains(key)
+                        && !(constraint.is_static
+                            && self
+                                .static_constraint_disabled
+                                .contains(&(name.clone(), key.clone())))
+                    {
+                        constraints.push(constraint.clone());
+                    }
+                }
+                current = def.extends.clone();
+            }
+            self.class_context_stack.push(class);
+            for constraint in constraints {
+                if constraint.items.iter().any(|item| {
+                    !Self::constraint_unmodeled(item) && !self.check_constraint_item(child, item)
+                }) {
+                    names.push(constraint.name.name.clone());
+                }
+            }
+            self.class_context_stack.pop();
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Active rand members of a child object. A caller's member-subset list
     /// applies only to the parent, not to the recursively randomized child.
     fn active_child_rand_members(&self, handle: usize) -> Vec<String> {

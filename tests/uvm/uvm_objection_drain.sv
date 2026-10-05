@@ -26,7 +26,9 @@ class drain_test extends uvm_test;
   endfunction
   task run_phase(uvm_phase phase);
     uvm_objection obj = phase.get_objection();
+    phase.raise_objection(this);
     obj.set_drain_time(this, 25);
+    phase.drop_objection(this);
   endtask
   function void extract_phase(uvm_phase phase);
     $display("T|extract_at|%0t", $time);
