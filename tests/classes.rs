@@ -69,6 +69,8 @@ mod nested_same_named_ref_assoc_formal;
 mod param_type_binding_resolves_enclosing_value_param;
 #[path = "classes/parameterized_class_scope.rs"]
 mod parameterized_class_scope;
+#[path = "classes/pre_randomize_mode_changes.rs"]
+mod pre_randomize_mode_changes;
 #[path = "classes/pure_constraint_implemented.rs"]
 mod pure_constraint_implemented;
 #[path = "classes/rand_array_elem_signedness.rs"]
@@ -77,6 +79,8 @@ mod rand_array_elem_signedness;
 mod rand_obj_array_elem_constraints;
 #[path = "classes/randomize_args_name_object_members.rs"]
 mod randomize_args_name_object_members;
+#[path = "classes/randomize_failure_diag.rs"]
+mod randomize_failure_diag;
 #[path = "classes/static_fixed_array_storage.rs"]
 mod static_fixed_array_storage;
 #[path = "classes/static_param_class_collection_reuse.rs"]
@@ -365,6 +369,9 @@ mod process_kill_via_member_handle;
 #[path = "classes/forward_declared_class_formal_member_write.rs"]
 mod forward_declared_class_formal_member_write;
 
+#[path = "classes/forward_class_formal_vs_caller_struct_collision.rs"]
+mod forward_class_formal_vs_caller_struct_collision;
+
 #[path = "classes/sibling_type_param_default_cast.rs"]
 mod sibling_type_param_default_cast;
 #[path = "classes/queue_eq_construction_path.rs"]
@@ -560,3 +567,15 @@ mod struct_array_field_read;
 mod dyn_array_struct_copy;
 #[path = "classes/assoc_wide_packed_struct_key.rs"]
 mod assoc_wide_packed_struct_key;
+#[path = "classes/concurrent_function_struct_local_shadow.rs"]
+mod concurrent_function_struct_local_shadow;
+#[path = "classes/type_param_prop_member_write.rs"]
+mod type_param_prop_member_write;
+#[path = "classes/uvm_feature_coverage.rs"]
+mod uvm_feature_coverage;
+#[path = "classes/uvm_ral_coverage.rs"]
+mod uvm_ral_coverage;
+#[path = "classes/uvm_tlm_coverage.rs"]
+mod uvm_tlm_coverage;
+#[path = "classes/issue_246_struct_member_randomize.rs"]
+mod issue_246_struct_member_randomize;

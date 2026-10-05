@@ -33,6 +33,8 @@ class clock_test extends uvm_test;
   endfunction
   task run_phase(uvm_phase phase);
     phase.raise_objection(this);
+    $display("T|run_start=%0t", $time);
+    top.started = 1;
     #16;
     phase.drop_objection(this);
   endtask
@@ -40,8 +42,12 @@ endclass
 
 module top;
   logic clk = 0;
+  bit started = 0;
   int top_fails = 0;
-  always #1 clk = ~clk;
+  initial begin
+    wait (started);
+    forever #1 clk = ~clk;
+  end
   channel_if channel(clk);
   clock_guard direct(.clk(clk), .level(channel.level));
   ap_top: assert property (@(posedge clk) channel.level |=> !channel.level)

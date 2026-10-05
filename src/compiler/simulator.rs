@@ -2554,6 +2554,10 @@ mod event_bits;
 mod module_paths;
 mod names;
 mod rand_csp;
+mod rand_diag;
+
+/// Marks a `dist` target recorded by MEMBER path in `rand_order_sensitive`.
+const MEMBER_DIST_MARK: &str = "\u{1}member:";
 mod rand_scope;
 mod sv_file;
 mod timing_checks;
@@ -52670,7 +52674,7 @@ impl Simulator {
                             if bound > 0 {
                                 let len = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
                                 if len >= bound {
-                                    let value = self.eval_expr(&args[0]);
+                                    let value = self.mbx_message(&args[0]);
                                     let cont = pc.resume_at(pc.start + i + 1);
                                     self.mailbox_put_waiters
                                         .entry(handle)
@@ -68190,38 +68194,50 @@ impl Simulator {
                     }
                 }
                 // Struct variable member write: `result.field1 = ...`
+                // (BUT NOT a member of a CLASS handle: a forward-declared-
+                // class formal like UVM's `uvm_reg_item rw` is recorded in
+                // `var_class_types`, yet a stale same-named struct local from
+                // a CALLER scope (the predictor's `uvm_reg_bus_op rw`) stays
+                // in the flat `var_typedef_types`, so this arm misread the
+                // class handle as a struct and spliced `status` over its low
+                // bits, zeroing the heap handle inside `uvm_reg::do_predict`.
+                // Never struct-splice a class variable — its members live in
+                // the heap, not a packed local.
                 if let ExprKind::Ident(hier) = &expr.kind {
                     if hier.path.len() == 1 {
                         let base_name = hier.path[0].name.name.as_str();
-                        let type_name = self
-                            .var_typedef_types
-                            .get(base_name)
-                            .cloned()
-                            .or_else(|| self.get_expr_type_name(expr));
-                        let dt: Option<DataType> = type_name
-                            .as_deref()
-                            .and_then(|tn| self.module.typedef_types.get(tn).cloned());
-                        if let Some(dt) = dt {
-                            let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
-                            if let Some(fields) = Self::struct_field_layout(&resolved) {
-                                if let Some((_, off, w, _real)) = fields
-                                    .iter()
-                                    .find(|(m, _, _, _)| m == &member.name)
-                                    .cloned()
-                                {
-                                    let mut cur = self
-                                        .get_local_or_signal(base_name)
-                                        .unwrap_or_else(|| Value::zero(off + w));
-                                    if (off + w) as usize > cur.width as usize {
-                                        cur = cur.resize(off + w);
+                        if self.class_of_var(base_name).is_none() {
+                            let type_name = self
+                                .var_typedef_types
+                                .get(base_name)
+                                .cloned()
+                                .or_else(|| self.get_expr_type_name(expr));
+                            let dt: Option<DataType> = type_name
+                                .as_deref()
+                                .and_then(|tn| self.module.typedef_types.get(tn).cloned());
+                            if let Some(dt) = dt {
+                                let resolved =
+                                    Self::resolve_type_ref(&dt, &self.module.typedef_types);
+                                if let Some(fields) = Self::struct_field_layout(&resolved) {
+                                    if let Some((_, off, w, _real)) = fields
+                                        .iter()
+                                        .find(|(m, _, _, _)| m == &member.name)
+                                        .cloned()
+                                    {
+                                        let mut cur = self
+                                            .get_local_or_signal(base_name)
+                                            .unwrap_or_else(|| Value::zero(off + w));
+                                        if (off + w) as usize > cur.width as usize {
+                                            cur = cur.resize(off + w);
+                                        }
+                                        let piece = val.resize(w);
+                                        for i in 0..w {
+                                            let bit = piece.get_bit(i as usize);
+                                            cur.set_bit((off + i) as usize, bit);
+                                        }
+                                        self.set_local_or_signal(base_name, cur);
+                                        return true;
                                     }
-                                    let piece = val.resize(w);
-                                    for i in 0..w {
-                                        let bit = piece.get_bit(i as usize);
-                                        cur.set_bit((off + i) as usize, bit);
-                                    }
-                                    self.set_local_or_signal(base_name, cur);
-                                    return true;
                                 }
                             }
                         }
@@ -71509,6 +71525,16 @@ impl Simulator {
                 _ => None,
             };
             if let Some(base_name) = struct_base_name {
+                // A variable that names a CLASS OBJECT is never a packed/
+                // unpacked struct: its `base.member` is a heap property, not
+                // a struct-field splice. Skip the layout path entirely even if
+                // a stale flat `var_typedef_types` entry (a same-named struct
+                // in an unrelated caller scope, e.g. the RAL predictor's
+                // `uvm_reg_bus_op rw` vs the reg's `uvm_reg_item rw` formal)
+                // poisoned the lookup. Without this, `rw.status` on a class
+                // handle is read/spliced as the stale struct's field and a
+                // class-handle member write is clobbered.
+                let is_class_base = self.class_of_var(&*base_name).is_some();
                 // First try packed_struct_fields directly (packed structs:
                 // 3-tuple without is_real). Augment is_real by resolving
                 // the base's struct typedef members. Then fall back to
@@ -71593,7 +71619,11 @@ impl Simulator {
                             Self::struct_field_layout(&resolved)
                         }
                     }
-                });
+                })
+                // A class-object variable is never struct-spliced: skip the
+                // stale-layout path even if a same-named struct in a caller
+                // scope poisoned `var_typedef_types` (see `is_class_base`).
+                .filter(|_| !is_class_base);
                 if let Some(fields) = fields_opt {
                     // Only trust this layout if it actually describes
                     // `base_val` (total width matches). Otherwise we'd
@@ -76467,6 +76497,25 @@ impl Simulator {
                         }
                     }
                 }
+                // §13.5.5, the same shape for a PACKAGE function: inside a
+                // subroutine body `vp::pkf` parses as MemberAccess on the
+                // package name (the Ident arm handles the flat form). Read as
+                // a member it returned 0, so `return vp::pkf;` lost the call.
+                if let Some(pkg) = Self::plain_ident_name(recv) {
+                    if self.module.packages.contains(&pkg)
+                        && self
+                            .module
+                            .functions
+                            .contains_key(&format!("{}::{}", pkg, member.name))
+                        && self
+                            .module
+                            .pkg_subr_owner
+                            .get(&member.name)
+                            .is_some_and(|owner| owner == &pkg)
+                    {
+                        return self.eval_call(expr, &[]);
+                    }
+                }
                 self.eval_expr_member_access(recv, member, ctx_width)
             }
             ExprKind::Call { func, args } => self.eval_call(func, args),
@@ -80438,17 +80487,21 @@ impl Simulator {
         // is by value, so drop the type binding on the way out too.
         let fe_key_type_var: Option<String> = (|| {
             let arr_name = Self::foreach_array_root_name(array)?;
+            // A subroutine-local array's key type lives in its frame's
+            // overlay (see the local associative-array declaration); ""
+            // there means an unnamed key type shadowing an outer array.
+            let local_kt = self.local_typedef_type_of(&format!("{}[]", arr_name));
+            if local_kt.as_deref() == Some("") {
+                return None;
+            }
             // Module/package-scope collections record the key type in
             // the module map; a CLASS PROPERTY records it on its class
             // (§3b): walk `this`'s hierarchy when the module map
             // misses — UVM's `severity_count[uvm_severity]` lives on
             // uvm_report_server, and without this the summary printed
             // members of an unrelated enum for every severity.
-            let kt = self
-                .module
-                .assoc_key_type_names
-                .get(&arr_name)
-                .cloned()
+            let kt = local_kt
+                .or_else(|| self.module.assoc_key_type_names.get(&arr_name).cloned())
                 .or_else(|| {
                     // `foreach (c.data[k])`: the property's class is the
                     // receiver's, not `this`'s.
@@ -82160,6 +82213,40 @@ impl Simulator {
                             .associative_arrays
                             .insert(name.clone(), is_string_key);
                         self.widths.insert(name.clone(), w);
+                        // §6.19.6/§7.8: a NAMED key type (`int aa[e_t];`)
+                        // gives a `foreach (aa[k])` index variable that type,
+                        // so `k.last`/`k.next`/`k.name` resolve against the
+                        // enum. Elaboration records it for module-scope
+                        // arrays only. Inside a subroutine frame it goes to
+                        // the frame's overlay under `aa[]` (no variable can
+                        // have that name), so a same-named array elsewhere
+                        // keeps its own key type; an unnamed key type records
+                        // "" there to shadow an outer entry.
+                        let key_tn = key_dt
+                            .as_ref()
+                            .and_then(|dt| match dt.as_ref() {
+                                crate::ast::types::DataType::TypeReference { name: tn, .. } => {
+                                    Some(tn.name.name.clone())
+                                }
+                                _ => None,
+                            })
+                            .filter(|tn| {
+                                self.module.enum_members.contains_key(tn)
+                                    || self.module.typedef_types.contains_key(tn)
+                            });
+                        if self.local_type_stack.is_empty() {
+                            match key_tn {
+                                Some(tn) => {
+                                    self.module.assoc_key_type_names.insert(bare.clone(), tn);
+                                }
+                                None => {
+                                    self.module.assoc_key_type_names.remove(&bare);
+                                }
+                            }
+                        } else {
+                            let slot = format!("{}[]", bare);
+                            self.record_local_typedef_type(&slot, key_tn.as_deref().unwrap_or(""));
+                        }
                         // Record the ELEMENT type under the renamed
                         // storage key so `all[k] = new` can resolve
                         // the element class (incl. parameterized
@@ -97481,10 +97568,7 @@ impl Simulator {
                     self.time, pid, is_peek, handle
                 );
             }
-            self.deliver_to_mailbox_waiter(pid, &lvalue, front.clone(), cont);
-            if !is_peek {
-                self.mbx_release_msg(&front);
-            }
+            self.deliver_to_mailbox_waiter(pid, &lvalue, front, cont, !is_peek);
         }
     }
 
@@ -97559,13 +97643,27 @@ impl Simulator {
         }
     }
 
+    /// The value a mailbox `put` queues for `arg`: an unpacked struct is
+    /// stashed member-wise and queued as its shadow id.
+    fn mbx_message(&mut self, arg: &Expression) -> Value {
+        match self.mbx_struct_arg(arg) {
+            Some((src, su)) => self.mbx_stash_struct(&src, &su),
+            None => self.eval_expr(arg),
+        }
+    }
+
     /// Write one delivered message into a parked waiter's lvalue, taking the
     /// aggregate path when the destination is an unpacked struct. Must run
     /// with the waiter's process context restored, so the lvalue's frame-local
-    /// name resolves to that process's storage.
-    fn mbx_assign_delivered(&mut self, lvalue: &Expression, v: &Value) {
+    /// name resolves to that process's storage. A `consume`d (`get`, not
+    /// `peek`) struct message frees its stash id; only a struct destination
+    /// says the value IS one — a scalar message's value is not an id.
+    fn mbx_assign_delivered(&mut self, lvalue: &Expression, v: &Value, consume: bool) {
         if let Some((dst, su)) = self.mbx_struct_arg(lvalue) {
             self.mbx_unstash_struct(&dst, &su, v);
+            if consume {
+                self.mbx_release_msg(v);
+            }
             return;
         }
         let width = self.infer_lhs_width(lvalue);
@@ -97578,16 +97676,17 @@ impl Simulator {
         lvalue: &Expression,
         v: Value,
         cont: ProcCont,
+        consume: bool,
     ) {
         if let Some(ctx) = self.process_contexts.remove(&pid) {
             let saved = self.take_process_context();
             self.restore_process_context(ctx);
-            self.mbx_assign_delivered(lvalue, &v);
+            self.mbx_assign_delivered(lvalue, &v, consume);
             let ctx = self.take_process_context();
             self.process_contexts.insert(pid, ctx);
             self.restore_process_context(saved);
         } else {
-            self.mbx_assign_delivered(lvalue, &v);
+            self.mbx_assign_delivered(lvalue, &v, consume);
         }
         if !cont.is_empty() {
             self.event_queue.schedule(self.time, pid, cont);
@@ -100567,6 +100666,36 @@ impl Simulator {
         Self::carried_type_binding(bindings, &chain, owner?, param)
     }
 
+    /// The concrete class bound to a TYPE-PARAMETER-typed property of an
+    /// object. `class_prop_type_named` hands back the parameter NAME for such a
+    /// property — `REQ req;` in `uvm_driver #(type REQ = uvm_sequence_item)` —
+    /// and leaves the resolution to its callers. The binding sits in the
+    /// object's own `type_bindings`, or in an `extends base #(item)` somewhere
+    /// between the object's class and the class declaring the property, so
+    /// the chain is walked to the declaring class and the name carried back
+    /// down it.
+    fn bound_prop_class(&self, inst: &ClassInstance, prop: &str, param: &str) -> Option<String> {
+        let owners = self.prop_owners(&inst.class_name);
+        let owner = owners.get(prop)?.0.as_str();
+        let mut chain: Vec<&super::elaborate::ElaboratedClass> = Vec::new();
+        let mut cur: Option<&str> = Some(inst.class_name.as_str());
+        while let Some(cn) = cur {
+            if chain.len() == 16 {
+                return None;
+            }
+            let cd = self.module.classes.get(cn)?;
+            chain.push(cd.as_ref());
+            if cn == owner {
+                let k = chain.len() - 1;
+                let c = Self::carried_type_binding(&inst.type_bindings, &chain, k, param)?;
+                let base = c.split('#').next().unwrap_or(&c);
+                return self.module.classes.contains_key(base).then_some(c);
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
     /// The binding of type parameter `name` of `chain[k]` for an object whose
     /// class is `chain[0]` with `bindings`: level 0 reads the bindings;
     /// each level above takes the child's `extends_type_args` entry at the
@@ -102837,7 +102966,10 @@ impl Simulator {
         self.obj_rng_stack.push(handle);
         let prev_receiver = std::mem::replace(&mut self.rand_receiver, receiver);
         let prev_subset = std::mem::replace(&mut self.randomize_subset, subset);
-        let r = self.exec_randomize_inner(handle, items);
+        let inline_src_file = (!items.is_empty())
+            .then(|| self.current_src_file())
+            .flatten();
+        let r = self.exec_randomize_inner(handle, items, inline_src_file);
         self.randomize_subset = prev_subset;
         self.rand_receiver = prev_receiver;
         self.obj_rng_stack.pop();
@@ -107437,6 +107569,12 @@ impl Simulator {
                     if self.module.classes.contains_key(&tn) || tn.contains('#') {
                         return Some(tn);
                     }
+                    // A property typed by a class TYPE PARAMETER comes back as
+                    // the parameter's NAME, which is no class. Resolve it, as
+                    // `class_prop_type_named` leaves to its callers.
+                    if let Some(c) = self.bound_prop_class(inst, vname, &tn) {
+                        return Some(c);
+                    }
                 }
             }
         }
@@ -109648,9 +109786,13 @@ impl Simulator {
         let ExprKind::Ident(h) = &cur.kind else {
             return None;
         };
-        if peeled.is_empty() && h.path.iter().all(|s| s.selects.is_empty()) {
+        if peeled.is_empty() && h.path.iter().all(|s| s.selects.is_empty()) && h.path.len() < 4 {
             // A whole member with no selects is `class_agg_member_parts`' case
             // (via `split_trailing_member`) — do not pay the walk for it.
+            // That handles ONE member below the property (`obj.prop.m`); a
+            // module-scope NESTED member (`obj.prop.m.n`, four segments)
+            // needs the walk, or its write went to name-keyed storage that
+            // every object shared and a method never saw.
             return None;
         }
         // Root-first pending steps: every segment, then that segment's
@@ -125935,7 +126077,14 @@ impl Simulator {
                 let base = self.eval_expr(expr);
                 let handle = base.to_u64().unwrap_or(0) as usize;
                 if let Some(arg) = args.first() {
-                    let v = self.eval_expr(arg);
+                    // A `put` inside a task body (an argument that is a
+                    // formal of that task) arrives here, not through
+                    // `exec_method_call`, so the message is built the same way.
+                    let v = if self.mailboxes.contains_key(&handle) {
+                        self.mbx_message(arg)
+                    } else {
+                        self.eval_expr(arg)
+                    };
                     // LRM §15.4.3/§15.4.5: a `put` stores in FIFO order and
                     // unblocks any process waiting in a `get`/`peek` on this
                     // mailbox. Hand the value directly to the FIFO-ordered
@@ -125965,7 +126114,7 @@ impl Simulator {
                                     .unwrap()
                                     .push_back(v.clone());
                             }
-                            self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont);
+                            self.deliver_to_mailbox_waiter(pid, &lvalue, v, cont, !is_peek);
                         } else if let Some(q) = self.mailboxes.get_mut(&handle) {
                             q.push_back(v);
                         }
@@ -125996,8 +126145,7 @@ impl Simulator {
                             .pop_front()
                             .unwrap();
                         if let Some(arg) = args.first() {
-                            let w = self.infer_lhs_width(arg);
-                            self.assign_value(arg, &val.resize(w));
+                            self.mbx_assign_delivered(arg, &val, true);
                         }
                         self.admit_mailbox_put_waiter(handle);
                         return Value::zero(32);
@@ -126039,8 +126187,7 @@ impl Simulator {
                 if self.mailboxes.contains_key(&handle) {
                     let val = self.mailboxes.get_mut(&handle).and_then(|q| q.pop_front());
                     if let (Some(v), Some(arg)) = (val, args.first()) {
-                        let w = self.infer_lhs_width(arg);
-                        self.assign_value(arg, &v.resize(w));
+                        self.mbx_assign_delivered(arg, &v, true);
                         self.admit_mailbox_put_waiter(handle);
                         return Value::from_u64(1, 32);
                     }
@@ -131198,18 +131345,14 @@ impl Simulator {
         if top.saves.iter().any(|d| d.meta.name == name) {
             return;
         }
-        // Only a variable still live outside this activation — in the signal
-        // maps or a caller's frame — can observe the stale entries; a name
-        // left over from an earlier, finished call has nothing to protect.
-        let n = self.local_stack.len();
-        if !(self.signals.contains_key(name)
-            || self.signal_name_to_id.contains_key(name)
-            || self.local_stack[..n.saturating_sub(1)]
-                .iter()
-                .any(|f| f.contains_key(name)))
-        {
-            return;
-        }
+        // No liveness filter: the displaced entries may belong to a task
+        // SUSPENDED in another process (its frames are swapped out, so
+        // neither `local_stack` nor the signal maps show them). A function
+        // run meanwhile — a predictor's `uvm_reg_bus_op rw` while a
+        // register task holds `uvm_reg_item rw` — would otherwise leave its
+        // struct layout behind, and the task's `rw.status = ...` then wrote
+        // a bit slice into the handle. Putting back a finished call's stale
+        // entries is harmless: it is the state from before this call.
         let save = DeclShadow {
             width: self.widths.get(name).copied(),
             signed: self.signed_signals.contains(name),
@@ -136548,10 +136691,7 @@ impl Simulator {
                     if let Some(arg) = args.first() {
                         // An UNPACKED struct has no single value to queue;
                         // stash it member-wise and queue its shadow id.
-                        let v = match self.mbx_struct_arg(arg) {
-                            Some((src, su)) => self.mbx_stash_struct(&src, &su),
-                            None => self.eval_expr(arg),
-                        };
+                        let v = self.mbx_message(arg);
                         // LRM §15.4.2: if a blocking get is waiting on this
                         // mailbox, hand the value directly to the waiter
                         // (skipping the queue) and reschedule its
@@ -136593,21 +136733,10 @@ impl Simulator {
                         }
                     }
                     if let (Some(v), Some(arg)) = (&val, args.first()) {
-                        match self.mbx_struct_arg(arg) {
-                            Some((dst, su)) => {
-                                self.mbx_unstash_struct(&dst, &su, v);
-                            }
-                            None => {
-                                let w = self.infer_lhs_width(arg);
-                                self.assign_value(arg, &v.resize(w));
-                            }
-                        }
+                        self.mbx_assign_delivered(arg, v, method_name == "get");
                     }
                     // A consuming `get` frees a slot — admit a parked producer.
                     if method_name == "get" {
-                        if let Some(v) = &val {
-                            self.mbx_release_msg(v);
-                        }
                         self.admit_mailbox_put_waiter(handle);
                     }
                     return Value::zero(32);
@@ -136624,10 +136753,7 @@ impl Simulator {
                                 return Value::zero(32);
                             }
                         }
-                        let v = match self.mbx_struct_arg(arg) {
-                            Some((src, su)) => self.mbx_stash_struct(&src, &su),
-                            None => self.eval_expr(arg),
-                        };
+                        let v = self.mbx_message(arg);
                         // Push-then-drain — see the blocking `put` arm.
                         self.mailboxes.get_mut(&handle).unwrap().push_back(v);
                         self.drain_mailbox_get_waiters(handle);
@@ -136641,17 +136767,8 @@ impl Simulator {
                         self.mailboxes.get(&handle).and_then(|q| q.front().cloned())
                     };
                     if let (Some(v), Some(arg)) = (&val, args.first()) {
-                        match self.mbx_struct_arg(arg) {
-                            Some((dst, su)) => {
-                                self.mbx_unstash_struct(&dst, &su, v);
-                            }
-                            None => {
-                                let w = self.infer_lhs_width(arg);
-                                self.assign_value(arg, &v.resize(w));
-                            }
-                        }
+                        self.mbx_assign_delivered(arg, v, method_name == "try_get");
                         if method_name == "try_get" {
-                            self.mbx_release_msg(v);
                             self.admit_mailbox_put_waiter(handle);
                         }
                         return Value::from_u64(1, 32);
@@ -139013,12 +139130,29 @@ impl Simulator {
                     is_dist: true,
                     ..
                 } => {
-                    let base = match &Simulator::unparen(expr).kind {
-                        ExprKind::Index { expr: b, .. } => Simulator::plain_ident_name(b),
-                        _ => Simulator::plain_ident_name(expr),
-                    };
-                    let Some(base) = base else {
-                        return true;
+                    // The variable the dist draws: a bare rand property, an
+                    // element of one, or (§18.4) a member or a select of a
+                    // member of an aggregate one (`s.f`, `s.f[3:0]`) — keyed
+                    // by its root property. The per-variable trials pick a
+                    // member's dist with its weights; the joint solver treats
+                    // the aggregate as one scalar and drew it uniformly.
+                    // A member target is keyed by its member PATH (`s.f`,
+                    // selects dropped) and judged against member paths below:
+                    // a constraint on a sibling member (`s.g < 10`) does not
+                    // couple it, and routing such a set to the joint solver
+                    // lost the weights.
+                    let base = match Simulator::member_path_key(expr) {
+                        Some(k) if k.contains('.') => format!("{}{}", MEMBER_DIST_MARK, k),
+                        _ => {
+                            let base = match &Simulator::unparen(expr).kind {
+                                ExprKind::Index { expr: b, .. } => Simulator::plain_ident_name(b),
+                                _ => Simulator::plain_ident_name(expr),
+                            };
+                            let Some(base) = base else {
+                                return true;
+                            };
+                            base
+                        }
                     };
                     if guarded {
                         return true;
@@ -139075,7 +139209,154 @@ impl Simulator {
                 }
             }
         }
+        let member_dists: Vec<&str> = dist
+            .iter()
+            .filter_map(|d: &String| d.strip_prefix(MEMBER_DIST_MARK))
+            .collect();
+        if !member_dists.is_empty() {
+            let mut paths: Vec<String> = Vec::new();
+            for con in constraints {
+                for it in &con.items {
+                    Self::collect_item_member_paths(it, &mut paths);
+                }
+            }
+            // Coupled: another reference to the same member, to a member
+            // below it, or to an aggregate that contains it.
+            let coupled = |k: &str| {
+                paths.iter().any(|o| {
+                    o == k
+                        || k.strip_prefix(o.as_str()).is_some_and(|r| r.starts_with('.'))
+                        || o.strip_prefix(k).is_some_and(|r| r.starts_with('.'))
+                })
+            };
+            if member_dists.iter().any(|k| coupled(k)) {
+                return true;
+            }
+        }
         dist.iter().any(|d| other.contains(d))
+    }
+
+    /// `root.m1.m2` for a member chain (flat ident or `MemberAccess`, index
+    /// and part selects dropped), `root` for a bare or indexed name.
+    fn member_path_key(e: &Expression) -> Option<String> {
+        let mut cur = Self::unparen(e);
+        let mut members: Vec<&str> = Vec::new();
+        loop {
+            match &cur.kind {
+                ExprKind::Index { expr: b, .. } | ExprKind::RangeSelect { expr: b, .. } => cur = b,
+                ExprKind::MemberAccess { expr: b, member } => {
+                    members.push(member.name.as_str());
+                    cur = b;
+                }
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        if h.root.is_some() {
+            return None;
+        }
+        let mut parts: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+        parts.extend(members.into_iter().rev());
+        Some(parts.join("."))
+    }
+
+    /// Every member path (`member_path_key`) a constraint item reads, except
+    /// a `dist`'s own target (its range bounds count).
+    fn collect_item_member_paths(item: &ConstraintItem, out: &mut Vec<String>) {
+        fn expr(e: &Expression, out: &mut Vec<String>) {
+            match &e.kind {
+                ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                    if let Some(k) = Simulator::member_path_key(e) {
+                        out.push(k);
+                    }
+                    if let ExprKind::Ident(h) = &e.kind {
+                        for seg in &h.path {
+                            for sel in &seg.selects {
+                                expr(sel, out);
+                            }
+                        }
+                    }
+                }
+                ExprKind::Index { expr: b, index } => {
+                    expr(b, out);
+                    expr(index, out);
+                }
+                ExprKind::RangeSelect { expr: b, left, right, .. } => {
+                    expr(b, out);
+                    expr(left, out);
+                    expr(right, out);
+                }
+                ExprKind::Unary { operand, .. } => expr(operand, out),
+                ExprKind::Binary { left, right, .. } => {
+                    expr(left, out);
+                    expr(right, out);
+                }
+                ExprKind::Conditional { condition, then_expr, else_expr } => {
+                    expr(condition, out);
+                    expr(then_expr, out);
+                    expr(else_expr, out);
+                }
+                ExprKind::Paren(i) => expr(i, out),
+                ExprKind::Concatenation(v) => v.iter().for_each(|x| expr(x, out)),
+                ExprKind::Call { func, args } => {
+                    expr(func, out);
+                    args.iter().for_each(|x| expr(x, out));
+                }
+                ExprKind::SystemCall { args, .. } => args.iter().for_each(|x| expr(x, out)),
+                ExprKind::Inside { expr: x, ranges } => {
+                    expr(x, out);
+                    ranges.iter().for_each(|r| expr(r, out));
+                }
+                ExprKind::Range(a, b) => {
+                    expr(a, out);
+                    expr(b, out);
+                }
+                _ => {}
+            }
+        }
+        fn ranges(rs: &[ConstraintRange], out: &mut Vec<String>) {
+            for r in rs {
+                match r {
+                    ConstraintRange::Value(e) => expr(e, out),
+                    ConstraintRange::Range { lo, hi } => {
+                        expr(lo, out);
+                        expr(hi, out);
+                    }
+                }
+            }
+        }
+        match item {
+            ConstraintItem::Expr(e) => expr(e, out),
+            ConstraintItem::Inside { expr: x, range, is_dist, .. } => {
+                if !*is_dist {
+                    expr(x, out);
+                }
+                ranges(range, out);
+            }
+            ConstraintItem::Implication { condition, constraint, .. } => {
+                expr(condition, out);
+                Simulator::collect_item_member_paths(constraint, out);
+            }
+            ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
+                expr(condition, out);
+                Simulator::collect_item_member_paths(then_item, out);
+                if let Some(e) = else_item {
+                    Simulator::collect_item_member_paths(e, out);
+                }
+            }
+            ConstraintItem::Foreach { array, item, .. } => {
+                expr(array, out);
+                Simulator::collect_item_member_paths(item, out);
+            }
+            ConstraintItem::Soft(i) => Simulator::collect_item_member_paths(i, out),
+            ConstraintItem::Block(items) => {
+                items.iter().for_each(|i| Simulator::collect_item_member_paths(i, out))
+            }
+            ConstraintItem::Unique { exprs, .. } => exprs.iter().for_each(|e| expr(e, out)),
+            ConstraintItem::Solve { .. } => {}
+        }
     }
 
     /// §18.5.10 — is uniform rejection sampling the right solver for this
@@ -139227,9 +139508,12 @@ impl Simulator {
                         !Self::constraint_unmodeled(item)
                             && !self.check_constraint_item(handle, item)
                     }) {
-                        failed_names.push(constraint.name.name.as_str());
+                        failed_names.push(constraint.name.name.clone());
                     }
                 }
+                failed_names.extend(self.failed_child_constraint_names(handle));
+                failed_names.sort();
+                failed_names.dedup();
                 let names = failed_names.join(", ");
                 eprintln!(
                     "[xezim][error] randomize budget exhausted in class {}; last failed constraints: {}; returning 0 and restoring prior values",
@@ -139251,7 +139535,7 @@ impl Simulator {
     fn exec_randomize(&mut self, handle: usize) -> Value {
         self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
-        let r = self.exec_randomize_inner(handle, &[]);
+        let r = self.exec_randomize_inner(handle, &[], None);
         self.obj_rng_stack.pop();
         self.end_randomize_budget();
         r
@@ -139270,7 +139554,7 @@ impl Simulator {
         let subset = self.randomize_subset.take();
         self.randomize_depth += 1;
         self.obj_rng_stack.push(sub);
-        self.exec_randomize_inner(sub, pushed);
+        self.exec_randomize_inner(sub, pushed, None);
         self.obj_rng_stack.pop();
         self.randomize_depth -= 1;
         self.randomize_subset = subset;
@@ -139777,16 +140061,26 @@ impl Simulator {
     /// local `addr` made every `addr` constraint of the object read it). The
     /// inline constraints' caller-scope operands were bound beforehand
     /// (`freeze_caller_scope_refs`), so the solve runs in a fresh frame.
-    fn exec_randomize_inner(&mut self, handle: usize, inline: &[ConstraintItem]) -> Value {
+    fn exec_randomize_inner(
+        &mut self,
+        handle: usize,
+        inline: &[ConstraintItem],
+        inline_src_file: Option<u32>,
+    ) -> Value {
         self.push_local_frame(HashMap::default());
         self.method_local_base.push(self.local_stack.len() - 1);
-        let r = self.exec_randomize_solve(handle, inline);
+        let r = self.exec_randomize_solve(handle, inline, inline_src_file);
         self.method_local_base.pop();
         self.pop_local_frame();
         r
     }
 
-    fn exec_randomize_solve(&mut self, handle: usize, inline: &[ConstraintItem]) -> Value {
+    fn exec_randomize_solve(
+        &mut self,
+        handle: usize,
+        inline: &[ConstraintItem],
+        inline_src_file: Option<u32>,
+    ) -> Value {
         // Reset the dist-pick-once tracker so each randomize call gets a
         // fresh weighted draw per `(handle, prop)`.
         self.dist_picked_once.clear();
@@ -139800,9 +140094,20 @@ impl Simulator {
         } else {
             return Value::zero(32);
         };
+        // §18.6.2: randomize() calls pre_randomize() first and only then
+        // computes the new values — so before anything below reads the
+        // rand_mode / constraint_mode state or the object's members, which
+        // pre_randomize() may change for THIS call (§18.8, §18.9).
+        if self.class_has_method(&class_name, "pre_randomize") {
+            self.exec_pre_randomize_preserving_children(handle);
+        }
 
         let mut rand_props = Vec::new();
         let mut constraints = Vec::new();
+        // Kept parallel with `constraints`. AST spans are file-local, so the
+        // defining class (or call site for an inline block) supplies the
+        // retained source index.
+        let mut constraint_src_files: Vec<Option<u32>> = Vec::new();
         // §18.5.14.2: inheritance depth of each collected constraint block
         // (0 = the object's own class, 1 = its parent, …). A soft constraint
         // in a DERIVED class has HIGHER priority than a conflicting soft
@@ -139969,6 +140274,8 @@ impl Simulator {
                     }
                     if seen_constraint_names.insert(con_name.clone()) {
                         constraints.push(con.clone());
+                        constraint_src_files
+                            .push(self.module.src_file_of_module.get(&cname).copied());
                         constraint_depth.push(class_depth);
                     }
                 }
@@ -139993,6 +140300,7 @@ impl Simulator {
                 items: inline.to_vec(),
                 span: crate::ast::Span::new(0, 0),
             });
+            constraint_src_files.push(inline_src_file);
         }
 
         // §18.5.5: expand the array SLICE of a `unique {…}` list into the
@@ -140140,10 +140448,6 @@ impl Simulator {
         // `class_context_stack`; without pushing it the call fell through to the
         // "unknown name" path and silently yielded 0.
         self.class_context_stack.push(Some(class_name.clone()));
-        // SV semantics: randomize() calls pre_randomize() before solving.
-        if self.class_has_method(&class_name, "pre_randomize") {
-            self.exec_pre_randomize_preserving_children(handle);
-        }
         let has_post = self.class_has_method(&class_name, "post_randomize");
 
         // §18.6: a failed enclosing solve restores the rand state of its
@@ -140316,6 +140620,7 @@ impl Simulator {
             && rand_nd_arrays.is_empty();
         let sub_objs = sub_objs.unwrap_or_default();
         let mut csp_runs = 0u32;
+        let mut rand_diag = rand_diag::rand_diag_enabled().then(rand_diag::RandDiag::default);
         let array_enums: HashMap<String, String> = rand_arrays
             .iter()
             .filter_map(|a| a.5.clone().map(|t| (a.0.clone(), t)))
@@ -141606,6 +141911,9 @@ impl Simulator {
             let mut fe_failed = false;
             let mut all_ok =
                 self.rand_items_accept(handle, &constraints, &rand_colls, &mut fe_failed);
+            if !all_ok && let Some(diag) = rand_diag.as_mut() {
+                self.rand_diag_tally(handle, &constraints, diag);
+            }
             if fe_failed {
                 fixed_fe_fail_streak += 1;
             }
@@ -141762,6 +142070,19 @@ impl Simulator {
                 }
             }
         }
+        if let Some(diag) = &rand_diag {
+            self.rand_diag_report(
+                &class_name,
+                &rand_props,
+                &rand_colls,
+                &rand_obj_props,
+                &rand_disabled,
+                &constraint_disabled,
+                &constraints,
+                &constraint_src_files,
+                diag,
+            );
+        }
         // §18.4: randomize() failed — no value was actually produced, so give
         // every tentatively-drawn randc value back to its permutation cycle.
         if has_rand_children {
@@ -141865,6 +142186,9 @@ impl Simulator {
             }
             return true;
         }
+        if let Some(ok) = self.check_fixed_nd_unique(handle, item) {
+            return ok;
+        }
         // Foreach over a FIXED-shape rand array: check strictly,
         // so an unsatisfied body retries the trial and an
         // UNSATISFIABLE one makes randomize() return 0 (§18.6.2)
@@ -141948,6 +142272,9 @@ impl Simulator {
         expr: &Expression,
         rand_set: &HashSet<String>,
     ) -> Option<RandMemberTarget> {
+        if let Some(r) = self.rand_agg_select_target(expr, rand_set) {
+            return Some(RandMemberTarget::Agg(r));
+        }
         let (base, field) = Self::split_trailing_member(expr)?;
         // The receiver must be a `rand` property of the object being solved,
         // or an element of a rand collection of handles (`arr[i].fld`, §18.4).
@@ -141996,6 +142323,80 @@ impl Simulator {
             cur = cd.extends.clone();
         }
         None
+    }
+
+    /// §18.4: a NESTED member (`s.f1.f2`) or a SELECT (`s.f[15:0]`,
+    /// `s.f[i]`) of a `rand` struct property of the object being solved —
+    /// the storage it aliases. A single whole member (`s.f`) is left to
+    /// `class_agg_member_parts` in `rand_member_target`.
+    fn rand_agg_select_target(
+        &mut self,
+        expr: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> Option<ClassAggRef> {
+        let mut cur = expr;
+        let mut steps = 0usize;
+        let mut has_select = false;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr: b, .. } => {
+                    steps += 1;
+                    cur = b;
+                }
+                ExprKind::Index { expr: b, .. } | ExprKind::RangeSelect { expr: b, .. } => {
+                    steps += 1;
+                    has_select = true;
+                    cur = b;
+                }
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &cur.kind else {
+            return None;
+        };
+        if h.path.len() != 1
+            || !h.path[0].selects.is_empty()
+            || !rand_set.contains(&h.path[0].name.name)
+            || (steps < 2 && !has_select)
+        {
+            return None;
+        }
+        self.class_member_select_ref(expr)
+    }
+
+    /// `rand_member_target` limited to an AGGREGATE member (`s.f`, `s.f1.f2`,
+    /// `s.f[3:0]`). The relational and dist/inside arms use this: a property
+    /// of a rand OBJECT handle (`a.x < b.y`) stays with the cross-object
+    /// joint solve, which runs the sub-object's `post_randomize` on the final
+    /// values — forcing it here rewrote `a.x` after that hook had run.
+    fn rand_agg_member_target(
+        &mut self,
+        expr: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> Option<RandMemberTarget> {
+        match self.rand_member_target(expr, rand_set)? {
+            t @ RandMemberTarget::Agg(_) => Some(t),
+            RandMemberTarget::Sub(..) => None,
+        }
+    }
+
+    /// Current value of a `RandMemberTarget`.
+    fn read_rand_member(&self, t: &RandMemberTarget) -> Option<Value> {
+        match t {
+            RandMemberTarget::Agg(r) => Some(self.read_class_agg(r)),
+            RandMemberTarget::Sub(h, prop) => self
+                .heap
+                .get(*h)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(prop))
+                .cloned(),
+        }
+    }
+
+    /// A key naming a member target for per-randomize bookkeeping
+    /// (`dist_picked_once`): the constraint expression's source position.
+    fn rand_member_key(expr: &Expression) -> String {
+        format!("#member@{}", expr.span.start)
     }
 
     /// Write a `RandMemberTarget`; reports whether the stored value changed.
@@ -143618,40 +144019,57 @@ impl Simulator {
             None => return false,       // X/Z or not modelled — let the check decide
             Some(false) => {}
         }
-        // Which side is the rand target, and what does the relation say about it?
+        // Mirror the operator: `K < x` constrains x from below.
+        let mirrored = match op {
+            BinaryOp::Lt => BinaryOp::Gt,
+            BinaryOp::Leq => BinaryOp::Geq,
+            BinaryOp::Gt => BinaryOp::Lt,
+            BinaryOp::Geq => BinaryOp::Leq,
+            other => *other,
+        };
+        // Which side is the rand target, and what does the relation say about
+        // it? A bare rand property first; then (§18.4) a member or a select
+        // of a member of an aggregate rand property.
+        enum RelTarget {
+            Prop(String),
+            Member(RandMemberTarget),
+        }
         let (target, bound_expr, op_on_target) =
             if let Some(v) = self.rand_lvalue_name(left, rand_set) {
-                (v, right, *op)
+                (RelTarget::Prop(v), right, *op)
             } else if let Some(v) = self.rand_lvalue_name(right, rand_set) {
-                // Mirror the operator: `K < x` constrains x from below.
-                let m = match op {
-                    BinaryOp::Lt => BinaryOp::Gt,
-                    BinaryOp::Leq => BinaryOp::Geq,
-                    BinaryOp::Gt => BinaryOp::Lt,
-                    BinaryOp::Geq => BinaryOp::Leq,
-                    other => *other,
-                };
-                (v, left, m)
+                (RelTarget::Prop(v), left, mirrored)
+            } else if let Some(t) = self.rand_agg_member_target(left, rand_set) {
+                (RelTarget::Member(t), right, *op)
+            } else if let Some(t) = self.rand_agg_member_target(right, rand_set) {
+                (RelTarget::Member(t), left, mirrored)
             } else {
                 return false;
             };
         let Some((bound, _, bs)) = self.exact_int(bound_expr) else {
             return false;
         };
-        let Some(cur) = self
-            .heap
-            .get(handle)
-            .and_then(|o| o.as_ref())
-            .and_then(|i| i.properties.get(&target))
-            .cloned()
-        else {
+        let cur = match &target {
+            RelTarget::Prop(name) => self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .and_then(|i| i.properties.get(name))
+                .cloned(),
+            RelTarget::Member(t) => self.read_rand_member(t),
+        };
+        let Some(cur) = cur else {
             return false;
         };
         let width = cur.width.max(1);
         if width > 64 {
             return false;
         }
-        let signed = (cur.is_signed || self.class_prop_signed_of(handle, &target)) && bs;
+        let prop_signed = match &target {
+            RelTarget::Prop(name) => self.class_prop_signed_of(handle, name),
+            RelTarget::Member(_) => false,
+        };
+        let signed = (cur.is_signed || prop_signed) && bs;
         let (dom_lo, dom_hi) = if signed {
             (-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1)
         } else {
@@ -143671,7 +144089,11 @@ impl Simulator {
         }
         // Intersect with the target's declared `inside` range (§18.5.12).
         let mut choices: Vec<(i128, i128)> = Vec::new();
-        if let Some(rs) = self.rand_ranges.get(&target).cloned() {
+        let ranges = match &target {
+            RelTarget::Prop(name) => self.rand_ranges.get(name).cloned(),
+            RelTarget::Member(_) => None,
+        };
+        if let Some(rs) = ranges {
             for (rl, rh) in rs {
                 let (l, h) = (rl.max(lo), rh.min(hi));
                 if l <= h {
@@ -143685,7 +144107,10 @@ impl Simulator {
         let Some(p) = self.pick_i128_range(&choices, width, signed) else {
             return false;
         };
-        self.set_prop_if_changed(handle, &target, p)
+        match &target {
+            RelTarget::Prop(name) => self.set_prop_if_changed(handle, name, p),
+            RelTarget::Member(t) => self.set_rand_member(t, p),
+        }
     }
 
     /// Is `e` a `.size()` (`.size` / `.size()`) reference to a rand DYNAMIC
@@ -144132,17 +144557,20 @@ impl Simulator {
                     expr: inner,
                     ranges,
                 } => {
-                    let cr: Vec<ConstraintRange> = ranges
-                        .iter()
-                        .map(|r| match &r.kind {
-                            ExprKind::Range(lo, hi) => ConstraintRange::Range {
-                                lo: (**lo).clone(),
-                                hi: (**hi).clone(),
-                            },
-                            _ => ConstraintRange::Value(r.clone()),
-                        })
-                        .collect();
+                    let cr = || -> Vec<ConstraintRange> {
+                        ranges
+                            .iter()
+                            .map(|r| match &r.kind {
+                                ExprKind::Range(lo, hi) => ConstraintRange::Range {
+                                    lo: (**lo).clone(),
+                                    hi: (**hi).clone(),
+                                },
+                                _ => ConstraintRange::Value(r.clone()),
+                            })
+                            .collect()
+                    };
                     if let Some(v) = self.rand_lvalue_name(inner, rand_set) {
+                        let cr = cr();
                         let cur = self.eval_expr(inner);
                         if self.value_in_ranges(&cur, &cr) {
                             return false;
@@ -144151,15 +144579,13 @@ impl Simulator {
                         if let Some(picked) = self.pick_from_ranges(&cr, width, cur.is_signed) {
                             return self.set_prop_if_changed(handle, &v, picked);
                         }
-                    } else if let Some(t) = self.rand_member_target(inner, rand_set) {
-                        // §18.5.12: an `inside` constraint on the member of an
-                        // aggregate rand property (`packed_struc.au_bytes in
-                        // {1,2,4,8,16}`). The target is not a bare rand prop,
-                        // so re-pick the member's bit-slice into the aggregate
-                        // (read-modify-write preserving the other members),
-                        // mirroring how the `==` arm re-picks via
-                        // `rand_member_target`/`set_rand_member`.
-                        let cur = self.eval_expr(inner);
+                    } else if let Some(t) = self.rand_agg_member_target(inner, rand_set) {
+                        // §18.4: a member (or a select of one) of an aggregate
+                        // rand property, as in the `ConstraintItem::Inside` arm.
+                        let cr = cr();
+                        let Some(cur) = self.read_rand_member(&t) else {
+                            return false;
+                        };
                         if self.value_in_ranges(&cur, &cr) {
                             return false;
                         }
@@ -144226,6 +144652,40 @@ impl Simulator {
                     let picked = self.pick_from_ranges(range, width, cur.is_signed);
                     if let Some(p) = picked {
                         return self.set_prop_if_changed(handle, &v, p);
+                    }
+                } else if let Some(t) = self.rand_agg_member_target(expr, rand_set) {
+                    // §18.4/§18.5.4: the same for a MEMBER (or a select of a
+                    // member) of an aggregate rand property, or a property of a
+                    // rand object handle. Without it the struct was drawn as
+                    // one uniform value and the item only filtered trials, so
+                    // a narrow range on a wide member never passed.
+                    let Some(cur) = self.read_rand_member(&t) else {
+                        return false;
+                    };
+                    let width = cur.width.max(1);
+                    if *is_dist && !dist_weights.is_empty() {
+                        let key = (handle, Self::rand_member_key(expr));
+                        if self.dist_picked_once.contains(&key) {
+                            return false;
+                        }
+                        let picked = self
+                            .pick_dist_value(Some(key.clone()), range, dist_weights)
+                            .map(|p| {
+                                let mut p = p.resize(width);
+                                p.is_signed = cur.is_signed;
+                                p
+                            });
+                        if let Some(p) = picked {
+                            self.dist_picked_once.insert(key);
+                            return self.set_rand_member(&t, p);
+                        }
+                        return false;
+                    }
+                    if self.value_in_ranges(&cur, range) {
+                        return false;
+                    }
+                    if let Some(p) = self.pick_from_ranges(range, width, cur.is_signed) {
+                        return self.set_rand_member(&t, p);
                     }
                 }
                 false
@@ -144296,7 +144756,30 @@ impl Simulator {
                 };
                 let arr_name = match arr_name {
                     Some(n) => n,
-                    None => return false,
+                    None => {
+                        // §18.4/§18.5.8: an array MEMBER of a rand struct
+                        // property (`foreach (u.arr[i]) u.arr[i] inside …`).
+                        // Its elements are member targets the body's own
+                        // items resolve, so solve the body per index.
+                        let Some(dims) = self.member_foreach_dims(handle, array) else {
+                            return false;
+                        };
+                        let names: Vec<String> = vars
+                            .iter()
+                            .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
+                            .collect();
+                        if names.is_empty() || names.len() > dims.len() {
+                            return false;
+                        }
+                        let mut changed = false;
+                        self.for_each_index(&names, &dims, |sim| {
+                            if sim.solve_forced(handle, body, rand_set) {
+                                changed = true;
+                            }
+                            None::<()>
+                        });
+                        return changed;
+                    }
                 };
                 // §18.5.8: 1-D and N-D fixed shapes alike, walking the
                 // inheritance chain (`fixed_foreach_dims`). Only the 1-D table
@@ -144492,17 +144975,26 @@ impl Simulator {
                         break;
                     }
                 }
-                let (lo, hi, w) = match range {
-                    Some(r) => r,
-                    None => return false,
+                // Every element as its index suffix: `[i]` for a 1-D array,
+                // `[i][j]…` for an N-D one (§18.5.5: `unique {m}` covers all
+                // the elements of a multi-dimensional array; only the 1-D
+                // table was consulted, so a 2-D `unique` repaired nothing).
+                let (suffixes, w): (Vec<String>, u32) = match range {
+                    Some((lo, hi, w)) => ((lo..=hi).map(|i| format!("[{}]", i)).collect(), w),
+                    None => match self.fixed_foreach_dims(handle, &prop) {
+                        Some((dims, w)) if dims.len() > 1 => {
+                            (Self::index_suffixes(&dims), w)
+                        }
+                        _ => return false,
+                    },
                 };
                 // Read the elements (scoped per-instance key first — where
                 // exec_randomize writes the baseline — then unscoped).
-                let read_elem = |s: &Self, i: i64| -> Option<Value> {
+                let read_elem = |s: &Self, sfx: &str| -> Option<Value> {
                     s.signals
-                        .get(&format!("{}#{}[{}]", handle, prop, i))
+                        .get(&format!("{}#{}{}", handle, prop, sfx))
                         .cloned()
-                        .or_else(|| s.signals.get(&format!("{}[{}]", prop, i)).cloned())
+                        .or_else(|| s.signals.get(&format!("{}{}", prop, sfx)).cloned())
                 };
                 let enum_pool: Vec<u64> = self
                     .prop_enum_type(handle, &prop)
@@ -144512,8 +145004,8 @@ impl Simulator {
                 let mut used: HashSet<u64> = HashSet::default();
                 let mut changed = false;
                 use rand::Rng;
-                for i in lo..=hi {
-                    let cur = read_elem(self, i).and_then(|v| v.to_u64());
+                for sfx in &suffixes {
+                    let cur = read_elem(self, sfx).and_then(|v| v.to_u64());
                     let needs_repick = match cur {
                         Some(cv) => !used.insert(cv),
                         None => true,
@@ -144544,8 +145036,8 @@ impl Simulator {
                         used.insert(p);
                         let v = Value::from_u64(p, w);
                         self.signals
-                            .insert(format!("{}#{}[{}]", handle, prop, i), v.clone());
-                        self.set_signal_value_by_name(&format!("{}[{}]", prop, i), v);
+                            .insert(format!("{}#{}{}", handle, prop, sfx), v.clone());
+                        self.set_signal_value_by_name(&format!("{}{}", prop, sfx), v);
                         changed = true;
                     }
                 }
@@ -145079,6 +145571,168 @@ impl Simulator {
             .insert(format!("{}#{}{}", handle, arr_name, idx), v);
     }
 
+    /// §18.5.8 over a MEMBER of a struct property (`foreach (u.arr[i])`):
+    /// the member's fixed unpacked bounds, one `(lo, hi)` per dimension.
+    /// `None` unless `array` is a member chain under a struct property of
+    /// `handle` ending at a member with fixed (range or size) dimensions.
+    fn member_foreach_dims(&mut self, handle: usize, array: &Expression) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::UnpackedDimension as UD;
+        let (root, members) = Self::foreach_member_chain(array)?;
+        let mut level = self.class_prop_struct(handle, &root)?;
+        let (last, path) = members.split_last()?;
+        for m in path {
+            let (dt, dims) = Self::struct_member_decl(&level, m)?;
+            if !dims.is_empty() {
+                return None;
+            }
+            match self.resolve_dt(&dt) {
+                DataType::Struct(inner) => level = inner,
+                _ => return None,
+            }
+        }
+        let (_, dims) = Self::struct_member_decl(&level, last)?;
+        if dims.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(dims.len());
+        for d in &dims {
+            match d {
+                UD::Range { left, right, .. } => {
+                    let l = self.eval_expr(left).to_i64()?;
+                    let r = self.eval_expr(right).to_i64()?;
+                    out.push((l.min(r), l.max(r)));
+                }
+                UD::Expression { expr, .. } => {
+                    let n = self.eval_expr(expr).to_i64()?;
+                    if n <= 0 {
+                        return None;
+                    }
+                    out.push((0, n - 1));
+                }
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// The `(root, members)` of a foreach array that names a member of a
+    /// struct property, in either parse shape: `Index{MemberAccess…}` (inside
+    /// a method) or a flat `Ident` `[u, arr]` (a constraint block keeps the
+    /// loop variables apart; a select may sit on the last segment).
+    fn foreach_member_chain(array: &Expression) -> Option<(String, Vec<String>)> {
+        match &array.kind {
+            ExprKind::Index { expr: base, .. } => {
+                let mut members: Vec<String> = Vec::new();
+                let mut cur = base.as_ref();
+                while let ExprKind::MemberAccess { expr: b, member } = &cur.kind {
+                    members.push(member.name.clone());
+                    cur = b;
+                }
+                let root = Self::plain_ident_name(cur)?;
+                if members.is_empty() {
+                    return None;
+                }
+                members.reverse();
+                Some((root, members))
+            }
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() >= 2
+                    && h.path[..h.path.len() - 1].iter().all(|s| s.selects.is_empty()) =>
+            {
+                Some((
+                    h.path[0].name.name.clone(),
+                    h.path[1..].iter().map(|s| s.name.name.clone()).collect(),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Run `f` once per index tuple of `dims` (the first `names.len()`
+    /// dimensions), with the loop variables bound in a fresh frame. Stops
+    /// early when `f` returns `Some`, passing that back.
+    fn for_each_index<T>(
+        &mut self,
+        names: &[String],
+        dims: &[(i64, i64)],
+        mut f: impl FnMut(&mut Self) -> Option<T>,
+    ) -> Option<T> {
+        let used = &dims[..names.len().min(dims.len())];
+        if used.iter().any(|&(lo, hi)| hi < lo) {
+            return None;
+        }
+        let mut idx: Vec<i64> = used.iter().map(|d| d.0).collect();
+        loop {
+            let frame: HashMap<String, Value> = names
+                .iter()
+                .zip(&idx)
+                .map(|(nm, &i)| (nm.clone(), Self::signed_loop_val(i)))
+                .collect();
+            self.push_local_frame(frame);
+            let r = f(self);
+            self.pop_local_frame();
+            if r.is_some() {
+                return r;
+            }
+            let mut k = used.len();
+            loop {
+                if k == 0 {
+                    return None;
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] <= used[k].1 {
+                    break;
+                }
+                idx[k] = used[k].0;
+            }
+        }
+    }
+
+    /// `[i][j]…` for every index tuple of `dims`, first dimension slowest.
+    fn index_suffixes(dims: &[(i64, i64)]) -> Vec<String> {
+        let mut out = vec![String::new()];
+        for &(lo, hi) in dims {
+            let mut next = Vec::with_capacity(out.len() * ((hi - lo + 1).max(0) as usize));
+            for pre in &out {
+                for i in lo..=hi {
+                    next.push(format!("{}[{}]", pre, i));
+                }
+            }
+            out = next;
+        }
+        out
+    }
+
+    /// §18.5.5: strict check of `unique {m}` over a whole MULTI-dimensional
+    /// fixed rand array (1-D arrays are rand collections, checked by
+    /// `coll_item_check`). Without it the item was unmodeled: a duplicate
+    /// draw was accepted, and so was a pigeonhole-unsatisfiable array.
+    fn check_fixed_nd_unique(&mut self, handle: usize, item: &ConstraintItem) -> Option<bool> {
+        let ConstraintItem::Unique { exprs, .. } = item else {
+            return None;
+        };
+        let [e] = exprs.as_slice() else {
+            return None;
+        };
+        let prop = Self::plain_ident_name(e)?;
+        let (dims, _) = self.fixed_foreach_dims(handle, &prop)?;
+        if dims.len() < 2 {
+            return None;
+        }
+        let mut seen: HashSet<u64> = HashSet::default();
+        for sfx in Self::index_suffixes(&dims) {
+            let v = self
+                .class_elem_load(handle, &prop, &sfx)
+                .or_else(|| self.get_signal_value_by_name(&format!("{}{}", prop, sfx)))?;
+            if v.has_xz() || !seen.insert(v.to_u64()?) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
     fn fixed_foreach_dims(&self, handle: usize, arr_name: &str) -> Option<(Vec<(i64, i64)>, u32)> {
         let mut cn = self
             .heap
@@ -145198,12 +145852,25 @@ impl Simulator {
         else {
             return None;
         };
-        let arr_name = Self::foreach_base_name(array)?;
-        let (dims, _w) = self.fixed_foreach_dims(handle, &arr_name)?;
         let idx_names: Vec<String> = vars
             .iter()
             .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
             .collect();
+        // An array MEMBER of a struct property (`foreach (u.arr[i])`).
+        if Self::foreach_member_chain(array).is_some() {
+            if let Some(dims) = self.member_foreach_dims(handle, array) {
+                if idx_names.len() != dims.len() || Self::constraint_unmodeled(body) {
+                    return None;
+                }
+                let body = (**body).clone();
+                let failed = self.for_each_index(&idx_names, &dims, |sim| {
+                    (!sim.item_holds(handle, &body)).then_some(())
+                });
+                return Some(failed.is_none());
+            }
+        }
+        let arr_name = Self::foreach_base_name(array)?;
+        let (dims, _w) = self.fixed_foreach_dims(handle, &arr_name)?;
         if idx_names.len() != dims.len() {
             return None;
         }

@@ -67,6 +67,16 @@ fn artifact_modes_round_trip() {
             String::from_utf8_lossy(&o.stdout),
             String::from_utf8_lossy(&o.stderr)
         );
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        let mut lines = stdout.lines();
+        let expected_version = format!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+        let expected_commit = format!(
+            "git {} ({})",
+            env!("XEZIM_GIT_HASH"),
+            env!("XEZIM_GIT_DATE")
+        );
+        assert_eq!(lines.next(), Some(expected_version.as_str()), "{n}: {text}");
+        assert_eq!(lines.next(), Some(expected_commit.as_str()), "{n}: {text}");
         assert!(
             text.contains("Loaded compiled:"),
             "{n}: fast path; got:\n{text}"
