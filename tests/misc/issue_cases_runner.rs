@@ -191,3 +191,39 @@ fn issue_26_static_init_sysfuncs() {
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
     assert!(msgs.iter().any(|m| m.contains("TEST_PASS")), "{:?}", msgs);
 }
+
+/// Issue #233: the reporter's parenless-call matrix (enum methods on locals,
+/// foreach keys and class members; free, package and interface functions;
+/// string and queue built-ins), run verbatim.
+#[test]
+fn issue_233_parenless_calls() {
+    let msgs = outputs(include_str!("../issue_cases/parenless.calls.sv"), 100_000);
+    assert!(
+        !msgs.iter().any(|m| m.starts_with("FAIL")),
+        "{:#?}",
+        msgs
+    );
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
+
+/// Issue #246: the reporter's randomize()-over-struct-fields MWE, run
+/// verbatim — member dist/inside/relational/equality targets, part-selects,
+/// nested members, unpacked members, `unique` on a 2-D array, the handle vs
+/// method storage views, and the nested rand-handle solve that used to spin
+/// for minutes (it must finish well inside the run).
+#[test]
+fn issue_246_struct_rand_fields() {
+    let start = std::time::Instant::now();
+    let msgs = outputs(include_str!("../issue_cases/struct.rand.fields.sv"), 100_000);
+    assert!(
+        !msgs.iter().any(|m| m.starts_with("FAIL")),
+        "{:#?}",
+        msgs
+    );
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "took {:?}",
+        start.elapsed()
+    );
+}

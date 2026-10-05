@@ -533,3 +533,5 @@ mod vif_static_roundtrip;
 mod constraint_shift_bounds;
 #[path = "classes/formal_class_type_frame_scoped.rs"]
 mod formal_class_type_frame_scoped;
+#[path = "classes/issue_246_struct_member_randomize.rs"]
+mod issue_246_struct_member_randomize;
