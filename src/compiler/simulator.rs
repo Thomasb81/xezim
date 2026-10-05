@@ -291,7 +291,7 @@ fn method_tier_threshold() -> u32 {
 /// lowering, register allocation, block layout. Stale entries with an old
 /// salt hash to different keys and are simply recompiled; the safety net is
 /// the suite-level ON == OFF parity run against a warm cache.
-const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3032;
+const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3033;
 
 /// class-perf P3: direct-call eligibility for a compiled (cid, mid).
 #[derive(Clone)]
@@ -29549,6 +29549,7 @@ impl Simulator {
                                 has_fallback: false,
                                 nba_dup_targets: true,
                                 foreach_slots: 0,
+                                static_locals: Box::new([]),
                             };
                             let mut ok = true;
                             for &m in chunk {
@@ -39303,6 +39304,7 @@ impl Simulator {
                         has_fallback: false,
                         nba_dup_targets: false,
                         foreach_slots: 0,
+                        static_locals: Box::new([]),
                     };
                     for &m in chunk {
                         let mb = match &entries[m].item {
@@ -63434,14 +63436,6 @@ impl Simulator {
         // Class associative-array member element write — base may be
         // a bare member (`m[k]=v`) or another object's (`obj.m[k]=v`).
         if let Some(an) = self.expr_assoc_name(expr) {
-            if env_set_cached!("XEZIM_AW_DBG") {
-                eprintln!(
-                    "[AW] assoc write an={} width={:?} map={:?}",
-                    an,
-                    self.assoc_elem_width(&an),
-                    self.module.assoc_elem_widths
-                );
-            }
             let idx_val = self.eval_expr(index);
             let idx_str = self.assoc_key_str(&an, &idx_val);
             let elem_name = Self::name_with_key(&an, &idx_str);
@@ -128789,7 +128783,22 @@ impl Simulator {
                     *count += 1;
                     self.wake_semaphore_waiters(handle);
                 }
-                return Value::zero(32);
+                // Not a mailbox/semaphore: if the receiver is a class instance
+                // whose class defines a user `put` method (the uvm_cache /
+                // uvm_regex_cache shape), do NOT swallow the call — fall
+                // through to the generic method dispatch below. Returning
+                // zero here silently dropped `obj.put(...)` whenever it was
+                // evaluated in EXPRESSION context (inside a function body),
+                // so the UVM regex cache never hit and every `uvm_re_match`
+                // recompiled its regex through the DPI.
+                let is_user_put = self
+                    .heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .is_some_and(|i| self.class_has_method(&i.class_name, "put"));
+                if !is_user_put {
+                    return Value::zero(32);
+                }
             }
             if mname == "get" {
                 let base = self.eval_expr(expr);
@@ -154128,6 +154137,50 @@ impl Simulator {
                     .unwrap_or_else(|| Value::zero(32));
             }
         }
+        // §6.21: seed the body's STATIC locals (register-backed; the
+        // compiler emits no seed — see `method_static_locals`) from the
+        // persistent store, or the block's recorded default on the first
+        // call, and open their sync entries so the exit
+        // `sync_static_locals` persists the final register values. Keys
+        // mirror the AST declaration site exactly (class/spec/subroutine-
+        // qualified), so the AST path and the compiled path share one cell.
+        if !block.static_locals.is_empty() {
+            let sub_name = self
+                .static_local_syncs
+                .last()
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default();
+            let mut seeds: Vec<(String, usize, Value)> = Vec::new();
+            for (nm, reg, default) in &block.static_locals {
+                let key = match (
+                    self.class_context_stack.last().and_then(|c| c.as_ref()),
+                    self.current_spec.as_ref(),
+                ) {
+                    (Some(cn), Some((spec_base, sig))) if spec_base == cn => {
+                        format!("{}#{}::{}::{}", cn, sig, sub_name, nm)
+                    }
+                    (Some(cn), _) => format!("{}::{}::{}", cn, sub_name, nm),
+                    _ => format!("{}::{}", sub_name, nm),
+                };
+                let persisted = self.static_local_vars.get(&key).cloned();
+                if let Some((_n, syncs)) = self.static_local_syncs.last_mut() {
+                    syncs.push((nm.clone(), key));
+                }
+                seeds.push((
+                    nm.clone(),
+                    *reg as usize,
+                    persisted.unwrap_or_else(|| default.clone()),
+                ));
+            }
+            for (nm, reg, v) in seeds {
+                if reg < self.vm_regs.len() {
+                    self.vm_regs[reg] = v.clone();
+                }
+                if let Some(fr) = self.local_stack.last_mut() {
+                    fr.insert(nm, v);
+                }
+            }
+        }
         // class-perf Step 9c: pre-record the type metadata that executing
         // the body's TOP-LEVEL VarDecls would write (class type, `#()`
         // args, container kind, typedef/enum name). The AST path records a
@@ -154203,6 +154256,25 @@ impl Simulator {
                     if let Some(v) = self.vm_regs.get(reg).cloned() {
                         outs.push((port.name.name.clone(), v));
                     }
+                }
+            }
+            if !outs.is_empty()
+                && let Some(fr) = self.local_stack.last_mut()
+            {
+                for (n, v) in outs {
+                    fr.insert(n, v);
+                }
+            }
+        }
+        // §6.21: copy final STATIC-local registers into the locals frame
+        // so the exit `sync_static_locals` persists them to
+        // `static_local_vars` (same contract as the formal writeback
+        // above).
+        if !block.static_locals.is_empty() {
+            let mut outs: Vec<(String, Value)> = Vec::new();
+            for (nm, reg, _) in &block.static_locals {
+                if let Some(v) = self.vm_regs.get(*reg as usize).cloned() {
+                    outs.push((nm.clone(), v));
                 }
             }
             if !outs.is_empty()
