@@ -2,9 +2,10 @@
 //! argument and return types): imported TASKS that consume time through an
 //! exported task, the scope a context import runs in, C -> SV -> C
 //! recursion, `pure` imports in continuous logic, the `c_name =` link form,
-//! a C-owned object carried as a chandle, and one call writing outputs of
-//! several types. Each bench prints `T|` lines; the expected values were
-//! worked out by hand from IEEE 1800-2017 clause 35.
+//! a C-owned object carried as a chandle, one call writing outputs of
+//! several types, and the Annex H utility API. Each bench prints `T|` lines;
+//! the expected values were worked out by hand from IEEE 1800-2017 clause 35
+//! and Annex H.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -169,6 +170,49 @@ fn dpi_pure_alias_chandle_and_outputs() {
             "T|released 1",
             "T|outputs half=18.5 label=x=37 byte=37 nib=0101 odd=1",
             "T|outputs half=10.5 label=x=21 byte=21 nib=010x odd=1",
+            "T|done",
+        ]
+    );
+}
+
+/// Annex H from C: the open-array queries (H.12.2) on ascending and
+/// descending ranges, a dynamic array, a queue and an empty dynamic array
+/// (the range [0:-1], no element pointer); out-of-range element pointers
+/// (H.12.3); each canonical element type (char, short, long long, double,
+/// float, svBitVecVal and svLogicVecVal words, scalar bit and logic) read
+/// in place and written back through inout and output formals
+/// (H.12.4-H.12.6); bit and part selects of plain 2- and 4-state vectors
+/// (H.10.1); per-scope user data kept apart for two instances (H.9.3); and
+/// svGetCallerInfo / the disable protocol (H.9.4, H.9.5).
+#[test]
+fn dpi_svdpi_annex_h_api() {
+    let so = compile("tests/dpi/svdpi_api.c");
+    assert_eq!(
+        tagged(&so, "tests/dpi/svdpi_api_test.sv"),
+        [
+            "T|up l=2 r=5 lo=2 hi=5 inc=-1 size=4 dims=1 bytes=16 | 2:20 3:30 4:40 5:50",
+            "T|down l=7 r=4 lo=4 hi=7 inc=1 size=4 dims=1 bytes=16 | 7:700 6:600 5:500 4:400",
+            "T|dyn l=0 r=2 lo=0 hi=2 inc=-1 size=3 dims=1 bytes=12 | 0:7 1:8 2:9",
+            "T|queue l=0 r=1 lo=0 hi=1 inc=-1 size=2 dims=1 bytes=8 | 0:5 1:6",
+            "T|none l=0 r=-1 lo=0 hi=-1 inc=-1 size=0 dims=1 bytes=0 | empty ptr=null",
+            "T|edges below=null above=null variadic=same raw=low dim2=0",
+            "T|sums byte=-4 short=31000 long=1099511627771 real=98.750 shortreal=2.750",
+            "T|inout b=2,-4,6,120 r=1.875,-3.750,150.000 dyn=21,24,27",
+            "T|bitvec dims=2 p.l=11 p.r=0 p.size=12 | 3:abc 2:123 1:fff",
+            "T|logicvec 0:10xz 1:0101 2:zzzz",
+            "T|fill 000 111 222",
+            "T|mark 1x0z 0101 zzz1",
+            "T|flip ones=3 now=01001",
+            "T|resolve unknown=2 now=1001",
+            "T|part low=0000cdef cross=00000078 top=00000001 bit4=0 bit5=1",
+            "T|put 01234567c9abcdef",
+            "T|lpart 000c000b",
+            "T|lput 111101zx",
+            "T|ud put 0 0",
+            "T|ud get 11 22",
+            "T|ud again 33 22",
+            "T|ud null_scope=-1 null_key=-1 unused=null replaced=2",
+            "T|misc caller=0 disabled=0",
             "T|done",
         ]
     );
