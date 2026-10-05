@@ -15597,6 +15597,17 @@ impl Simulator {
     }
 
     fn exec_dpi_import_call(&mut self, sv_name: &str, args: &[Expression]) -> Option<Value> {
+        self.exec_dpi_import_call_in(sv_name, args, None)
+    }
+
+    /// `exec_dpi_import_call` for a call reached through a hierarchical
+    /// prefix (`u_a.c_fn()`): `via` is that instance path (`u_a`).
+    fn exec_dpi_import_call_in(
+        &mut self,
+        sv_name: &str,
+        args: &[Expression],
+        via: Option<&str>,
+    ) -> Option<Value> {
         let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
         if !self.dpi_bindings.contains_key(sv_name) {
             let c_name = self.module.dpi_imports.get(sv_name)?.c_name.clone();
@@ -15942,9 +15953,21 @@ impl Simulator {
         // Set the active DPI scope to match the import's declaration
         // site. DPI routines rely on `svGetScope` returning the caller's
         // enclosing scope so that scope-aware helpers find the right
-        // package/module context. We synthesise a scope handle from the
-        // import name's leading package/module path (e.g. `pkg::foo` → `pkg`).
-        let scope_name: String = sv_name.split("::").next().unwrap_or("").to_string();
+        // package/module context (§35.5.3). A package import is in its
+        // package (`pkg::foo` → `pkg`, or a bare name the package owns); a
+        // module import is in the instance it is called through or running
+        // in (`top.u_a`). The bare import name used to be taken as the
+        // scope, so a module's context import saw a scope named after
+        // itself.
+        let scope_name: String = if let Some((pkg, _)) = sv_name.split_once("::") {
+            pkg.to_string()
+        } else if let Some(prefix) = via {
+            self.hier_path(prefix)
+        } else if let Some(pkg) = self.module.pkg_subr_owner.get(sv_name) {
+            pkg.clone()
+        } else {
+            self.hier_path(&self.active_instance_scope())
+        };
         let prev_scope = ACTIVE_SCOPE.with(|cell| cell.get());
         if !scope_name.is_empty() {
             // Look up or create a scope handle and pin it for the
@@ -127508,8 +127531,18 @@ impl Simulator {
             if let Some(cg_def) = self.covergroup_def_for(name) {
                 return self.instantiate_covergroup(&cg_def, args);
             }
-            // DPI import call
-            if let Some(v) = self.exec_dpi_import_call(name, args) {
+            // DPI import call — through an instance path (`u_a.c_fn()`), the
+            // call runs in that instance's scope (§35.5.3).
+            let via: Option<String> = (hier.path.len() > 1)
+                .then(|| {
+                    hier.path[..hier.path.len() - 1]
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
+                .filter(|p| self.module.instances.iter().any(|i| &i.path == p));
+            if let Some(v) = self.exec_dpi_import_call_in(name, args, via.as_deref()) {
                 return v;
             }
             // Unqualified call inside a class method — resolve to a method
