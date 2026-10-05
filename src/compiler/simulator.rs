@@ -142794,7 +142794,13 @@ impl Simulator {
     }
 
     fn set_prop_if_changed(&mut self, handle: usize, name: &str, val: Value) -> bool {
-        let mut val = val;
+        // §11.6.1/§18.5: a value the solver forces is stored at the property's
+        // declared width, like any assignment. Kept at the forcing
+        // expression's width (`ma == 40'h... * tot - 1` into an `int
+        // unsigned`, `b == 32'd300` into a `byte`, a `!=` re-pick drawn at the
+        // other operand's 40 bits into a 1-bit `bit`), the check then compared
+        // the oversized value and accepted an unsatisfiable set.
+        let mut val = self.fit_class_prop(handle, name, &val);
         if !val.is_signed && !val.is_real && self.class_prop_signed_of(handle, name) {
             val.is_signed = true;
         }
@@ -143591,7 +143597,7 @@ impl Simulator {
             } else if let Some(t) = self.rand_agg_member_target(right, rand_set) {
                 (RelTarget::Member(t), left, mirrored)
             } else {
-                return false;
+                return self.force_sum_bound(handle, op, left, right, rand_set);
             };
         let Some((bound, _, bs)) = self.exact_int(bound_expr) else {
             return false;
@@ -143658,6 +143664,132 @@ impl Simulator {
             RelTarget::Prop(name) => self.set_prop_if_changed(handle, name, p),
             RelTarget::Member(t) => self.set_rand_member(t, p),
         }
+    }
+
+    /// §18.5: `t1 + t2 + … <= K` (or `<`, or mirrored) where every term is a
+    /// rand variable or member — bare, or zero-extended as `{1'b0, x}` — so
+    /// each term is non-negative and the bound is met by lowering terms. A
+    /// sum of struct members (`{1'b0, regs.MODE.NUM_HOSTS} + {1'b0,
+    /// regs.MODE.FIRST_HOST} <= 1`) had no repair at all: only a lucky draw
+    /// passed, so randomize() exhausted its trials. Terms are visited in
+    /// random order; one that still fits the remaining budget keeps its value
+    /// (so a term another constraint pins stays put), any other is redrawn
+    /// within the budget. Called only when the relation is violated.
+    fn force_sum_bound(
+        &mut self,
+        handle: usize,
+        op: &BinaryOp,
+        left: &Expression,
+        right: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> bool {
+        enum Term {
+            Prop(String, u32),
+            Member(RandMemberTarget, u32),
+        }
+        fn leaves<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
+            match &e.kind {
+                ExprKind::Paren(i) => leaves(i, out),
+                ExprKind::Binary {
+                    op: BinaryOp::Add,
+                    left,
+                    right,
+                } => {
+                    leaves(left, out);
+                    leaves(right, out);
+                }
+                _ => out.push(e),
+            }
+        }
+        // The side holding the sum, and the inclusive upper bound on it.
+        let (sum_side, bound_side, strict) = match op {
+            BinaryOp::Leq => (left, right, false),
+            BinaryOp::Lt => (left, right, true),
+            BinaryOp::Geq => (right, left, false),
+            BinaryOp::Gt => (right, left, true),
+            _ => return false,
+        };
+        let mut parts: Vec<&Expression> = Vec::new();
+        leaves(sum_side, &mut parts);
+        if parts.len() < 2 {
+            return false;
+        }
+        let mut terms: Vec<Term> = Vec::with_capacity(parts.len());
+        for p in parts {
+            // `{1'b0, x}` / `{2'b00, x}`: zero bits above a single target.
+            let target = match &Self::unparen(p).kind {
+                ExprKind::Concatenation(items) => {
+                    let Some((last, zeros)) = items.split_last() else {
+                        return false;
+                    };
+                    let all_zero = zeros.iter().all(|z| {
+                        matches!(z.kind, ExprKind::Number(_))
+                            && self.eval_expr(z).to_u64() == Some(0)
+                    });
+                    if !all_zero {
+                        return false;
+                    }
+                    last
+                }
+                _ => p,
+            };
+            if let Some(name) = self.rand_lvalue_name(target, rand_set) {
+                let w = self.class_prop_width_of(handle, &name).unwrap_or(0);
+                if w == 0 || w > 63 || self.class_prop_signed_of(handle, &name) {
+                    return false;
+                }
+                terms.push(Term::Prop(name, w));
+            } else if let Some(t) = self.rand_agg_member_target(target, rand_set) {
+                let w = self.read_rand_member(&t).map(|v| v.width).unwrap_or(0);
+                if w == 0 || w > 63 {
+                    return false;
+                }
+                terms.push(Term::Member(t, w));
+            } else {
+                return false;
+            }
+        }
+        let Some((k, _, _)) = self.exact_int(bound_side) else {
+            return false;
+        };
+        let mut budget: i128 = if strict { k - 1 } else { k };
+        if budget < 0 {
+            return false; // unsatisfiable for non-negative terms
+        }
+        use rand::seq::SliceRandom;
+        let mut order: Vec<usize> = (0..terms.len()).collect();
+        order.shuffle(self.cur_rng());
+        let mut changed = false;
+        for i in order {
+            let (cur, w) = match &terms[i] {
+                Term::Prop(n, w) => (
+                    self.heap
+                        .get(handle)
+                        .and_then(|o| o.as_ref())
+                        .and_then(|inst| inst.properties.get(n))
+                        .and_then(|v| v.to_u64()),
+                    *w,
+                ),
+                Term::Member(t, w) => (self.read_rand_member(t).and_then(|v| v.to_u64()), *w),
+            };
+            let max = ((1u128 << w) - 1) as i128;
+            let cap = budget.min(max);
+            let keep = cur.is_some_and(|c| (c as i128) <= cap);
+            let v = if keep {
+                cur.unwrap() as i128
+            } else {
+                use rand::Rng;
+                let v = self.cur_rng().gen_range(0..=cap as u64) as i128;
+                let nv = Value::from_u64(v as u64, w);
+                changed |= match &terms[i] {
+                    Term::Prop(n, _) => self.set_prop_if_changed(handle, n, nv),
+                    Term::Member(t, _) => self.set_rand_member(t, nv),
+                };
+                v
+            };
+            budget -= v;
+        }
+        changed
     }
 
     /// Is `e` a `.size()` (`.size` / `.size()`) reference to a rand DYNAMIC

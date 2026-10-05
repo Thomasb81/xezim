@@ -227,3 +227,19 @@ fn issue_246_struct_rand_fields() {
         start.elapsed()
     );
 }
+
+/// The randomize() width-overflow family and dist obedience MWE, run
+/// verbatim: `==` / `!=` forcing a value wider than its rand variable, a
+/// >64-bit rand struct with member-sum constraints, and the dist-frequency
+/// and width-boundary guards around them. `tests/classes/rand_width_overflow.rs`
+/// restates each section as its own test.
+#[test]
+fn rand_width_overflow_and_dist_mwe() {
+    let msgs = outputs(include_str!("../issue_cases/rand.width.dist.sv"), 100_000);
+    assert!(
+        !msgs.iter().any(|m| m.starts_with("FAIL")),
+        "{:#?}",
+        msgs
+    );
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
