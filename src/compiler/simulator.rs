@@ -76293,6 +76293,25 @@ impl Simulator {
                         }
                     }
                 }
+                // §13.5.5, the same shape for a PACKAGE function: inside a
+                // subroutine body `vp::pkf` parses as MemberAccess on the
+                // package name (the Ident arm handles the flat form). Read as
+                // a member it returned 0, so `return vp::pkf;` lost the call.
+                if let Some(pkg) = Self::plain_ident_name(recv) {
+                    if self.module.packages.contains(&pkg)
+                        && self
+                            .module
+                            .functions
+                            .contains_key(&format!("{}::{}", pkg, member.name))
+                        && self
+                            .module
+                            .pkg_subr_owner
+                            .get(&member.name)
+                            .is_some_and(|owner| owner == &pkg)
+                    {
+                        return self.eval_call(expr, &[]);
+                    }
+                }
                 self.eval_expr_member_access(recv, member, ctx_width)
             }
             ExprKind::Call { func, args } => self.eval_call(func, args),
@@ -80222,17 +80241,21 @@ impl Simulator {
         // is by value, so drop the type binding on the way out too.
         let fe_key_type_var: Option<String> = (|| {
             let arr_name = Self::foreach_array_root_name(array)?;
+            // A subroutine-local array's key type lives in its frame's
+            // overlay (see the local associative-array declaration); ""
+            // there means an unnamed key type shadowing an outer array.
+            let local_kt = self.local_typedef_type_of(&format!("{}[]", arr_name));
+            if local_kt.as_deref() == Some("") {
+                return None;
+            }
             // Module/package-scope collections record the key type in
             // the module map; a CLASS PROPERTY records it on its class
             // (§3b): walk `this`'s hierarchy when the module map
             // misses — UVM's `severity_count[uvm_severity]` lives on
             // uvm_report_server, and without this the summary printed
             // members of an unrelated enum for every severity.
-            let kt = self
-                .module
-                .assoc_key_type_names
-                .get(&arr_name)
-                .cloned()
+            let kt = local_kt
+                .or_else(|| self.module.assoc_key_type_names.get(&arr_name).cloned())
                 .or_else(|| {
                     let handle = self.this_stack.last().copied().flatten()?;
                     let mut cur = self
@@ -81923,6 +81946,40 @@ impl Simulator {
                             .associative_arrays
                             .insert(name.clone(), is_string_key);
                         self.widths.insert(name.clone(), w);
+                        // §6.19.6/§7.8: a NAMED key type (`int aa[e_t];`)
+                        // gives a `foreach (aa[k])` index variable that type,
+                        // so `k.last`/`k.next`/`k.name` resolve against the
+                        // enum. Elaboration records it for module-scope
+                        // arrays only. Inside a subroutine frame it goes to
+                        // the frame's overlay under `aa[]` (no variable can
+                        // have that name), so a same-named array elsewhere
+                        // keeps its own key type; an unnamed key type records
+                        // "" there to shadow an outer entry.
+                        let key_tn = key_dt
+                            .as_ref()
+                            .and_then(|dt| match dt.as_ref() {
+                                crate::ast::types::DataType::TypeReference { name: tn, .. } => {
+                                    Some(tn.name.name.clone())
+                                }
+                                _ => None,
+                            })
+                            .filter(|tn| {
+                                self.module.enum_members.contains_key(tn)
+                                    || self.module.typedef_types.contains_key(tn)
+                            });
+                        if self.local_type_stack.is_empty() {
+                            match key_tn {
+                                Some(tn) => {
+                                    self.module.assoc_key_type_names.insert(bare.clone(), tn);
+                                }
+                                None => {
+                                    self.module.assoc_key_type_names.remove(&bare);
+                                }
+                            }
+                        } else {
+                            let slot = format!("{}[]", bare);
+                            self.record_local_typedef_type(&slot, key_tn.as_deref().unwrap_or(""));
+                        }
                         // Record the ELEMENT type under the renamed
                         // storage key so `all[k] = new` can resolve
                         // the element class (incl. parameterized
