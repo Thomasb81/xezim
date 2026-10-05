@@ -45,10 +45,16 @@ mod collection_of_handles_new;
 mod constraint_foreach_signed_indices;
 #[path = "classes/constructor_body_ports.rs"]
 mod constructor_body_ports;
+#[path = "classes/ctor_bare_member_dynarray_size.rs"]
+mod ctor_bare_member_dynarray_size;
 #[path = "classes/explicit_param_static_coll_read.rs"]
 mod explicit_param_static_coll_read;
 #[path = "classes/function_local_struct_return_shadow.rs"]
 mod function_local_struct_return_shadow;
+#[path = "classes/foreach_cross_elem_whole_equality.rs"]
+mod foreach_cross_elem_whole_equality;
+#[path = "classes/foreach_packed_struct_member_inside.rs"]
+mod foreach_packed_struct_member_inside;
 #[path = "classes/implements_typedef_scope.rs"]
 mod implements_typedef_scope;
 #[path = "classes/inherited_local_member.rs"]
@@ -81,6 +87,8 @@ mod static_fixed_array_storage;
 mod static_param_class_collection_reuse;
 #[path = "classes/struct_member_class_handle_new.rs"]
 mod struct_member_class_handle_new;
+#[path = "classes/struct_member_bitselect_frame_local.rs"]
+mod struct_member_bitselect_frame_local;
 #[path = "classes/subroutine_formal_frame_type.rs"]
 mod subroutine_formal_frame_type;
 #[path = "classes/this_collection_struct_members.rs"]
@@ -278,6 +286,8 @@ mod issue4_coupled_constraints;
 mod ivtest_class_struct_cluster;
 #[path = "classes/localparam_class_not_parameterized.rs"]
 mod localparam_class_not_parameterized;
+#[path = "classes/local_shadows_sig.rs"]
+mod local_shadows_sig;
 #[path = "classes/method_default_this_call.rs"]
 mod method_default_this_call;
 #[path = "classes/module_scope_derived_constraints.rs"]
@@ -290,6 +300,8 @@ mod nested_seq_method_dispatch;
 mod nonvirtual_dispatch_fscanf_process;
 #[path = "classes/out_of_class_method_shadow.rs"]
 mod out_of_class_method_shadow;
+#[path = "classes/oor_packed_index_2state.rs"]
+mod oor_packed_index_2state;
 #[path = "classes/param_typedef_ctor_resolution.rs"]
 mod param_typedef_ctor_resolution;
 #[path = "classes/process_class_9_7.rs"]
@@ -354,12 +366,22 @@ mod type_param_member_resolves_to_own_spec;
 #[path = "classes/process_kill_via_member_handle.rs"]
 mod process_kill_via_member_handle;
 
+#[path = "classes/forward_declared_class_formal_member_write.rs"]
+mod forward_declared_class_formal_member_write;
+
+#[path = "classes/forward_class_formal_vs_caller_struct_collision.rs"]
+mod forward_class_formal_vs_caller_struct_collision;
+
 #[path = "classes/sibling_type_param_default_cast.rs"]
 mod sibling_type_param_default_cast;
 #[path = "classes/queue_eq_construction_path.rs"]
 mod queue_eq_construction_path;
 #[path = "classes/queue_elem_receiver_splice.rs"]
 mod queue_elem_receiver_splice;
+#[path = "classes/reg_field_byte_shift_stream_cast.rs"]
+mod reg_field_byte_shift_stream_cast;
+#[path = "classes/pkg_assoc_elem_read_neq.rs"]
+mod pkg_assoc_elem_read_neq;
 #[path = "classes/unpacked_struct_class_property_whole_value.rs"]
 mod unpacked_struct_class_property_whole_value;
 #[path = "classes/uvm_config_db_tests.rs"]
@@ -537,6 +559,14 @@ mod vif_static_roundtrip;
 mod constraint_shift_bounds;
 #[path = "classes/formal_class_type_frame_scoped.rs"]
 mod formal_class_type_frame_scoped;
+#[path = "classes/type_param_inherited_member_write.rs"]
+mod type_param_inherited_member_write;
+#[path = "classes/struct_array_field_read.rs"]
+mod struct_array_field_read;
+#[path = "classes/dyn_array_struct_copy.rs"]
+mod dyn_array_struct_copy;
+#[path = "classes/assoc_wide_packed_struct_key.rs"]
+mod assoc_wide_packed_struct_key;
 #[path = "classes/concurrent_function_struct_local_shadow.rs"]
 mod concurrent_function_struct_local_shadow;
 #[path = "classes/type_param_prop_member_write.rs"]
