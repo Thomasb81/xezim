@@ -130768,18 +130768,14 @@ impl Simulator {
         if top.saves.iter().any(|d| d.meta.name == name) {
             return;
         }
-        // Only a variable still live outside this activation — in the signal
-        // maps or a caller's frame — can observe the stale entries; a name
-        // left over from an earlier, finished call has nothing to protect.
-        let n = self.local_stack.len();
-        if !(self.signals.contains_key(name)
-            || self.signal_name_to_id.contains_key(name)
-            || self.local_stack[..n.saturating_sub(1)]
-                .iter()
-                .any(|f| f.contains_key(name)))
-        {
-            return;
-        }
+        // No liveness filter: the displaced entries may belong to a task
+        // SUSPENDED in another process (its frames are swapped out, so
+        // neither `local_stack` nor the signal maps show them). A function
+        // run meanwhile — a predictor's `uvm_reg_bus_op rw` while a
+        // register task holds `uvm_reg_item rw` — would otherwise leave its
+        // struct layout behind, and the task's `rw.status = ...` then wrote
+        // a bit slice into the handle. Putting back a finished call's stale
+        // entries is harmless: it is the state from before this call.
         let save = DeclShadow {
             width: self.widths.get(name).copied(),
             signed: self.signed_signals.contains(name),

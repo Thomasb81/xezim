@@ -535,3 +535,5 @@ mod constraint_shift_bounds;
 mod formal_class_type_frame_scoped;
 #[path = "classes/type_param_prop_member_write.rs"]
 mod type_param_prop_member_write;
+#[path = "classes/concurrent_function_struct_local_shadow.rs"]
+mod concurrent_function_struct_local_shadow;
