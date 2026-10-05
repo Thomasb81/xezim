@@ -56,32 +56,24 @@ impl Simulator {
         }
     }
 
-    /// The source file a constraint block was parsed from: the one whose
-    /// text at the block's span is that block's declaration. A span is an
-    /// offset into its own file's preprocessed text.
-    fn constraint_block_file(&self, con: &ClassConstraint) -> Option<usize> {
-        let span = con.span;
-        if span.start >= span.end {
-            return None;
-        }
-        self.module.source_texts.iter().position(|t| {
-            t.get(span.start..span.end).is_some_and(|s| {
-                let s = s.trim_start();
-                s.starts_with("constraint") && s.contains(con.name.name.as_str())
-            })
-        })
-    }
-
     /// `file:line` and the whitespace-collapsed source text of an item.
     fn constraint_item_source(
         &self,
-        con: &ClassConstraint,
         item: &ConstraintItem,
+        src_file: Option<u32>,
     ) -> Option<(String, String)> {
         let span = item_span(item)?;
-        let file = self.constraint_block_file(con);
-        let i = match file {
-            Some(i) => i,
+        let i = match src_file.map(|i| i as usize) {
+            Some(i)
+                if self
+                    .module
+                    .source_texts
+                    .get(i)
+                    .is_some_and(|t| span.end <= t.len()) =>
+            {
+                i
+            }
+            Some(_) => return None,
             None => {
                 let mut fits = self
                     .module
@@ -122,6 +114,7 @@ impl Simulator {
         rand_disabled: &HashSet<String>,
         constraint_disabled: &HashSet<String>,
         constraints: &[ClassConstraint],
+        constraint_src_files: &[Option<u32>],
         diag: &RandDiag,
     ) {
         eprintln!(
@@ -179,7 +172,11 @@ impl Simulator {
                 "[rand-diag]     {}/{} {}",
                 n,
                 diag.trials,
-                self.rand_diag_item(&constraints[ci], ii)
+                self.rand_diag_item(
+                    &constraints[ci],
+                    constraint_src_files.get(ci).copied().flatten(),
+                    ii,
+                )
             );
             let own = &item_vars[ci][ii];
             if own.is_empty() {
@@ -193,7 +190,11 @@ impl Simulator {
                         eprintln!(
                             "[rand-diag]       related ({}): {}",
                             shared.join(", "),
-                            self.rand_diag_item(con, jj)
+                            self.rand_diag_item(
+                                con,
+                                constraint_src_files.get(cj).copied().flatten(),
+                                jj,
+                            )
                         );
                     }
                 }
@@ -202,12 +203,12 @@ impl Simulator {
     }
 
     /// `block (file:line): text` for item `ii` of `con`.
-    fn rand_diag_item(&self, con: &ClassConstraint, ii: usize) -> String {
+    fn rand_diag_item(&self, con: &ClassConstraint, src_file: Option<u32>, ii: usize) -> String {
         let block = match con.name.name.as_str() {
             "__inline__" => "with {...}",
             n => n,
         };
-        match self.constraint_item_source(con, &con.items[ii]) {
+        match self.constraint_item_source(&con.items[ii], src_file) {
             Some((loc, text)) => format!("{} ({}): {}", block, loc, text),
             None => format!("{} (item {}): {:?}", block, ii, con.items[ii]),
         }

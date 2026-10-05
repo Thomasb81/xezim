@@ -102552,7 +102552,10 @@ impl Simulator {
         self.obj_rng_stack.push(handle);
         let prev_receiver = std::mem::replace(&mut self.rand_receiver, receiver);
         let prev_subset = std::mem::replace(&mut self.randomize_subset, subset);
-        let r = self.exec_randomize_inner(handle, items);
+        let inline_src_file = (!items.is_empty())
+            .then(|| self.current_src_file())
+            .flatten();
+        let r = self.exec_randomize_inner(handle, items, inline_src_file);
         self.randomize_subset = prev_subset;
         self.rand_receiver = prev_receiver;
         self.obj_rng_stack.pop();
@@ -138818,7 +138821,7 @@ impl Simulator {
     fn exec_randomize(&mut self, handle: usize) -> Value {
         self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
-        let r = self.exec_randomize_inner(handle, &[]);
+        let r = self.exec_randomize_inner(handle, &[], None);
         self.obj_rng_stack.pop();
         self.end_randomize_budget();
         r
@@ -138837,7 +138840,7 @@ impl Simulator {
         let subset = self.randomize_subset.take();
         self.randomize_depth += 1;
         self.obj_rng_stack.push(sub);
-        self.exec_randomize_inner(sub, pushed);
+        self.exec_randomize_inner(sub, pushed, None);
         self.obj_rng_stack.pop();
         self.randomize_depth -= 1;
         self.randomize_subset = subset;
@@ -139344,16 +139347,26 @@ impl Simulator {
     /// local `addr` made every `addr` constraint of the object read it). The
     /// inline constraints' caller-scope operands were bound beforehand
     /// (`freeze_caller_scope_refs`), so the solve runs in a fresh frame.
-    fn exec_randomize_inner(&mut self, handle: usize, inline: &[ConstraintItem]) -> Value {
+    fn exec_randomize_inner(
+        &mut self,
+        handle: usize,
+        inline: &[ConstraintItem],
+        inline_src_file: Option<u32>,
+    ) -> Value {
         self.push_local_frame(HashMap::default());
         self.method_local_base.push(self.local_stack.len() - 1);
-        let r = self.exec_randomize_solve(handle, inline);
+        let r = self.exec_randomize_solve(handle, inline, inline_src_file);
         self.method_local_base.pop();
         self.pop_local_frame();
         r
     }
 
-    fn exec_randomize_solve(&mut self, handle: usize, inline: &[ConstraintItem]) -> Value {
+    fn exec_randomize_solve(
+        &mut self,
+        handle: usize,
+        inline: &[ConstraintItem],
+        inline_src_file: Option<u32>,
+    ) -> Value {
         // Reset the dist-pick-once tracker so each randomize call gets a
         // fresh weighted draw per `(handle, prop)`.
         self.dist_picked_once.clear();
@@ -139370,6 +139383,10 @@ impl Simulator {
 
         let mut rand_props = Vec::new();
         let mut constraints = Vec::new();
+        // Kept parallel with `constraints`. AST spans are file-local, so the
+        // defining class (or call site for an inline block) supplies the
+        // retained source index.
+        let mut constraint_src_files: Vec<Option<u32>> = Vec::new();
         // §18.5.14.2: inheritance depth of each collected constraint block
         // (0 = the object's own class, 1 = its parent, …). A soft constraint
         // in a DERIVED class has HIGHER priority than a conflicting soft
@@ -139536,6 +139553,8 @@ impl Simulator {
                     }
                     if seen_constraint_names.insert(con_name.clone()) {
                         constraints.push(con.clone());
+                        constraint_src_files
+                            .push(self.module.src_file_of_module.get(&cname).copied());
                         constraint_depth.push(class_depth);
                     }
                 }
@@ -139560,6 +139579,7 @@ impl Simulator {
                 items: inline.to_vec(),
                 span: crate::ast::Span::new(0, 0),
             });
+            constraint_src_files.push(inline_src_file);
         }
 
         // §18.5.5: expand the array SLICE of a `unique {…}` list into the
@@ -141342,6 +141362,7 @@ impl Simulator {
                 &rand_disabled,
                 &constraint_disabled,
                 &constraints,
+                &constraint_src_files,
                 diag,
             );
         }

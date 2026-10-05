@@ -28,12 +28,27 @@ endmodule
 ";
 
 fn run(diag: bool) -> (String, String) {
-    let dir = std::env::temp_dir().join(format!("xezim_rand_diag_{}_{}", std::process::id(), diag));
+    run_sources("single", &[("rand_diag.sv", SRC)], diag)
+}
+
+fn run_sources(tag: &str, sources: &[(&str, &str)], diag: bool) -> (String, String) {
+    let dir = std::env::temp_dir().join(format!(
+        "xezim_rand_diag_{}_{}_{}",
+        std::process::id(),
+        tag,
+        diag
+    ));
     std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("rand_diag.sv");
-    std::fs::write(&file, SRC).unwrap();
+    let files: Vec<_> = sources
+        .iter()
+        .map(|(name, source)| {
+            let file = dir.join(name);
+            std::fs::write(&file, source).unwrap();
+            file
+        })
+        .collect();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
-    cmd.arg("--simulate").arg("-s").arg("top").arg(&file);
+    cmd.arg("--simulate").arg("-s").arg("top").args(&files);
     if diag {
         cmd.env("XEZIM_RAND_DIAG", "1");
     } else {
@@ -91,4 +106,85 @@ fn nothing_is_reported_without_the_variable() {
     let (stdout, stderr) = run(false);
     assert!(stdout.contains("randomize failed"), "{stdout}");
     assert!(diag_lines(&stderr).is_empty(), "{stderr}");
+}
+
+#[test]
+fn named_constraints_use_their_defining_file() {
+    const DECOY: &str = "\
+class unused_item;
+  rand int value;
+  constraint bounds { value < 2; value > 20; }
+endclass
+";
+    const ACTUAL: &str = "\
+class item;
+  rand int value;
+  constraint bounds { value < 5; value > 10; }
+endclass
+module top;
+  initial begin
+    item it = new();
+    if (!it.randomize()) $display(\"failed as expected\");
+  end
+endmodule
+";
+    let (stdout, stderr) = run_sources(
+        "named_multifile",
+        &[("decoy_source.sv", DECOY), ("named_source.sv", ACTUAL)],
+        true,
+    );
+    assert!(stdout.contains("failed as expected"), "{stdout}");
+    let lines = diag_lines(&stderr);
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("bounds")
+                && line.contains("named_source.sv:3")
+                && line.contains("value < 5")
+        }),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("decoy_source.sv")),
+        "{lines:#?}"
+    );
+}
+
+#[test]
+fn inline_constraints_use_their_call_site_file() {
+    const DECOY: &str = "\
+module unused_top;
+  int padding_that_keeps_this_source_long_enough_for_matching_offsets;
+endmodule
+";
+    const ACTUAL: &str = "\
+class item;
+  rand int value;
+endclass
+module top;
+  initial begin
+    item it = new();
+    if (!it.randomize() with { value < 5; value > 10; })
+      $display(\"failed as expected\");
+  end
+endmodule
+";
+    let (stdout, stderr) = run_sources(
+        "inline_multifile",
+        &[("unused_source.sv", DECOY), ("inline_source.sv", ACTUAL)],
+        true,
+    );
+    assert!(stdout.contains("failed as expected"), "{stdout}");
+    let lines = diag_lines(&stderr);
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("with {...}")
+                && line.contains("inline_source.sv:7")
+                && line.contains("value < 5")
+        }),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("(item ")),
+        "{lines:#?}"
+    );
 }
