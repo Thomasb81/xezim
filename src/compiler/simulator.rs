@@ -141805,6 +141805,22 @@ impl Simulator {
         self.class_member_select_ref(expr)
     }
 
+    /// `rand_member_target` limited to an AGGREGATE member (`s.f`, `s.f1.f2`,
+    /// `s.f[3:0]`). The relational and dist/inside arms use this: a property
+    /// of a rand OBJECT handle (`a.x < b.y`) stays with the cross-object
+    /// joint solve, which runs the sub-object's `post_randomize` on the final
+    /// values — forcing it here rewrote `a.x` after that hook had run.
+    fn rand_agg_member_target(
+        &mut self,
+        expr: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> Option<RandMemberTarget> {
+        match self.rand_member_target(expr, rand_set)? {
+            t @ RandMemberTarget::Agg(_) => Some(t),
+            RandMemberTarget::Sub(..) => None,
+        }
+    }
+
     /// Current value of a `RandMemberTarget`.
     fn read_rand_member(&self, t: &RandMemberTarget) -> Option<Value> {
         match t {
@@ -143464,9 +143480,9 @@ impl Simulator {
                 (RelTarget::Prop(v), right, *op)
             } else if let Some(v) = self.rand_lvalue_name(right, rand_set) {
                 (RelTarget::Prop(v), left, mirrored)
-            } else if let Some(t) = self.rand_member_target(left, rand_set) {
+            } else if let Some(t) = self.rand_agg_member_target(left, rand_set) {
                 (RelTarget::Member(t), right, *op)
-            } else if let Some(t) = self.rand_member_target(right, rand_set) {
+            } else if let Some(t) = self.rand_agg_member_target(right, rand_set) {
                 (RelTarget::Member(t), left, mirrored)
             } else {
                 return false;
@@ -143934,7 +143950,7 @@ impl Simulator {
                         if let Some(picked) = self.pick_from_ranges(&cr, width, cur.is_signed) {
                             return self.set_prop_if_changed(handle, &v, picked);
                         }
-                    } else if let Some(t) = self.rand_member_target(inner, rand_set) {
+                    } else if let Some(t) = self.rand_agg_member_target(inner, rand_set) {
                         // §18.4: a member (or a select of one) of an aggregate
                         // rand property, as in the `ConstraintItem::Inside` arm.
                         let cr = cr();
@@ -144008,7 +144024,7 @@ impl Simulator {
                     if let Some(p) = picked {
                         return self.set_prop_if_changed(handle, &v, p);
                     }
-                } else if let Some(t) = self.rand_member_target(expr, rand_set) {
+                } else if let Some(t) = self.rand_agg_member_target(expr, rand_set) {
                     // §18.4/§18.5.4: the same for a MEMBER (or a select of a
                     // member) of an aggregate rand property, or a property of a
                     // rand object handle. Without it the struct was drawn as
