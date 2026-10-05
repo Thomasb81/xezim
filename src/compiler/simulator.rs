@@ -124880,14 +124880,29 @@ impl Simulator {
                         // Single-name receiver: could be the object itself,
                         // OR an `this`-local class property — only the
                         // former applies modes globally to the object.
-                        let h_val = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
+                        let name = &h.path[0].name.name;
+                        let this_h = self.this_stack.last().copied().flatten();
+                        // §8.11/§18.8: a bare name that DECLARES a non-class
+                        // property of `this` (and no local shadows it) names
+                        // that random variable, whatever value it holds. Its
+                        // value used to be tried as a handle first, so an
+                        // `id` holding 1 switched off object #1 instead.
+                        let this_scalar_prop = this_h.is_some_and(|th| {
+                            !self.local_stack.last().is_some_and(|f| f.contains_key(name))
+                                && self.object_declares_property(th, name)
+                                && self.prop_class_type(th, name).is_none()
+                        });
+                        let h_val = if this_scalar_prop {
+                            0
+                        } else {
+                            self.eval_expr(expr).to_u64().unwrap_or(0) as usize
+                        };
                         if h_val != 0 && self.heap.get(h_val).and_then(|x| x.as_ref()).is_some() {
                             (Some(h_val), None)
                         } else {
                             // Treat as `this.<name>`, i.e. specific rand prop
                             // or constraint name on the current this.
-                            let this_h = self.this_stack.last().and_then(|t| *t);
-                            (this_h, Some(h.path[0].name.name.clone()))
+                            (this_h, Some(name.clone()))
                         }
                     }
                     ExprKind::MemberAccess {
@@ -141905,6 +141920,32 @@ impl Simulator {
     /// (`dist_picked_once`): the constraint expression's source position.
     fn rand_member_key(expr: &Expression) -> String {
         format!("#member@{}", expr.span.start)
+    }
+
+    /// Whether the class of the object `handle` (or an ancestor) declares a
+    /// property `name`.
+    fn object_declares_property(&self, handle: usize, name: &str) -> bool {
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                return false;
+            }
+            let base = cn.split('#').next().unwrap_or(&cn);
+            let Some(cd) = self.module.classes.get(base) else {
+                return false;
+            };
+            if cd.properties.contains_key(name) {
+                return true;
+            }
+            cur = cd.extends.clone();
+        }
+        false
     }
 
     /// Write a `RandMemberTarget`; reports whether the stored value changed.
