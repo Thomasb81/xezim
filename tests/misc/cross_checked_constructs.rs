@@ -1,6 +1,6 @@
 //! Language constructs whose output was cross-checked line by line against
 //! the reference simulator. The passing tests pin behaviour that already
-//! matches; the `#[ignore]`d ones pin a divergence until it is fixed.
+//! matches; every case remains active to pin the expected behavior.
 
 use xezim::simulate;
 

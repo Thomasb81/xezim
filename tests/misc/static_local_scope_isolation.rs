@@ -103,10 +103,7 @@ endmodule
 /// the recursion depth. xezim currently gives each activation a fresh cell
 /// and returns 1. Reference-verified expectation: 4.
 ///
-/// Ignored because it fails today; this is a pin for the known gap, not a
-/// gate. Remove the attribute together with the fix.
 #[test]
-#[ignore = "known gap: recursive activations do not share one static cell"]
 fn recursive_activations_share_one_static_cell() {
     let text = run(
         "recur",

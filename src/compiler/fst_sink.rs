@@ -38,6 +38,9 @@ pub struct FstTimestep {
 /// Render a `Value` as the FST bit string: full width, MSB first, '0'/'1'/'x'/'z'.
 /// Width-0 yields a single '0' so the writer never sees an empty change.
 pub fn fst_format_value(val: &Value) -> Vec<u8> {
+    if val.is_real {
+        return val.to_f64().to_le_bytes().to_vec();
+    }
     let w = val.width as usize;
     if w == 0 {
         return vec![b'0'];

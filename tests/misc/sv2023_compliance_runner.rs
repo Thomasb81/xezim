@@ -2,9 +2,7 @@
 //!
 //! The suite lives at `../sv2023_compliance_testsuite/`. Each test is a
 //! standalone SV file that prints `SVTEST_PASS` on success and
-//! `SVTEST_FAIL` on failure. The soft packed union test is `#[ignore]`d
-//! because a prior attempt OOM'd during elaboration; root cause is not
-//! diagnosed and the feature is intentionally skipped.
+//! `SVTEST_FAIL` on failure.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -74,6 +72,28 @@ fn run_sv2023_positive(category: &str, filename: &str) {
     );
 }
 
+fn run_sv2023_source(name: &str, source: &str) {
+    let dir = std::env::temp_dir().join(format!("xezim_sv2023_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temporary directory");
+    let path = dir.join(name);
+    std::fs::write(&path, source).expect("write temporary source");
+    let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
+        .arg("--sv2023")
+        .arg("--no-cache")
+        .arg(&path)
+        .output()
+        .expect("execute test source");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        output.status.success()
+            && stdout.contains("SVTEST_PASS")
+            && !stdout.contains("SVTEST_FAIL"),
+        "{name} failed:\n{stdout}{stderr}"
+    );
+}
+
 #[test]
 fn sv2023_t100_triple_quoted_string() {
     run_sv2023_positive("10_sv2023", "t100_triple_quoted_string.sv");
@@ -105,9 +125,34 @@ fn sv2023_t105_type_this_parameterized_class() {
 }
 
 #[test]
-#[ignore = "soft packed union: prior OOM in elaboration; root cause not diagnosed"]
 fn sv2023_t106_soft_packed_union() {
-    run_sv2023_positive("10_sv2023", "t106_soft_packed_union.sv");
+    let external = testsuite_root()
+        .join("tests/10_sv2023")
+        .join("t106_soft_packed_union.sv");
+    if external.exists() {
+        run_sv2023_positive("10_sv2023", "t106_soft_packed_union.sv");
+    } else {
+        run_sv2023_source(
+            "soft_packed_union.sv",
+            r#"module top;
+  typedef union soft packed {
+    bit [7:0] byte_value;
+    bit [15:0] half_value;
+  } soft_u_t;
+  soft_u_t value;
+  initial begin
+    if ($bits(value) != 16) begin $display("SVTEST_FAIL width"); $finish; end
+    value.byte_value = 8'h5a;
+    if (value.byte_value !== 8'h5a) begin $display("SVTEST_FAIL byte"); $finish; end
+    value.half_value = 16'h1234;
+    if (value.half_value !== 16'h1234) begin $display("SVTEST_FAIL half"); $finish; end
+    $display("SVTEST_PASS");
+    $finish;
+  end
+endmodule
+"#,
+        );
+    }
 }
 
 #[test]

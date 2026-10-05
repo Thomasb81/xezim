@@ -6209,6 +6209,12 @@ pub struct Simulator {
     /// for `rand` class-handle members (a cyclic object graph would otherwise
     /// recurse forever).
     randomize_depth: usize,
+    /// One work/time budget shared by an outer randomize call and every
+    /// recursive rand-object solve it starts.
+    randomize_budget_depth: usize,
+    randomize_budget_remaining: u64,
+    randomize_budget_deadline: Option<std::time::Instant>,
+    randomize_budget_exhausted: bool,
     /// Active enclosing solves retain only their reachable children's rand state.
     rand_child_snapshots: Vec<rand_scope::RandChildTransaction>,
     /// IEEE 1800-2017 §18.5.11 — a `static constraint` block is SHARED by every
@@ -7498,6 +7504,11 @@ pub struct Simulator {
     fst_id_to_trace: Vec<Vec<u32>>,
     /// Previous emitted value per `fst_trace` entry (parallel vector).
     fst_prev_signals: Vec<Value>,
+    /// SV event objects are pulses rather than levels, so they are kept out of
+    /// `fst_trace` and emitted once for each trigger.
+    fst_events: Vec<(usize, FstSignalId)>,
+    /// Last emitted trigger time for each `fst_events` entry.
+    fst_event_last: Vec<u64>,
     /// Pre-computed combinatorial entries with sensitivity sets.
     comb_entries: Vec<CombEntry>,
     /// Optional content-addressed cache for the compiled combinational
@@ -11564,6 +11575,10 @@ impl Simulator {
             constraint_mode_disabled: HashMap::default(),
             static_constraint_disabled: HashSet::default(),
             randomize_depth: 0,
+            randomize_budget_depth: 0,
+            randomize_budget_remaining: 0,
+            randomize_budget_deadline: None,
+            randomize_budget_exhausted: false,
             rand_child_snapshots: Vec::new(),
             randc_used: HashMap::default(),
             randc_pending: HashMap::default(),
@@ -11906,6 +11921,8 @@ impl Simulator {
             fst_trace: Vec::new(),
             fst_id_to_trace: Vec::new(),
             fst_prev_signals: Vec::new(),
+            fst_events: Vec::new(),
+            fst_event_last: Vec::new(),
             comb_entries: Vec::new(),
             prepared_comb_cache_path: None,
             comb_level: Vec::new(),
@@ -47007,6 +47024,7 @@ impl Simulator {
         // clocking input snapshots are refreshed, resume the clocking-event
         // waiters (`@(cb)` / `##N`) that fired this slot — in the Reactive
         // region — so they observe post-edge state and this cycle's samples.
+        let tick_late_epoch_start = self.late_resume_epoch;
         self.drain_deferred_clocking_conts();
         self.drain_reactive_region();
         self.drain_nba_region_waiters();
@@ -47037,7 +47055,13 @@ impl Simulator {
         // must wake the DUT's `@(ev)` at the same timestamp — register
         // backdoor mirrors read X otherwise. Loop while the re-pass itself
         // produces further late resumes; bounded like every fixpoint here.
-        if self.late_resume_epoch != 0 && !self.finished && !self.zero_delay_defer_pending {
+        //
+        // Gated on tick_late_epoch_start so that ticks where no late-region
+        // resumes ran avoid permanent extra scanning after the first late resume.
+        if self.late_resume_epoch != tick_late_epoch_start
+            && !self.finished
+            && !self.zero_delay_defer_pending
+        {
             let mut late_passes = 0u32;
             loop {
                 let epoch_before = self.late_resume_epoch;
@@ -47050,10 +47074,7 @@ impl Simulator {
                 self.drain_reactive_region();
                 self.drain_nba_region_waiters();
                 late_passes += 1;
-                if self.finished
-                    || late_passes > 10_000
-                    || self.late_resume_epoch == epoch_before
-                {
+                if self.finished || late_passes > 10_000 || self.late_resume_epoch == epoch_before {
                     break;
                 }
             }
@@ -52110,7 +52131,7 @@ impl Simulator {
                                 .flatten()
                             {
                                 if self.stmts_have_blocking(&td.items) {
-                                    let cleanup = self.bind_task_frame(&td, args);
+                                    let cleanup = self.bind_task_frame(&td, args, None);
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -52135,7 +52156,7 @@ impl Simulator {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     if let Some(td) = self.package_task_target(func) {
                         if self.stmts_have_blocking(&td.items) {
-                            let cleanup = self.bind_task_frame(&td, args);
+                            let cleanup = self.bind_task_frame(&td, args, None);
                             self.task_cleanup.push(cleanup);
                             let mut cont: Vec<Statement> = td.items.clone();
                             cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -52170,7 +52191,7 @@ impl Simulator {
                                         .rsplit_once('.')
                                         .map(|(sc, _)| sc.to_string())
                                         .unwrap_or_default();
-                                    let mut cleanup = self.bind_task_frame(&td, args);
+                                    let mut cleanup = self.bind_task_frame(&td, args, None);
                                     self.push_instance_task_context(&mut cleanup);
                                     cleanup.prev_hint = self.name_resolve_hint.borrow().clone();
                                     cleanup.frame_scope_hint = Some(scope.clone());
@@ -52308,7 +52329,11 @@ impl Simulator {
                                         unreachable!("resolve_class_task yields tasks only")
                                     };
                                     if self.stmts_have_blocking(&td.items) {
-                                        let mut cleanup = self.bind_task_frame(td, args);
+                                        let spec = self
+                                            .task_method_spec(Some(rh), &mclass)
+                                            .or_else(|| self.current_spec.clone());
+                                        let mut cleanup =
+                                            self.bind_task_frame(td, args, Some(spec));
                                         // Even a same-object bare call changes
                                         // the defining-class context used by
                                         // `super`; push both stacks uniformly.
@@ -52486,7 +52511,8 @@ impl Simulator {
                                 unreachable!("resolve_class_task yields tasks only")
                             };
                             if self.stmts_have_blocking(&td.items) {
-                                let mut cleanup = self.bind_task_frame(td, args);
+                                let spec = recv_spec.clone().or_else(|| self.current_spec.clone());
+                                let mut cleanup = self.bind_task_frame(td, args, Some(spec));
                                 // Static context: push the declaring class for
                                 // member/static resolution, with a null `this`.
                                 self.m_scope_stack.clear();
@@ -74035,6 +74061,60 @@ impl Simulator {
                         }
                     }
                 }
+                if hier.path.iter().all(|seg| seg.selects.is_empty()) {
+                    if hier.path.len() == 1 {
+                        let name = hier.path[0].name.name.as_str();
+                        if self.get_signal_value_by_name(name).is_none()
+                            && (self.module.functions.contains_key(name)
+                                || self.module.lets.contains_key(name))
+                        {
+                            return self.eval_call(expr, &[]);
+                        }
+                    } else {
+                        let leaf = hier.path.last().unwrap().name.name.as_str();
+                        let joined = hier
+                            .path
+                            .iter()
+                            .map(|seg| seg.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        let scoped = hier
+                            .path
+                            .iter()
+                            .map(|seg| seg.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("::");
+                        let package_head = self.module.packages.contains(&hier.path[0].name.name);
+                        let package_fn = package_head
+                            && self.get_signal_value_by_name(leaf).is_none()
+                            && self.module.functions.contains_key(&scoped)
+                            && self
+                                .module
+                                .pkg_subr_owner
+                                .get(leaf)
+                                .is_some_and(|owner| owner == &hier.path[0].name.name);
+                        let instance_fn =
+                            !package_head && self.module.functions.contains_key(&joined);
+                        if package_fn || instance_fn {
+                            return self.eval_call(expr, &[]);
+                        }
+
+                        if Self::is_parenless_zero_arg_builtin(leaf) {
+                            let head = hier_prefix(hier);
+                            let recv = Expression::new(ExprKind::Ident(head), expr.span);
+                            let recv_name = self.expr_assoc_name(&recv).or_else(|| {
+                                Self::plain_ident_name(&recv).filter(|name| {
+                                    self.module.dynamic_arrays.contains(name)
+                                        || self.module.associative_arrays.contains_key(name)
+                                        || self.module.arrays.contains_key(name)
+                                })
+                            });
+                            if self.expr_is_string_valued(&recv) || recv_name.is_some() {
+                                return self.eval_call(expr, &[]);
+                            }
+                        }
+                    }
+                }
                 self.fast_signal_read(hier)
             }
             ExprKind::Unary { op, operand } => {
@@ -74252,7 +74332,10 @@ impl Simulator {
                                 for (a, b) in ls.iter().zip(rs.iter()) {
                                     let lv = self.get_signal_value_by_name(&format!("{}{}", lb, a));
                                     let rv = self.get_signal_value_by_name(&format!("{}{}", rb, b));
-                                    if lv.is_none() || rv.is_none() || self.coll_values_opt_eq(&lv, &rv, ew) == false {
+                                    if lv.is_none()
+                                        || rv.is_none()
+                                        || self.coll_values_opt_eq(&lv, &rv, ew) == false
+                                    {
                                         equal = false;
                                         break;
                                     }
@@ -76346,6 +76429,19 @@ impl Simulator {
                 }
             }
             ExprKind::MemberAccess { expr: recv, member } => {
+                if Self::is_parenless_zero_arg_builtin(&member.name) {
+                    let recv_name = self.expr_assoc_name(recv).or_else(|| {
+                        Self::plain_ident_name(recv).filter(|name| {
+                            self.module.dynamic_arrays.contains(name)
+                                || self.module.associative_arrays.contains_key(name)
+                                || self.module.arrays.contains_key(name)
+                        })
+                    });
+                    if self.expr_is_string_valued(recv) || recv_name.is_some() {
+                        return self.eval_call(expr, &[]);
+                    }
+                }
+
                 // §13.5.5: inside a function/task/class-method/final body a
                 // parenless zero-argument method parses as MemberAccess
                 // (module/initial/always scope yields a flat hierarchical
@@ -79400,9 +79496,8 @@ impl Simulator {
             // resolve it through the current instance's bindings to
             // the concrete class. A non-parameter name resolves to
             // None and passes through unchanged.
-            let type_name = type_name.map(|tn| {
-                self.resolve_type_param_binding(&tn).unwrap_or(tn.clone())
-            });
+            let type_name =
+                type_name.map(|tn| self.resolve_type_param_binding(&tn).unwrap_or(tn.clone()));
             if let Some(tname) = type_name {
                 // §8.25: the type-parameter resolved to a SPECIALIZED
                 // class name `Base#(args)` (e.g. `T obj = new()` where
@@ -84281,7 +84376,8 @@ impl Simulator {
                         for q in self.semaphore_get_waiters.values_mut() {
                             q.retain(|w| !to_kill.contains(&w.pid));
                         }
-                        self.await_waiters.retain(|w| !to_kill.contains(&w.waiter_pid));
+                        self.await_waiters
+                            .retain(|w| !to_kill.contains(&w.waiter_pid));
                         self.release_killed_from_join_waiters(&to_kill);
                         self.wake_await_waiters(&to_kill);
                         return;
@@ -84387,7 +84483,8 @@ impl Simulator {
                 for q in self.semaphore_get_waiters.values_mut() {
                     q.retain(|w| !to_kill.contains(&w.pid));
                 }
-                self.await_waiters.retain(|w| !to_kill.contains(&w.waiter_pid));
+                self.await_waiters
+                    .retain(|w| !to_kill.contains(&w.waiter_pid));
                 // A killed process must no longer hold back a join waiter: drop
                 // it from every waiter's expected children, and wake any waiter
                 // whose remaining children are now all accounted for.
@@ -97421,11 +97518,7 @@ impl Simulator {
 
     /// Copy an unpacked-struct message into a shadow variable; the returned
     /// value is the id that names it, to be queued in the message's place.
-    fn mbx_stash_struct(
-        &mut self,
-        src: &str,
-        su: &crate::ast::types::StructUnionType,
-    ) -> Value {
+    fn mbx_stash_struct(&mut self, src: &str, su: &crate::ast::types::StructUnionType) -> Value {
         let id = match self.mbx_free_ids.pop() {
             Some(id) => id,
             None => {
@@ -97699,7 +97792,8 @@ impl Simulator {
         for q in self.semaphore_get_waiters.values_mut() {
             q.retain(|w| !to_kill.contains(&w.pid));
         }
-        self.await_waiters.retain(|w| !to_kill.contains(&w.waiter_pid));
+        self.await_waiters
+            .retain(|w| !to_kill.contains(&w.waiter_pid));
         self.release_killed_from_join_waiters(&to_kill);
         // Wake any process that was awaiting the killed process.
         self.wake_await_waiters(&to_kill);
@@ -97711,8 +97805,8 @@ impl Simulator {
     /// dispatch should then stop executing the caller's current statement
     /// stream); false if the target is already terminated.
     fn proc_await(&mut self, target_pid: usize, caller_pid: usize, continuation: ProcCont) -> bool {
-        let terminated = self.killed_pids.contains(&target_pid)
-            || self.finished_pids.contains(&target_pid);
+        let terminated =
+            self.killed_pids.contains(&target_pid) || self.finished_pids.contains(&target_pid);
         if terminated {
             return false; // already done — caller continues
         }
@@ -98758,7 +98852,8 @@ impl Simulator {
         // storing the backing signal_table index per leaf.
         struct FstNode {
             children: BTreeMap<String, FstNode>,
-            signals: Vec<(String, u32, usize)>, // (leaf, width, signal_table idx)
+            // (display name, width, signal-table id, encoding, declaration kind, event)
+            signals: Vec<(String, u32, usize, FstSignalType, FstVarType, bool)>,
         }
         impl FstNode {
             fn new() -> Self {
@@ -98779,6 +98874,26 @@ impl Simulator {
                 _ => continue,
             };
             let width = self.lookup_signal_width(name).unwrap_or(1);
+            let own_id = self
+                .signal_name_to_id
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(tbl_id);
+            let kind = self.dump_var_kind(name, own_id);
+            let signal_type = if kind == VcdVarKind::Real {
+                FstSignalType::real()
+            } else {
+                FstSignalType::bit_vec(width.max(1))
+            };
+            let var_type = match kind {
+                VcdVarKind::Wire => FstVarType::Wire,
+                VcdVarKind::Reg => FstVarType::Reg,
+                VcdVarKind::Integer => FstVarType::Integer,
+                VcdVarKind::Time => FstVarType::Time,
+                VcdVarKind::Real => FstVarType::Real,
+                VcdVarKind::Event => FstVarType::Event,
+                VcdVarKind::Parameter => FstVarType::Parameter,
+            };
             let parts: Vec<&str> = name.split('.').collect();
             let (scope_parts, leaf) = if parts.len() > 1 {
                 (&parts[..parts.len() - 1], parts[parts.len() - 1])
@@ -98792,27 +98907,43 @@ impl Simulator {
                     .entry(part.to_string())
                     .or_insert_with(FstNode::new);
             }
-            node.signals.push((leaf.to_string(), width, tbl_id));
+            let display_name = match kind {
+                VcdVarKind::Real | VcdVarKind::Event => leaf.to_string(),
+                _ => match self.dump_var_range(name, width) {
+                    Some((left, right)) => format!("{leaf} [{left}:{right}]"),
+                    None => leaf.to_string(),
+                },
+            };
+            node.signals.push((
+                display_name,
+                width,
+                tbl_id,
+                signal_type,
+                var_type,
+                kind == VcdVarKind::Event,
+            ));
         }
 
         // DFS-emit scopes/vars, collecting (signal_table idx, FstSignalId).
         let mut trace: Vec<(usize, FstSignalId)> = Vec::new();
+        let mut events: Vec<(usize, FstSignalId)> = Vec::new();
         let mut id_to_fst: HashMap<usize, FstSignalId> = HashMap::default();
         fn emit<W: std::io::Write + std::io::Seek>(
             header: &mut FstHeaderWriter<W>,
             name: &str,
             node: &FstNode,
             trace: &mut Vec<(usize, FstSignalId)>,
+            events: &mut Vec<(usize, FstSignalId)>,
             id_to_fst: &mut HashMap<usize, FstSignalId>,
         ) {
             let _ = header.scope(name, "", FstScopeType::Module);
-            for (leaf, width, tbl_id) in &node.signals {
+            for (leaf, _width, tbl_id, signal_type, var_type, is_event) in &node.signals {
                 // Aliased nets (same signal_table id) reuse one FST id.
                 let alias = id_to_fst.get(tbl_id).copied();
                 let fid = match header.var(
                     leaf,
-                    FstSignalType::bit_vec((*width).max(1)),
-                    FstVarType::Wire,
+                    *signal_type,
+                    *var_type,
                     FstVarDirection::Implicit,
                     alias,
                 ) {
@@ -98821,11 +98952,15 @@ impl Simulator {
                 };
                 if alias.is_none() {
                     id_to_fst.insert(*tbl_id, fid);
-                    trace.push((*tbl_id, fid));
+                    if *is_event {
+                        events.push((*tbl_id, fid));
+                    } else {
+                        trace.push((*tbl_id, fid));
+                    }
                 }
             }
             for (child_name, child) in &node.children {
-                emit(header, child_name, child, trace, id_to_fst);
+                emit(header, child_name, child, trace, events, id_to_fst);
             }
             let _ = header.up_scope();
         }
@@ -98836,14 +98971,35 @@ impl Simulator {
                     children: BTreeMap::new(),
                     signals: std::mem::take(&mut root.signals),
                 };
-                emit(&mut header, "$unit", &unit, &mut trace, &mut id_to_fst);
+                emit(
+                    &mut header,
+                    "$unit",
+                    &unit,
+                    &mut trace,
+                    &mut events,
+                    &mut id_to_fst,
+                );
             }
             for (child_name, child) in &root.children {
-                emit(&mut header, child_name, child, &mut trace, &mut id_to_fst);
+                emit(
+                    &mut header,
+                    child_name,
+                    child,
+                    &mut trace,
+                    &mut events,
+                    &mut id_to_fst,
+                );
             }
         } else {
             let top_name = self.module.name.clone();
-            emit(&mut header, &top_name, &root, &mut trace, &mut id_to_fst);
+            emit(
+                &mut header,
+                &top_name,
+                &root,
+                &mut trace,
+                &mut events,
+                &mut id_to_fst,
+            );
         }
 
         let mut body = match header.finish() {
@@ -98861,9 +99017,12 @@ impl Simulator {
         let _ = body.time_change(self.time);
         let mut prev: Vec<Value> = Vec::with_capacity(trace.len());
         for (tbl_id, fid) in &trace {
-            let val = self.signal_table[*tbl_id].clone();
+            let val = self.dump_value(*tbl_id);
             let _ = body.signal_change(*fid, &Self::fst_format_value(&val));
-            prev.push(val);
+            prev.push(self.signal_table[*tbl_id].clone());
+        }
+        for (_, fid) in &events {
+            let _ = body.signal_change(*fid, b"0");
         }
 
         // Incremental change detection, shared with the VCD and XTrace writers
@@ -98872,6 +99031,8 @@ impl Simulator {
         self.enable_dump_dirty_tracking();
         self.fst_trace = trace;
         self.fst_prev_signals = prev;
+        self.fst_event_last = vec![u64::MAX; events.len()];
+        self.fst_events = events;
         self.fst_path = Some(filename.to_string());
         self.fst_writer = Some(if self.dump_writer_threaded() {
             super::fst_sink::FstSink::threaded(body)
@@ -98901,7 +99062,7 @@ impl Simulator {
                 let tbl_id = self.fst_trace[idx].0;
                 let val = &self.signal_table[tbl_id];
                 if self.fst_prev_signals[idx] != *val {
-                    changes.push((self.fst_trace[idx].1, val.clone()));
+                    changes.push((self.fst_trace[idx].1, self.dump_value(tbl_id)));
                     self.fst_prev_signals[idx] = val.clone();
                 }
             }};
@@ -98916,6 +99077,21 @@ impl Simulator {
                 for idx in 0..self.fst_trace.len() {
                     check_fst_slot!(idx);
                 }
+            }
+        }
+        let now = self.time;
+        for idx in 0..self.fst_events.len() {
+            let id = self.fst_events[idx].0;
+            let fired = self
+                .name_opt(id)
+                .and_then(|name| self.event_triggered_time.get(name))
+                .copied()
+                == Some(now);
+            if fired && self.fst_event_last[idx] != now {
+                self.fst_event_last[idx] = now;
+                let fid = self.fst_events[idx].1;
+                changes.push((fid, Value::ones(1)));
+                changes.push((fid, Value::zero(1)));
             }
         }
         if changes.is_empty() {
@@ -102315,6 +102491,41 @@ impl Simulator {
         )
     }
 
+    fn is_parenless_zero_arg_builtin(m: &str) -> bool {
+        matches!(
+            m,
+            "first"
+                | "last"
+                | "num"
+                | "next"
+                | "prev"
+                | "name"
+                | "size"
+                | "len"
+                | "pop_front"
+                | "pop_back"
+                | "sort"
+                | "rsort"
+                | "reverse"
+                | "shuffle"
+                | "sum"
+                | "product"
+                | "and"
+                | "or"
+                | "xor"
+                | "min"
+                | "max"
+                | "unique"
+                | "unique_index"
+                | "tolower"
+                | "toupper"
+                | "atoi"
+                | "atohex"
+                | "atooct"
+                | "atobin"
+        )
+    }
+
     /// Simple glob match for string pattern matching (`*` = any run, `?` =
     /// any single char). Patterns/scopes are short, so simple recursion is
     /// fine.
@@ -102622,6 +102833,7 @@ impl Simulator {
             .filter(|s| !s.is_empty());
         // §18.7: the inline constraints join the class's set for this call
         // (sizing, element solving, acceptance).
+        self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
         let prev_receiver = std::mem::replace(&mut self.rand_receiver, receiver);
         let prev_subset = std::mem::replace(&mut self.randomize_subset, subset);
@@ -102629,6 +102841,7 @@ impl Simulator {
         self.randomize_subset = prev_subset;
         self.rand_receiver = prev_receiver;
         self.obj_rng_stack.pop();
+        self.end_randomize_budget();
         r
     }
 
@@ -107059,14 +107272,49 @@ impl Simulator {
     }
 
     fn push_local_frame(&mut self, f: HashMap<String, Value>) {
+        let types = self.take_pooled_types();
+        self.push_local_frame_typed(f, types);
+    }
+
+    /// Push a local frame together with its type overlay (the declared
+    /// class / typedef names of its variables, see `local_type_stack`). A
+    /// subroutine collects its formals' types while binding them and hands
+    /// them over here: recording them with `record_local_*` before the push
+    /// wrote them into the CALLER's overlay instead.
+    fn push_local_frame_typed(
+        &mut self,
+        f: HashMap<String, Value>,
+        types: (HashMap<String, String>, HashMap<String, String>),
+    ) {
         if self.name_stats_on {
             self.name_stats[2].set(self.name_stats[2].get() + 1);
         }
         self.local_stack.push(f);
         let fgen = self.next_frame_gen();
         self.local_gen_stack.push(fgen);
-        let pair = self.local_type_pool.pop().unwrap_or_default();
-        self.local_type_stack.push(pair);
+        self.local_type_stack.push(types);
+    }
+
+    /// An empty type-overlay pair from the pool (capacity retained) or a
+    /// fresh one.
+    fn take_pooled_types(&mut self) -> (HashMap<String, String>, HashMap<String, String>) {
+        self.local_type_pool.pop().unwrap_or_default()
+    }
+
+    /// The type bound to the class type parameter `dt` names under the
+    /// current specialization, or `None` when `dt` names no type parameter.
+    fn formal_type_param_binding(&self, dt: &DataType) -> Option<String> {
+        let DataType::TypeReference { name: tn, .. } = dt else {
+            return None;
+        };
+        let type_name = &tn.name.name;
+        if self.module.classes.contains_key(type_name)
+            || self.module.enum_members.contains_key(type_name)
+            || self.module.typedefs.contains_key(type_name)
+        {
+            return None;
+        }
+        self.resolve_type_param_binding(type_name)
     }
 
     /// Return a popped `local_type_stack` pair to the pool: only lookups ever
@@ -113777,12 +114025,7 @@ impl Simulator {
     /// may be unset). Missing either side makes the pair unequal; an unknown
     /// element is treated as unequal (multi-dimensional-array reference
     /// semantics collapse an x element to a non-match).
-    fn coll_values_opt_eq(
-        &self,
-        a: &Option<Value>,
-        b: &Option<Value>,
-        ew: Option<u32>,
-    ) -> bool {
+    fn coll_values_opt_eq(&self, a: &Option<Value>, b: &Option<Value>, ew: Option<u32>) -> bool {
         match (a.as_ref(), b.as_ref()) {
             (Some(av), Some(bv)) => self.coll_values_eq(av, bv, ew),
             _ => false,
@@ -113837,7 +114080,9 @@ impl Simulator {
             // Compare at the declared element width so a differing storage
             // slot (width/signedness) does not decide the pair (the packed/
             // unpacked element-table family) — bits are what matter.
-            let ew = self.coll_elem_width(&ln).or_else(|| self.coll_elem_width(&rn));
+            let ew = self
+                .coll_elem_width(&ln)
+                .or_else(|| self.coll_elem_width(&rn));
             if !self.coll_values_eq(&lv, &rv, ew) {
                 equal = false;
             }
@@ -113935,7 +114180,9 @@ impl Simulator {
         let mut equal = size_eq;
         if equal {
             let rset: std::collections::HashSet<&String> = rkeys.iter().collect();
-            let ew = self.coll_elem_width(&ln).or_else(|| self.coll_elem_width(&rn));
+            let ew = self
+                .coll_elem_width(&ln)
+                .or_else(|| self.coll_elem_width(&rn));
             for k in &lkeys {
                 if !rset.contains(k) {
                     equal = false;
@@ -116623,7 +116870,10 @@ impl Simulator {
         }
         let name = format!("{}<{}>", base, sig);
         if let Some(hit) = self.module.classes.get(&name) {
-            return self.spec_clone_origin.contains_key(&name).then(|| hit.clone());
+            return self
+                .spec_clone_origin
+                .contains_key(&name)
+                .then(|| hit.clone());
         }
         let orig = self.module.classes.get(base)?.clone();
         let adds = self.param_vif_props(&orig, sig);
@@ -116636,7 +116886,8 @@ impl Simulator {
         self.module
             .classes
             .insert(name.clone(), std::sync::Arc::new(c));
-        self.spec_clone_origin.insert(name.clone(), base.to_string());
+        self.spec_clone_origin
+            .insert(name.clone(), base.to_string());
         self.class_member_names_cell = std::cell::OnceCell::new();
         self.compiled_method_admission = None;
         self.persisted_method_context_hash = None;
@@ -118720,8 +118971,13 @@ impl Simulator {
                 // A NESTED receiver (`e.d.vif` — a vif property of a
                 // handle-valued member, not of a bare variable): resolve
                 // the receiver chain to its object handle and classify from
+                // the receiver chain to its object handle and classify from
                 // that object's class chain.
-                if self.class_member_names().vif_props.contains(member.name.as_str()) {
+                if self
+                    .class_member_names()
+                    .vif_props
+                    .contains(member.name.as_str())
+                {
                     if let Some(oh) = self.chain_handle(expr) {
                         return self.vif_operand_handle_prop(oh, &member.name);
                     }
@@ -118786,9 +119042,7 @@ impl Simulator {
     /// caller falls back to its non-vif path.
     fn chain_handle(&self, expr: &Expression) -> Option<usize> {
         match &expr.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 => {
-                self.eval_ident_handle(&h.path[0].name.name)
-            }
+            ExprKind::Ident(h) if h.path.len() == 1 => self.eval_ident_handle(&h.path[0].name.name),
             ExprKind::Ident(h) if h.path.len() > 1 => {
                 // A packed multi-segment path (`e.d`): the head names the
                 // object, each following segment an instance-property read.
@@ -124537,13 +124791,10 @@ impl Simulator {
                     } else {
                         n0
                     };
-                    let mid_is_scope_chain = fh.path[1..fh.path.len() - 1]
-                        .iter()
-                        .all(|s| {
-                            !self
-                                .member_is_static_coll(cls_for_members, &s.name.name)
-                                && !self.is_associative_array(&s.name.name)
-                        });
+                    let mid_is_scope_chain = fh.path[1..fh.path.len() - 1].iter().all(|s| {
+                        !self.member_is_static_coll(cls_for_members, &s.name.name)
+                            && !self.is_associative_array(&s.name.name)
+                    });
                     if !self.local_stack.last().is_some_and(|m| m.contains_key(n0))
                         && !self.signal_name_to_id.contains_key(n0)
                         && (self.module.packages.contains(n0)
@@ -124640,8 +124891,7 @@ impl Simulator {
                             }
                             if let Some(td) = self.task_decl_rc(&scoped) {
                                 let saved = self.name_resolve_hint.borrow().clone();
-                                *self.name_resolve_hint.borrow_mut() =
-                                    Some(scope.to_string());
+                                *self.name_resolve_hint.borrow_mut() = Some(scope.to_string());
                                 let saved_ts = self.timescale_scope_override.take();
                                 self.timescale_scope_override = Some(scope.to_string());
                                 self.exec_task_call(&td, args);
@@ -127508,7 +127758,10 @@ impl Simulator {
                     let recv = hier_prefix(hier);
                     let recv_expr = Expression::new(ExprKind::Ident(recv), func.span);
                     let h = self.eval_expr(&recv_expr).to_u64().unwrap_or(0) as usize;
-                    if h != 0 && (self.heap.get(h).and_then(|o| o.as_ref()).is_some() || h as u64 >= PROCESS_HANDLE_BASE) {
+                    if h != 0
+                        && (self.heap.get(h).and_then(|o| o.as_ref()).is_some()
+                            || h as u64 >= PROCESS_HANDLE_BASE)
+                    {
                         let mname = hier.path.last().unwrap().name.name.clone();
                         return self.exec_method_call(h, &mname, args);
                     }
@@ -129912,6 +130165,8 @@ impl Simulator {
 
         // Set up local scope with parameters
         let mut locals = self.take_pooled_frame();
+        // The callee frame's type overlay, pushed together with `locals`.
+        let mut frame_types = self.take_pooled_types();
         self.push_queue_frame();
         // `output`/`inout`/`ref` formals copy back to the caller's actual on
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
@@ -130038,7 +130293,7 @@ impl Simulator {
                 // §13.5.3: a default may reference EARLIER formals (`int b =
                 // a + 1`). Push the partially-bound frame so they resolve —
                 // evaluated bare, `a` was unknown and the default was x.
-                self.push_local_frame(locals.clone());
+                self.push_local_frame_typed(locals.clone(), frame_types.clone());
                 let v = self.eval_expr(def);
                 self.pop_local_frame();
                 v
@@ -130105,14 +130360,18 @@ impl Simulator {
                 // lands in the typedef maps and `class_of_var` misses it
                 // (id-collision-in-heap receiver gating).
                 if self.module.classes.contains_key(&type_name) {
-                    self.record_local_class_type(&port.name.name, &type_name);
+                    frame_types
+                        .0
+                        .insert(port.name.name.clone(), type_name.clone());
                     self.var_class_types
                         .insert(port.name.name.clone(), type_name);
                     self.note_formal_type_args(&port.name.name, type_args);
                 } else if self.module.enum_members.contains_key(&type_name)
                     || self.module.typedefs.contains_key(&type_name)
                 {
-                    self.record_local_typedef_type(&port.name.name, &type_name);
+                    frame_types
+                        .1
+                        .insert(port.name.name.clone(), type_name.clone());
                     self.var_typedef_types
                         .insert(port.name.name.clone(), type_name);
                 } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
@@ -130137,7 +130396,9 @@ impl Simulator {
                                 .classes
                                 .contains_key(concrete.split('#').next().unwrap_or(&concrete)));
                     if cn_is_class {
-                        self.record_local_class_type(&port.name.name, &concrete);
+                        frame_types
+                            .0
+                            .insert(port.name.name.clone(), concrete.clone());
                         self.var_class_types
                             .insert(port.name.name.clone(), concrete);
                     }
@@ -130248,12 +130509,12 @@ impl Simulator {
             // Class check first — see the port loop above (a class name can
             // also key the typedef width table).
             if self.module.classes.contains_key(&type_name) {
-                self.record_local_class_type(&ret_name, &type_name);
+                frame_types.0.insert(ret_name.clone(), type_name.clone());
                 self.var_class_types.insert(ret_name.clone(), type_name);
             } else if self.module.enum_members.contains_key(&type_name)
                 || self.module.typedefs.contains_key(&type_name)
             {
-                self.record_local_typedef_type(&ret_name, &type_name);
+                frame_types.1.insert(ret_name.clone(), type_name.clone());
                 self.var_typedef_types.insert(ret_name.clone(), type_name);
             }
         }
@@ -130300,7 +130561,7 @@ impl Simulator {
             }
         }
         self.local_iface_aliases.push(iface_alias_frame);
-        self.push_local_frame(locals);
+        self.push_local_frame_typed(locals, frame_types);
         self.open_decl_shadow_frame();
         for port in &fd.ports {
             if let DataType::TypeReference { name: tn, type_args, .. } = &port.data_type {
@@ -130547,7 +130808,7 @@ impl Simulator {
             .pending_pkg_scope
             .take()
             .or_else(|| self.module.func_decl_scope.get(&td.name.name.name).cloned());
-        let mut cleanup = self.bind_task_frame(td, args);
+        let mut cleanup = self.bind_task_frame(td, args, None);
         self.open_decl_shadow_frame();
         if std::mem::take(&mut self.task_clears_this) {
             self.push_instance_task_context(&mut cleanup);
@@ -131255,10 +131516,34 @@ impl Simulator {
         }
     }
 
-    fn bind_task_frame(&mut self, td: &TaskDeclaration, args: &[Expression]) -> TaskCleanup {
+    /// `type_ctx` is `Some(spec)` for a class method task: `spec` is the
+    /// `current_spec` its body runs under (see `task_method_spec`).
+    fn bind_task_frame(
+        &mut self,
+        td: &TaskDeclaration,
+        args: &[Expression],
+        type_ctx: Option<Option<(String, String)>>,
+    ) -> TaskCleanup {
         use crate::ast::types::PortDirection;
         let normalized = Self::normalize_call_args(&td.ports, args);
         let args: &[Expression] = normalized.as_deref().unwrap_or(args);
+        // §8.25: a formal typed by one of the class's type parameters has
+        // the type bound in the CALLEE's specialization. Resolve each under
+        // it now — the arguments below evaluate in the caller's context,
+        // where the parameter means something else or nothing.
+        let bound_types: Vec<Option<String>> = match type_ctx {
+            Some(spec) => {
+                let saved = std::mem::replace(&mut self.current_spec, spec);
+                let bound = td
+                    .ports
+                    .iter()
+                    .map(|port| self.formal_type_param_binding(&port.data_type))
+                    .collect();
+                self.current_spec = saved;
+                bound
+            }
+            None => vec![None; td.ports.len()],
+        };
         // Dedup by borrowed name: the formal list is tiny, so a linear
         // scan beats a HashSet plus one String allocation per formal on
         // EVERY call.
@@ -131279,6 +131564,8 @@ impl Simulator {
             .collect();
         // Evaluate input args and collect output/ref arg expressions
         let mut locals = self.take_pooled_frame();
+        // The callee frame's type overlay, pushed together with `locals`.
+        let mut frame_types = self.take_pooled_types();
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
         // §25.9 via the __vif_local__ convention: a virtual-interface ACTUAL
         // records its interface under the formal's name (cleared otherwise so
@@ -131318,14 +131605,46 @@ impl Simulator {
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
+            // A type-parameter formal's bound type: a typedef (an unpacked
+            // struct binds member-wise below) or a class.
+            let bound = bound_types[i].as_deref();
+            let data_type = match bound.and_then(|b| self.module.typedef_types.get(b)) {
+                Some(dt) => std::borrow::Cow::Owned(dt.clone()),
+                None => std::borrow::Cow::Borrowed(&port.data_type),
+            };
             // §13.3: a formal is a variable of its declared type — give it the
             // same structural metadata a local declaration gets, or member and
             // element selects on it silently read 0.
             self.register_formal_type_metadata(
                 &port.name.name,
-                &port.data_type,
+                &data_type,
                 port.dimensions.is_empty(),
             );
+            if let Some(b) = bound {
+                let base = b.split('#').next().unwrap_or(b);
+                if self.module.classes.contains_key(base) {
+                    frame_types.0.insert(port.name.name.clone(), b.to_string());
+                    self.var_class_types
+                        .insert(port.name.name.clone(), b.to_string());
+                } else if self.module.enum_members.contains_key(b)
+                    || self.module.typedefs.contains_key(b)
+                {
+                    frame_types.1.insert(port.name.name.clone(), b.to_string());
+                }
+            } else if let DataType::TypeReference { name: tn, .. } = &port.data_type {
+                let type_name = &tn.name.name;
+                if self.module.classes.contains_key(type_name) {
+                    frame_types
+                        .0
+                        .insert(port.name.name.clone(), type_name.clone());
+                } else if self.module.enum_members.contains_key(type_name)
+                    || self.module.typedefs.contains_key(type_name)
+                {
+                    frame_types
+                        .1
+                        .insert(port.name.name.clone(), type_name.clone());
+                }
+            }
             // Unpacked array formal (`int a[2:0]` or `int a[3]`): copy the
             // caller's elements in, and copy them back for an out/inout/ref.
             if i < args.len() {
@@ -131354,8 +131673,9 @@ impl Simulator {
                             (self.port_class_ref(port).is_some(), &port.data_type)
                         {
                             let tn = &name.name.name;
-                            let concrete = self
-                                .resolve_type_param_binding(tn)
+                            let concrete = bound
+                                .map(str::to_string)
+                                .or_else(|| self.resolve_type_param_binding(tn))
                                 .unwrap_or_else(|| tn.clone());
                             self.module
                                 .typedef_unpacked_dims
@@ -131389,7 +131709,7 @@ impl Simulator {
             if i < args.len() && port.dimensions.is_empty() {
                 if let Some(backs) = self.bind_unpacked_struct_formal(
                     &port.name.name,
-                    &port.data_type,
+                    &data_type,
                     port.direction,
                     &args[i],
                     &mut locals,
@@ -131546,45 +131866,7 @@ impl Simulator {
                 }
             }
         }
-        self.push_local_frame(locals);
-        // §13.3: a class- or typedef-typed formal belongs to the CALLEE's
-        // frame overlay, and that frame only exists once the push above has
-        // happened — recording during the port loop would land in the
-        // CALLER's frame, which `local_class_type_of` never scans.
-        // `register_formal_type_metadata` there can only reach the
-        // by-bare-name globals, and those are shared by every process: a task
-        // suspended elsewhere holding a same-named local of an unrelated class
-        // overwrites the entry. After this task resumed from a timing control
-        // its formal then read THAT class, so `$cast` into the formal failed
-        // for a compatible object and SUCCEEDED for an incompatible one
-        // (issue #239).
-        for port in &td.ports {
-            if let DataType::TypeReference { name: tn, .. } = &port.data_type {
-                let type_name = tn.name.name.clone();
-                // Class check first: a class name can also key the typedef
-                // WIDTH table, which would misfile a class-typed formal into
-                // the typedef overlay (see the exec_function_call port loop).
-                if self.module.classes.contains_key(&type_name) {
-                    self.record_local_class_type(&port.name.name, &type_name);
-                } else if self.module.enum_members.contains_key(&type_name)
-                    || self.module.typedefs.contains_key(&type_name)
-                {
-                    self.record_local_typedef_type(&port.name.name, &type_name);
-                } else if let Some(concrete) = self.resolve_type_param_binding(&type_name) {
-                    // Formal typed with a class TYPE PARAMETER (`IMP imp`):
-                    // record the resolved concrete class, as the function and
-                    // class-method port loops already do.
-                    let is_class = self.module.classes.contains_key(&concrete)
-                        || (concrete.contains('#')
-                            && self.module.classes.contains_key(
-                                concrete.split('#').next().unwrap_or(&concrete),
-                            ));
-                    if is_class {
-                        self.record_local_class_type(&port.name.name, &concrete);
-                    }
-                }
-            }
-        }
+        self.push_local_frame_typed(locals, frame_types);
         // §6.21: open a static-local sync frame keyed by this task name.
         let sync_name = self.sync_frame_name(&td.name.name.name);
         self.static_local_syncs.push((sync_name, Vec::new()));
@@ -131752,6 +132034,21 @@ impl Simulator {
         // right after binding the locals frame; mirror it here.
         self.method_local_base
             .push(self.local_stack.len().saturating_sub(1));
+        if let Some(spec) = self.task_method_spec(handle_opt, &mclass) {
+            self.current_spec = Some(spec);
+        }
+    }
+
+    /// The class specialization a method task's body runs under — what
+    /// `push_task_method_this` makes `current_spec` — or `None` when the
+    /// caller's stays in force. `bind_task_frame` resolves the formals'
+    /// type parameters under it before `this` is pushed.
+    fn task_method_spec(
+        &self,
+        handle_opt: Option<usize>,
+        mclass: &str,
+    ) -> Option<(String, String)> {
+        let mut spec = None;
         if let Some(h) = handle_opt {
             if let Some(inst) = self.heap.get(h).and_then(|o| o.as_ref()) {
                 let cn = inst.class_name.clone();
@@ -131768,7 +132065,7 @@ impl Simulator {
                 };
                 if differs {
                     if inst.spec.is_some() {
-                        self.current_spec = inst.spec.clone();
+                        spec = inst.spec.clone();
                     } else if let Some(cd) = self.module.classes.get(&cn) {
                         let mut param_names = cd.param_order.clone();
                         if param_names.is_empty() {
@@ -131788,7 +132085,7 @@ impl Simulator {
                                 })
                                 .collect();
                             if sig_frags.len() == param_names.len() {
-                                self.current_spec = Some((cn, sig_frags.join(",")));
+                                spec = Some((cn, sig_frags.join(",")));
                             }
                         }
                     }
@@ -131805,9 +132102,10 @@ impl Simulator {
         // `T::type_id::create`) resolved `T` to the unknown-type fallback,
         // `logic`, and every create returned null: the run reported UVM_ERROR 0
         // while driving no transactions at all. Mirror the function path here.
-        if let Some(spec) = handle_opt.and_then(|h| self.inherited_method_spec(h, &mclass)) {
-            self.current_spec = Some(spec);
+        if let Some(s) = handle_opt.and_then(|h| self.inherited_method_spec(h, mclass)) {
+            spec = Some(s);
         }
+        spec
     }
 
     /// The covergroup definition `new` instantiates for a type name: inside
@@ -135154,8 +135452,7 @@ impl Simulator {
                 .clone()
                 .filter(|(b, _)| *b == class_name_owned)
                 .or_else(|| computed_spec.clone());
-            active
-                .and_then(|(b, sig)| self.ensure_param_vif_class(&b, &sig))
+            active.and_then(|(b, sig)| self.ensure_param_vif_class(&b, &sig))
         };
         let class_def: &crate::compiler::elaborate::ElaboratedClass = param_vif_entry
             .as_deref()
@@ -138881,15 +139178,82 @@ impl Simulator {
         true
     }
 
+    fn randomize_budget_setting(&self, key: &str, default: u64) -> u64 {
+        self.plusargs
+            .iter()
+            .find_map(|arg| {
+                arg.trim_start_matches('+')
+                    .strip_prefix(key)
+                    .and_then(|value| value.parse::<u64>().ok())
+            })
+            .filter(|value| *value != 0)
+            .unwrap_or(default)
+    }
+
+    fn begin_randomize_budget(&mut self) {
+        if self.randomize_budget_depth == 0 {
+            let trials = self.randomize_budget_setting("xezim_rand_trials=", 1000);
+            let timeout = self.randomize_budget_setting("xezim_rand_timeout=", 30);
+            self.randomize_budget_remaining = trials;
+            self.randomize_budget_deadline =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(timeout));
+            self.randomize_budget_exhausted = false;
+        }
+        self.randomize_budget_depth += 1;
+    }
+
+    fn end_randomize_budget(&mut self) {
+        self.randomize_budget_depth = self.randomize_budget_depth.saturating_sub(1);
+        if self.randomize_budget_depth == 0 {
+            self.randomize_budget_deadline = None;
+        }
+    }
+
+    fn take_randomize_budget(
+        &mut self,
+        handle: usize,
+        class_name: &str,
+        constraints: &[ClassConstraint],
+    ) -> bool {
+        let timed_out = self
+            .randomize_budget_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        if self.randomize_budget_exhausted || timed_out || self.randomize_budget_remaining == 0 {
+            if !self.randomize_budget_exhausted {
+                self.randomize_budget_exhausted = true;
+                let mut failed_names = Vec::new();
+                for constraint in constraints {
+                    if constraint.items.iter().any(|item| {
+                        !Self::constraint_unmodeled(item)
+                            && !self.check_constraint_item(handle, item)
+                    }) {
+                        failed_names.push(constraint.name.name.as_str());
+                    }
+                }
+                let names = failed_names.join(", ");
+                eprintln!(
+                    "[xezim][error] randomize budget exhausted in class {}; last failed constraints: {}; returning 0 and restoring prior values",
+                    class_name,
+                    if names.is_empty() { "<none>" } else { &names }
+                );
+            }
+            return false;
+        }
+        self.randomize_budget_remaining -= 1;
+        true
+    }
+
     /// §18.14.1: `obj.randomize()` draws from the OBJECT's random stream —
     /// mark it the active stream owner for the whole solve (constraints, dist
     /// picks, randc, pre/post_randomize) so every draw routes through
     /// `cur_rng()`. Nested randomize calls stack, so an inner object still
     /// uses its own stream.
     fn exec_randomize(&mut self, handle: usize) -> Value {
+        self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
         let r = self.exec_randomize_inner(handle, &[]);
         self.obj_rng_stack.pop();
+        self.end_randomize_budget();
         r
     }
 
@@ -139830,6 +140194,9 @@ impl Simulator {
                 }
             }
             for _ in 0..256 {
+                if !self.take_randomize_budget(handle, &class_name, &constraints) {
+                    break;
+                }
                 for (name, width) in &rand_props {
                     let v = if let Some(et) = enum_prop_types.get(name) {
                         let members = self
@@ -139874,7 +140241,7 @@ impl Simulator {
                         .iter()
                         .all(|it| self.check_constraint_item(handle, it))
                 });
-                if ok {
+                if ok && !self.randomize_budget_exhausted {
                     if has_post {
                         self.exec_method_call(handle, "post_randomize", &[]);
                     }
@@ -139981,7 +140348,7 @@ impl Simulator {
                 true,
                 &[],
             ) {
-                rand_csp::CspOutcome::Sat => {
+                rand_csp::CspOutcome::Sat if !self.randomize_budget_exhausted => {
                     if has_post {
                         self.exec_method_call(handle, "post_randomize", &[]);
                     }
@@ -140028,6 +140395,9 @@ impl Simulator {
                     self.time
                 );
                 self.finished = true;
+                break;
+            }
+            if !self.take_randomize_budget(handle, &class_name, &constraints) {
                 break;
             }
             self.rand_tight_mode = fixed_fe_fail_streak >= 4;
@@ -141264,7 +141634,7 @@ impl Simulator {
                 all_ok = self.sub_object_constraints_ok(handle, &rand_obj_props);
             }
 
-            if all_ok && !(has_soft && csp_ok) {
+            if all_ok && !(has_soft && csp_ok) && !self.randomize_budget_exhausted {
                 // SV semantics: randomize() calls post_randomize() on success
                 // (e.g. riscv_instr builds its imm_str / formats operands here).
                 if has_post {
@@ -141300,7 +141670,8 @@ impl Simulator {
                     &sub_objs,
                 ) {
                     rand_csp::CspOutcome::Sat
-                        if self.sub_object_constraints_ok(handle, &rand_obj_props) =>
+                        if !self.randomize_budget_exhausted
+                            && self.sub_object_constraints_ok(handle, &rand_obj_props) =>
                     {
                         // The joint solve rewrote the sub-objects after
                         // their own post_randomize ran: run it on the final
@@ -146291,6 +146662,8 @@ impl Simulator {
                     }
                 };
                 let mut locals: HashMap<String, Value> = self.take_pooled_frame();
+                // The callee frame's type overlay, pushed together with `locals`.
+                let mut frame_types = self.take_pooled_types();
                 // §13.5.3: reorder named args into formal order and fill any
                 // omitted (`.name()` / positional `,,`) slot from the formal's
                 // default before positional binding below.
@@ -146406,18 +146779,6 @@ impl Simulator {
                 // Member-wise struct `output`/`inout`/`ref` formals bypass the
                 // whole-value `output_bindings` path (see exec_function_call).
                 let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
-                // PORT TYPE-PARAMETER CLASS BINDINGS: a formal declared with a
-                // TYPE PARAMETER class type (`IMP imp`) resolves to a concrete
-                // class per-call (see the branch below). Record it NOW so that
-                // after the callee's frame is pushed (push_local_frame below)
-                // we can re-record into the CALLEE's frame slot — the body's
-                // `$cast`/`new` reads it via `local_class_type_of`, which
-                // scans only frames at/after the callee's method_local_base
-                // and would otherwise miss it (and fall back to a STALE,
-                // same-named global `var_class_types` entry from an unrelated
-                // scope such as uvm_config_db's `imp`, failing a valid TLM
-                // initiator socket $cast with UVM/TLM2/NOIMP).
-                let mut frame_class_ports: Vec<(String, String)> = Vec::new();
                 for (i, port) in ports.iter().enumerate() {
                     // A plain scalar or class formal: none of the struct,
                     // collection, array or width probes below can claim it.
@@ -146620,7 +146981,7 @@ impl Simulator {
                         // of silently evaluating to the type's zero value.
                         self.this_stack.push(Some(handle));
                         self.class_context_stack.push(Some(cname.clone()));
-                        self.push_local_frame(locals.clone());
+                        self.push_local_frame_typed(locals.clone(), frame_types.clone());
                         let v = self.eval_expr(def);
                         self.pop_local_frame();
                         self.class_context_stack.pop();
@@ -146705,20 +147066,20 @@ impl Simulator {
                         // class name can also key the typedef width table,
                         // which misfiled class-typed formals into the
                         // typedef maps).
-                        let forward_declared = class_ref == Some(true);
-                        if !forward_declared && self.module.classes.contains_key(&type_name) {
-                            // Defer the overlay write to AFTER push_local_frame
-                            // (see frame_class_ports below). Recording here hit
-                            // the CALLER's frame, which `local_class_type_of`
-                            // never scans, so a class-typed formal lived only in
-                            // the by-bare-name global — and another process
-                            // suspended in a task holding a same-named local of
-                            // a different class overwrote it. The formal then
-                            // read that class: `$cast` into it failed for a
-                            // compatible object, and an INCOMPATIBLE one cast
-                            // successfully (issue #239).
-                            frame_class_ports
-                                .push((port.name.name.clone(), type_name.clone()));
+                        if self.module.classes.contains_key(&type_name) {
+                            // A real class — whether decl'd inline or via a
+                            // forward `typedef class` placeholder (`class_ref`
+                            // Some(true)) — names a CLASS OBJECT, so record
+                            // it in the class overlay (`frame_types.0`),
+                            // not just the typedef tables. Otherwise a
+                            // forward-declared-class formal (e.g. UVM's
+                            // `uvm_process_guard_base guard`) is classified
+                            // as a plain typedef and `class_of_var` returns
+                            // None, so `receiver_may_be_handle` fails and a
+                            // class-handle member write is silently dropped.
+                            frame_types
+                                .0
+                                .insert(port.name.name.clone(), type_name.clone());
                             self.note_formal_type_args(&port.name.name, type_args);
                             if self.var_class_types.get(port.name.name.as_str()) != Some(&type_name)
                             {
@@ -146726,10 +147087,23 @@ impl Simulator {
                                 self.var_class_types
                                     .insert(port.name.name.clone(), type_name.clone());
                             }
+                            // A forward-declared placeholder keeps its typedef
+                            // alias so width/layout lookups still resolve it the
+                            // same way (the pre-merge code also recorded it as a
+                            // typedef).
+                            if self.module.typedefs.contains_key(&type_name)
+                                || self.module.enum_members.contains_key(&type_name)
+                            {
+                                frame_types
+                                    .1
+                                    .insert(port.name.name.clone(), type_name.clone());
+                            }
                         } else if self.module.enum_members.contains_key(&type_name)
                             || self.module.typedefs.contains_key(&type_name)
                         {
-                            self.record_local_typedef_type(&port.name.name, &type_name);
+                            frame_types
+                                .1
+                                .insert(port.name.name.clone(), type_name.clone());
                             // An entry already holding this type is left as
                             // is: rewriting it changes nothing, and an
                             // untouched name needs no metadata save.
@@ -146758,7 +147132,9 @@ impl Simulator {
                                         concrete.split('#').next().unwrap_or(&concrete),
                                     ));
                             if cn_is_class {
-                                frame_class_ports.push((port.name.name.clone(), concrete.clone()));
+                                frame_types
+                                    .0
+                                    .insert(port.name.name.clone(), concrete.clone());
                                 if self.var_class_types.get(port.name.name.as_str())
                                     != Some(&concrete)
                                 {
@@ -146861,7 +147237,7 @@ impl Simulator {
                     // real report message's set_action/get_action persist so
                     // the report-server `$display` fires natively.
                     if let Some(cn) = plan.ret.as_ref().and_then(|r| r.class.as_deref()) {
-                        self.record_local_class_type(rn, cn);
+                        frame_types.0.insert(rn.to_string(), cn.to_string());
                         if self.var_class_types.get(rn).map(String::as_str) != Some(cn) {
                             self.meta_note(rn);
                             self.var_class_types.insert(rn.to_string(), cn.to_string());
@@ -147099,33 +147475,8 @@ impl Simulator {
                         Some(prev)
                     }
                 };
-                self.push_local_frame(locals);
+                self.push_local_frame_typed(locals, frame_types);
                 self.open_decl_shadow_frame();
-                // Re-apply the TYPE-PARAMETER class bindings now that the
-                // callee's own frame is on top of `local_type_stack`. During
-                // the port loop above, `local_type_stack.last_mut()` still
-                // pointed at the CALLER's frame, so recording there would be
-                // invisible to `local_class_type_of` (which scans only from
-                // this method's base downward via `method_local_base`).
-                // Recording here makes `$cast(imp, parent)` in a socket `new`
-                // body resolve `imp` to its concrete class (e.g. `producer`)
-                // instead of a stale same-named global entry.
-                for (pn, pconcrete) in frame_class_ports {
-                    self.record_local_class_type(&pn, &pconcrete);
-                }
-                for port in ports {
-                    if let DataType::TypeReference { name: tn, type_args, .. } = &port.data_type {
-                        let type_name = tn.name.name.clone();
-                        if self.module.classes.contains_key(&type_name) {
-                            self.record_local_class_type(&port.name.name, &type_name);
-                            self.note_formal_type_args(&port.name.name, type_args);
-                        } else if self.module.enum_members.contains_key(&type_name)
-                            || self.module.typedefs.contains_key(&type_name)
-                        {
-                            self.record_local_typedef_type(&port.name.name, &type_name);
-                        }
-                    }
-                }
                 // Record the `local_stack` depth BEFORE this method's own
                 // frame (i.e. the count of caller frames) so that
                 // `get_expr_type_name`'s `in_any_frame` check only considers

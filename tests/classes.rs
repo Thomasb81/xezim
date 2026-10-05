@@ -85,6 +85,8 @@ mod static_param_class_collection_reuse;
 mod struct_member_class_handle_new;
 #[path = "classes/struct_member_bitselect_frame_local.rs"]
 mod struct_member_bitselect_frame_local;
+#[path = "classes/subroutine_formal_frame_type.rs"]
+mod subroutine_formal_frame_type;
 #[path = "classes/this_collection_struct_members.rs"]
 mod this_collection_struct_members;
 #[path = "classes/this_super_member.rs"]
@@ -359,6 +361,9 @@ mod type_param_member_resolves_to_own_spec;
 
 #[path = "classes/process_kill_via_member_handle.rs"]
 mod process_kill_via_member_handle;
+
+#[path = "classes/forward_declared_class_formal_member_write.rs"]
+mod forward_declared_class_formal_member_write;
 
 #[path = "classes/sibling_type_param_default_cast.rs"]
 mod sibling_type_param_default_cast;

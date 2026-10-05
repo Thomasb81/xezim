@@ -7,15 +7,19 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```
+//! use xezim::compiler::arena::Arena;
+//!
 //! // Create arena at start of tick
 //! let mut arena = Arena::with_capacity(1024 * 1024);  // 1MB
 //!
 //! // Allocate objects
-//! let val = arena.alloc(Value::zero(64));
-//! let vec = arena.alloc_vec(100);
+//! let val = arena.alloc(42_u64);
+//! let vec = arena.alloc_vec::<u32>(100);
 //!
 //! // At end of tick: reset (no deallocation)
+//! drop(vec);
+//! let _ = val;
 //! arena.reset();
 //! ```
 
