@@ -5839,6 +5839,10 @@ pub struct Simulator {
     /// `typedef_layout_member`'s unpacked-struct typedef layouts by total
     /// width; dropped when a block-local typedef is registered.
     typedef_layouts_by_width: Option<HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>>>,
+    /// Declared (left, right) of the packed range of a class property whose
+    /// range does not start at bit 0 (`logic [31:8] a`), keyed by (class,
+    /// property); None for one indexed from 0. See `class_prop_select_dim`.
+    class_prop_dim_cache: std::cell::RefCell<HashMap<(String, String), Option<(i64, i64)>>>,
     /// LRM §16.5 SVA clocked-assertion sites. Populated lazily on
     /// the first time the AssertionStatement{is_property,
     /// expr:SvaClocked} executes. Each site's `prev_clock` lets us
@@ -11486,6 +11490,7 @@ impl Simulator {
             pending_observed: Vec::new(),
             deferred_asserts: Vec::new(),
             typedef_layouts_by_width: None,
+            class_prop_dim_cache: std::cell::RefCell::new(HashMap::default()),
             sva_sites: Vec::new(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
@@ -66944,7 +66949,14 @@ impl Simulator {
                 // excluded here. Bit-selects are already correct in both
                 // directions; this closes the part-select WRITE gap.
                 let mut elem_ascending_dim: Option<(i64, i64)> = None;
-                if let ExprKind::Ident(h) = &expr.kind {
+                if let Some((_, lo_b)) = self.class_prop_select_dim(expr) {
+                    // A class property declared `[31:8]` (see
+                    // `class_prop_select_dim`).
+                    li -= lo_b;
+                    if matches!(kind, RangeKind::Constant) {
+                        ri -= lo_b;
+                    }
+                } else if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
                     let is_multi_d = self
                         .module
@@ -76254,6 +76266,12 @@ impl Simulator {
                     }
                 }
                 // Fall back to bit select
+                if let Some((_, lo_b)) = self.class_prop_select_dim(expr) {
+                    return match self.eval_expr(index).to_index() {
+                        Some(i) if i >= lo_b => self.eval_expr(expr).bit_select((i - lo_b) as usize),
+                        _ => Value::new(1),
+                    };
+                }
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
                     if let Some(dims) = self.module.packed_full_dims.get(&*nm) {
@@ -76460,7 +76478,8 @@ impl Simulator {
                             .copied()
                     }
                     _ => None,
-                };
+                }
+                .or_else(|| self.class_prop_select_dim(expr));
                 if let Some((dl, dr)) = plain_dim.filter(|&(l, r)| l >= r) {
                     let _ = dl;
                     if dr != 0 {
@@ -109064,6 +109083,84 @@ impl Simulator {
             return None;
         }
         Some((handle, nm.clone()))
+    }
+
+    /// §7.4.1/§11.5.1: the declared (left, right) range of the class
+    /// property a select's base names (`a`, `this.a`, `obj.a`) when that
+    /// range is descending and does not end at bit 0 (`logic [31:8] a`):
+    /// select labels then offset by `right`. Class properties are not in the
+    /// signal tables that give a module vector its declared range, so
+    /// `a[31:16]` read bits 31..16 of the 24 stored ones.
+    fn class_prop_select_dim(&mut self, base: &Expression) -> Option<(i64, i64)> {
+        if self.no_class_objects() {
+            return None;
+        }
+        let (h, prop) = match self.class_prop_receiver(base) {
+            Some(r) => r,
+            // Inside a solve the receiver local of `obj.randomize() with
+            // { obj.p[…] … }` is out of scope; it names the object being
+            // randomized (`this`).
+            None => {
+                let (recv, prop) = Self::split_trailing_member(base)?;
+                let rn = Self::plain_ident_name(&recv)?;
+                if self.rand_receiver.as_deref() != Some(rn.as_str()) {
+                    return None;
+                }
+                (self.this_stack.last().copied().flatten()?, prop)
+            }
+        };
+        let class = self.heap.get(h)?.as_ref()?.class_name.clone();
+        let key = (class, prop);
+        if let Some(hit) = self.class_prop_dim_cache.borrow().get(&key) {
+            return *hit;
+        }
+        let mut found: Option<(i64, i64)> = None;
+        let mut cur = Some(key.0.clone());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else { break };
+            if cd.properties.contains_key(&key.1) {
+                if let Some(dt) = self.class_prop_decl_type(cd, &key.1) {
+                    let dt = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+                    if let DataType::IntegerVector { dimensions, .. } = dt {
+                        if let [crate::ast::types::PackedDimension::Range { left, right, .. }] =
+                            dimensions.as_slice()
+                        {
+                            let params = self.instance_param_scope(h);
+                            let l = super::elaborate::const_eval_i64_with_params(left, Some(&params))
+                                .or_else(|| {
+                                    super::elaborate::const_eval_i64_with_params(
+                                        left,
+                                        Some(&self.module.parameters),
+                                    )
+                                });
+                            let r = super::elaborate::const_eval_i64_with_params(right, Some(&params))
+                                .or_else(|| {
+                                    super::elaborate::const_eval_i64_with_params(
+                                        right,
+                                        Some(&self.module.parameters),
+                                    )
+                                });
+                            if let (Some(l), Some(r)) = (l, r) {
+                                if l > r && r != 0 {
+                                    found = Some((l, r));
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        // A type parameter can bind differently per specialization: cache
+        // only a class-chain answer that does not depend on one.
+        self.class_prop_dim_cache.borrow_mut().insert(key, found);
+        found
     }
 
     /// The declared struct/union type of class property `prop` on `handle`.
