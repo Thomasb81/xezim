@@ -4247,14 +4247,186 @@ enum DpiArgKind {
     ChandleOut,
     StringIn,
     StringOut,
-    OpenArrayI32In,
-    OpenArrayI32Out,
+    /// An open-array formal (`int a[]`, `bit [7:0] a[]`): passed as an
+    /// Annex H open-array handle (see `DpiOpenArrayHeader`).
+    OpenArrayIn(DpiOaElem),
+    OpenArrayOut(DpiOaElem),
     VecLogicIn(u32),
     VecLogicOut(u32),
     /// 2-state packed vector (`bit [N]`) passed as plain `uint32_t*`
     /// (svBitVecVal*). ABI differs from VecLogicIn: no bval field.
     VecBitIn(u32),
     VecBitOut(u32),
+}
+
+/// The canonical C element of a DPI open array (IEEE 1800-2017 H.7):
+/// `char`, `short`, `int`, `long long`, `float`, `double`, or a packed
+/// vector as `svBitVecVal` / `svLogicVecVal` words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpiOaElem {
+    I8,
+    I16,
+    I32,
+    I64,
+    F32,
+    F64,
+    Bit(u32),
+    Logic(u32),
+}
+
+impl DpiOaElem {
+    fn bytes(self) -> usize {
+        match self {
+            DpiOaElem::I8 => 1,
+            DpiOaElem::I16 => 2,
+            DpiOaElem::I32 | DpiOaElem::F32 => 4,
+            DpiOaElem::I64 | DpiOaElem::F64 => 8,
+            DpiOaElem::Bit(w) => 4 * w.div_ceil(32).max(1) as usize,
+            DpiOaElem::Logic(w) => 8 * w.div_ceil(32).max(1) as usize,
+        }
+    }
+
+    /// The SV width of one element.
+    fn width(self) -> u32 {
+        match self {
+            DpiOaElem::I8 => 8,
+            DpiOaElem::I16 => 16,
+            DpiOaElem::I32 | DpiOaElem::F32 => 32,
+            DpiOaElem::I64 | DpiOaElem::F64 => 64,
+            DpiOaElem::Bit(w) | DpiOaElem::Logic(w) => w.max(1),
+        }
+    }
+}
+
+/// The header placed immediately BEFORE the element data of a DPI open
+/// array; the handle C receives points at the data, so code indexing it as
+/// a plain C array keeps working while `svSize`, `svLeft`,
+/// `svGetArrElemPtr1`, ... (src/svdpi_shim.c, which mirrors this layout as
+/// `xz_oa_hdr`) read the shape from here.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DpiOpenArrayHeader {
+    magic: u32,
+    elem_bytes: u32,
+    ndims: i32,
+    packed: i32,
+    packed_left: i32,
+    packed_right: i32,
+    left: [i32; 4],
+    right: [i32; 4],
+    total_bytes: u32,
+    elem_count: u32,
+}
+
+const DPI_OA_MAGIC: u32 = 0x414f_5a58; // "XZOA"
+const DPI_OA_HDR_BYTES: usize = std::mem::size_of::<DpiOpenArrayHeader>();
+const _: () = assert!(DPI_OA_HDR_BYTES == 64);
+
+/// One open-array argument: its buffer (header + data, 8-byte aligned) and
+/// shape, kept alive for the call and decoded again for an output.
+struct DpiOpenArrayArg {
+    buf: Vec<u64>,
+    elem: DpiOaElem,
+    count: usize,
+}
+
+impl DpiOpenArrayArg {
+    fn new(elem: DpiOaElem, values: &[Value], left: i64, right: i64) -> Self {
+        let count = values.len();
+        let eb = elem.bytes();
+        let data_bytes = eb * count;
+        let mut buf = vec![0u64; (DPI_OA_HDR_BYTES + data_bytes).div_ceil(8)];
+        let packed = matches!(elem, DpiOaElem::Bit(_) | DpiOaElem::Logic(_));
+        let hdr = DpiOpenArrayHeader {
+            magic: DPI_OA_MAGIC,
+            elem_bytes: eb as u32,
+            ndims: 1,
+            packed: packed as i32,
+            packed_left: if packed { elem.width() as i32 - 1 } else { 0 },
+            packed_right: 0,
+            left: [left as i32, 0, 0, 0],
+            right: [right as i32, 0, 0, 0],
+            total_bytes: data_bytes as u32,
+            elem_count: count as u32,
+        };
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), buf.len() * 8)
+        };
+        bytes[..DPI_OA_HDR_BYTES].copy_from_slice(unsafe {
+            std::slice::from_raw_parts((&hdr as *const DpiOpenArrayHeader).cast::<u8>(), DPI_OA_HDR_BYTES)
+        });
+        for (i, v) in values.iter().enumerate() {
+            let at = DPI_OA_HDR_BYTES + i * eb;
+            let dst = &mut bytes[at..at + eb];
+            match elem {
+                DpiOaElem::I8 | DpiOaElem::I16 | DpiOaElem::I32 | DpiOaElem::I64 => {
+                    let x = if v.is_real { v.to_f64() as i64 as u64 } else { v.to_u64().unwrap_or(0) };
+                    dst.copy_from_slice(&x.to_le_bytes()[..eb]);
+                }
+                DpiOaElem::F32 => dst.copy_from_slice(&(Self::real_of(v) as f32).to_le_bytes()),
+                DpiOaElem::F64 => dst.copy_from_slice(&Self::real_of(v).to_le_bytes()),
+                DpiOaElem::Bit(w) => {
+                    let (aval, _) = Simulator::dpi_value_to_logic_words(v, w);
+                    for (k, word) in aval.iter().enumerate().take(eb / 4) {
+                        dst[k * 4..k * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+                DpiOaElem::Logic(w) => {
+                    let il = Simulator::dpi_value_to_logic_interleaved(v, w);
+                    for (k, word) in il.iter().enumerate().take(eb / 4) {
+                        dst[k * 4..k * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+            }
+        }
+        DpiOpenArrayArg { buf, elem, count }
+    }
+
+    fn real_of(v: &Value) -> f64 {
+        if v.is_real {
+            v.to_f64()
+        } else {
+            v.to_u64().unwrap_or(0) as i64 as f64
+        }
+    }
+
+    /// The handle C receives: the start of the element data.
+    fn handle(&mut self) -> *mut std::ffi::c_void {
+        unsafe { self.buf.as_mut_ptr().cast::<u8>().add(DPI_OA_HDR_BYTES).cast() }
+    }
+
+    /// The elements as C left them.
+    fn values(&self) -> Vec<Value> {
+        let eb = self.elem.bytes();
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.buf.len() * 8)
+        };
+        (0..self.count)
+            .map(|i| {
+                let at = DPI_OA_HDR_BYTES + i * eb;
+                let src = &bytes[at..at + eb];
+                let word = |k: usize| u32::from_le_bytes(src[k * 4..k * 4 + 4].try_into().unwrap());
+                match self.elem {
+                    DpiOaElem::I8 => Value::from_u64(src[0] as i8 as i64 as u64, 8),
+                    DpiOaElem::I16 => {
+                        Value::from_u64(i16::from_le_bytes([src[0], src[1]]) as i64 as u64, 16)
+                    }
+                    DpiOaElem::I32 => Value::from_u64(word(0) as u64, 32),
+                    DpiOaElem::I64 => Value::from_u64(u64::from_le_bytes(src.try_into().unwrap()), 64),
+                    DpiOaElem::F32 => Value::from_f64(f32::from_le_bytes(src.try_into().unwrap()) as f64),
+                    DpiOaElem::F64 => Value::from_f64(f64::from_le_bytes(src.try_into().unwrap())),
+                    DpiOaElem::Bit(w) => {
+                        let aval: Vec<u32> = (0..eb / 4).map(word).collect();
+                        Simulator::dpi_logic_words_to_value(&aval, &[], w)
+                    }
+                    DpiOaElem::Logic(w) => {
+                        let il: Vec<u32> = (0..eb / 4).map(word).collect();
+                        Simulator::dpi_logic_interleaved_to_value(&il, w)
+                    }
+                }
+            })
+            .collect()
+    }
 }
 
 struct DpiBinding {
@@ -15155,24 +15327,36 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let is_i32 = matches!(
-                dt,
-                DataType::IntegerAtom {
-                    kind: IntegerAtomType::Int
-                        | IntegerAtomType::Integer
-                        | IntegerAtomType::Byte
-                        | IntegerAtomType::ShortInt,
-                    ..
-                }
-            ) || (matches!(dt, DataType::Implicit { .. }) && w <= 32);
-            if is_i32 {
-                return Some(if out_dir {
-                    DpiArgKind::OpenArrayI32Out
-                } else {
-                    DpiArgKind::OpenArrayI32In
-                });
+            // §35.5.6.1/H.7: an open array's elements take their canonical
+            // C form — a `byte` array is `char`s, not `int`s.
+            let elem = match dt {
+                DataType::IntegerAtom { kind, .. } => match kind {
+                    IntegerAtomType::Byte => DpiOaElem::I8,
+                    IntegerAtomType::ShortInt => DpiOaElem::I16,
+                    IntegerAtomType::Int | IntegerAtomType::Integer => DpiOaElem::I32,
+                    IntegerAtomType::LongInt | IntegerAtomType::Time => DpiOaElem::I64,
+                },
+                DataType::Real { kind, .. } => match kind {
+                    crate::ast::types::RealType::ShortReal => DpiOaElem::F32,
+                    _ => DpiOaElem::F64,
+                },
+                DataType::IntegerVector { kind, .. } => match kind {
+                    crate::ast::types::IntegerVectorType::Bit => DpiOaElem::Bit(w),
+                    _ => DpiOaElem::Logic(w),
+                },
+                DataType::Implicit { .. } if w <= 32 => DpiOaElem::I32,
+                _ => return None,
+            };
+            // Only the outermost dimension may be open; a fixed inner one
+            // is outside this marshaling.
+            if dims.len() != 1 {
+                return None;
             }
-            return None;
+            return Some(if out_dir {
+                DpiArgKind::OpenArrayOut(elem)
+            } else {
+                DpiArgKind::OpenArrayIn(elem)
+            });
         }
         match dt {
             DataType::IntegerAtom { kind, .. } => match kind {
@@ -15390,8 +15574,7 @@ impl Simulator {
                 DpiArgKind::ChandleOut => Type::pointer(),
                 DpiArgKind::StringIn => Type::pointer(),
                 DpiArgKind::StringOut => Type::pointer(),
-                DpiArgKind::OpenArrayI32In => Type::pointer(),
-                DpiArgKind::OpenArrayI32Out => Type::pointer(),
+                DpiArgKind::OpenArrayIn(_) | DpiArgKind::OpenArrayOut(_) => Type::pointer(),
                 DpiArgKind::VecLogicIn(_) => Type::pointer(),
                 DpiArgKind::VecLogicOut(_) => Type::pointer(),
                 DpiArgKind::VecBitIn(_) => Type::pointer(),
@@ -15493,24 +15676,28 @@ impl Simulator {
         out.resize(width)
     }
 
-    fn dpi_collect_i32_array_arg(
-        &mut self,
-        expr: Option<&Expression>,
-    ) -> (Option<String>, Vec<i32>) {
+    /// The elements of an open-array actual and its declared bounds
+    /// (`left`, `right`): a fixed unpacked array (`[7:0]` gives 7, 0), a
+    /// dynamic array or queue (0 .. size-1, empty when size is 0), or any
+    /// other expression as a one-element array.
+    fn dpi_collect_open_array(&mut self, expr: Option<&Expression>) -> (Vec<Value>, i64, i64) {
         let Some(e) = expr else {
-            return (None, Vec::new());
+            return (Vec::new(), 0, -1);
         };
         if let ExprKind::Ident(hier) = &e.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some((lo, hi, _elem_w)) = self.module.arrays.get(&*name).copied() {
-                let mut out = Vec::new();
+            // A dynamic array or queue also has a `module.arrays` entry, but
+            // its range is storage capacity: the live size bounds it.
+            let live = self.dpi_open_array_live_size(&name);
+            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
+                let hi = live.map_or(hi, |n| lo + n as i64 - 1);
+                let mut out = Vec::with_capacity((hi - lo + 1).max(0) as usize);
                 // Compact-resolver fast path: if the array is in
                 // array_first_id, walk the contiguous id range with no
                 // per-element name allocation.
                 if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
-                    for off in 0..=(hi - lo) as usize {
-                        let id = first_id + off;
-                        out.push(self.cell_read(id).to_i64().unwrap_or(0) as i32);
+                    for off in 0..(hi - lo + 1).max(0) as usize {
+                        out.push(self.cell_read(first_id + off));
                     }
                 } else {
                     for idx in lo..=hi {
@@ -15521,33 +15708,56 @@ impl Simulator {
                             self.signals
                                 .get(&elem_name)
                                 .cloned()
-                                .unwrap_or_else(|| Value::zero(32))
+                                .unwrap_or_else(|| Value::zero(elem_w.max(1) as u32))
                         };
-                        out.push(vv.to_i64().unwrap_or(0) as i32);
+                        out.push(vv);
                     }
                 }
-                return (Some(name.to_string()), out);
+                let (left, right) = if live.is_none() && self.module.descending_arrays.contains(&*name) {
+                    (hi, lo)
+                } else {
+                    (lo, hi)
+                };
+                return (out, left as i64, right as i64);
+            }
+            if let Some(n) = live {
+                let out = (0..n)
+                    .map(|i| {
+                        self.get_signal_value_by_name(&format!("{}[{}]", name, i))
+                            .unwrap_or_else(|| Value::zero(32))
+                    })
+                    .collect();
+                return (out, 0, n as i64 - 1);
             }
         }
-        (None, vec![self.eval_expr(e).to_i64().unwrap_or(0) as i32])
+        (vec![self.eval_expr(e)], 0, 0)
     }
 
-    fn dpi_writeback_i32_array_arg(&mut self, expr: &Expression, data: &[i32]) {
+    /// The element count of a dynamic array or queue actual; None for a
+    /// fixed-size array.
+    fn dpi_open_array_live_size(&self, name: &str) -> Option<u64> {
+        (self.module.dynamic_arrays.contains(name)
+            || self.signals.contains_key(&Self::name_with_suffix(name, ".size")))
+        .then(|| self.get_queue_size(name))
+    }
+
+    /// Write an output open array back to its actual, element by element
+    /// in the order `dpi_collect_open_array` read them.
+    fn dpi_writeback_open_array(&mut self, expr: &Expression, data: &[Value]) {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
+            let live = self.dpi_open_array_live_size(&name);
             if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
-                let mut k = 0usize;
+                let hi = live.map_or(hi, |n| lo + n as i64 - 1);
+                let elem_w = elem_w.max(1) as u32;
+                let fit = |v: &Value| if v.is_real { v.clone() } else { v.resize(elem_w) };
                 // Compact-resolver fast path.
                 if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
-                    for off in 0..=(hi - lo) as usize {
-                        if k >= data.len() {
-                            break;
-                        }
+                    for (off, d) in data.iter().enumerate().take((hi - lo + 1).max(0) as usize) {
                         let id = first_id + off;
-                        let mut val = Value::from_u64(data[k] as u32 as u64, elem_w);
+                        let mut val = fit(d);
                         if is_packed_id(id) {
                             self.packed_store_value(id, &val);
-                            k += 1;
                             continue;
                         }
                         val.is_signed = self.signal_signed[id];
@@ -15556,43 +15766,51 @@ impl Simulator {
                             write_sig!(self, id, val);
                             self.table_modified = true;
                         }
-                        k += 1;
                     }
                     return;
                 }
-                for idx in lo..=hi {
-                    if k >= data.len() {
-                        break;
-                    }
+                for (idx, d) in (lo..=hi).zip(data) {
                     let elem_name = format!("{}[{}]", name, idx);
-                    let mut val = Value::from_u64(data[k] as u32 as u64, elem_w);
+                    let mut val = fit(d);
                     if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
                         val.is_signed = self.signal_signed[id];
-                    } else if self.signed_signals.contains(&elem_name) {
-                        val.is_signed = true;
-                    }
-                    if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
-                        let changed = self.signal_table[id] != val;
-                        if changed {
+                        if self.signal_table[id] != val {
                             self.mark_dirty_id(id);
                             write_sig!(self, id, val);
                             self.table_modified = true;
                         }
                     } else {
+                        if self.signed_signals.contains(&elem_name) {
+                            val.is_signed = true;
+                        }
                         let changed = self.signals.get(&elem_name).is_none_or(|p| *p != val);
                         if changed {
                             self.mark_dirty(&elem_name);
                         }
                         self.signals.insert(elem_name, val);
                     }
-                    k += 1;
+                }
+                return;
+            }
+            if let Some(n) = live {
+                for (i, d) in data.iter().enumerate().take(n as usize) {
+                    let elem_name = format!("{}[{}]", name, i);
+                    let mut val = d.clone();
+                    if let Some(old) = self.get_signal_value_by_name(&elem_name) {
+                        if !val.is_real && !old.is_real {
+                            val = val.resize(old.width);
+                            val.is_signed = old.is_signed;
+                        }
+                    }
+                    self.set_signal_value_by_name(&elem_name, val);
                 }
                 return;
             }
         }
         if let Some(v0) = data.first() {
             let w = self.infer_lhs_width(expr);
-            self.assign_value(expr, &Value::from_u64(*v0 as u32 as u64, w));
+            let v = if v0.is_real { v0.clone() } else { v0.resize(w as u32) };
+            self.assign_value(expr, &v);
         }
     }
 
@@ -15669,7 +15887,7 @@ impl Simulator {
         let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::with_capacity(arg_kinds.len());
         let mut string_ptr_cells: Vec<Box<*const std::ffi::c_char>> =
             Vec::with_capacity(arg_kinds.len());
-        let mut open_i32_vals: Vec<Vec<i32>> = Vec::with_capacity(arg_kinds.len());
+        let mut open_arrays: Vec<DpiOpenArrayArg> = Vec::with_capacity(arg_kinds.len());
         let mut cstrings: Vec<CString> = Vec::with_capacity(arg_kinds.len());
         let mut logic_aval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
         let mut writebacks: Vec<(usize, DpiArgKind, Expression)> = Vec::new();
@@ -15798,21 +16016,17 @@ impl Simulator {
                         writebacks.push((string_ptr_cells.len() - 1, *kind, expr.clone()));
                     }
                 }
-                DpiArgKind::OpenArrayI32In => {
-                    let (_aname, mut arr) = self.dpi_collect_i32_array_arg(args.get(i));
-                    let p = Box::new(arr.as_mut_ptr().cast::<c_void>());
-                    open_i32_vals.push(arr);
+                DpiArgKind::OpenArrayIn(elem) | DpiArgKind::OpenArrayOut(elem) => {
+                    let (values, left, right) = self.dpi_collect_open_array(args.get(i));
+                    let mut oa = DpiOpenArrayArg::new(*elem, &values, left, right);
+                    let p = Box::new(oa.handle());
+                    open_arrays.push(oa);
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
-                }
-                DpiArgKind::OpenArrayI32Out => {
-                    let (_aname, mut arr) = self.dpi_collect_i32_array_arg(args.get(i));
-                    let p = Box::new(arr.as_mut_ptr().cast::<c_void>());
-                    open_i32_vals.push(arr);
-                    ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
-                    if let Some(expr) = args.get(i) {
-                        writebacks.push((open_i32_vals.len() - 1, *kind, expr.clone()));
+                    if matches!(kind, DpiArgKind::OpenArrayOut(_)) {
+                        if let Some(expr) = args.get(i) {
+                            writebacks.push((open_arrays.len() - 1, *kind, expr.clone()));
+                        }
                     }
                 }
                 DpiArgKind::VecLogicIn(width) => {
@@ -16087,9 +16301,10 @@ impl Simulator {
                         self.assign_value(&expr, &Value::from_string(&s));
                     }
                 }
-                DpiArgKind::OpenArrayI32Out => {
-                    if let Some(arr) = open_i32_vals.get(idx) {
-                        self.dpi_writeback_i32_array_arg(&expr, arr);
+                DpiArgKind::OpenArrayOut(_) => {
+                    if let Some(oa) = open_arrays.get(idx) {
+                        let values = oa.values();
+                        self.dpi_writeback_open_array(&expr, &values);
                     }
                 }
                 DpiArgKind::VecLogicOut(width) => {
