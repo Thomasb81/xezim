@@ -104,7 +104,14 @@ fn run_with_deadline(
     stem: &str,
     plusargs: &[&str],
 ) -> (std::process::ExitStatus, String, Duration) {
-    let dir = std::env::temp_dir().join(format!("xezim_rand_budget_{}", std::process::id()));
+    // One directory per case: the cases run as parallel threads of one test
+    // process, and each removes its directory when done, so a directory
+    // shared by process id could vanish before another case's simulator
+    // read its design.
+    let dir = std::env::temp_dir().join(format!(
+        "xezim_rand_budget_{}_{stem}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).expect("create temporary directory");
     let path = dir.join(format!("{stem}.sv"));
     std::fs::write(&path, source).expect("write design");
