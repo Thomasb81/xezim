@@ -533,3 +533,5 @@ mod vif_static_roundtrip;
 mod constraint_shift_bounds;
 #[path = "classes/formal_class_type_frame_scoped.rs"]
 mod formal_class_type_frame_scoped;
+#[path = "classes/uvm_feature_coverage.rs"]
+mod uvm_feature_coverage;
