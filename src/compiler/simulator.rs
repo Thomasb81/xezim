@@ -2577,6 +2577,39 @@ pub(crate) use names::{IdNames, NameMap};
 pub use timing_checks::{set_no_notifier, set_no_tchk_msg, set_no_timing_checks};
 
 #[cfg(test)]
+mod store_write_mask_tests {
+    use super::{name_bit, note_store_write, take_store_writes};
+
+    /// Two simulations in one process each run on their own thread. A drain
+    /// on one thread must not clear the writes the other noted: with one
+    /// process-wide mask it did, and the other's parked `wait(cond)` never
+    /// re-checked (UVM runs hung under `cargo test`, which runs tests
+    /// concurrently).
+    #[test]
+    fn a_drain_on_one_thread_keeps_another_threads_writes() {
+        let _ = take_store_writes();
+        note_store_write(name_bit("pending"));
+        std::thread::spawn(|| {
+            let _ = take_store_writes();
+            note_store_write(name_bit("other"));
+            let _ = take_store_writes();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(take_store_writes() & name_bit("pending"), name_bit("pending"));
+        assert_eq!(take_store_writes(), 0);
+    }
+
+    /// A thread's first drain sees every bit: writes made before it existed
+    /// cannot be known, so its first look must re-check everything.
+    #[test]
+    fn a_new_threads_first_drain_sees_every_bit() {
+        let first = std::thread::spawn(take_store_writes).join().unwrap();
+        assert_eq!(first, u64::MAX);
+    }
+}
+
+#[cfg(test)]
 mod nba_fast_index_tests {
     use super::{CombEntry, CombItem, Expression, NbaFastIndex, ProcCont, Statement, TimingWheel};
 
@@ -3104,15 +3137,24 @@ impl TimingWheel {
     }
 }
 
-/// Names written since the condition-waiter drain last looked, as a 64-bit
-/// filter over `name_bit`. Set by every mutation of the STRING-KEYED stores a
-/// parked `wait(cond)` can depend on: class properties (`PropMap`), class
-/// statics (`StaticMap`), the runtime signal map (`SignalMap`), and every
-/// procedural / name-based NBA assignment. A write that does not name its
-/// target sets every bit. The id-based RTL signal table is deliberately NOT
-/// counted: a clock toggle must not re-arm the UVM housekeeping waits (see
-/// `drain_condition_waiters`).
-static STORE_WRITE_MASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    /// Names written since the condition-waiter drain last looked, as a
+    /// 64-bit filter over `name_bit`. Set by every mutation of the
+    /// STRING-KEYED stores a parked `wait(cond)` can depend on: class
+    /// properties (`PropMap`), class statics (`StaticMap`), the runtime signal
+    /// map (`SignalMap`), and every procedural / name-based NBA assignment. A
+    /// write that does not name its target sets every bit. The id-based RTL
+    /// signal table is deliberately NOT counted: a clock toggle must not
+    /// re-arm the UVM housekeeping waits (see `drain_condition_waiters`).
+    ///
+    /// Per THREAD, not per process: a simulation runs on one thread
+    /// (`simulate_multi` gives it its own), and two simulations in one
+    /// process — the test harness runs them concurrently — shared the old
+    /// process-wide mask, so one's drain cleared the bits the other had just
+    /// set; that one's parked `wait(cond)` then never re-checked and its run
+    /// hung. Starts full, so a thread's first drain re-checks everything.
+    static STORE_WRITE_MASK: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
 
 /// The `STORE_WRITE_MASK` bits of a property / variable name: two bits of
 /// an FNV-1a hash, so two short names rarely share both.
@@ -3142,10 +3184,7 @@ fn meta_key_bits(key: &str) -> u64 {
 
 #[inline]
 fn note_store_write(bits: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    if STORE_WRITE_MASK.load(Relaxed) & bits != bits {
-        STORE_WRITE_MASK.fetch_or(bits, Relaxed);
-    }
+    STORE_WRITE_MASK.with(|m| m.set(m.get() | bits));
 }
 
 /// A write to the string-keyed stores that does not name its target.
@@ -3156,7 +3195,7 @@ fn bump_store_gen() {
 
 /// The names written since the last call.
 fn take_store_writes() -> u64 {
-    STORE_WRITE_MASK.swap(0, std::sync::atomic::Ordering::Relaxed)
+    STORE_WRITE_MASK.with(|m| m.replace(0))
 }
 
 /// A class object's property map. Reads deref to the plain map; every
