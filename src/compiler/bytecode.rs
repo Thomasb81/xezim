@@ -829,6 +829,17 @@ pub struct CompiledBlock {
     /// addresses (compile-time indices into the runtime arena). Zero for
     /// every block without a compiled member-collection foreach.
     pub foreach_slots: u32,
+    /// class-perf §6.21: the METHOD body's `static` locals, as
+    /// `(name, reg, default)`; empty for module blocks. The method
+    /// dispatch shell seeds each register from `static_local_vars`
+    /// before the block runs and copies the final register back into
+    /// the locals frame afterwards so the exit sync persists it. The
+    /// block itself never seeds the register (see
+    /// `method_static_locals`).
+    /// Cold for module blocks: boxed so the comb settle hot loop's
+    /// `CombItem::CompiledContAssign { compiled }` variant keeps its
+    /// cache-compact layout (see `comb_entry_layout_stays_cache_compact`).
+    pub static_locals: Box<[(String, RegId, Value)]>,
 }
 
 /// class-perf Step 7: one resolved method-dispatch target, shared by `Rc`
@@ -1454,6 +1465,16 @@ pub struct BytecodeCompiler<'a> {
     /// class-perf P2 (typed handle roots): local/formal name -> declared
     /// class; resolves dispatch chains rooted at handle locals statically.
     method_handle_local_types: HashMap<String, String>,
+    /// §6.21: the method body's STATIC locals lowered to register-backed
+    /// slots whose value persists across calls. The dispatch shell seeds
+    /// each register from `static_local_vars` before the block runs and
+    /// copies the final register back into the locals frame afterwards so
+    /// the exit sync persists it. The block itself NEVER seeds the register:
+    /// a compile-time default would let `fold_const_regs` fold e.g.
+    /// `m_inst == null` to true, silently constructing a fresh singleton on
+    /// every call. `(name, reg, default)`: `default` is the first-call
+    /// seed, exactly the AST declaration's.
+    method_static_locals: Vec<(String, RegId, Value)>,
     /// class-perf P2: method names returning `string` in every declaring
     /// class — string-concat operand typing for method-call operands.
     method_string_ret_names: HashSet<String>,
@@ -1849,6 +1870,7 @@ impl<'a> BytecodeCompiler<'a> {
             method_this_reg: None,
             method_handle_names: std::collections::HashSet::default(),
             method_handle_local_types: HashMap::default(),
+            method_static_locals: Vec::new(),
             method_string_ret_names: HashSet::default(),
             pkg_enum_consts: HashMap::default(),
             class_shadow_names: HashSet::default(),
@@ -9387,6 +9409,59 @@ impl<'a> BytecodeCompiler<'a> {
                     } else {
                         self.decl_width(data_type)
                     };
+                    // §6.21: a STATIC local persists across calls — its
+                    // declaration runs ONCE. The compiled path must NOT
+                    // seed the register (a compile-time default folds
+                    // `m_inst == null` to true and a fresh singleton is
+                    // constructed on every call); the dispatch shell seeds
+                    // it from the persistent store instead and copies the
+                    // final register back at exit. A declarator WITH an
+                    // initializer has run-once semantics the block cannot
+                    // express — bail the whole method to the AST path.
+                    if self.method_mode
+                        && matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                    {
+                        if decl.init.is_some() {
+                            self.bail("static_local_init");
+                            return false;
+                        }
+                        let slot = self.alloc_reg();
+                        let is_real = crate::compiler::elaborate::is_type_real(data_type);
+                        let is_string = matches!(
+                            data_type,
+                            crate::ast::types::DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        );
+                        let is_class_handle = self.class_local_names.contains(&decl.name.name);
+                        let (w, default) = if is_class_handle {
+                            (0, Value::zero(32))
+                        } else if is_real {
+                            (0, Value::from_f64(0.0))
+                        } else {
+                            let w = if is_string { 0 } else { self.decl_width(data_type) };
+                            (w, self.type_default_value(data_type, w))
+                        };
+                        if is_class_handle {
+                            self.method_handle_names.insert(decl.name.name.clone());
+                        } else {
+                            if is_real {
+                                self.local_var_is_real.insert(decl.name.name.clone());
+                            }
+                            if is_string {
+                                self.local_var_is_string.insert(decl.name.name.clone());
+                            }
+                            if let Some(k) = self.local_kind_of(data_type, None) {
+                                self.local_kinds.insert(slot, k);
+                            }
+                        }
+                        self.local_var_regs.insert(decl.name.name.clone(), (slot, w));
+                        self.decl_local_regs.insert(decl.name.name.clone());
+                        self.method_static_locals
+                            .push((decl.name.name.clone(), slot, default));
+                        continue;
+                    }
                     // Step 6: a CLASS-typed local holds a heap HANDLE in a
                     // register — default null (0), no resize (handles
                     // round-trip untouched), and the name joins
@@ -16397,6 +16472,7 @@ impl<'a> BytecodeCompiler<'a> {
             has_fallback,
             nba_dup_targets,
             foreach_slots: self.foreach_slot_count,
+            static_locals: std::mem::take(&mut self.method_static_locals).into_boxed_slice(),
         }
     }
 
@@ -16458,6 +16534,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_ast_fallback = false;
         self.allow_expr_fallback = false;
         self.allow_waits = false;
+        self.method_static_locals.clear();
         self.class_shadow_names = class_shadow_names.clone();
         self.member_safe_names = member_safe_names.clone();
         self.bare_member_names = bare_member_names.clone();
@@ -16644,6 +16721,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.static_coll_member_names.clear();
             self.coll_elem_member_names.clear();
             self.cast_reg_ok_locals.clear();
+            self.method_static_locals.clear();
             self.method_ret_jumps.clear();
             self.bail_reset();
             return None;
@@ -16686,6 +16764,15 @@ impl<'a> BytecodeCompiler<'a> {
             if let Some(&(fr, _)) = self.local_var_regs.get(name) {
                 self.emit(Insn::Move(fr, fr));
             }
+        }
+        // §6.21: the same observable-export marker for STATIC locals — the
+        // dispatch shell reads their registers after `exec_insns` (to
+        // persist them into `static_local_vars` via the exit sync), so a
+        // body-final store must not be NOP'd by copy-forwarding either.
+        let static_local_slots: Vec<RegId> =
+            self.method_static_locals.iter().map(|(_, s, _)| *s).collect();
+        for slot in static_local_slots {
+            self.emit(Insn::Move(slot, slot));
         }
 
         let block = self.finish();
@@ -19585,6 +19672,7 @@ mod tests {
             has_fallback: true,
             nba_dup_targets: false,
             foreach_slots: 0,
+            static_locals: Box::new([]),
         };
         let lower =
             |cb: &CompiledBlock| lower_two_state(cb, &[8], &[false], &[false], &HashMap::default());
