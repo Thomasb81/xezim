@@ -545,3 +545,5 @@ mod uvm_feature_coverage;
 mod uvm_ral_coverage;
 #[path = "classes/uvm_tlm_coverage.rs"]
 mod uvm_tlm_coverage;
+#[path = "classes/issue_246_struct_member_randomize.rs"]
+mod issue_246_struct_member_randomize;
