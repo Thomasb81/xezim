@@ -1,7 +1,8 @@
 //! Parse and elaboration errors print `file:line:col` of the ORIGINAL source
 //! (the `include`d file a line came from, not the file that included it),
-//! the source line, and a caret under the offending text — and a default run
-//! prints nothing else around them.
+//! the source line, and a caret under the offending text. Simulation-mode
+//! stdout starts with the build identity even when parsing or elaboration
+//! fails; diagnostics themselves remain isolated on stderr.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,6 +30,15 @@ fn run(dir: &Path) -> (i32, String, String) {
     )
 }
 
+fn banner() -> String {
+    format!(
+        "=== xezim {} ===\ngit {} ({})\n",
+        env!("CARGO_PKG_VERSION"),
+        env!("XEZIM_GIT_HASH"),
+        env!("XEZIM_GIT_DATE")
+    )
+}
+
 #[test]
 fn syntax_error_in_top_file() {
     let dir = case_dir("top");
@@ -39,7 +49,7 @@ fn syntax_error_in_top_file() {
     .unwrap();
     let (code, stdout, stderr) = run(&dir);
     assert_eq!(code, 1);
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, banner());
     assert_eq!(
         stderr,
         concat!(
@@ -62,7 +72,7 @@ fn syntax_error_in_included_file() {
     .unwrap();
     let (code, stdout, stderr) = run(&dir);
     assert_eq!(code, 1);
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, banner());
     // The recovery error after the include is back in top.sv, on its own line.
     assert_eq!(
         stderr,
@@ -89,7 +99,7 @@ fn undeclared_identifier_at_elaboration() {
     .unwrap();
     let (code, stdout, stderr) = run(&dir);
     assert_eq!(code, 1);
-    assert_eq!(stdout, "");
+    assert_eq!(stdout, banner());
     assert_eq!(
         stderr,
         concat!(
@@ -113,8 +123,9 @@ fn undeclared_identifier_in_included_file() {
         "module top;\n  logic a;\n`include \"body.svh\"\nendmodule\n",
     )
     .unwrap();
-    let (code, _, stderr) = run(&dir);
+    let (code, stdout, stderr) = run(&dir);
     assert_eq!(code, 1);
+    assert_eq!(stdout, banner());
     assert_eq!(
         stderr,
         concat!(
@@ -127,7 +138,7 @@ fn undeclared_identifier_in_included_file() {
 }
 
 #[test]
-fn clean_run_prints_only_design_output_and_the_result_line() {
+fn clean_run_starts_with_identity_then_prints_design_and_result() {
     let dir = case_dir("clean");
     std::fs::write(
         dir.join("top.sv"),
@@ -138,7 +149,10 @@ fn clean_run_prints_only_design_output_and_the_result_line() {
     assert_eq!(code, 0);
     assert_eq!(
         stdout,
-        "hello\nSimulation finished at time 5 ($finish called)\n"
+        format!(
+            "{}hello\nSimulation finished at time 5 ($finish called)\n",
+            banner()
+        )
     );
     assert_eq!(stderr, "");
 }

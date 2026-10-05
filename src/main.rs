@@ -363,6 +363,15 @@ fn print_version() {
     println!("tag {}", env!("XEZIM_GIT_TAG"));
 }
 
+fn print_simulation_banner() {
+    println!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
+    println!(
+        "git {} ({})",
+        env!("XEZIM_GIT_HASH"),
+        env!("XEZIM_GIT_DATE")
+    );
+}
+
 /// Parse a SystemVerilog time literal (`1ns`, `10ns`, `100ps`) to a power-of-
 /// ten seconds exponent. Rejects an illegal mantissa or unit.
 fn parse_time_literal(s: &str) -> Result<i32, String> {
@@ -2844,6 +2853,12 @@ suppressed but the explicit SDF annotation still applies."
         }
     }
 
+    // Print build identity before loading, compiling, or running the design so
+    // every simulation log identifies the exact binary that produced it.
+    if mode == Mode::Simulate {
+        print_simulation_banner();
+    }
+
     if design_cache_enabled && mode == Mode::Simulate {
         let directory = design_cache_dir
             .clone()
@@ -2889,12 +2904,6 @@ suppressed but the explicit SDF annotation still applies."
             if head.len() == 8 && &head[..] == xezim::XEZIM_BYTECODE_MAGIC {
                 match xezim::read_compiled(sf) {
                     Ok(Some(elab)) => {
-                        chatter_out!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
-                        chatter_out!(
-                            "git {} ({})",
-                            env!("XEZIM_GIT_HASH"),
-                            env!("XEZIM_GIT_DATE")
-                        );
                         chatter_out!("Loaded compiled: {}", sf);
                         chatter_out!("Max time: {} ns", max_time);
                         chatter_out!("------------------------------");
@@ -3126,7 +3135,7 @@ suppressed but the explicit SDF annotation still applies."
     // stay pure source text. The simulate path adds its own Max-time lines
     // below. Build identity in --compile/--parse logs matters for exactly the
     // situation those modes are used in: debugging with a specific build.
-    if mode != Mode::Preprocess {
+    if mode != Mode::Preprocess && mode != Mode::Simulate {
         chatter_out!("=== xezim {} ===", env!("CARGO_PKG_VERSION"));
         chatter_out!(
             "git {} ({})",

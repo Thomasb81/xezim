@@ -245,6 +245,8 @@ mod select_depth;
 mod select_semantics_11_5_1;
 #[path = "misc/shadow_name_matrix.rs"]
 mod shadow_name_matrix;
+#[path = "misc/simulation_version_banner.rs"]
+mod simulation_version_banner;
 #[path = "misc/spec_static_and_pkg_queue.rs"]
 mod spec_static_and_pkg_queue;
 #[path = "misc/struct_members_and_constant_targets.rs"]
