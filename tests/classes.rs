@@ -539,3 +539,5 @@ mod uvm_ral_coverage;
 mod type_param_prop_member_write;
 #[path = "classes/concurrent_function_struct_local_shadow.rs"]
 mod concurrent_function_struct_local_shadow;
+#[path = "classes/uvm_tlm_coverage.rs"]
+mod uvm_tlm_coverage;
