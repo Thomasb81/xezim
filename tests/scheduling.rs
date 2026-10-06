@@ -258,6 +258,10 @@ mod inlined_call_rollback;
 mod intra_assignment_delay_in_always;
 #[path = "scheduling/labeled_block_local_hier_ref.rs"]
 mod labeled_block_local_hier_ref;
+#[path = "scheduling/lrm_audit_clocking_skew.rs"]
+mod lrm_audit_clocking_skew;
+#[path = "scheduling/lrm_audit_disable_from_fork.rs"]
+mod lrm_audit_disable_from_fork;
 #[path = "scheduling/nba_array_elem_last_write_wins.rs"]
 mod nba_array_elem_last_write_wins;
 #[path = "scheduling/nba_wait_for_region_yield.rs"]

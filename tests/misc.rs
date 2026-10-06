@@ -423,6 +423,8 @@ mod indexed_event_roundtrip;
 mod loop_body_inlines_pure_call;
 #[path = "misc/loopvar_collision_child_leaf.rs"]
 mod loopvar_collision_child_leaf;
+#[path = "misc/lrm_audit_force_net_select.rs"]
+mod lrm_audit_force_net_select;
 #[path = "misc/macro_directive_prefix_names.rs"]
 mod macro_directive_prefix_names;
 #[path = "misc/nested_struct_string_member_display.rs"]

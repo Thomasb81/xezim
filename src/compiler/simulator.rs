@@ -2157,6 +2157,21 @@ const WHEEL_SIZE: usize = 4096;
 /// Prefix of the hidden per-clocking-input sample mirror signals (§14.13).
 /// Not expressible in SV source, so it can never collide with a user name.
 const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
+
+/// IEEE 1800-2023 §14.4: `#1step` in the clocking skew maps. An input with no
+/// declared skew samples with 1step too (§14.3 default), so the default-input
+/// map holds only explicit non-1step skews.
+const CB_SKEW_1STEP: u64 = u64::MAX;
+
+/// §14.4 explicit input skew `#N` (N > 0): a net's values over the last N
+/// ticks. `changes` holds `(slot, value at the end of that slot)` in time
+/// order, `init` the value before the first recorded slot.
+#[derive(Default)]
+struct ClockingHist {
+    init: Option<Value>,
+    changes: VecDeque<(u64, Value)>,
+    span: u64,
+}
 /// Number of u64 words needed for the occupancy bitmap (256 / 64 = 4).
 const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 
@@ -3974,6 +3989,9 @@ struct ProcFsm {
         Option<Vec<Sensitivity>>,
         Option<Vec<SensitivityId>>,
     )>,
+    /// Per wait: a clocking event (`@(cb)`), whose waiter resumes in the
+    /// Reactive region after the block samples (§14.13).
+    wait_is_clocking: Vec<bool>,
     pc: u32,
     regs: Vec<Value>,
     scope: String,
@@ -5506,6 +5524,19 @@ struct ActiveForceExpr {
     read_signal_ids: Vec<usize>,
     read_epochs: Vec<u64>,
     has_unresolved_reads: bool,
+    /// §10.6.2 bit/part-select force on a net (`partial_forces`): the reads
+    /// are the net's drivers' and the forcing expressions'; `lvalue` is the
+    /// whole net.
+    partial: bool,
+}
+
+/// IEEE 1800-2023 §10.6.2: the forced bits of a net under bit/part-select
+/// `force`. `bits[i]` names the piece (forcing expression) and the bit
+/// within it that bit `i` takes; `None` bits follow the net's drivers.
+struct PartialForce {
+    bits: Vec<Option<(usize, u32)>>,
+    /// (rvalue, select width, resolution hint) per `force` statement.
+    pieces: Vec<(Expression, u32, Option<String>)>,
 }
 
 impl VcdVarKind {
@@ -5690,6 +5721,10 @@ pub struct Simulator {
     vpi_port_directions: HashMap<Arc<str>, PortDirection>,
     /// Signals currently under force/release control (LRM §9.3.1).
     forced_signals: HashMap<usize, Value>,
+    /// §10.6.2 bit/part-select forces on nets, by signal id. Each id is
+    /// also in `forced_signals` (so ordinary writes drop) and has a
+    /// `partial` `active_force_exprs` entry that re-merges the drivers.
+    partial_forces: HashMap<usize, PartialForce>,
     /// Nets released while a settle pass was running (the entry table is
     /// taken out then); re-driven when the pass ends.
     pending_release_ids: Vec<usize>,
@@ -6156,6 +6191,17 @@ pub struct Simulator {
     /// NBA update. Without this, `cb.<in>` reads the post-edge value (off by
     /// one clock relative to a reference simulator).
     clocking_preponed: HashMap<String, Value>,
+    /// §14.4 `input #N` history per sampled net (see `ClockingHist`). Empty
+    /// unless some clocking input has an explicit positive skew.
+    clocking_hist: HashMap<String, ClockingHist>,
+    /// Time of the slot `refresh_clocking_preponed` last ran in.
+    clocking_hist_slot: Option<u64>,
+    /// §14.3 clocking-visible name of each `clocking_meta` signal, in the
+    /// same order. Snapshots are keyed by it, so `input d; input #3 dl = d;`
+    /// keeps two samples of one net.
+    clocking_vis: HashMap<String, Vec<String>>,
+    /// §14.16.2 inout clockvars: cb → nets that are BOTH sampled and driven.
+    clocking_inouts: HashMap<String, HashSet<String>>,
     /// Continuations of clocking-event waiters (`@(cb)` / `##N`) that fired this
     /// slot, held for resumption in the Reactive region — after `apply_nba` and
     /// `tick_clocking_blocks` — instead of running in the Active region with the
@@ -7248,6 +7294,20 @@ pub struct Simulator {
     foreach_replay_limit: u32,
     /// SV-2023: target named block for `disable <name>` propagation.
     disable_target: Option<String>,
+    /// §9.6.2: a `disable` just executed whose target has not been located
+    /// yet — the process loop checks its own continuation first, then the
+    /// processes the block may belong to (`disable_remote_block`).
+    disable_check_pending: bool,
+    /// §9.6.2: address of each flattened NAMED block frame → the block name,
+    /// so a `disable` can find where the block ends in a continuation chain.
+    named_block_frames: HashMap<usize, String>,
+    /// §9.6.2: the forking process's continuation at each run-loop fork
+    /// child's spawn — the named blocks the child was forked inside.
+    fork_spawn_cont: HashMap<usize, ProcCont>,
+    fork_spawn_prune_at: usize,
+    /// §9.6.2: processes unwound out of a named block or task by another
+    /// process's `disable`, applied when each next runs.
+    pending_block_disable: HashMap<usize, String>,
     /// Label of a process-level named block (`initial begin : worker`) -> its
     /// pid, so `disable worker` from another process can terminate it.
     disable_labels: HashMap<String, usize>,
@@ -11759,6 +11819,7 @@ impl Simulator {
             real_signals,
             multi_dim_array_names,
             forced_signals: HashMap::default(),
+            partial_forces: HashMap::default(),
             pending_release_ids: Vec::new(),
             prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
@@ -11858,6 +11919,10 @@ impl Simulator {
             clocking_last_edge: HashMap::default(),
             default_clocking_cb: None,
             clocking_preponed: HashMap::default(),
+            clocking_hist: HashMap::default(),
+            clocking_hist_slot: None,
+            clocking_inouts: HashMap::default(),
+            clocking_vis: HashMap::default(),
             deferred_clocking_conts: Vec::new(),
             pending_reactive: Vec::new(),
             active_union_tag: HashMap::default(),
@@ -12180,6 +12245,11 @@ impl Simulator {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(64),
             disable_target: None,
+            disable_check_pending: false,
+            named_block_frames: HashMap::default(),
+            fork_spawn_cont: HashMap::default(),
+            fork_spawn_prune_at: 1024,
+            pending_block_disable: HashMap::default(),
             disable_labels: HashMap::default(),
             fork_block_children: HashMap::default(),
             warned_assoc_index: HashSet::default(),
@@ -16880,6 +16950,7 @@ impl Simulator {
                 // §14.3 renaming: the meta/snapshot key on the RESOLVED NET;
                 // `alias_map` translates the clocking-visible name to it.
                 let mut alias_map: HashMap<String, String> = HashMap::default();
+                let mut inouts: HashSet<String> = HashSet::default();
                 let sigs: Vec<(String, bool)> = cd
                     .signals
                     .iter()
@@ -16897,9 +16968,21 @@ impl Simulator {
                             }
                             _ => s.name.name.clone(),
                         };
+                        if matches!(s.direction, crate::ast::types::PortDirection::Inout) {
+                            inouts.insert(net.clone());
+                        }
                         (net, is_input)
                     })
                     .collect();
+                let vis: Vec<String> = cd.signals.iter().map(|s| s.name.name.clone()).collect();
+                self.clocking_vis.insert(cb_name.clone(), vis);
+                if !inouts.is_empty() {
+                    if cd.is_default {
+                        self.clocking_inouts
+                            .insert("__xz_default_clocking".to_string(), inouts.clone());
+                    }
+                    self.clocking_inouts.insert(cb_name.clone(), inouts);
+                }
                 if !alias_map.is_empty() {
                     if cd.is_default {
                         self.clocking_sig_alias
@@ -16983,19 +17066,45 @@ impl Simulator {
                 )
             })
             .collect();
-        let skew_ticks = |slf: &mut Self, e: &Expression| -> u64 {
+        let skew_ticks = |slf: &mut Self, cb: &str, e: &Expression| -> u64 {
+            if let ExprKind::Ident(h) = &e.kind
+                && h.path.len() == 1
+                && h.path[0].name.name == crate::ast::decl::CLOCKING_ONE_STEP
+            {
+                return CB_SKEW_1STEP;
+            }
             // A `#1ns` skew is an ABSOLUTE time literal (stored in seconds);
             // convert against the global tick directly — eval_delay_ticks'
             // module-timescale context isn't established at compile time.
             if let ExprKind::Number(crate::ast::expr::NumberLiteral::Time(secs)) = &e.kind {
                 return (secs / slf.tick_s).round() as u64;
             }
-            slf.eval_delay_ticks(e)
+            // §14.4: a plain number is in the time unit of the module or
+            // interface declaring the block (unlike statement delays, the
+            // elaborator does not pre-scale clocking skews).
+            let scope = match cb.rsplit_once('.') {
+                Some((inst, _)) => inst.to_string(),
+                None => slf.module.name.clone(),
+            };
+            let saved = slf.timescale_scope_override.replace(scope);
+            let (unit_exp, _) = slf.current_timescale_exp();
+            slf.timescale_scope_override = saved;
+            let v = slf.eval_expr(e);
+            let f = if v.is_real {
+                v.to_f64()
+            } else {
+                v.to_u64().unwrap_or(0) as f64
+            };
+            let scale = 10f64.powi(unit_exp - Self::secs_to_exp(slf.tick_s));
+            (f * scale).round().max(0.0) as u64
         };
         for (cb, is_default, out_dskew, out_per_sig, in_dskew, in_per_sig) in skew_specs {
-            // Process output skew
+            // Process output skew. An output `#1step` skew drives one tick
+            // (the global time precision) after the clocking event, as the
+            // reference simulator does.
+            let out_ticks = |t: u64| if t == CB_SKEW_1STEP { 1 } else { t };
             if let Some(e) = out_dskew {
-                let t = skew_ticks(self, &e);
+                let t = out_ticks(skew_ticks(self, &cb, &e));
                 if t > 0 {
                     self.clocking_out_skew.insert(cb.clone(), t);
                     if is_default {
@@ -17006,16 +17115,18 @@ impl Simulator {
             }
             let mut out_m: HashMap<String, u64> = HashMap::default();
             for (net, e) in out_per_sig {
-                let t = skew_ticks(self, &e);
+                let t = out_ticks(skew_ticks(self, &cb, &e));
                 out_m.insert(net, t);
             }
             if !out_m.is_empty() {
                 self.clocking_sig_out_skew.insert(cb.clone(), out_m);
             }
-            // Process input skew
+            // Process input skew (§14.4): absent and `#1step` sample in the
+            // Preponed region; an explicit `#0` samples in the Observed
+            // region, so it is recorded too.
             if let Some(e) = in_dskew {
-                let t = skew_ticks(self, &e);
-                if t > 0 {
+                let t = skew_ticks(self, &cb, &e);
+                if t != CB_SKEW_1STEP {
                     self.clocking_in_skew.insert(cb.clone(), t);
                     if is_default {
                         self.clocking_in_skew
@@ -17025,12 +17136,42 @@ impl Simulator {
             }
             let mut in_m: HashMap<String, u64> = HashMap::default();
             for (net, e) in in_per_sig {
-                let t = skew_ticks(self, &e);
+                let t = skew_ticks(self, &cb, &e);
                 in_m.insert(net, t);
             }
             if !in_m.is_empty() {
                 self.clocking_sig_in_skew.insert(cb, in_m);
             }
+        }
+        // §14.4 `input #N`: track the history of every net some clocking
+        // input samples with an explicit positive skew.
+        let mut hist: Vec<(String, u64)> = Vec::new();
+        for (cb, (_, sigs)) in self.clocking_meta.iter() {
+            let dskew = self
+                .clocking_in_skew
+                .get(cb)
+                .copied()
+                .unwrap_or(CB_SKEW_1STEP);
+            let vis = self.clocking_vis.get(cb);
+            for (i, (net, is_input)) in sigs.iter().enumerate() {
+                if !*is_input {
+                    continue;
+                }
+                let v = vis.and_then(|l| l.get(i)).unwrap_or(net);
+                let skew = self
+                    .clocking_sig_in_skew
+                    .get(cb)
+                    .and_then(|m| m.get(v))
+                    .copied()
+                    .unwrap_or(dskew);
+                if skew != 0 && skew != CB_SKEW_1STEP {
+                    hist.push((net.clone(), skew));
+                }
+            }
+        }
+        for (net, skew) in hist {
+            let h = self.clocking_hist.entry(net).or_default();
+            h.span = h.span.max(skew);
         }
         // Friendly fallback: `##N` with a single clocking block and no
         // explicit `default` — unambiguous, so use it (strict LRM would
@@ -17995,6 +18136,7 @@ impl Simulator {
         self.snapshot_edge_signals_full();
         self.in_pre_process_settle = true;
         self.settle_combinatorial();
+        self.fire_time0_input_port_blocks();
         self.in_pre_process_settle = false;
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
         let dt = t_settle0.elapsed();
@@ -23299,6 +23441,17 @@ impl Simulator {
             .into_iter()
             .map(|ev| (ev, None, None))
             .collect();
+        let wait_is_clocking: Vec<bool> = if self.clocking_meta.is_empty() {
+            vec![false; waits.len()]
+        } else {
+            let saved = self
+                .name_resolve_hint
+                .borrow_mut()
+                .replace(scope.to_string());
+            let v = waits.iter().map(|w| self.is_clocking_event(&w.0)).collect();
+            *self.name_resolve_hint.borrow_mut() = saved;
+            v
+        };
         let mut cb = compiler.finish();
         // Constant-delay fold: an integer bare delay elaborates to
         // `LoadConst(int) ; LoadConst(real scale) ; Mul ; WaitDelayReg`.
@@ -23412,6 +23565,7 @@ impl Simulator {
                 ts: self.lower_proc_fsm_ts(&cb),
                 compiled: cb,
                 waits,
+                wait_is_clocking,
                 pc: 0,
                 regs: Vec::new(),
                 scope: scope.to_string(),
@@ -45933,6 +46087,71 @@ impl Simulator {
         }
     }
 
+    /// §14.13: an explicit `@(cb)` (not the `##N` default-clocking form)
+    /// whose block's clock edge is due in THIS time slot but not yet
+    /// processed by `tick_clocking_blocks` — a process that reached it in
+    /// the Active region after the raw edge (`@(posedge clk); @(cb);`) still
+    /// sees this slot's clocking event, which the block raises after it
+    /// samples. Such a continuation is resumed with the slot's clocking
+    /// waiters instead of waiting a whole cycle.
+    fn clocking_event_due_now(&self, event: &EventControl) -> bool {
+        if self.clocking_tick_cache.is_empty() {
+            return false;
+        }
+        let key = match event {
+            EventControl::Identifier(id) => {
+                if id.name.starts_with("__xz_default_clocking") {
+                    return false;
+                }
+                self.clocking_meta
+                    .contains_key(&id.name)
+                    .then(|| id.name.clone())
+            }
+            EventControl::HierIdentifier(e) => match &e.kind {
+                ExprKind::Ident(h) => {
+                    let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    self.resolve_clocking_key(&segs)
+                }
+                _ => None,
+            },
+            EventControl::EventExpr(exprs) if exprs.len() == 1 && exprs[0].edge.is_none() => {
+                let rebased = self.vif_rebase_expr(&exprs[0].expr);
+                let term = rebased.as_ref().unwrap_or(&exprs[0].expr);
+                let flat = Self::member_chain_as_flat_ident_for_sens(term);
+                let term = flat.as_ref().unwrap_or(term);
+                match &term.kind {
+                    ExprKind::Ident(h) => {
+                        let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+                        self.resolve_clocking_key(&segs)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(key) = key else {
+            return false;
+        };
+        if key.starts_with("__xz_default_clocking") {
+            return false;
+        }
+        let Some(ent) = self.clocking_tick_cache.iter().find(|t| t.cb == key) else {
+            return false;
+        };
+        let cur = match ent.id {
+            Some(id) => self.signal_table[id]
+                .to_u64()
+                .map(|u| (u & 1) as u8)
+                .unwrap_or(2),
+            None => return false,
+        };
+        match ent.edge {
+            EdgeKind::Negedge => ent.prev == 1 && cur == 0,
+            EdgeKind::Posedge => ent.prev == 0 && cur == 1,
+            _ => ent.prev != cur && ent.prev != 2 && cur != 2,
+        }
+    }
+
     /// Edge check against an EXPLICIT prior value (the waiter's arm-time
     /// snapshot) rather than `prev_val`. Used for a waiter registered in the
     /// current snapshot generation: comparing against the value the signal had
@@ -51002,6 +51221,11 @@ impl Simulator {
         if self.killed_pids.contains(&pid) {
             return;
         }
+        // A stale `disable` target would keep later loops from consuming
+        // their own `break`; a disable posted by another process (§9.6.2)
+        // starts this activation's unwind instead.
+        self.disable_target = None;
+        self.disable_check_pending = false;
         // A freshly-activated scheduled process must resolve unqualified names
         // from a clean slate. `name_resolve_hint` is a transient sibling-scope
         // hint set while resolving DOTTED names (resolve_hier_name records the
@@ -51204,6 +51428,15 @@ impl Simulator {
     /// Dispatch a scheduled payload, recognizing the empty marker used by a
     /// retained dynamic-delay always assignment.
     fn run_process_payload(&mut self, pid: usize, stmts: &ProcCont) {
+        // §9.6.2: a disable posted by another process (`disable_remote_block`)
+        // starts this activation's unwind — after the process context (and
+        // its saved flags) is back in place.
+        if !self.pending_block_disable.is_empty() {
+            if let Some(x) = self.pending_block_disable.remove(&pid) {
+                self.disable_target = Some(x);
+                self.break_flag = true;
+            }
+        }
         if stmts.is_empty() && self.fast_delay_always.contains_key(&pid) {
             self.run_fast_delay_always(pid);
         } else if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
@@ -51617,9 +51850,14 @@ impl Simulator {
                     2 => {
                         let ix = out[1] as usize;
                         let terms = self.fsm_wait_terms(&mut f, ix);
-                        let w =
-                            self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), false);
-                        self.event_waiters.push(w);
+                        let clk = f.wait_is_clocking.get(ix).copied().unwrap_or(false);
+                        if clk && self.clocking_event_due_now(&f.waits[ix].0) {
+                            self.deferred_clocking_conts.push((pid, ProcCont::empty()));
+                        } else {
+                            let w =
+                                self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), clk);
+                            self.event_waiters.push(w);
+                        }
                         f.pc = npc;
                         break;
                     }
@@ -51697,9 +51935,19 @@ impl Simulator {
                     }
                     FsmWait::Edge(ix) => {
                         let terms = self.fsm_wait_terms(&mut f, ix as usize);
-                        let w =
-                            self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), false);
-                        self.event_waiters.push(w);
+                        // §14.13: a clocking event resumes after the block samples.
+                        let clk = f
+                            .wait_is_clocking
+                            .get(ix as usize)
+                            .copied()
+                            .unwrap_or(false);
+                        if clk && self.clocking_event_due_now(&f.waits[ix as usize].0) {
+                            self.deferred_clocking_conts.push((pid, ProcCont::empty()));
+                        } else {
+                            let w =
+                                self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), clk);
+                            self.event_waiters.push(w);
+                        }
                     }
                 }
                 break;
@@ -52619,6 +52867,17 @@ impl Simulator {
                 continue;
             }
 
+            // §9.6.2 `disable <block|task>`: skip to the end of the named
+            // block's frame (or the task's `ScopePop`), running only the task
+            // cleanups passed on the way.
+            if self.break_flag && self.disable_target.is_some() && self.disable_unwinding(pid, pc) {
+                if let StatementKind::ScopePop = &stmt.kind {
+                    self.disable_pop_task_frame();
+                }
+                i += 1;
+                continue;
+            }
+
             // §12.7.2 for-step barrier (see `StatementKind::LoopStep`). Checked
             // HERE, ahead of the generic dispatch, because `exec_statement`
             // skips every statement while `continue_flag` is set — which is
@@ -52700,11 +52959,14 @@ impl Simulator {
 
             // Expand SeqBlocks: flatten begin/end so that timing controls and waits
             // inside them are properly handled with process suspension.
-            if let StatementKind::SeqBlock { stmts: inner, .. } = &stmt.kind {
+            if let StatementKind::SeqBlock { stmts: inner, name } = &stmt.kind {
                 if self.stmts_have_blocking(inner) {
                     // Immutable AST: share one Arc frame per (process, span)
                     // instead of cloning the whole list on every entry.
-                    let frame = self.blocking_cont_frame(pid, stmt.span, 0, inner);
+                    let frame = match name {
+                        None => self.blocking_cont_frame(pid, stmt.span, 0, inner),
+                        Some(n) => self.named_block_frame(pid, stmt, inner, &n.name),
+                    };
                     self.run_process_stmts(pid, &pc.pushed_frame(frame, pc.start + i + 1));
                     return;
                 }
@@ -53846,7 +54108,9 @@ impl Simulator {
                                 }
                             }
                             let has_real = sens.iter().any(|s| self.sens_term_resolves(s));
-                            if has_real {
+                            if has_real && is_clk_ev && self.clocking_event_due_now(event) {
+                                self.deferred_clocking_conts.push((pid, cont));
+                            } else if has_real {
                                 let w = self.make_event_waiter_kind(pid, sens, cont, is_clk_ev);
                                 self.event_waiters.push(w);
                             } else {
@@ -54453,6 +54717,7 @@ impl Simulator {
                     let pid_child = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid_child, pid);
+                    self.note_fork_spawn(pid_child, pc);
                     // §9.3.2: a fork child executes in the forking process's
                     // scope, so it inherits the parent's instance-scope hint
                     // (additive — a child previously had none at all).
@@ -54875,9 +55140,298 @@ impl Simulator {
         // bounds it. What changed is that a level costs a pointer instead of a
         // copy of everything the caller had left.
         if !self.finished {
+            // §9.6.2: a `disable` of THIS named block ends here.
+            if self.break_flag
+                && self.disable_target.is_some()
+                && (self.disable_check_pending || !self.named_block_frames.is_empty())
+                && self.disable_unwinding(pid, pc)
+            {
+                if let Some(n) = self.named_block_frames.get(&Self::frame_key(&pc.stmts)) {
+                    if self
+                        .disable_target
+                        .as_deref()
+                        .is_some_and(|t| Self::block_name_matches(t, n))
+                        && !self.killed_pids.contains(&pid)
+                    {
+                        self.disable_target = None;
+                        self.break_flag = false;
+                        self.continue_flag = false;
+                    }
+                }
+            }
             if let Some(frame) = pc.next.clone() {
                 self.run_process_stmts(pid, &frame);
             }
+        }
+    }
+
+    /// §9.6.2: identity of a statement frame (its address).
+    fn frame_key(f: &Arc<[Statement]>) -> usize {
+        Arc::as_ptr(f) as *const Statement as usize
+    }
+
+    /// A `disable` target (possibly hierarchical, `top.blk`) naming block `n`.
+    fn block_name_matches(target: &str, n: &str) -> bool {
+        target == n || target.rsplit('.').next() == Some(n)
+    }
+
+    /// §9.6.2: whether continuation `pc` is inside the named block `x`.
+    fn cont_has_named_block(&self, pc: &ProcCont, x: &str) -> bool {
+        if self.named_block_frames.is_empty() {
+            return false;
+        }
+        let mut cur = Some(pc);
+        while let Some(f) = cur {
+            if let Some(n) = self.named_block_frames.get(&Self::frame_key(&f.stmts)) {
+                if Self::block_name_matches(x, n) {
+                    return true;
+                }
+            }
+            cur = f.next.as_deref();
+        }
+        false
+    }
+
+    /// §9.6.2: is process `pid` (running continuation `pc`) unwinding a
+    /// pending `disable` through its own frames? Resolves a freshly executed
+    /// `disable` first: a target that is not this process's own block or
+    /// task is handed to `disable_remote_block` and the flags cleared here.
+    fn disable_unwinding(&mut self, pid: usize, pc: &ProcCont) -> bool {
+        let Some(x) = self.disable_target.clone() else {
+            return false;
+        };
+        let own = |slf: &Self| {
+            slf.killed_pids.contains(&pid)
+                || slf.cont_has_named_block(pc, &x)
+                || slf
+                    .active_task_pids
+                    .get(&x)
+                    .is_some_and(|s| s.contains(&pid))
+        };
+        if self.disable_check_pending {
+            self.disable_check_pending = false;
+            if own(self) {
+                // The block's own fork children die with it.
+                if !self.killed_pids.contains(&pid) && self.cont_has_named_block(pc, &x) {
+                    let kids = self.children_forked_in(pid, &x);
+                    for k in kids {
+                        self.proc_kill(k);
+                    }
+                }
+            } else {
+                self.disable_target = None;
+                self.break_flag = false;
+                self.disable_remote_block(&x);
+                return self.break_flag
+                    && self.disable_target.is_some()
+                    && self.killed_pids.contains(&pid);
+            }
+        }
+        own(self)
+    }
+
+    /// Run a task-frame cleanup passed while unwinding a `disable`; the
+    /// unwind ends there when the task is the target.
+    fn disable_pop_task_frame(&mut self) {
+        let Some(c) = self.task_cleanup.pop() else {
+            return;
+        };
+        let tname = c.task_name.clone();
+        let target = self.disable_target.clone();
+        self.unwind_task_frame(c);
+        let consumed = match (tname.as_deref(), target.as_deref()) {
+            (Some(tn), Some(t)) => {
+                t == tn || Self::block_name_matches(t, tn.rsplit('.').next().unwrap_or(tn))
+            }
+            _ => false,
+        };
+        if consumed && !self.killed_pids.contains(&self.current_pid) {
+            self.disable_target = None;
+            self.break_flag = false;
+            self.continue_flag = false;
+        } else {
+            self.disable_target = target;
+            self.break_flag = true;
+        }
+    }
+
+    /// Record a run-loop fork child's spawn point (§9.6.2), pruning entries
+    /// of children that have ended.
+    fn note_fork_spawn(&mut self, child: usize, pc: &ProcCont) {
+        if self.named_block_frames.is_empty() {
+            return;
+        }
+        self.fork_spawn_cont.insert(child, pc.clone());
+        if self.fork_spawn_cont.len() > self.fork_spawn_prune_at {
+            let parents = &self.process_parents;
+            self.fork_spawn_cont.retain(|k, _| parents.contains_key(k));
+            self.fork_spawn_prune_at = (self.fork_spawn_cont.len() * 2).max(1024);
+        }
+    }
+
+    /// Is `anc` a fork ancestor of `pid`?
+    fn is_fork_ancestor(&self, anc: usize, pid: usize) -> bool {
+        let mut c = pid;
+        let mut steps = 0;
+        while let Some(&p) = self.process_parents.get(&c) {
+            if p == anc {
+                return true;
+            }
+            c = p;
+            steps += 1;
+            if steps > 100_000 {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Direct fork children of `pid` that were spawned inside named block `x`.
+    fn children_forked_in(&self, pid: usize, x: &str) -> Vec<usize> {
+        let mut kids: Vec<usize> = self
+            .process_parents
+            .iter()
+            .filter(|&(_, &p)| p == pid)
+            .map(|(&c, _)| c)
+            .filter(|c| {
+                self.fork_spawn_cont
+                    .get(c)
+                    .is_some_and(|sp| self.cont_has_named_block(sp, x))
+            })
+            .collect();
+        kids.sort_unstable();
+        kids
+    }
+
+    /// The continuation process `pid` is parked on, if it is parked.
+    fn parked_cont_of(&self, pid: usize) -> Option<&ProcCont> {
+        if let Some(w) = self
+            .join_waiters
+            .iter()
+            .find(|w| w.parent_pid == pid && !w.wait_fork)
+        {
+            return Some(&w.continuation);
+        }
+        if let Some(c) = self.event_queue.pending_stmts_for(pid) {
+            return Some(c);
+        }
+        if let Some(w) = self.event_waiters.iter().find(|w| w.pid == pid) {
+            return Some(&w.continuation);
+        }
+        if let Some((_, c)) = self.condition_waiters.iter().find(|(p, _)| *p == pid) {
+            return Some(c);
+        }
+        if let Some((_, c)) = self.inactive_queue.iter().find(|(p, _)| *p == pid) {
+            return Some(c);
+        }
+        None
+    }
+
+    /// Remove process `pid` from wherever it is parked and return its
+    /// continuation.
+    fn take_parked_cont(&mut self, pid: usize) -> Option<ProcCont> {
+        if let Some(idx) = self
+            .join_waiters
+            .iter()
+            .position(|w| w.parent_pid == pid && !w.wait_fork)
+        {
+            return Some(self.join_waiters.remove(idx).continuation);
+        }
+        self.proc_suspend(pid);
+        let info = self.suspended_proc_info.remove(&pid)?;
+        self.suspended_pids.remove(&pid);
+        Some(info.continuation)
+    }
+
+    /// IEEE 1800-2023 §9.6.2: `disable x` where `x` is a block (or task)
+    /// that ANOTHER process is executing — an ancestor the disabling process
+    /// was forked inside, or any process parked inside it. That process
+    /// resumes at the end of the block, and every process forked inside the
+    /// block, the disabling one included, is terminated.
+    fn disable_remote_block(&mut self, x: &str) {
+        let me = self.current_pid;
+        let mut owner: Option<usize> = None;
+        let mut task_owner = false;
+        let mut c = me;
+        let mut steps = 0;
+        while let Some(&a) = self.process_parents.get(&c) {
+            if self
+                .fork_spawn_cont
+                .get(&c)
+                .is_some_and(|sp| self.cont_has_named_block(sp, x))
+            {
+                owner = Some(a);
+                break;
+            }
+            if self.active_task_pids.get(x).is_some_and(|s| s.contains(&a)) {
+                owner = Some(a);
+                task_owner = true;
+                break;
+            }
+            c = a;
+            steps += 1;
+            if steps > 100_000 {
+                break;
+            }
+        }
+        if owner.is_none() && !self.named_block_frames.is_empty() {
+            let mut cands: Vec<usize> = self.join_waiters.iter().map(|w| w.parent_pid).collect();
+            cands.extend(self.event_waiters.iter().map(|w| w.pid));
+            cands.extend(self.condition_waiters.iter().map(|(p, _)| *p));
+            cands.extend(self.inactive_queue.iter().map(|(p, _)| *p));
+            cands.extend(
+                self.event_queue
+                    .pending_pid_times()
+                    .into_iter()
+                    .map(|(p, _)| p),
+            );
+            cands.sort_unstable();
+            cands.dedup();
+            owner = cands.into_iter().find(|&p| {
+                p != me
+                    && !self.killed_pids.contains(&p)
+                    && self
+                        .parked_cont_of(p)
+                        .is_some_and(|pc| self.cont_has_named_block(pc, x))
+            });
+        }
+        let Some(a) = owner else {
+            return;
+        };
+        let parked_inside = self
+            .parked_cont_of(a)
+            .is_some_and(|pc| task_owner || self.cont_has_named_block(pc, x));
+        if !parked_inside {
+            return;
+        }
+        let kids: Vec<usize> = if task_owner {
+            let mut v: Vec<usize> = self
+                .process_parents
+                .iter()
+                .filter(|&(_, &p)| p == a)
+                .map(|(&c, _)| c)
+                .collect();
+            v.sort_unstable();
+            v
+        } else {
+            self.children_forked_in(a, x)
+        };
+        let mut doomed: HashSet<usize> = HashSet::default();
+        for &k in &kids {
+            doomed.insert(k);
+            doomed.extend(self.collect_fork_descendants(k));
+        }
+        let Some(cont) = self.take_parked_cont(a) else {
+            return;
+        };
+        for k in kids {
+            self.proc_kill(k);
+        }
+        self.pending_block_disable.insert(a, x.to_string());
+        self.event_queue.schedule(self.time, a, cont);
+        if doomed.contains(&me) {
+            self.disable_target = Some(x.to_string());
+            self.break_flag = true;
         }
     }
 
@@ -55359,6 +55913,32 @@ impl Simulator {
     /// from the process path (a blocking `begin/end` or a blocking chosen
     /// `if` branch). Keyed per process like `forever_cont_cache`: sibling
     /// instances share spans but never a pid.
+    /// §9.6.2: the frame of a flattened NAMED block — its statements and a
+    /// trailing `Null`, so the frame is never dropped from a continuation
+    /// chain as exhausted while the block is still running (`ProcCont::pushed`
+    /// elides spent frames) — registered so a `disable` can find where the
+    /// block ends.
+    fn named_block_frame(
+        &mut self,
+        pid: usize,
+        stmt: &Statement,
+        inner: &[Statement],
+        name: &str,
+    ) -> Arc<[Statement]> {
+        let key = (pid, stmt.span.start as usize, stmt.span.end as usize, 2u8);
+        if let Some(f) = self.blocking_cont_cache.get(&key) {
+            return f.clone();
+        }
+        let mut v: Vec<Statement> = Vec::with_capacity(inner.len() + 1);
+        v.extend_from_slice(inner);
+        v.push(Statement::new(StatementKind::Null, stmt.span));
+        let f: Arc<[Statement]> = Arc::from(v);
+        self.named_block_frames
+            .insert(Self::frame_key(&f), name.to_string());
+        self.blocking_cont_cache.insert(key, f.clone());
+        f
+    }
+
     fn blocking_cont_frame(
         &mut self,
         pid: usize,
@@ -63869,6 +64449,7 @@ impl Simulator {
             read_signal_ids,
             read_epochs,
             has_unresolved_reads,
+            partial: false,
         });
     }
 
@@ -63945,6 +64526,22 @@ impl Simulator {
             if is_conservative {
                 conservative_done[idx] = true;
             }
+            if self.active_force_exprs[idx].partial {
+                if let Some((_, Some(id))) = self.force_target(&lvalue) {
+                    self.refresh_partial_force(id, &lvalue);
+                }
+                let ids = self.active_force_exprs[idx].read_signal_ids.clone();
+                self.active_force_exprs[idx].read_epochs = ids
+                    .iter()
+                    .map(|&id| {
+                        self.active_force_signal_epochs
+                            .get(id)
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                continue;
+            }
             let saved_hint = self.name_resolve_hint.borrow().clone();
             *self.name_resolve_hint.borrow_mut() = hint;
             let v = self.eval_expr(&rvalue);
@@ -64000,6 +64597,9 @@ impl Simulator {
     /// slot `force_target` resolved, if any).
     fn release_override(&mut self, target: Option<(&str, Option<usize>)>) {
         if let Some((name, id)) = target {
+            if let Some(id) = id {
+                self.partial_forces.remove(&id);
+            }
             self.forced_names.remove(name);
             self.active_force_exprs.retain(|entry| entry.key != name);
             if let Some(id) = id.filter(|&id| is_packed_id(id)) {
@@ -64041,6 +64641,232 @@ impl Simulator {
             .iter_mut()
             .for_each(|v| *v |= EDGE_ARMED);
         self.dirty_any = true;
+    }
+
+    /// IEEE 1800-2023 §10.6.2: a constant bit- or part-select of a whole
+    /// NET (`w[0]`, `w[7:6]`, `w[i +: 2]`): the net's id, its base
+    /// identifier expression, and the physical (lo bit, width) selected.
+    fn force_select_range(&mut self, lv: &Expression) -> Option<(usize, Expression, u32, u32)> {
+        let (base, a, b) = match &lv.kind {
+            ExprKind::Index { expr, index } => {
+                let l = self.eval_expr(index).to_i64()?;
+                (expr, l, l)
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let l = self.eval_expr(left).to_i64()?;
+                let r = self.eval_expr(right).to_i64()?;
+                match kind {
+                    RangeKind::Constant => (expr, l, r),
+                    RangeKind::IndexedUp if r > 0 => (expr, l + r - 1, l),
+                    RangeKind::IndexedDown if r > 0 => (expr, l, l - r + 1),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if !h.path.iter().all(|s| s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.resolve_hier_name(h).to_string();
+        if !self.module.nets.contains(&name)
+            || self.module.arrays.contains_key(&name)
+            || self
+                .module
+                .packed_signal_elem_widths
+                .get(&name)
+                .copied()
+                .unwrap_or(0)
+                > 1
+        {
+            return None;
+        }
+        let id = *self.signal_name_to_id.get(name.as_str())?;
+        if is_packed_id(id) || id >= self.signal_widths.len() {
+            return None;
+        }
+        let phys = |lab: i64| -> i64 {
+            if let Some(&(_, hi_l)) = self.module.ascending_packed.get(&name) {
+                hi_l - lab
+            } else {
+                let off = self
+                    .module
+                    .packed_full_dims
+                    .get(&name)
+                    .and_then(|d| d.first())
+                    .map(|&(dl, dr)| dl.min(dr))
+                    .unwrap_or(0);
+                lab - off
+            }
+        };
+        let (pa, pb) = (phys(a), phys(b));
+        let lo = pa.min(pb);
+        let hi = pa.max(pb);
+        let w = self.signal_widths[id] as i64;
+        if lo < 0 || hi >= w {
+            return None;
+        }
+        Some((id, (**base).clone(), lo as u32, (hi - lo + 1) as u32))
+    }
+
+    /// §10.6.2 `force` of a net bit/part-select: those bits take `rvalue`
+    /// (tracked like a whole-net force expression); the others keep
+    /// following the net's drivers.
+    fn force_partial(&mut self, sel: (usize, Expression, u32, u32), rvalue: &Expression) {
+        let (id, base, lo, width) = sel;
+        let w = self.signal_widths[id] as usize;
+        let hint = self.name_resolve_hint.borrow().clone();
+        let pf = self
+            .partial_forces
+            .entry(id)
+            .or_insert_with(|| PartialForce {
+                bits: vec![None; w],
+                pieces: Vec::new(),
+            });
+        let p = pf.pieces.len();
+        pf.pieces.push((rvalue.clone(), width, hint));
+        for k in 0..width {
+            if let Some(slot) = pf.bits.get_mut((lo + k) as usize) {
+                *slot = Some((p, k));
+            }
+        }
+        self.arm_partial_force(id, &base);
+        self.refresh_partial_force(id, &base);
+    }
+
+    /// §10.6.2 `release` of a net bit/part-select: those bits return to the
+    /// net's drivers at once; the net is fully released with its last bit.
+    fn release_partial(&mut self, sel: (usize, Expression, u32, u32)) {
+        let (id, base, lo, width) = sel;
+        let Some(pf) = self.partial_forces.get_mut(&id) else {
+            return;
+        };
+        for k in 0..width {
+            if let Some(slot) = pf.bits.get_mut((lo + k) as usize) {
+                *slot = None;
+            }
+        }
+        if pf.bits.iter().all(|b| b.is_none()) {
+            let target = self.force_target(&base);
+            self.release_override(target.as_ref().map(|(n, id)| (n.as_str(), *id)));
+            return;
+        }
+        self.refresh_partial_force(id, &base);
+    }
+
+    /// Track the reads a partial force depends on: the net's drivers and its
+    /// forcing expressions (see `refresh_active_forces`).
+    fn arm_partial_force(&mut self, id: usize, base: &Expression) {
+        let Some((key, _)) = self.force_target(base) else {
+            return;
+        };
+        self.active_force_exprs.retain(|entry| entry.key != key);
+        let mut ids: Vec<usize> = Vec::new();
+        for e in self.comb_entries.iter() {
+            if e.cold.write_signal_ids.contains(&id) {
+                ids.extend(e.cold.read_signal_ids.iter().copied());
+            }
+        }
+        let mut reads: HashSet<String> = HashSet::default();
+        if let Some(pf) = self.partial_forces.get(&id) {
+            for (rv, _, _) in &pf.pieces {
+                Self::collect_expr_reads(rv, &self.module, &mut reads);
+            }
+        }
+        let top_prefix = format!("{}.", self.module.name);
+        let hint = self.name_resolve_hint.borrow().clone();
+        let mut has_unresolved_reads = false;
+        for read in reads {
+            let mut rid = self.resolve_read_name(&read, &top_prefix);
+            if rid.is_none()
+                && let Some(scope_hint) = hint.as_deref()
+            {
+                let mut scope = scope_hint;
+                loop {
+                    rid = self.resolve_read_name(&format!("{}.{}", scope, read), &top_prefix);
+                    if rid.is_some() {
+                        break;
+                    }
+                    let Some((parent, _)) = scope.rsplit_once('.') else {
+                        break;
+                    };
+                    scope = parent;
+                }
+            }
+            match rid {
+                Some(r) => ids.push(r),
+                None => has_unresolved_reads = true,
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let read_epochs = ids
+            .iter()
+            .map(|&r| self.active_force_signal_epochs.get(r).copied().unwrap_or(0))
+            .collect();
+        self.active_force_exprs.push(ActiveForceExpr {
+            key,
+            lvalue: base.clone(),
+            rvalue: Expression::new(ExprKind::Empty, base.span),
+            hint,
+            read_signal_ids: ids,
+            read_epochs,
+            has_unresolved_reads,
+            partial: true,
+        });
+    }
+
+    /// Recompute a partially forced net: lift the override, re-evaluate its
+    /// drivers, then pin the forced bits over the driven value.
+    fn refresh_partial_force(&mut self, id: usize, base: &Expression) {
+        let Some(pf) = self.partial_forces.get(&id) else {
+            return;
+        };
+        let pieces: Vec<(Expression, u32, Option<String>)> = pf.pieces.clone();
+        let bits = pf.bits.clone();
+        let mut vals: Vec<Option<Value>> = vec![None; pieces.len()];
+        for (pi, _) in bits.iter().flatten() {
+            if vals[*pi].is_none() {
+                let (rv, w, h) = &pieces[*pi];
+                let saved = self.name_resolve_hint.borrow().clone();
+                *self.name_resolve_hint.borrow_mut() = h.clone();
+                let v = self.eval_expr(rv).resize(*w);
+                *self.name_resolve_hint.borrow_mut() = saved;
+                vals[*pi] = Some(v);
+            }
+        }
+        self.forced_signals.remove(&id);
+        if !self.settling && !self.in_edge_block {
+            let drivers: Vec<CombEntry> = self
+                .comb_entries
+                .iter()
+                .filter(|e| e.cold.write_signal_ids.contains(&id))
+                .cloned()
+                .collect();
+            for entry in &drivers {
+                self.eval_comb_entry_full(entry);
+            }
+        }
+        let mut merged = self.signal_table[id].clone();
+        for (i, b) in bits.iter().enumerate() {
+            if let Some((pi, k)) = b {
+                if let Some(v) = &vals[*pi] {
+                    merged.set_bit(i, v.get_bit(*k as usize));
+                }
+            }
+        }
+        if merged != self.signal_table[id] {
+            self.assign_value(base, &merged);
+        }
+        let stored = self.signal_table[id].clone();
+        self.forced_signals.insert(id, stored);
     }
 
     fn force_target(&mut self, lv: &Expression) -> Option<(String, Option<usize>)> {
@@ -84576,8 +85402,12 @@ impl Simulator {
                             .map(|s| s.as_str())
                             .unwrap_or(raw_sig);
                         if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
+                            // §14.16.2: an `inout` clockvar is driven like an
+                            // output (it is registered as an input for sampling).
+                            let inouts = self.clocking_inouts.get(&cb);
                             let out_net = sigs.iter().find(|(n, is_in)| {
-                                !*is_in && (n == sig || n.rsplit('.').next() == Some(sig))
+                                (!*is_in || inouts.is_some_and(|s| s.contains(n)))
+                                    && (n == sig || n.rsplit('.').next() == Some(sig))
                             });
                             if let Some((net, _)) = out_net {
                                 let net = net.clone();
@@ -84599,7 +85429,7 @@ impl Simulator {
                                 let skew = self
                                     .clocking_sig_out_skew
                                     .get(&cb)
-                                    .and_then(|m| m.get(&net))
+                                    .and_then(|m| m.get(raw_sig).or_else(|| m.get(&net)))
                                     .copied()
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
@@ -85257,8 +86087,9 @@ impl Simulator {
                 // A `disable` naming THIS block ends here; execution resumes
                 // after it (§9.6.2).
                 if let (Some(target), Some(n)) = (self.disable_target.as_deref(), name.as_ref()) {
-                    if target == n.name {
+                    if Self::block_name_matches(target, &n.name) {
                         self.disable_target = None;
+                        self.disable_check_pending = false;
                         self.break_flag = false;
                         self.continue_flag = false;
                     }
@@ -85721,10 +86552,11 @@ impl Simulator {
                         to_kill.insert(c);
                         to_kill.extend(self.collect_fork_descendants(c));
                     }
-                    // If the disabling process is itself one of them (disabling
-                    // the block it is currently inside), fall through to the
-                    // unwind path rather than killing itself here.
-                    if !to_kill.contains(&self.current_pid) {
+                    // The disabling process may itself be one of them (a child
+                    // or deeper descendant disabling its own fork block): it
+                    // is terminated with its siblings and unwinds to its end.
+                    let self_doomed = to_kill.contains(&self.current_pid);
+                    {
                         for &pid in &to_kill {
                             self.killed_pids.insert(pid);
                             self.vc_cancel_process(pid);
@@ -85749,6 +86581,10 @@ impl Simulator {
                             .retain(|w| !to_kill.contains(&w.waiter_pid));
                         self.release_killed_from_join_waiters(&to_kill);
                         self.wake_await_waiters(&to_kill);
+                        if self_doomed {
+                            self.disable_target = Some(name.name.clone());
+                            self.break_flag = true;
+                        }
                         return;
                     }
                 }
@@ -85785,9 +86621,16 @@ impl Simulator {
                 // process is terminated — exact for the common `fork
                 // task_a; task_b; join` + `disable task_b` shape.)
                 if let Some(pids) = self.active_task_pids.get(&name.name).cloned() {
+                    // An ANCESTOR executing the task (the disabling process was
+                    // forked inside it) is unwound out of the call instead —
+                    // see `disable_remote_block`.
                     let to_kill: HashSet<usize> = pids
                         .into_iter()
-                        .filter(|&p| p != self.current_pid && !self.killed_pids.contains(&p))
+                        .filter(|&p| {
+                            p != self.current_pid
+                                && !self.killed_pids.contains(&p)
+                                && !self.is_fork_ancestor(p, self.current_pid)
+                        })
                         .collect();
                     if !to_kill.is_empty() {
                         for &pid in &to_kill {
@@ -85826,6 +86669,9 @@ impl Simulator {
                 // enclosing the loop it is `break`.
                 self.disable_target = Some(name.name.clone());
                 self.break_flag = true;
+                // Not yet known to be this process's own block: the process
+                // loop checks, and hands it to `disable_remote_block` if not.
+                self.disable_check_pending = true;
             }
             StatementKind::DisableFork => {
                 // LRM §9.6.2: terminate all active descendant processes of the
@@ -86153,6 +86999,19 @@ impl Simulator {
                     // name-keyed fallbacks) drops writes to registered
                     // targets.
                     let v = self.eval_expr(rvalue);
+                    let partial_sel = if matches!(pc, ProceduralContinuous::Force { .. })
+                        && matches!(
+                            lvalue.kind,
+                            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+                        ) {
+                        self.force_select_range(lvalue)
+                    } else {
+                        None
+                    };
+                    if let Some(sel) = partial_sel {
+                        self.force_partial(sel, rvalue);
+                        return;
+                    }
                     let target = self.force_target(lvalue);
                     let vpi_target = target.as_ref().map(|(_, id)| *id);
                     // A second force/assign on an already-overridden target
@@ -86162,6 +87021,7 @@ impl Simulator {
                     if let Some((ref name, id)) = target {
                         if let Some(id) = id {
                             self.unforce_cell(id);
+                            self.partial_forces.remove(&id);
                         }
                         self.forced_names.remove(name);
                     }
@@ -86202,6 +87062,17 @@ impl Simulator {
                     // mark the source signals of every comb entry driving it
                     // dirty so the next settle re-evaluates the drivers.
                     // §10.6.1 `deassign` likewise retains the last value.
+                    if matches!(pc, ProceduralContinuous::Release(_))
+                        && matches!(
+                            lvalue.kind,
+                            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+                        )
+                    {
+                        if let Some(sel) = self.force_select_range(lvalue) {
+                            self.release_partial(sel);
+                            return;
+                        }
+                    }
                     let target = self.force_target(lvalue);
                     self.release_override(target.as_ref().map(|(n, id)| (n.as_str(), *id)));
                     // §38.36.1 cbRelease / cbDeassign, reported once the
@@ -91373,6 +92244,55 @@ impl Simulator {
                 self.clocking_preponed.insert(n, v);
             }
         }
+        if !self.clocking_hist.is_empty() {
+            self.record_clocking_hist();
+        }
+    }
+
+    /// §14.4 `input #N`: at slot entry, the value of each tracked net is its
+    /// value at the end of the previous slot; record it against that slot
+    /// when it changed, and drop entries no skew can reach any more.
+    fn record_clocking_hist(&mut self) {
+        let now = self.time;
+        let prev = self.clocking_hist_slot;
+        if prev == Some(now) {
+            return;
+        }
+        self.clocking_hist_slot = Some(now);
+        let nets: Vec<String> = self.clocking_hist.keys().cloned().collect();
+        for n in nets {
+            let Some(v) = self.get_signal_value_by_name(&n) else {
+                continue;
+            };
+            let Some(h) = self.clocking_hist.get_mut(&n) else {
+                continue;
+            };
+            let Some(prev) = prev else {
+                h.init = Some(v);
+                continue;
+            };
+            let last = h.changes.back().map(|(_, v)| v).or(h.init.as_ref());
+            if last != Some(&v) {
+                h.changes.push_back((prev, v));
+            }
+            let floor = now.saturating_sub(h.span);
+            while h.changes.len() >= 2 && h.changes[1].0 < floor {
+                h.changes.pop_front();
+            }
+        }
+    }
+
+    /// §14.4: the value net `n` had at the START of time `at` — its value at
+    /// the end of the last slot before `at` (a change made at `at` itself is
+    /// not yet visible to an `input #N` sample taken then).
+    fn clocking_hist_value(&self, n: &str, at: u64) -> Option<Value> {
+        let h = self.clocking_hist.get(n)?;
+        for (t, v) in h.changes.iter().rev() {
+            if *t < at {
+                return Some(v.clone());
+            }
+        }
+        h.init.clone()
     }
 
     fn refresh_sva_preponed(&mut self) {
@@ -91902,35 +92822,47 @@ impl Simulator {
                     self.assign_value(&lval, &val);
                 }
             }
-            // Posedge: refresh input snapshots. §14.4 input skew:
-            // - #0 (default): sample from preponed (before this edge)
-            // - #1step or more: sample from current state (after NBA updates at this edge)
-            // For each signal, check per-signal skew first, then default skew.
-            let in_dskew = self.clocking_in_skew.get(&cb).copied().unwrap_or(0);
+            // Refresh the input samples. IEEE 1800-2023 §14.4 input skew:
+            // - `#1step` (also the §14.3 default): the Preponed value, before
+            //   this edge's updates;
+            // - `#0`: the Observed-region value, after this edge's NBAs;
+            // - `#N`: the value N time units before the edge (`ClockingHist`).
+            // A per-signal skew overrides the block default. The `##N` /
+            // default-clocking aliases share the named block's skews.
+            let skey: &str = if cb.starts_with("__xz_default_clocking") {
+                self.default_clocking_cb.as_deref().unwrap_or(cb.as_str())
+            } else {
+                cb.as_str()
+            };
+            let in_dskew = self
+                .clocking_in_skew
+                .get(skey)
+                .copied()
+                .unwrap_or(CB_SKEW_1STEP);
+            let vis_list: Vec<String> = self.clocking_vis.get(skey).cloned().unwrap_or_default();
             let mut snap = HashMap::default();
-            for (sig, is_input) in &sigs {
+            for (i, (sig, is_input)) in sigs.iter().enumerate() {
                 if *is_input {
-                    // Determine the skew for this signal: per-signal override or default
+                    let vis = vis_list.get(i).unwrap_or(sig);
                     let skew = self
                         .clocking_sig_in_skew
-                        .get(&cb)
-                        .and_then(|m| m.get(sig))
+                        .get(skey)
+                        .and_then(|m| m.get(vis))
                         .copied()
                         .unwrap_or(in_dskew);
-                    // §14.4: skew > 0 means sample AFTER the edge (current value, post-NBA)
-                    // skew == 0 means sample AT the edge (preponed value, pre-NBA)
-                    let v = if skew > 0 {
-                        // Use current (post-NBA) value
-                        self.get_signal_value_by_name(sig)
-                    } else {
-                        // Use preponed (pre-NBA) value, fall back to current if not available
+                    let v = if skew == CB_SKEW_1STEP {
                         self.clocking_preponed
                             .get(sig)
                             .cloned()
                             .or_else(|| self.get_signal_value_by_name(sig))
+                    } else if skew == 0 {
+                        self.get_signal_value_by_name(sig)
+                    } else {
+                        self.clocking_hist_value(sig, self.time.saturating_sub(skew))
+                            .or_else(|| self.get_signal_value_by_name(sig))
                     };
                     if let Some(v) = v {
-                        snap.insert(sig.clone(), v);
+                        snap.insert(vis.clone(), v);
                     }
                 }
             }
@@ -91938,20 +92870,9 @@ impl Simulator {
             // `@(cb.sig)` fires at THIS edge, and only on an actual change.
             let mirror: Vec<(String, Value)> = snap
                 .iter()
-                .map(|(net, v)| (net.clone(), v.clone()))
+                .map(|(vis, v)| (vis.clone(), v.clone()))
                 .collect();
-            for (net, v) in mirror {
-                // meta stores resolved nets; the mirror is keyed by the
-                // clocking-visible name, so translate back through the alias.
-                let vis = self
-                    .clocking_sig_alias
-                    .get(&cb)
-                    .and_then(|m| {
-                        m.iter()
-                            .find(|(_, n)| **n == net)
-                            .map(|(vis, _)| vis.clone())
-                    })
-                    .unwrap_or_else(|| net.clone());
+            for (vis, v) in mirror {
                 let hidden = format!("{}{}.{}", CB_SAMPLE_PREFIX, cb, vis);
                 if let Some(&id) = self.signal_name_to_id.get(hidden.as_str()) {
                     let w = self.signal_widths[id];
@@ -95639,6 +96560,105 @@ impl Simulator {
         // signal table.
         let stored = self.signal_table.get(id).cloned().unwrap_or(v);
         self.forced_signals.insert(id, stored);
+    }
+
+    /// IEEE 1800-2023 §23.3.3 / §10.3: an input port is a continuous
+    /// assignment from its actual, so the actual's time-0 value reaches the
+    /// port as an update event at time 0 — also when the actual got it from
+    /// its declaration initializer, which by itself is no event (§6.8). A
+    /// level-sensitive `always @(...)` / `always @*` in the instance that
+    /// reads such a port therefore runs once at time 0 instead of waiting for
+    /// the first later change. The instance body reads the actual itself
+    /// (the elaborator renames input ports), so the ports come from
+    /// `input_port_actuals`. An actual still all x/z (0 for 2-state) made no
+    /// change.
+    fn fire_time0_input_port_blocks(&mut self) {
+        if self.module.input_port_actuals.is_empty() || self.comb_entries.is_empty() {
+            return;
+        }
+        let top = format!("{}.", self.module.name);
+        let cands: Vec<(usize, String)> = self
+            .comb_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.defer_at_time0
+                    && matches!(
+                        e.item,
+                        CombItem::AlwaysBlock {
+                            is_always_comb: false,
+                            ..
+                        } | CombItem::CompiledAlwaysBlock {
+                            is_always_comb: false,
+                            ..
+                        }
+                    )
+            })
+            .filter_map(|(i, e)| {
+                let sc = e.cold.scope_hint.as_deref()?;
+                let sc = sc.strip_prefix(top.as_str()).unwrap_or(sc);
+                (!sc.is_empty()).then(|| (i, sc.to_string()))
+            })
+            .collect();
+        if cands.is_empty() {
+            return;
+        }
+        let scopes: HashSet<&str> = cands.iter().map(|(_, s)| s.as_str()).collect();
+        let actuals: Vec<(String, Expression)> = self
+            .module
+            .input_port_actuals
+            .iter()
+            .filter(|(inst, _)| scopes.contains(inst.as_str()))
+            .cloned()
+            .collect();
+        let mut port_ids: HashMap<String, Vec<usize>> = HashMap::default();
+        for (inst, actual) in &actuals {
+            let mut reads: HashSet<String> = HashSet::default();
+            Self::collect_expr_reads(actual, &self.module, &mut reads);
+            let ids: Vec<usize> = reads
+                .iter()
+                .filter_map(|r| self.resolve_read_name(r, &top))
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let v = self.eval_expr(actual);
+            let two_state = ids
+                .iter()
+                .all(|&id| self.signal_two_state.get(id).copied().unwrap_or(false));
+            let changed = if two_state {
+                v.is_nonzero().unwrap_or(false)
+            } else {
+                (0..v.width as usize)
+                    .any(|i| matches!(v.get_bit(i), LogicBit::Zero | LogicBit::One))
+            };
+            if changed {
+                port_ids.entry(inst.clone()).or_default().extend(ids);
+            }
+        }
+        if port_ids.is_empty() {
+            return;
+        }
+        let fire: Vec<usize> = cands
+            .iter()
+            .filter(|(i, sc)| {
+                port_ids.get(sc).is_some_and(|ids| {
+                    self.comb_entries[*i]
+                        .cold
+                        .read_signal_ids
+                        .iter()
+                        .any(|r| ids.contains(r))
+                })
+            })
+            .map(|(i, _)| *i)
+            .collect();
+        for eidx in fire {
+            let entry = self.comb_entries[eidx].clone();
+            self.eval_comb_entry_full(&entry);
+        }
+        if self.dirty_any {
+            self.settle_combinatorial();
+        }
     }
 
     /// Lift a force on cell `id` so a replacing force's own write lands.
@@ -122519,17 +123539,38 @@ impl Simulator {
             .unwrap_or(raw_sig);
         let matches_sig = |k: &str| k == sig || k.rsplit('.').next() == Some(sig);
         let snap = self.clocking_snapshots.get(&cb)?;
+        // Samples are keyed by the clocking-visible name (`clocking_vis`).
+        if let Some(v) = snap.get(raw_sig) {
+            return Some(v.clone());
+        }
+        if let Some((_, v)) = snap
+            .iter()
+            .find(|(k, _)| k.rsplit('.').next() == Some(raw_sig))
+        {
+            return Some(v.clone());
+        }
         if let Some(v) = snap.get(sig) {
             return Some(v.clone());
         }
         if let Some((_, v)) = snap.iter().find(|(k, _)| matches_sig(k)) {
             return Some(v.clone());
         }
-        // Known cb but not sampled yet (read before the first edge) — the
-        // live net value is the sensible answer.
+        // §14.13: a clockvar read before the block's first clocking event
+        // has not been sampled yet and holds its type's default (x for a
+        // 4-state net), not the live net value.
         let (_, sigs) = self.clocking_meta.get(&cb)?;
         let (net, _) = sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n))?;
-        self.get_signal_value_by_name(net)
+        match self.signal_name_to_id.get(net.as_str()).copied() {
+            Some(id) if id < self.signal_widths.len() => {
+                let w = self.signal_widths[id];
+                if self.signal_two_state.get(id).copied().unwrap_or(false) {
+                    Some(Value::zero(w))
+                } else {
+                    Some(Value::all_x(w))
+                }
+            }
+            _ => self.get_signal_value_by_name(net),
+        }
     }
 
     /// §8.13/§25.9: the virtual-interface declaration of property `prop` as
@@ -133431,6 +134472,7 @@ impl Simulator {
         let tleaf = tname.rsplit('.').next().unwrap_or(tname);
         if matches!(self.disable_target.as_deref(), Some(t) if t == tname || t == tleaf) {
             self.disable_target = None;
+            self.disable_check_pending = false;
             self.break_flag = false;
         }
         self.unwind_task_frame(cleanup);

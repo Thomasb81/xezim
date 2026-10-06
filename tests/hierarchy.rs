@@ -219,6 +219,8 @@ mod interface_task_lexical_scope;
 mod library_dir_on_demand;
 #[path = "hierarchy/lrm_package_variable_scoping.rs"]
 mod lrm_package_variable_scoping;
+#[path = "hierarchy/lrm_audit_time0_port_event.rs"]
+mod lrm_audit_time0_port_event;
 #[path = "hierarchy/modport_expression_ports.rs"]
 mod modport_expression_ports;
 #[path = "hierarchy/modport_shape_battery.rs"]
