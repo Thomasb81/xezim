@@ -393,6 +393,8 @@ struct Csp {
     fields: HashMap<usize, Vec<(String, u32, u32)>>,
     /// Declared lsb of a base variable's packed range (`[31:8]` -> 8).
     lsb: HashMap<usize, i64>,
+    /// Variables whose packed labels increase from most to least significant.
+    ascending: HashSet<usize>,
 }
 
 /// Translation scope: bound `foreach` indices and the `with` iterator.
@@ -733,6 +735,7 @@ impl Simulator {
             slice_vars: HashMap::default(),
             fields: HashMap::default(),
             lsb: HashMap::default(),
+            ascending: HashSet::default(),
         };
         let dom_of = |w: u32, s: bool, members: &Option<Vec<u64>>| -> Dom {
             match members {
@@ -841,6 +844,7 @@ impl Simulator {
             slice_vars: HashMap::default(),
             fields: HashMap::default(),
             lsb: HashMap::default(),
+            ascending: HashSet::default(),
         };
         let enum_dom = |me: &Self, tn: &str| -> Option<Dom> {
             let members = me.module.enum_members.get(tn)?;
@@ -3444,6 +3448,7 @@ impl Simulator {
         csp.slice_vars.clear();
         csp.fields.clear();
         csp.lsb.clear();
+        csp.ascending.clear();
         let scalars: Vec<(String, usize)> =
             csp.scalars.iter().map(|(n, &v)| (n.clone(), v)).collect();
         for (name, v) in &scalars {
@@ -3454,12 +3459,14 @@ impl Simulator {
                 if !fields.is_empty() {
                     csp.fields.insert(*v, fields);
                 }
-                if let Some(l) = lsb {
-                    csp.lsb.insert(*v, l);
+                if let Some((left, right)) = lsb {
+                    csp.lsb.insert(*v, right);
+                    if left < right {
+                        csp.ascending.insert(*v);
+                    }
                 }
             } else {
-                // A shape the select arithmetic does not cover (ascending or
-                // multi-dimensional packed range): no slicing.
+                // Multi-dimensional packed ranges are not split here.
                 csp.lsb.insert(*v, i64::MIN);
             }
         }
@@ -3517,15 +3524,14 @@ impl Simulator {
         csp.vars.len() - 1
     }
 
-    /// (packed-struct fields, declared lsb) of scalar `name`; the lsb is
-    /// None for a struct (fields start at 0). None for a packed range the
-    /// select arithmetic does not cover.
+    /// Packed-struct fields and declared (left, right) of scalar `name`.
+    /// Struct fields use zero-based storage; unsupported shapes return None.
     #[allow(clippy::type_complexity)]
     fn csp_scalar_shape(
         &mut self,
         csp: &Csp,
         name: &str,
-    ) -> Option<(Vec<(String, u32, u32)>, Option<i64>)> {
+    ) -> Option<(Vec<(String, u32, u32)>, Option<(i64, i64)>)> {
         let dt: Option<DataType> = if csp.scope.is_some() {
             if let Some(f) = self.module.packed_struct_fields.get(name) {
                 return Some((f.clone(), None));
@@ -3558,7 +3564,7 @@ impl Simulator {
             found
         };
         let Some(dt) = dt else {
-            return Some((Vec::new(), Some(0)));
+            return Some((Vec::new(), Some((0, 0))));
         };
         let dt = crate::compiler::elaborate::resolve_typedef_chain(&dt, &self.module.typedef_types).clone();
         if let Some(f) = crate::compiler::elaborate::packed_struct_field_layout(
@@ -3571,7 +3577,7 @@ impl Simulator {
         }
         match &dt {
             DataType::IntegerVector { dimensions, .. } => match dimensions.as_slice() {
-                [] => Some((Vec::new(), Some(0))),
+                [] => Some((Vec::new(), Some((0, 0)))),
                 [crate::ast::types::PackedDimension::Range { left, right, .. }] => {
                     let l = crate::compiler::elaborate::const_eval_i64_with_params(
                         left,
@@ -3581,11 +3587,11 @@ impl Simulator {
                         right,
                         Some(&self.module.parameters),
                     )?;
-                    (l >= r).then_some((Vec::new(), Some(r)))
+                    Some((Vec::new(), Some((l, r))))
                 }
                 _ => None,
             },
-            _ => Some((Vec::new(), Some(0))),
+            _ => Some((Vec::new(), Some((0, 0)))),
         }
     }
 
@@ -3780,7 +3786,11 @@ impl Simulator {
             let Some((lo, w)) = lo_hi(me, konst)? else {
                 return Some((v, None));
             };
-            let lo = lo - origin;
+            let lo = if whole && csp.ascending.contains(&v) {
+                origin - lo - w + 1
+            } else {
+                lo - origin
+            };
             if lo < 0 || w < 1 || lo + w > bw as i64 {
                 return None;
             }
@@ -3796,8 +3806,15 @@ impl Simulator {
                 let (l, r) = (konst(me, left), konst(me, right));
                 Some(match kind {
                     crate::ast::expr::RangeKind::Constant => match (l, r) {
-                        (Some(l), Some(r)) if l >= r => Some((r, l - r + 1)),
-                        (Some(_), Some(_)) => return None,
+                        (Some(l), Some(r)) => {
+                            let (v, _, _, whole) = me.csp_slice_base_k(csp, expr, konst)?;
+                            let ascending = whole && csp.ascending.contains(&v);
+                            if (ascending && l <= r) || (!ascending && l >= r) {
+                                Some((l.min(r), (l - r).abs() + 1))
+                            } else {
+                                return None;
+                            }
+                        }
                         _ => None,
                     },
                     crate::ast::expr::RangeKind::IndexedUp => {

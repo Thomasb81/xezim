@@ -67,6 +67,10 @@ mod compliance_tests;
 mod const_chain_fold;
 #[path = "misc/constant_expression_contexts.rs"]
 mod constant_expression_contexts;
+#[path = "misc/constraint_issue_regressions.rs"]
+mod constraint_issue_regressions;
+#[path = "misc/constraint_select_regressions.rs"]
+mod constraint_select_regressions;
 #[path = "misc/cont_assign_rhs_undeclared.rs"]
 mod cont_assign_rhs_undeclared;
 #[path = "misc/cov_assertion_basic.rs"]

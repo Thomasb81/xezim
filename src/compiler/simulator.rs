@@ -6011,9 +6011,8 @@ pub struct Simulator {
     /// `typedef_layout_member`'s unpacked-struct typedef layouts by total
     /// width; dropped when a block-local typedef is registered.
     typedef_layouts_by_width: Option<HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>>>,
-    /// Declared (left, right) of the packed range of a class property whose
-    /// range does not start at bit 0 (`logic [31:8] a`), keyed by (class,
-    /// property); None for one indexed from 0. See `class_prop_select_dim`.
+    /// Class packed ranges needing label translation, keyed by (class,
+    /// property); None for descending ranges ending at zero.
     class_prop_dim_cache: std::cell::RefCell<HashMap<(String, String), Option<(i64, i64)>>>,
     /// LRM §16.5 SVA clocked-assertion sites. Populated lazily on
     /// the first time the AssertionStatement{is_property,
@@ -67187,12 +67186,22 @@ impl Simulator {
                 // excluded here. Bit-selects are already correct in both
                 // directions; this closes the part-select WRITE gap.
                 let mut elem_ascending_dim: Option<(i64, i64)> = None;
-                if let Some((_, lo_b)) = self.class_prop_select_dim(expr) {
-                    // A class property declared `[31:8]` (see
-                    // `class_prop_select_dim`).
-                    li -= lo_b;
-                    if matches!(kind, RangeKind::Constant) {
-                        ri -= lo_b;
+                let class_dim = self.class_prop_select_dim(expr);
+                if let Some((dl, dr)) = class_dim {
+                    if dl < dr {
+                        li = match kind {
+                            RangeKind::Constant => dr - li,
+                            RangeKind::IndexedUp => dr - li - (ri - 1),
+                            RangeKind::IndexedDown => dr - li + (ri - 1),
+                        };
+                        if matches!(kind, RangeKind::Constant) {
+                            ri = dr - ri;
+                        }
+                    } else {
+                        li -= dr;
+                        if matches!(kind, RangeKind::Constant) {
+                            ri -= dr;
+                        }
                     }
                 } else if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
@@ -67682,7 +67691,8 @@ impl Simulator {
                             // property landed correctly. Resolved before the
                             // mutable borrow below.
                             let (msb, lsb) = match self.class_prop_packed_shape(handle, &fname) {
-                                Some((_, total, left, right)) if left < right && total > 0 => {
+                                Some((_, total, left, right))
+                                    if class_dim.is_none() && left < right && total > 0 => {
                                     let top = total as usize - 1;
                                     (top.saturating_sub(lsb), top.saturating_sub(msb))
                                 }
@@ -76504,9 +76514,12 @@ impl Simulator {
                     }
                 }
                 // Fall back to bit select
-                if let Some((_, lo_b)) = self.class_prop_select_dim(expr) {
+                if let Some((dl, dr)) = self.class_prop_select_dim(expr) {
                     return match self.eval_expr(index).to_index() {
-                        Some(i) if i >= lo_b => self.eval_expr(expr).bit_select((i - lo_b) as usize),
+                        Some(i) if i >= dl.min(dr) && i <= dl.max(dr) => {
+                            let physical = if dl < dr { dr - i } else { i - dr };
+                            self.eval_expr(expr).bit_select(physical as usize)
+                        }
                         _ => Value::new(1),
                     };
                 }
@@ -76726,7 +76739,9 @@ impl Simulator {
                             ri -= dr;
                         }
                     }
-                } else if let Some((dl, dr)) = self.select_base_elem_dim(expr) {
+                } else if let Some((dl, dr)) =
+                    plain_dim.or_else(|| self.select_base_elem_dim(expr))
+                {
                     // ELEMENT of an unpacked array/queue/assoc (or a packed
                     // element): `logic [31:8] q[$]; q[0][31:8]` selects the
                     // whole element (this read xxabcd — bits 23:8 plus
@@ -109325,8 +109340,8 @@ impl Simulator {
 
     /// §7.4.1/§11.5.1: the declared (left, right) range of the class
     /// property a select's base names (`a`, `this.a`, `obj.a`) when that
-    /// range is descending and does not end at bit 0 (`logic [31:8] a`):
-    /// select labels then offset by `right`. Class properties are not in the
+    /// range is ascending or does not end at bit 0 (`logic [31:8] a`):
+    /// select labels map relative to `right`. Class properties are not in the
     /// signal tables that give a module vector its declared range, so
     /// `a[31:16]` read bits 31..16 of the 24 stored ones.
     fn class_prop_select_dim(&mut self, base: &Expression) -> Option<(i64, i64)> {
@@ -109384,7 +109399,7 @@ impl Simulator {
                                     )
                                 });
                             if let (Some(l), Some(r)) = (l, r) {
-                                if l > r && r != 0 {
+                                if l < r || r != 0 {
                                     found = Some((l, r));
                                 }
                             }
