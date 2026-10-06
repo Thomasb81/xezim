@@ -4012,6 +4012,10 @@ struct ClockingTick {
     prev: u8,
 }
 
+/// A callee's rename frames held aside while its actuals are evaluated
+/// (`begin_formal_dyn` / `commit_formal_dyn`).
+type FormalDynSetup = (usize, Vec<(String, String)>, Vec<(String, String)>);
+
 #[derive(Debug, Clone, Default)]
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
@@ -4051,6 +4055,7 @@ struct ProcessContext {
     // under a distinct key. Stack of frames pushed/popped in sync with
     // `push_queue_frame`/`pop_and_restore_queue_frame`.
     local_dyn: Vec<Vec<(String, String)>>,
+    formal_dyn: Vec<Vec<(String, String)>>,
     static_local_syncs: Vec<(String, Vec<(String, String)>)>,
     /// See `Simulator::method_local_base`. This is per-PROCESS state: the
     /// base indexes into `local_stack`, which is swapped out with the rest
@@ -4289,6 +4294,12 @@ enum DpiExpKind {
     /// `string` — modeled only as an INPUT argument (`const char*`); a string
     /// RETURN is not modeled (mapped to Bad).
     StrIn,
+    /// §35.5.6 / H.8.2: an `output`/`inout` formal of an exported subroutine
+    /// arrives as a POINTER (`int*`, `long long*`, `double*`); the formal's
+    /// final value is stored through it on return.
+    I32Out,
+    I64Out,
+    RealOut,
     Bad,
 }
 
@@ -4401,8 +4412,17 @@ struct DpiOpenArrayArg {
 }
 
 impl DpiOpenArrayArg {
-    fn new(elem: DpiOaElem, values: &[Value], left: i64, right: i64) -> Self {
+    /// `shape` is each unpacked dimension's `(left, right)`, outermost
+    /// first; `values` holds the elements row-major, every dimension in
+    /// ascending index order (the order `svGetArrElemPtr*` addresses).
+    fn new(elem: DpiOaElem, values: &[Value], shape: &[(i64, i64)]) -> Self {
         let count = values.len();
+        let mut left = [0i32; 4];
+        let mut right = [0i32; 4];
+        for (k, &(l, r)) in shape.iter().take(4).enumerate() {
+            left[k] = l as i32;
+            right[k] = r as i32;
+        }
         let eb = elem.bytes();
         let data_bytes = eb * count;
         let mut buf = vec![0u64; (DPI_OA_HDR_BYTES + data_bytes).div_ceil(8)];
@@ -4410,12 +4430,12 @@ impl DpiOpenArrayArg {
         let hdr = DpiOpenArrayHeader {
             magic: DPI_OA_MAGIC,
             elem_bytes: eb as u32,
-            ndims: 1,
+            ndims: shape.len().clamp(1, 4) as i32,
             packed: packed as i32,
             packed_left: if packed { elem.width() as i32 - 1 } else { 0 },
             packed_right: 0,
-            left: [left as i32, 0, 0, 0],
-            right: [right as i32, 0, 0, 0],
+            left,
+            right,
             total_bytes: data_bytes as u32,
             elem_count: count as u32,
         };
@@ -6454,6 +6474,14 @@ pub struct Simulator {
     /// locals (bare name -> process-unique storage key). See
     /// `ProcessContext::local_dyn`.
     local_dyn: Vec<Vec<(String, String)>>,
+    /// Parallel to `local_dyn`: each call frame's queue / dynamic-array /
+    /// associative FORMALS, bare name -> storage key (a per-call copy
+    /// `@q#N`, or for `ref` the actual's own storage). The frame's
+    /// `local_dyn` table holds an identity entry `(name, name)` for each, so
+    /// it shadows an enclosing same-named local and reads as its bare name
+    /// from a nested call (§13.3); `dyn_name_lookup` maps the identity hit
+    /// in the innermost frame through this table.
+    formal_dyn: Vec<Vec<(String, String)>>,
     /// Monotonic counter backing the process-unique keys in `local_dyn`.
     next_dyn_id: u64,
     /// Built-in mailboxes (handle -> queue of values)
@@ -7293,6 +7321,11 @@ pub struct Simulator {
     /// their own); element accesses on them are rewritten onto the actual.
     /// Pushed/popped in lockstep with `ref_binding_stack`.
     ref_identity_stack: Vec<Vec<String>>,
+    /// Rename-table entries of the queue / associative formals bound so far
+    /// in the call being set up (see `bind_queue_param`). They enter the
+    /// callee's frame only once every actual is evaluated: an actual must
+    /// not resolve to a formal of the call it is being passed to.
+    pending_formal_dyn: Vec<(String, String)>,
     /// True while the top ref frame has an aliased or identity-bound formal —
     /// the only state in which `ref_formal_redirect_*` can rewrite anything.
     /// Maintained on push/pop/take/restore so the hot paths test one bool.
@@ -11948,6 +11981,7 @@ impl Simulator {
             var_container_types: HashMap::default(),
             var_typedef_types: HashMap::default(),
             local_dyn: Vec::new(),
+            formal_dyn: Vec::new(),
             next_dyn_id: 0,
             string_signals: HashSet::default(),
             queue_frame_saves: Vec::new(),
@@ -12163,6 +12197,7 @@ impl Simulator {
             ref_binding_stack: Vec::new(),
             ref_alias_stack: Vec::new(),
             ref_identity_stack: Vec::new(),
+            pending_formal_dyn: Vec::new(),
             ref_redirect_hot: false,
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
@@ -15133,6 +15168,28 @@ impl Simulator {
         }
     }
 
+    /// An exported subroutine's formal: its scalar kind, as a pointer kind
+    /// for an `output`/`inout` (§35.5.6: C passes those by reference).
+    fn dpi_export_port_kind(
+        &self,
+        dt: &crate::ast::types::DataType,
+        dir: PortDirection,
+    ) -> DpiExpKind {
+        let k = self.dpi_export_kind(dt);
+        if !matches!(
+            dir,
+            PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+        ) {
+            return k;
+        }
+        match k {
+            DpiExpKind::I32 => DpiExpKind::I32Out,
+            DpiExpKind::I64 => DpiExpKind::I64Out,
+            DpiExpKind::Real => DpiExpKind::RealOut,
+            _ => DpiExpKind::Bad,
+        }
+    }
+
     /// `(return_kind, arg_kinds)` for an exported subroutine. `void`-returning
     /// functions and tasks report `Void`. None if the name is neither a
     /// function nor a task. Any `Bad` kind means the C signature can't be
@@ -15152,14 +15209,14 @@ impl Simulator {
             let args = fd
                 .ports
                 .iter()
-                .map(|p| self.dpi_export_kind(&p.data_type))
+                .map(|p| self.dpi_export_port_kind(&p.data_type, p.direction))
                 .collect();
             Some((ret, args))
         } else if let Some(td) = self.module.tasks.get(name) {
             let args = td
                 .ports
                 .iter()
-                .map(|p| self.dpi_export_kind(&p.data_type))
+                .map(|p| self.dpi_export_port_kind(&p.data_type, p.direction))
                 .collect();
             Some((DpiExpKind::Void, args))
         } else {
@@ -15183,6 +15240,9 @@ impl Simulator {
             DpiExpKind::I64 => "long long",
             DpiExpKind::Real => "double",
             DpiExpKind::StrIn => "const char*",
+            DpiExpKind::I32Out => "int*",
+            DpiExpKind::I64Out => "long long*",
+            DpiExpKind::RealOut => "double*",
             DpiExpKind::Bad => "long long",
         };
         let mut body = String::new();
@@ -15254,6 +15314,11 @@ impl Simulator {
                             "    {{ double __t = a{}; memcpy(&__a[{}], &__t, 8); }}\n",
                             i, i
                         )),
+                        DpiExpKind::I32Out | DpiExpKind::I64Out | DpiExpKind::RealOut => pack
+                            .push_str(&format!(
+                                "    __a[{}] = (long long)(unsigned long)a{};\n",
+                                i, i
+                            )),
                         _ => pack.push_str(&format!("    __a[{}] = (long long)a{};\n", i, i)),
                     }
                 }
@@ -15331,10 +15396,62 @@ impl Simulator {
             return 0;
         };
         let raw: Vec<i64> = (0..nargs).map(|i| unsafe { *args.add(i) }).collect();
+        // §35.5.6: an `output`/`inout` formal binds to a frame local of this
+        // dispatch holding the pointee; its final value is stored back
+        // through the C pointer after the call.
+        let out_name = |i: usize| format!("__dpi_export_out{}", i);
+        let mut out_frame: HashMap<String, Value> = HashMap::default();
+        let mut outs: Vec<(usize, DpiExpKind, i64)> = Vec::new();
+        for (i, &slot) in raw.iter().enumerate() {
+            let k = arg_kinds.get(i).copied().unwrap_or(DpiExpKind::Bad);
+            if slot == 0
+                || !matches!(
+                    k,
+                    DpiExpKind::I32Out | DpiExpKind::I64Out | DpiExpKind::RealOut
+                )
+            {
+                continue;
+            }
+            let v = unsafe {
+                match k {
+                    DpiExpKind::I32Out => {
+                        let mut v = Value::from_u64(*(slot as *const i32) as u32 as u64, 32);
+                        v.is_signed = true;
+                        v
+                    }
+                    DpiExpKind::I64Out => {
+                        let mut v = Value::from_u64(*(slot as *const i64) as u64, 64);
+                        v.is_signed = true;
+                        v
+                    }
+                    _ => Value::from_f64(*(slot as *const f64)),
+                }
+            };
+            out_frame.insert(out_name(i), v);
+            outs.push((i, k, slot));
+        }
         let arg_exprs: Vec<Expression> = raw
             .iter()
             .enumerate()
             .map(|(i, &slot)| {
+                if outs.iter().any(|&(j, ..)| j == i) {
+                    return Expression::new(
+                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                            root: None,
+                            path: vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: out_name(i),
+                                    span: crate::ast::Span::dummy(),
+                                },
+                                selects: Vec::new(),
+                            }],
+                            span: crate::ast::Span::dummy(),
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        crate::ast::Span::dummy(),
+                    );
+                }
                 match arg_kinds.get(i) {
                     Some(DpiExpKind::Real) => {
                         return Expression::new(
@@ -15371,23 +15488,43 @@ impl Simulator {
                 }
             })
             .collect();
+        let has_outs = !outs.is_empty();
+        if has_outs {
+            self.push_local_frame(out_frame);
+        }
+        let mut ret = 0i64;
         if let Some(fd) = self.fn_decl_rc(&name) {
             self.dpi_export_depth += 1;
             let r = self.exec_function_call(&fd, &arg_exprs);
             self.dpi_export_depth -= 1;
-            return match ret_kind {
+            ret = match ret_kind {
                 DpiExpKind::Real => r.to_f64().to_bits() as i64,
                 DpiExpKind::Void => 0,
                 _ => r.to_i64().unwrap_or(0),
             };
-        }
-        if let Some(td) = self.task_decl_rc(&name) {
+        } else if let Some(td) = self.task_decl_rc(&name) {
             self.dpi_export_depth += 1;
             self.exec_task_call(&td, &arg_exprs);
             self.dpi_export_depth -= 1;
-            return 0;
         }
-        0
+        if has_outs {
+            let frame = self.pop_local_frame_take().unwrap_or_default();
+            for (i, k, slot) in outs {
+                let Some(v) = frame.get(&out_name(i)) else {
+                    continue;
+                };
+                unsafe {
+                    match k {
+                        DpiExpKind::I32Out => {
+                            *(slot as *mut i32) = v.to_u64().unwrap_or(0) as u32 as i32
+                        }
+                        DpiExpKind::I64Out => *(slot as *mut i64) = v.to_u64().unwrap_or(0) as i64,
+                        _ => *(slot as *mut f64) = v.to_f64(),
+                    }
+                }
+            }
+        }
+        ret
     }
 
     fn bind_all_dpi_imports(&mut self) {
@@ -15559,9 +15696,10 @@ impl Simulator {
                 DataType::Implicit { .. } if w <= 32 => DpiOaElem::I32,
                 _ => return None,
             };
-            // Only the outermost dimension may be open; a fixed inner one
-            // is outside this marshaling.
-            if dims.len() != 1 {
+            // §35.5.6.1 / H.12: a formal with several unpacked dimensions
+            // (`int a[][]`) is one handle over the whole array, row-major,
+            // with a shape per dimension — up to the header's four.
+            if dims.is_empty() || dims.len() > 4 {
                 return None;
             }
             return Some(if out_dir {
@@ -15650,6 +15788,38 @@ impl Simulator {
                     DpiArgKind::Real64In
                 }),
             },
+            // IEEE 1800-2023 §35.5.6 / H.7.7: a PACKED struct or union is
+            // passed like the packed array of its bits — `svBitVecVal*` when
+            // every member is 2-state, else `svLogicVecVal*` — for any width
+            // and direction. It mapped to no kind, the whole import was
+            // marked unsupported, and every call returned 0 without
+            // reaching the C side.
+            DataType::Struct(su) if su.packed => {
+                let w = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                if w == 0 {
+                    return None;
+                }
+                let is_2state = self.packed_aggregate_two_state(su);
+                Some(match (out_dir, is_2state) {
+                    (true, true) => DpiArgKind::VecBitOut(w),
+                    (true, false) => DpiArgKind::VecLogicOut(w),
+                    (false, true) => DpiArgKind::VecBitIn(w),
+                    (false, false) => DpiArgKind::VecLogicIn(w),
+                })
+            }
+            // §35.5.6: an enum passes as its base type (`int` by default).
+            DataType::Enum(e) => match e.base_type.as_deref() {
+                Some(bt) => self.dpi_atom_kind(bt, dims, dir),
+                None => Some(if out_dir {
+                    DpiArgKind::Int32Out
+                } else {
+                    DpiArgKind::Int32In
+                }),
+            },
             DataType::Simple { kind, .. } => match kind {
                 crate::ast::types::SimpleType::Chandle => Some(if out_dir {
                     DpiArgKind::ChandleOut
@@ -15665,6 +15835,19 @@ impl Simulator {
             },
             _ => None,
         }
+    }
+
+    /// §6.11 / §7.2.1: a packed struct or union is 2-state only when every
+    /// member (through typedefs and nested packed aggregates) is.
+    fn packed_aggregate_two_state(&self, su: &crate::ast::types::StructUnionType) -> bool {
+        su.members.iter().all(|m| {
+            let mdt =
+                super::elaborate::resolve_typedef_chain(&m.data_type, &self.module.typedef_types);
+            match mdt {
+                DataType::Struct(inner) => self.packed_aggregate_two_state(inner),
+                _ => super::elaborate::is_type_two_state_resolved(mdt, &self.module.typedef_types),
+            }
+        })
     }
 
     fn dpi_return_kind(dt: &DataType) -> Option<DpiRetKind> {
@@ -15892,12 +16075,28 @@ impl Simulator {
     /// (`left`, `right`): a fixed unpacked array (`[7:0]` gives 7, 0), a
     /// dynamic array or queue (0 .. size-1, empty when size is 0), or any
     /// other expression as a one-element array.
-    fn dpi_collect_open_array(&mut self, expr: Option<&Expression>) -> (Vec<Value>, i64, i64) {
+    fn dpi_collect_open_array(
+        &mut self,
+        expr: Option<&Expression>,
+    ) -> (Vec<Value>, Vec<(i64, i64)>) {
         let Some(e) = expr else {
-            return (Vec::new(), 0, -1);
+            return (Vec::new(), vec![(0, -1)]);
         };
         if let ExprKind::Ident(hier) = &e.kind {
             let name = self.resolve_hier_name(hier);
+            // §35.5.6.1: a multi-dimensional actual (`int a[2][3]`) — every
+            // element, row-major.
+            if let Some(shape) = self.dpi_multi_dim_shape(&name) {
+                let elem_w = self.dpi_multi_dim_elem_width(&name);
+                let out = Self::dpi_multi_dim_names(&name, &shape)
+                    .into_iter()
+                    .map(|en| {
+                        self.get_signal_value_by_name(&en)
+                            .unwrap_or_else(|| Value::zero(elem_w))
+                    })
+                    .collect();
+                return (out, shape);
+            }
             // A dynamic array or queue also has a `module.arrays` entry, but
             // its range is storage capacity: the live size bounds it.
             let live = self.dpi_open_array_live_size(&name);
@@ -15931,7 +16130,7 @@ impl Simulator {
                     } else {
                         (lo, hi)
                     };
-                return (out, left as i64, right as i64);
+                return (out, vec![(left, right)]);
             }
             if let Some(n) = live {
                 let out = (0..n)
@@ -15940,10 +16139,45 @@ impl Simulator {
                             .unwrap_or_else(|| Value::zero(32))
                     })
                     .collect();
-                return (out, 0, n as i64 - 1);
+                return (out, vec![(0, n as i64 - 1)]);
             }
         }
-        (vec![self.eval_expr(e)], 0, 0)
+        (vec![self.eval_expr(e)], vec![(0, 0)])
+    }
+
+    /// The `(lo, hi)` of each unpacked dimension of a fixed MULTI-
+    /// dimensional array (`int a[2][3]`), outermost first; `None` for a
+    /// one-dimensional array or anything else.
+    fn dpi_multi_dim_shape(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        let shape = self.foreach_dims(name)?;
+        (shape.len() > 1 && shape.len() <= 4 && shape.iter().all(|&(lo, hi)| hi >= lo))
+            .then_some(shape)
+    }
+
+    fn dpi_multi_dim_elem_width(&self, name: &str) -> u32 {
+        if let Some(&(_, _, w)) = self.module.arrays_2d.get(name) {
+            return w.max(1);
+        }
+        self.module
+            .arrays_nd
+            .get(name)
+            .map_or(32, |(_, w)| (*w).max(1))
+    }
+
+    /// Element names of a multi-dimensional array, row-major, each
+    /// dimension in ascending index order (`a[0][0]`, `a[0][1]`, ...).
+    fn dpi_multi_dim_names(name: &str, shape: &[(i64, i64)]) -> Vec<String> {
+        let mut names = vec![name.to_string()];
+        for &(lo, hi) in shape {
+            let mut next = Vec::with_capacity(names.len() * (hi - lo + 1) as usize);
+            for n in &names {
+                for i in lo..=hi {
+                    next.push(format!("{}[{}]", n, i));
+                }
+            }
+            names = next;
+        }
+        names
     }
 
     /// The element count of a dynamic array or queue actual; None for a
@@ -15961,6 +16195,18 @@ impl Simulator {
     fn dpi_writeback_open_array(&mut self, expr: &Expression, data: &[Value]) {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
+            if let Some(shape) = self.dpi_multi_dim_shape(&name) {
+                let elem_w = self.dpi_multi_dim_elem_width(&name);
+                for (en, d) in Self::dpi_multi_dim_names(&name, &shape).iter().zip(data) {
+                    let v = if d.is_real {
+                        d.clone()
+                    } else {
+                        d.resize(elem_w)
+                    };
+                    self.set_signal_value_by_name(en, v);
+                }
+                return;
+            }
             let live = self.dpi_open_array_live_size(&name);
             if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
                 let hi = live.map_or(hi, |n| lo + n as i64 - 1);
@@ -16242,8 +16488,8 @@ impl Simulator {
                     }
                 }
                 DpiArgKind::OpenArrayIn(elem) | DpiArgKind::OpenArrayOut(elem) => {
-                    let (values, left, right) = self.dpi_collect_open_array(args.get(i));
-                    let mut oa = DpiOpenArrayArg::new(*elem, &values, left, right);
+                    let (values, shape) = self.dpi_collect_open_array(args.get(i));
+                    let mut oa = DpiOpenArrayArg::new(*elem, &values, &shape);
                     let p = Box::new(oa.handle());
                     open_arrays.push(oa);
                     ptr_vals.push(p);
@@ -44377,6 +44623,13 @@ impl Simulator {
     }
 
     fn event_to_sens(&self, event: &EventControl) -> Vec<Sensitivity> {
+        // §13.5.2: inside a task, an event control on a `ref` formal waits
+        // on the ACTUAL (see `ref_event_control`).
+        if self.ref_redirect_possible() {
+            if let Some(ev) = self.ref_event_control(event) {
+                return self.event_to_sens(&ev);
+            }
+        }
         // Walk past Paren / RangeSelect / BitSelect / Concatenation wrappers
         // to find the underlying Ident(s). For E902 etc. that use
         // `always @(sig[5:0] or other)` the sensitivity expression is a
@@ -50003,6 +50256,7 @@ impl Simulator {
             queue_frame_saves: self.queue_frame_saves.clone(),
             task_cleanup: self.task_cleanup.clone(),
             local_dyn: self.local_dyn.clone(),
+            formal_dyn: self.formal_dyn.clone(),
             static_local_syncs: self.static_local_syncs.clone(),
             method_local_base: self.method_local_base.clone(),
         }
@@ -50057,6 +50311,7 @@ impl Simulator {
             && self.queue_frame_saves.is_empty()
             && self.task_cleanup.is_empty()
             && self.local_dyn.is_empty()
+            && self.formal_dyn.is_empty()
             && self.static_local_syncs.is_empty()
             && self.method_local_base.is_empty()
             && !self.ref_redirect_hot
@@ -50084,6 +50339,7 @@ impl Simulator {
             queue_frame_saves: std::mem::take(&mut self.queue_frame_saves),
             task_cleanup: std::mem::take(&mut self.task_cleanup),
             local_dyn: std::mem::take(&mut self.local_dyn),
+            formal_dyn: std::mem::take(&mut self.formal_dyn),
             static_local_syncs: std::mem::take(&mut self.static_local_syncs),
             method_local_base: std::mem::take(&mut self.method_local_base),
         }
@@ -50108,6 +50364,7 @@ impl Simulator {
         self.queue_frame_saves = ctx.queue_frame_saves;
         self.task_cleanup = ctx.task_cleanup;
         self.local_dyn = ctx.local_dyn;
+        self.formal_dyn = ctx.formal_dyn;
         self.static_local_syncs = ctx.static_local_syncs;
         self.method_local_base = ctx.method_local_base;
     }
@@ -64605,6 +64862,54 @@ impl Simulator {
         self.ref_formal_redirect_inner(e, false)
     }
 
+    /// IEEE 1800-2023 §13.5.2: a `ref` formal names the actual's storage,
+    /// so an event control on it (`@(posedge sig)`, `@(sig)`, `@(b[2])`)
+    /// waits for a change of the ACTUAL. The formal itself is a frame value
+    /// with no signal behind it: the wait resolved to nothing, fell through
+    /// to the NBA-region fallback and resumed in the same time step. Each
+    /// term naming a formal aliased to module-visible storage (or an
+    /// identity-bound aggregate) is rewritten onto the actual. `None` when
+    /// no term changes.
+    fn ref_event_control(&self, event: &EventControl) -> Option<EventControl> {
+        let redirect = |e: &Expression| -> Option<Expression> {
+            let mut inner = e;
+            while let ExprKind::Paren(x) = &inner.kind {
+                inner = x;
+            }
+            self.ref_formal_redirect_inner(inner, true)
+        };
+        match event {
+            EventControl::HierIdentifier(e) => redirect(e).map(EventControl::HierIdentifier),
+            EventControl::Identifier(id) => {
+                let e = Expression::new(
+                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![crate::ast::expr::HierPathSegment {
+                            name: id.clone(),
+                            selects: Vec::new(),
+                        }],
+                        span: id.span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    }),
+                    id.span,
+                );
+                redirect(&e).map(EventControl::HierIdentifier)
+            }
+            EventControl::EventExpr(terms) => {
+                let mut out: Option<Vec<crate::ast::stmt::EventExpr>> = None;
+                for (k, t) in terms.iter().enumerate() {
+                    if let Some(ne) = redirect(&t.expr) {
+                        let v = out.get_or_insert_with(|| terms.clone());
+                        v[k].expr = ne;
+                    }
+                }
+                out.map(EventControl::EventExpr)
+            }
+            EventControl::Star | EventControl::ParenStar => None,
+        }
+    }
+
     /// Cheap reject for the hot paths: only a call with an aliased or an
     /// identity-bound `ref` formal can redirect anything.
     #[inline(always)]
@@ -76881,6 +77186,12 @@ impl Simulator {
                         let l = self.eval_expr(left).to_i64().unwrap_or(0);
                         let r = self.eval_expr(right).to_i64().unwrap_or(0);
                         self.dollar_bound.pop();
+                        // §7.10.1: `q[a:b]` with a > b is the EMPTY queue
+                        // (`q[3:1]`, and `q[n:$]` on n elements) — not the
+                        // swapped range.
+                        if is_dyn && matches!(kind, RangeKind::Constant) && l > r {
+                            return Value::zero(0);
+                        }
                         let (lo, hi) = match kind {
                             RangeKind::Constant => (l.min(r), l.max(r)),
                             RangeKind::IndexedUp => (l, l + r - 1),
@@ -89726,6 +90037,12 @@ impl Simulator {
                                                 let mut r =
                                                     self.eval_expr(right).to_i64().unwrap_or(0);
                                                 self.dollar_bound.pop();
+                                                // §7.10.1: a queue slice `q[a:b]`
+                                                // with a > b is empty.
+                                                if is_dyn && l > r {
+                                                    result.push_str("'{}");
+                                                    continue;
+                                                }
                                                 if l > r {
                                                     std::mem::swap(&mut l, &mut r);
                                                 }
@@ -103400,6 +103717,7 @@ impl Simulator {
         self.queue_frame_saves.push(saves);
         let dyns = self.local_dyn_pool.pop().unwrap_or_default();
         self.local_dyn.push(dyns);
+        self.formal_dyn.push(Vec::new());
     }
 
     /// Look up the process-unique storage key for a local dynamic-array /
@@ -103411,20 +103729,51 @@ impl Simulator {
     fn dyn_name_lookup(&self, bare: &str) -> Option<&str> {
         // Walk frames innermost-first: a local dyn array declared in an
         // enclosing call frame is visible in nested scopes (matches how
-        // inlined blocking calls share the caller's scope). A queue/assoc
-        // FORMAL records an identity mapping (see `bind_queue_param`) so it
-        // shadows a caller's same-named renamed local.
+        // inlined blocking calls share the caller's scope). A collection
+        // FORMAL (see `bind_queue_param`) shadows a caller's same-named
+        // renamed local, and reads as its bare name from a nested call.
+        let entry = self.dyn_entry(bare)?;
+        if entry.1.len() == entry.0.len() {
+            return Some(self.dyn_identity_hit(entry));
+        }
+        Some(entry.1.as_str())
+    }
+
+    /// The innermost rename-table entry for `bare` (see `dyn_name_lookup`).
+    #[inline(always)]
+    fn dyn_entry(&self, bare: &str) -> Option<&(String, String)> {
         for frame in self.local_dyn.iter().rev() {
             // Frames hold at most a handful of entries — a reverse linear
             // scan (later declaration shadows earlier) beats hashing `bare`
             // once per frame (this probe runs for every bare-name resolve).
-            for (k, uq) in frame.iter().rev() {
-                if k == bare {
-                    return Some(uq.as_str());
+            for e in frame.iter().rev() {
+                if e.0 == bare {
+                    return Some(e);
                 }
             }
         }
         None
+    }
+
+    /// `dyn_name_lookup`'s hit on an identity entry `(name, name)`: in the
+    /// innermost frame a collection formal resolves to its storage key (see
+    /// `formal_dyn`); anywhere else the bare name stands.
+    #[inline(never)]
+    fn dyn_identity_hit<'a>(&'a self, entry: &'a (String, String)) -> &'a str {
+        let in_top = self.local_dyn.last().is_some_and(|t| {
+            t.as_ptr_range()
+                .contains(&(entry as *const (String, String)))
+        });
+        if in_top {
+            if let Some((_, target)) = self
+                .formal_dyn
+                .last()
+                .and_then(|f| f.iter().rev().find(|(n, _)| *n == entry.0))
+            {
+                return target;
+            }
+        }
+        entry.1.as_str()
     }
 
     /// class-perf row 3: split a `\u{1}`-marked LOCAL collection receiver
@@ -103451,9 +103800,12 @@ impl Simulator {
     /// member does not get stolen by an enclosing method's same-named local.
     fn dyn_name_lookup_innermost(&self, bare: &str) -> Option<&str> {
         let frame = self.local_dyn.last()?;
-        for (k, uq) in frame.iter().rev() {
-            if k == bare {
-                return Some(uq.as_str());
+        for e in frame.iter().rev() {
+            if e.0 == bare {
+                if e.1.len() == e.0.len() {
+                    return Some(self.dyn_identity_hit(e));
+                }
+                return Some(e.1.as_str());
             }
         }
         None
@@ -103735,6 +104087,25 @@ impl Simulator {
             if self.local_dyn_pool.len() < 64 && dyn_frame.capacity() <= 32 {
                 dyn_frame.clear();
                 self.local_dyn_pool.push(dyn_frame);
+            }
+        }
+        if let Some(formals) = self.formal_dyn.pop() {
+            for (_bare, key) in &formals {
+                // A `ref` formal's alias (see `bind_queue_param`) names
+                // storage an enclosing frame owns: leave it alone.
+                if key.starts_with('@')
+                    && (self
+                        .local_dyn
+                        .iter()
+                        .any(|f| f.iter().any(|(_, k)| k == key))
+                        || self
+                            .formal_dyn
+                            .iter()
+                            .any(|f| f.iter().any(|(_, k)| k == key)))
+                {
+                    continue;
+                }
+                self.cleanup_dyn_storage(key);
             }
         }
     }
@@ -114846,6 +115217,12 @@ impl Simulator {
             .var_decl_types
             .get(name)
             .map(Cow::Borrowed)
+            .or_else(|| {
+                // A collection formal's per-call key `@name#N` (see
+                // `formal_dyn_key`): the formal's own declared type.
+                let bare = name.strip_prefix('@')?.rsplit_once('#')?.0;
+                self.module.var_decl_types.get(bare).map(Cow::Borrowed)
+            })
             .or_else(|| match Self::flat_single_base(name) {
                 // `flat_path_type` of a one-segment path is its base's
                 // declared type: borrow it.
@@ -117032,26 +117409,36 @@ impl Simulator {
         }
     }
 
-    /// Bind a queue / dynamic-array subroutine parameter by value: copy the
-    /// caller's queue contents into the parameter's (global-scoped) storage and
-    /// register it as a dynamic array so the body's foreach/size/index resolve.
-    /// Returns true when it handled a queue parameter. (Pass-by-value copy;
-    /// parameter storage uses the bare parameter name, so deep recursion through
-    /// the same queue parameter is not isolated — acceptable for the generator's
-    /// non-recursive `gen_section`-style helpers.)
-    /// Bind a queue-typed argument into the call frame. Returns `Some(caller)`
-    /// on success — the caller's queue name, or an empty string for a literal
-    /// actual (nothing to write back to). `None` when `arg` is not a queue.
-    /// The caller writes the param's queue back to `caller` for a `ref`/
-    /// `output`/`inout` formal; without that, a `ref` queue's `push_back` was
-    /// lost on return (§13.5.2).
+    /// Bind a queue / dynamic-array FORMAL (`int q[$]`, `int d[]`, or a
+    /// typedef carrying those dims) into the call frame. Returns `None` when
+    /// the formal is not a queue/dynamic array, else `Some((storage, caller))`:
+    /// the key the formal's body accesses resolve to, and the caller's
+    /// collection to copy back to on return (empty when nothing is copied
+    /// back).
+    ///
+    /// IEEE 1800-2023 §13.5.1: an `input` formal is a COPY. It lives under a
+    /// per-call key (`@q#N`, mapped in the frame's rename table like an
+    /// automatic local), so writes in the body never reach the caller — not
+    /// even when the actual has the formal's own name — and recursive or
+    /// concurrent calls each own their copy. An `output` formal starts empty;
+    /// `output`/`inout` copy back on return.
+    ///
+    /// §13.5.2: a `ref` formal is an ALIAS of the actual's storage: the
+    /// formal's name maps to the actual's key, so every read and write goes
+    /// to the caller's collection while the call runs (two concurrently
+    /// forked tasks pushing into one `ref` queue both land), and nothing is
+    /// copied back.
+    ///
+    /// §7.10 / §13.5: a slice actual (`q[1:$]`, `q[a+:n]`) binds exactly the
+    /// slice's elements; `q[n:$]` past the end and `q[3:1]` bind none.
     fn bind_queue_param(
         &mut self,
         pname: &str,
         dims: &[crate::ast::types::UnpackedDimension],
         arg: &Expression,
         queue_data_type: &crate::ast::types::DataType,
-    ) -> Option<String> {
+        dir: PortDirection,
+    ) -> Option<(String, String)> {
         use crate::ast::types::{DataType, UnpackedDimension};
         self.meta_note(pname);
         if !matches!(
@@ -117062,10 +117449,7 @@ impl Simulator {
         }
         // A queue literal / assignment pattern (`{"a", "b"}` or `'{...}`) passed
         // directly as the actual: bind each top-level element as one queue
-        // entry. Without this the param falls back to a scalar bind while a
-        // stale same-named queue registration from a prior call survives, so
-        // `foreach(param[i])` iterates phantom (unset → garbage) elements.
-
+        // entry.
         let literal_elems: Option<Vec<&Expression>> = match &arg.kind {
             ExprKind::Concatenation(parts) => Some(parts.iter().collect()),
             ExprKind::AssignmentPattern(items) => Some(items.iter().map(|it| it.expr()).collect()),
@@ -117082,7 +117466,6 @@ impl Simulator {
             .var_decl_types
             .insert(pname.to_string(), queue_data_type.clone());
         let resolved_dt = Self::resolve_type_ref(queue_data_type, &self.module.typedef_types);
-        matches!(resolved_dt, DataType::Struct(_));
         if let crate::ast::types::DataType::Struct(su) = resolved_dt {
             if !su.packed {
                 // Record the element typedef name so MemberAccess reads can
@@ -117113,34 +117496,159 @@ impl Simulator {
             }
         }
         if let Some(parts) = literal_elems {
-            // Clear any stale storage/registration for this bare param name.
-            let mut stale: Vec<String> = self.signals.keys_with_elem_prefix(&format!("{}[", pname));
-            let pn_size = format!("{}.size", pname);
-            if self.signals.contains_key(&pn_size) {
-                stale.push(pn_size);
-            }
-            for k in stale {
-                self.signals.remove(&k);
-            }
-            self.module.arrays.insert(pname.to_string(), (0, -1, 32));
-            self.module.dynamic_arrays.insert(pname.to_string());
+            let key = self.formal_dyn_key(pname, queue_data_type);
+            self.module.arrays.insert(key.clone(), (0, -1, 32));
+            self.module.dynamic_arrays.insert(key.clone());
             // An element that is itself a `'{..}` pattern (a dynamic array of
             // UNPACKED structs) is scattered member-wise, not evaluated.
             for (j, part) in parts.iter().enumerate() {
                 if matches!(part.kind, ExprKind::AssignmentPattern(_)) {
-                    self.assign_pattern_or_leaf(
-                        &format!("{}[{}]", pname, j),
-                        queue_data_type,
-                        part,
-                    );
+                    self.assign_pattern_or_leaf(&format!("{}[{}]", key, j), queue_data_type, part);
                     continue;
                 }
                 let v = self.eval_expr(part);
-                self.set_signal_value_by_name(&format!("{}[{}]", pname, j), v);
+                self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
             }
-            self.set_queue_size(pname, parts.len() as u64);
-            return Some(String::new());
+            self.set_queue_size(&key, parts.len() as u64);
+            return Some((key, String::new()));
         }
+        if let Some((vals, w)) = self.collection_slice_values(arg) {
+            let key = self.formal_dyn_key(pname, queue_data_type);
+            self.module.arrays.insert(key.clone(), (0, -1, w));
+            self.module.dynamic_arrays.insert(key.clone());
+            let n = vals.len() as u64;
+            for (j, v) in vals.into_iter().enumerate() {
+                self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
+            }
+            self.set_queue_size(&key, n);
+            return Some((key, String::new()));
+        }
+        let cname = self.queue_actual_storage(arg)?;
+        if matches!(dir, PortDirection::Ref) {
+            // §13.5.2: alias — the formal resolves to the actual's storage.
+            self.map_formal_dyn(pname, &cname);
+            return Some((cname, String::new()));
+        }
+        let size = if matches!(dir, PortDirection::Output) {
+            0
+        } else {
+            self.get_queue_size(&cname)
+        };
+        let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
+        let key = self.formal_dyn_key(pname, queue_data_type);
+        // A queue of unpacked structs keeps its members as separate leaves
+        // (`q[0].addr`); those are copied element-wise below.
+        let elem_struct = (cname != key)
+            .then(|| self.queue_elem_struct(&cname))
+            .flatten();
+        let vals: Vec<Value> = if elem_struct.is_some() {
+            Vec::new()
+        } else {
+            (0..size)
+                .map(|j| {
+                    self.get_signal_value_by_name(&format!("{}[{}]", cname, j))
+                        .unwrap_or_else(|| Value::zero(w))
+                })
+                .collect()
+        };
+        self.module.arrays.insert(key.clone(), (0, -1, w));
+        self.module.dynamic_arrays.insert(key.clone());
+        if let Some(su) = &elem_struct {
+            for j in 0..size {
+                let (src, dst) = (format!("{}[{}]", cname, j), format!("{}[{}]", key, j));
+                self.copy_unpacked_struct(&dst, &src, su);
+            }
+        }
+        for (j, v) in vals.into_iter().enumerate() {
+            self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
+        }
+        self.set_queue_size(&key, size);
+        Some((key, cname))
+    }
+
+    /// The per-call storage key of a queue / dynamic-array / associative
+    /// formal (see `bind_queue_param`): an `@name#N` key like an automatic
+    /// local's, entered in the callee frame's rename table by
+    /// `commit_formal_dyn` and torn down with the frame.
+    fn formal_dyn_key(&mut self, pname: &str, dt: &crate::ast::types::DataType) -> String {
+        let id = self.next_dyn_id;
+        self.next_dyn_id += 1;
+        let mut key = String::with_capacity(pname.len() + 12);
+        key.push('@');
+        key.push_str(pname);
+        key.push('#');
+        Self::push_i64(&mut key, id as i64);
+        self.map_formal_dyn(pname, &key);
+        // The element type under the per-call key too: a queue of unpacked
+        // structs spreads its members by it, and a class-element queue
+        // constructs its `push_back(new(..))` elements by it. A plain
+        // integral / real / enum element needs no entry of its own
+        // (`p_elem_type_ref` maps the key back to the formal's), which spares
+        // a type clone on every call.
+        let plain = matches!(
+            Self::resolve_type_ref_borrowed(dt, &self.module.typedef_types),
+            DataType::IntegerAtom { .. }
+                | DataType::IntegerVector { .. }
+                | DataType::Real { .. }
+                | DataType::Enum(_)
+        );
+        if !plain {
+            self.module.var_decl_types.insert(key.clone(), dt.clone());
+        }
+        if let crate::ast::types::DataType::TypeReference { name: tn, .. } = dt {
+            if self.module.classes.contains_key(&tn.name.name) {
+                self.module
+                    .array_elem_class
+                    .insert(key.clone(), tn.name.name.clone());
+            }
+        }
+        key
+    }
+
+    /// Queue the rename-table entry `pname -> target` for the call being set
+    /// up (a by-value formal's own key, or a `ref` formal's alias of the
+    /// actual's storage); `commit_formal_dyn` enters it in the callee frame.
+    /// The entry also SHADOWS any enclosing renamed local of the same name:
+    /// without it `dyn_name_lookup` walks up and redirects the callee's
+    /// formal to the caller's storage.
+    fn map_formal_dyn(&mut self, pname: &str, target: &str) {
+        self.pending_formal_dyn
+            .push((pname.to_string(), target.to_string()));
+    }
+
+    /// Start binding a call's formals: the callee's (empty) rename frame,
+    /// just pushed by `push_queue_frame`, is held aside so every actual
+    /// resolves in the CALLER's view, and the formals' entries queue up from
+    /// the returned base (see `map_formal_dyn`).
+    fn begin_formal_dyn(&mut self) -> FormalDynSetup {
+        let names = self.local_dyn.pop().unwrap_or_default();
+        let formals = self.formal_dyn.pop().unwrap_or_default();
+        (self.pending_formal_dyn.len(), names, formals)
+    }
+
+    /// Reinstate the callee frame held by `begin_formal_dyn` with the
+    /// formals queued since `base` entered in it, once all the call's
+    /// actuals are evaluated.
+    fn commit_formal_dyn(&mut self, (base, mut names, mut formals): FormalDynSetup) {
+        for (pname, target) in self.pending_formal_dyn.drain(base..) {
+            match names.iter_mut().find(|(k, _)| *k == pname) {
+                Some(slot) => slot.1 = pname.clone(),
+                None => names.push((pname.clone(), pname.clone())),
+            }
+            match formals.iter_mut().find(|(k, _)| *k == pname) {
+                Some(slot) => slot.1 = target,
+                None => formals.push((pname, target)),
+            }
+        }
+        self.local_dyn.push(names);
+        self.formal_dyn.push(formals);
+    }
+
+    /// The storage key of a queue / dynamic-array (or fixed unpacked array)
+    /// ACTUAL: a plain name (a caller-local one under its per-process rename
+    /// `@q#7`), or a member chain `obj.q` / `a.b.q` mapped to the owning
+    /// object's `<handle>#q` storage. `None` when `arg` names no collection.
+    fn queue_actual_storage(&mut self, arg: &Expression) -> Option<String> {
         let cname = match &arg.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let mut n = self.resolve_hier_name(h);
@@ -117156,33 +117664,17 @@ impl Simulator {
                 } else if let Some(s) = self.instance_assoc_member(&n) {
                     n = std::borrow::Cow::Owned(s);
                 }
-                n
+                n.into_owned()
             }
-            // Flattened `obj.member` (parsed as Ident path [obj, member]) or
-            // explicit `ExprKind::MemberAccess`. §13.5.2: a queue/dynamic-
-            // array member of ANOTHER object passed as a `ref`/`output`/
-            // `inout` actual — e.g. callback macro `cb.doit(comp.q)` /
-            // `cb.doit(this.q)`. The member's per-instance storage lives at
-            // `<handle>#member`; resolve the base object to its heap handle,
-            // then map to that flat namespace so the element copy-in /
-            // writeback below targets the right collection. Without this the
-            // arg fell through to a scalar bind and a `push_back` inside the
-            // callee never reached the caller's member queue (the
-            // callback queue stayed empty, so callback iteration performed
-            // nothing).
-            // A member-access chain of arbitrary depth: `obj.q`, `a.b.q`,
-            // `a.b.c.q`, … (parsed as a flattened Ident path, all segments
-            // plain identifiers — no index/scope selects). The HEAD is the
-            // base object; each MIDDLE segment is a handle-valued property
-            // of the object the preceding segment resolves to; the LAST
-            // segment is the leaf member that names the queue/dynamic array.
-            // Walk the heap: head handle → member_handle per middle segment
-            // → then map the owning handle + leaf name to the per-instance
-            // `<handle>#member` storage namespace.
-            //
+            // §13.5.2: a queue/dynamic-array member of ANOTHER object passed
+            // as the actual — `cb.doit(comp.q)` / `cb.doit(this.q)`, or a
+            // member chain of any depth (`a.b.c.q`, parsed as a flattened
+            // Ident path of plain segments). The HEAD is the base object;
+            // each MIDDLE segment is a handle-valued property of the object
+            // the preceding segment resolves to; the LAST segment names the
+            // collection, stored per instance at `<handle>#member`.
             // (Scope-qualified names like `pkg::Class::queue` are a different
-            // AST shape — ClassScope, not a member chain — and resolve via
-            // static-property tables elsewhere; they don't reach this path.)
+            // AST shape and resolve via static-property tables elsewhere.)
             ExprKind::Ident(h)
                 if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
             {
@@ -117192,11 +117684,11 @@ impl Simulator {
                 for seg in h.path.iter().take(h.path.len() - 1).skip(1) {
                     handle = self.member_handle(handle, &seg.name.name)?;
                 }
-                std::borrow::Cow::Owned(self.handle_collection_name(handle, &leaf)?)
+                self.handle_collection_name(handle, &leaf)?
             }
             ExprKind::MemberAccess { expr, member } => {
                 let handle = self.eval_handle_expr(expr)?;
-                std::borrow::Cow::Owned(self.handle_collection_name(handle, &member.name)?)
+                self.handle_collection_name(handle, &member.name)?
             }
             _ => return None,
         };
@@ -117205,66 +117697,61 @@ impl Simulator {
         {
             return None;
         }
-        let size = self.get_queue_size(&cname);
-        let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
-        // A queue of unpacked structs keeps its members as separate leaves
-        // (`q[0].addr`); those are copied element-wise below.
-        let elem_struct = (*cname != *pname)
-            .then(|| self.queue_elem_struct(&cname))
-            .flatten();
-        let vals: Vec<Value> = if elem_struct.is_some() {
+        Some(cname)
+    }
+
+    /// §7.10 / §7.4.6: the elements of a SLICE of an unpacked collection
+    /// used as a value (`q[1:$]`, `q[a+:n]`, `fixed[1:3]`), with the
+    /// element width; `None` when `arg` is not such a slice (or one this
+    /// helper does not model: a descending fixed array, struct elements).
+    /// For a queue or dynamic array an empty or reversed range (`q[3:1]`,
+    /// `q[4:$]` on four elements) yields no elements, and bounds beyond
+    /// either end are clamped (§7.10.1).
+    fn collection_slice_values(&mut self, arg: &Expression) -> Option<(Vec<Value>, u32)> {
+        let ExprKind::RangeSelect {
+            expr: base,
+            kind,
+            left,
+            right,
+        } = &arg.kind
+        else {
+            return None;
+        };
+        let name = self.queue_actual_storage(base)?;
+        if self.module.descending_arrays.contains(&*name) || self.queue_elem_struct(&name).is_some()
+        {
+            return None;
+        }
+        let (lo_a, hi_a, w) = *self.module.arrays.get(&*name)?;
+        let is_dyn = self.module.dynamic_arrays.contains(&*name);
+        let upper = if is_dyn {
+            self.get_queue_size(&name) as i64 - 1
+        } else {
+            hi_a
+        };
+        self.dollar_bound.push(upper);
+        let l = self.eval_expr(left).to_i64();
+        let r = self.eval_expr(right).to_i64();
+        self.dollar_bound.pop();
+        let (l, r) = (l?, r?);
+        let (from, to) = match kind {
+            RangeKind::Constant => (l, r),
+            RangeKind::IndexedUp => (l, l + r - 1),
+            RangeKind::IndexedDown => (l - r + 1, l),
+        };
+        let lo_b = if is_dyn { 0 } else { lo_a };
+        let (from, to) = (from.max(lo_b), to.min(upper));
+        let vals = if from > to {
             Vec::new()
         } else {
-            (0..size)
-                .map(|j| {
-                    self.get_signal_value_by_name(&format!("{}[{}]", cname, j))
+            (from..=to)
+                .map(|idx| {
+                    self.get_signal_value_by_name(&format!("{}[{}]", name, idx))
                         .unwrap_or_else(|| Value::zero(w))
                 })
                 .collect()
         };
-        // §13.5.2: a queue FORMAL lives under its BARE name, so a nested
-        // call whose formal has the SAME name overwrites this frame's
-        // storage — and the outer frame then keeps appending to whatever the
-        // inner call left behind. Snapshot the caller-frame content the same
-        // way a declared local does; `pop_and_restore_queue_frame` puts it
-        // back on return. (UVM's `uvm_reg::get_full_hdl_path(ref paths[$])`
-        // calls `uvm_reg_block::get_full_hdl_path(ref paths[$])` — the inner
-        // string entry survived into the outer concat queue, so every
-        // backdoor read saw a bogus leading path and failed.)
-        // An IDENTITY binding (the actual IS the formal's bare storage —
-        // `f(paths)` into `ref paths[$]`) shares one storage by design:
-        // snapshotting it would restore the caller's pre-call content over
-        // the callee's writes on return.
-        if pname != cname {
-            self.snapshot_queue_local(pname);
-        }
-        self.module.arrays.insert(pname.to_string(), (0, -1, w));
-        self.module.dynamic_arrays.insert(pname.to_string());
-        if let Some(su) = &elem_struct {
-            for j in 0..size {
-                let (src, dst) = (format!("{}[{}]", cname, j), format!("{}[{}]", pname, j));
-                self.copy_unpacked_struct(&dst, &src, su);
-            }
-        }
-        for (j, v) in vals.into_iter().enumerate() {
-            self.set_signal_value_by_name(&format!("{}[{}]", pname, j), v);
-        }
-        self.set_queue_size(pname, size);
-        // Identity mapping so the formal SHADOWS any enclosing renamed local
-        // of the same name: without it `dyn_name_lookup` walks up and
-        // redirects the callee's formal `children` to the caller's renamed
-        // `@children#N`, so the body writes to the caller's storage while
-        // the writeback reads the (empty) bare formal and clobbers it.
-        // (`cleanup_dyn_storage` skips bare names, so this is never torn down
-        // here — the existing writeback/snapshot machinery owns the formal.)
-        if let Some(frame) = self.local_dyn.last_mut() {
-            if let Some(slot) = frame.iter_mut().find(|(k, _)| k == pname) {
-                slot.1 = pname.to_string();
-            } else {
-                frame.push((pname.to_string(), pname.to_string()));
-            }
-        }
-        Some(cname.into_owned())
+        Some((vals, w))
     }
 
     /// §13.5.2: stage a queue FORMAL's contents under a fresh temporary
@@ -123586,6 +124073,13 @@ impl Simulator {
         // Every store below is a collection some class declares under this
         // name (or types with a parameter or a dimensioned typedef).
         if !self.coll_member_possible(name) {
+            return None;
+        }
+        // §8.10 / §13.3: the running subroutine's own formal or automatic
+        // local of this name (an entry in its rename frame) shadows a
+        // same-named property — `uvm_packer::put_bits(ref bit bitstream[])`
+        // must read its formal, not the class's `static bit bitstream[]`.
+        if self.dyn_name_lookup_innermost(name).is_some() {
             return None;
         }
         // §8.9: inside a STATIC method there is no `this`; the lexical class
@@ -131267,6 +131761,16 @@ impl Simulator {
         )
     }
 
+    /// Bind an ASSOCIATIVE-array formal. Returns `(storage, caller, prior)`:
+    /// the key the body's accesses resolve to, the caller's array, and the
+    /// storage key's registration before the call. `storage == caller` marks
+    /// an alias (nothing to copy back or purge).
+    ///
+    /// IEEE 1800-2023 §13.5.1: an `input`/`output`/`inout` formal is a COPY
+    /// under a per-call key (see `formal_dyn_key`), so the body's writes stay
+    /// local even when the actual has the formal's own name; `output` starts
+    /// empty. §13.5.2: a `ref` formal ALIASES the actual's storage, so
+    /// concurrent callers' writes all land in it.
     fn bind_assoc_param(
         &mut self,
         port: &crate::ast::decl::FunctionPort,
@@ -131278,38 +131782,42 @@ impl Simulator {
         let ExprKind::Ident(hier) = &arg.kind else {
             return None;
         };
-        let caller = self.resolve_hier_name(hier);
+        let caller = self.resolve_hier_name(hier).into_owned();
         let param = port.name.name.clone();
-        let prefix = format!("{}[", caller);
-        let entries: Vec<(String, Value)> = self
-            .signals
-            .keys_with_elem_prefix(&prefix)
-            .into_iter()
-            .filter(|k| k.ends_with(']'))
-            .filter_map(|k| {
-                let v = self.signals.get(&k)?.clone();
-                let key = &k[prefix.len()..k.len() - 1];
-                Some((format!("{}[{}]", param, key), v))
-            })
-            .collect();
-        for (k, v) in entries {
-            self.signals.insert(k, v);
+        if matches!(port.direction, PortDirection::Ref) {
+            self.map_formal_dyn(&param, &caller);
+            let prior = self.module.associative_arrays.get(&caller).copied();
+            return Some((caller.clone(), caller, prior));
         }
-        let is_string_key = self.is_string_keyed_array(&caller);
-        let prior = self.module.associative_arrays.get(&param).copied();
-        self.module
-            .associative_arrays
-            .insert(param.clone(), is_string_key);
-        // Identity mapping so the formal shadows any enclosing renamed local
-        // of the same name (see `bind_queue_param`).
-        if let Some(frame) = self.local_dyn.last_mut() {
-            if let Some(slot) = frame.iter_mut().find(|(k, _)| *k == param) {
-                slot.1 = param.clone();
-            } else {
-                frame.push((param.clone(), param.clone()));
+        let key = self.formal_dyn_key(&param, &port.data_type);
+        if !matches!(port.direction, PortDirection::Output) {
+            let prefix = format!("{}[", caller);
+            let entries: Vec<(String, Value)> = self
+                .signals
+                .keys_with_elem_prefix(&prefix)
+                .into_iter()
+                .filter(|k| k.ends_with(']'))
+                .filter_map(|k| {
+                    let v = self.signals.get(&k)?.clone();
+                    let sub = &k[prefix.len()..k.len() - 1];
+                    Some((format!("{}[{}]", key, sub), v))
+                })
+                .collect();
+            for (k, v) in entries {
+                self.signals.insert(k, v);
             }
         }
-        Some((param, caller.to_string(), prior))
+        let is_string_key = self.is_string_keyed_array(&caller);
+        self.module
+            .associative_arrays
+            .insert(key.clone(), is_string_key);
+        if let Some(&w) = self.widths.get(caller.as_str()) {
+            self.widths.insert(key.clone(), w);
+        }
+        if self.string_signals.contains(caller.as_str()) {
+            self.string_signals.insert(key.clone());
+        }
+        Some((key, caller, None))
     }
 
     /// Drop a formal associative array's entries and registration. Restores
@@ -132248,6 +132756,7 @@ impl Simulator {
         // The callee frame's type overlay, pushed together with `locals`.
         let mut frame_types = self.take_pooled_types();
         self.push_queue_frame();
+        let formal_dyn = self.begin_formal_dyn();
         // `output`/`inout`/`ref` formals copy back to the caller's actual on
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
@@ -132345,11 +132854,15 @@ impl Simulator {
                     } else {
                         port.dimensions.clone()
                     };
-                if let Some(caller) =
-                    self.bind_queue_param(&port.name.name, &eff_dims, &args[i], &port.data_type)
-                {
+                if let Some((store, caller)) = self.bind_queue_param(
+                    &port.name.name,
+                    &eff_dims,
+                    &args[i],
+                    &port.data_type,
+                    port.direction,
+                ) {
                     if is_out && !caller.is_empty() {
-                        queue_writebacks.push((port.name.name.clone(), caller));
+                        queue_writebacks.push((store, caller));
                     }
                     continue;
                 }
@@ -132641,6 +133154,7 @@ impl Simulator {
             }
         }
         self.local_iface_aliases.push(iface_alias_frame);
+        self.commit_formal_dyn(formal_dyn);
         self.push_local_frame_typed(locals, frame_types);
         self.open_decl_shadow_frame();
         for port in &fd.ports {
@@ -133683,6 +134197,7 @@ impl Simulator {
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
         let mut identity_formals: Vec<String> = Vec::new(); // ref aggregates bound by identity
         self.push_queue_frame();
+        let formal_dyn = self.begin_formal_dyn();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
@@ -133769,15 +134284,19 @@ impl Simulator {
                     } else {
                         port.dimensions.clone()
                     };
-                if let Some(caller) =
-                    self.bind_queue_param(&port.name.name, &eff_dims, &args[i], &port.data_type)
-                {
+                if let Some((store, caller)) = self.bind_queue_param(
+                    &port.name.name,
+                    &eff_dims,
+                    &args[i],
+                    &port.data_type,
+                    port.direction,
+                ) {
                     if matches!(
                         port.direction,
                         PortDirection::Output | PortDirection::Inout | PortDirection::Ref
                     ) && !caller.is_empty()
                     {
-                        queue_writebacks.push((port.name.name.clone(), caller));
+                        queue_writebacks.push((store, caller));
                     }
                     continue;
                 }
@@ -133804,33 +134323,12 @@ impl Simulator {
                 .iter()
                 .any(|d| matches!(d, crate::ast::types::UnpackedDimension::Associative { .. }));
             if is_assoc && i < args.len() {
-                if let ExprKind::Ident(hier) = &args[i].kind {
-                    let caller_name = self.resolve_hier_name(hier);
-                    let param_name = port.name.name.clone();
-                    let assoc_is_out = matches!(
-                        port.direction,
-                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-                    );
-                    let prefix = format!("{}[", caller_name);
-                    let entries: Vec<(String, Value)> = self
-                        .signals
-                        .keys_with_elem_prefix(&prefix)
-                        .into_iter()
-                        .filter(|k| k.ends_with(']'))
-                        .filter_map(|k| {
-                            let v = self.signals.get(&k)?.clone();
-                            let key = &k[prefix.len()..k.len() - 1];
-                            Some((format!("{}[{}]", param_name, key), v))
-                        })
-                        .collect();
-                    for (k, v) in entries {
-                        self.signals.insert(k, v);
-                    }
-                    let is_string_key = self.is_string_keyed_array(&caller_name);
-                    self.module
-                        .associative_arrays
-                        .insert(param_name.clone(), is_string_key);
-                    assoc_params.push((param_name, caller_name.to_string(), assoc_is_out));
+                let assoc_is_out = matches!(
+                    port.direction,
+                    PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                );
+                if let Some((param_name, caller_name, _)) = self.bind_assoc_param(port, &args[i]) {
+                    assoc_params.push((param_name, caller_name, assoc_is_out));
                 }
                 continue;
             }
@@ -133947,6 +134445,7 @@ impl Simulator {
                 }
             }
         }
+        self.commit_formal_dyn(formal_dyn);
         self.push_local_frame_typed(locals, frame_types);
         // §6.21: open a static-local sync frame keyed by this task name.
         let sync_name = self.sync_frame_name(&td.name.name.name);
@@ -138917,6 +139416,7 @@ impl Simulator {
                                 queue_frame_saves: Vec::new(),
                                 task_cleanup: Vec::new(),
                                 local_dyn: Vec::new(),
+                                formal_dyn: Vec::new(),
                                 static_local_syncs: Vec::new(),
                                 method_local_base: Vec::new(),
                             },
@@ -149741,6 +150241,7 @@ impl Simulator {
                 let dyn_ret_type: Option<DataType> =
                     plan.ret.as_ref().and_then(|r| r.dyn_ret.clone());
                 self.push_queue_frame();
+                let formal_dyn = self.begin_formal_dyn();
                 // `output`/`inout`/`ref` formals copy back to the caller's
                 // actual on return (e.g. `randomize_instr(output riscv_instr
                 // instr, …)` writing the picked instruction to `instr_list[i]`).
@@ -149948,18 +150449,19 @@ impl Simulator {
                             } else {
                                 port.dimensions.clone()
                             };
-                        if let Some(caller) = self.bind_queue_param(
+                        if let Some((store, caller)) = self.bind_queue_param(
                             &port.name.name,
                             &eff_dims,
                             &args[i],
                             &port.data_type,
+                            port.direction,
                         ) {
                             let is_out = matches!(
                                 port.direction,
                                 PortDirection::Output | PortDirection::Inout | PortDirection::Ref
                             );
                             if is_out && !caller.is_empty() {
-                                queue_writebacks.push((port.name.name.clone(), caller));
+                                queue_writebacks.push((store, caller));
                             }
                             continue;
                         }
@@ -150494,6 +150996,7 @@ impl Simulator {
                         Some(prev)
                     }
                 };
+                self.commit_formal_dyn(formal_dyn);
                 self.push_local_frame_typed(locals, frame_types);
                 self.open_decl_shadow_frame();
                 // Record the `local_stack` depth BEFORE this method's own

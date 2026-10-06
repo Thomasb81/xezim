@@ -247,3 +247,36 @@ fn dpi_svdpi_annex_h_api() {
         ]
     );
 }
+
+/// IEEE 1800-2023 §35.5.6 / Annex H (LRM-audit finding): a packed struct or
+/// union formal travels as an svBitVecVal / svLogicVecVal vector in every
+/// direction — it mapped to no argument kind, so the import was marked
+/// unsupported and each call returned 0 without reaching C. Also an enum
+/// formal (its base type), 2-D and 3-D open arrays in and out (§35.5.6.1),
+/// and the output / inout formals of exported functions and tasks, which C
+/// passes by pointer and which were never written back (§35.5.6, H.8.2).
+/// Expected values come from the reference simulator.
+#[test]
+fn dpi_packed_aggregates_multidim_arrays_and_export_outputs() {
+    let so = compile("tests/dpi/packed_aggregate_dpi.c");
+    assert_eq!(
+        tagged(&so, "tests/dpi/packed_aggregate_dpi_test.sv"),
+        [
+            "T|ps out=02030405 in=01020304",
+            "T|ps inout=11121314",
+            "T|ps output=a1b2c3d4",
+            "T|pl in=182032",
+            "T|pl output=0101xzxz",
+            "T|pw output=deadbfef123457",
+            "T|pu in=77",
+            "T|pu output=0000cafe",
+            "T|enum in=9",
+            "T|2d 272 152 57",
+            "T|3d 16362",
+            "T|2d output='{'{1, 2}, '{11, 12}}",
+            "T|export output=17",
+            "T|export outputs=105291",
+            "T|export task output=33",
+        ]
+    );
+}
