@@ -6011,6 +6011,9 @@ pub struct Simulator {
     /// `typedef_layout_member`'s unpacked-struct typedef layouts by total
     /// width; dropped when a block-local typedef is registered.
     typedef_layouts_by_width: Option<HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>>>,
+    /// Class packed ranges needing label translation, keyed by (class,
+    /// property); None for descending ranges ending at zero.
+    class_prop_dim_cache: std::cell::RefCell<HashMap<(String, String), Option<(i64, i64)>>>,
     /// LRM §16.5 SVA clocked-assertion sites. Populated lazily on
     /// the first time the AssertionStatement{is_property,
     /// expr:SvaClocked} executes. Each site's `prev_clock` lets us
@@ -11658,6 +11661,7 @@ impl Simulator {
             pending_observed: Vec::new(),
             deferred_asserts: Vec::new(),
             typedef_layouts_by_width: None,
+            class_prop_dim_cache: std::cell::RefCell::new(HashMap::default()),
             sva_sites: Vec::new(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
@@ -16753,6 +16757,7 @@ impl Simulator {
                 ));
             }
         }
+        self.register_struct_member_collections();
         for (name, is_assoc, width, is_str) in static_cols {
             if is_assoc {
                 self.module
@@ -67181,7 +67186,24 @@ impl Simulator {
                 // excluded here. Bit-selects are already correct in both
                 // directions; this closes the part-select WRITE gap.
                 let mut elem_ascending_dim: Option<(i64, i64)> = None;
-                if let ExprKind::Ident(h) = &expr.kind {
+                let class_dim = self.class_prop_select_dim(expr);
+                if let Some((dl, dr)) = class_dim {
+                    if dl < dr {
+                        li = match kind {
+                            RangeKind::Constant => dr - li,
+                            RangeKind::IndexedUp => dr - li - (ri - 1),
+                            RangeKind::IndexedDown => dr - li + (ri - 1),
+                        };
+                        if matches!(kind, RangeKind::Constant) {
+                            ri = dr - ri;
+                        }
+                    } else {
+                        li -= dr;
+                        if matches!(kind, RangeKind::Constant) {
+                            ri -= dr;
+                        }
+                    }
+                } else if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
                     let is_multi_d = self
                         .module
@@ -67669,7 +67691,8 @@ impl Simulator {
                             // property landed correctly. Resolved before the
                             // mutable borrow below.
                             let (msb, lsb) = match self.class_prop_packed_shape(handle, &fname) {
-                                Some((_, total, left, right)) if left < right && total > 0 => {
+                                Some((_, total, left, right))
+                                    if class_dim.is_none() && left < right && total > 0 => {
                                     let top = total as usize - 1;
                                     (top.saturating_sub(lsb), top.saturating_sub(msb))
                                 }
@@ -69160,6 +69183,94 @@ impl Simulator {
 
     /// Leaf identifier name of an expression, if it is a plain (possibly
     /// scoped/dotted) identifier.
+    /// `std::randomize(targets) with {items}` through the joint solver
+    /// (`rand_csp_solve_scope`): plain integral scalars and 1-D arrays (at
+    /// their current size) are its variables. NotApplicable when a target
+    /// is anything else.
+    fn std_randomize_joint(
+        &mut self,
+        items: &[crate::ast::decl::ConstraintItem],
+        targets: &[(String, Expression)],
+    ) -> rand_csp::CspOutcome {
+        let mut scalars = Vec::new();
+        let mut arrays = Vec::new();
+        for (name, lv) in targets {
+            let enum_vals = |me: &Self, n: &str| {
+                me.declared_enum_members(n)
+                    .filter(|m| !m.is_empty())
+                    .map(|m| m.iter().map(|x| x.1).collect::<Vec<u64>>())
+            };
+            if let Some(nm) = self.array_operand_name(lv) {
+                if self.module.arrays_nd.contains_key(&nm) || self.module.arrays_2d.contains_key(&nm) {
+                    return rand_csp::CspOutcome::NotApplicable;
+                }
+                let dynamic = self.module.dynamic_arrays.contains(&nm)
+                    || self.signals.contains_key(&Self::name_with_suffix(&nm, ".size"));
+                let idx: Vec<i64> = if dynamic {
+                    (0..self.get_queue_size(&nm) as i64).collect()
+                } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&nm) {
+                    (lo.min(hi)..=lo.max(hi)).collect()
+                } else {
+                    return rand_csp::CspOutcome::NotApplicable;
+                };
+                let Some(first) = idx.first() else {
+                    // An empty array has no element variables.
+                    continue;
+                };
+                let Some(v0) = self.get_signal_value_by_name(&format!("{}[{}]", nm, first)) else {
+                    return rand_csp::CspOutcome::NotApplicable;
+                };
+                if v0.is_real {
+                    return rand_csp::CspOutcome::NotApplicable;
+                }
+                let w = self.module.arrays.get(&nm).map(|t| t.2 as u32).unwrap_or(v0.width);
+                if w > 64 {
+                    // Left as drawn: a constraint reading it is judged by the
+                    // final check.
+                    continue;
+                }
+                let signed = v0.is_signed || self.signed_signals.contains(&nm);
+                let ev = enum_vals(self, &nm);
+                arrays.push((nm, idx, w.max(1), signed, ev));
+                continue;
+            }
+            if let Some((root, _)) = name.split_once('.') {
+                // A field of a packed struct that is itself a target: a view
+                // of that variable, not a variable of its own.
+                if targets.iter().any(|(n, _)| n == root) {
+                    continue;
+                }
+                return rand_csp::CspOutcome::NotApplicable;
+            }
+            if !matches!(lv.kind, ExprKind::Ident(_)) {
+                return rand_csp::CspOutcome::NotApplicable;
+            }
+            let cur = self.eval_expr(lv);
+            if cur.is_real {
+                return rand_csp::CspOutcome::NotApplicable;
+            }
+            if cur.width > 64 {
+                continue;
+            }
+            let ev = enum_vals(self, name);
+            scalars.push((name.clone(), lv.clone(), cur.width.max(1), cur.is_signed, ev));
+        }
+        self.rand_csp_solve_scope(items, &scalars, &arrays)
+    }
+
+    /// The root variable a `std::randomize` target names: `v`, `s.f`,
+    /// `a[i]` all name `v`/`s`/`a`.
+    fn randomize_target_root(e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.first().map(|s| s.name.name.clone()),
+            ExprKind::Paren(x)
+            | ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::Index { expr: x, .. }
+            | ExprKind::RangeSelect { expr: x, .. } => Self::randomize_target_root(x),
+            _ => None,
+        }
+    }
+
     fn expr_leaf_name(e: &Expression) -> Option<String> {
         match &e.kind {
             ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
@@ -76403,6 +76514,15 @@ impl Simulator {
                     }
                 }
                 // Fall back to bit select
+                if let Some((dl, dr)) = self.class_prop_select_dim(expr) {
+                    return match self.eval_expr(index).to_index() {
+                        Some(i) if i >= dl.min(dr) && i <= dl.max(dr) => {
+                            let physical = if dl < dr { dr - i } else { i - dr };
+                            self.eval_expr(expr).bit_select(physical as usize)
+                        }
+                        _ => Value::new(1),
+                    };
+                }
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
                     if let Some(dims) = self.module.packed_full_dims.get(&*nm) {
@@ -76609,7 +76729,8 @@ impl Simulator {
                             .copied()
                     }
                     _ => None,
-                };
+                }
+                .or_else(|| self.class_prop_select_dim(expr));
                 if let Some((dl, dr)) = plain_dim.filter(|&(l, r)| l >= r) {
                     let _ = dl;
                     if dr != 0 {
@@ -76618,7 +76739,9 @@ impl Simulator {
                             ri -= dr;
                         }
                     }
-                } else if let Some((dl, dr)) = self.select_base_elem_dim(expr) {
+                } else if let Some((dl, dr)) =
+                    plain_dim.or_else(|| self.select_base_elem_dim(expr))
+                {
                     // ELEMENT of an unpacked array/queue/assoc (or a packed
                     // element): `logic [31:8] q[$]; q[0][31:8]` selects the
                     // whole element (this read xxabcd — bits 23:8 plus
@@ -103039,6 +103162,14 @@ impl Simulator {
                                     targets.push((n, a.clone()));
                                 }
                             }
+                            // Guards decided by state variables alone pick
+                            // their branch now (see `fold_state_guards`).
+                            let rand_roots: HashSet<String> = args
+                                .iter()
+                                .filter_map(Self::randomize_target_root)
+                                .collect();
+                            let folded = self.fold_state_guards(constraints, &rand_roots);
+                            let constraints: &[crate::ast::decl::ConstraintItem] = &folded;
                             let mut satisfied = false;
                             for attempt in 0..10 {
                                 if attempt > 0 {
@@ -103046,6 +103177,11 @@ impl Simulator {
                                     // constraint violated — reseed and retry.
                                     self.exec_std_randomize(args);
                                 }
+                                // §18.4: a dynamic-array target whose size is
+                                // only bounded (`a.size() >= n`, `inside`) gets
+                                // a size inside the bounds; an `==` is left to
+                                // the item itself.
+                                self.size_bounded_dyn_targets(constraints, &targets);
                                 // §18.5.12 (issue #4): COUPLED affine constraints
                                 // (`A + B < 1000`, `A < B`, `A + B == 50`) tie two
                                 // targets together, so per-target narrowing below
@@ -103185,6 +103321,18 @@ impl Simulator {
                                 // ascending cross-element chain that exhausts
                                 // its headroom); a fresh seed usually escapes.
                                 if self.inline_constraints_satisfied(constraints) {
+                                    satisfied = true;
+                                    break;
+                                }
+                                // The per-variable repair above cannot satisfy
+                                // constraints that tie several variables
+                                // together (`sum()`, chains, guarded
+                                // relations): solve them jointly, with the
+                                // array sizes this pass chose.
+                                if matches!(
+                                    self.std_randomize_joint(constraints, &targets),
+                                    rand_csp::CspOutcome::Sat
+                                ) {
                                     satisfied = true;
                                     break;
                                 }
@@ -104050,13 +104198,13 @@ impl Simulator {
                         // §18.5.7.1: bind the index variable so body
                         // expressions (`arr[i]`, `i + 5`) see the concrete
                         // index value.
-                        let mut frame: HashMap<String, Value> = HashMap::default();
-                        if let Some(iv) = &idx_var {
-                            frame.insert(iv.clone(), Self::signed_loop_val(i));
-                        }
-                        self.push_local_frame(frame);
+                        let binds: Vec<(String, Value)> = idx_var
+                            .iter()
+                            .map(|iv| (iv.clone(), Self::signed_loop_val(i)))
+                            .collect();
+                        let saved = self.bind_loop_vars(binds);
                         self.solve_inline_foreach_elem(item, &arr_name, i, elem_w);
-                        self.pop_local_frame();
+                        self.unbind_loop_vars(saved);
                     }
                 } else if let Some(w) = Self::plain_ident_name(base)
                     .and_then(|n| self.lookup_signal_width(&n))
@@ -104074,13 +104222,13 @@ impl Simulator {
                         .first()
                         .and_then(|v| v.as_ref().map(|id| id.name.clone()));
                     for i in 0..w as i64 {
-                        let mut frame: HashMap<String, Value> = HashMap::default();
-                        if let Some(iv) = &idx_var {
-                            frame.insert(iv.clone(), Self::signed_loop_val(i));
-                        }
-                        self.push_local_frame(frame);
+                        let binds: Vec<(String, Value)> = idx_var
+                            .iter()
+                            .map(|iv| (iv.clone(), Self::signed_loop_val(i)))
+                            .collect();
+                        let saved = self.bind_loop_vars(binds);
                         self.apply_inline_constraint(item, targets);
-                        self.pop_local_frame();
+                        self.unbind_loop_vars(saved);
                     }
                 }
             }
@@ -104116,6 +104264,271 @@ impl Simulator {
             Some(nm.to_string())
         } else {
             None
+        }
+    }
+
+    /// Bind `foreach` index variables for a `std::randomize` constraint walk.
+    /// They go into the CURRENT local frame (a fresh frame would hide the
+    /// caller's automatic locals — lookups see only the top frame — so a
+    /// `foreach (mask[i]) if (mask[i]) …` over a task-local `mask` read x,
+    /// and writes to a task-local target were lost when the frame popped).
+    /// Returns what to restore; outside any frame one is pushed.
+    fn bind_loop_vars(&mut self, binds: Vec<(String, Value)>) -> Option<Vec<(String, Option<Value>)>> {
+        let Some(top) = self.local_stack.last_mut() else {
+            self.push_local_frame(binds.into_iter().collect());
+            return None;
+        };
+        Some(
+            binds
+                .into_iter()
+                .map(|(k, v)| {
+                    let old = top.insert(k.clone(), v);
+                    (k, old)
+                })
+                .collect(),
+        )
+    }
+
+    fn unbind_loop_vars(&mut self, saved: Option<Vec<(String, Option<Value>)>>) {
+        let Some(saved) = saved else {
+            self.pop_local_frame();
+            return;
+        };
+        if let Some(top) = self.local_stack.last_mut() {
+            for (k, old) in saved.into_iter().rev() {
+                match old {
+                    Some(v) => {
+                        top.insert(k, v);
+                    }
+                    None => {
+                        top.remove(&k);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `std::randomize` sizing for dynamic-array targets constrained only by
+    /// bounds on `size()`: collect `size() REL e` / `e REL size()` (with `e`
+    /// reading no target) and `size() inside {…}` over the top-level items,
+    /// and draw a size inside them. An array with an `==` on its size, or no
+    /// bound at all, is left alone.
+    fn size_bounded_dyn_targets(
+        &mut self,
+        constraints: &[crate::ast::decl::ConstraintItem],
+        targets: &[(String, Expression)],
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        use rand::Rng;
+        let roots: HashSet<String> = targets
+            .iter()
+            .filter_map(|(_, lv)| Self::randomize_target_root(lv))
+            .collect();
+        let mut flat: Vec<&CI> = Vec::new();
+        let mut stack: Vec<&CI> = constraints.iter().collect();
+        while let Some(it) = stack.pop() {
+            match it {
+                CI::Block(xs) => stack.extend(xs.iter()),
+                other => flat.push(other),
+            }
+        }
+        // array -> (lo, hi, pinned by ==)
+        let mut bounds: HashMap<String, (i64, i64, bool)> = HashMap::default();
+        for it in flat {
+            match it {
+                CI::Expr(e) => {
+                    let ExprKind::Binary { op, left, right } = &e.kind else {
+                        continue;
+                    };
+                    let (arr, other, flip) = if let Some(a) = self.size_call_on_target(left, targets) {
+                        (a, right, false)
+                    } else if let Some(a) = self.size_call_on_target(right, targets) {
+                        (a, left, true)
+                    } else {
+                        continue;
+                    };
+                    let b = bounds.entry(arr).or_insert((0, i32::MAX as i64, false));
+                    if *op == BinaryOp::Eq {
+                        b.2 = true;
+                        continue;
+                    }
+                    let mut reads = false;
+                    Self::walk_operands(other, &mut |x| {
+                        if let ExprKind::Ident(h) = &x.kind {
+                            if h.path.first().is_some_and(|f| roots.contains(&f.name.name)) {
+                                reads = true;
+                            }
+                        }
+                    });
+                    if reads {
+                        b.2 = true;
+                        continue;
+                    }
+                    let Some(k) = self.eval_expr(other).to_i64() else {
+                        continue;
+                    };
+                    // Read as `size OP k`.
+                    let op = if flip {
+                        match op {
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::Leq => BinaryOp::Geq,
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::Geq => BinaryOp::Leq,
+                            o => *o,
+                        }
+                    } else {
+                        *op
+                    };
+                    match op {
+                        BinaryOp::Gt => b.0 = b.0.max(k.saturating_add(1)),
+                        BinaryOp::Geq => b.0 = b.0.max(k),
+                        BinaryOp::Lt => b.1 = b.1.min(k.saturating_sub(1)),
+                        BinaryOp::Leq => b.1 = b.1.min(k),
+                        _ => {}
+                    }
+                }
+                CI::Inside { expr, range, .. } => {
+                    if let Some(arr) = self.size_call_on_target(expr, targets) {
+                        // A set membership pins the choice to the set.
+                        let b = bounds.entry(arr).or_insert((0, i32::MAX as i64, false));
+                        if range.len() == 1 {
+                            if let crate::ast::decl::ConstraintRange::Range { lo, hi } = &range[0] {
+                                if let (Some(l), Some(h)) =
+                                    (self.eval_expr(lo).to_i64(), self.eval_expr(hi).to_i64())
+                                {
+                                    b.0 = b.0.max(l);
+                                    b.1 = b.1.min(h);
+                                    continue;
+                                }
+                            }
+                        }
+                        b.2 = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (arr, (lo, hi, pinned)) in bounds {
+            if pinned || lo > hi || (lo == 0 && hi == i32::MAX as i64) {
+                continue;
+            }
+            // An open upper bound stays near the lower one: an unbounded
+            // draw would build an enormous array.
+            let hi = hi.min(lo.saturating_add(1024));
+            let n = self.cur_rng().gen_range(lo.max(0)..=hi.max(lo.max(0)));
+            self.resize_random_dyn_target(&arr, n as u64);
+        }
+    }
+
+    /// §7.2.1/§7.4.5: a struct member that is a dynamic collection is its
+    /// own collection object. Elaboration registers it for a plain struct
+    /// variable with a one-dimension member (`s.q` for `int q[$]`), but an
+    /// element of an ARRAY of structs (`sa[1].q`) was left out of
+    /// `dynamic_arrays` — `push_back` was dropped and `size()` read the
+    /// storage placeholder — and a member that is an ARRAY of queues
+    /// (`rg_t q[7:0][$]`) was registered as a 2-D array of scalars. Register
+    /// both the way a standalone `int q[$]` / `int aq[7:0][$]` is.
+    fn register_struct_member_collections(&mut self) {
+        use crate::ast::types::UnpackedDimension as UD;
+        let roots: Vec<(String, DataType)> = self
+            .module
+            .var_decl_types
+            .iter()
+            .filter(|(k, _)| !k.contains(['.', '[', ':']))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let params = self.module.parameters.clone();
+        let fixed = |d: &UD| -> Option<(i64, i64)> {
+            match d {
+                UD::Range { left, right, .. } => {
+                    let l = super::elaborate::const_eval_i64_with_params(left, Some(&params))?;
+                    let r = super::elaborate::const_eval_i64_with_params(right, Some(&params))?;
+                    Some((l.min(r), l.max(r)))
+                }
+                UD::Expression { expr, .. } => {
+                    let n = super::elaborate::const_eval_i64_with_params(expr, Some(&params))?;
+                    (n > 0).then_some((0, n - 1))
+                }
+                _ => None,
+            }
+        };
+        let mut new_dyn: Vec<(String, u32, bool)> = Vec::new();
+        let mut new_outer: Vec<(String, (i64, i64), u32)> = Vec::new();
+        for (root, dt) in roots {
+            let resolved =
+                super::elaborate::resolve_typedef_chain(&dt, &self.module.typedef_types).clone();
+            let DataType::Struct(su) = resolved else {
+                continue;
+            };
+            if su.packed {
+                continue;
+            }
+            // The struct variables: the root itself, or each element of a
+            // 1-D array of structs.
+            let elem_array = self
+                .module
+                .arrays
+                .get(&root)
+                .copied()
+                .filter(|_| !self.module.dynamic_arrays.contains(&root));
+            let prefixes: Vec<String> = match elem_array {
+                Some((lo, hi, _)) => (lo.min(hi)..=lo.max(hi))
+                    .map(|i| format!("{}[{}]", root, i))
+                    .collect(),
+                None => vec![root.clone()],
+            };
+            for m in &su.members {
+                let mw = super::elaborate::resolve_type_width(
+                    &m.data_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+                .max(1);
+                for d in &m.declarators {
+                    let dyn_kind = |x: &UD| match x {
+                        UD::Queue { .. } => Some(true),
+                        UD::Unsized(_) => Some(false),
+                        _ => None,
+                    };
+                    match d.dimensions.as_slice() {
+                        [one] if elem_array.is_some() => {
+                            if let Some(is_q) = dyn_kind(one) {
+                                for p in &prefixes {
+                                    new_dyn.push((format!("{}.{}", p, d.name.name), mw, is_q));
+                                }
+                            }
+                        }
+                        [outer, last] => {
+                            let (Some(range), Some(is_q)) = (fixed(outer), dyn_kind(last)) else {
+                                continue;
+                            };
+                            for p in &prefixes {
+                                let base = format!("{}.{}", p, d.name.name);
+                                for i in range.0..=range.1 {
+                                    new_dyn.push((format!("{}[{}]", base, i), mw, is_q));
+                                }
+                                new_outer.push((base, range, mw));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for (base, (lo, hi), w) in new_outer {
+            self.module.arrays_2d.remove(&base);
+            self.module.arrays.insert(base, (lo, hi, w));
+        }
+        for (name, w, is_q) in new_dyn {
+            if self.module.dynamic_arrays.contains(&name) {
+                continue;
+            }
+            self.module.dynamic_arrays.insert(name.clone());
+            if is_q {
+                self.module.queue_vars.insert(name.clone());
+            }
+            self.module.arrays.insert(name.clone(), (0, 63, w));
+            self.set_queue_size(&name, 0);
         }
     }
 
@@ -104534,13 +104947,13 @@ impl Simulator {
             return;
         }
         loop {
-            let mut frame: HashMap<String, Value> = HashMap::default();
+            let mut binds: Vec<(String, Value)> = Vec::new();
             for (k, n) in names.iter().enumerate() {
                 if let Some(n) = n {
-                    frame.insert(n.clone(), Self::signed_loop_val(idx[k]));
+                    binds.push((n.clone(), Self::signed_loop_val(idx[k])));
                 }
             }
-            self.push_local_frame(frame);
+            let saved = self.bind_loop_vars(binds);
             let cur = self.eval_expr(&elem);
             let w = cur.width.max(1);
             let (mut lo, mut hi): (i64, i64) =
@@ -104634,7 +105047,7 @@ impl Simulator {
                     self.assign_value(&t, &v);
                 }
             }
-            self.pop_local_frame();
+            self.unbind_loop_vars(saved);
             let mut k = idx.len();
             loop {
                 if k == 0 {
@@ -104990,7 +105403,10 @@ impl Simulator {
                 item: body,
                 ..
             } => {
-                if Self::constraint_unmodeled(body) {
+                // §18.12: the scope's collections are already sized, so a
+                // `size()`/`sum()`/`min()`… term is an ordinary value here —
+                // only `solve…before` carries no condition.
+                if matches!(**body, CI::Solve { .. }) {
                     return true;
                 }
                 let base = match &array.kind {
@@ -105020,15 +105436,15 @@ impl Simulator {
                     return true;
                 }
                 loop {
-                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    let mut binds: Vec<(String, Value)> = Vec::new();
                     for (k, iv) in idx_vars.iter().enumerate() {
                         if let (Some(iv), Some(&i)) = (iv, idx.get(k)) {
-                            frame.insert(iv.clone(), Self::signed_loop_val(i));
+                            binds.push((iv.clone(), Self::signed_loop_val(i)));
                         }
                     }
-                    self.push_local_frame(frame);
+                    let saved = self.bind_loop_vars(binds);
                     let ok = self.check_constraint_item_impl(body);
-                    self.pop_local_frame();
+                    self.unbind_loop_vars(saved);
                     if !ok {
                         return false;
                     }
@@ -105056,12 +105472,8 @@ impl Simulator {
                 }
                 true
             }
-            _ => {
-                if Self::constraint_unmodeled(item) {
-                    return true;
-                }
-                self.check_constraint_item_impl(item)
-            }
+            CI::Solve { .. } => true,
+            _ => self.check_constraint_item_impl(item),
         }
     }
 
@@ -108924,6 +109336,84 @@ impl Simulator {
             return None;
         }
         Some((handle, nm.clone()))
+    }
+
+    /// §7.4.1/§11.5.1: the declared (left, right) range of the class
+    /// property a select's base names (`a`, `this.a`, `obj.a`) when that
+    /// range is ascending or does not end at bit 0 (`logic [31:8] a`):
+    /// select labels map relative to `right`. Class properties are not in the
+    /// signal tables that give a module vector its declared range, so
+    /// `a[31:16]` read bits 31..16 of the 24 stored ones.
+    fn class_prop_select_dim(&mut self, base: &Expression) -> Option<(i64, i64)> {
+        if self.no_class_objects() {
+            return None;
+        }
+        let (h, prop) = match self.class_prop_receiver(base) {
+            Some(r) => r,
+            // Inside a solve the receiver local of `obj.randomize() with
+            // { obj.p[…] … }` is out of scope; it names the object being
+            // randomized (`this`).
+            None => {
+                let (recv, prop) = Self::split_trailing_member(base)?;
+                let rn = Self::plain_ident_name(&recv)?;
+                if self.rand_receiver.as_deref() != Some(rn.as_str()) {
+                    return None;
+                }
+                (self.this_stack.last().copied().flatten()?, prop)
+            }
+        };
+        let class = self.heap.get(h)?.as_ref()?.class_name.clone();
+        let key = (class, prop);
+        if let Some(hit) = self.class_prop_dim_cache.borrow().get(&key) {
+            return *hit;
+        }
+        let mut found: Option<(i64, i64)> = None;
+        let mut cur = Some(key.0.clone());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else { break };
+            if cd.properties.contains_key(&key.1) {
+                if let Some(dt) = self.class_prop_decl_type(cd, &key.1) {
+                    let dt = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+                    if let DataType::IntegerVector { dimensions, .. } = dt {
+                        if let [crate::ast::types::PackedDimension::Range { left, right, .. }] =
+                            dimensions.as_slice()
+                        {
+                            let params = self.instance_param_scope(h);
+                            let l = super::elaborate::const_eval_i64_with_params(left, Some(&params))
+                                .or_else(|| {
+                                    super::elaborate::const_eval_i64_with_params(
+                                        left,
+                                        Some(&self.module.parameters),
+                                    )
+                                });
+                            let r = super::elaborate::const_eval_i64_with_params(right, Some(&params))
+                                .or_else(|| {
+                                    super::elaborate::const_eval_i64_with_params(
+                                        right,
+                                        Some(&self.module.parameters),
+                                    )
+                                });
+                            if let (Some(l), Some(r)) = (l, r) {
+                                if l < r || r != 0 {
+                                    found = Some((l, r));
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        // A type parameter can bind differently per specialization: cache
+        // only a class-chain answer that does not depend on one.
+        self.class_prop_dim_cache.borrow_mut().insert(key, found);
+        found
     }
 
     /// The declared struct/union type of class property `prop` on `handle`.
