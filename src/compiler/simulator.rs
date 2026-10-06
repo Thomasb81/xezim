@@ -64865,6 +64865,9 @@ impl Simulator {
         if merged != self.signal_table[id] {
             self.assign_value(base, &merged);
         }
+        // A gate driving the net must see the override (see the whole-net
+        // force path).
+        self.ctl_note_deposit(base);
         let stored = self.signal_table[id].clone();
         self.forced_signals.insert(id, stored);
     }
@@ -94665,6 +94668,10 @@ impl Simulator {
         if (base_v ^ new_v) & mask == 0 && (base_x ^ new_x) & mask == 0 {
             return false;
         }
+        // §10.6.2: a forced net keeps its forced value against its gate driver.
+        if !self.forced_signals.is_empty() && self.forced_signals.contains_key(&id) {
+            return false;
+        }
         if sdf_any && self.sdf_delays.get(id).copied().unwrap_or(0) > 0 && self.time > 0 {
             let mut value = self.signal_table[id].clone();
             value.set_inline_bits(new_v, new_x);
@@ -94895,6 +94902,15 @@ impl Simulator {
             return false;
         }
         if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
+            // §10.6.2: a forced net keeps its forced value against its gate
+            // driver. Checked only on a change, off the common path.
+            if !self.forced_signals.is_empty() {
+                if let Some(fv) = self.forced_signals.get(&id) {
+                    let code = fv.get_bit_code(dst.bit as usize);
+                    self.signal_table[id].set_bit_code(dst.bit as usize, code);
+                    return false;
+                }
+            }
             self.sync_mirror(id);
             self.table_modified = true;
             // sync_mirror just refreshed the mirror — skip the repack
