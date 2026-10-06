@@ -34,13 +34,6 @@ use crate::ast::decl::DistWeight;
 use crate::compiler::elaborate::{is_type_real, is_type_signed, resolve_type_width};
 use rand::Rng;
 
-thread_local! {
-    /// Set while a `std::randomize` (scope) solve runs: the solver's
-    /// evaluation frames then extend the caller's locals instead of hiding
-    /// them (see `csp_frame`).
-    static CSP_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// Sorted, disjoint, inclusive integer intervals.
 type Dom = Vec<(i128, i128)>;
 
@@ -272,19 +265,6 @@ enum Node {
         src: usize,
         neg: bool,
     },
-    /// `var OP other` where `other` is an expression the linear model
-    /// cannot express (a select of a variable, an element of a state array
-    /// indexed by variables, …). Once every variable `other` reads is fixed
-    /// it is evaluated and narrows `var` — `==` fixes it — instead of
-    /// waiting for `var` to be guessed. `whole` is the original relation
-    /// (negated when `neg`), judged once everything is fixed.
-    Fun {
-        var: usize,
-        op: BinaryOp,
-        other: usize,
-        whole: usize,
-        neg: bool,
-    },
     And(Vec<Node>),
     Or(Vec<Node>),
     If {
@@ -323,9 +303,6 @@ enum VarKey {
     Elem(String),
     /// A rand scalar of a rand sub-object: (its handle, property).
     Sub(usize, String),
-    /// A segment or select of another variable (`csp_split_slices`): never
-    /// written back — the variable it is part of is.
-    Aux,
 }
 
 #[derive(Clone, Debug)]
@@ -379,20 +356,6 @@ struct Csp {
     opaque: bool,
     /// Rand sub-object scalars are variables too (`csp_add_sub`).
     has_subs: bool,
-    /// `std::randomize(…) with {…}` (§18.12): the variables are the
-    /// caller's own — written through these lvalues (scalars) and by
-    /// element name (arrays) — and the solve runs in the caller's scope.
-    scope: Option<HashMap<String, Expression>>,
-    /// Constant bit/part selects and packed-struct fields of solver
-    /// scalars (§11.5.1, §7.2.1), split into segment variables: base
-    /// variable -> its segments (lsb, width, variable), lsb first.
-    segs: HashMap<usize, Vec<(u32, u32, usize)>>,
-    /// A select spanning several segments: (base, lsb, width) -> variable.
-    slice_vars: HashMap<(usize, u32, u32), usize>,
-    /// Packed-struct field layout (name, lsb, width) of a base variable.
-    fields: HashMap<usize, Vec<(String, u32, u32)>>,
-    /// Declared lsb of a base variable's packed range (`[31:8]` -> 8).
-    lsb: HashMap<usize, i64>,
 }
 
 /// Translation scope: bound `foreach` indices and the `with` iterator.
@@ -566,13 +529,6 @@ impl Node {
             }
             Node::AllDiff(vs) => out.extend(vs.iter().copied()),
             Node::Eval { src, .. } => out.extend(srcs[*src].deps.iter().copied()),
-            Node::Fun {
-                var, other, whole, ..
-            } => {
-                out.push(*var);
-                out.extend(srcs[*other].deps.iter().copied());
-                out.extend(srcs[*whole].deps.iter().copied());
-            }
             Node::And(ns) | Node::Or(ns) => ns.iter().for_each(|n| n.deps(srcs, out)),
             Node::If {
                 cond, then, els, ..
@@ -653,7 +609,6 @@ impl Simulator {
             }
             &joint
         };
-        self.csp_split_slices(&mut csp, constraints);
         if self
             .csp_translate(&mut csp, constraints, constraint_depth)
             .is_none()
@@ -701,116 +656,6 @@ impl Simulator {
         CspOutcome::Sat
     }
 
-    /// §18.12: solve `std::randomize(…) with {items}` jointly. `scalars`
-    /// are (name, lvalue, width, signed, enum values); `arrays` are (name,
-    /// element indices, width, signed, enum values) of collections already
-    /// sized. The solution is written to the caller's variables and checked
-    /// with the inline-constraint checker.
-    #[allow(clippy::type_complexity)]
-    pub(super) fn rand_csp_solve_scope(
-        &mut self,
-        items: &[ConstraintItem],
-        scalars: &[(String, Expression, u32, bool, Option<Vec<u64>>)],
-        arrays: &[(String, Vec<i64>, u32, bool, Option<Vec<u64>>)],
-    ) -> CspOutcome {
-        let mut csp = Csp {
-            handle: usize::MAX,
-            vars: Vec::new(),
-            dom0: Vec::new(),
-            scalars: HashMap::default(),
-            arrays: HashMap::default(),
-            srcs: Vec::new(),
-            nodes: Vec::new(),
-            soft_enabled: None,
-            soft_priority: Vec::new(),
-            soft_rank: (0, 0),
-            dists: Vec::new(),
-            order: Vec::new(),
-            opaque: false,
-            has_subs: false,
-            scope: Some(HashMap::default()),
-            segs: HashMap::default(),
-            slice_vars: HashMap::default(),
-            fields: HashMap::default(),
-            lsb: HashMap::default(),
-        };
-        let dom_of = |w: u32, s: bool, members: &Option<Vec<u64>>| -> Dom {
-            match members {
-                Some(m) if !m.is_empty() => {
-                    dom_norm(m.iter().map(|&v| (v as i128, v as i128)).collect())
-                }
-                _ => {
-                    let (lo, hi) = ws_range(w, s);
-                    vec![(lo, hi)]
-                }
-            }
-        };
-        for (name, idx, w, s, members) in arrays {
-            if *w == 0 || *w > 64 {
-                return CspOutcome::NotApplicable;
-            }
-            let dom = dom_of(*w, *s, members);
-            let mut elems = Vec::with_capacity(idx.len());
-            for &i in idx {
-                elems.push((i, csp.vars.len()));
-                csp.vars.push(CspVar {
-                    key: VarKey::Elem(format!("{}[{}]", name, i)),
-                    width: *w,
-                    signed: *s,
-                });
-                csp.dom0.push(dom.clone());
-            }
-            csp.arrays.insert(
-                name.clone(),
-                CspArr {
-                    elems,
-                    width: *w,
-                    signed: *s,
-                },
-            );
-        }
-        for (name, lv, w, s, members) in scalars {
-            if *w == 0 || *w > 64 || csp.arrays.contains_key(name) {
-                return CspOutcome::NotApplicable;
-            }
-            csp.scalars.insert(name.clone(), csp.vars.len());
-            csp.vars.push(CspVar {
-                key: VarKey::Prop(name.clone()),
-                width: *w,
-                signed: *s,
-            });
-            csp.dom0.push(dom_of(*w, *s, members));
-            if let Some(l) = csp.scope.as_mut() {
-                l.insert(name.clone(), lv.clone());
-            }
-        }
-        if csp.vars.is_empty() || csp.vars.len() > MAX_VARS {
-            return CspOutcome::NotApplicable;
-        }
-        let constraints = vec![ClassConstraint {
-            is_static: false,
-            is_extern: false,
-            has_body: true,
-            name: crate::ast::Identifier {
-                name: "__inline__".to_string(),
-                span: crate::ast::Span::dummy(),
-            },
-            items: items.to_vec(),
-            span: crate::ast::Span::dummy(),
-        }];
-        let prev = CSP_SCOPE.with(|c| c.replace(true));
-        let prev_receiver = self.rand_receiver.take();
-        self.csp_split_slices(&mut csp, &constraints);
-        let out = if self.csp_translate(&mut csp, &constraints, &[]).is_none() {
-            CspOutcome::NotApplicable
-        } else {
-            self.csp_run(&csp, &constraints, &[])
-        };
-        self.rand_receiver = prev_receiver;
-        CSP_SCOPE.with(|c| c.set(prev));
-        out
-    }
-
     /// Build the variable table: rand scalars and array elements.
     fn csp_vars(
         &mut self,
@@ -836,11 +681,6 @@ impl Simulator {
             order: Vec::new(),
             opaque: false,
             has_subs: false,
-            scope: None,
-            segs: HashMap::default(),
-            slice_vars: HashMap::default(),
-            fields: HashMap::default(),
-            lsb: HashMap::default(),
         };
         let enum_dom = |me: &Self, tn: &str| -> Option<Dom> {
             let members = me.module.enum_members.get(tn)?;
@@ -928,7 +768,6 @@ impl Simulator {
         csp.soft_priority.clear();
         csp.opaque = false;
         let env = Env::default();
-        self.csp_slice_links(csp);
         for (index, con) in constraints.iter().enumerate() {
             csp.soft_rank = if con.name.name == "__inline__" {
                 (0, usize::MAX)
@@ -1007,14 +846,7 @@ impl Simulator {
             let x = st.fixed(v).unwrap_or(0);
             self.csp_write(csp, v, x);
         }
-        let accepted = if csp.scope.is_some() {
-            let items: Vec<ConstraintItem> =
-                constraints.iter().flat_map(|c| c.items.iter().cloned()).collect();
-            self.inline_constraints_satisfied(&items)
-        } else {
-            self.rand_items_accept(csp.handle, constraints, colls, &mut false)
-        };
-        if accepted {
+        if self.rand_items_accept(csp.handle, constraints, colls, &mut false) {
             CspOutcome::Sat
         } else {
             if std::env::var_os("XEZIM_RAND_DBG").is_some() {
@@ -1322,29 +1154,6 @@ impl Simulator {
                 _ => {}
             }
         }
-        // A `Fun` variable is decided after the variables its value is a
-        // function of, so it is narrowed rather than guessed.
-        fn funs(n: &Node, srcs: &[Src], aux: &mut Aux) {
-            match n {
-                Node::And(ns) | Node::Or(ns) => ns.iter().for_each(|m| funs(m, srcs, aux)),
-                Node::If { then, els, .. } => {
-                    funs(then, srcs, aux);
-                    funs(els, srcs, aux);
-                }
-                Node::Fun { var, other, .. } => {
-                    for &d in &srcs[*other].deps {
-                        if d != *var && !aux.preds[*var].contains(&d) {
-                            aux.preds[*var].push(d);
-                            aux.succs[d].push(*var);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        for nd in &csp.nodes {
-            funs(nd, &csp.srcs, &mut aux);
-        }
         let mut gv = Vec::new();
         for nd in &csp.nodes {
             conds(nd, &csp.srcs, &mut gv);
@@ -1510,50 +1319,6 @@ impl Simulator {
             Node::Eval { src, neg } => {
                 !self.csp_src_fixed(csp, st, *src) || self.csp_eval_src(csp, st, *src) != *neg
             }
-            Node::Fun {
-                var,
-                op,
-                other,
-                whole,
-                neg,
-            } => {
-                if !self.csp_src_fixed(csp, st, *other) {
-                    return true;
-                }
-                if self.csp_src_fixed(csp, st, *whole) {
-                    return self.csp_eval_src(csp, st, *whole) != *neg;
-                }
-                let c = self.csp_eval_value(csp, st, *other);
-                if c.has_unknown() {
-                    // §11.4.4: a relation with an x/z operand is not true.
-                    return false;
-                }
-                let (vw, vs) = (csp.vars[*var].width, csp.vars[*var].signed);
-                let k: i128 = match (vs, c.is_signed) {
-                    (false, false) => match c.to_u64() {
-                        Some(x) => x as i128,
-                        None => return true,
-                    },
-                    (true, true) if c.width <= 64 => {
-                        let x = c.to_u64().unwrap_or(0);
-                        let sh = 64 - c.width.max(1);
-                        (((x << sh) as i64) >> sh) as i128
-                    }
-                    // Mixed signedness: leave it to the final judgement.
-                    _ => return true,
-                };
-                let _ = vw;
-                const BIG: i128 = i128::MAX / 4;
-                let nd = match op {
-                    BinaryOp::Eq | BinaryOp::CaseEq => dom_meet(&st.d[*var], &vec![(k, k)]),
-                    BinaryOp::Neq | BinaryOp::CaseNeq => dom_minus(&st.d[*var], &vec![(k, k)]),
-                    BinaryOp::Lt => dom_clip(&st.d[*var], -BIG, k - 1),
-                    BinaryOp::Leq => dom_clip(&st.d[*var], -BIG, k),
-                    BinaryOp::Gt => dom_clip(&st.d[*var], k + 1, BIG),
-                    _ => dom_clip(&st.d[*var], k, BIG),
-                };
-                st.set(*var, nd)
-            }
             Node::And(ns) => ns.iter().all(|m| self.csp_enforce(csp, m, st)),
             Node::Or(ns) => {
                 let mut open: Option<&Node> = None;
@@ -1662,10 +1427,7 @@ impl Simulator {
                 xs.sort_unstable();
                 Some(xs.windows(2).all(|w| w[0] != w[1]))
             }
-            Node::Eval { src, neg }
-            | Node::Fun {
-                whole: src, neg, ..
-            } => {
+            Node::Eval { src, neg } => {
                 if self.csp_src_fixed(csp, st, *src) {
                     Some(self.csp_eval_src(csp, st, *src) != *neg)
                 } else {
@@ -1714,19 +1476,6 @@ impl Simulator {
         st.all_fixed(&csp.srcs[src].deps)
     }
 
-    /// The local frame to evaluate under with `binds` (foreach indices)
-    /// bound. A class solve runs in the object's method frame, which holds
-    /// nothing else; a scope solve keeps the caller's locals visible.
-    fn csp_frame(&self, binds: &[(String, Value)]) -> HashMap<String, Value> {
-        let mut frame: HashMap<String, Value> = if CSP_SCOPE.with(|c| c.get()) {
-            self.local_stack.last().cloned().unwrap_or_default()
-        } else {
-            HashMap::default()
-        };
-        frame.extend(binds.iter().cloned());
-        frame
-    }
-
     /// Judge a source constraint with the ordinary evaluator: the fixed
     /// variables it reads are written to the object first.
     fn csp_eval_src(&mut self, csp: &Csp, st: &St, src: usize) -> bool {
@@ -1736,7 +1485,7 @@ impl Simulator {
                 self.csp_write(csp, v, x);
             }
         }
-        let frame = self.csp_frame(&s.binds);
+        let frame: HashMap<String, Value> = s.binds.iter().cloned().collect();
         self.push_local_frame(frame);
         let ok = match &s.item {
             SrcItem::Expr(e) => self.cons_expr_true(e),
@@ -1746,41 +1495,10 @@ impl Simulator {
         ok
     }
 
-    /// The value of a source expression with its fixed variables written.
-    fn csp_eval_value(&mut self, csp: &Csp, st: &St, src: usize) -> Value {
-        let s = &csp.srcs[src];
-        for &v in &s.deps {
-            if let Some(x) = st.fixed(v) {
-                self.csp_write(csp, v, x);
-            }
-        }
-        let frame = self.csp_frame(&s.binds);
-        self.push_local_frame(frame);
-        let v = match &s.item {
-            SrcItem::Expr(e) => self.eval_expr(e),
-            SrcItem::Item(_) => Value::new(1),
-        };
-        self.pop_local_frame();
-        v
-    }
-
     fn csp_write(&mut self, csp: &Csp, v: usize, x: i128) {
         let var = &csp.vars[v];
         let mut val = Value::from_u64(Self::bits_at(x, var.width) as u64, var.width);
         val.is_signed = var.signed;
-        if let Some(lvals) = &csp.scope {
-            match &var.key {
-                VarKey::Prop(n) => {
-                    if let Some(lv) = lvals.get(n) {
-                        let lv = lv.clone();
-                        self.assign_value(&lv, &val);
-                    }
-                }
-                VarKey::Elem(k) => self.set_signal_value_by_name(k, val),
-                VarKey::Sub(..) | VarKey::Aux => {}
-            }
-            return;
-        }
         match &var.key {
             VarKey::Prop(n) => {
                 if let Some(Some(inst)) = self.heap.get_mut(csp.handle) {
@@ -1788,7 +1506,6 @@ impl Simulator {
                 }
             }
             VarKey::Elem(k) => self.write_coll_elem(k, val),
-            VarKey::Aux => {}
             VarKey::Sub(h, n) => {
                 if let Some(Some(inst)) = self.heap.get_mut(*h) {
                     inst.properties.insert(n.clone(), val);
@@ -2239,7 +1956,7 @@ impl Simulator {
             return;
         };
         let (vlo, vhi) = ws_range(w, s);
-        let frame = self.csp_frame(&env.binds);
+        let frame: HashMap<String, Value> = env.binds.iter().cloned().collect();
         self.push_local_frame(frame);
         let mut items = Vec::with_capacity(ranges.len());
         let mut ok = true;
@@ -2522,11 +2239,8 @@ impl Simulator {
         env: &Env,
         neg: bool,
     ) -> Option<Node> {
-        let fallback = |me: &mut Self, csp: &mut Csp| match me
-            .csp_rel_fun(csp, whole, op, left, right, env, neg)
-        {
-            Some(n) => Some(n),
-            None => me.csp_eval_node(csp, SrcItem::Expr(whole.clone()), env, neg),
+        let fallback = |me: &mut Self, csp: &mut Csp| {
+            me.csp_eval_node(csp, SrcItem::Expr(whole.clone()), env, neg)
         };
         // `(a >> k) REL c` with a constant k and an unsigned `a` is a RANGE on
         // `a`: the shift is floor division by 2**k, so each relation maps onto
@@ -2537,14 +2251,6 @@ impl Simulator {
         // its exact equivalent, solves instantly.
         if let Some(n) = self.csp_shr_rel(csp, whole, op, left, right, env, neg) {
             return Some(n);
-        }
-        if matches!(op, BinaryOp::Eq | BinaryOp::CaseEq) && !neg {
-            if let Some(n) = self
-                .csp_masked_eq(csp, whole, left, right, env)
-                .or_else(|| self.csp_masked_eq(csp, whole, right, left, env))
-            {
-                return Some(n);
-            }
         }
         let (Some(a), Some(b)) = (self.csp_ae(csp, left, env), self.csp_ae(csp, right, env)) else {
             return fallback(self, csp);
@@ -2612,91 +2318,6 @@ impl Simulator {
             fits,
             src,
             sneg: neg,
-        })
-    }
-
-    /// `x OP e` (either way round) with `x` a solver variable and `e` an
-    /// expression of OTHER variables the linear model cannot express: a
-    /// `Fun` node (see there). None when no side qualifies.
-    #[allow(clippy::too_many_arguments)]
-    fn csp_rel_fun(
-        &mut self,
-        csp: &mut Csp,
-        whole: &Expression,
-        op: BinaryOp,
-        left: &Expression,
-        right: &Expression,
-        env: &Env,
-        neg: bool,
-    ) -> Option<Node> {
-        if !matches!(
-            op,
-            BinaryOp::Eq
-                | BinaryOp::CaseEq
-                | BinaryOp::Neq
-                | BinaryOp::CaseNeq
-                | BinaryOp::Lt
-                | BinaryOp::Leq
-                | BinaryOp::Gt
-                | BinaryOp::Geq
-        ) {
-            return None;
-        }
-        let op = if neg {
-            match op {
-                BinaryOp::Eq | BinaryOp::CaseEq => BinaryOp::Neq,
-                BinaryOp::Neq | BinaryOp::CaseNeq => BinaryOp::Eq,
-                BinaryOp::Lt => BinaryOp::Geq,
-                BinaryOp::Leq => BinaryOp::Gt,
-                BinaryOp::Gt => BinaryOp::Leq,
-                _ => BinaryOp::Lt,
-            }
-        } else {
-            op
-        };
-        let mirror = |o: BinaryOp| match o {
-            BinaryOp::Lt => BinaryOp::Gt,
-            BinaryOp::Leq => BinaryOp::Geq,
-            BinaryOp::Gt => BinaryOp::Lt,
-            BinaryOp::Geq => BinaryOp::Leq,
-            o => o,
-        };
-        let plain_var = |me: &mut Self, csp: &Csp, e: &Expression| match me.csp_ae(csp, e, env) {
-            Some(Ae::Var(v, ..)) => Some(v),
-            _ => None,
-        };
-        let reads = |me: &Self, csp: &Csp, e: &Expression| -> Option<Vec<usize>> {
-            let mut d = Vec::new();
-            me.csp_refs(csp, e, env, &mut d).then_some(d)
-        };
-        let mut pick = None;
-        if let Some(v) = plain_var(self, csp, left) {
-            if let Some(d) = reads(self, csp, right).filter(|d| !d.is_empty() && !d.contains(&v)) {
-                pick = Some((v, right, op, d));
-            }
-        }
-        if pick.is_none() {
-            if let Some(v) = plain_var(self, csp, right) {
-                if let Some(d) = reads(self, csp, left).filter(|d| !d.is_empty() && !d.contains(&v))
-                {
-                    pick = Some((v, left, mirror(op), d));
-                }
-            }
-        }
-        let (var, other, op, mut deps) = pick?;
-        deps.sort_unstable();
-        deps.dedup();
-        let other_src = self.csp_src(csp, SrcItem::Expr(other.clone()), env, deps.clone());
-        deps.push(var);
-        deps.sort_unstable();
-        deps.dedup();
-        let whole_src = self.csp_src(csp, SrcItem::Expr(whole.clone()), env, deps);
-        Some(Node::Fun {
-            var,
-            op,
-            other: other_src,
-            whole: whole_src,
-            neg,
         })
     }
 
@@ -2783,7 +2404,7 @@ impl Simulator {
         let Some(lin) = lin else {
             return self.csp_eval_node(csp, whole, env, neg);
         };
-        let frame = self.csp_frame(&env.binds);
+        let frame: HashMap<String, Value> = env.binds.iter().cloned().collect();
         self.push_local_frame(frame);
         let set = dom_norm(self.cons_ranges_i128(ranges));
         self.pop_local_frame();
@@ -2903,10 +2524,6 @@ impl Simulator {
                     // this object through an alias; stay conservative.
                     if h.path.len() == 1 {
                         push_name(&seg.name.name, out);
-                    } else if csp.scalars.contains_key(&h.path[0].name.name) {
-                        // A field of a packed-struct variable (`s.lo`) reads
-                        // the variable.
-                        push_name(&h.path[0].name.name, out);
                     }
                 }
                 true
@@ -3074,7 +2691,7 @@ impl Simulator {
 
     /// Evaluate a variable-free expression with the foreach indices bound.
     fn csp_const_any(&mut self, e: &Expression, env: &Env) -> Value {
-        let frame = self.csp_frame(&env.binds);
+        let frame: HashMap<String, Value> = env.binds.iter().cloned().collect();
         self.push_local_frame(frame);
         let v = self.eval_expr(e);
         self.pop_local_frame();
@@ -3106,15 +2723,6 @@ impl Simulator {
                     }
                 }
                 _ => {}
-            }
-        }
-        if matches!(
-            e.kind,
-            ExprKind::RangeSelect { .. } | ExprKind::Index { .. } | ExprKind::MemberAccess { .. }
-        ) || (!csp.segs.is_empty() && matches!(e.kind, ExprKind::Ident(_)))
-        {
-            if let Some(a) = self.csp_slice_ae(csp, e, env) {
-                return Some(a);
             }
         }
         if let Some(n) = self.csp_member(csp, e) {
@@ -3425,629 +3033,5 @@ impl Simulator {
             lo,
             hi: b.min(d),
         });
-    }
-}
-
-
-/// §11.5.1/§7.2.1: a constant bit or part select, or a packed-struct field,
-/// of a solver scalar. The scalar is split into segments at every boundary
-/// such a select uses, tied to it by the exact identity `v == Σ seg·2^lsb`;
-/// a select is then a plain variable (a segment, or an auxiliary variable
-/// equal to the segments it covers). Relations on selects become linear and
-/// propagate, instead of waiting for a guess of the whole scalar to land on
-/// the selected bits (`addr[39:16] == page` on a 40-bit `addr`).
-impl Simulator {
-    /// Field layout and declared lsb of every scalar, then the selects the
-    /// constraints use and the segments they need.
-    fn csp_split_slices(&mut self, csp: &mut Csp, constraints: &[ClassConstraint]) {
-        csp.segs.clear();
-        csp.slice_vars.clear();
-        csp.fields.clear();
-        csp.lsb.clear();
-        let scalars: Vec<(String, usize)> =
-            csp.scalars.iter().map(|(n, &v)| (n.clone(), v)).collect();
-        for (name, v) in &scalars {
-            if csp.vars[*v].signed || csp.vars[*v].width > 64 {
-                continue;
-            }
-            if let Some((fields, lsb)) = self.csp_scalar_shape(csp, name) {
-                if !fields.is_empty() {
-                    csp.fields.insert(*v, fields);
-                }
-                if let Some(l) = lsb {
-                    csp.lsb.insert(*v, l);
-                }
-            } else {
-                // A shape the select arithmetic does not cover (ascending or
-                // multi-dimensional packed range): no slicing.
-                csp.lsb.insert(*v, i64::MIN);
-            }
-        }
-        // (base) -> constant ranges, and whether some select is dynamic.
-        let mut uses: HashMap<usize, (Vec<(u32, u32)>, bool)> = HashMap::default();
-        let mut bound: Vec<String> = Vec::new();
-        for c in constraints {
-            for it in &c.items {
-                self.csp_scan_item(csp, it, &mut bound, &mut uses);
-            }
-        }
-        for (v, (ranges, dynamic)) in uses {
-            let w = csp.vars[v].width;
-            if csp.vars[v].signed || w > 64 || w < 2 || csp.lsb.get(&v) == Some(&i64::MIN) {
-                continue;
-            }
-            let mut cuts: Vec<u32> = vec![0, w];
-            if dynamic {
-                cuts.extend(1..w);
-            }
-            for &(lo, rw) in &ranges {
-                cuts.push(lo);
-                cuts.push(lo + rw);
-            }
-            cuts.retain(|&c| c <= w);
-            cuts.sort_unstable();
-            cuts.dedup();
-            if cuts.len() <= 2 {
-                continue;
-            }
-            let mut segs = Vec::with_capacity(cuts.len() - 1);
-            for k in 0..cuts.len() - 1 {
-                let (lo, hi) = (cuts[k], cuts[k + 1]);
-                segs.push((lo, hi - lo, Self::csp_aux_var(csp, hi - lo)));
-            }
-            for &(lo, rw) in &ranges {
-                let covered = segs.iter().filter(|s| s.0 >= lo && s.0 + s.1 <= lo + rw).count();
-                if covered > 1 && !csp.slice_vars.contains_key(&(v, lo, rw)) {
-                    let x = Self::csp_aux_var(csp, rw);
-                    csp.slice_vars.insert((v, lo, rw), x);
-                }
-            }
-            csp.segs.insert(v, segs);
-        }
-    }
-
-    fn csp_aux_var(csp: &mut Csp, w: u32) -> usize {
-        csp.vars.push(CspVar {
-            key: VarKey::Aux,
-            width: w,
-            signed: false,
-        });
-        let (lo, hi) = ws_range(w, false);
-        csp.dom0.push(vec![(lo, hi)]);
-        csp.vars.len() - 1
-    }
-
-    /// (packed-struct fields, declared lsb) of scalar `name`; the lsb is
-    /// None for a struct (fields start at 0). None for a packed range the
-    /// select arithmetic does not cover.
-    #[allow(clippy::type_complexity)]
-    fn csp_scalar_shape(
-        &mut self,
-        csp: &Csp,
-        name: &str,
-    ) -> Option<(Vec<(String, u32, u32)>, Option<i64>)> {
-        let dt: Option<DataType> = if csp.scope.is_some() {
-            if let Some(f) = self.module.packed_struct_fields.get(name) {
-                return Some((f.clone(), None));
-            }
-            self.module.var_decl_types.get(name).cloned()
-        } else {
-            if let Some(su) = self.class_prop_struct(csp.handle, name) {
-                if !su.packed {
-                    return None;
-                }
-                let params = self.instance_param_scope(csp.handle);
-                let (fields, _) = self.packed_agg_layout_with(&su, &params);
-                return Some((fields, None));
-            }
-            let class = self
-                .heap
-                .get(csp.handle)
-                .and_then(|o| o.as_ref())
-                .map(|i| i.class_name.clone());
-            let mut cur = class;
-            let mut found = None;
-            while let Some(cn) = cur {
-                let Some(cd) = self.module.classes.get(&cn) else { break };
-                if let Some(t) = self.class_prop_decl_type(cd, name) {
-                    found = Some(t.clone());
-                    break;
-                }
-                cur = cd.extends.clone();
-            }
-            found
-        };
-        let Some(dt) = dt else {
-            return Some((Vec::new(), Some(0)));
-        };
-        let dt = crate::compiler::elaborate::resolve_typedef_chain(&dt, &self.module.typedef_types).clone();
-        if let Some(f) = crate::compiler::elaborate::packed_struct_field_layout(
-            &dt,
-            &self.module.parameters,
-            &self.module.typedefs,
-            &self.module.typedef_types,
-        ) {
-            return Some((f, None));
-        }
-        match &dt {
-            DataType::IntegerVector { dimensions, .. } => match dimensions.as_slice() {
-                [] => Some((Vec::new(), Some(0))),
-                [crate::ast::types::PackedDimension::Range { left, right, .. }] => {
-                    let l = crate::compiler::elaborate::const_eval_i64_with_params(
-                        left,
-                        Some(&self.module.parameters),
-                    )?;
-                    let r = crate::compiler::elaborate::const_eval_i64_with_params(
-                        right,
-                        Some(&self.module.parameters),
-                    )?;
-                    (l >= r).then_some((Vec::new(), Some(r)))
-                }
-                _ => None,
-            },
-            _ => Some((Vec::new(), Some(0))),
-        }
-    }
-
-    fn csp_scan_item(
-        &mut self,
-        csp: &Csp,
-        it: &ConstraintItem,
-        bound: &mut Vec<String>,
-        uses: &mut HashMap<usize, (Vec<(u32, u32)>, bool)>,
-    ) {
-        let mut scan = |me: &mut Self, e: &Expression, bound: &mut Vec<String>| {
-            me.csp_scan_expr(csp, e, bound, uses)
-        };
-        match it {
-            ConstraintItem::Expr(e) => scan(self, e, bound),
-            ConstraintItem::Inside { expr, range, .. } => {
-                scan(self, expr, bound);
-                for r in range {
-                    match r {
-                        ConstraintRange::Value(e) => scan(self, e, bound),
-                        ConstraintRange::Range { lo, hi } => {
-                            scan(self, lo, bound);
-                            scan(self, hi, bound);
-                        }
-                    }
-                }
-            }
-            ConstraintItem::Implication {
-                condition,
-                constraint,
-                ..
-            } => {
-                scan(self, condition, bound);
-                self.csp_scan_item(csp, constraint, bound, uses);
-            }
-            ConstraintItem::IfElse {
-                condition,
-                then_item,
-                else_item,
-                ..
-            } => {
-                scan(self, condition, bound);
-                self.csp_scan_item(csp, then_item, bound, uses);
-                if let Some(e) = else_item {
-                    self.csp_scan_item(csp, e, bound, uses);
-                }
-            }
-            ConstraintItem::Foreach { vars, item, .. } => {
-                let mark = bound.len();
-                bound.extend(vars.iter().flatten().map(|v| v.name.clone()));
-                self.csp_scan_item(csp, item, bound, uses);
-                bound.truncate(mark);
-            }
-            ConstraintItem::Soft(x) => self.csp_scan_item(csp, x, bound, uses),
-            ConstraintItem::Block(xs) => {
-                for x in xs {
-                    self.csp_scan_item(csp, x, bound, uses);
-                }
-            }
-            ConstraintItem::Unique { exprs, .. } => {
-                for e in exprs {
-                    scan(self, e, bound);
-                }
-            }
-            ConstraintItem::Solve { .. } => {}
-        }
-    }
-
-    fn csp_scan_expr(
-        &mut self,
-        csp: &Csp,
-        e: &Expression,
-        bound: &mut Vec<String>,
-        uses: &mut HashMap<usize, (Vec<(u32, u32)>, bool)>,
-    ) {
-        let bound_now = bound.clone();
-        let mut konst = |me: &mut Self, x: &Expression| -> Option<i64> {
-            let mut reads_bound = false;
-            Self::walk_operands(x, &mut |y| {
-                if let ExprKind::Ident(h) = &y.kind {
-                    if h.path.len() == 1 && bound_now.iter().any(|b| *b == h.path[0].name.name) {
-                        reads_bound = true;
-                    }
-                }
-            });
-            if reads_bound || !me.csp_free(csp, x, &Env::default()) {
-                return None;
-            }
-            me.csp_const(x, &Env::default())?.to_i64()
-        };
-        if let Some((v, r)) = self.csp_select_ref(csp, e, &mut konst) {
-            let u = uses.entry(v).or_default();
-            match r {
-                Some(r) => u.0.push(r),
-                None => u.1 = true,
-            }
-        }
-        // `x & MASK`: the runs of ones in the mask are selects of x.
-        if let ExprKind::Binary {
-            op: BinaryOp::BitAnd,
-            left,
-            right,
-        } = &Self::unparen(e).kind
-        {
-            for (x, m) in [(left, right), (right, left)] {
-                let Some(mask) = konst(self, m) else { continue };
-                if let Some((v, lo, w, _)) = self.csp_slice_base_k(csp, x, &mut konst) {
-                    let u = uses.entry(v).or_default();
-                    for (rl, rw) in Self::mask_runs(mask as u64, w) {
-                        u.0.push((lo + rl, rw));
-                    }
-                }
-            }
-        }
-        let mut subs: Vec<&Expression> = Vec::new();
-        match &e.kind {
-            ExprKind::Ident(h) => {
-                for seg in &h.path {
-                    subs.extend(seg.selects.iter());
-                }
-            }
-            ExprKind::Unary { operand, .. } => subs.push(operand),
-            ExprKind::Binary { left, right, .. } => {
-                subs.push(left);
-                subs.push(right);
-            }
-            ExprKind::Conditional {
-                condition,
-                then_expr,
-                else_expr,
-            } => subs.extend([condition.as_ref(), then_expr, else_expr]),
-            ExprKind::Concatenation(parts) => subs.extend(parts.iter()),
-            ExprKind::Replication { count, exprs } => {
-                subs.push(count);
-                subs.extend(exprs.iter());
-            }
-            ExprKind::Call { func, args } => {
-                subs.push(func);
-                subs.extend(args.iter());
-            }
-            ExprKind::SystemCall { args, .. } => subs.extend(args.iter()),
-            ExprKind::Inside { expr, ranges } => {
-                subs.push(expr);
-                subs.extend(ranges.iter());
-            }
-            ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => subs.push(expr),
-            ExprKind::Index { expr, index } => {
-                subs.push(expr);
-                subs.push(index);
-            }
-            ExprKind::RangeSelect {
-                expr, left, right, ..
-            } => subs.extend([expr.as_ref(), left, right]),
-            ExprKind::Range(a, b) => {
-                subs.push(a);
-                subs.push(b);
-            }
-            ExprKind::WithClause { expr, filter } => {
-                subs.push(expr);
-                subs.push(filter);
-            }
-            _ => {}
-        }
-        for x in subs {
-            self.csp_scan_expr(csp, x, bound, uses);
-        }
-    }
-
-    /// The bits of a solver scalar `e` names: Some((base, Some((lsb, w))))
-    /// for a constant select or field, Some((base, None)) for a select
-    /// whose position is not constant, None when `e` is no select or field
-    /// of a scalar (a whole scalar included). Select indices count from the
-    /// declared lsb of a whole variable, from 0 within a field.
-    fn csp_select_ref(
-        &mut self,
-        csp: &Csp,
-        e: &Expression,
-        konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
-    ) -> Option<(usize, Option<(u32, u32)>)> {
-        let e = Self::unparen(e);
-        let pick = |me: &mut Self,
-                    base: &Expression,
-                    konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
-                    lo_hi: &mut dyn FnMut(&mut Self, &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>) -> Option<Option<(i64, i64)>>|
-         -> Option<(usize, Option<(u32, u32)>)> {
-            let (v, blo, bw, whole) = me.csp_slice_base_k(csp, base, konst)?;
-            let origin = if whole {
-                csp.lsb.get(&v).copied().unwrap_or(0)
-            } else {
-                0
-            };
-            let Some((lo, w)) = lo_hi(me, konst)? else {
-                return Some((v, None));
-            };
-            let lo = lo - origin;
-            if lo < 0 || w < 1 || lo + w > bw as i64 {
-                return None;
-            }
-            Some((v, Some((blo + lo as u32, w as u32))))
-        };
-        match &e.kind {
-            ExprKind::RangeSelect {
-                expr,
-                kind,
-                left,
-                right,
-            } => pick(self, expr, konst, &mut |me, konst| {
-                let (l, r) = (konst(me, left), konst(me, right));
-                Some(match kind {
-                    crate::ast::expr::RangeKind::Constant => match (l, r) {
-                        (Some(l), Some(r)) if l >= r => Some((r, l - r + 1)),
-                        (Some(_), Some(_)) => return None,
-                        _ => None,
-                    },
-                    crate::ast::expr::RangeKind::IndexedUp => {
-                        let w = r?;
-                        l.map(|b| (b, w))
-                    }
-                    crate::ast::expr::RangeKind::IndexedDown => {
-                        let w = r?;
-                        l.map(|b| (b - w + 1, w))
-                    }
-                })
-            }),
-            ExprKind::Index { expr, index } => pick(self, expr, konst, &mut |me, konst| {
-                Some(konst(me, index).map(|i| (i, 1)))
-            }),
-            // `x[i]` held as a select on the identifier's last segment.
-            ExprKind::Ident(h)
-                if h.root.is_none()
-                    && h.path.last().is_some_and(|s| s.selects.len() == 1)
-                    && h.path[..h.path.len() - 1].iter().all(|s| s.selects.is_empty()) =>
-            {
-                let mut bh = h.clone();
-                let idx = bh.path.last_mut().unwrap().selects.pop().unwrap();
-                let base = Expression::new(ExprKind::Ident(bh), e.span);
-                pick(self, &base, konst, &mut |me, konst| {
-                    Some(konst(me, &idx).map(|i| (i, 1)))
-                })
-            }
-            _ => {
-                let (v, lo, w, whole) = self.csp_slice_base_k(csp, e, konst)?;
-                (!whole).then_some((v, Some((lo, w))))
-            }
-        }
-    }
-
-    /// `e` as (base, lsb, width, whole): a whole scalar, a field, or a select
-    /// of either.
-    fn csp_slice_base_k(
-        &mut self,
-        csp: &Csp,
-        e: &Expression,
-        konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
-    ) -> Option<(usize, u32, u32, bool)> {
-        let e = Self::unparen(e);
-        let var_of = |me: &Self, n: &str| -> Option<usize> {
-            let &v = csp.scalars.get(n)?;
-            (!me.csp_var_no_slices(csp, v)).then_some(v)
-        };
-        let field = |csp: &Csp, v: usize, f: &str| -> Option<(u32, u32)> {
-            csp.fields
-                .get(&v)?
-                .iter()
-                .find(|(n, ..)| n == f)
-                .map(|&(_, lo, w)| (lo, w))
-        };
-        // `x`, `this.x`, `recv.x`: the scalar itself.
-        if let Some(n) = self.csp_member(csp, e) {
-            if let Some(v) = var_of(self, &n) {
-                return Some((v, 0, csp.vars[v].width, true));
-            }
-        }
-        match &e.kind {
-            ExprKind::Ident(h) if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) => {
-                let names: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
-                // object-first binding: `p.f` is field f of the scalar p;
-                // `this.p.f` / `recv.p.f` likewise.
-                let start = if names.len() >= 2
-                    && (names[0] == "this" || self.rand_receiver.as_deref() == Some(names[0]))
-                    && !csp.scalars.contains_key(names[0])
-                {
-                    1
-                } else {
-                    0
-                };
-                let v = var_of(self, names[start])?;
-                if names.len() == start + 1 {
-                    return Some((v, 0, csp.vars[v].width, true));
-                }
-                if names.len() == start + 2 {
-                    let (lo, w) = field(csp, v, names[start + 1])?;
-                    return Some((v, lo, w, false));
-                }
-                None
-            }
-            ExprKind::MemberAccess { expr, member } => {
-                let (v, lo, _, whole) = self.csp_slice_base_k(csp, expr, konst)?;
-                if !whole {
-                    return None;
-                }
-                let (flo, fw) = field(csp, v, &member.name)?;
-                Some((v, lo + flo, fw, false))
-            }
-            _ => None,
-        }
-    }
-
-    /// A scalar that is not split (no select arithmetic for its shape).
-    fn csp_var_no_slices(&self, csp: &Csp, v: usize) -> bool {
-        csp.lsb.get(&v) == Some(&i64::MIN)
-    }
-
-    /// The structural identities: each split scalar equals the sum of its
-    /// segments, each multi-segment select the sum of the segments it covers.
-    fn csp_slice_links(&mut self, csp: &mut Csp) {
-        let mut links: Vec<Lin> = Vec::new();
-        for (&v, segs) in &csp.segs {
-            let mut t: Vec<(usize, i128)> = vec![(v, 1)];
-            for &(lo, _, x) in segs {
-                t.push((x, -(1i128 << lo)));
-            }
-            links.push(Lin { t, k: 0 });
-        }
-        for (&(v, lo, w), &x) in &csp.slice_vars {
-            let Some(segs) = csp.segs.get(&v) else { continue };
-            let mut t: Vec<(usize, i128)> = vec![(x, 1)];
-            for &(slo, sw, sx) in segs {
-                if slo >= lo && slo + sw <= lo + w {
-                    t.push((sx, -(1i128 << (slo - lo))));
-                }
-            }
-            links.push(Lin { t, k: 0 });
-        }
-        for mut lin in links {
-            lin.t.sort_unstable_by_key(|x| x.0);
-            let deps: Vec<usize> = lin.t.iter().map(|x| x.0).collect();
-            let one = Self::literal_of(&Value::from_u64(1, 1), crate::ast::Span::dummy());
-            let src = self.csp_src(csp, SrcItem::Expr(one), &Env::default(), deps);
-            csp.nodes.push(Node::Lin {
-                lin,
-                rel: Rel::Eq,
-                fits: Vec::new(),
-                src,
-                sneg: false,
-            });
-        }
-    }
-
-    /// Maximal runs of ones in the low `w` bits of `m`: (lsb, width).
-    fn mask_runs(m: u64, w: u32) -> Vec<(u32, u32)> {
-        let mut out = Vec::new();
-        let mut i = 0u32;
-        while i < w.min(64) {
-            if (m >> i) & 1 == 1 {
-                let start = i;
-                while i < w.min(64) && (m >> i) & 1 == 1 {
-                    i += 1;
-                }
-                out.push((start, i - start));
-            } else {
-                i += 1;
-            }
-        }
-        out
-    }
-
-    /// `(x & M) == C` with constant `M`, `C` and `x` a scalar, field or
-    /// select: each run of ones in `M` pins those bits of `x` to `C`'s, and a
-    /// `C` bit outside `M` makes it unsatisfiable. None for another shape.
-    fn csp_masked_eq(
-        &mut self,
-        csp: &mut Csp,
-        whole: &Expression,
-        masked: &Expression,
-        other: &Expression,
-        env: &Env,
-    ) -> Option<Node> {
-        let ExprKind::Binary {
-            op: BinaryOp::BitAnd,
-            left,
-            right,
-        } = &Self::unparen(masked).kind
-        else {
-            return None;
-        };
-        if !self.csp_free(csp, other, env) {
-            return None;
-        }
-        let c = self.csp_const(other, env)?.to_u64()?;
-        for (x, m) in [(left, right), (right, left)] {
-            if !self.csp_free(csp, m, env) {
-                continue;
-            }
-            let Some(mask) = self.csp_const(m, env).and_then(|v| v.to_u64()) else {
-                continue;
-            };
-            let mut konst = |me: &mut Self, y: &Expression| -> Option<i64> {
-                if !me.csp_free(csp, y, env) {
-                    return None;
-                }
-                me.csp_const(y, env)?.to_i64()
-            };
-            let Some((v, lo, w, _)) = self.csp_slice_base_k(csp, x, &mut konst) else {
-                continue;
-            };
-            let wm = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-            let mask = mask & wm;
-            if c & !mask != 0 {
-                return Some(Node::False);
-            }
-            let mut nodes = Vec::new();
-            for (rl, rw) in Self::mask_runs(mask, w) {
-                let (blo, bw) = (lo + rl, rw);
-                let var = if blo == 0 && bw == csp.vars[v].width {
-                    Some(v)
-                } else {
-                    csp.segs.get(&v).and_then(|segs| {
-                        segs.iter()
-                            .find(|s| s.0 == blo && s.1 == bw)
-                            .map(|s| s.2)
-                            .or_else(|| csp.slice_vars.get(&(v, blo, bw)).copied())
-                    })
-                };
-                let var = var?;
-                let want = ((c >> rl) & if rw >= 64 { u64::MAX } else { (1u64 << rw) - 1 }) as i128;
-                let src = self.csp_src(csp, SrcItem::Expr(whole.clone()), env, vec![var]);
-                nodes.push(Node::Lin {
-                    lin: Lin {
-                        t: vec![(var, 1)],
-                        k: -want,
-                    },
-                    rel: Rel::Eq,
-                    fits: Vec::new(),
-                    src,
-                    sneg: false,
-                });
-            }
-            return Some(Self::csp_and(nodes));
-        }
-        None
-    }
-
-    /// A select or field of a split scalar as its solver variable.
-    fn csp_slice_ae(&mut self, csp: &Csp, e: &Expression, env: &Env) -> Option<Ae> {
-        let mut konst = |me: &mut Self, x: &Expression| -> Option<i64> {
-            if !me.csp_free(csp, x, env) {
-                return None;
-            }
-            me.csp_const(x, env)?.to_i64()
-        };
-        let (v, r) = self.csp_select_ref(csp, e, &mut konst)?;
-        let (lo, w) = r?;
-        if lo == 0 && w == csp.vars[v].width {
-            // `v[31:8]` of `logic [31:8] v`: the whole variable.
-            return Some(Self::csp_var_ae(csp, v));
-        }
-        let segs = csp.segs.get(&v)?;
-        if let Some(&(_, _, x)) = segs.iter().find(|s| s.0 == lo && s.1 == w) {
-            return Some(Ae::Var(x, w, false));
-        }
-        let &x = csp.slice_vars.get(&(v, lo, w))?;
-        Some(Ae::Var(x, w, false))
     }
 }
