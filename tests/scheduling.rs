@@ -262,6 +262,8 @@ mod labeled_block_local_hier_ref;
 mod lrm_audit_clocking_skew;
 #[path = "scheduling/lrm_audit_disable_from_fork.rs"]
 mod lrm_audit_disable_from_fork;
+#[path = "scheduling/lrm_audit_sva.rs"]
+mod lrm_audit_sva;
 #[path = "scheduling/nba_array_elem_last_write_wins.rs"]
 mod nba_array_elem_last_write_wins;
 #[path = "scheduling/nba_wait_for_region_yield.rs"]

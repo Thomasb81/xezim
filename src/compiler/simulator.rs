@@ -452,6 +452,9 @@ const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
+/// §16.3: the message of the `$error` a failed assertion with no `else`
+/// clause reports (the reference simulator's wording).
+const ASSERT_DEFAULT_ERROR: &str = "Assertion error.";
 /// Internal task a waiter resumes to report that a wait made from the
 /// nested (C-called) path is over; see `run_nested_until`.
 const SYNC_WAKE_MARKER: &str = "$__xz_sync_wake";
@@ -3401,6 +3404,12 @@ struct DeferredReport {
     span: crate::ast::Span,
     passed: bool,
     action: Option<Statement>,
+    /// §16.3: a failed assertion with no `else` clause reports the default
+    /// `$error`, naming this scope (`%m` where the assertion executed).
+    default_error_scope: Option<String>,
+    /// The scope of the comb-entry `always_comb` that queued the report
+    /// (`pid` is then `usize::MAX`).
+    comb_scope: Option<String>,
     this_handle: Option<usize>,
     class_context: Option<String>,
 }
@@ -3493,6 +3502,24 @@ struct SvaClockedSite {
     /// and swapped in while this site's predicate is evaluated, so the
     /// property samples pre-edge values (see `eval_sva_sampled`).
     sampled_ids: Vec<usize>,
+    /// §16.10: the initial values of the attempt's local variable slots
+    /// (empty when the property has none).
+    lv_init: SvaEnv,
+    /// §16.14.6: a procedural concurrent assertion. An attempt starts only
+    /// for an execution of the statement (`matured`), not at every tick.
+    procedural: bool,
+    /// §16.14.6.1: the automatic variables the property reads, captured
+    /// into these slots when the statement executes.
+    captured: Vec<(usize, String)>,
+    /// §16.14.6.2: matured instances, each the slot values it captured,
+    /// waiting for the next tick of the leading clock.
+    matured: Vec<SvaEnv>,
+    /// The property has its own `disable iff` (§16.15: the scope's
+    /// `default disable iff` does not apply).
+    explicit_disable: bool,
+    /// The full path of the scope the assertion executes in, which selects
+    /// the `default disable iff` that governs it.
+    disable_scope: String,
 }
 
 /// A sequence (§16.9) as parsed, before it is turned into an automaton.
@@ -3527,6 +3554,23 @@ enum SvaSeq {
         min: u32,
         max: u32,
     },
+    /// §16.10 / §16.11 match items, run within the cycle: local variable
+    /// assignments and subroutine calls (no cycle of its own).
+    Assign(Vec<SvaMatchItem>),
+}
+
+/// The local variable values of one thread of an attempt (§16.10), indexed
+/// by the slots the site's locals were bound to; empty for a site with no
+/// locals.
+type SvaEnv = Vec<Value>;
+
+/// A §16.10 / §16.11 sequence match item.
+#[derive(Debug, Clone)]
+struct SvaMatchItem {
+    /// The assigned local `(slot, width, signed)`; `None` for a subroutine
+    /// call run for its side effect.
+    slot: Option<(usize, u32, bool)>,
+    expr: Expression,
 }
 
 /// Sequence automaton: a cycle advances over `Tick` edges; every other edge
@@ -3548,6 +3592,8 @@ enum SvaEdge {
     Tick(usize),
     /// A compound sub-sequence: followed at every cycle it reports a match.
     Sub(Box<SvaCompound>, usize),
+    /// Run the match items, then follow (§16.10 / §16.11).
+    Assign(Vec<SvaMatchItem>, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -3567,8 +3613,21 @@ enum SvaCompound {
 #[derive(Debug, Clone, Default)]
 struct SvaRun {
     started: bool,
-    pcs: Vec<usize>,
+    /// The states waiting for the next cycle, each with its thread's local
+    /// variables (§16.10).
+    pcs: Vec<(usize, SvaEnv)>,
     subs: Vec<SvaSubRun>,
+    /// The local variables the run starts with.
+    init_env: SvaEnv,
+}
+
+impl SvaRun {
+    fn with_env(init_env: SvaEnv) -> Self {
+        SvaRun {
+            init_env,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3579,6 +3638,10 @@ struct SvaSubRun {
     runs: Vec<SvaRun>,
     /// Which operand of an `and` has matched so far.
     ever: [bool; 2],
+    /// The local variables the compound was entered with, and those of each
+    /// operand's latest match (§16.10: an operand's assignments flow out).
+    env: SvaEnv,
+    ever_env: [SvaEnv; 2],
 }
 
 /// A property body compiled for evaluation (§16.12).
@@ -3637,7 +3700,8 @@ enum SvaState {
         ra: Option<SvaOutcome>,
         rb: Option<SvaOutcome>,
     },
-    Leaf,
+    /// `s_eventually` / `s_always`, with the attempt's local variables.
+    Leaf(SvaEnv),
 }
 
 /// Thompson-style construction of `SvaNfa` fragments.
@@ -3830,6 +3894,12 @@ impl SvaNfaBuilder {
             SvaSeq::FirstMatch(a) => self.sub(SvaCompound::FirstMatch(Self::build(a))),
             SvaSeq::Rep { seq, min, max } => self.rep(&SvaRepUnit::Seq(seq), *min, *max),
             SvaSeq::Goto { cond, min, max } => self.rep(&SvaRepUnit::Goto(cond), *min, *max),
+            SvaSeq::Assign(items) => {
+                let s = self.state();
+                let t = self.state();
+                self.add(s, SvaEdge::Assign(items.clone(), t));
+                (s, t)
+            }
             SvaSeq::NonCon { cond, min, max } => {
                 // §16.9.2: `b[->min:max] ##1 !b[*0:$]`.
                 let (s, e) = self.rep(&SvaRepUnit::Goto(cond), *min, *max);
@@ -6108,6 +6178,18 @@ pub struct Simulator {
     /// edge-detect the clock signal each loop iteration; `pending`
     /// queues consequents deferred by `|=>` or `##N`.
     sva_sites: Vec<SvaClockedSite>,
+    /// §16.10: the local variables of the attempt thread being evaluated,
+    /// read through slot markers (see `sva_bind_locals`).
+    sva_lv: Vec<Value>,
+    /// `(width, signed, two-state)` of each local variable slot of the site
+    /// being registered (see `sva_bind_locals`).
+    sva_lv_types: Vec<(u32, bool, bool)>,
+    /// §16.14.6.2: procedural concurrent assertion instances queued this time
+    /// step, not yet matured: `(site, process, captured slot values)`. A
+    /// flush point of the process drops its own.
+    sva_proc_pending: Vec<(usize, usize, Vec<Value>)>,
+    /// §16.15 `default disable iff`, by the scope that declares it.
+    sva_default_disable: HashMap<String, Expression>,
     /// LRM §16.9.3: index of the SVA site whose body is currently
     /// being evaluated. Set by `tick_sva_sites` around each body
     /// eval; consulted by `eval_expr`'s `$past` handler to find the
@@ -11900,6 +11982,10 @@ impl Simulator {
             typedef_layouts_by_width: None,
             class_prop_dim_cache: std::cell::RefCell::new(HashMap::default()),
             sva_sites: Vec::new(),
+            sva_lv: Vec::new(),
+            sva_lv_types: Vec::new(),
+            sva_proc_pending: Vec::new(),
+            sva_default_disable: HashMap::default(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
             clocking_snapshots: HashMap::default(),
@@ -44038,6 +44124,25 @@ impl Simulator {
                 if let Some(r) = reads.as_deref_mut() {
                     Self::collect_expr_reads(e, module, r)
                 };
+            }
+            // §9.2.2.2.1 / §16.3: an immediate or deferred assertion's
+            // expression and action blocks are part of the procedure, so an
+            // `always_comb` / `always @*` whose only reads are in an assertion
+            // still re-runs when they change. A concurrent assertion samples
+            // on its own clock and adds nothing.
+            StatementKind::Assertion(a) if !a.is_property => {
+                if let Some(r) = reads.as_deref_mut() {
+                    Self::collect_expr_reads(&a.expr, module, r)
+                };
+                for act in [&a.action, &a.else_action].into_iter().flatten() {
+                    Self::collect_stmt_rw(
+                        act,
+                        module,
+                        reads.as_deref_mut(),
+                        writes,
+                        arrays.as_deref_mut(),
+                    );
+                }
             }
             StatementKind::VarDecl { declarators, .. } => {
                 for d in declarators {
@@ -86780,6 +86885,29 @@ impl Simulator {
                 // today — they'd need to fire in the reactive region,
                 // which is its own follow-up.
                 if a.is_property {
+                    // §16.15 `default disable iff <guard>;` (a marker item
+                    // the parser emits in the declaring scope).
+                    if let ExprKind::SystemCall { name, args } = &a.expr.kind
+                        && name == "$sva_default_disable"
+                    {
+                        if let Some(g) = args.first() {
+                            let mut g = g.clone();
+                            self.sva_resolve_signals(&mut g);
+                            // Keyed by the declaring scope's full path (a
+                            // generate block included).
+                            let scope = self.m_path();
+                            self.sva_default_disable.insert(scope, g);
+                            // It governs the whole scope, so assertions
+                            // registered before it are covered too.
+                            for i in 0..self.sva_sites.len() {
+                                if !self.sva_sites[i].explicit_disable {
+                                    let key = self.sva_sites[i].disable_scope.clone();
+                                    self.sva_sites[i].disable = self.sva_default_disable_for(&key);
+                                }
+                            }
+                        }
+                        return;
+                    }
                     // LRM §16.6: `assert property (p_name);` —
                     // resolve a bare property-name reference to its
                     // stored body before dispatching to SVA. The
@@ -86866,6 +86994,22 @@ impl Simulator {
                                     (**body).clone(),
                                 ))
                             }
+                            // §16.14.6: a procedural assertion without a clock
+                            // of its own takes the one inferred from its
+                            // `always` procedure, ahead of the default clocking.
+                            _ if a.inferred_clock.is_some() => {
+                                let ev = a.inferred_clock.as_ref().unwrap();
+                                let clock_signal = match &ev.expr.kind {
+                                    ExprKind::Ident(h) => self.resolve_hier_name(h).into_owned(),
+                                    _ => String::new(),
+                                };
+                                let edge = match ev.edge {
+                                    Some(crate::ast::stmt::Edge::Negedge) => 1u8,
+                                    Some(crate::ast::stmt::Edge::Edge) => 2u8,
+                                    _ => 0u8,
+                                };
+                                Some((clock_signal, edge, ev.iff.clone(), resolved_expr.clone()))
+                            }
                             _ => match self.clocking_meta.get("__xz_default_clocking") {
                                 Some((clk, _)) => {
                                     let clk = clk.clone();
@@ -86881,68 +87025,34 @@ impl Simulator {
                         };
                     if let Some((clock_signal, edge, iff, body)) = clocked {
                         let span_key = a.span.start;
-                        if !self
-                            .sva_sites
-                            .iter()
-                            .any(|s| s.span_key == span_key && s.dedup_scope == self.current_scope)
-                        {
-                            // LRM §16.5.1: collect the ids of every signal
-                            // referenced in the property body so their
-                            // Preponed (slot-entry) values can be sampled
-                            // when the assertion fires (see eval_sva_sampled).
-                            let kind: u8 = match a.kind {
-                                AssertionKind::Assert => 0,
-                                AssertionKind::Assume => 1,
-                                AssertionKind::Cover => 2,
-                            };
-                            // Named sequence / property instances INSIDE the
-                            // body (`a |=> s`) expand here, once.
-                            let mut body_expanded = self.sva_expand_named(&body, 0);
-                            let mut sampled_ids = Vec::new();
-                            self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
-                            sampled_ids.sort_unstable();
-                            sampled_ids.dedup();
-                            let mut past_names = Vec::new();
-                            self.collect_past_arg_names(&body_expanded, &mut past_names);
-                            // A signal is sampled once per property clock,
-                            // however many sampled-value calls reference it.
-                            past_names.sort_unstable();
-                            past_names.dedup();
-                            self.sva_resolve_signals(&mut body_expanded);
-                            let (disable, node) = self.sva_compile_site(&body_expanded);
-                            let scope = self.active_instance_scope();
-                            let mut m_chain = self.m_scope_stack.clone();
-                            if let Some(l) = &a.label {
-                                m_chain.push(l.name.clone());
+                        let existing = self.sva_sites.iter().position(|s| {
+                            s.span_key == span_key && s.dedup_scope == self.current_scope
+                        });
+                        let idx = match existing {
+                            Some(i) => i,
+                            None => {
+                                self.register_sva_site(a, clock_signal, edge, iff, body);
+                                self.sva_sites.len() - 1
                             }
-                            let action_pid = self.next_pid;
-                            self.next_pid += 1;
-                            self.process_scope_hint.insert(action_pid, scope.clone());
-                            let src = self.scope_src_file(Some(scope.as_str()));
-                            self.sva_sites.push(SvaClockedSite {
-                                span_key,
-                                stat_key: Self::assert_stat_key(span_key, src),
-                                stat_loc: (src, span_key),
-                                dedup_scope: self.current_scope.clone(),
-                                kind,
-                                all_matches: a.is_sequence,
-                                clock_signal,
-                                edge,
-                                iff,
-                                body: body_expanded,
-                                past_names,
-                                node: std::sync::Arc::new(node),
-                                disable,
-                                prev_clock: 2, // sentinel
-                                attempts: Vec::new(),
-                                past_snapshots: HashMap::default(),
-                                pass_action: a.action.as_deref().cloned(),
-                                fail_action: a.else_action.as_deref().cloned(),
-                                scope,
-                                action_pid,
-                                m_chain,
-                                sampled_ids,
-                            });
+                        };
+                        // §16.14.6.2: each execution of a procedural
+                        // concurrent assertion queues one instance, with the
+                        // automatic variables it reads captured now.
+                        if self.sva_sites[idx].procedural {
+                            let mut env = self.sva_sites[idx].lv_init.clone();
+                            for (k, name) in &self.sva_sites[idx].captured {
+                                if let Some(v) =
+                                    self.local_stack.last().and_then(|m| m.get(name.as_str()))
+                                {
+                                    env[*k] = v.clone();
+                                }
+                            }
+                            let pid = if self.settling {
+                                usize::MAX
+                            } else {
+                                self.current_pid
+                            };
+                            self.sva_proc_pending.push((idx, pid, env));
                         }
                         return;
                     }
@@ -86984,6 +87094,10 @@ impl Simulator {
                 if !true_branch {
                     if let Some(ea) = &a.else_action {
                         self.exec_statement(ea);
+                    } else if kind_tag != 2 {
+                        // §16.3: with no `else` clause a failure calls
+                        // `$error` (a cover has no failure action).
+                        self.emit_severity_text("Error", ASSERT_DEFAULT_ERROR);
                     }
                 } else if let Some(ac) = &a.action {
                     self.exec_statement(ac);
@@ -89491,6 +89605,11 @@ impl Simulator {
     /// `emit_severity` with the message already formatted.
     fn emit_severity_text(&mut self, severity: &str, body: &str) {
         let scope = self.severity_scope();
+        self.emit_severity_text_in(severity, body, &scope);
+    }
+
+    /// `emit_severity_text` naming `scope` in the context line.
+    fn emit_severity_text_in(&mut self, severity: &str, body: &str, scope: &str) {
         let time_s = self.format_time_parts(self.time_in_current_unit()).0;
         let line = if body.is_empty() {
             format!("** {}", severity)
@@ -91615,6 +91734,20 @@ impl Simulator {
                         SvaSeq::FirstMatch(Box::new(self.sva_seq_from_expr(s)))
                     }
                     ("$sva_strong", Some(s)) | ("$sva_weak", Some(s)) => self.sva_seq_from_expr(s),
+                    // §16.10 / §16.11 `(seq, item...)`: the items run when
+                    // `seq` matches.
+                    ("$sva_match", Some(s)) => {
+                        let items = args[1..].iter().map(|a| self.sva_match_item(a)).collect();
+                        Self::sva_concat(self.sva_seq_from_expr(s), SvaSeq::Assign(items))
+                    }
+                    // §16.10: a sequence's local variable initialisers run
+                    // when its evaluation starts.
+                    ("$sva_locals", Some(_)) => {
+                        let (body, inits) = args.split_last().unwrap();
+                        let items: Vec<SvaMatchItem> =
+                            inits.iter().map(|a| self.sva_match_item(a)).collect();
+                        Self::sva_concat(SvaSeq::Assign(items), self.sva_seq_from_expr(body))
+                    }
                     _ => SvaSeq::Bool(e.clone()),
                 }
             }
@@ -91659,11 +91792,118 @@ impl Simulator {
         }
     }
 
+    /// A §16.10 / §16.11 match item: an assignment (`v = e`, `v += e`,
+    /// `v++`) to a local variable slot bound by `sva_bind_locals`, or a
+    /// subroutine call.
+    fn sva_match_item(&self, e: &Expression) -> SvaMatchItem {
+        use crate::ast::expr::{BinaryOp, UnaryOp};
+        let slot_of = |lv: &Expression| -> Option<(usize, u32, bool)> {
+            let k = Self::sva_lv_slot(lv)?;
+            let (w, signed, _) = self.sva_lv_types.get(k).copied()?;
+            Some((k, w, signed))
+        };
+        let one = |span| SvaNfaBuilder::true_lit(span);
+        match &e.kind {
+            ExprKind::Paren(inner) => return self.sva_match_item(inner),
+            ExprKind::AssignExpr { lvalue, rvalue }
+            | ExprKind::Binary {
+                op: BinaryOp::Assign,
+                left: lvalue,
+                right: rvalue,
+            } => {
+                if let Some(slot) = slot_of(lvalue) {
+                    return SvaMatchItem {
+                        slot: Some(slot),
+                        expr: (**rvalue).clone(),
+                    };
+                }
+            }
+            ExprKind::Unary { op, operand }
+                if matches!(
+                    op,
+                    UnaryOp::PostIncr | UnaryOp::PreIncr | UnaryOp::PostDecr | UnaryOp::PreDecr
+                ) =>
+            {
+                if let Some(slot) = slot_of(operand) {
+                    let bop = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) {
+                        BinaryOp::Add
+                    } else {
+                        BinaryOp::Sub
+                    };
+                    return SvaMatchItem {
+                        slot: Some(slot),
+                        expr: Expression::new(
+                            ExprKind::Binary {
+                                op: bop,
+                                left: operand.clone(),
+                                right: Box::new(one(e.span)),
+                            },
+                            e.span,
+                        ),
+                    };
+                }
+            }
+            _ => {}
+        }
+        SvaMatchItem {
+            slot: None,
+            expr: e.clone(),
+        }
+    }
+
+    /// The slot of a local variable read bound by `sva_bind_locals`.
+    fn sva_lv_slot(e: &Expression) -> Option<usize> {
+        match &e.kind {
+            ExprKind::Paren(inner) => Self::sva_lv_slot(inner),
+            ExprKind::SystemCall { name, args } if name == SVA_SIG_MARKER && args.len() == 2 => {
+                match &args[0].kind {
+                    ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.parse().ok(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// §16.10: run `init` (a property's local variable initialisers) when
+    /// each evaluation of `node` starts — ahead of its leading sequences.
+    fn sva_inject_init(node: &mut SvaNode, init: &[SvaMatchItem]) {
+        let inject = |nfa: &mut SvaNfa| {
+            nfa.states
+                .push(vec![SvaEdge::Assign(init.to_vec(), nfa.start)]);
+            nfa.start = nfa.states.len() - 1;
+        };
+        match node {
+            SvaNode::Seq(nfa, _) => inject(nfa),
+            SvaNode::Impl { ante, .. } => inject(ante),
+            SvaNode::Not(inner) => Self::sva_inject_init(inner, init),
+            SvaNode::And(a, b) | SvaNode::Or(a, b) => {
+                Self::sva_inject_init(a, init);
+                Self::sva_inject_init(b, init);
+            }
+            // Not modelled: initialisers ahead of `s_eventually` /
+            // `s_always` of a boolean.
+            SvaNode::Eventually(_) | SvaNode::Always(_) => {}
+        }
+    }
+
     /// Compile a property body (§16.12) into an `SvaNode`.
     fn sva_compile_node(&mut self, e: &Expression) -> SvaNode {
         use crate::ast::expr::{BinaryOp, UnaryOp};
         match &e.kind {
             ExprKind::Paren(inner) => self.sva_compile_node(inner),
+            // §16.10: a property's local variables; their initialisers run
+            // at the start of each evaluation.
+            ExprKind::SystemCall { name, args } if name == "$sva_locals" && !args.is_empty() => {
+                let (body, inits) = args.split_last().unwrap();
+                let items: Vec<SvaMatchItem> =
+                    inits.iter().map(|a| self.sva_match_item(a)).collect();
+                let mut node = self.sva_compile_node(body);
+                if !items.is_empty() {
+                    Self::sva_inject_init(&mut node, &items);
+                }
+                node
+            }
             ExprKind::Binary { op, left, right }
                 if matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow) =>
             {
@@ -91719,7 +91959,7 @@ impl Simulator {
     fn sva_strong_pending(node: &SvaNode, st: &SvaState) -> bool {
         match (node, st) {
             (SvaNode::Seq(_, strong), SvaState::Seq(_)) => *strong,
-            (SvaNode::Eventually(_), SvaState::Leaf) => true,
+            (SvaNode::Eventually(_), SvaState::Leaf(_)) => true,
             (SvaNode::Impl { cons: cn, .. }, SvaState::Impl { cons, .. }) => {
                 cons.iter().any(|(_, cs)| Self::sva_strong_pending(cn, cs))
             }
@@ -91763,6 +92003,9 @@ impl Simulator {
         use crate::ast::expr::{BinaryOp, UnaryOp};
         match &e.kind {
             ExprKind::Paren(inner) => Self::sva_has_property_op(inner),
+            ExprKind::SystemCall { name, args } if name == "$sva_locals" => {
+                args.last().is_some_and(Self::sva_has_property_op)
+            }
             ExprKind::Binary { op, left, right } => {
                 matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow)
                     || (matches!(op, BinaryOp::SvaAnd | BinaryOp::SeqOr)
@@ -91791,90 +92034,160 @@ impl Simulator {
         (None, self.sva_compile_node(inner))
     }
 
-    fn sva_new_state(node: &SvaNode) -> SvaState {
+    fn sva_new_state(node: &SvaNode, env: &SvaEnv) -> SvaState {
         match node {
-            SvaNode::Seq(..) => SvaState::Seq(SvaRun::default()),
-            SvaNode::Not(inner) => SvaState::Not(Box::new(Self::sva_new_state(inner))),
+            SvaNode::Seq(..) => SvaState::Seq(SvaRun::with_env(env.clone())),
+            SvaNode::Not(inner) => SvaState::Not(Box::new(Self::sva_new_state(inner, env))),
             SvaNode::Impl { .. } => SvaState::Impl {
-                ante: SvaRun::default(),
+                ante: SvaRun::with_env(env.clone()),
                 ante_alive: true,
                 matched_any: false,
                 cons: Vec::new(),
             },
             SvaNode::And(a, b) => SvaState::And {
-                a: Box::new(Self::sva_new_state(a)),
-                b: Box::new(Self::sva_new_state(b)),
+                a: Box::new(Self::sva_new_state(a, env)),
+                b: Box::new(Self::sva_new_state(b, env)),
                 ra: None,
                 rb: None,
             },
             SvaNode::Or(a, b) => SvaState::Or {
-                a: Box::new(Self::sva_new_state(a)),
-                b: Box::new(Self::sva_new_state(b)),
+                a: Box::new(Self::sva_new_state(a, env)),
+                b: Box::new(Self::sva_new_state(b, env)),
                 ra: None,
                 rb: None,
             },
-            SvaNode::Eventually(_) | SvaNode::Always(_) => SvaState::Leaf,
+            SvaNode::Eventually(_) | SvaNode::Always(_) => SvaState::Leaf(env.clone()),
         }
     }
 
+    /// Evaluate `e` for a thread whose local variables (§16.10) are `env`:
+    /// they are installed as `sva_lv` for the reads of their slot markers.
+    fn sva_eval_env(&mut self, e: &Expression, env: &mut SvaEnv) -> Value {
+        if env.is_empty() {
+            return self.eval_expr(e);
+        }
+        std::mem::swap(&mut self.sva_lv, env);
+        let v = self.eval_expr(e);
+        std::mem::swap(&mut self.sva_lv, env);
+        v
+    }
+
+    /// Run match items on a copy of `env` (§16.10 assignments in order,
+    /// §16.11 subroutine calls for their side effects).
+    fn sva_run_match_items(&mut self, items: &[SvaMatchItem], env: &SvaEnv) -> SvaEnv {
+        let mut env = env.clone();
+        for it in items {
+            match it.slot {
+                Some((k, w, signed)) => {
+                    let v = self.sva_eval_env(&it.expr, &mut env);
+                    let mut v = v.resize_for_assign(w);
+                    v.is_signed = signed;
+                    if let Some(slot) = env.get_mut(k) {
+                        *slot = v;
+                    }
+                }
+                None => {
+                    let stmt = Statement::new(StatementKind::Expr(it.expr.clone()), it.expr.span);
+                    std::mem::swap(&mut self.sva_lv, &mut env);
+                    self.exec_statement(&stmt);
+                    std::mem::swap(&mut self.sva_lv, &mut env);
+                }
+            }
+        }
+        env
+    }
+
+    /// §16.10: the local variables after both operands of an `and` /
+    /// `intersect` matched: `a`'s, with every slot `b` assigned (changed from
+    /// the values the compound was entered with) taken from `b`.
+    fn sva_merge_env(a: &SvaEnv, b: &SvaEnv, base: &SvaEnv) -> SvaEnv {
+        let mut out = a.clone();
+        for (k, v) in b.iter().enumerate() {
+            if base.get(k) != Some(v) {
+                if let Some(o) = out.get_mut(k) {
+                    *o = v.clone();
+                }
+            }
+        }
+        out
+    }
+
     /// Advance a sequence automaton by one clock tick (the first call is the
-    /// start tick). Returns `(matched at this tick, still alive)`. With
-    /// `first_match` the run stops at its first match.
+    /// start tick). Returns the local variables of each thread that matched
+    /// at this tick (none: no match), and whether the run is still alive.
+    /// With `first_match` the run stops at its first match.
     fn sva_run_advance(
         &mut self,
         nfa: &SvaNfa,
         run: &mut SvaRun,
         first_match: bool,
-    ) -> (bool, bool) {
-        let mut work: Vec<usize> = Vec::new();
+    ) -> (Vec<SvaEnv>, bool) {
+        let mut work: Vec<(usize, SvaEnv)> = Vec::new();
         let mut subs: Vec<SvaSubRun> = Vec::new();
         if !run.started {
             run.started = true;
-            work.push(nfa.start);
+            work.push((nfa.start, std::mem::take(&mut run.init_env)));
         } else {
-            for &pc in &run.pcs {
+            for (pc, env) in run.pcs.drain(..) {
                 for e in &nfa.states[pc] {
                     if let SvaEdge::Tick(t) = e {
-                        work.push(*t);
+                        work.push((*t, env.clone()));
                     }
                 }
             }
             for mut sub in run.subs.drain(..) {
                 let (m, alive) = self.sva_sub_advance(nfa, &mut sub);
-                if m {
-                    work.push(sub.target);
+                for env in m {
+                    work.push((sub.target, env));
                 }
                 if alive {
                     subs.push(sub);
                 }
             }
         }
+        // A state is visited once per distinct set of local values; a run
+        // with no locals (every env empty) needs only the state.
         let mut visited = vec![false; nfa.states.len()];
-        let mut tick_pcs: Vec<usize> = Vec::new();
-        let mut matched = false;
-        while let Some(pc) = work.pop() {
-            if visited[pc] {
-                continue;
+        let mut seen: Vec<(usize, SvaEnv)> = Vec::new();
+        let mut tick_pcs: Vec<(usize, SvaEnv)> = Vec::new();
+        let mut matched: Vec<SvaEnv> = Vec::new();
+        while let Some((pc, mut env)) = work.pop() {
+            if env.is_empty() {
+                if visited[pc] {
+                    continue;
+                }
+                visited[pc] = true;
+            } else {
+                if seen.iter().any(|(p, e)| *p == pc && *e == env) {
+                    continue;
+                }
+                seen.push((pc, env.clone()));
             }
-            visited[pc] = true;
             if pc == nfa.accept {
-                matched = true;
+                if !matched.contains(&env) {
+                    matched.push(env.clone());
+                }
                 if first_match {
                     break;
                 }
             }
             for ei in 0..nfa.states[pc].len() {
                 match &nfa.states[pc][ei] {
-                    SvaEdge::Eps(t) => work.push(*t),
+                    SvaEdge::Eps(t) => work.push((*t, env.clone())),
                     SvaEdge::Check(c, t) => {
-                        if self.eval_expr(c).is_true() {
-                            work.push(*t);
+                        if self.sva_eval_env(c, &mut env).is_true() {
+                            work.push((*t, env.clone()));
                         }
                     }
                     SvaEdge::Tick(_) => {
-                        if !tick_pcs.contains(&pc) {
-                            tick_pcs.push(pc);
+                        if !tick_pcs.iter().any(|(p, e)| *p == pc && *e == env) {
+                            tick_pcs.push((pc, env.clone()));
                         }
+                    }
+                    SvaEdge::Assign(items, t) => {
+                        let items = items.clone();
+                        let next = self.sva_run_match_items(&items, &env);
+                        work.push((*t, next));
                     }
                     SvaEdge::Sub(comp, t) => {
                         let n = match &**comp {
@@ -91884,12 +92197,14 @@ impl Simulator {
                         let mut sub = SvaSubRun {
                             at: (pc, ei),
                             target: *t,
-                            runs: vec![SvaRun::default(); n],
+                            runs: vec![SvaRun::with_env(env.clone()); n],
                             ever: [false, false],
+                            env: env.clone(),
+                            ever_env: [Vec::new(), Vec::new()],
                         };
                         let (m, alive) = self.sva_sub_advance(nfa, &mut sub);
-                        if m {
-                            work.push(*t);
+                        for menv in m {
+                            work.push((*t, menv));
                         }
                         if alive {
                             subs.push(sub);
@@ -91898,45 +92213,72 @@ impl Simulator {
                 }
             }
         }
-        if matched && first_match {
+        if !matched.is_empty() && first_match {
             run.pcs.clear();
             run.subs.clear();
-            return (true, false);
+            return (matched, false);
         }
         run.pcs = tick_pcs;
         run.subs = subs;
-        (matched, !run.pcs.is_empty() || !run.subs.is_empty())
+        let alive = !run.pcs.is_empty() || !run.subs.is_empty();
+        (matched, alive)
     }
 
-    /// Advance one compound edge; `(matched at this tick, still alive)`.
-    fn sva_sub_advance(&mut self, nfa: &SvaNfa, sub: &mut SvaSubRun) -> (bool, bool) {
+    /// Advance one compound edge: the local variables of each match at this
+    /// tick, and whether it is still alive.
+    fn sva_sub_advance(&mut self, nfa: &SvaNfa, sub: &mut SvaSubRun) -> (Vec<SvaEnv>, bool) {
         let SvaEdge::Sub(comp, _) = &nfa.states[sub.at.0][sub.at.1] else {
-            return (false, false);
+            return (Vec::new(), false);
         };
         match &**comp {
             SvaCompound::FirstMatch(inner) => {
                 let (m, alive) = self.sva_run_advance(inner, &mut sub.runs[0], true);
-                if m { (true, false) } else { (false, alive) }
+                if !m.is_empty() {
+                    (m, false)
+                } else {
+                    (m, alive)
+                }
             }
             SvaCompound::Throughout(e, inner) => {
-                if !self.eval_expr(e).is_true() {
-                    return (false, false);
+                let mut env = std::mem::take(&mut sub.env);
+                let holds = self.sva_eval_env(e, &mut env).is_true();
+                sub.env = env;
+                if !holds {
+                    return (Vec::new(), false);
                 }
                 self.sva_run_advance(inner, &mut sub.runs[0], false)
             }
             SvaCompound::And(n1, n2) => {
                 let (m1, a1) = self.sva_run_advance(n1, &mut sub.runs[0], false);
                 let (m2, a2) = self.sva_run_advance(n2, &mut sub.runs[1], false);
-                let matched = (m1 && (m2 || sub.ever[1])) || (m2 && sub.ever[0]);
-                sub.ever[0] |= m1;
-                sub.ever[1] |= m2;
+                let mut out: Vec<SvaEnv> = Vec::new();
+                if !m1.is_empty() && !m2.is_empty() {
+                    out.push(Self::sva_merge_env(&m1[0], &m2[0], &sub.env));
+                } else if !m1.is_empty() && sub.ever[1] {
+                    out.push(Self::sva_merge_env(&m1[0], &sub.ever_env[1], &sub.env));
+                } else if !m2.is_empty() && sub.ever[0] {
+                    out.push(Self::sva_merge_env(&sub.ever_env[0], &m2[0], &sub.env));
+                }
+                if let Some(e) = m1.into_iter().next() {
+                    sub.ever[0] = true;
+                    sub.ever_env[0] = e;
+                }
+                if let Some(e) = m2.into_iter().next() {
+                    sub.ever[1] = true;
+                    sub.ever_env[1] = e;
+                }
                 let dead = (!a1 && !sub.ever[0]) || (!a2 && !sub.ever[1]) || (!a1 && !a2);
-                (matched, !dead)
+                (out, !dead)
             }
             SvaCompound::Intersect(n1, n2) => {
                 let (m1, a1) = self.sva_run_advance(n1, &mut sub.runs[0], false);
                 let (m2, a2) = self.sva_run_advance(n2, &mut sub.runs[1], false);
-                (m1 && m2, a1 && a2)
+                let out = if !m1.is_empty() && !m2.is_empty() {
+                    vec![Self::sva_merge_env(&m1[0], &m2[0], &sub.env)]
+                } else {
+                    Vec::new()
+                };
+                (out, a1 && a2)
             }
         }
     }
@@ -91946,7 +92288,7 @@ impl Simulator {
         match (node, st) {
             (SvaNode::Seq(nfa, _), SvaState::Seq(run)) => {
                 let (m, alive) = self.sva_run_advance(nfa, run, true);
-                if m {
+                if !m.is_empty() {
                     Some(SvaOutcome::Pass)
                 } else if !alive {
                     Some(SvaOutcome::Fail)
@@ -91972,13 +92314,17 @@ impl Simulator {
                     cons,
                 },
             ) => {
-                let mut fresh: Option<SvaState> = None;
+                // Every match of the antecedent starts one evaluation of the
+                // consequent, with the local variables of that match.
+                let mut fresh: Vec<SvaState> = Vec::new();
                 if *ante_alive {
                     let (m, alive) = self.sva_run_advance(ante, arun, false);
                     *ante_alive = alive;
-                    if m {
+                    if !m.is_empty() {
                         *matched_any = true;
-                        fresh = Some(Self::sva_new_state(cons_node));
+                        for env in &m {
+                            fresh.push(Self::sva_new_state(cons_node, env));
+                        }
                     }
                 }
                 let mut failed = false;
@@ -91997,7 +92343,7 @@ impl Simulator {
                         None => keep.push((0, cst)),
                     }
                 }
-                if let Some(mut cst) = fresh {
+                for mut cst in fresh {
                     if *overlap {
                         match self.sva_advance(cons_node, &mut cst) {
                             Some(SvaOutcome::Fail) => failed = true,
@@ -92063,15 +92409,15 @@ impl Simulator {
                     _ => None,
                 }
             }
-            (SvaNode::Eventually(e), SvaState::Leaf) => {
-                if self.eval_expr(e).is_true() {
+            (SvaNode::Eventually(e), SvaState::Leaf(env)) => {
+                if self.sva_eval_env(e, env).is_true() {
                     Some(SvaOutcome::Pass)
                 } else {
                     None
                 }
             }
-            (SvaNode::Always(e), SvaState::Leaf) => {
-                if self.eval_expr(e).is_true() {
+            (SvaNode::Always(e), SvaState::Leaf(env)) => {
+                if self.sva_eval_env(e, env).is_true() {
                     None
                 } else {
                     Some(SvaOutcome::Fail)
@@ -92079,6 +92425,131 @@ impl Simulator {
             }
             _ => Some(SvaOutcome::Vacuous),
         }
+    }
+
+    /// LRM §16.5: register the clocked site of a concurrent assertion
+    /// statement on its first execution: expand named sequences and
+    /// properties, bind its local variables (§16.10) and, for a procedural
+    /// assertion, the automatic variables it captures (§16.14.6.1), and
+    /// compile the property.
+    fn register_sva_site(
+        &mut self,
+        a: &crate::ast::stmt::AssertionStatement,
+        clock_signal: String,
+        edge: u8,
+        iff: Option<Expression>,
+        body: Expression,
+    ) {
+        use crate::ast::stmt::AssertionKind;
+        let span_key = a.span.start;
+        let kind: u8 = match a.kind {
+            AssertionKind::Assert => 0,
+            AssertionKind::Assume => 1,
+            AssertionKind::Cover => 2,
+        };
+        // Named sequence / property instances INSIDE the body (`a |=> s`)
+        // expand here, once.
+        let mut body_expanded = self.sva_expand_named(&body, 0);
+        let mut lv_init: Vec<Value> = Vec::new();
+        let mut lv_types =
+            self.sva_bind_locals(&mut body_expanded, &HashMap::default(), &mut lv_init);
+        let procedural = a.procedural;
+        let mut captured: Vec<(usize, String)> = Vec::new();
+        if procedural {
+            self.sva_capture_proc_locals(
+                &mut body_expanded,
+                &mut captured,
+                &mut lv_init,
+                &mut lv_types,
+            );
+        }
+        // LRM §16.5.1: collect the ids of every signal referenced in the
+        // property body so their Preponed (slot-entry) values can be sampled
+        // when the assertion fires (see eval_sva_sampled).
+        let mut sampled_ids = Vec::new();
+        self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
+        sampled_ids.sort_unstable();
+        sampled_ids.dedup();
+        // A site registered mid-slot (a procedural assertion, while its
+        // procedure runs in the Active region) has no slot-entry samples yet:
+        // take the values now, before this slot's nonblocking updates.
+        for &id in &sampled_ids {
+            if id < self.signal_table.len() && !self.sva_preponed.contains_key(&id) {
+                self.sva_preponed.insert(id, self.signal_table[id].clone());
+            }
+        }
+        let mut past_names = Vec::new();
+        self.collect_past_arg_names(&body_expanded, &mut past_names);
+        // A signal is sampled once per property clock, however many
+        // sampled-value calls reference it.
+        past_names.sort_unstable();
+        past_names.dedup();
+        self.sva_resolve_signals(&mut body_expanded);
+        self.sva_lv_types = lv_types;
+        let (disable, node) = self.sva_compile_site(&body_expanded);
+        self.sva_lv_types = Vec::new();
+        let scope = self.active_instance_scope();
+        // §16.15: without a `disable iff` of its own, the scope's default
+        // disable condition applies.
+        let explicit_disable = disable.is_some();
+        let disable_scope = self.m_path();
+        let disable = disable.or_else(|| self.sva_default_disable_for(&disable_scope));
+        let mut m_chain = self.m_scope_stack.clone();
+        if let Some(l) = &a.label {
+            m_chain.push(l.name.clone());
+        }
+        let action_pid = self.next_pid;
+        self.next_pid += 1;
+        self.process_scope_hint.insert(action_pid, scope.clone());
+        let src = self.scope_src_file(Some(scope.as_str()));
+        // A procedural assertion registers while its procedure runs, which
+        // for an edge-triggered procedure is at the tick that starts its
+        // first attempt: take that edge as seen (§16.14.6).
+        let prev_clock = if procedural {
+            let cur = self
+                .get_signal_value_by_name(&clock_signal)
+                .and_then(|v| v.to_u64())
+                .map(|u| (u & 1) as u8)
+                .unwrap_or(2);
+            match (edge, cur) {
+                (0, 1) => 0,
+                (1, 0) => 1,
+                (2, 0 | 1) => cur ^ 1,
+                _ => cur,
+            }
+        } else {
+            2 // sentinel
+        };
+        self.sva_sites.push(SvaClockedSite {
+            span_key,
+            stat_key: Self::assert_stat_key(span_key, src),
+            stat_loc: (src, span_key),
+            dedup_scope: self.current_scope.clone(),
+            kind,
+            all_matches: a.is_sequence,
+            clock_signal,
+            edge,
+            iff,
+            body: body_expanded,
+            past_names,
+            node: std::sync::Arc::new(node),
+            disable,
+            prev_clock,
+            attempts: Vec::new(),
+            past_snapshots: HashMap::default(),
+            pass_action: a.action.as_deref().cloned(),
+            fail_action: a.else_action.as_deref().cloned(),
+            scope,
+            action_pid,
+            m_chain,
+            sampled_ids,
+            lv_init,
+            procedural,
+            captured,
+            matured: Vec::new(),
+            explicit_disable,
+            disable_scope,
+        });
     }
 
     /// Tally one finished attempt on a site: cover sites count matches only.
@@ -92109,7 +92580,26 @@ impl Simulator {
             let act = if passed {
                 s.pass_action.clone()
             } else {
-                s.fail_action.clone()
+                // §16.3: a failure with no `else` clause calls `$error`
+                // (a cover has no failure action).
+                s.fail_action.clone().or_else(|| {
+                    (s.kind != 2).then(|| {
+                        let span = crate::ast::Span::dummy();
+                        Statement::new(
+                            StatementKind::Expr(Expression::new(
+                                ExprKind::SystemCall {
+                                    name: "$error".to_string(),
+                                    args: vec![Expression::new(
+                                        ExprKind::StringLiteral(ASSERT_DEFAULT_ERROR.to_string()),
+                                        span,
+                                    )],
+                                },
+                                span,
+                            )),
+                            span,
+                        )
+                    })
+                })
             };
             act.map(|a| (a, s.scope.clone(), s.action_pid, s.m_chain.clone()))
         }) else {
@@ -92367,6 +92857,16 @@ impl Simulator {
     }
 
     fn tick_sva_sites_inner(&mut self) {
+        // §16.14.6.2: the procedural instances queued so far mature (no
+        // flush point can drop them any more); each starts an attempt at the
+        // next tick of its leading clock.
+        if !self.sva_proc_pending.is_empty() {
+            for (idx, _, env) in std::mem::take(&mut self.sva_proc_pending) {
+                if let Some(site) = self.sva_sites.get_mut(idx) {
+                    site.matured.push(env);
+                }
+            }
+        }
         // Use indices so we can call &mut self methods inside the loop
         // without holding a borrow on self.sva_sites.
         for i in 0..self.sva_sites.len() {
@@ -92420,13 +92920,21 @@ impl Simulator {
             self.sva_sites[i].disable = disable;
             if disabled {
                 self.sva_sites[i].attempts.clear();
+                self.sva_sites[i].matured.clear();
                 self.sva_sites[i].sampled_ids = sampled_ids;
                 self.active_sva_site = prev_active;
                 continue;
             }
             let saved = self.install_preponed(&sampled_ids);
             let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
-            attempts.push(Self::sva_new_state(&node));
+            if self.sva_sites[i].procedural {
+                // §16.14.6: one attempt per matured instance, none otherwise.
+                for env in std::mem::take(&mut self.sva_sites[i].matured) {
+                    attempts.push(Self::sva_new_state(&node, &env));
+                }
+            } else {
+                attempts.push(Self::sva_new_state(&node, &self.sva_sites[i].lv_init));
+            }
             let mut results: Vec<SvaOutcome> = Vec::new();
             let mut live: Vec<SvaState> = Vec::with_capacity(attempts.len());
             let all_matches = self.sva_sites[i].all_matches;
@@ -92439,7 +92947,7 @@ impl Simulator {
                         _ => None,
                     };
                     if let Some((matched, alive)) = step {
-                        if matched {
+                        if !matched.is_empty() {
                             results.push(SvaOutcome::Pass);
                         }
                         if alive {
@@ -92607,6 +93115,9 @@ impl Simulator {
 
     /// The value behind an `SVA_SIG_MARKER` read.
     fn sva_sig_read(&self, args: &[Expression]) -> Value {
+        if args.len() == 2 {
+            return self.sva_lv_read(args);
+        }
         let id = match args.first().map(|a| &a.kind) {
             Some(ExprKind::Number(NumberLiteral::Integer { value, .. })) => {
                 value.parse::<usize>().unwrap_or(usize::MAX)
@@ -92624,6 +93135,344 @@ impl Simulator {
             v.is_real = true;
         }
         v
+    }
+
+    /// §16.10: a local variable read (a two-argument `SVA_SIG_MARKER`: the
+    /// slot, then 1) from the thread being evaluated.
+    #[inline(never)]
+    fn sva_lv_read(&self, args: &[Expression]) -> Value {
+        let k = match &args[0].kind {
+            ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                value.parse::<usize>().unwrap_or(usize::MAX)
+            }
+            _ => usize::MAX,
+        };
+        self.sva_lv.get(k).cloned().unwrap_or_else(|| Value::new(1))
+    }
+
+    /// The marker read of local variable slot `k` (see `sva_lv_read`).
+    fn sva_lv_marker(k: usize, span: crate::ast::Span) -> Expression {
+        let num = |v: usize| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: Cell::new(None),
+                }),
+                span,
+            )
+        };
+        Expression::new(
+            ExprKind::SystemCall {
+                name: SVA_SIG_MARKER.to_string(),
+                args: vec![num(k), num(1)],
+            },
+            span,
+        )
+    }
+
+    /// §16.10: give each local variable declared in `e` (by a property or a
+    /// sequence instance: `$sva_locals(<decl>..., <body>)`) its own slot, and
+    /// turn every reference to it in its scope into a slot marker read. The
+    /// declarations become initialising assignments (dropped when there are
+    /// none); the slot types go to `sva_lv_types`, their initial values to
+    /// `init`.
+    fn sva_bind_locals(
+        &self,
+        e: &mut Expression,
+        names: &HashMap<String, usize>,
+        init: &mut Vec<Value>,
+    ) -> Vec<(u32, bool, bool)> {
+        let mut types = Vec::new();
+        self.sva_bind_locals_in(e, names, init, &mut types);
+        types
+    }
+
+    fn sva_bind_locals_in(
+        &self,
+        e: &mut Expression,
+        names: &HashMap<String, usize>,
+        init: &mut Vec<Value>,
+        types: &mut Vec<(u32, bool, bool)>,
+    ) {
+        let span = e.span;
+        match &mut e.kind {
+            ExprKind::SystemCall { name, args } if name == "$sva_locals" && !args.is_empty() => {
+                let mut body = args.pop().unwrap();
+                let mut scope = names.clone();
+                let mut assigns: Vec<Expression> = Vec::new();
+                for decl in args.iter() {
+                    let ExprKind::SystemCall { args: d, .. } = &decl.kind else {
+                        continue;
+                    };
+                    let (Some(ExprKind::TypeLiteral(dt)), Some(ExprKind::Ident(h))) =
+                        (d.first().map(|x| &x.kind), d.get(1).map(|x| &x.kind))
+                    else {
+                        continue;
+                    };
+                    let Some(seg) = h.path.last() else {
+                        continue;
+                    };
+                    let w = super::elaborate::resolve_type_width(
+                        dt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    )
+                    .max(1);
+                    let signed = self.type_is_signed_concrete(dt);
+                    let two_state = super::elaborate::is_type_two_state(dt);
+                    let k = init.len();
+                    let mut v = if two_state {
+                        Value::zero(w)
+                    } else {
+                        Value::new(w)
+                    };
+                    v.is_signed = signed;
+                    init.push(v);
+                    types.push((w, signed, two_state));
+                    if let Some(iv) = d.get(2) {
+                        let mut iv = iv.clone();
+                        self.sva_bind_locals_in(&mut iv, &scope, init, types);
+                        assigns.push(Expression::new(
+                            ExprKind::AssignExpr {
+                                lvalue: Box::new(Self::sva_lv_marker(k, decl.span)),
+                                rvalue: Box::new(iv),
+                            },
+                            decl.span,
+                        ));
+                    }
+                    scope.insert(seg.name.name.clone(), k);
+                }
+                self.sva_bind_locals_in(&mut body, &scope, init, types);
+                if assigns.is_empty() {
+                    *e = body;
+                } else {
+                    assigns.push(body);
+                    *args = assigns;
+                }
+            }
+            ExprKind::Ident(h) => {
+                if names.is_empty() || h.root.is_some() || h.path.len() != 1 {
+                    return;
+                }
+                let Some(&k) = names.get(h.path[0].name.name.as_str()) else {
+                    return;
+                };
+                let selects = std::mem::take(&mut h.path[0].selects);
+                let mut out = Self::sva_lv_marker(k, span);
+                for mut sel in selects {
+                    self.sva_bind_locals_in(&mut sel, names, init, types);
+                    out = match sel.kind {
+                        ExprKind::Range(l, r) => Expression::new(
+                            ExprKind::RangeSelect {
+                                expr: Box::new(out),
+                                kind: crate::ast::expr::RangeKind::Constant,
+                                left: l,
+                                right: r,
+                            },
+                            span,
+                        ),
+                        _ => Expression::new(
+                            ExprKind::Index {
+                                expr: Box::new(out),
+                                index: Box::new(sel),
+                            },
+                            span,
+                        ),
+                    };
+                }
+                *e = out;
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.sva_bind_locals_in(operand, names, init, types)
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::AssignExpr {
+                lvalue: left,
+                rvalue: right,
+            }
+            | ExprKind::Range(left, right) => {
+                self.sva_bind_locals_in(left, names, init, types);
+                self.sva_bind_locals_in(right, names, init, types);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.sva_bind_locals_in(condition, names, init, types);
+                self.sva_bind_locals_in(then_expr, names, init, types);
+                self.sva_bind_locals_in(else_expr, names, init, types);
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::SystemCall { args, .. }
+            | ExprKind::Concatenation(args) => {
+                for a in args {
+                    self.sva_bind_locals_in(a, names, init, types);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                self.sva_bind_locals_in(count, names, init, types);
+                for a in exprs {
+                    self.sva_bind_locals_in(a, names, init, types);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                self.sva_bind_locals_in(expr, names, init, types);
+                self.sva_bind_locals_in(index, names, init, types);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.sva_bind_locals_in(expr, names, init, types);
+                self.sva_bind_locals_in(left, names, init, types);
+                self.sva_bind_locals_in(right, names, init, types);
+            }
+            ExprKind::Inside { expr, ranges } => {
+                self.sva_bind_locals_in(expr, names, init, types);
+                for r in ranges {
+                    self.sva_bind_locals_in(r, names, init, types);
+                }
+            }
+            ExprKind::MemberAccess { expr, .. } => {
+                self.sva_bind_locals_in(expr, names, init, types)
+            }
+            ExprKind::SvaClocked { body, .. } => self.sva_bind_locals_in(body, names, init, types),
+            _ => {}
+        }
+    }
+
+    /// §16.14.6.1: the automatic variables of the running procedure that a
+    /// procedural concurrent assertion reads become slots too, filled with
+    /// their values each time the statement executes (`captured`).
+    fn sva_capture_proc_locals(
+        &self,
+        e: &mut Expression,
+        captured: &mut Vec<(usize, String)>,
+        init: &mut Vec<Value>,
+        types: &mut Vec<(u32, bool, bool)>,
+    ) {
+        let span = e.span;
+        match &mut e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.len() != 1 {
+                    return;
+                }
+                let name = h.path[0].name.name.clone();
+                let k = if let Some((k, _)) = captured.iter().find(|(_, n)| *n == name) {
+                    *k
+                } else {
+                    let Some(v) = self.local_stack.last().and_then(|m| m.get(name.as_str())) else {
+                        return;
+                    };
+                    let k = init.len();
+                    init.push(v.clone());
+                    types.push((v.width, v.is_signed, false));
+                    captured.push((k, name));
+                    k
+                };
+                let selects = std::mem::take(&mut h.path[0].selects);
+                let mut out = Self::sva_lv_marker(k, span);
+                for mut sel in selects {
+                    self.sva_capture_proc_locals(&mut sel, captured, init, types);
+                    out = match sel.kind {
+                        ExprKind::Range(l, r) => Expression::new(
+                            ExprKind::RangeSelect {
+                                expr: Box::new(out),
+                                kind: crate::ast::expr::RangeKind::Constant,
+                                left: l,
+                                right: r,
+                            },
+                            span,
+                        ),
+                        _ => Expression::new(
+                            ExprKind::Index {
+                                expr: Box::new(out),
+                                index: Box::new(sel),
+                            },
+                            span,
+                        ),
+                    };
+                }
+                *e = out;
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.sva_capture_proc_locals(operand, captured, init, types)
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::AssignExpr {
+                lvalue: left,
+                rvalue: right,
+            }
+            | ExprKind::Range(left, right) => {
+                self.sva_capture_proc_locals(left, captured, init, types);
+                self.sva_capture_proc_locals(right, captured, init, types);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.sva_capture_proc_locals(condition, captured, init, types);
+                self.sva_capture_proc_locals(then_expr, captured, init, types);
+                self.sva_capture_proc_locals(else_expr, captured, init, types);
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::SystemCall { args, .. }
+            | ExprKind::Concatenation(args) => {
+                for a in args {
+                    self.sva_capture_proc_locals(a, captured, init, types);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                self.sva_capture_proc_locals(expr, captured, init, types);
+                self.sva_capture_proc_locals(index, captured, init, types);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.sva_capture_proc_locals(expr, captured, init, types);
+                self.sva_capture_proc_locals(left, captured, init, types);
+                self.sva_capture_proc_locals(right, captured, init, types);
+            }
+            ExprKind::Inside { expr, ranges } => {
+                self.sva_capture_proc_locals(expr, captured, init, types);
+                for r in ranges {
+                    self.sva_capture_proc_locals(r, captured, init, types);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// §16.15: the `default disable iff` that governs an assertion in
+    /// `scope` — declared there or in an enclosing generate scope of the same
+    /// module instance.
+    fn sva_default_disable_for(&self, scope: &str) -> Option<Expression> {
+        if self.sva_default_disable.is_empty() {
+            return None;
+        }
+        let top = self.module.name.as_str();
+        let mut cur = scope;
+        loop {
+            if let Some(g) = self.sva_default_disable.get(cur) {
+                return Some(g.clone());
+            }
+            // A module instance's default does not reach its children.
+            let rel = cur
+                .strip_prefix(top)
+                .map(|r| r.trim_start_matches('.'))
+                .unwrap_or(cur);
+            if rel.is_empty() || self.module.instances.iter().any(|i| i.path == rel) {
+                return None;
+            }
+            match cur.rfind('.') {
+                Some(i) => cur = &cur[..i],
+                None => return None,
+            }
+        }
     }
 
     /// Walk `expr` and append every bare signal name referenced by a
@@ -92968,14 +93817,26 @@ impl Simulator {
         } else {
             entry.fail_count += 1;
         }
-        let pid = self.current_pid;
+        // An `always_comb` / `always @*` the settle runs as a comb entry is
+        // not the process that happens to be current (whose resumption, a
+        // §16.4.2 flush point, would drop the report): its reports belong to
+        // no process, keyed by the block's scope instead.
+        let (pid, comb_scope) = if self.settling {
+            (usize::MAX, self.name_resolve_hint.borrow().clone())
+        } else {
+            (self.current_pid, None)
+        };
         // A re-executed assertion of the same activation (an always_comb
         // evaluated twice in one slot) supersedes its earlier report.
         self.deferred_asserts
-            .retain(|d| !(d.pid == pid && d.span == a.span));
+            .retain(|d| !(d.pid == pid && d.span == a.span && d.comb_scope == comb_scope));
         let action = if passed { &a.action } else { &a.else_action };
         let action = action.as_deref().map(|st| self.capture_deferred_action(st));
-        if action.is_none() && passed {
+        // §16.3: a failure without an `else` clause calls `$error` (a cover
+        // has no failure action).
+        let default_error_scope =
+            (action.is_none() && !passed && kind_tag != 2).then(|| self.m_path());
+        if action.is_none() && default_error_scope.is_none() {
             return;
         }
         self.deferred_asserts.push(DeferredReport {
@@ -92984,6 +93845,8 @@ impl Simulator {
             span: a.span,
             passed,
             action,
+            default_error_scope,
+            comb_scope,
             this_handle: self.this_stack.last().copied().flatten(),
             class_context: self.class_context_stack.last().cloned().flatten(),
         });
@@ -93028,6 +93891,11 @@ impl Simulator {
         if !self.deferred_asserts.is_empty() {
             self.deferred_asserts.retain(|d| d.pid != pid);
         }
+        // §16.14.6.2: a flush point drops the process's pending procedural
+        // concurrent assertion instances too.
+        if !self.sva_proc_pending.is_empty() {
+            self.sva_proc_pending.retain(|p| p.1 != pid);
+        }
     }
 
     /// Mature the pending deferred reports at the end of the time slot:
@@ -93051,6 +93919,9 @@ impl Simulator {
                 continue;
             }
             let Some(action) = d.action else {
+                if let Some(scope) = d.default_error_scope {
+                    self.emit_severity_text_in("Error", ASSERT_DEFAULT_ERROR, &scope);
+                }
                 continue;
             };
             let saved_pid = self.current_pid;
