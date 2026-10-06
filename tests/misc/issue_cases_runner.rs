@@ -198,11 +198,7 @@ fn issue_26_static_init_sysfuncs() {
 #[test]
 fn issue_233_parenless_calls() {
     let msgs = outputs(include_str!("../issue_cases/parenless.calls.sv"), 100_000);
-    assert!(
-        !msgs.iter().any(|m| m.starts_with("FAIL")),
-        "{:#?}",
-        msgs
-    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
 
@@ -214,12 +210,11 @@ fn issue_233_parenless_calls() {
 #[test]
 fn issue_246_struct_rand_fields() {
     let start = std::time::Instant::now();
-    let msgs = outputs(include_str!("../issue_cases/struct.rand.fields.sv"), 100_000);
-    assert!(
-        !msgs.iter().any(|m| m.starts_with("FAIL")),
-        "{:#?}",
-        msgs
+    let msgs = outputs(
+        include_str!("../issue_cases/struct.rand.fields.sv"),
+        100_000,
     );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
     assert!(
         start.elapsed() < std::time::Duration::from_secs(60),
@@ -236,10 +231,6 @@ fn issue_246_struct_rand_fields() {
 #[test]
 fn rand_width_overflow_and_dist_mwe() {
     let msgs = outputs(include_str!("../issue_cases/rand.width.dist.sv"), 100_000);
-    assert!(
-        !msgs.iter().any(|m| m.starts_with("FAIL")),
-        "{:#?}",
-        msgs
-    );
+    assert!(!msgs.iter().any(|m| m.starts_with("FAIL")), "{:#?}", msgs);
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }

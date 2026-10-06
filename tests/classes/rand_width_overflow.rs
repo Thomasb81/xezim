@@ -53,7 +53,10 @@ module probe;
 endmodule
 "#,
     );
-    assert_eq!(out, ["T failed=0 token=9 restored=1", "T recovered=1 token=6"]);
+    assert_eq!(
+        out,
+        ["T failed=0 token=9 restored=1", "T recovered=1 token=6"]
+    );
 }
 
 /// Reversed operands and strict bounds take the same sum-repair path.

@@ -89,7 +89,8 @@ fn assert_summary(version: &str, out: &[String], errors: u32) {
         "UVM {version}: fatal reported:\n{out:#?}"
     );
     assert!(
-        !out.iter().any(|l| l.contains("[xezim][error]") || l.contains("[xezim][fatal]")),
+        !out.iter()
+            .any(|l| l.contains("[xezim][error]") || l.contains("[xezim][fatal]")),
         "UVM {version}: simulator error:\n{out:#?}"
     );
 }
@@ -188,7 +189,11 @@ const RIGHTS_WO_2020: [&str; 9] = [
 fn uvm_ral_map_rights() {
     let src = include_str!("../uvm/uvm_ral_map_rights.sv");
     for v in VERSIONS {
-        let wo = if v == "1.2" { RIGHTS_WO_1_2 } else { RIGHTS_WO_2020 };
+        let wo = if v == "1.2" {
+            RIGHTS_WO_1_2
+        } else {
+            RIGHTS_WO_2020
+        };
         // The bench's order: the common rows with `@` standing for the first
         // version-specific row and `@@` for the remaining eight.
         let mut want: Vec<&str> = Vec::new();
@@ -258,7 +263,9 @@ fn uvm_ral_mirror_check_mismatch() {
         assert_eq!(mism.len(), 1, "UVM {v}: {mism:#?}");
         assert!(
             mism[0].contains("\"blk.CTRL\"")
-                && mism[0].contains("(0x0000000000000011) does not match mirrored value (0x00000000000000a5)"),
+                && mism[0].contains(
+                    "(0x0000000000000011) does not match mirrored value (0x00000000000000a5)"
+                ),
             "UVM {v}: {}",
             mism[0]
         );

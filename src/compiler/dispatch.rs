@@ -76,6 +76,7 @@ pub enum Opcode {
     BranchUnlessZero,
     BranchIfSignalFalse,
     ClearSigned,
+    DropXz,
     Pow,
     NbaAssignArrayRead,
     BinOpConstAdd,
@@ -182,6 +183,7 @@ impl Opcode {
             Insn::EvalExprFallback(..) => Self::StmtFallback,
             Insn::SetSigned(_) => Self::SetSigned,
             Insn::ClearSigned(_) => Self::ClearSigned,
+            Insn::DropXz(_) => Self::DropXz,
             Insn::Pow(_, _, _) => Self::Pow,
             Insn::Nop | Insn::CovHit(_) => Self::Nop,
             Insn::LoadSignalRange(_, _, _, _) => Self::LoadSignalRange,
@@ -232,7 +234,7 @@ impl Opcode {
     }
 }
 
-pub const NUM_OPCODES: usize = 97;
+pub const NUM_OPCODES: usize = 98;
 
 /// Sizes the opcode-census arrays, which are indexed by `Opcode as usize`. A
 /// stale value panics at run time under `XEZIM_OPCODE_CENSUS=1`, so pin it to

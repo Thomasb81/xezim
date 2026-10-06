@@ -140,7 +140,11 @@ fn main() {
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let mut objs = Vec::new();
     for src in srcs {
-        let stem = std::path::Path::new(src).file_stem().unwrap().to_string_lossy().to_string();
+        let stem = std::path::Path::new(src)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let obj = out_dir.join(format!("{}.o", stem));
         let status = Command::new(&cc)
             .args(["-c", "-fPIC", "-O2", src, "-o"])

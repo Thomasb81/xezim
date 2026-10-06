@@ -29,6 +29,8 @@ mod dpi_export_task_waits;
 mod dpi_integration_tests;
 #[path = "strings/dpi_library_loading.rs"]
 mod dpi_library_loading;
+#[path = "strings/dpi_semantics.rs"]
+mod dpi_semantics;
 #[path = "strings/dpi_unit_scope.rs"]
 mod dpi_unit_scope;
 #[path = "strings/fixed_string_array_dims.rs"]
@@ -109,5 +111,3 @@ mod vpi_routines;
 mod vpi_typed_port_kinds;
 #[path = "strings/wide_string2num.rs"]
 mod wide_string2num;
-#[path = "strings/dpi_semantics.rs"]
-mod dpi_semantics;

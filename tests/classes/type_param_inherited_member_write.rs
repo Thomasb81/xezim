@@ -5,8 +5,13 @@ use std::process::Command;
 /// Verified byte-for-byte against reference simulators.
 #[test]
 fn type_param_inherited_member_write() {
-    let test_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/classes/type_param_inherited_member_write.sv");
-    assert!(test_file.exists(), "Test file not found: {}", test_file.display());
+    let test_file = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/classes/type_param_inherited_member_write.sv");
+    assert!(
+        test_file.exists(),
+        "Test file not found: {}",
+        test_file.display()
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg("--simulate")
         .arg("-s")
@@ -19,7 +24,16 @@ fn type_param_inherited_member_write() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!combined.contains("Parse errors"), "Parse error:\n{combined}");
-    assert!(!combined.contains("TAG_FAIL"), "type_param_inherited_member_write failed:\n{combined}");
-    assert!(combined.contains("TAG_PASS"), "type_param_inherited_member_write: no TAG_PASS.\nOutput:\n{combined}");
+    assert!(
+        !combined.contains("Parse errors"),
+        "Parse error:\n{combined}"
+    );
+    assert!(
+        !combined.contains("TAG_FAIL"),
+        "type_param_inherited_member_write failed:\n{combined}"
+    );
+    assert!(
+        combined.contains("TAG_PASS"),
+        "type_param_inherited_member_write: no TAG_PASS.\nOutput:\n{combined}"
+    );
 }

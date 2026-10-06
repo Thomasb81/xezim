@@ -475,11 +475,11 @@ mod two_state_wide_reduction;
 mod udn_resolver_compiled;
 #[path = "misc/undeclared_in_subroutines.rs"]
 mod undeclared_in_subroutines;
+#[path = "misc/uninstantiated_module_params.rs"]
+mod uninstantiated_module_params;
 #[path = "misc/virtual_array_names.rs"]
 mod virtual_array_names;
 #[path = "misc/while_continue_final_iter.rs"]
 mod while_continue_final_iter;
 #[path = "misc/zero_width_select_unselected_generate.rs"]
 mod zero_width_select_unselected_generate;
-#[path = "misc/uninstantiated_module_params.rs"]
-mod uninstantiated_module_params;

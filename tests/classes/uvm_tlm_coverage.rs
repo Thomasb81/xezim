@@ -89,7 +89,8 @@ fn assert_summary(version: &str, out: &[String], errors: u32, fatals: u32) {
         );
     }
     assert!(
-        !out.iter().any(|l| l.contains("[xezim][error]") || l.contains("[xezim][fatal]")),
+        !out.iter()
+            .any(|l| l.contains("[xezim][error]") || l.contains("[xezim][fatal]")),
         "UVM {version}: simulator error:\n{out:#?}"
     );
 }

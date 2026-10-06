@@ -265,10 +265,12 @@ pub struct CaseLutData {
 /// interpreter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LocalKind {
-    /// Integral, declared width and signedness (§6.11, §6.8).
+    /// Integral, declared width and signedness (§6.11, §6.8), and whether
+    /// the type is 2-state (§6.11.1: a write drops X/Z to 0).
     Int {
         width: u32,
         signed: bool,
+        two_state: bool,
     },
     Real,
     Str,
@@ -470,6 +472,10 @@ pub enum Insn {
     /// unsigned), so this operand must ZERO-extend at the coming Resize —
     /// clear the runtime signed flag the load stamped on it.
     ClearSigned(RegId),
+    /// §6.11.1/§10.7: the register is a 2-state local just written — map
+    /// its X/Z bits to 0. Emitted only after a store to a register-backed
+    /// local of a 2-state type (see `emit_local_fit`).
+    DropXz(RegId),
     /// §11.4.3 `**` with a non-constant base: left operand pre-resized to the
     /// operation width by the compiler; result width = left's width.
     Pow(RegId, RegId, RegId),
@@ -1024,6 +1030,7 @@ impl Insn {
             | Resize(a, _)
             | SetSigned(a)
             | ClearSigned(a)
+            | DropXz(a)
             | LoadSignal(a, _)
             | LoadSignalSigned(a, _)
             | LoadSignalRange(a, _, _, _)
@@ -1227,6 +1234,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::Select(..) => "Select",
         Insn::Move(..) => "Move",
         Insn::SetSigned(..) => "SetSigned",
+        Insn::DropXz(..) => "DropXz",
         Insn::ClearSigned(..) => "ClearSigned",
         Insn::Pow(..) => "Pow",
         Insn::LoadClassMember(..) => "LoadCls",
@@ -2856,6 +2864,8 @@ impl<'a> BytecodeCompiler<'a> {
                 self.local_kind_of(Self::port_effective_type(&fd.ports, i), Some(&name))
             {
                 self.local_kinds.insert(slot, k);
+                // §13.5: binding an input is an assignment to the formal.
+                self.drop_xz_new_two_state_local(slot);
             }
             binds.push((p.name.name.clone(), (slot, w)));
             if let Some(ew) = self.decl_elem_width_in(&p.data_type, Some(&name)) {
@@ -3097,6 +3107,7 @@ impl<'a> BytecodeCompiler<'a> {
                         }
                         if let Some(k) = self.local_kind_of(data_type, None) {
                             self.local_kinds.insert(slot, k);
+                            self.drop_xz_new_two_state_local(slot);
                         }
                         self.local_var_regs.insert(d.name.name.clone(), (slot, w));
                     }
@@ -3774,7 +3785,13 @@ impl<'a> BytecodeCompiler<'a> {
                     Some(Sg::Unsigned) => false,
                     None => !matches!(kind, A::Time),
                 };
-                Some(LocalKind::Int { width, signed })
+                // §6.11: `integer` and `time` are the 4-state atoms.
+                let two_state = !matches!(kind, A::Integer | A::Time);
+                Some(LocalKind::Int {
+                    width,
+                    signed,
+                    two_state,
+                })
             }
             D::IntegerVector {
                 signing,
@@ -3786,6 +3803,13 @@ impl<'a> BytecodeCompiler<'a> {
                 dimensions,
                 ..
             } => {
+                let two_state = matches!(
+                    dt,
+                    D::IntegerVector {
+                        kind: crate::ast::types::IntegerVectorType::Bit,
+                        ..
+                    }
+                );
                 // One `[N-1:0]` range at most: the interpreter selects bits
                 // of a frame value from bit 0, with no declared range.
                 match dimensions.as_slice() {
@@ -3804,6 +3828,7 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(LocalKind::Int {
                     width,
                     signed: matches!(signing, Some(Sg::Signed)),
+                    two_state,
                 })
             }
             _ => None,
@@ -3816,12 +3841,126 @@ impl<'a> BytecodeCompiler<'a> {
     /// otherwise inherit from its source (`int s; s = u;` with an unsigned
     /// `u` left `s < 0` false).
     fn emit_local_fit(&mut self, reg: RegId) {
-        if let Some(LocalKind::Int { signed, .. }) = self.local_kinds.get(&reg).copied() {
+        if let Some(LocalKind::Int {
+            signed, two_state, ..
+        }) = self.local_kinds.get(&reg).copied()
+        {
+            // §6.11.1: a 2-state local drops X/Z — unless the value just
+            // stored provably has none (see `stored_value_two_state`).
+            let known = two_state && self.stored_value_two_state(reg);
             self.emit(if signed {
                 Insn::SetSigned(reg)
             } else {
                 Insn::ClearSigned(reg)
             });
+            if two_state && !known {
+                self.emit(Insn::DropXz(reg));
+            }
+        }
+    }
+
+    /// §6.11.1: `slot` was just bound as a register-backed local and typed
+    /// in `local_kinds`; a 2-state one drops any X/Z its initial value
+    /// carries, so every 2-state local register holds a 2-state value (the
+    /// invariant `stored_value_two_state` relies on).
+    fn drop_xz_new_two_state_local(&mut self, slot: RegId) {
+        if matches!(
+            self.local_kinds.get(&slot),
+            Some(LocalKind::Int {
+                two_state: true,
+                ..
+            })
+        ) && !self.stored_value_two_state(slot)
+        {
+            self.emit(Insn::DropXz(slot));
+        }
+    }
+
+    /// Is the value just stored into the 2-state local `reg` (the trailing
+    /// `Move`/`LoadConst` into it, before its `Resize`) free of X/Z by
+    /// construction? Every store into a 2-state local passes through
+    /// `emit_local_fit`, so a register typed as one (`local_kinds`) always
+    /// holds a 2-state value; a known constant has none, and an arithmetic,
+    /// bitwise or compare op over such operands yields none. Only the
+    /// straight-line instructions of the store's own expression are
+    /// inspected (no branch can land between them: conditionals compile to
+    /// `Select`), and anything not recognised keeps the `DropXz`. A loop
+    /// counter's `i = i + 1` / `i++` therefore costs nothing extra.
+    fn stored_value_two_state(&self, reg: RegId) -> bool {
+        let insns = &self.insns;
+        let mut end = insns.len();
+        while end > 0
+            && matches!(
+                insns[end - 1],
+                Insn::Resize(r, _) | Insn::SetSigned(r) | Insn::ClearSigned(r) if r == reg
+            )
+        {
+            end -= 1;
+        }
+        let home = |r: RegId| {
+            matches!(
+                self.local_kinds.get(&r),
+                Some(LocalKind::Int {
+                    two_state: true,
+                    ..
+                })
+            )
+        };
+        // `r` as defined by the instructions before index `upto` (a short
+        // window of the same expression).
+        let operand = |r: RegId, upto: usize| -> bool {
+            if home(r) {
+                return true;
+            }
+            insns[upto.saturating_sub(4)..upto]
+                .iter()
+                .rev()
+                .find_map(|i| match i {
+                    Insn::LoadConst(d, v) if *d == r => Some(!v.has_xz() && !v.is_real),
+                    i if Self::dest_reg(i) == Some(r)
+                        || Self::in_place_reg(i) == Some(r)
+                        || matches!(i, Insn::EvalExprFallback(_, d, _) if *d == r)
+                        || matches!(i, Insn::StmtFallback(..)) =>
+                    {
+                        Some(false)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(false)
+        };
+        let def_known = |at: usize, d: RegId| -> bool {
+            match &insns[at] {
+                Insn::LoadConst(x, v) if *x == d => !v.has_xz() && !v.is_real,
+                Insn::Add(x, a, b)
+                | Insn::Sub(x, a, b)
+                | Insn::Mul(x, a, b)
+                | Insn::BitAnd(x, a, b)
+                | Insn::BitOr(x, a, b)
+                | Insn::BitXor(x, a, b)
+                | Insn::Shl(x, a, b)
+                | Insn::Shr(x, a, b)
+                | Insn::Eq(x, a, b)
+                | Insn::Neq(x, a, b)
+                | Insn::Lt(x, a, b)
+                | Insn::Leq(x, a, b)
+                | Insn::Gt(x, a, b)
+                | Insn::Geq(x, a, b)
+                    if *x == d =>
+                {
+                    operand(*a, at) && operand(*b, at)
+                }
+                Insn::BitNot(x, a) if *x == d => operand(*a, at),
+                _ => false,
+            }
+        };
+        let Some(last) = end.checked_sub(1) else {
+            return false;
+        };
+        match &insns[last] {
+            Insn::Move(d, src) if *d == reg => {
+                home(*src) || (last > 0 && def_known(last - 1, *src))
+            }
+            _ => def_known(last, reg),
         }
     }
 
@@ -7203,6 +7342,7 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::Move(..)
             | Insn::SetSigned(..)
             | Insn::ClearSigned(..)
+            | Insn::DropXz(..)
             | Insn::Add(..)
             | Insn::Sub(..)
             | Insn::Mul(..)
@@ -8790,6 +8930,42 @@ impl<'a> BytecodeCompiler<'a> {
         None
     }
 
+    /// Does `e` name a whole unpacked array, dynamic array or queue (or a
+    /// slice of one)? Conservative: any name registered as a collection in
+    /// this scope or at the top counts.
+    fn names_unpacked_collection(&self, e: &Expression) -> bool {
+        let e = match &e.kind {
+            ExprKind::Paren(i) => i.as_ref(),
+            ExprKind::RangeSelect { expr, .. } => expr.as_ref(),
+            _ => e,
+        };
+        let ExprKind::Ident(h) = &e.kind else {
+            return false;
+        };
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return false;
+        }
+        let raw = h
+            .path
+            .iter()
+            .map(|s| s.name.name.as_str())
+            .collect::<Vec<_>>()
+            .join(".");
+        let is_coll = |n: &str| {
+            self.arrays.contains_key(n)
+                || self.arrays_2d.is_some_and(|m| m.contains_key(n))
+                || self.multi_dim_arrays.is_some_and(|m| m.contains(n))
+                || self.dynamic_arrays.is_some_and(|m| m.contains(n))
+                || self.queue_vars.is_some_and(|m| m.contains(n))
+        };
+        if is_coll(&raw) {
+            return true;
+        }
+        self.scope_hint
+            .as_ref()
+            .is_some_and(|scope| is_coll(&cat_dot(scope, &raw)))
+    }
+
     /// Hoist disjoint full-range `dst[i] <= src[i]` copies out of a canonical
     /// packed loop. All slices are written in the same NBA region and the
     /// sources are side-effect-free signal reads, so a single whole-vector NBA
@@ -10242,6 +10418,7 @@ impl<'a> BytecodeCompiler<'a> {
                             }
                             if let Some(k) = self.local_kind_of(data_type, None) {
                                 self.local_kinds.insert(slot, k);
+                                self.drop_xz_new_two_state_local(slot);
                             }
                             self.local_var_regs.insert(name.name.clone(), (slot, w));
                             self.reg_var_loop_depth += 1;
@@ -10601,6 +10778,7 @@ impl<'a> BytecodeCompiler<'a> {
                     LocalKind::Int {
                         width: 32,
                         signed: true,
+                        two_state: true,
                     },
                 );
                 let saved_const = self.const_var_binds.get(&var).copied();
@@ -12243,6 +12421,20 @@ impl<'a> BytecodeCompiler<'a> {
                 Some(dst)
             }
             ExprKind::SystemCall { name, args } => match name.as_str() {
+                // §6.24.3: a cast whose operand is an UNPACKED array/queue
+                // packs the operand's elements (`int'(barr)`); the register
+                // path would read the container signal. Interpreted.
+                "$__xz_named_cast" | "$__xz_size_cast" | "$__xz_type_cast"
+                    if args
+                        .get(1)
+                        .is_some_and(|a| self.names_unpacked_collection(a)) =>
+                {
+                    if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "cast_unpacked") {
+                        return Some(r);
+                    }
+                    self.bail("cast_unpacked");
+                    None
+                }
                 crate::compiler::simulator::COV_COND_FN => self.compile_cov_cond(args),
                 // §21.3.3 `$sformatf` with a LITERAL template and specs the
                 // native filler covers exactly — parsed once here, filled
@@ -16748,7 +16940,10 @@ impl<'a> BytecodeCompiler<'a> {
             | Insn::Nop => {}
             Insn::BranchUnlessZero(c, _) => f(*c),
             // In-place mutators read their register.
-            Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) => f(*a),
+            Insn::Resize(a, _)
+            | Insn::SetSigned(a)
+            | Insn::ClearSigned(a)
+            | Insn::DropXz(a) => f(*a),
             // Class-member access: Load reads the handle; Store reads the
             // handle AND the stored value register.
             Insn::LoadClassMember(_, h, _) => f(*h),
@@ -17277,7 +17472,9 @@ impl<'a> BytecodeCompiler<'a> {
     /// The register an instruction modifies IN PLACE (read and written).
     fn in_place_reg(insn: &Insn) -> Option<RegId> {
         match insn {
-            Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) => Some(*a),
+            Insn::Resize(a, _) | Insn::SetSigned(a) | Insn::ClearSigned(a) | Insn::DropXz(a) => {
+                Some(*a)
+            }
             _ => None,
         }
     }
@@ -18090,6 +18287,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::EvalExprFallback(_, d, _)
                 | Insn::SetSigned(d)
                 | Insn::ClearSigned(d)
+                | Insn::DropXz(d)
                 | Insn::LoadSignalRange(d, _, _, _)
                 | Insn::LoadSignalBit(d, _, _)
                 | Insn::BinOpConst(d, _, _, _) => Some(Some(*d)),
@@ -18847,7 +19045,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::LoadArrayElem(d, _, _) => store(&mut rw, *d, None),
 
                 // Stamp/clear `is_signed`; storage and width are untouched.
-                Insn::SetSigned(_) | Insn::ClearSigned(_) => {}
+                Insn::SetSigned(_) | Insn::ClearSigned(_) | Insn::DropXz(_) => {}
 
                 // Result width is the (runtime) left operand's width — not
                 // statically tracked here.
@@ -19119,6 +19317,8 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 }
                 Insn::SetSigned(r) => set_to = Some((*r, false)),
+                // X/Z to 0 keeps the flag.
+                Insn::DropXz(_) => {}
                 // -- no register writes: state flows through --
                 Insn::Jump(_)
                 | Insn::BranchIfFalse(_, _)
@@ -19533,6 +19733,7 @@ mod tests {
                 kind: LocalKind::Int {
                     width: 8,
                     signed: false,
+                    two_state: false,
                 },
             }]
             .into_boxed_slice(),
@@ -23259,6 +23460,8 @@ pub fn lower_two_state(
                 }
                 sg[*r as usize] = true;
             }
+            // Two-state registers hold no X/Z: nothing to drop.
+            Insn::DropXz(_) => {}
             // A copy with the Resize arm's narrow rules folded in.
             Insn::MoveResize(d, s, w) => {
                 let cur = rw[*s as usize]?;

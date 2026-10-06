@@ -108,10 +108,7 @@ fn run_with_deadline(
     // process, and each removes its directory when done, so a directory
     // shared by process id could vanish before another case's simulator
     // read its design.
-    let dir = std::env::temp_dir().join(format!(
-        "xezim_rand_budget_{}_{stem}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("xezim_rand_budget_{}_{stem}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temporary directory");
     let path = dir.join(format!("{stem}.sv"));
     std::fs::write(&path, source).expect("write design");

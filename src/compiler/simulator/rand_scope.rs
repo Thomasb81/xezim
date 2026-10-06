@@ -1561,7 +1561,10 @@ impl Simulator {
         let ExprKind::Binary { op, left, right } = &e.kind else {
             return None;
         };
-        if !matches!(op, BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq) {
+        if !matches!(
+            op,
+            BinaryOp::Lt | BinaryOp::Leq | BinaryOp::Gt | BinaryOp::Geq
+        ) {
             return None;
         }
         let l_rand = Self::reads_unknown(left, rand_roots, bound);
@@ -1687,7 +1690,9 @@ impl Simulator {
             ConstraintItem::Block(xs) => Some(ConstraintItem::Block(
                 xs.iter().filter_map(|x| fold(self, x, bound)).collect(),
             )),
-            ConstraintItem::Soft(x) => fold(self, x, bound).map(|x| ConstraintItem::Soft(Box::new(x))),
+            ConstraintItem::Soft(x) => {
+                fold(self, x, bound).map(|x| ConstraintItem::Soft(Box::new(x)))
+            }
             ConstraintItem::Foreach {
                 array,
                 vars,
@@ -1697,7 +1702,8 @@ impl Simulator {
                 // §18.5.8.1: a `foreach` over a STATE container iterates a
                 // known index set — unroll it, so each iteration's guards
                 // (`if (mask[i])`) are decided like any other state guard.
-                if let Some(unrolled) = self.unroll_state_foreach(array, vars, item, rand_roots, bound)
+                if let Some(unrolled) =
+                    self.unroll_state_foreach(array, vars, item, rand_roots, bound)
                 {
                     let body: Vec<ConstraintItem> = unrolled
                         .iter()
