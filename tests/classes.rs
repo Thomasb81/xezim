@@ -505,6 +505,20 @@ mod interface_class_extends_type_param;
 mod issue_246_struct_member_randomize;
 #[path = "classes/issue_249_rand_mode_receiver.rs"]
 mod issue_249_rand_mode_receiver;
+#[path = "classes/lrm_chained_handle_writes.rs"]
+mod lrm_chained_handle_writes;
+#[path = "classes/lrm_class_queue_locator_in_expr.rs"]
+mod lrm_class_queue_locator_in_expr;
+#[path = "classes/lrm_param_sized_array_member.rs"]
+mod lrm_param_sized_array_member;
+#[path = "classes/lrm_property_vs_struct_member_name.rs"]
+mod lrm_property_vs_struct_member_name;
+#[path = "classes/lrm_shadowed_property_static_type.rs"]
+mod lrm_shadowed_property_static_type;
+#[path = "classes/lrm_signed_class_collection_elements.rs"]
+mod lrm_signed_class_collection_elements;
+#[path = "classes/lrm_static_method_via_handle.rs"]
+mod lrm_static_method_via_handle;
 #[path = "classes/member_collection_runtime_class.rs"]
 mod member_collection_runtime_class;
 #[path = "classes/member_visibility_local_protected.rs"]

@@ -217,6 +217,8 @@ mod interface_port_inside;
 mod interface_task_lexical_scope;
 #[path = "hierarchy/library_dir_on_demand.rs"]
 mod library_dir_on_demand;
+#[path = "hierarchy/lrm_package_variable_scoping.rs"]
+mod lrm_package_variable_scoping;
 #[path = "hierarchy/modport_expression_ports.rs"]
 mod modport_expression_ports;
 #[path = "hierarchy/modport_shape_battery.rs"]

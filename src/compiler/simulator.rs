@@ -6869,6 +6869,12 @@ pub struct Simulator {
     /// `"<Class>::<name>"`; the set is the cheap gate that keeps every
     /// unshadowed access on the bare-name fast path.
     shadowed_prop_names: HashSet<String>,
+    /// §6.11.1 / §7.5: instance-scoped storage names (`<handle>#<member>`) of
+    /// queue / dynamic-array class properties whose element type is a SIGNED
+    /// integral type (`byte`, `shortint`, `logic signed [7:0]`, ...). Their
+    /// elements live in the runtime map with no declared signedness of their
+    /// own, so a store stamps it from here (`p.dyn[1] = 8'hff` reads -1).
+    signed_class_colls: HashSet<String>,
     /// §8.25 / §8.3: classes whose base class depends on their own
     /// parameters — `class W #(type B = base) extends B;` (the base IS a type
     /// parameter) or `class W2 #(type B) extends W #(B);` (the base is such a
@@ -9052,6 +9058,100 @@ impl Simulator {
         }
     }
 
+    /// §26.3: the storage name of package `pkg`'s variable `name` when the
+    /// bare name is contested (see `split_contested_package_vars`), else
+    /// `None` (the bare hoisted entry is the package's own).
+    fn pkg_var_storage(&self, pkg: &str, name: &str) -> Option<String> {
+        if self.pkg_ambiguous_names.is_empty() || !self.pkg_ambiguous_names.contains(name) {
+            return None;
+        }
+        let q = format!("{}::{}", pkg, name);
+        self.signal_name_to_id.contains_key(q.as_str()).then_some(q)
+    }
+
+    /// §26.3: a package variable whose bare name another package also
+    /// declares, or that a module-scope declaration displaces, gets its own
+    /// storage under `<pkg>::<name>`. Package declarations are hoisted into
+    /// ONE design-wide bare namespace, so `pa::cnt` and `pc::cnt` were the
+    /// same cell (and `base_p::v` read the module's own `v`). The qualified
+    /// cells are added as signals here, a call-initialized one's static
+    /// initializer is retargeted to it, and the bare names are returned so
+    /// name resolution can route through the qualified cells.
+    fn split_contested_package_vars(module: &mut ElaboratedModule) -> HashSet<String> {
+        let mut owners: HashMap<&str, usize> = HashMap::default();
+        for key in module.pkg_var_decls.keys() {
+            if let Some((_, base)) = key.split_once("::") {
+                *owners.entry(base).or_default() += 1;
+            }
+        }
+        let contested: HashSet<String> = owners
+            .into_iter()
+            .filter(|(base, n)| {
+                *n >= 2
+                    || module.wildcard_shadowed.contains(*base)
+                    || module.foreign_displaced.contains(*base)
+            })
+            .map(|(b, _)| b.to_string())
+            .collect();
+        if contested.is_empty() {
+            return contested;
+        }
+        let mut keys: Vec<String> = module
+            .pkg_var_decls
+            .keys()
+            .filter(|k| {
+                k.split_once("::")
+                    .is_some_and(|(_, b)| contested.contains(b))
+            })
+            .cloned()
+            .collect();
+        keys.sort();
+        for k in keys {
+            if let Some(sig) = module.pkg_var_decls.get(&k).cloned() {
+                let (_, base) = k.split_once("::").unwrap();
+                if let Some(ty) = module.var_decl_types.get(base).cloned() {
+                    module.var_decl_types.entry(k.clone()).or_insert(ty);
+                }
+                if module.string_signals.contains(base) {
+                    module.string_signals.insert(k.clone());
+                }
+                if module.two_state_signals.contains(base) {
+                    module.two_state_signals.insert(k.clone());
+                }
+                module.signals.insert(k, sig);
+            }
+        }
+        for (idx, q) in module.pkg_var_init_blocks.clone() {
+            let Some((_, base)) = q.split_once("::") else {
+                continue;
+            };
+            if !contested.contains(base) {
+                continue;
+            }
+            if let Some(b) = module.static_init_blocks.get_mut(idx) {
+                if let StatementKind::BlockingAssign { lvalue, .. } = &mut b.stmt.kind {
+                    *lvalue = Expression::new(
+                        ExprKind::Ident(HierarchicalIdentifier {
+                            root: None,
+                            path: vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: q.clone(),
+                                    span: lvalue.span,
+                                },
+                                selects: Vec::new(),
+                            }],
+                            span: lvalue.span,
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        lvalue.span,
+                    );
+                }
+            }
+        }
+        contested
+    }
+
     fn classify_typedef_collection_properties(module: &mut ElaboratedModule) {
         use crate::ast::types::{SimpleType, UnpackedDimension as UD};
         let mut classes: Vec<String> = module.classes.keys().cloned().collect();
@@ -9928,6 +10028,7 @@ impl Simulator {
         // collection typedef must be classified as a queue/assoc/array member
         // — elaborate_class only saw the class's OWN local typedefs.
         Self::classify_typedef_collection_properties(&mut module);
+        let contested_pkg_vars = Self::split_contested_package_vars(&mut module);
         Self::register_struct_member_packed_dims(&mut module);
         // §9.2.2.2: give every dynamic array / queue a REAL `<q>.size` signal.
         // It doubles as the queue's change proxy in the comb dependency graph:
@@ -10398,7 +10499,7 @@ impl Simulator {
         // called) through the running package's own entry. Every other name
         // resolves identically either way, so the set stays empty for
         // practically every design and both lookups short-circuit.
-        let mut pkg_ambiguous_names: HashSet<String> = HashSet::default();
+        let mut pkg_ambiguous_names: HashSet<String> = contested_pkg_vars;
         {
             let mut first_owner: HashMap<&str, &str> = HashMap::default();
             for key in module.parameters.keys() {
@@ -11933,6 +12034,7 @@ impl Simulator {
             rand_receiver: None,
             randomize_subset: None,
             shadowed_prop_names: HashSet::default(),
+            signed_class_colls: HashSet::default(),
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),
             dep_names: Vec::new(),
@@ -65136,6 +65238,8 @@ impl Simulator {
                 .filter(|_| !fitted.is_real && self.is_associative_array(&an))
             {
                 fitted.is_signed = sg;
+            } else if !fitted.is_real && self.signed_class_coll(&an) {
+                fitted = self.fit_signed_class_coll_elem(&an, fitted);
             }
             let changed = self.signals.get(&elem_name) != Some(&fitted);
             self.signals.insert(elem_name, fitted);
@@ -65764,6 +65868,8 @@ impl Simulator {
                     !fitted.is_real && !elem_is_string && self.is_associative_array(&name)
                 }) {
                     fitted.is_signed = sg;
+                } else if !fitted.is_real && self.signed_class_coll(&name) {
+                    fitted = self.fit_signed_class_coll_elem(&name, fitted);
                 }
                 if self.warn_x && self.time > 0 {
                     let prev = self.signals.get(&elem_name).cloned();
@@ -66073,6 +66179,11 @@ impl Simulator {
                     {
                         let mut ident = h.clone();
                         ident.path[0].name = member.clone();
+                        // §26.3: a contested package variable has its own
+                        // per-package storage under `<pkg>::<name>`.
+                        if let Some(q) = self.pkg_var_storage(&h.path[0].name.name, &member.name) {
+                            ident.path[0].name.name = q;
+                        }
                         // The stripped name names a NEW signal and must resolve
                         // under its own column, not the field the package
                         // qualifier's node carried. `h` here is the
@@ -66097,6 +66208,10 @@ impl Simulator {
             {
                 let mut ident = h.clone();
                 ident.path.remove(0);
+                // §26.3: a contested package variable's own storage.
+                if let Some(q) = self.pkg_var_storage(&h.path[0].name.name, &h.path[1].name.name) {
+                    ident.path[0].name.name = q;
+                }
                 // See the MemberAccess arm above: the cloned node inherits
                 // `cached_resolved_name` from the `<pkg>::<member>` reference;
                 // reset it so the bare `<member>` resolves fresh.
@@ -72790,6 +72905,7 @@ impl Simulator {
             || self.name_stats_on
             || self.rand_receiver.is_some()
             || self.item_alias.is_some()
+            || (!self.shadowed_prop_names.is_empty() && self.shadowed_prop_names.contains(m))
             || self.iface_alias_for(n).is_some()
         {
             return None;
@@ -73619,6 +73735,12 @@ impl Simulator {
                     if hier.path.len() >= 3 {
                         let mut stripped = hier.clone();
                         stripped.path.remove(0);
+                        // §26.3: a contested package variable's own storage.
+                        if let Some(q) =
+                            self.pkg_var_storage(&hier.path[0].name.name, &hier.path[1].name.name)
+                        {
+                            stripped.path[0].name.name = q;
+                        }
                         stripped.cached_signal_id = std::cell::Cell::new(None);
                         stripped.cached_resolved_name = std::cell::OnceCell::new();
                         let e2 = Expression::new(ExprKind::Ident(stripped), expr.span);
@@ -88903,6 +89025,7 @@ impl Simulator {
             ExprKind::MemberAccess { member, .. } => &member.name,
             ExprKind::Ident(hier) if hier.path.len() == 1 => &hier.path[0].name.name,
             ExprKind::Ident(hier) if hier.path.len() == 2 => &hier.path[1].name.name,
+            ExprKind::Ident(hier) if hier.path.len() >= 3 => &hier.path.last().unwrap().name.name,
             _ => return false,
         };
         if !self.class_member_names().string_props.contains(prop_name) {
@@ -88920,6 +89043,13 @@ impl Simulator {
                     ExprKind::This => self.this_stack.last().copied().flatten(),
                     ExprKind::Ident(hier) if hier.path.len() == 1 => {
                         self.peek_local_handle(&hier.path[0].name.name)
+                    }
+                    // §8.5: a receiver that is itself a handle chain
+                    // (`n.h.tag`, `this.h.tag`): `%s` padded the string to
+                    // its container width because only a one-level
+                    // receiver was resolved.
+                    ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                        self.eval_handle_expr(recv)
                     }
                     _ => None,
                 };
@@ -88952,6 +89082,14 @@ impl Simulator {
             ExprKind::Ident(hier) if hier.path.len() == 2 => {
                 let h = self.peek_local_handle(&hier.path[0].name.name);
                 (h, hier.path[1].name.name.clone())
+            }
+            // §8.5: `a.b.<prop>` flattened into one identifier.
+            ExprKind::Ident(hier) if hier.path.iter().all(|s| s.selects.is_empty()) => {
+                let prefix = Expression::new(ExprKind::Ident(hier_prefix(hier)), expr.span);
+                (
+                    self.eval_handle_expr(&prefix),
+                    hier.path.last().unwrap().name.name.clone(),
+                )
             }
             _ => return false,
         };
@@ -89645,7 +89783,12 @@ impl Simulator {
                                             if let Some(&(lo, hi, _w)) =
                                                 cd.array_properties.get(&prop)
                                             {
-                                                range = Some((lo, hi));
+                                                range = Some(self.inst_fixed_bounds(
+                                                    cd,
+                                                    h,
+                                                    &prop,
+                                                    (lo, hi),
+                                                ));
                                                 break;
                                             }
                                             cur = cd.extends.clone();
@@ -92208,19 +92351,8 @@ impl Simulator {
             }
         }
         if !self.pkg_ambiguous_names.is_empty() && hier.path.len() == 1 {
-            let leaf = hier.path[0].name.name.as_str();
-            if self.pkg_ambiguous_names.contains(leaf)
-                && !self
-                    .local_stack
-                    .last()
-                    .is_some_and(|l| l.contains_key(leaf))
-            {
-                if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
-                    let qual = format!("{}::{}", pkg, leaf);
-                    if self.signal_name_to_id.contains_key(qual.as_str()) {
-                        return std::borrow::Cow::Owned(qual);
-                    }
-                }
+            if let Some(qual) = self.ambiguous_pkg_name(hier.path[0].name.name.as_str()) {
+                return std::borrow::Cow::Owned(qual);
             }
         }
         if let Some(cached) = hier.cached_resolved_name.get() {
@@ -92232,6 +92364,103 @@ impl Simulator {
             return std::borrow::Cow::Borrowed(cached.as_str());
         }
         std::borrow::Cow::Owned(owned)
+    }
+
+    /// §26.3: the storage of a bare name that more than one package declares
+    /// (or that a module-scope declaration contests), as seen from the
+    /// running code: inside a package subroutine its own package's; in a
+    /// method of a package class that class's package's; in a module /
+    /// interface / program the package the design unit imports it from —
+    /// unless the scope declares the name itself. `None` keeps the plain
+    /// resolution.
+    fn ambiguous_pkg_name(&self, leaf: &str) -> Option<String> {
+        if !self.pkg_ambiguous_names.contains(leaf)
+            || self
+                .local_stack
+                .last()
+                .is_some_and(|l| l.contains_key(leaf))
+        {
+            return None;
+        }
+        let qual_in = |pkg: &str| -> Option<String> {
+            let q = format!("{}::{}", pkg, leaf);
+            self.signal_name_to_id.contains_key(q.as_str()).then_some(q)
+        };
+        match self.pkg_scope_stack.last() {
+            Some(Some(pkg)) => return qual_in(pkg),
+            // A module subroutine: its module's imports decide (below).
+            Some(None) | None => {}
+        }
+        if let Some(Some(ctx)) = self.class_context_stack.last() {
+            if let Some(pkg) = self.module.class_decl_pkg.get(ctx.as_str()) {
+                return qual_in(pkg);
+            }
+        }
+        self.scope_import_pkg(leaf, &|pkg| {
+            self.signal_name_to_id
+                .contains_key(format!("{}::{}", pkg, leaf).as_str())
+        })
+        .map(|pkg| format!("{}::{}", pkg, leaf))
+    }
+
+    /// §26.3: the package the running design unit (module / interface /
+    /// program instance) imports `leaf` from, among the packages for which
+    /// `has(pkg)` holds — an explicit `import P::leaf` first, else a unique
+    /// wildcard import. `None` when the scope declares `leaf` itself or no
+    /// single package supplies it.
+    fn scope_import_pkg(&self, leaf: &str, has: &dyn Fn(&str) -> bool) -> Option<String> {
+        if self.module.def_pkg_imports.is_empty() {
+            return None;
+        }
+        // The running design unit: the instance scope of the process.
+        let scope: Option<String> = match self.activation_scope.borrow().as_deref() {
+            Some(s) => Some(s.to_string()),
+            None => self.name_resolve_hint.borrow().clone(),
+        };
+        let scope = scope.unwrap_or_default();
+        let def: String = if scope.is_empty() {
+            if self.module.wildcard_shadowed.contains(leaf)
+                || self.module.foreign_displaced.contains(leaf)
+            {
+                return None;
+            }
+            self.module.name.clone()
+        } else {
+            let mut cur: &str = scope.as_str();
+            loop {
+                let local = format!("{}.{}", cur, leaf);
+                if self.signal_name_to_id.contains_key(local.as_str())
+                    || self.signals.contains_key(&local)
+                {
+                    return None;
+                }
+                if let Some(inst) = self.instance_by_path(cur) {
+                    break inst.def_name.clone();
+                }
+                match cur.rsplit_once('.') {
+                    Some((p, _)) => cur = p,
+                    None => return None,
+                }
+            }
+        };
+        let imports = self.module.def_pkg_imports.get(&def)?;
+        if let Some((pkg, _)) = imports
+            .iter()
+            .find(|(_, item)| item.as_deref() == Some(leaf))
+        {
+            return has(pkg).then(|| pkg.clone());
+        }
+        let mut hit: Option<&String> = None;
+        for (pkg, item) in imports {
+            if item.is_some() || !has(pkg) {
+                continue;
+            }
+            if hit.is_some_and(|h| h != pkg) {
+                return None; // §26.3: imported from two packages
+            }
+            hit = Some(pkg);
+        }
+        hit.cloned()
     }
 
     fn resolve_hier_name_slow(&self, hier: &HierarchicalIdentifier) -> String {
@@ -92254,19 +92483,8 @@ impl Simulator {
         // otherwise), a local of that name still wins, and the result is
         // deliberately NOT memoized: it depends on the call frame, not the node.
         if !self.pkg_ambiguous_names.is_empty() && hier.path.len() == 1 {
-            let leaf = hier.path[0].name.name.as_str();
-            if self.pkg_ambiguous_names.contains(leaf)
-                && !self
-                    .local_stack
-                    .last()
-                    .is_some_and(|l| l.contains_key(leaf))
-            {
-                if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
-                    let qual = format!("{}::{}", pkg, leaf);
-                    if self.signal_name_to_id.contains_key(qual.as_str()) {
-                        return qual;
-                    }
-                }
+            if let Some(qual) = self.ambiguous_pkg_name(hier.path[0].name.name.as_str()) {
+                return qual;
             }
         }
         // Per-hier cache: first call resolves and memoizes the result on the
@@ -92355,9 +92573,16 @@ impl Simulator {
                 .contains_key(hier.path[0].name.name.as_str())
             && !self.signals.contains_key(&hier.path[0].name.name)
         {
-            let stripped: String = hier.path[1..]
-                .iter()
-                .map(|s| s.name.name.as_str())
+            // §26.3: a contested package variable has its own storage.
+            let qual = self.pkg_var_storage(&hier.path[0].name.name, &hier.path[1].name.name);
+            let stripped: String = qual
+                .as_deref()
+                .into_iter()
+                .chain(
+                    hier.path[1 + qual.is_some() as usize..]
+                        .iter()
+                        .map(|s| s.name.name.as_str()),
+                )
                 .collect::<Vec<_>>()
                 .join(".");
             let _ = hier.cached_resolved_name.set(stripped.clone());
@@ -92690,6 +92915,20 @@ impl Simulator {
         // since the table is keyed by the full path itself, not nested deeper.
         // On c910, this scan over 35.7M signals dominated time-0 settle
         // (575s / 11K probes).
+        //
+        // §8.5 / §23.9: inside a class method a bare name its class (or an
+        // ancestor) declares as a property IS that property. The leaf scan
+        // below matched any design signal with that last segment — e.g. the
+        // member `h` of an unpacked-struct variable `r` (`r.h`) — so a
+        // method's `h = new` constructed nothing and every later `g.h.<m>`
+        // read x.
+        if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+            if let Some(Some(ctx)) = self.class_context_stack.last() {
+                if self.prop_owners(ctx).contains_key(leaf.as_str()) {
+                    return raw;
+                }
+            }
+        }
         if hier.path.len() == 1 && !leaf.contains('.') {
             // An elided input port with this leaf could have been the match
             // this heuristic picked before the port was left out.
@@ -102432,6 +102671,14 @@ impl Simulator {
                 && (self.module.dynamic_arrays.contains(base)
                     || self.module.associative_arrays.contains_key(base))
             {
+                // §6.11.1: an element of a signed-element class collection
+                // keeps the element type's width and signedness, not the
+                // rvalue's (`p.dyn[1] = 8'hff` stores the byte -1).
+                let val = if !val.is_real && self.signed_class_coll(base) {
+                    self.fit_signed_class_coll_elem(base, val)
+                } else {
+                    val
+                };
                 let base = base.to_string();
                 self.signals.insert(name.to_string(), val);
                 self.touch_queue(&base);
@@ -102515,6 +102762,7 @@ impl Simulator {
         while let Some(c) = cur {
             if let Some(cd) = self.module.classes.get(&c) {
                 if let Some(&(lo, hi, _)) = cd.array_properties.get(member) {
+                    let (lo, hi) = self.inst_fixed_bounds(cd, h, member, (lo, hi));
                     return Some((hi - lo + 1) as u64);
                 }
                 cur = cd.extends.clone();
@@ -102548,6 +102796,7 @@ impl Simulator {
                         while let Some(c) = cur {
                             if let Some(cd) = self.module.classes.get(&c) {
                                 if let Some(&(lo, hi, _)) = cd.array_properties.get(member) {
+                                    let (lo, hi) = self.inst_fixed_bounds(cd, h, member, (lo, hi));
                                     return Some((scoped, lo, hi));
                                 }
                                 cur = cd.extends.clone();
@@ -110944,6 +111193,16 @@ impl Simulator {
     /// (or an array of them) and `<suffix>` is any chain of `.member` / `[i]`.
     /// Each leaf gets its own per-instance cell keyed `<prop><suffix>`.
     fn class_unpacked_leaf(&mut self, e: &Expression) -> Option<ClassAggRef> {
+        // §11.4.2 / §11.3.6: the probe below EVALUATES every index of the
+        // chain, and the real read or write evaluates them again. With a side
+        // effect in an index (`items[--sp]`, `q[i++].f`) that ran it twice
+        // whenever a property name of the chain COULD be a struct — e.g. any
+        // `T items[N]` whose type parameter might bind a struct — so a
+        // `return items[--sp];` popped two elements. Only probe such a chain
+        // when one of its receivers really is an unpacked-struct property.
+        if Self::chain_has_impure_index(e) && !self.chain_names_unpacked_struct_prop(e) {
+            return None;
+        }
         // A dotted reference is an IDENT with a multi-segment path outside a
         // method body and a MemberAccess/Index chain inside one; both shapes
         // reach here, and both used to resolve only one level below the
@@ -110996,6 +111255,81 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// Whether an index or select of the member/index chain `e` (not of a
+    /// receiver's own sub-expressions) has a side effect.
+    fn chain_has_impure_index(e: &Expression) -> bool {
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, .. } => cur = expr,
+                ExprKind::Index { expr, index } => {
+                    if !Self::cond_expr_is_effect_free(index, false) {
+                        return true;
+                    }
+                    cur = expr;
+                }
+                ExprKind::Ident(h) => {
+                    return h.path.iter().any(|s| {
+                        s.selects
+                            .iter()
+                            .any(|x| !Self::cond_expr_is_effect_free(x, false))
+                    });
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether some receiver of the chain `e` is an unpacked-struct class
+    /// property that spreads member-wise, found WITHOUT evaluating any index
+    /// of the chain (see `class_unpacked_leaf`).
+    fn chain_names_unpacked_struct_prop(&mut self, e: &Expression) -> bool {
+        let mut bases: Vec<Expression> = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+                    cur = expr;
+                    if !matches!(cur.kind, ExprKind::Ident(_)) {
+                        bases.push(cur.clone());
+                    }
+                }
+                _ => break,
+            }
+        }
+        if let ExprKind::Ident(h) = &cur.kind {
+            for k in 0..h.path.len() {
+                let mut base_h = h.clone();
+                base_h.path.truncate(k + 1);
+                if let Some(seg) = base_h.path.last_mut() {
+                    seg.selects.clear();
+                }
+                base_h.cached_signal_id = std::cell::Cell::new(None);
+                base_h.cached_resolved_name = std::cell::OnceCell::new();
+                bases.push(Expression::new(ExprKind::Ident(base_h), cur.span));
+            }
+        }
+        for base in &bases {
+            if !Self::receiver_prop_name(base).is_some_and(|p| self.struct_prop_name_possible(p)) {
+                continue;
+            }
+            if Self::chain_has_impure_index(base) {
+                // A receiver with its own side effect: keep the old probe.
+                return true;
+            }
+            let Some((handle, prop)) = self.class_prop_receiver(base) else {
+                continue;
+            };
+            if self
+                .class_prop_struct(handle, &prop)
+                .is_some_and(|su| Self::spreads_member_wise(&su))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Candidate splits of a dotted identifier: each segment in turn is taken
@@ -112642,12 +112976,17 @@ impl Simulator {
             };
             if let Some((shape, _)) = class_def.array_nd_properties.get(member) {
                 if let Some(data_type) = class_def.property_types.get(member) {
-                    layout = Some((shape.clone(), data_type.clone()));
+                    let shape = self
+                        .inst_nd_shape(class_def, handle, member)
+                        .unwrap_or_else(|| shape.clone());
+                    layout = Some((shape, data_type.clone()));
                     break;
                 }
             }
             if let Some(&(low, high, _)) = class_def.array_properties.get(member) {
                 if let Some(data_type) = class_def.property_types.get(member) {
+                    let (low, high) =
+                        self.inst_fixed_bounds(class_def, handle, member, (low, high));
                     layout = Some((vec![(low, high)], data_type.clone()));
                     break;
                 }
@@ -117110,8 +117449,28 @@ impl Simulator {
                     _ => false,
                 }
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self.signed_class_coll(obj);
         (w, signed)
+    }
+
+    /// Whether `coll` is the instance-scoped storage of a class queue /
+    /// dynamic-array property with a signed integral element type (see
+    /// `signed_class_colls`).
+    #[inline]
+    fn signed_class_coll(&self, coll: &str) -> bool {
+        !self.signed_class_colls.is_empty() && self.signed_class_colls.contains(coll)
+    }
+
+    /// §6.11.1: an element stored into a signed-element class collection
+    /// takes the element type's width and signedness, not the rvalue's.
+    fn fit_signed_class_coll_elem(&self, coll: &str, val: Value) -> Value {
+        let mut v = match self.module.arrays.get(coll) {
+            Some(&(_, _, w)) if w > 0 && w != val.width => val.resize(w),
+            _ => val,
+        };
+        v.is_signed = true;
+        v
     }
 
     fn eval_builtin_method(
@@ -117694,8 +118053,14 @@ impl Simulator {
                                 .and_then(|m| m.to_i64())
                                 .unwrap_or(i64::MAX)
                     } else {
+                        // The first element has nothing to compare against
+                        // (`min_val` is None): it was an unconditional unwrap
+                        // that panicked on every unsigned collection.
                         v.to_u64().unwrap_or(u64::MAX)
-                            < min_val.as_ref().unwrap().to_u64().unwrap_or(u64::MAX)
+                            < min_val
+                                .as_ref()
+                                .and_then(|m| m.to_u64())
+                                .unwrap_or(u64::MAX)
                     };
                     if min_val.is_none() || lt {
                         min_val = Some(v);
@@ -117717,7 +118082,8 @@ impl Simulator {
                                 .and_then(|m| m.to_i64())
                                 .unwrap_or(i64::MIN)
                     } else {
-                        v.to_u64().unwrap_or(0) > max_val.as_ref().unwrap().to_u64().unwrap_or(0)
+                        v.to_u64().unwrap_or(0)
+                            > max_val.as_ref().and_then(|m| m.to_u64()).unwrap_or(0)
                     };
                     if max_val.is_none() || gt {
                         max_val = Some(v);
@@ -125986,6 +126352,54 @@ impl Simulator {
         None
     }
 
+    /// §8.25 + §8.10: a static method called through an object handle
+    /// (`c.depth()`) belongs to the object's specialization: `c` of type
+    /// `St#(2)` runs `St#(2)::depth`, whose bare parameter `N` reads 2, not
+    /// the default. The object carries its specialization in `spec`; for a
+    /// method inherited from a parameterized ancestor the ancestor's binding
+    /// is derived from it. A null handle (or an object built without a
+    /// specialization) keeps the plain class dispatch.
+    fn exec_static_method_via_object(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        args: &[Expression],
+        handle: usize,
+    ) -> Option<Value> {
+        let spec = (handle != 0)
+            .then(|| self.heap.get(handle).and_then(|o| o.as_ref()))
+            .flatten()
+            .and_then(|inst| inst.spec.clone())
+            .and_then(|(base, sig)| {
+                // The class in the receiver's chain that declares the method.
+                let mut cur = Some(class_name.to_string());
+                let mut declaring = None;
+                while let Some(cn) = cur {
+                    let cd = self.module.classes.get(&cn)?;
+                    if cd.methods.contains_key(method_name) {
+                        declaring = Some(cn);
+                        break;
+                    }
+                    cur = cd.extends.clone();
+                }
+                let declaring = declaring?;
+                if self.class_origin(&declaring) == base {
+                    Some((base, sig))
+                } else {
+                    self.inherited_method_spec(handle, &declaring)
+                }
+            });
+        match spec {
+            Some(spec) => {
+                let saved = std::mem::replace(&mut self.current_spec, Some(spec));
+                let v = self.exec_static_method(class_name, method_name, args);
+                self.current_spec = saved;
+                v
+            }
+            None => self.exec_static_method(class_name, method_name, args),
+        }
+    }
+
     /// Internal helper: execute static method without config_db interception
     fn exec_static_method_internal(
         &mut self,
@@ -127982,7 +128396,9 @@ impl Simulator {
                 .map(|c| c.split('#').next().unwrap_or(&c).to_string())
             {
                 if self.is_static_method(&base_cls, &member.name) {
-                    if let Some(res) = self.exec_static_method(&base_cls, &member.name, args) {
+                    if let Some(res) =
+                        self.exec_static_method_via_object(&base_cls, &member.name, args, handle)
+                    {
                         return res;
                     }
                 }
@@ -129155,7 +129571,9 @@ impl Simulator {
                     {
                         let m = method_name.clone();
                         if self.is_static_method(&base_cls, &m) {
-                            if let Some(res) = self.exec_static_method(&base_cls, &m, args) {
+                            if let Some(res) =
+                                self.exec_static_method_via_object(&base_cls, &m, args, handle)
+                            {
                                 return res;
                             }
                         }
@@ -129473,8 +129891,21 @@ impl Simulator {
                 && !self.pkg_ambiguous_names.is_empty()
                 && self.pkg_ambiguous_names.contains(name.as_str())
             {
-                if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
-                    let pkg = pkg.clone();
+                // Outside a package subroutine, the calling design unit's
+                // import of the name decides (§26.3: `import pc::who;` binds
+                // `who()` to pc's even when another package declares one).
+                let owner = match self.pkg_scope_stack.last() {
+                    Some(Some(pkg)) => Some(pkg.clone()),
+                    _ => {
+                        let n = name.to_string();
+                        self.scope_import_pkg(&n, &|pkg| {
+                            let q = format!("{}::{}", pkg, n);
+                            self.module.functions.get(&q).is_some()
+                                || self.module.tasks.contains_key(&q)
+                        })
+                    }
+                };
+                if let Some(pkg) = owner {
                     let qual = format!("{}::{}", pkg, name);
                     if let Some(fd) = self.fn_decl_rc(&qual) {
                         self.pending_pkg_scope = Some(pkg);
@@ -137429,6 +137860,14 @@ impl Simulator {
             // to independent storage with size starting at 0.
             for (prop, &(width, max)) in &cdef.queue_properties {
                 let scoped = format!("{}#{}", handle, prop);
+                if cdef.property_types.get(prop).is_some_and(|dt| {
+                    matches!(
+                        dt,
+                        DataType::IntegerAtom { .. } | DataType::IntegerVector { .. }
+                    ) && super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types)
+                }) {
+                    self.signed_class_colls.insert(scoped.clone());
+                }
                 self.module.dynamic_arrays.insert(scoped.clone());
                 self.module.arrays.insert(scoped.clone(), (0, 63, width));
                 if let Some(m) = max {
@@ -137441,6 +137880,15 @@ impl Simulator {
             // element to 0 so index reads / foreach see a populated range.
             for (prop, &(lo, hi, width)) in &cdef.array_properties {
                 let scoped = format!("{}#{}", handle, prop);
+                // §8.25: sized by a value parameter — this object's size.
+                let (lo, hi) = match cdef
+                    .param_sized_props
+                    .get(prop)
+                    .and_then(|d| self.param_sized_shape(d, &instance, &classes_to_init))
+                {
+                    Some(sh) if sh.len() == 1 => sh[0],
+                    _ => (lo, hi),
+                };
                 self.module.arrays.insert(scoped.clone(), (lo, hi, width));
                 for i in lo..=hi {
                     self.signals
@@ -137454,6 +137902,13 @@ impl Simulator {
             // element's default is null). Oversized shapes stay lazy.
             for (prop, (shape, width)) in &cdef.array_nd_properties {
                 let scoped = format!("{}#{}", handle, prop);
+                // §8.25: sized by a value parameter — this object's shape.
+                let own_shape = cdef
+                    .param_sized_props
+                    .get(prop)
+                    .and_then(|d| self.param_sized_shape(d, &instance, &classes_to_init))
+                    .filter(|sh| sh.len() == shape.len());
+                let shape = own_shape.as_ref().unwrap_or(shape);
                 if shape.len() == 2 {
                     self.module
                         .arrays_2d
@@ -137895,6 +138350,7 @@ impl Simulator {
                 // `pattern_elems`, the same expansion the general array-pattern
                 // spread (`assign_pattern_array`) uses.
                 if let Some(&(lo, hi, _w)) = cdef.array_properties.get(&pname) {
+                    let (lo, hi) = self.inst_fixed_bounds(cdef, handle, &pname, (lo, hi));
                     let scoped = format!("{}#{}", handle, pname);
                     if let ExprKind::AssignmentPattern(items) = &init.kind {
                         let indices: Vec<i64> = (lo..=hi).collect();
@@ -138803,6 +139259,7 @@ impl Simulator {
                     .and_then(|s| s.type_name.clone())
                     .is_some_and(|tn| self.module.classes.contains_key(&tn));
                 if let Some(&(lo, hi, w)) = cd.array_properties.get(prop) {
+                    let (lo, hi) = self.inst_fixed_bounds(cd, handle, prop, (lo, hi));
                     out.push(RandColl {
                         prop: prop.clone(),
                         scoped,
@@ -141695,6 +142152,7 @@ impl Simulator {
                     if let Some(&(lo, hi, w)) = class_def.array_properties.get(prop)
                         && !is_handle
                     {
+                        let (lo, hi) = self.inst_fixed_bounds(class_def, handle, prop, (lo, hi));
                         rand_arrays.push((
                             prop.clone(),
                             format!("{}#{}", handle, prop),
@@ -144110,6 +144568,95 @@ impl Simulator {
     /// Re-register the per-instance storage of collection members whose
     /// element width depends on the object's parameters — see the call in
     /// `instantiate_class_with_type_args`.
+    /// §8.25: the shape of the param-sized fixed-array member `dims` for an
+    /// object under construction, from the parameter values it binds (leaf
+    /// first, so a derived class's parameter shadows an ancestor's), falling
+    /// back to the design's parameters for any other name. `None` when a bound
+    /// does not fold.
+    fn param_sized_shape(
+        &self,
+        dims: &[crate::ast::types::UnpackedDimension],
+        instance: &ClassInstance,
+        chain: &[std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>],
+    ) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::UnpackedDimension as UD;
+        let mut m: HashMap<String, Value> = HashMap::default();
+        for c in chain {
+            for (pn, _) in &c.param_defaults {
+                if let Some(v) = instance.properties.get(pn) {
+                    m.entry(pn.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        let mut full: Option<HashMap<String, Value>> = None;
+        let mut ev = |e: &Expression| -> Option<i64> {
+            if let Some(v) = super::elaborate::const_eval_i64_with_params(e, Some(&m)) {
+                return Some(v);
+            }
+            let f = full.get_or_insert_with(|| {
+                let mut f = self.module.parameters.clone();
+                f.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())));
+                f
+            });
+            super::elaborate::const_eval_i64_with_params(e, Some(f))
+        };
+        dims.iter()
+            .map(|d| match d {
+                UD::Range { left, right, .. } => {
+                    let (l, r) = (ev(left)?, ev(right)?);
+                    Some((l.min(r), l.max(r)))
+                }
+                UD::Expression { expr, .. } => {
+                    let n = ev(expr)?;
+                    (n > 0).then_some((0, n - 1))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// §8.25: bounds of the 1-D fixed-array member `prop` of the object
+    /// `handle`. A member sized by a class value parameter has its own size
+    /// per object (registered at construction); everything else has the
+    /// class's `default`.
+    fn inst_fixed_bounds(
+        &self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        handle: usize,
+        prop: &str,
+        default: (i64, i64),
+    ) -> (i64, i64) {
+        if cdef.param_sized_props.is_empty() || !cdef.param_sized_props.contains_key(prop) {
+            return default;
+        }
+        self.module
+            .arrays
+            .get(format!("{}#{}", handle, prop).as_str())
+            .map(|&(lo, hi, _)| (lo, hi))
+            .unwrap_or(default)
+    }
+
+    /// §8.25: the per-object shape of a param-sized multi-dimensional member
+    /// (see `inst_fixed_bounds`); `None` for any other member.
+    fn inst_nd_shape(
+        &self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        handle: usize,
+        prop: &str,
+    ) -> Option<Vec<(i64, i64)>> {
+        if cdef.param_sized_props.is_empty() || !cdef.param_sized_props.contains_key(prop) {
+            return None;
+        }
+        let scoped = format!("{}#{}", handle, prop);
+        if let Some(&(a, b, _)) = self.module.arrays_2d.get(scoped.as_str()) {
+            return Some(vec![a, b]);
+        }
+        self.module
+            .arrays_nd
+            .get(scoped.as_str())
+            .map(|(sh, _)| sh.clone())
+    }
+
     fn respec_member_elem_widths(
         &mut self,
         handle: usize,
@@ -144123,6 +144670,7 @@ impl Simulator {
                 if w == width || w == 0 {
                     continue;
                 }
+                let (lo, hi) = self.inst_fixed_bounds(cdef, handle, prop, (lo, hi));
                 let scoped = format!("{}#{}", handle, prop);
                 self.module.arrays.insert(scoped.clone(), (lo, hi, w));
                 for i in lo..=hi {
@@ -144138,6 +144686,8 @@ impl Simulator {
                 if w == *width || w == 0 {
                     continue;
                 }
+                let own = self.inst_nd_shape(cdef, handle, prop);
+                let shape = own.as_ref().unwrap_or(shape);
                 let scoped = format!("{}#{}", handle, prop);
                 if let Some(e) = self.module.arrays_2d.get_mut(&scoped) {
                     e.2 = w;
@@ -146632,6 +147182,7 @@ impl Simulator {
                 loop {
                     if let Some(cd) = self.module.classes.get(&cn) {
                         if let Some(&(lo, hi, w)) = cd.array_properties.get(&prop) {
+                            let (lo, hi) = self.inst_fixed_bounds(cd, handle, &prop, (lo, hi));
                             range = Some((lo, hi, w));
                             break;
                         }
@@ -147420,7 +147971,13 @@ impl Simulator {
         loop {
             let cd = self.module.classes.get(&cn)?;
             if let Some(&(lo, hi, w)) = cd.array_properties.get(arr_name) {
+                let (lo, hi) = self.inst_fixed_bounds(cd, handle, arr_name, (lo, hi));
                 return Some((vec![(lo, hi)], w));
+            }
+            if let Some(sh) = self.inst_nd_shape(cd, handle, arr_name) {
+                if let Some((_, w)) = cd.array_nd_properties.get(arr_name) {
+                    return Some((sh, *w));
+                }
             }
             if let Some((shape, w)) = cd.array_nd_properties.get(arr_name) {
                 return Some((shape.clone(), *w));
@@ -153439,6 +153996,35 @@ impl Simulator {
                 // property's declared type comes from the head's runtime
                 // class. Without this, `h.prop = new` could not resolve the
                 // class to construct and silently stored garbage.
+                // §8.15: the same for a longer chain (`n.next.next = new(3)`):
+                // walk the live handles to the last owner. Without it the
+                // chain had no type, `new(3)` was not a construction and the
+                // write was lost.
+                if hier.path.len() >= 3
+                    && hier.path.iter().all(|s| s.selects.is_empty())
+                    && !self.signal_name_to_id.contains_key(name.as_ref())
+                    && self.bare_name_is_class_channel(hier.path[0].name.name.as_str())
+                {
+                    let n = hier.path.len();
+                    let mut h = self.eval_ident_handle(hier.path[0].name.name.as_str());
+                    for seg in &hier.path[1..n - 1] {
+                        h = h
+                            .filter(|&x| x != 0)
+                            .and_then(|x| self.member_handle(x, &seg.name.name));
+                    }
+                    if let Some(cn) = h
+                        .filter(|&x| x != 0)
+                        .and_then(|x| self.heap.get(x))
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone())
+                    {
+                        if let Some(t) =
+                            self.class_prop_type_named(&cn, &hier.path[n - 1].name.name)
+                        {
+                            return Some(t);
+                        }
+                    }
+                }
                 if hier.path.len() == 2
                     && hier.path.iter().all(|s| s.selects.is_empty())
                     && self
@@ -153778,6 +154364,14 @@ impl Simulator {
                     }
                 }
                 if let Some(base_type) = self.get_expr_type_name(base) {
+                    // §8.15: a member of a handle reached through a chain
+                    // (`next.next.next = new(40)` in a method): the base's
+                    // type is a class, whose declaration types the member.
+                    if self.module.classes.contains_key(&base_type) {
+                        if let Some(t) = self.class_prop_type_named(&base_type, &member.name) {
+                            return Some(t);
+                        }
+                    }
                     let dt_opt = self.module.typedef_types.get(&base_type).cloned();
                     if let Some(dt) = dt_opt {
                         let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
@@ -154162,9 +154756,114 @@ impl Simulator {
                         ));
                     }
                 }
+            } else if let Some(r) = self.shadowed_member_rewrite(e) {
+                return Some(r);
             }
         }
         Self::super_as_this(e)
+    }
+
+    /// §8.14 + §8.10: `h.p` (and `this.p`, `a.b.p`) where `p` is SHADOWED
+    /// names the copy declared by the nearest class at or above the STATIC
+    /// type of `h`, not the copy of the object's leaf class: a `Base` handle
+    /// to a `Derived` object reads and writes `Base`'s `p`. The member is
+    /// renamed to the qualified storage key (`"<Class>::p"`, see
+    /// `instantiate_class_with_type_args`) when the two declarers differ.
+    /// `None` keeps the bare-name path.
+    fn shadowed_member_rewrite(&self, e: &Expression) -> Option<Expression> {
+        let (prefix, m, span): (Expression, &str, crate::ast::Span) = match &e.kind {
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.root.is_none()
+                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let m = h.path.last()?.name.name.as_str();
+                if !self.shadowed_prop_names.contains(m) || h.path[0].name.name == "super" {
+                    return None;
+                }
+                let p = hier_prefix(h);
+                let prefix = if p.path.len() == 1 && p.path[0].name.name == "this" {
+                    Expression::new(ExprKind::This, e.span)
+                } else {
+                    Expression::new(ExprKind::Ident(p), e.span)
+                };
+                (prefix, m, e.span)
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                if !self.shadowed_prop_names.contains(member.name.as_str()) {
+                    return None;
+                }
+                let prefix = match &base.kind {
+                    ExprKind::Ident(bh)
+                        if bh.path.len() == 1
+                            && bh.path[0].selects.is_empty()
+                            && bh.path[0].name.name == "this" =>
+                    {
+                        Expression::new(ExprKind::This, base.span)
+                    }
+                    ExprKind::Ident(bh) if bh.path.iter().any(|s| !s.selects.is_empty()) => {
+                        return None;
+                    }
+                    ExprKind::Ident(_) | ExprKind::This | ExprKind::MemberAccess { .. } => {
+                        (**base).clone()
+                    }
+                    ExprKind::Index { .. } => (**base).clone(),
+                    _ => return None,
+                };
+                (prefix, member.name.as_str(), e.span)
+            }
+            _ => return None,
+        };
+        // The static class of the prefix.
+        let static_cls: String = if matches!(prefix.kind, ExprKind::This) {
+            self.class_context_stack.last().cloned().flatten()?
+        } else {
+            let tn = self.get_expr_type_name(&prefix)?;
+            let tn = match self.extract_spec_from_string(&tn) {
+                Some((base, _)) => base,
+                None => tn,
+            };
+            if self.module.classes.contains_key(&tn) {
+                tn
+            } else {
+                self.resolve_simple_typedef_class(&tn)
+                    .filter(|c| self.module.classes.contains_key(c))?
+            }
+        };
+        let declarer_from = |start: &str| -> Option<String> {
+            let mut cur = Some(start.to_string());
+            let mut guard = 0;
+            while let Some(cn) = cur {
+                guard += 1;
+                if guard > 64 {
+                    return None;
+                }
+                let cd = self.module.classes.get(&cn)?;
+                if cd.properties.contains_key(m) {
+                    return Some(cn);
+                }
+                cur = cd.extends.clone();
+            }
+            None
+        };
+        let target = declarer_from(&static_cls)?;
+        let handle = self.eval_handle_expr(&prefix).filter(|&h| h != 0)?;
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let leaf = declarer_from(&inst.class_name)?;
+        if leaf == target {
+            return None;
+        }
+        let qkey = format!("{}::{}", target, m);
+        if !inst.properties.contains_key(qkey.as_str()) {
+            return None;
+        }
+        Some(Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(prefix),
+                member: crate::ast::Identifier { name: qkey, span },
+            },
+            span,
+        ))
     }
 
     fn super_as_this(e: &Expression) -> Option<Expression> {
