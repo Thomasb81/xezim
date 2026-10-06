@@ -25,7 +25,10 @@ module wide_guard_probe ;
          bit           spare_enable = 0 ;
          if (std::randomize(spare_word) with {
             spare_enable -> (spare_word == 0) ;
-         }) $display("OK control (pred=0) spare_word[0]=%b", spare_word[0]) ;
+         }) begin
+            verify(!$isunknown(spare_word), "randomized word contains unknown bits");
+            $display("OK control (pred=0) spare_word[0]=%b", spare_word[0]);
+         end
          else verify(0, "control (pred=0) returned 0") ;
       end
 
@@ -34,5 +37,4 @@ module wide_guard_probe ;
       $finish ;
    end
 endmodule
-
 

@@ -20,6 +20,7 @@ module real_window_probe ;
             samples[i] <= 1.1 * period ;
          }
       }) begin
+         verify(samples.size() == 16, "unexpected sample count");
          foreach (samples[i]) begin
             if (samples[i] < 900 || samples[i] > 1100) begin
                invalid++ ;
@@ -37,5 +38,4 @@ module real_window_probe ;
       $finish ;
    end
 endmodule
-
 

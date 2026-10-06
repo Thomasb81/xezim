@@ -22,6 +22,8 @@ module array_joint_probe ;
             foreach (parts[i]) { parts[i] inside { [0:2] } ; }
             parts.sum() with (16'(item)) == total_parts ;
          }) begin
+            verify(slot_count >= 6 && slot_count <= 24, "joint size outside bounds");
+            foreach (parts[i]) verify(parts[i] <= 2, "joint element outside bounds");
             verify(parts.size() == slot_count && words.size() == slot_count, "sum-test: size mismatch") ;
             verify(parts.sum() with (16'(item)) == total_parts, "sum-test: sum mismatch") ;
             $display("sum-test: OK slot_count=%0d parts.size()=%0d words.size()=%0d",
@@ -45,6 +47,7 @@ module array_joint_probe ;
             foreach (parts[i]) { parts[i] inside { [0:2] } ; }
          }) begin
             verify(slot_count >= 6 && slot_count <= 24, "size-test: slot_count out of range") ;
+            foreach (parts[i]) verify(parts[i] <= 2, "sized element outside bounds");
             verify(parts.size() == slot_count, "size-test: parts.size() != slot_count") ;
             $display("size-test: OK slot_count=%0d parts.size()=%0d", slot_count, parts.size()) ;
          end else begin
@@ -65,7 +68,11 @@ module array_joint_probe ;
             }
             parts.size() == slot_count ;
             foreach (parts[i]) { parts[i] inside { [0:2] } ; }
-         }) verify(parts.size() == slot_count, "hang-test: parts.size() != slot_count") ;
+         }) begin
+            verify(parts.size() == slot_count, "integer size mismatch");
+            verify(slot_count >= 6 && slot_count <= 24, "integer size outside bounds");
+            foreach (parts[i]) verify(parts[i] <= 2, "integer element outside bounds");
+         end
          else verify(0, "hang-test: std::randomize returned 0") ;
       end
 
@@ -74,5 +81,4 @@ module array_joint_probe ;
       $finish ;
    end
 endmodule
-
 
