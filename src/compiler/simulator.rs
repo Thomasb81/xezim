@@ -6761,6 +6761,10 @@ pub struct Simulator {
     /// only ones whose bare hoisted entry is ambiguous. Empty for a design
     /// without such a collision, which short-circuits the qualified lookup.
     pkg_ambiguous_names: HashSet<String>,
+    /// §26.3: the package VARIABLE names among `pkg_ambiguous_names` (see
+    /// `split_contested_package_vars`): only these resolve through a design
+    /// unit's imports or a package class's package.
+    contested_pkg_vars: HashSet<String>,
     /// §21.2.1.7 `%m` lexical-scope hierarchy WITHIN the current instance:
     /// task / function / named-block / fork-block names, innermost last.
     /// Pushed on subroutine/named-block entry, popped on exit.
@@ -6869,6 +6873,9 @@ pub struct Simulator {
     /// `"<Class>::<name>"`; the set is the cheap gate that keeps every
     /// unshadowed access on the bare-name fast path.
     shadowed_prop_names: HashSet<String>,
+    /// `meta_key_bits` of every name in `shadowed_prop_names`: a prefilter that
+    /// spares the hot member-access paths a hash per access.
+    shadowed_prop_mask: u64,
     /// §6.11.1 / §7.5: instance-scoped storage names (`<handle>#<member>`) of
     /// queue / dynamic-array class properties whose element type is a SIGNED
     /// integral type (`byte`, `shortint`, `logic signed [7:0]`, ...). Their
@@ -9062,7 +9069,7 @@ impl Simulator {
     /// bare name is contested (see `split_contested_package_vars`), else
     /// `None` (the bare hoisted entry is the package's own).
     fn pkg_var_storage(&self, pkg: &str, name: &str) -> Option<String> {
-        if self.pkg_ambiguous_names.is_empty() || !self.pkg_ambiguous_names.contains(name) {
+        if self.contested_pkg_vars.is_empty() || !self.contested_pkg_vars.contains(name) {
             return None;
         }
         let q = format!("{}::{}", pkg, name);
@@ -10499,7 +10506,7 @@ impl Simulator {
         // called) through the running package's own entry. Every other name
         // resolves identically either way, so the set stays empty for
         // practically every design and both lookups short-circuit.
-        let mut pkg_ambiguous_names: HashSet<String> = contested_pkg_vars;
+        let mut pkg_ambiguous_names: HashSet<String> = contested_pkg_vars.clone();
         {
             let mut first_owner: HashMap<&str, &str> = HashMap::default();
             for key in module.parameters.keys() {
@@ -12012,6 +12019,7 @@ impl Simulator {
             pkg_scope_stack: Vec::new(),
             pending_pkg_scope: None,
             pkg_ambiguous_names,
+            contested_pkg_vars,
             m_scope_stack: Vec::new(),
             static_local_vars: HashMap::default(),
             static_local_names: HashSet::default(),
@@ -12034,6 +12042,7 @@ impl Simulator {
             rand_receiver: None,
             randomize_subset: None,
             shadowed_prop_names: HashSet::default(),
+            shadowed_prop_mask: 0,
             signed_class_colls: HashSet::default(),
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),
@@ -65238,7 +65247,7 @@ impl Simulator {
                 .filter(|_| !fitted.is_real && self.is_associative_array(&an))
             {
                 fitted.is_signed = sg;
-            } else if !fitted.is_real && self.signed_class_coll(&an) {
+            } else if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&an) {
                 fitted = self.fit_signed_class_coll_elem(&an, fitted);
             }
             let changed = self.signals.get(&elem_name) != Some(&fitted);
@@ -65868,7 +65877,7 @@ impl Simulator {
                     !fitted.is_real && !elem_is_string && self.is_associative_array(&name)
                 }) {
                     fitted.is_signed = sg;
-                } else if !fitted.is_real && self.signed_class_coll(&name) {
+                } else if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&name) {
                     fitted = self.fit_signed_class_coll_elem(&name, fitted);
                 }
                 if self.warn_x && self.time > 0 {
@@ -72905,7 +72914,6 @@ impl Simulator {
             || self.name_stats_on
             || self.rand_receiver.is_some()
             || self.item_alias.is_some()
-            || (!self.shadowed_prop_names.is_empty() && self.shadowed_prop_names.contains(m))
             || self.iface_alias_for(n).is_some()
         {
             return None;
@@ -73001,7 +73009,7 @@ impl Simulator {
             }
         }
         let handle = recv.to_u64()? as usize;
-        if handle == 0 {
+        if handle == 0 || (self.shadowed_prop_mask != 0 && self.prop_maybe_shadowed(m)) {
             return None;
         }
         self.heap.get(handle)?.as_ref()?.properties.get(m).cloned()
@@ -92351,8 +92359,25 @@ impl Simulator {
             }
         }
         if !self.pkg_ambiguous_names.is_empty() && hier.path.len() == 1 {
-            if let Some(qual) = self.ambiguous_pkg_name(hier.path[0].name.name.as_str()) {
-                return std::borrow::Cow::Owned(qual);
+            let leaf = hier.path[0].name.name.as_str();
+            if self.pkg_ambiguous_names.contains(leaf)
+                && !self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(leaf))
+            {
+                if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
+                    let qual = format!("{}::{}", pkg, leaf);
+                    if self.signal_name_to_id.contains_key(qual.as_str()) {
+                        return std::borrow::Cow::Owned(qual);
+                    }
+                } else if !self.contested_pkg_vars.is_empty()
+                    && self.contested_pkg_vars.contains(leaf)
+                {
+                    if let Some(qual) = self.contested_pkg_var_in_scope(leaf) {
+                        return std::borrow::Cow::Owned(qual);
+                    }
+                }
             }
         }
         if let Some(cached) = hier.cached_resolved_name.get() {
@@ -92366,31 +92391,20 @@ impl Simulator {
         std::borrow::Cow::Owned(owned)
     }
 
-    /// §26.3: the storage of a bare name that more than one package declares
-    /// (or that a module-scope declaration contests), as seen from the
-    /// running code: inside a package subroutine its own package's; in a
-    /// method of a package class that class's package's; in a module /
+    /// §26.3: the storage of a contested package variable `leaf` (see
+    /// `split_contested_package_vars`) referenced bare OUTSIDE a package
+    /// subroutine (those resolve in their own package before reaching here):
+    /// in a method of a package class that class's package's; in a module /
     /// interface / program the package the design unit imports it from —
     /// unless the scope declares the name itself. `None` keeps the plain
     /// resolution.
-    fn ambiguous_pkg_name(&self, leaf: &str) -> Option<String> {
-        if !self.pkg_ambiguous_names.contains(leaf)
-            || self
-                .local_stack
-                .last()
-                .is_some_and(|l| l.contains_key(leaf))
-        {
-            return None;
-        }
+    #[cold]
+    #[inline(never)]
+    fn contested_pkg_var_in_scope(&self, leaf: &str) -> Option<String> {
         let qual_in = |pkg: &str| -> Option<String> {
             let q = format!("{}::{}", pkg, leaf);
             self.signal_name_to_id.contains_key(q.as_str()).then_some(q)
         };
-        match self.pkg_scope_stack.last() {
-            Some(Some(pkg)) => return qual_in(pkg),
-            // A module subroutine: its module's imports decide (below).
-            Some(None) | None => {}
-        }
         if let Some(Some(ctx)) = self.class_context_stack.last() {
             if let Some(pkg) = self.module.class_decl_pkg.get(ctx.as_str()) {
                 return qual_in(pkg);
@@ -92408,6 +92422,7 @@ impl Simulator {
     /// `has(pkg)` holds — an explicit `import P::leaf` first, else a unique
     /// wildcard import. `None` when the scope declares `leaf` itself or no
     /// single package supplies it.
+    #[inline(never)]
     fn scope_import_pkg(&self, leaf: &str, has: &dyn Fn(&str) -> bool) -> Option<String> {
         if self.module.def_pkg_imports.is_empty() {
             return None;
@@ -92483,8 +92498,25 @@ impl Simulator {
         // otherwise), a local of that name still wins, and the result is
         // deliberately NOT memoized: it depends on the call frame, not the node.
         if !self.pkg_ambiguous_names.is_empty() && hier.path.len() == 1 {
-            if let Some(qual) = self.ambiguous_pkg_name(hier.path[0].name.name.as_str()) {
-                return qual;
+            let leaf = hier.path[0].name.name.as_str();
+            if self.pkg_ambiguous_names.contains(leaf)
+                && !self
+                    .local_stack
+                    .last()
+                    .is_some_and(|l| l.contains_key(leaf))
+            {
+                if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
+                    let qual = format!("{}::{}", pkg, leaf);
+                    if self.signal_name_to_id.contains_key(qual.as_str()) {
+                        return qual;
+                    }
+                } else if !self.contested_pkg_vars.is_empty()
+                    && self.contested_pkg_vars.contains(leaf)
+                {
+                    if let Some(qual) = self.contested_pkg_var_in_scope(leaf) {
+                        return qual;
+                    }
+                }
             }
         }
         // Per-hier cache: first call resolves and memoizes the result on the
@@ -102674,7 +102706,11 @@ impl Simulator {
                 // §6.11.1: an element of a signed-element class collection
                 // keeps the element type's width and signedness, not the
                 // rvalue's (`p.dyn[1] = 8'hff` stores the byte -1).
-                let val = if !val.is_real && self.signed_class_coll(base) {
+                let val = if !self.signed_class_colls.is_empty()
+                    && !val.is_real
+                    && !val.is_signed
+                    && self.signed_class_colls.contains(base)
+                {
                     self.fit_signed_class_coll_elem(base, val)
                 } else {
                     val
@@ -111285,6 +111321,7 @@ impl Simulator {
     /// Whether some receiver of the chain `e` is an unpacked-struct class
     /// property that spreads member-wise, found WITHOUT evaluating any index
     /// of the chain (see `class_unpacked_leaf`).
+    #[inline(never)]
     fn chain_names_unpacked_struct_prop(&mut self, e: &Expression) -> bool {
         let mut bases: Vec<Expression> = Vec::new();
         let mut cur = e;
@@ -117464,6 +117501,7 @@ impl Simulator {
 
     /// §6.11.1: an element stored into a signed-element class collection
     /// takes the element type's width and signedness, not the rvalue's.
+    #[inline(never)]
     fn fit_signed_class_coll_elem(&self, coll: &str, val: Value) -> Value {
         let mut v = match self.module.arrays.get(coll) {
             Some(&(_, _, w)) if w > 0 && w != val.width => val.resize(w),
@@ -126359,6 +126397,7 @@ impl Simulator {
     /// method inherited from a parameterized ancestor the ancestor's binding
     /// is derived from it. A null handle (or an object built without a
     /// specialization) keeps the plain class dispatch.
+    #[inline(never)]
     fn exec_static_method_via_object(
         &mut self,
         class_name: &str,
@@ -129896,6 +129935,11 @@ impl Simulator {
                 // `who()` to pc's even when another package declares one).
                 let owner = match self.pkg_scope_stack.last() {
                     Some(Some(pkg)) => Some(pkg.clone()),
+                    // Only a call made directly in a design unit's procedural
+                    // code consults its imports: inside any subroutine or
+                    // method the lookup below would run per call, and library
+                    // code (UVM) calls contested names on hot paths.
+                    _ if self.class_context_stack.last().is_some() => None,
                     _ => {
                         let n = name.to_string();
                         self.scope_import_pkg(&n, &|pkg| {
@@ -137712,6 +137756,7 @@ impl Simulator {
                 }
                 let key = if seed == 2 {
                     if !self.shadowed_prop_names.contains(prop_name.as_str()) {
+                        self.shadowed_prop_mask |= meta_key_bits(prop_name);
                         self.shadowed_prop_names.insert(prop_name.clone());
                     }
                     format!("{}::{}", cdef.name, prop_name)
@@ -144573,6 +144618,7 @@ impl Simulator {
     /// first, so a derived class's parameter shadows an ancestor's), falling
     /// back to the design's parameters for any other name. `None` when a bound
     /// does not fold.
+    #[inline(never)]
     fn param_sized_shape(
         &self,
         dims: &[crate::ast::types::UnpackedDimension],
@@ -154770,6 +154816,14 @@ impl Simulator {
     /// renamed to the qualified storage key (`"<Class>::p"`, see
     /// `instantiate_class_with_type_args`) when the two declarers differ.
     /// `None` keeps the bare-name path.
+    /// Whether `m` is a shadowed property name (see `shadowed_prop_names`).
+    #[inline]
+    fn prop_maybe_shadowed(&self, m: &str) -> bool {
+        let bits = meta_key_bits(m);
+        self.shadowed_prop_mask & bits == bits && self.shadowed_prop_names.contains(m)
+    }
+
+    #[inline(never)]
     fn shadowed_member_rewrite(&self, e: &Expression) -> Option<Expression> {
         let (prefix, m, span): (Expression, &str, crate::ast::Span) = match &e.kind {
             ExprKind::Ident(h)
@@ -154778,7 +154832,7 @@ impl Simulator {
                     && h.path.iter().all(|s| s.selects.is_empty()) =>
             {
                 let m = h.path.last()?.name.name.as_str();
-                if !self.shadowed_prop_names.contains(m) || h.path[0].name.name == "super" {
+                if !self.prop_maybe_shadowed(m) || h.path[0].name.name == "super" {
                     return None;
                 }
                 let p = hier_prefix(h);
@@ -154790,7 +154844,7 @@ impl Simulator {
                 (prefix, m, e.span)
             }
             ExprKind::MemberAccess { expr: base, member } => {
-                if !self.shadowed_prop_names.contains(member.name.as_str()) {
+                if !self.prop_maybe_shadowed(member.name.as_str()) {
                     return None;
                 }
                 let prefix = match &base.kind {
