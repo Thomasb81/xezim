@@ -15,6 +15,36 @@ fn manifest_path(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
+#[test]
+fn dpi_header_width_helpers_have_defined_c_shifts() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let binary =
+        std::env::temp_dir().join(format!("dpi_width_check_{}_{}", std::process::id(), nanos));
+    let built = Command::new("cc")
+        .args([
+            "-fsanitize=undefined",
+            "-fno-sanitize-recover=undefined",
+            "-I",
+        ])
+        .arg(manifest_path("include"))
+        .arg(manifest_path("tests/dpi/header_width_checks.c"))
+        .arg("-o")
+        .arg(&binary)
+        .status()
+        .expect("launch C compiler");
+    assert!(built.success(), "compile header checks");
+    let out = Command::new(&binary).output().expect("run header checks");
+    let _ = std::fs::remove_file(&binary);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Build `c_file` into a fresh shared library.
 fn compile(c_file: &str) -> PathBuf {
     let nanos = SystemTime::now()

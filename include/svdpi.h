@@ -118,12 +118,14 @@ DPI_CONTEXT int svGetTimePrecision(const svScope scope, int32_t *time_precision)
 #ifndef SV_PACKED_DATA_NELEMS
 #define SV_PACKED_DATA_NELEMS(WIDTH) (((WIDTH) + 31) >> 5)
 #endif
-#define SV_MASK(N) (~(-1 << (N)))
+#define SV_MASK(N) \
+    ((N) >= 32 ? UINT32_MAX : ((UINT32_C(1) << (N)) - UINT32_C(1)))
 #define SV_GET_UNSIGNED_BITS(VALUE, N) \
     ((N) == 32 ? (VALUE) : ((VALUE) & SV_MASK(N)))
 #define SV_GET_SIGNED_BITS(VALUE, N) \
     ((N) == 32 ? (VALUE) : \
-     (((VALUE) & (1 << ((N) - 1))) ? ((VALUE) | ~SV_MASK(N)) : ((VALUE) & SV_MASK(N))))
+     (((VALUE) & (UINT32_C(1) << ((N) - 1))) ? \
+      ((VALUE) | ~SV_MASK(N)) : ((VALUE) & SV_MASK(N))))
 
 /* H.10.1: bit selects and part selects of canonical vectors. A part select
  * of `w` bits (1..32) starts at bit `i` and lands in bits [w-1:0]. */
