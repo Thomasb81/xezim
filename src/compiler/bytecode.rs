@@ -622,6 +622,13 @@ pub enum Insn {
     /// `local_var_regs` for the loop's duration.
     ForeachNext(RegId, u32, RegId),
 
+    /// class-perf collection-return: materialize the method's `return '{…}`
+    /// literal into the reserved interpreter snapshot store — element `i`
+    /// from register `arg_start + i` — then hand it to the caller through
+    /// `pending_ret_collection`. The result register is a dead passthrough
+    /// (width 0), exactly like a class-handle return.
+    RetCollection(u32, u32),
+
     Nop,
 
     /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
@@ -884,6 +891,10 @@ pub(super) struct PreboundCompiledMethod {
     /// relational/arith operands): the interpreter routes those through the
     /// `string_signals` registry, which the compiled block cannot see.
     pub string_formals: std::rc::Rc<HashSet<String>>,
+    /// class-perf collection-return: the return type is a queue / unsized
+    /// dynamic array — the body returns via the `pending_ret_collection`
+    /// side channel; the result cell is a width-0 passthrough.
+    pub is_collection_result: bool,
     /// class-perf Step 9b: member-collection names callable with a value-
     /// arg builtin (`size`/`num`, `exists`, `delete`, `push_back`/
     /// `push_front`, `pop_front`/`pop_back`, `insert`) — see the simulator's
@@ -1123,6 +1134,10 @@ impl Insn {
                 *o += rb;
                 *v += rb;
             }
+            // The collection-return hand-off reads a contiguous arg range
+            // (no rebasing needed beyond the range itself — the base is an
+            // absolute slot like CallFreeFunction's).
+            RetCollection(_, _) => {}
             RangeSelectW(a, b, c, _, _) => {
                 *a += rb;
                 *b += rb;
@@ -1255,6 +1270,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::Cast(..) => "Cast",
         Insn::ForeachKeys(..) => "FeKeys",
         Insn::ForeachNext(..) => "FeNext",
+        Insn::RetCollection(..) => "RetColl",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
@@ -1572,6 +1588,15 @@ pub struct BytecodeCompiler<'a> {
     /// the result Value (a byte vector) passes through untouched — the Return
     /// handler tolerates an absent width and skips the Resize.
     method_result_is_string: bool,
+    /// class-perf collection-return: the method's return type is a queue /
+    /// unsized dynamic array. `return '{…}` literals lower to `RetCollection`
+    /// (side-channel hand-off); other return expression forms bail.
+    method_ret_is_collection: bool,
+    /// class-perf free-function tier: compiling a package/module-scope
+    /// FUNCTION (no class scope). Bare names outside the frame (package
+    /// variables, statics) are unresolvable storage for the compiled block
+    /// — any read of one declines the whole body (see the Ident arm).
+    free_function_mode: bool,
     /// String-typed formal names (plan-provided). Any use of one outside the
     /// pass-through surface (read, compare, assign, concat, call arg, return)
     /// bails: indexing/string-methods/arith take interpreter-only paths.
@@ -1894,6 +1919,8 @@ impl<'a> BytecodeCompiler<'a> {
             method_result_width: None,
             method_result_is_class: false,
             method_result_is_string: false,
+            method_ret_is_collection: false,
+            free_function_mode: false,
             string_formal_names: HashSet::default(),
             string_member_names: HashSet::default(),
             coll_member_names: HashSet::default(),
@@ -5429,6 +5456,17 @@ impl<'a> BytecodeCompiler<'a> {
         prefix: Option<&str>,
         allow_ext_reads: bool,
     ) -> bool {
+        // A DPI IMPORT function (`import "DPI-C" function string f(...);`)
+        // has NO body: it is a foreign call the compiled path cannot inline
+        // or const-fold. An empty body used to look "vacuously pure", so a
+        // wrapper like uvm_dpi_get_next_arg inlined it to a constant and
+        // every call returned garbage/empty strings (uvm_complete_test:
+        // the +UVM_TESTNAME cmdline scan read an empty string and run_test
+        // never saw the test name). Treat a body-less function as impure —
+        // the call stays on the interpreter, which performs the DPI call.
+        if fd.items.is_empty() {
+            return false;
+        }
         let mut bound: HashSet<String> = HashSet::default();
         bound.insert(fd.name.name.name.clone());
         for p in &fd.ports {
@@ -9232,6 +9270,51 @@ impl<'a> BytecodeCompiler<'a> {
             // register's value and returns it to the caller). Trailing/jump
             // targets are back-patched like `inline_ret_jumps` below.
             StatementKind::Return(e) if self.method_mode => {
+                // class-perf collection-return: only `return '{…}` literals
+                // are admitted — each element lands in a contiguous arg slot
+                // and one `RetCollection` hands the range to the interpreter's
+                // snapshot store (mirrors the AST path's
+                // `populate_queue_from_init(RET_SNAP, e)` + pending hand-off).
+                // Any other return expression form bails — the interpreter's
+                // conversion/concat paths for queue-typed values are not
+                // reproduced.
+                if self.method_ret_is_collection {
+                    let Some(items) = e else {
+                        self.bail("Return_collection_empty");
+                        return false;
+                    };
+                    let crate::ast::expr::ExprKind::AssignmentPattern(items) = &items.kind else {
+                        self.bail("Return_collection_not_literal");
+                        return false;
+                    };
+                    let mut arg_values: Vec<RegId> = Vec::with_capacity(items.len());
+                    for item in items {
+                        let crate::ast::expr::AssignmentPatternItem::Ordered(item) = item else {
+                            self.bail("Return_collection_named_item");
+                            return false;
+                        };
+                        let Some(r) = self.compile_expr(item, 0) else {
+                            return false;
+                        };
+                        arg_values.push(r);
+                    }
+                    let n = arg_values.len() as u32;
+                    let arg_start = self.alloc_reg();
+                    for _ in 1..arg_values.len() {
+                        self.alloc_reg();
+                    }
+                    for (i, &v) in arg_values.iter().enumerate() {
+                        let slot = (arg_start as usize + i) as RegId;
+                        if slot != v {
+                            self.emit(Insn::Move(slot, v));
+                        }
+                    }
+                    self.emit(Insn::RetCollection(arg_start as u32, n));
+                    let j = self.insns.len();
+                    self.emit(Insn::Jump(0));
+                    self.method_ret_jumps.push(j);
+                    return true;
+                }
                 if let Some(e) = e {
                     let Some(rv) = self.method_return_val_reg else {
                         self.bail("Return_value_in_void");
@@ -11022,6 +11105,26 @@ impl<'a> BytecodeCompiler<'a> {
                         // lowering (target class = lhs declared type).
                         if bare == "new" {
                             self.bail("Expr_New");
+                            return None;
+                        }
+                        // class-perf free-function tier: a free (package/
+                        // module-scope) function frame has NO class scope —
+                        // every bare name that is not a formal/local/return
+                        // cell resolves, in the interpreter, to a
+                        // package-level VARIABLE (assoc arrays, queues,
+                        // state objects: uvm_globals' `m_uvm_core_state`
+                        // and friends). Those live outside the signal
+                        // table (or with unrelated storage), and a compiled
+                        // block reading them as module signals returned
+                        // garbage that corrupted the whole UVM init
+                        // sequence (uvm_complete_test: run_test silently
+                        // produced nothing). Decline the body unless every
+                        // such name was explicitly admitted.
+                        if self.free_function_mode
+                            && !self.method_handle_names.contains(bare)
+                            && !self.string_formal_names.contains(bare)
+                        {
+                            self.bail("free_fn_pkg_variable");
                             return None;
                         }
                     }
@@ -13259,6 +13362,17 @@ impl<'a> BytecodeCompiler<'a> {
                     && !self
                         .bare_member_names
                         .contains(h.path[0].name.name.as_str())
+                    // free-function bodies have no `this` and no defining
+                    // class context: a class-scope static call
+                    // (`Cls.m(..)` / `pkg.Cls.m(..)`) re-enters the
+                    // dispatcher with the CALLER's class context — for a
+                    // free fn that is whatever frame ran last, so
+                    // `uvm_report_info`'s `uvm_report_server::get_server()`
+                    // resolved against a stale/foreign class and the report
+                    // pipeline corrupted strings. Free fns decline static
+                    // scoped calls; they stay on the AST interpreter which
+                    // resolves the scope correctly.
+                    && !self.free_function_mode
                     && self
                         .scope_static_receivers
                         .contains(h.path[0].name.name.as_str())
@@ -16524,6 +16638,7 @@ impl<'a> BytecodeCompiler<'a> {
         string_formals: &HashSet<String>,
         writeback_formals: &[String],
         result: Option<(&str, u32, bool, bool)>,
+        ret_is_collection: bool,
         body: &[&crate::ast::stmt::Statement],
     ) -> Option<(CompiledBlock, RegId, Option<RegId>, Option<RegId>)> {
         use crate::ast::stmt::StatementKind;
@@ -16534,6 +16649,9 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_ast_fallback = false;
         self.allow_expr_fallback = false;
         self.allow_waits = false;
+        self.method_ret_is_collection = ret_is_collection;
+        self.free_function_mode = method_class.starts_with("__free_fn__");
+
         self.method_static_locals.clear();
         self.class_shadow_names = class_shadow_names.clone();
         self.member_safe_names = member_safe_names.clone();
@@ -16663,6 +16781,7 @@ impl<'a> BytecodeCompiler<'a> {
                 self.method_result_width = if rw > 0 { Some(rw) } else { None };
                 self.method_result_is_class = is_class;
                 self.method_result_is_string = is_string;
+                self.method_ret_is_collection = ret_is_collection;
                 self.method_return_val_reg = Some(r);
                 (Some(r), Some(r))
             }
@@ -16715,6 +16834,8 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_result_width = None;
             self.method_result_is_class = false;
             self.method_result_is_string = false;
+            self.method_ret_is_collection = false;
+            self.free_function_mode = false;
             self.string_formal_names.clear();
             self.string_member_names.clear();
             self.coll_member_names.clear();
@@ -16868,6 +16989,12 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // class-perf P2: a free-function call reads its arg range only.
             Insn::CallFreeFunction(_, _, a, n) => {
+                for x in (*a as usize..*a as usize + *n as usize) {
+                    f(x as RegId);
+                }
+            }
+            // class-perf collection-return: a contiguous arg range read.
+            Insn::RetCollection(a, n) => {
                 for x in (*a as usize..*a as usize + *n as usize) {
                     f(x as RegId);
                 }
@@ -18681,6 +18808,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // Collection element store defines nothing (the storage key
                 // is a flat string in `signals`).
                 Insn::StoreCollElem(..) => {}
+                // Collection-return hand-off defines no SSA value (the
+                // result leaves via the side-channel snapshot store).
+                Insn::RetCollection(..) => {}
                 // `$cast`: the 1/0 result's width is statically 32, but the
                 // register route also re-defines the dest slot at a runtime
                 // width (the frame arm's fit) — drop both from tracking.
@@ -19787,6 +19917,7 @@ mod tests {
             &HashSet::default(),
             &[],
             Some(("f", 32, false, false)),
+            false,
             &body,
         );
         let (block, this_reg, _result_reg, _ret_reg) =
@@ -19883,6 +20014,7 @@ mod tests {
             &HashSet::default(),
             &[],
             Some(("f", 32, false, false)),
+            false,
             &body,
         );
         let compiled =
@@ -19964,6 +20096,7 @@ mod tests {
                     &HashSet::default(),
                     &[],
                     Some(("f", 32, false, false)),
+                    false,
                     &body
                 )
                 .is_none(),

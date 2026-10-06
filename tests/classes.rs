@@ -198,6 +198,10 @@ mod class_value_params;
 mod class_width_copy_fork;
 #[path = "classes/compiled_method_accessors.rs"]
 mod compiled_method_accessors;
+#[path = "classes/compiled_method_type_param_members.rs"]
+mod compiled_method_type_param_members;
+#[path = "classes/compiled_method_free_fn_caller_locals.rs"]
+mod compiled_method_free_fn_caller_locals;
 #[path = "classes/compiled_method_array_members.rs"]
 mod compiled_method_array_members;
 #[path = "classes/compiled_method_cast.rs"]

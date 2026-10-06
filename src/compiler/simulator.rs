@@ -31661,6 +31661,10 @@ impl Simulator {
                     debug_assert!(false, "foreach insn in isolated comb exec");
                     break;
                 }
+                Insn::RetCollection(..) => {
+                    debug_assert!(false, "ret-collection insn in isolated comb exec");
+                    break;
+                }
                 Insn::LoadConst(dest, val) => {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
@@ -32452,6 +32456,10 @@ impl Simulator {
                 }
                 Insn::ForeachKeys(..) | Insn::ForeachNext(..) => {
                     debug_assert!(false, "foreach insn in isolated comb exec");
+                    break;
+                }
+                Insn::RetCollection(..) => {
+                    debug_assert!(false, "ret-collection insn in isolated comb exec");
                     break;
                 }
                 Insn::LoadConst(dest, val) => {
@@ -33939,6 +33947,14 @@ impl Simulator {
                         self.vm_drain_arg_temps(base, n);
                     }
                     self.vm_regs[*dest as usize] = result;
+                    // class-perf collection-return: a compiled CALLER can't
+                    // consume a collection result (its lowering of a
+                    // collection-typed assignment declines the whole method,
+                    // so a surviving `pending_ret_collection` could only leak
+                    // into an outer, unrelated assign). The AST fast path's
+                    // `assign_pending_ret_collection` TAKES the pending (and
+                    // drops it on failure); mirror that consumption here.
+                    self.pending_ret_collection = None;
                     local_count += 1;
                 }
             }
@@ -34160,6 +34176,11 @@ impl Simulator {
                     self.vm_drain_arg_temps(base, n);
                 }
                 self.vm_regs[*dest as usize] = result;
+                // class-perf collection-return leak guard (see CallMethod):
+                // a callee routed through `exec_method_call` may leave a
+                // `pending_ret_collection`; a compiled caller can never
+                // consume one, so drop it here.
+                self.pending_ret_collection = None;
                 local_count += 1;
             }
             // Step 9b-ii: element READ of a class member collection
@@ -34428,6 +34449,31 @@ impl Simulator {
                 self.foreach_arena[s] = (vals, 0);
                 local_count += 1;
             }
+            // class-perf collection-return: materialize the returned literal
+            // into the reserved interpreter snapshot store and hand it
+            // through `pending_ret_collection`, byte-identical to the AST
+            // path's `populate_queue_from_init(RET_SNAP, e)` + hand-off.
+            Insn::RetCollection(arg_start, n) => {
+                const RET_SNAP: &str = "__xz_ret_coll__";
+                let base = *arg_start as usize;
+                let n = *n as usize;
+                for (i, r) in (base..base + n).enumerate() {
+                    let v = self
+                        .vm_regs
+                        .get(r)
+                        .cloned()
+                        .unwrap_or_else(|| Value::zero(32));
+                    let name = format!("{RET_SNAP}[{i}]");
+                    self.set_signal_value_by_name(&name, v);
+                    // Mirror populate_queue_from_init's width registration
+                    // (unregistered names read fine, but a registered width
+                    // keeps downstream element-width fits exact).
+                    self.widths.entry(name).or_insert(32);
+                }
+                self.set_queue_size(RET_SNAP, n as u64);
+                self.pending_ret_collection = Some(RET_SNAP.to_string());
+                local_count += 1;
+            }
             _ => unreachable!("unexpected opcode in class executor"),
         }
         local_count
@@ -34640,7 +34686,8 @@ impl Simulator {
                 | Insn::LoadCollElem(..)
                 | Insn::StoreCollElem(..)
                 | Insn::Cast(..)
-                | Insn::ForeachKeys(..) => {
+                | Insn::ForeachKeys(..)
+                | Insn::RetCollection(..) => {
                     local_count += self.exec_class_opcode(&insns[pc]);
                 }
                 // Advance a compiled foreach: pop the slot's next key into
@@ -49099,6 +49146,7 @@ impl Simulator {
             Insn::Cast(..) => "Cast",
             Insn::ForeachKeys(..) => "ForeachKeys",
             Insn::ForeachNext(..) => "ForeachNext",
+            Insn::RetCollection(..) => "RetCollection",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
@@ -130836,7 +130884,7 @@ impl Simulator {
         // ordered.
         self.fn_ret_collection_stack
             .push(self.fn_returns_collection(&fd.return_type));
-        self.pkg_scope_stack.push(pkg_scope);
+        self.pkg_scope_stack.push(pkg_scope.clone());
         let m_fn_entry = self.subroutine_m_entry(
             &fd.name.name.name,
             fd.span,
@@ -130846,6 +130894,145 @@ impl Simulator {
         // §6.21: open a static-local sync frame keyed by this subroutine name.
         let sync_name = self.sync_frame_name(&fd.name.name.name);
         self.static_local_syncs.push((sync_name, Vec::new()));
+        // class-perf free-function tier: a package/module-scope function may
+        // run as bytecode exactly like a class method. `this` is null here
+        // (pushed above), mirroring the interpreter's frame; the plan is
+        // keyed by a synthetic class name derived from the declaring scope,
+        // so class-dependent plan inputs (member admission sets, extends
+        // walks) all see an empty class and every admission decision
+        // degrades to the free-function rules.
+        if let Some(cval) = compiled_methods_enabled()
+            .then(|| self.try_run_compiled_free_function(fd, pkg_scope.as_deref()))
+            .flatten()
+        {
+            self.close_decl_shadow_frame();
+            for n in &frame_string_signals {
+                self.string_signals.remove(n);
+            }
+            if let Some(removed) = self.string_signals_removed.pop() {
+                for n in removed {
+                    self.string_signals.insert(n);
+                }
+            }
+            self.sync_static_locals();
+            self.local_iface_aliases.pop();
+            self.func_call_stack.pop();
+            self.fn_ret_collection_stack.pop();
+            self.pkg_scope_stack.pop();
+            self.m_scope_stack = saved_m_scope_fn;
+            self.this_stack.pop();
+            self.class_context_stack.pop();
+            // (sync_static_locals already popped this frame's
+            // static_local_syncs entry — same contract as the interpreter
+            // epilogue below.)
+            let mut result = cval;
+            if let Some(k) = &static_ret_key {
+                self.static_fn_ret.insert(k.clone(), result.clone());
+            }
+            let unpacked_struct_ret = self.unpacked_struct_of(&fd.return_type).is_some();
+            if !result.is_real
+                && !unpacked_struct_ret
+                && !Self::is_string_data_type(&fd.return_type)
+                && !matches!(
+                    fd.return_type,
+                    crate::ast::types::DataType::Void { .. } | crate::ast::types::DataType::Real { .. }
+                )
+            {
+                let w = super::elaborate::resolve_type_width(
+                    &fd.return_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                if w > 0 && w != result.width {
+                    result = result.resize(w);
+                }
+                result.is_signed = super::elaborate::is_type_signed(&fd.return_type);
+            }
+            for (param, caller, is_out, prior) in std::mem::take(&mut assoc_params) {
+                if param == caller {
+                    match prior {
+                        Some(v) => {
+                            self.module.associative_arrays.insert(param.clone(), v);
+                        }
+                        None => {
+                            self.module.associative_arrays.remove(&param);
+                        }
+                    }
+                    continue;
+                }
+                if is_out {
+                    self.writeback_assoc_param(&param, &caller);
+                }
+                self.purge_assoc_param(&param, prior);
+            }
+            let mut staged_wb: Vec<(String, String)> = Vec::new();
+            for (param, caller) in &queue_writebacks {
+                if caller.is_empty() || param == caller {
+                    continue;
+                }
+                let tmp = self.stage_queue_param(param);
+                staged_wb.push((tmp, caller.clone()));
+            }
+            self.writeback_array_args(&array_writebacks);
+            for (param, caller, ..) in &array_writebacks {
+                if param == caller {
+                    continue;
+                }
+                let prefix = format!("{}[", param);
+                let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
+                for k in keys {
+                    self.signals.remove(&k);
+                }
+                self.purge_array_formal(param);
+            }
+            let writebacks: Vec<(String, Value, Expression)> = output_bindings
+                .iter()
+                .filter_map(|(pn, caller)| {
+                    self.local_stack
+                        .last()
+                        .and_then(|l| l.get(pn).cloned())
+                        .map(|v| (pn.clone(), v, caller.clone()))
+                })
+                .collect();
+            let struct_wb: Vec<(Expression, Value)> = struct_output_writebacks
+                .iter()
+                .filter_map(|(local_key, caller_lval)| {
+                    self.local_stack
+                        .last()
+                        .and_then(|l| l.get(local_key).cloned())
+                        .map(|v| (caller_lval.clone(), v))
+                })
+                .collect();
+            self.pop_local_frame();
+            let vif_ended = if vif_saved.is_empty() {
+                HashMap::default()
+            } else {
+                let outs: Vec<&str> = writebacks.iter().map(|(pn, _, _)| pn.as_str()).collect();
+                self.vif_formals_exit(vif_saved, &vif_formals, &outs)
+            };
+            for (pn, v, caller) in writebacks {
+                if let Some(nm) = vif_ended.get(&pn) {
+                    self.vif_bind_actual(&caller, nm);
+                }
+                self.assign_value(&caller, &v);
+            }
+            for (caller_lval, v) in struct_wb {
+                self.assign_value(&caller_lval, &v);
+            }
+            self.break_flag = saved_break;
+            self.continue_flag = saved_continue;
+            self.return_flag = saved_return;
+            self.pop_and_restore_queue_frame();
+            for (tmp, caller) in staged_wb {
+                self.writeback_queue_param(&tmp, &caller);
+                self.drop_staged_queue(&tmp);
+            }
+            for saved in formal_metadata.into_iter().rev() {
+                self.restore_formal_metadata(saved);
+            }
+            self.return_value = None;
+            return result;
+        }
         // Execute function body
         for stmt in &fd.items {
             self.exec_statement(stmt);
@@ -149012,6 +149199,21 @@ impl Simulator {
                         self.scalar_formal_integral(dt).is_some()
                             || self.typeref_names_class(dt)
                             || self.typeref_names_enum(dt)
+                            // class-perf (uvm_lru_cache::get): a member typed
+                            // by a TypeReference that plan time cannot resolve
+                            // (a TYPE PARAMETER — `DATA_T data;` in
+                            // uvm_lru_cache_node — or a parameterized-class
+                            // alias) is still a plain heap slot: the
+                            // interpreter's dotted read fetches
+                            // `properties[name]` verbatim (class_prop_width
+                            // never resizes non-integral members), and
+                            // LoadClassMember does the same. Specializations
+                            // bind such params to class handles (the UVM LRU
+                            // cache binds DATA_T=chandle), so the slot value
+                            // passes through untouched. Only the heap-slot
+                            // SHAPES that are NOT properties-keyed (collections
+                            // above, statics above) stay refused.
+                            || matches!(dt, crate::ast::types::DataType::TypeReference { .. })
                     })
                     // Unknown type (missing property_types entry): assume the
                     // safe side and refuse to lower.
@@ -149059,6 +149261,20 @@ impl Simulator {
             // `_local_report_object_` declaration) resolves by its
             // rightmost segment against the class table.
             if let Some((_, base)) = tn.name.name.rsplit_once("::") {
+                if self.module.classes.contains_key(base) {
+                    return Some(base.to_string());
+                }
+            }
+            // class-perf: a parameterized-class typedef target hoisted from a
+            // class-local alias (`typedef uvm_lru_cache_node#(KEY_T,DATA_T)
+            // node_type;` — the UVM LRU cache's `m_hash`/`m_begin`/`node`
+            // declarations) carries its spec-args in the NAME at plan time
+            // (no specialization context exists yet). The member reads off
+            // such a handle (`node.data`, `node.prev.next`) only need the
+            // member ADMISSION sets of the defining class, which are
+            // per-class-name and inheritance-safe — strip the `#(...)`
+            // fragment and resolve to the base class.
+            if let Some((base, _)) = tn.name.name.split_once('#') {
                 if self.module.classes.contains_key(base) {
                     return Some(base.to_string());
                 }
@@ -149677,6 +149893,37 @@ impl Simulator {
         }
     }
 
+    /// class-perf free-function tier: run a package/module-scope FUNCTION
+    /// body as bytecode, reusing `try_run_compiled_method`'s entire plan +
+    /// admission + block-cache machinery under a SYNTHETIC class name. The
+    /// interpreter's frame for this call already holds the bound formals and
+    /// the implicit return cell; the callee runs with `this == 0` (pushed
+    /// null above), so any member access degrades exactly as the interpreter
+    /// would — and a body that touches `this`-relative names was never
+    /// compilable anyway (the compiler's handle-chain gates require a
+    /// class-typed root, which no free-function frame provides).
+    fn try_run_compiled_free_function(
+        &mut self,
+        fd: &crate::ast::decl::FunctionDeclaration,
+        pkg_scope: Option<&str>,
+    ) -> Option<Value> {
+        let cname = format!(
+            "__free_fn__{}",
+            pkg_scope.unwrap_or("-")
+        );
+        let ret_is_string = Self::is_string_data_type(&fd.return_type);
+        self.try_run_compiled_method(
+            0,
+            &cname,
+            &fd.name.name.name,
+            &fd.ports,
+            &fd.items,
+            Some(&fd.name.name.name),
+            ret_is_string,
+            &crate::ast::decl::ClassMethodKind::Function(fd.clone()),
+        )
+    }
+
     fn try_run_compiled_method(
         &mut self,
         handle: usize,
@@ -149843,6 +150090,15 @@ impl Simulator {
             // stamped — the interpreter never touches a non-`plainly_integral`
             // (Typeref) return, so a handle must round-trip unchanged.
             let is_class_result = self.typeref_names_class(&_f.return_type);
+            // class-perf collection-return: the return type resolves to a
+            // queue / unsized dynamic array. The body returns via the
+            // `pending_ret_collection` side channel (the compiler admits
+            // ONLY collection literals); the result cell is a width-0
+            // passthrough (like a class handle).
+            let is_collection_result = !is_class_result
+                && !is_string_result
+                && !is_void_result
+                && self.fn_returns_collection(&_f.return_type);
             let (static_result_width, result_signed) = if is_string_result {
                 (0u32, false)
             } else if is_class_result {
@@ -149850,6 +150106,10 @@ impl Simulator {
                 (0u32, false)
             } else if is_void_result {
                 // Step 9e: void / ctor — passthrough result cell.
+                (0u32, false)
+            } else if is_collection_result {
+                // Collection return: the VALUE leaves via the side channel;
+                // the result register is never consumed by the caller.
                 (0u32, false)
             } else if let Some(pair) = self.scalar_formal_integral(&_f.return_type) {
                 pair
@@ -149903,8 +150163,25 @@ impl Simulator {
                     // Scalar-integral GATE (bail to AST if not): the type must be
                     // a compile-able integer vector/atom. (String formals are
                     // handled above — allowed, not skipped.)
+                    use crate::ast::types::DataType as DT;
                     let Some(pw) = self.scalar_formal_integral(&port.data_type).map(|(w, _)| w)
                     else {
+                        // class-perf collection-return: a TYPE-PARAM formal
+                        // (`KEY_T key` — an unresolvable TypeReference: type
+                        // params are never hoisted into `typedef_types`) of a
+                        // collection-returning method. The interpreter's
+                        // binding loop resolves it to neither integral nor
+                        // class, stamps signedness via
+                        // `type_is_signed_concrete` and keeps the actual's
+                        // width — admit it as width-0 keep-source, exactly
+                        // that parity. (Resolving the module-scope default
+                        // would truncate a string actual.)
+                        if is_collection_result
+                            && matches!(port.data_type, DT::TypeReference { .. })
+                        {
+                            formals.push((port.name.name.clone(), 0));
+                            continue;
+                        }
                         // real/enum/collection formal: AST — memoize the skip
                         // (the decision is instance-independent: the declared
                         // formal type cannot change per instance).
@@ -149921,7 +150198,6 @@ impl Simulator {
                     // from module scope and truncate the seed. Width 0 = keep the
                     // source width, exactly like the AST path (which only stamps
                     // signedness there).
-                    use crate::ast::types::DataType as DT;
                     let keep_source = !matches!(port.data_type, DT::TypeReference { .. })
                         && !matches!(port.data_type, DT::IntegerAtom { .. })
                         && !Self::packed_dims_are_literal(&port.data_type);
@@ -149955,6 +150231,7 @@ impl Simulator {
                 is_class_result,
                 is_string_result,
                 is_void_result,
+                is_collection_result,
                 string_formals: std::rc::Rc::new(string_formals),
                 coll_members: std::rc::Rc::new(self.class_coll_member_names(cname)),
                 static_coll_members: std::rc::Rc::new(self.class_static_coll_member_names(cname)),
@@ -150440,6 +150717,7 @@ impl Simulator {
                             pre.is_class_result,
                             pre.is_string_result,
                         )),
+                        pre.is_collection_result,
                         &body_refs,
                     );
                     compiler_outcome
@@ -150676,7 +150954,20 @@ impl Simulator {
             None
         };
         // Run the block.
+        self.return_flag = false;
         self.exec_insns(&block.instructions);
+        // A StmtFallback for a `return …` statement executed through the
+        // interpreter sets `return_value` — the compiled block's result
+        // register never sees it (the compiler only bakes the Move for
+        // return expressions it could LOWER). Mirror the interpreter's
+        // `return_value.or(implicit)` epilogue: an explicit return wins.
+        // (The interpreter seeds the implicit cell and reads it back; an
+        // explicit `return x` overrode it the same way.)
+        if let Some(rv) = self.return_value.take() {
+            if (result_reg as usize) < self.vm_regs.len() {
+                self.vm_regs[result_reg as usize] = rv;
+            }
+        }
         if let Some(prev) = _prev_comp {
             CUR_METHOD_COMPILED.store(prev, Ordering::Relaxed);
         }
@@ -150741,7 +151032,15 @@ impl Simulator {
         // §13.4.1 signedness stamp). A CLASS-HANDLE return is passed through
         // UNTOUCHED (no resize, no stamp) exactly like the interpreter, which
         // never resizes/stamps a non-`plainly_integral` (Typeref) return.
+        // class-perf collection-return: the value left via
+        // `pending_ret_collection` (the `RetCollection` exec arm); the result
+        // register is dead — return a placeholder, untouched, like a class
+        // handle. (The stale-pending fall-off-end semantics match the
+        // interpreter: it only clears pending inside Return statements too.)
         let mut result = result;
+        if pre.is_collection_result {
+            return Some(Value::zero(32));
+        }
         if result_width > 0 && result.width != result_width {
             result = result.resize_for_assign(result_width);
         }
@@ -150797,6 +151096,14 @@ impl Simulator {
             || self.class_is_parameterized(dclass)
             || self.is_static_method(dclass, method)
         {
+            never(self);
+            return None;
+        }
+        // class-perf collection-return: the callee returns via the
+        // `pending_ret_collection` side channel, which needs the
+        // interpreter's queue-frame / epilogue machinery — VM->VM direct
+        // calls are scalar-only.
+        if pre.is_collection_result {
             never(self);
             return None;
         }

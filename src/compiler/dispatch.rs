@@ -223,6 +223,7 @@ impl Opcode {
             Insn::Cast(..) => Self::Cast,
             Insn::ForeachKeys(..) => Self::ForeachKeys,
             Insn::ForeachNext(..) => Self::ForeachNext,
+            Insn::RetCollection(..) => Self::Nop, // census: no register ops
         }
     }
 
