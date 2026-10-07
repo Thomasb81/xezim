@@ -7327,6 +7327,10 @@ pub struct Simulator {
     /// constant condition (`wait(0)`) reads no name and is never re-checked.
     /// `None` keeps the unconditional re-schedule (RTL signals, calls).
     cond_waiter_gate: HashMap<usize, Option<Box<[u64]>>>,
+    /// Timestamp of each UNGATED parked waiter's last unconditional re-check
+    /// by a re-pass drain (`drain_condition_waiters(_, from_repass: true)`);
+    /// see that method for why one re-check per timestamp is enough.
+    cond_repass_recheck: HashMap<usize, u64>,
     /// IEEE 1800-2017 §4.4.2.3 Inactive region: continuations of `#0`
     /// delays park here instead of in the event_queue. The event_queue's
     /// batch drain in `run_one_tick` re-fetches same-time entries into the
@@ -12051,6 +12055,7 @@ impl Simulator {
             cond_waiter_reads: HashMap::default(),
             cond_waiter_conditions: HashMap::default(),
             cond_waiter_gate: HashMap::default(),
+            cond_repass_recheck: HashMap::default(),
             inactive_queue: Vec::new(),
             nba_region_waiters: Vec::new(),
             cond_progress: 0,
@@ -44432,6 +44437,25 @@ impl Simulator {
             // continuations parked by this round's active-region work run
             // before its NBAs commit.
             self.drain_inactive_pre_nba();
+            // §9.7.4: `wait(expr)` is a same-delta, same-timestep handoff. A
+            // waiter whose condition an ACTIVE-region continuation just made
+            // true (an inline edge resume above — e.g. a grant handshake
+            // writing the watched variable) must resume BEFORE this
+            // generation's NBA region commits and edge-dispatches its own
+            // waiters again; otherwise a peer parked on the very NBA the
+            // resumer queued (`nba <= next_nba; @(nba)`) wakes first and
+            // observes pre-handoff state (reference-verified: the granted
+            // sequence must put its item before the peeker's one-NBA peek).
+            // `pre_inactive=true`: the waiter's own queued NBAs commit in the
+            // apply_nba below — after the snapshot — so their edges stay
+            // detectable; `in_edge_cont` records its blocking signal writes
+            // for the §9.2 rescan drain.
+            if !self.ready_condition_waiters.is_empty() {
+                let __prev_edge_cont = self.in_edge_cont;
+                self.in_edge_cont = true;
+                self.drain_condition_waiters(true, false);
+                self.in_edge_cont = __prev_edge_cont;
+            }
             if self.nba_fast.is_empty()
                 && self.nba_queue.is_empty()
                 && self.packed_nba.is_empty()
@@ -45327,7 +45351,21 @@ impl Simulator {
     ///     multi-generation condition-waiter cascade cannot starve it.
     ///   * `false` — the end-of-active drain: flush any pending NBA before
     ///     settling, and run to the full same-time fixpoint.
-    fn drain_condition_waiters(&mut self, pre_inactive: bool) {
+    ///   * `from_repass` — called from the end-of-tick late-region re-pass
+    ///     loop. An UNGATED parked waiter (its condition reads names whose
+    ///     writes are not noted — RTL signals) is unconditionally re-scheduled
+    ///     by every ordinary drain; inside the re-pass fixpoint that schedule
+    ///     bumps `late_resume_epoch` without any real progress, so the loop
+    ///     would re-drain, re-schedule, re-park the still-false waiter up to
+    ///     its 10 000-pass bound every tick (`wait(done >= N)` in a datapath
+    ///     regression cost >100× wall-clock). A re-pass drain re-checks each
+    ///     ungated waiter at most ONCE per timestamp: if it re-parks, the
+    ///     next wake is the ordinary drain outside the re-pass loop (same
+    ///     timing as before the re-pass loop existed). Gated waiters (class
+    ///     properties / method locals) keep exact same-timestamp semantics —
+    ///     their read-bits intersect the store-write mask the moment a late
+    ///     region writes them.
+    fn drain_condition_waiters(&mut self, pre_inactive: bool, from_repass: bool) {
         let mut guard = 0u32;
         while (!self.condition_waiters.is_empty() || !self.ready_condition_waiters.is_empty())
             && !self.finished
@@ -45362,6 +45400,14 @@ impl Simulator {
                         still_parked.push((cpid, cont));
                         continue;
                     }
+                } else if from_repass
+                    && self.cond_repass_recheck.get(&cpid) == Some(&self.time)
+                {
+                    still_parked.push((cpid, cont));
+                    continue;
+                }
+                if from_repass {
+                    self.cond_repass_recheck.insert(cpid, self.time);
                 }
                 self.cond_waiter_gate.remove(&cpid);
                 self.cond_waiter_reads.remove(&cpid);
@@ -45583,7 +45629,7 @@ impl Simulator {
             // slave's `wait(state!=BEGIN_RESP)` wakes on the clobbered value).
             // The end-of-tick fixpoint alone is too late: the `#0` resume has
             // already committed the overwrite by then.
-            self.drain_condition_waiters(true);
+            self.drain_condition_waiters(true, false);
             if self.promote_inactive_to_active() && self.event_queue.next_time() == Some(self.time)
             {
                 // Cont-assign propagation and edge-sensitive blocks are
@@ -45719,7 +45765,7 @@ impl Simulator {
         self.dump_write_changes();
 
         // Condition-waiter fixpoint (level-sensitive `wait(expr)` resume).
-        self.drain_condition_waiters(false);
+        self.drain_condition_waiters(false, false);
 
         // LRM §4.4/§4.7: every late-region resume above (clocking conts,
         // reactive initials, Re-NBA waiters, condition waiters re-queued at
@@ -45752,6 +45798,7 @@ impl Simulator {
                 self.drain_deferred_clocking_conts();
                 self.drain_reactive_region();
                 self.drain_nba_region_waiters();
+                self.drain_condition_waiters(false, true);
                 late_passes += 1;
                 if self.finished || late_passes > 10_000 || self.late_resume_epoch == epoch_before {
                     break;
@@ -52556,6 +52603,29 @@ impl Simulator {
                         if let Some((keys, is_str, var_scope, live_size_name, key_type)) =
                             self.foreach_materialize_keys_1d(array, vars)
                         {
+                            // §12.7.3 (blocking-body trampoline): this path
+                            // bypasses `exec_stmt_foreach`, so the loop
+                            // variable's class binding (assoc KEY class, then
+                            // element class) must be recorded HERE — a
+                            // `foreach (m_successors[succ])` body writing
+                            // `succ.m_state = …` dropped every write without
+                            // it, because the id-collision receiver gate
+                            // could not classify the bare name. Recorded into
+                            // the task's live frame, the binding rides the
+                            // process-context snapshot through every
+                            // park/restore cycle of the ForeachTail unrolling.
+                            if let Some(arr_name) = Self::foreach_array_root_name(array) {
+                                if let Some(cls) = self
+                                    .assoc_key_class_of_foreach(&arr_name, array)
+                                    .or_else(|| self.elem_class_of_arr(&arr_name))
+                                {
+                                    if self.module.classes.contains_key(&cls)
+                                        && let Some(v) = vars.first().and_then(|v| v.as_ref())
+                                    {
+                                        self.record_local_class_type(&v.name, &cls);
+                                    }
+                                }
+                            }
                             let fe_names: Vec<String> = vars
                                 .iter()
                                 .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
@@ -79307,7 +79377,16 @@ impl Simulator {
         if vars.len() == 1 {
             if let Some(v) = vars[0].as_ref() {
                 if let Some(arr_name) = Self::foreach_array_root_name(array) {
-                    if let Some(cls) = self.elem_class_of_arr(&arr_name) {
+                    // An ASSOCIATIVE collection's loop variable is its KEY
+                    // (§12.7.3) — try the key's class before the element
+                    // class: `bit m_successors[uvm_phase]` has an element
+                    // class of `bit` (None) while the key names `uvm_phase`.
+                    // Key first matters when BOTH are classes: the loop var
+                    // still binds the key, not the value type.
+                    if let Some(cls) = self
+                        .assoc_key_class_of_foreach(&arr_name, array)
+                        .or_else(|| self.elem_class_of_arr(&arr_name))
+                    {
                         if self.module.classes.contains_key(&cls) {
                             self.record_local_class_type(&v.name, &cls);
                         }
@@ -88185,6 +88264,40 @@ impl Simulator {
     fn drain_nba_region_waiters(&mut self) {
         if self.nba_region_waiters.is_empty() {
             return;
+        }
+        // IEEE 1800-2017 §4.4.2/§4.5: the NBA region runs only after ALL
+        // active-region work of this time slot has settled. A `fork ...
+        // join_none` child whose continuation is still queued at the
+        // current time (scheduled, not yet started — the parent parked on
+        // `@(nba)` immediately after forking) must get its first slice
+        // BEFORE processes parked on `uvm_wait_for_nba_region` resume, or
+        // the resuming parent observes pre-child state. Reference-verified
+        // shape: UVM `execute_phase` forks `master_phase_process`
+        // (traverse -> phase task -> `raise_objection`), then parks on
+        // `uvm_wait_for_nba_region`; the NBA-region resume that follows
+        // checks `phase_done.get_objection_total(top)` and with the child
+        // un-run saw 0, skipped the ALL_DROPPED wait and ran the
+        // READY_TO_END traverse one iteration early.
+        // Bounded: children forked by the drained entries join the queue
+        // and run too; a genuine loop self-limits via the scheduler's own
+        // parking.
+        let mut drain_guard = 0u32;
+        while self.event_queue.next_time() == Some(self.time)
+            && !self.finished
+            && !self.zero_delay_defer_pending
+        {
+            let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
+                break;
+            };
+            self.late_resume_epoch += 1;
+            self.run_scheduled_process(bpid, &stmts);
+            if !self.is_pid_suspended(bpid) {
+                self.child_finished(bpid);
+            }
+            drain_guard += 1;
+            if drain_guard > 100_000 {
+                break;
+            }
         }
         let waiters = std::mem::take(&mut self.nba_region_waiters);
         self.late_resume_epoch += waiters.len() as u64;
@@ -115610,6 +115723,87 @@ impl Simulator {
         let leaf = arr.rsplit('.').next().unwrap_or(arr);
         let leaf = leaf.split('[').next().unwrap_or(leaf);
         self.collection_element_class_named(leaf)
+    }
+
+    /// The CLASS an associative collection's loop variable names, when its
+    /// KEY type is a class handle — `foreach (m_successors[succ])` over
+    /// `bit m_successors[uvm_phase]` binds `succ` to the KEY (§12.7.3), and
+    /// the element class (`bit`) says nothing about it. Consults the
+    /// scope-visible key type (frame overlay, then the module-scope
+    /// `assoc_key_type_names` map) and resolves it to a registered class.
+    /// Returns None unless the key type names a class.
+    fn assoc_key_class_of_arr(&self, arr: &str) -> Option<String> {
+        let local_kt = self.local_typedef_type_of(&format!("{}[]", arr));
+        if local_kt.as_deref() == Some("") {
+            return None;
+        }
+        let kt = local_kt.or_else(|| self.module.assoc_key_type_names.get(arr).cloned())?;
+        let cls = if self.module.classes.contains_key(&kt) {
+            kt
+        } else {
+            // A typedef'd / specialized class key (`k_t k[c_t]`).
+            self.resolve_typeref_class_name_str(&kt)?
+        };
+        self.module.classes.contains_key(&cls).then_some(cls)
+    }
+
+    /// Like [`Self::assoc_key_class_of_arr`], but falls back to the
+    /// receiver-relative class walk — for a loop inside a class method the
+    /// key type lives on the property's declaring class
+    /// (`assoc_key_types` / `static_assoc_key_types`), not in any
+    /// module-scope map. The anchor is the foreach receiver when the array
+    /// expression names one, `this` otherwise (the same chain the §6.19.6
+    /// enum-key binding above walks).
+    fn assoc_key_class_of_foreach(&self, arr: &str, array: &Expression) -> Option<String> {
+        if let Some(cls) = self.assoc_key_class_of_arr(arr) {
+            return Some(cls);
+        }
+        let recv = match &array.kind {
+            ExprKind::Index { expr: b, .. } => &**b,
+            _ => array,
+        };
+        let recv_handle = match &recv.kind {
+            ExprKind::MemberAccess { expr: inner, .. } => self.eval_handle_expr(inner),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                self.eval_ident_handle(&h.path[0].name.name)
+            }
+            _ => None,
+        };
+        let handle = match recv_handle {
+            Some(h) => h,
+            None => self.this_stack.last().copied().flatten()?,
+        };
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cn) = cur {
+            if !seen.insert(cn.clone()) {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            if let Some(kt) = cd
+                .assoc_key_types
+                .get(arr)
+                .or_else(|| cd.static_assoc_key_types.get(arr))
+            {
+                let cls = if self.module.classes.contains_key(kt) {
+                    kt.clone()
+                } else {
+                    match self.resolve_typeref_class_name_str(kt) {
+                        Some(c) => c,
+                        None => return None,
+                    }
+                };
+                return self.module.classes.contains_key(&cls).then_some(cls);
+            }
+            cur = cd.extends.clone();
+        }
+        None
     }
 
     /// LRM §7.12.2: `q.sort()/.rsort()/.unique() with (item.field)`.
@@ -149991,6 +150185,35 @@ impl Simulator {
                     .collect();
                 self.pop_local_frame();
                 self.this_stack.pop();
+                // §13.5.2: copy `output`/`inout`/`ref` associative-array
+                // formals back onto the caller's AA (signal-namespace merge)
+                // BEFORE `pop_and_restore_queue_frame` — that unwind deletes
+                // every element signal under the formal's dyn key (`@o#N[..]`
+                // is registered in the callee's queue frame), so a writeback
+                // after it copied nothing and `output edges_t o` left the
+                // caller's array empty (UVM `get_predecessors_for_successors`).
+                for (param, caller, is_out, prior) in std::mem::take(&mut assoc_params) {
+                    if param == caller {
+                        // Identity binding — the body's writes landed directly
+                        // in the caller's namespace; just restore the prior
+                        // registration (a nested same-name formal must not
+                        // leave the flat `module.associative_arrays` entry
+                        // clobbered).
+                        match prior {
+                            Some(v) => {
+                                self.module.associative_arrays.insert(param.clone(), v);
+                            }
+                            None => {
+                                self.module.associative_arrays.remove(&param);
+                            }
+                        }
+                        continue;
+                    }
+                    if is_out {
+                        self.writeback_assoc_param(&param, &caller);
+                    }
+                    self.purge_assoc_param(&param, prior);
+                }
                 // Capture the callee's formals, restore the caller's
                 // shadowed storage, then apply — see `stage_queue_param`.
                 let mut staged_wb: Vec<(String, String)> = Vec::new();
@@ -150040,31 +150263,6 @@ impl Simulator {
                 }
                 for (caller_lval, v) in struct_wb {
                     self.assign_value(&caller_lval, &v);
-                }
-                // §13.5.2: copy `output`/`inout`/`ref` associative-array
-                // formals back onto the caller's AA (signal-namespace
-                // merge), then drop the formal's temporary copy.
-                for (param, caller, is_out, prior) in std::mem::take(&mut assoc_params) {
-                    if param == caller {
-                        // Identity binding — the body's writes landed directly
-                        // in the caller's namespace; just restore the prior
-                        // registration (a nested same-name formal must not
-                        // leave the flat `module.associative_arrays` entry
-                        // clobbered).
-                        match prior {
-                            Some(v) => {
-                                self.module.associative_arrays.insert(param.clone(), v);
-                            }
-                            None => {
-                                self.module.associative_arrays.remove(&param);
-                            }
-                        }
-                        continue;
-                    }
-                    if is_out {
-                        self.writeback_assoc_param(&param, &caller);
-                    }
-                    self.purge_assoc_param(&param, prior);
                 }
                 if let Some(frame) = meta_open.then(|| self.meta_frames.pop()).flatten() {
                     if !frame.full {

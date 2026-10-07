@@ -51,6 +51,8 @@ mod constructor_body_ports;
 mod ctor_bare_member_dynarray_size;
 #[path = "classes/explicit_param_static_coll_read.rs"]
 mod explicit_param_static_coll_read;
+#[path = "classes/foreach_assoc_key_handle_write.rs"]
+mod foreach_assoc_key_handle_write;
 #[path = "classes/foreach_cross_elem_whole_equality.rs"]
 mod foreach_cross_elem_whole_equality;
 #[path = "classes/foreach_packed_struct_member_inside.rs"]
@@ -296,6 +298,8 @@ mod local_shadows_sig;
 mod localparam_class_not_parameterized;
 #[path = "classes/method_default_this_call.rs"]
 mod method_default_this_call;
+#[path = "classes/method_output_assoc_writeback.rs"]
+mod method_output_assoc_writeback;
 #[path = "classes/module_scope_derived_constraints.rs"]
 mod module_scope_derived_constraints;
 #[path = "classes/nba_region_event_same_slot.rs"]
