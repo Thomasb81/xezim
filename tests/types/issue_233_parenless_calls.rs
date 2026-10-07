@@ -112,7 +112,13 @@ endmodule
         .collect();
     assert_eq!(
         lines,
-        ["T function 7", "T assign 7", "T task 8", "T method 9", "T in_package 14"]
+        [
+            "T function 7",
+            "T assign 7",
+            "T task 8",
+            "T method 9",
+            "T in_package 14"
+        ]
     );
 }
 

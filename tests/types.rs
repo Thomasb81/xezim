@@ -135,6 +135,12 @@ mod local_localparam_width;
 mod local_packed_struct_alias;
 #[path = "types/logical_shift_self_width.rs"]
 mod logical_shift_self_width;
+#[path = "types/lrm_audit_bitstream_casts.rs"]
+mod lrm_audit_bitstream_casts;
+#[path = "types/lrm_audit_procedural_locals.rs"]
+mod lrm_audit_procedural_locals;
+#[path = "types/lrm_audit_struct_member_defaults.rs"]
+mod lrm_audit_struct_member_defaults;
 #[path = "types/lrm_dynamic_cast.rs"]
 mod lrm_dynamic_cast;
 #[path = "types/lrm_real_cast_case_inside.rs"]

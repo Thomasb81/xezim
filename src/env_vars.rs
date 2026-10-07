@@ -282,8 +282,8 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Edge engine: shadow-compare dirty-driven scan vs full scan",
     ),
     (
-        "XEZIM_DISPATCHER",
-        "Select process dispatcher implementation (debug)",
+        "XEZIM_DPI_STACK_MB",
+        "Stack size in MB reserved for each running DPI imported-task call (default 256)",
     ),
     (
         "XEZIM_DUMP_CA_READS",
@@ -625,66 +625,19 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_PARTITION_BY_CLOCK",
-        "PDES: partition design by clock domain (0/1)",
+        "Parallel: partition edge blocks by clock domain (0/1)",
     ),
     (
         "XEZIM_PARTITION_BY_CLOCK_MAX_K",
-        "PDES: max clock-domain partitions",
+        "Parallel: max clock-domain partitions",
     ),
     (
         "XEZIM_PARTITION_SCOPES",
-        "PDES: comma-separated scope prefixes to partition by",
-    ),
-    (
-        "XEZIM_PDES_BUCKET_NBA",
-        "PDES: bucket NBA commits per partition",
-    ),
-    (
-        "XEZIM_PDES_CHK_KINDS",
-        "PDES: verify partition kind assignment (debug)",
-    ),
-    (
-        "XEZIM_PDES_CHUNK_TARGET",
-        "PDES: target entries per work chunk",
-    ),
-    (
-        "XEZIM_PDES_DUMP_SIG",
-        "PDES: dump cross-partition signal traffic",
-    ),
-    ("XEZIM_PDES_K", "PDES: number of logical partitions"),
-    (
-        "XEZIM_PDES_PAR_APPLY",
-        "PDES: apply partition results in parallel (0/1)",
-    ),
-    (
-        "XEZIM_PDES_PHASE4_DRYRUN",
-        "PDES: run partition phase 4 in dry-run compare mode",
-    ),
-    ("XEZIM_PDES_POOL", "PDES: worker thread-pool size"),
-    (
-        "XEZIM_PDES_SCAN_MERGE",
-        "PDES: merge partition edge scans (0/1)",
-    ),
-    (
-        "XEZIM_PDES_SUBCHUNK",
-        "PDES: sub-chunk granularity for load balancing",
-    ),
-    (
-        "XEZIM_PDES_TICKS",
-        "PDES: print per-tick partition statistics",
+        "Parallel: semicolon-separated scope prefixes to partition edge blocks by",
     ),
     (
         "XEZIM_PEND_DBG",
         "Elab debug: trace pending-module/library resolution",
-    ),
-    ("XEZIM_PERLP_AFTER", "Per-LP settle: activate after N ticks"),
-    (
-        "XEZIM_PERLP_SETTLE",
-        "Per-LP settle: enable per-logical-partition settle state (0/1)",
-    ),
-    (
-        "XEZIM_PERLP_SHADOW",
-        "Per-LP settle: shadow-compare against canonical settle",
     ),
     (
         "XEZIM_PLACE_DBG",

@@ -56,7 +56,6 @@ fn run(version: &str, src: &str, plusargs: &[&str]) -> compiler::Simulator {
         None,
         None,
         false,
-        None,
     )
     .unwrap_or_else(|e| panic!("UVM {} bench failed to simulate: {}", version, e))
 }
@@ -177,7 +176,11 @@ fn uvm_report_verbosity_actions_and_overrides() {
             "UVM {v}: the overridden ERROR must print as a WARNING"
         );
         // NOISY is uncounted; SOFT counts as a warning, not an error.
-        assert_eq!(tagged(&out), vec!["T|err=0 warn=1"], "UVM {v}: severity counts");
+        assert_eq!(
+            tagged(&out),
+            vec!["T|err=0 warn=1"],
+            "UVM {v}: severity counts"
+        );
     }
 }
 
@@ -191,16 +194,34 @@ fn uvm_cmdline_testname_and_verbosity() {
             .any(|l| l == "UVM_INFO @ 0: uvm_test_top [VB] HIGH message")
     };
     for v in VERSIONS {
-        let out = lines(&run(v, src, &["+UVM_TESTNAME=test_b", "+UVM_VERBOSITY=UVM_HIGH"]));
-        assert_eq!(tagged(&out), vec!["T|ran|test_b"], "UVM {v}: +UVM_TESTNAME=test_b");
-        assert!(vb(&out), "UVM {v}: +UVM_VERBOSITY=UVM_HIGH must let HIGH through");
+        let out = lines(&run(
+            v,
+            src,
+            &["+UVM_TESTNAME=test_b", "+UVM_VERBOSITY=UVM_HIGH"],
+        ));
+        assert_eq!(
+            tagged(&out),
+            vec!["T|ran|test_b"],
+            "UVM {v}: +UVM_TESTNAME=test_b"
+        );
+        assert!(
+            vb(&out),
+            "UVM {v}: +UVM_VERBOSITY=UVM_HIGH must let HIGH through"
+        );
         assert_clean(v, &out);
 
         let out = lines(&run(v, src, &["+UVM_TESTNAME=test_b"]));
-        assert!(!vb(&out), "UVM {v}: without +UVM_VERBOSITY, HIGH stays filtered");
+        assert!(
+            !vb(&out),
+            "UVM {v}: without +UVM_VERBOSITY, HIGH stays filtered"
+        );
 
         let out = lines(&run(v, src, &["+UVM_TESTNAME=test_a"]));
-        assert_eq!(tagged(&out), vec!["T|ran|test_a"], "UVM {v}: +UVM_TESTNAME=test_a");
+        assert_eq!(
+            tagged(&out),
+            vec!["T|ran|test_a"],
+            "UVM {v}: +UVM_TESTNAME=test_a"
+        );
     }
 }
 
@@ -213,16 +234,23 @@ fn uvm_virtual_sequence_drives_two_agents() {
         let sim = run(v, src, &[]);
         let out = lines(&sim);
         let t = tagged(&out);
-        let of = |p: &str| -> Vec<&str> {
-            t.iter().copied().filter(|l| l.starts_with(p)).collect()
-        };
-        assert_eq!(of("T|da|"), vec!["T|da|100", "T|da|101", "T|da|102"], "UVM {v}");
+        let of =
+            |p: &str| -> Vec<&str> { t.iter().copied().filter(|l| l.starts_with(p)).collect() };
+        assert_eq!(
+            of("T|da|"),
+            vec!["T|da|100", "T|da|101", "T|da|102"],
+            "UVM {v}"
+        );
         assert_eq!(
             of("T|db|"),
             vec!["T|db|200", "T|db|201", "T|db|202", "T|db|203"],
             "UVM {v}"
         );
-        assert_eq!(t.last(), Some(&"T|vseq_done|4"), "UVM {v}: fork/join waits for both");
+        assert_eq!(
+            t.last(),
+            Some(&"T|vseq_done|4"),
+            "UVM {v}: fork/join waits for both"
+        );
         assert_clean(v, &out);
     }
 }
@@ -274,7 +302,11 @@ fn uvm_locked_sequence_items_are_contiguous() {
             "UVM {v}: the locked sequence must not be interleaved: {t:?}"
         );
         let a: Vec<&str> = t.iter().copied().filter(|l| l.starts_with("T|A")).collect();
-        assert_eq!(a, vec!["T|A0", "T|A1", "T|A2"], "UVM {v}: A keeps its own order");
+        assert_eq!(
+            a,
+            vec!["T|A0", "T|A1", "T|A2"],
+            "UVM {v}: A keeps its own order"
+        );
         assert_clean(v, &out);
     }
 }
@@ -309,7 +341,13 @@ fn uvm_global_timeout_ends_a_hung_run_phase() {
             "UVM {v}: expected a PH_TIMEOUT fatal at t=300:\n{}",
             out.join("\n")
         );
-        assert!(out.iter().any(|l| l == "UVM_FATAL :    1"), "UVM {v}: one fatal");
-        assert_eq!(sim.time, 300, "UVM {v}: the timeout, not max time, ends the run");
+        assert!(
+            out.iter().any(|l| l == "UVM_FATAL :    1"),
+            "UVM {v}: one fatal"
+        );
+        assert_eq!(
+            sim.time, 300,
+            "UVM {v}: the timeout, not max time, ends the run"
+        );
     }
 }

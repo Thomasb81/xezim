@@ -5,8 +5,13 @@ use std::process::Command;
 /// Verified byte-for-byte against reference simulators.
 #[test]
 fn struct_array_field_read() {
-    let test_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/classes/struct_array_field_read.sv");
-    assert!(test_file.exists(), "Test file not found: {}", test_file.display());
+    let test_file =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/classes/struct_array_field_read.sv");
+    assert!(
+        test_file.exists(),
+        "Test file not found: {}",
+        test_file.display()
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg("--simulate")
         .arg("-s")
@@ -19,7 +24,16 @@ fn struct_array_field_read() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!combined.contains("Parse errors"), "Parse error:\n{combined}");
-    assert!(!combined.contains("TAG_FAIL"), "struct_array_field_read failed:\n{combined}");
-    assert!(combined.contains("TAG_PASS"), "struct_array_field_read: no TAG_PASS.\nOutput:\n{combined}");
+    assert!(
+        !combined.contains("Parse errors"),
+        "Parse error:\n{combined}"
+    );
+    assert!(
+        !combined.contains("TAG_FAIL"),
+        "struct_array_field_read failed:\n{combined}"
+    );
+    assert!(
+        combined.contains("TAG_PASS"),
+        "struct_array_field_read: no TAG_PASS.\nOutput:\n{combined}"
+    );
 }

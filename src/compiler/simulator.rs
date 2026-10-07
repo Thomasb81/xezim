@@ -32,8 +32,7 @@ use std::io::Write;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, OnceLock};
 use xezim_core::elaborate::resolve_type_width;
 use xezim_core::hasher::{HashMap, HashSet};
 
@@ -452,6 +451,9 @@ const VC_CHANGED_MARKER: &str = "$__xz_vc_changed";
 /// A signal of a concurrent assertion resolved at registration: `(<id>)`
 /// reads `signal_table[id]` (see `sva_resolve_signals`).
 const SVA_SIG_MARKER: &str = "$__xz_sva_sig";
+/// §16.3: the message of the `$error` a failed assertion with no `else`
+/// clause reports (the reference simulator's wording).
+const ASSERT_DEFAULT_ERROR: &str = "Assertion error.";
 /// Internal task a waiter resumes to report that a wait made from the
 /// nested (C-called) path is over; see `run_nested_until`.
 const SYNC_WAKE_MARKER: &str = "$__xz_sync_wake";
@@ -734,26 +736,6 @@ fn xz_copy_debug_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("XEZIM_CP_DBG").is_some())
 }
 
-fn pdes_parallel_apply_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    cached_env_flag("XEZIM_PDES_PAR_APPLY", &FLAG)
-}
-
-fn pdes_bucket_nba_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    cached_env_flag("XEZIM_PDES_BUCKET_NBA", &FLAG)
-}
-
-fn pdes_pool_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    cached_env_flag("XEZIM_PDES_POOL", &FLAG)
-}
-
-fn pdes_scan_merge_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    cached_env_flag("XEZIM_PDES_SCAN_MERGE", &FLAG)
-}
-
 fn parallel_disabled_by_env() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     cached_env_flag("XEZIM_NO_PARALLEL", &FLAG)
@@ -762,40 +744,6 @@ fn parallel_disabled_by_env() -> bool {
 fn parallel_serialize_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     cached_env_flag("XEZIM_PARALLEL_SERIALIZE", &FLAG)
-}
-
-fn dispatcher_env_cached() -> Option<&'static str> {
-    static VALUE: OnceLock<Option<String>> = OnceLock::new();
-    VALUE
-        .get_or_init(|| std::env::var("XEZIM_DISPATCHER").ok())
-        .as_deref()
-}
-
-fn pdes_chunk_target_from_env() -> Option<usize> {
-    static VALUE: OnceLock<Option<usize>> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        const DEFAULT_PDES_CHUNK_TARGET: usize = 4000;
-        match std::env::var("XEZIM_PDES_CHUNK_TARGET") {
-            Ok(raw) if raw.trim() == "0" => None,
-            Ok(raw) => raw
-                .trim()
-                .parse::<usize>()
-                .ok()
-                .filter(|&n| n >= 50)
-                .or(Some(DEFAULT_PDES_CHUNK_TARGET)),
-            Err(_) => Some(DEFAULT_PDES_CHUNK_TARGET),
-        }
-    })
-}
-
-fn pdes_subchunk_split_from_env() -> usize {
-    static VALUE: OnceLock<usize> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("XEZIM_PDES_SUBCHUNK")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-    })
 }
 
 macro_rules! sim_dbg_eprintln {
@@ -1568,274 +1516,6 @@ struct ParallelBlockSlice {
 unsafe impl Send for ParallelBlockSlice {}
 unsafe impl Sync for ParallelBlockSlice {}
 
-#[derive(Clone, Copy)]
-struct ParallelDispatchShared {
-    signal_table_ptr: usize,
-    signal_table_len: usize,
-    signal_signed_ptr: usize,
-    signal_signed_len: usize,
-    signal_name_to_id_ptr: usize,
-    array_first_id_ptr: usize,
-    packed_ptr: usize,
-}
-
-impl ParallelDispatchShared {
-    fn new(
-        signal_table: &[Value],
-        signal_signed: &[bool],
-        signal_name_to_id: &NameMap,
-        array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
-        packed: &PackedMem,
-    ) -> Self {
-        Self {
-            signal_table_ptr: signal_table.as_ptr() as usize,
-            signal_table_len: signal_table.len(),
-            signal_signed_ptr: signal_signed.as_ptr() as usize,
-            signal_signed_len: signal_signed.len(),
-            signal_name_to_id_ptr: signal_name_to_id as *const _ as usize,
-            array_first_id_ptr: array_first_id as *const _ as usize,
-            packed_ptr: packed as *const _ as usize,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ParallelChunkRef {
-    ptr: usize,
-    len: usize,
-}
-
-impl ParallelChunkRef {
-    fn new(chunk: &[(usize, ParallelBlockSlice)]) -> Self {
-        Self {
-            ptr: chunk.as_ptr() as usize,
-            len: chunk.len(),
-        }
-    }
-}
-
-struct ParallelJob {
-    slot: usize,
-    blocks: ParallelChunkRef,
-    shared: ParallelDispatchShared,
-    result_tx: mpsc::Sender<ParallelJobResult>,
-}
-
-struct ParallelJobResult {
-    slot: usize,
-    nba: Vec<NbaFast>,
-    exec_ns: u128,
-}
-
-enum ParallelWorkerMsg {
-    Run(ParallelJob),
-    Stop,
-}
-
-struct ParallelDispatchResult {
-    nba: Vec<Vec<NbaFast>>,
-    thread_ns: Vec<u128>,
-    enqueue_ns: u128,
-    wait_ns: u128,
-}
-
-struct ParallelWorkerPool {
-    senders: Vec<mpsc::Sender<ParallelWorkerMsg>>,
-    handles: Vec<JoinHandle<()>>,
-    next_worker: usize,
-}
-
-impl ParallelWorkerPool {
-    fn new(worker_count: usize) -> Self {
-        let worker_count = worker_count.max(1);
-        let mut senders = Vec::with_capacity(worker_count);
-        let mut handles = Vec::with_capacity(worker_count);
-        for worker_idx in 0..worker_count {
-            let (tx, rx) = mpsc::channel::<ParallelWorkerMsg>();
-            let handle = std::thread::Builder::new()
-                .name(format!("xezim-pdes-{}", worker_idx))
-                .spawn(move || parallel_worker_loop(rx))
-                .expect("spawn xezim PDES worker");
-            senders.push(tx);
-            handles.push(handle);
-        }
-        Self {
-            senders,
-            handles,
-            next_worker: 0,
-        }
-    }
-
-    fn worker_count(&self) -> usize {
-        self.senders.len()
-    }
-
-    fn dispatch_refs(
-        &mut self,
-        chunks: &[&[(usize, ParallelBlockSlice)]],
-        shared: ParallelDispatchShared,
-    ) -> ParallelDispatchResult {
-        if chunks.is_empty() {
-            return ParallelDispatchResult {
-                nba: Vec::new(),
-                thread_ns: Vec::new(),
-                enqueue_ns: 0,
-                wait_ns: 0,
-            };
-        }
-
-        let (result_tx, result_rx) = mpsc::channel::<ParallelJobResult>();
-        let mut results: Vec<Option<Vec<NbaFast>>> = (0..chunks.len()).map(|_| None).collect();
-        let mut thread_ns = Vec::with_capacity(chunks.len());
-        let mut sent = 0usize;
-        let enqueue_t0 = std::time::Instant::now();
-        for (slot, chunk) in chunks.iter().enumerate() {
-            if chunk.is_empty() {
-                results[slot] = Some(Vec::new());
-                thread_ns.push(0);
-                continue;
-            }
-            let job = ParallelJob {
-                slot,
-                blocks: ParallelChunkRef::new(chunk),
-                shared,
-                result_tx: result_tx.clone(),
-            };
-            let worker = self.next_worker % self.senders.len();
-            self.next_worker = (self.next_worker + 1) % self.senders.len();
-            match self.senders[worker].send(ParallelWorkerMsg::Run(job)) {
-                Ok(()) => sent += 1,
-                Err(err) => {
-                    if let ParallelWorkerMsg::Run(job) = err.0 {
-                        let (nba, exec_ns) = run_parallel_job(&job);
-                        results[slot] = Some(nba);
-                        thread_ns.push(exec_ns);
-                    }
-                }
-            }
-        }
-        drop(result_tx);
-        let enqueue_ns = enqueue_t0.elapsed().as_nanos();
-
-        let wait_t0 = std::time::Instant::now();
-        for _ in 0..sent {
-            match result_rx.recv() {
-                Ok(result) if result.slot < results.len() => {
-                    results[result.slot] = Some(result.nba);
-                    thread_ns.push(result.exec_ns);
-                }
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        let wait_ns = wait_t0.elapsed().as_nanos();
-
-        ParallelDispatchResult {
-            nba: results
-                .into_iter()
-                .map(|result| result.unwrap_or_default())
-                .collect(),
-            thread_ns,
-            enqueue_ns,
-            wait_ns,
-        }
-    }
-}
-
-impl Drop for ParallelWorkerPool {
-    fn drop(&mut self) {
-        for sender in &self.senders {
-            let _ = sender.send(ParallelWorkerMsg::Stop);
-        }
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
-        }
-    }
-}
-
-fn parallel_worker_loop(rx: mpsc::Receiver<ParallelWorkerMsg>) {
-    while let Ok(msg) = rx.recv() {
-        match msg {
-            ParallelWorkerMsg::Run(job) => {
-                let (nba, exec_ns) = run_parallel_job(&job);
-                let _ = job.result_tx.send(ParallelJobResult {
-                    slot: job.slot,
-                    nba,
-                    exec_ns,
-                });
-            }
-            ParallelWorkerMsg::Stop => break,
-        }
-    }
-}
-
-fn run_parallel_job(job: &ParallelJob) -> (Vec<NbaFast>, u128) {
-    let signal_table = unsafe {
-        std::slice::from_raw_parts(
-            job.shared.signal_table_ptr as *const Value,
-            job.shared.signal_table_len,
-        )
-    };
-    let signal_signed = unsafe {
-        std::slice::from_raw_parts(
-            job.shared.signal_signed_ptr as *const bool,
-            job.shared.signal_signed_len,
-        )
-    };
-    let signal_name_to_id = unsafe { &*(job.shared.signal_name_to_id_ptr as *const NameMap) };
-    let array_first_id =
-        unsafe { &*(job.shared.array_first_id_ptr as *const HashMap<Arc<str>, (usize, i64, i64)>) };
-    let packed = unsafe { &*(job.shared.packed_ptr as *const PackedMem) };
-    let chunk = unsafe {
-        std::slice::from_raw_parts(
-            job.blocks.ptr as *const (usize, ParallelBlockSlice),
-            job.blocks.len,
-        )
-    };
-    let t0 = std::time::Instant::now();
-    let nba = exec_parallel_chunk(
-        chunk,
-        signal_table,
-        signal_signed,
-        signal_name_to_id,
-        array_first_id,
-        packed,
-    );
-    (nba, t0.elapsed().as_nanos())
-}
-
-fn exec_parallel_chunk(
-    chunk: &[(usize, ParallelBlockSlice)],
-    signal_table: &[Value],
-    signal_signed: &[bool],
-    signal_name_to_id: &NameMap,
-    array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
-    packed: &PackedMem,
-) -> Vec<NbaFast> {
-    let mut thread_nba: Vec<NbaFast> = Vec::new();
-    let max_regs = chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
-    let mut vm_regs = vec![Value::zero(1); max_regs];
-    for (bi, bs) in chunk {
-        if vm_regs.len() < bs.num_regs {
-            vm_regs.resize(bs.num_regs, Value::zero(1));
-        }
-        let insns = unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
-        let mut nba = Simulator::exec_insns_isolated(
-            insns,
-            signal_table,
-            signal_signed,
-            signal_name_to_id,
-            array_first_id,
-            Some(packed),
-            &mut vm_regs,
-            *bi as u32,
-            bs.nba_dup,
-        );
-        thread_nba.append(&mut nba);
-    }
-    thread_nba
-}
-
 #[derive(Debug, Clone)]
 struct EdgeSensitiveBlock {
     /// Pre-resolved signal IDs for O(1) edge checking. The unresolved
@@ -2157,6 +1837,21 @@ const WHEEL_SIZE: usize = 4096;
 /// Prefix of the hidden per-clocking-input sample mirror signals (§14.13).
 /// Not expressible in SV source, so it can never collide with a user name.
 const CB_SAMPLE_PREFIX: &str = "__xz_cbsample.";
+
+/// IEEE 1800-2023 §14.4: `#1step` in the clocking skew maps. An input with no
+/// declared skew samples with 1step too (§14.3 default), so the default-input
+/// map holds only explicit non-1step skews.
+const CB_SKEW_1STEP: u64 = u64::MAX;
+
+/// §14.4 explicit input skew `#N` (N > 0): a net's values over the last N
+/// ticks. `changes` holds `(slot, value at the end of that slot)` in time
+/// order, `init` the value before the first recorded slot.
+#[derive(Default)]
+struct ClockingHist {
+    init: Option<Value>,
+    changes: VecDeque<(u64, Value)>,
+    span: u64,
+}
 /// Number of u64 words needed for the occupancy bitmap (256 / 64 = 4).
 const BITMAP_WORDS: usize = WHEEL_SIZE / 64;
 
@@ -2550,6 +2245,7 @@ impl NbaFastIndex {
 }
 
 mod code_cov;
+mod dpi_task;
 mod event_bits;
 mod module_paths;
 mod names;
@@ -2596,7 +2292,10 @@ mod store_write_mask_tests {
         })
         .join()
         .unwrap();
-        assert_eq!(take_store_writes() & name_bit("pending"), name_bit("pending"));
+        assert_eq!(
+            take_store_writes() & name_bit("pending"),
+            name_bit("pending")
+        );
         assert_eq!(take_store_writes(), 0);
     }
 
@@ -2688,10 +2387,8 @@ mod nba_fast_index_tests {
 }
 
 /// Per-tick wall-time accumulators that the event_loop driver carries
-/// across iterations.  Extracted from `event_loop` (Phase 3 of
-/// PERLP-EVENTLOOP-PLAN.md) so `run_one_tick` can be called as a unit
-/// — both by the single-threaded driver here and (future) by per-LP
-/// threads in Phase 4.
+/// across iterations.  Extracted from `event_loop` so `run_one_tick`
+/// can be called as a unit.
 #[derive(Default, Debug)]
 struct PerTickAccum {
     t_settle: u64,
@@ -3383,6 +3080,12 @@ struct DeferredReport {
     span: crate::ast::Span,
     passed: bool,
     action: Option<Statement>,
+    /// §16.3: a failed assertion with no `else` clause reports the default
+    /// `$error`, naming this scope (`%m` where the assertion executed).
+    default_error_scope: Option<String>,
+    /// The scope of the comb-entry `always_comb` that queued the report
+    /// (`pid` is then `usize::MAX`).
+    comb_scope: Option<String>,
     this_handle: Option<usize>,
     class_context: Option<String>,
 }
@@ -3475,6 +3178,24 @@ struct SvaClockedSite {
     /// and swapped in while this site's predicate is evaluated, so the
     /// property samples pre-edge values (see `eval_sva_sampled`).
     sampled_ids: Vec<usize>,
+    /// §16.10: the initial values of the attempt's local variable slots
+    /// (empty when the property has none).
+    lv_init: SvaEnv,
+    /// §16.14.6: a procedural concurrent assertion. An attempt starts only
+    /// for an execution of the statement (`matured`), not at every tick.
+    procedural: bool,
+    /// §16.14.6.1: the automatic variables the property reads, captured
+    /// into these slots when the statement executes.
+    captured: Vec<(usize, String)>,
+    /// §16.14.6.2: matured instances, each the slot values it captured,
+    /// waiting for the next tick of the leading clock.
+    matured: Vec<SvaEnv>,
+    /// The property has its own `disable iff` (§16.15: the scope's
+    /// `default disable iff` does not apply).
+    explicit_disable: bool,
+    /// The full path of the scope the assertion executes in, which selects
+    /// the `default disable iff` that governs it.
+    disable_scope: String,
 }
 
 /// A sequence (§16.9) as parsed, before it is turned into an automaton.
@@ -3509,6 +3230,23 @@ enum SvaSeq {
         min: u32,
         max: u32,
     },
+    /// §16.10 / §16.11 match items, run within the cycle: local variable
+    /// assignments and subroutine calls (no cycle of its own).
+    Assign(Vec<SvaMatchItem>),
+}
+
+/// The local variable values of one thread of an attempt (§16.10), indexed
+/// by the slots the site's locals were bound to; empty for a site with no
+/// locals.
+type SvaEnv = Vec<Value>;
+
+/// A §16.10 / §16.11 sequence match item.
+#[derive(Debug, Clone)]
+struct SvaMatchItem {
+    /// The assigned local `(slot, width, signed)`; `None` for a subroutine
+    /// call run for its side effect.
+    slot: Option<(usize, u32, bool)>,
+    expr: Expression,
 }
 
 /// Sequence automaton: a cycle advances over `Tick` edges; every other edge
@@ -3530,6 +3268,8 @@ enum SvaEdge {
     Tick(usize),
     /// A compound sub-sequence: followed at every cycle it reports a match.
     Sub(Box<SvaCompound>, usize),
+    /// Run the match items, then follow (§16.10 / §16.11).
+    Assign(Vec<SvaMatchItem>, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -3549,8 +3289,21 @@ enum SvaCompound {
 #[derive(Debug, Clone, Default)]
 struct SvaRun {
     started: bool,
-    pcs: Vec<usize>,
+    /// The states waiting for the next cycle, each with its thread's local
+    /// variables (§16.10).
+    pcs: Vec<(usize, SvaEnv)>,
     subs: Vec<SvaSubRun>,
+    /// The local variables the run starts with.
+    init_env: SvaEnv,
+}
+
+impl SvaRun {
+    fn with_env(init_env: SvaEnv) -> Self {
+        SvaRun {
+            init_env,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3561,6 +3314,10 @@ struct SvaSubRun {
     runs: Vec<SvaRun>,
     /// Which operand of an `and` has matched so far.
     ever: [bool; 2],
+    /// The local variables the compound was entered with, and those of each
+    /// operand's latest match (§16.10: an operand's assignments flow out).
+    env: SvaEnv,
+    ever_env: [SvaEnv; 2],
 }
 
 /// A property body compiled for evaluation (§16.12).
@@ -3619,7 +3376,8 @@ enum SvaState {
         ra: Option<SvaOutcome>,
         rb: Option<SvaOutcome>,
     },
-    Leaf,
+    /// `s_eventually` / `s_always`, with the attempt's local variables.
+    Leaf(SvaEnv),
 }
 
 /// Thompson-style construction of `SvaNfa` fragments.
@@ -3812,6 +3570,12 @@ impl SvaNfaBuilder {
             SvaSeq::FirstMatch(a) => self.sub(SvaCompound::FirstMatch(Self::build(a))),
             SvaSeq::Rep { seq, min, max } => self.rep(&SvaRepUnit::Seq(seq), *min, *max),
             SvaSeq::Goto { cond, min, max } => self.rep(&SvaRepUnit::Goto(cond), *min, *max),
+            SvaSeq::Assign(items) => {
+                let s = self.state();
+                let t = self.state();
+                self.add(s, SvaEdge::Assign(items.clone(), t));
+                (s, t)
+            }
             SvaSeq::NonCon { cond, min, max } => {
                 // §16.9.2: `b[->min:max] ##1 !b[*0:$]`.
                 let (s, e) = self.rep(&SvaRepUnit::Goto(cond), *min, *max);
@@ -3971,6 +3735,9 @@ struct ProcFsm {
         Option<Vec<Sensitivity>>,
         Option<Vec<SensitivityId>>,
     )>,
+    /// Per wait: a clocking event (`@(cb)`), whose waiter resumes in the
+    /// Reactive region after the block samples (§14.13).
+    wait_is_clocking: Vec<bool>,
     pc: u32,
     regs: Vec<Value>,
     scope: String,
@@ -4008,6 +3775,10 @@ struct ClockingTick {
     edge: EdgeKind,
     prev: u8,
 }
+
+/// A callee's rename frames held aside while its actuals are evaluated
+/// (`begin_formal_dyn` / `commit_formal_dyn`).
+type FormalDynSetup = (usize, Vec<(String, String)>, Vec<(String, String)>);
 
 #[derive(Debug, Clone, Default)]
 struct ProcessContext {
@@ -4048,6 +3819,7 @@ struct ProcessContext {
     // under a distinct key. Stack of frames pushed/popped in sync with
     // `push_queue_frame`/`pop_and_restore_queue_frame`.
     local_dyn: Vec<Vec<(String, String)>>,
+    formal_dyn: Vec<Vec<(String, String)>>,
     static_local_syncs: Vec<(String, Vec<(String, String)>)>,
     /// See `Simulator::method_local_base`. This is per-PROCESS state: the
     /// base indexes into `local_stack`, which is swapped out with the rest
@@ -4131,6 +3903,11 @@ struct InstTemplate {
     /// claim: a declared type name and no queue, associative, fixed,
     /// multi-dimensional or static collection property of the class.
     coll_candidates: Vec<(usize, String)>,
+    /// §7.2.2 member defaults of the chain's UNPACKED-struct properties
+    /// (`dflt_t d;` with `typedef struct { int a = 3; } dflt_t`): the cell
+    /// key `<prop>.<member>`, the default expression and the member's type,
+    /// root class first so a derived class's property wins.
+    struct_defaults: Vec<(String, Expression, DataType)>,
 }
 
 impl MethodCallPlan {
@@ -4281,6 +4058,12 @@ enum DpiExpKind {
     /// `string` — modeled only as an INPUT argument (`const char*`); a string
     /// RETURN is not modeled (mapped to Bad).
     StrIn,
+    /// §35.5.6 / H.8.2: an `output`/`inout` formal of an exported subroutine
+    /// arrives as a POINTER (`int*`, `long long*`, `double*`); the formal's
+    /// final value is stored through it on return.
+    I32Out,
+    I64Out,
+    RealOut,
     Bad,
 }
 
@@ -4393,8 +4176,17 @@ struct DpiOpenArrayArg {
 }
 
 impl DpiOpenArrayArg {
-    fn new(elem: DpiOaElem, values: &[Value], left: i64, right: i64) -> Self {
+    /// `shape` is each unpacked dimension's `(left, right)`, outermost
+    /// first; `values` holds the elements row-major, every dimension in
+    /// ascending index order (the order `svGetArrElemPtr*` addresses).
+    fn new(elem: DpiOaElem, values: &[Value], shape: &[(i64, i64)]) -> Self {
         let count = values.len();
+        let mut left = [0i32; 4];
+        let mut right = [0i32; 4];
+        for (k, &(l, r)) in shape.iter().take(4).enumerate() {
+            left[k] = l as i32;
+            right[k] = r as i32;
+        }
         let eb = elem.bytes();
         let data_bytes = eb * count;
         let mut buf = vec![0u64; (DPI_OA_HDR_BYTES + data_bytes).div_ceil(8)];
@@ -4402,27 +4194,33 @@ impl DpiOpenArrayArg {
         let hdr = DpiOpenArrayHeader {
             magic: DPI_OA_MAGIC,
             elem_bytes: eb as u32,
-            ndims: 1,
+            ndims: shape.len().clamp(1, 4) as i32,
             packed: packed as i32,
             packed_left: if packed { elem.width() as i32 - 1 } else { 0 },
             packed_right: 0,
-            left: [left as i32, 0, 0, 0],
-            right: [right as i32, 0, 0, 0],
+            left,
+            right,
             total_bytes: data_bytes as u32,
             elem_count: count as u32,
         };
-        let bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), buf.len() * 8)
-        };
+        let bytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), buf.len() * 8) };
         bytes[..DPI_OA_HDR_BYTES].copy_from_slice(unsafe {
-            std::slice::from_raw_parts((&hdr as *const DpiOpenArrayHeader).cast::<u8>(), DPI_OA_HDR_BYTES)
+            std::slice::from_raw_parts(
+                (&hdr as *const DpiOpenArrayHeader).cast::<u8>(),
+                DPI_OA_HDR_BYTES,
+            )
         });
         for (i, v) in values.iter().enumerate() {
             let at = DPI_OA_HDR_BYTES + i * eb;
             let dst = &mut bytes[at..at + eb];
             match elem {
                 DpiOaElem::I8 | DpiOaElem::I16 | DpiOaElem::I32 | DpiOaElem::I64 => {
-                    let x = if v.is_real { v.to_f64() as i64 as u64 } else { v.to_u64().unwrap_or(0) };
+                    let x = if v.is_real {
+                        v.to_f64() as i64 as u64
+                    } else {
+                        v.to_u64().unwrap_or(0)
+                    };
                     dst.copy_from_slice(&x.to_le_bytes()[..eb]);
                 }
                 DpiOaElem::F32 => dst.copy_from_slice(&(Self::real_of(v) as f32).to_le_bytes()),
@@ -4454,7 +4252,13 @@ impl DpiOpenArrayArg {
 
     /// The handle C receives: the start of the element data.
     fn handle(&mut self) -> *mut std::ffi::c_void {
-        unsafe { self.buf.as_mut_ptr().cast::<u8>().add(DPI_OA_HDR_BYTES).cast() }
+        unsafe {
+            self.buf
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(DPI_OA_HDR_BYTES)
+                .cast()
+        }
     }
 
     /// The elements as C left them.
@@ -4474,8 +4278,12 @@ impl DpiOpenArrayArg {
                         Value::from_u64(i16::from_le_bytes([src[0], src[1]]) as i64 as u64, 16)
                     }
                     DpiOaElem::I32 => Value::from_u64(word(0) as u64, 32),
-                    DpiOaElem::I64 => Value::from_u64(u64::from_le_bytes(src.try_into().unwrap()), 64),
-                    DpiOaElem::F32 => Value::from_f64(f32::from_le_bytes(src.try_into().unwrap()) as f64),
+                    DpiOaElem::I64 => {
+                        Value::from_u64(u64::from_le_bytes(src.try_into().unwrap()), 64)
+                    }
+                    DpiOaElem::F32 => {
+                        Value::from_f64(f32::from_le_bytes(src.try_into().unwrap()) as f64)
+                    }
                     DpiOaElem::F64 => Value::from_f64(f64::from_le_bytes(src.try_into().unwrap())),
                     DpiOaElem::Bit(w) => {
                         let aval: Vec<u32> = (0..eb / 4).map(word).collect();
@@ -5462,6 +5270,19 @@ struct ActiveForceExpr {
     read_signal_ids: Vec<usize>,
     read_epochs: Vec<u64>,
     has_unresolved_reads: bool,
+    /// §10.6.2 bit/part-select force on a net (`partial_forces`): the reads
+    /// are the net's drivers' and the forcing expressions'; `lvalue` is the
+    /// whole net.
+    partial: bool,
+}
+
+/// IEEE 1800-2023 §10.6.2: the forced bits of a net under bit/part-select
+/// `force`. `bits[i]` names the piece (forcing expression) and the bit
+/// within it that bit `i` takes; `None` bits follow the net's drivers.
+struct PartialForce {
+    bits: Vec<Option<(usize, u32)>>,
+    /// (rvalue, select width, resolution hint) per `force` statement.
+    pieces: Vec<(Expression, u32, Option<String>)>,
 }
 
 impl VcdVarKind {
@@ -5646,6 +5467,10 @@ pub struct Simulator {
     vpi_port_directions: HashMap<Arc<str>, PortDirection>,
     /// Signals currently under force/release control (LRM §9.3.1).
     forced_signals: HashMap<usize, Value>,
+    /// §10.6.2 bit/part-select forces on nets, by signal id. Each id is
+    /// also in `forced_signals` (so ordinary writes drop) and has a
+    /// `partial` `active_force_exprs` entry that re-merges the drivers.
+    partial_forces: HashMap<usize, PartialForce>,
     /// Nets released while a settle pass was running (the entry table is
     /// taken out then); re-driven when the pass ends.
     pending_release_ids: Vec<usize>,
@@ -5708,6 +5533,11 @@ pub struct Simulator {
     /// replaced for its duration: (name, width, signed, real, string) as they
     /// were before. See `fb_frame_push`.
     fb_meta_saves: Vec<(String, Option<u32>, bool, bool, bool)>,
+    /// `local_stack` depth below each active fallback frame (see
+    /// `fb_frame_push`): a write inside one leaves 2-state fitting to the
+    /// copy-back, since the carried locals' types are not in
+    /// `var_decl_types`.
+    fb_frame_depths: Vec<usize>,
     /// Lazily-built leaf index over `module.parameters` for the bytecode
     /// compiler's suffix-match fallback (see `lookup_param_value`). Built
     /// once — parameters are final before any bytecode compilation runs.
@@ -5913,6 +5743,10 @@ pub struct Simulator {
     signal_type_names: HashMap<usize, String>,
     pub widths: HashMap<String, u32>,
     pub signed_signals: HashSet<String>,
+    /// Names of ARRAY locals whose packed element geometry
+    /// `exec_stmt_var_decl` registered in `packed_full_dims` (so a later
+    /// same-named array local can drop it).
+    array_local_packed_dims: HashSet<String>,
     pub real_signals: HashSet<String>,
     /// Base names of 2D/ND UNPACKED arrays (union of `module.arrays_2d` and
     /// `module.arrays_nd` keys). The bytecode compiler consults this so a
@@ -6020,6 +5854,18 @@ pub struct Simulator {
     /// edge-detect the clock signal each loop iteration; `pending`
     /// queues consequents deferred by `|=>` or `##N`.
     sva_sites: Vec<SvaClockedSite>,
+    /// §16.10: the local variables of the attempt thread being evaluated,
+    /// read through slot markers (see `sva_bind_locals`).
+    sva_lv: Vec<Value>,
+    /// `(width, signed, two-state)` of each local variable slot of the site
+    /// being registered (see `sva_bind_locals`).
+    sva_lv_types: Vec<(u32, bool, bool)>,
+    /// §16.14.6.2: procedural concurrent assertion instances queued this time
+    /// step, not yet matured: `(site, process, captured slot values)`. A
+    /// flush point of the process drops its own.
+    sva_proc_pending: Vec<(usize, usize, Vec<Value>)>,
+    /// §16.15 `default disable iff`, by the scope that declares it.
+    sva_default_disable: HashMap<String, Expression>,
     /// LRM §16.9.3: index of the SVA site whose body is currently
     /// being evaluated. Set by `tick_sva_sites` around each body
     /// eval; consulted by `eval_expr`'s `$past` handler to find the
@@ -6103,6 +5949,17 @@ pub struct Simulator {
     /// NBA update. Without this, `cb.<in>` reads the post-edge value (off by
     /// one clock relative to a reference simulator).
     clocking_preponed: HashMap<String, Value>,
+    /// §14.4 `input #N` history per sampled net (see `ClockingHist`). Empty
+    /// unless some clocking input has an explicit positive skew.
+    clocking_hist: HashMap<String, ClockingHist>,
+    /// Time of the slot `refresh_clocking_preponed` last ran in.
+    clocking_hist_slot: Option<u64>,
+    /// §14.3 clocking-visible name of each `clocking_meta` signal, in the
+    /// same order. Snapshots are keyed by it, so `input d; input #3 dl = d;`
+    /// keeps two samples of one net.
+    clocking_vis: HashMap<String, Vec<String>>,
+    /// §14.16.2 inout clockvars: cb → nets that are BOTH sampled and driven.
+    clocking_inouts: HashMap<String, HashSet<String>>,
     /// Continuations of clocking-event waiters (`@(cb)` / `##N`) that fired this
     /// slot, held for resumption in the Reactive region — after `apply_nba` and
     /// `tick_clocking_blocks` — instead of running in the Active region with the
@@ -6430,6 +6287,14 @@ pub struct Simulator {
     /// locals (bare name -> process-unique storage key). See
     /// `ProcessContext::local_dyn`.
     local_dyn: Vec<Vec<(String, String)>>,
+    /// Parallel to `local_dyn`: each call frame's queue / dynamic-array /
+    /// associative FORMALS, bare name -> storage key (a per-call copy
+    /// `@q#N`, or for `ref` the actual's own storage). The frame's
+    /// `local_dyn` table holds an identity entry `(name, name)` for each, so
+    /// it shadows an enclosing same-named local and reads as its bare name
+    /// from a nested call (§13.3); `dyn_name_lookup` maps the identity hit
+    /// in the innermost frame through this table.
+    formal_dyn: Vec<Vec<(String, String)>>,
     /// Monotonic counter backing the process-unique keys in `local_dyn`.
     next_dyn_id: u64,
     /// Built-in mailboxes (handle -> queue of values)
@@ -6737,6 +6602,10 @@ pub struct Simulator {
     /// only ones whose bare hoisted entry is ambiguous. Empty for a design
     /// without such a collision, which short-circuits the qualified lookup.
     pkg_ambiguous_names: HashSet<String>,
+    /// §26.3: the package VARIABLE names among `pkg_ambiguous_names` (see
+    /// `split_contested_package_vars`): only these resolve through a design
+    /// unit's imports or a package class's package.
+    contested_pkg_vars: HashSet<String>,
     /// §21.2.1.7 `%m` lexical-scope hierarchy WITHIN the current instance:
     /// task / function / named-block / fork-block names, innermost last.
     /// Pushed on subroutine/named-block entry, popped on exit.
@@ -6845,6 +6714,15 @@ pub struct Simulator {
     /// `"<Class>::<name>"`; the set is the cheap gate that keeps every
     /// unshadowed access on the bare-name fast path.
     shadowed_prop_names: HashSet<String>,
+    /// `meta_key_bits` of every name in `shadowed_prop_names`: a prefilter that
+    /// spares the hot member-access paths a hash per access.
+    shadowed_prop_mask: u64,
+    /// §6.11.1 / §7.5: instance-scoped storage names (`<handle>#<member>`) of
+    /// queue / dynamic-array class properties whose element type is a SIGNED
+    /// integral type (`byte`, `shortint`, `logic signed [7:0]`, ...). Their
+    /// elements live in the runtime map with no declared signedness of their
+    /// own, so a store stamps it from here (`p.dyn[1] = 8'hff` reads -1).
+    signed_class_colls: HashSet<String>,
     /// §8.25 / §8.3: classes whose base class depends on their own
     /// parameters — `class W #(type B = base) extends B;` (the base IS a type
     /// parameter) or `class W2 #(type B) extends W #(B);` (the base is such a
@@ -7025,14 +6903,6 @@ pub struct Simulator {
     /// populated. Drives how many worker threads the parallel-edge
     /// dispatcher spawns.
     pub(crate) edge_block_partition_count: u32,
-    /// Per-signal exclusive-writer LP id (Some(lp)) or None when the
-    /// signal has no parallel-eligible NBA writer or is written by
-    /// multiple LPs (boundary). Populated by
-    /// `classify_signal_lp_writers` after `apply_multikernel_scope_partition`.
-    /// Phase-1 PDES infrastructure: enables per-LP NBA bucket apply
-    /// (Phase 1.5) and per-LP local signal_table (Phase 2). Empty
-    /// when no multikernel partition is active.
-    pub(crate) signal_lp_writer: Vec<Option<u32>>,
     /// Per-edge-block execution counts. Cheap enough to maintain on the hot
     /// path, and used only for optional end-of-run attribution.
     edge_block_exec_counts: Vec<u64>,
@@ -7168,6 +7038,16 @@ pub struct Simulator {
     /// statements run on the synchronous path and cannot park, so a wait
     /// there runs the scheduler nested instead (`run_nested_until`).
     dpi_export_depth: u32,
+    /// §35.5.2/§35.9: imported tasks running on their own stacks
+    /// (`dpi_task.rs`): the SV names of the imported tasks a loaded library
+    /// implements (empty: none, and the mechanism costs nothing), the live
+    /// calls by id, the one running now, and whether that one is unwinding
+    /// after a disable.
+    dpi_task_names: HashSet<String>,
+    dpi_tasks: HashMap<u64, Box<dpi_task::DpiTask>>,
+    dpi_cur_task: Option<u64>,
+    dpi_unwinding: bool,
+    next_dpi_task: u64,
     /// Wake markers fired by waiters registered from that nested path.
     sync_wakes: HashSet<u64>,
     next_sync_wake: u64,
@@ -7183,6 +7063,20 @@ pub struct Simulator {
     foreach_replay_limit: u32,
     /// SV-2023: target named block for `disable <name>` propagation.
     disable_target: Option<String>,
+    /// §9.6.2: a `disable` just executed whose target has not been located
+    /// yet — the process loop checks its own continuation first, then the
+    /// processes the block may belong to (`disable_remote_block`).
+    disable_check_pending: bool,
+    /// §9.6.2: address of each flattened NAMED block frame → the block name,
+    /// so a `disable` can find where the block ends in a continuation chain.
+    named_block_frames: HashMap<usize, String>,
+    /// §9.6.2: the forking process's continuation at each run-loop fork
+    /// child's spawn — the named blocks the child was forked inside.
+    fork_spawn_cont: HashMap<usize, ProcCont>,
+    fork_spawn_prune_at: usize,
+    /// §9.6.2: processes unwound out of a named block or task by another
+    /// process's `disable`, applied when each next runs.
+    pending_block_disable: HashMap<usize, String>,
     /// Label of a process-level named block (`initial begin : worker`) -> its
     /// pid, so `disable worker` from another process can terminate it.
     disable_labels: HashMap<String, usize>,
@@ -7256,6 +7150,11 @@ pub struct Simulator {
     /// their own); element accesses on them are rewritten onto the actual.
     /// Pushed/popped in lockstep with `ref_binding_stack`.
     ref_identity_stack: Vec<Vec<String>>,
+    /// Rename-table entries of the queue / associative formals bound so far
+    /// in the call being set up (see `bind_queue_param`). They enter the
+    /// callee's frame only once every actual is evaluated: an actual must
+    /// not resolve to a formal of the call it is being passed to.
+    pending_formal_dyn: Vec<(String, String)>,
     /// True while the top ref frame has an aliased or identity-bound formal —
     /// the only state in which `ref_formal_redirect_*` can rewrite anything.
     /// Maintained on push/pop/take/restore so the hot paths test one bool.
@@ -7609,34 +7508,8 @@ pub struct Simulator {
     vcd_limit: Option<u64>,
     vcd_bytes: u64,
     vcd_limit_hit: bool,
-    /// Persistent workers for XEZIM_DISPATCHER=pdes parallel edge dispatch.
-    pdes_worker_pool: Option<ParallelWorkerPool>,
-    /// LP-A (core0) scope prefix captured when the multikernel-scope
-    /// partition is applied — the per-LP settle (XEZIM_DISPATCHER=perlp)
-    /// builds its comb partition from this.
-    perlp_settle_prefix: Option<String>,
-    /// Lazily-built per-LP settle state (comb partition + Send ctx +
-    /// persistent scratch). Built on first settle under perlp.
-    perlp_settle: Option<PerLpSettleState>,
-    /// perlp settle: ticks taking the fast partitioned path vs the AST/empty
-    /// fallback to the canonical settle.
-    prof_perlp_settle_fast: u64,
-    prof_perlp_settle_fallback: u64,
-    /// XEZIM_PERLP_SHADOW=1: run the partitioned settle on a clone and the
-    /// canonical settle as truth, comparing per-tick to find the first real
-    /// value divergence (debugging the partitioned settle).
-    perlp_shadow: bool,
-    perlp_shadow_real_diffs: u64,
-    /// Timing: ns in the two per-LP settle_subset_tracked calls (the
-    /// PARALLELIZABLE part of perlp settle) vs total ns in
-    /// settle_combinatorial_perlp. The ratio is B3's speedup ceiling.
-    prof_perlp_compute_ns: u64,
-    prof_perlp_total_ns: u64,
-    /// XEZIM_PERLP_AFTER=<sim_time>: run the canonical settle until this time,
-    /// then switch to the partitioned settle. Lets us run the X-rampant
-    /// reset/boot phase canonically (order-sensitive 4-state) and use perlp
-    /// only once signals are defined.
-    perlp_after: u64,
+    /// XEZIM_BSP_SHADOW=1: number of time>0 settles compared so far.
+    bsp_shadow_checks: u64,
     /// Buffered stdout sink for $display/$write. Lazily initialized on first
     /// write; runs its own background writer unless XEZIM_DUMP_INLINE=1.
     stdout_sink: Option<super::stdout_sink::StdoutSink>,
@@ -8139,8 +8012,8 @@ pub struct Simulator {
     event_skip: bool,
     // Skip only at sim_time >= this (XEZIM_EVENT_AFTER). Boot/load uses write
     // paths ($readmemh, testbench drives, DPI) that may bypass the change
-    // hook; running boot WITHOUT skip avoids that false-skip window (the same
-    // boot-gate the per-LP settle needed). The 99% waste is in steady state.
+    // hook; running boot WITHOUT skip avoids that false-skip window. The 99%
+    // waste is in steady state.
     event_after: u64,
     edge_block_data_reads: Vec<Vec<u32>>,
     edge_block_gateable: Vec<bool>,
@@ -8288,26 +8161,6 @@ pub struct Simulator {
     /// dispatch; sum tells you total dispatcher cycles.
     prof_par_dispatch_partition: u64,
     prof_par_dispatch_legacy: u64,
-    /// PDES-dispatcher hits: when XEZIM_DISPATCHER=pdes the parallel
-    /// block dispatch uses the PDES path (same chunk mechanism but
-    /// tagged separately for profiling). Sparse-snapshot per-LP and
-    /// boundary-channel integration would attach here; current
-    /// implementation is a placeholder that delegates to std::scope.
-    prof_par_dispatch_pdes: u64,
-    /// PDES dispatcher per-phase wall (nanoseconds, accumulated across
-    /// all per-tick dispatches). Lets the [PROF-pdes] line attribute
-    /// the +8.5% overhead vs baseline to its actual source: spawn,
-    /// exec, or merge.
-    prof_pdes_spawn_ns: u64,
-    prof_pdes_exec_ns: u64,
-    prof_pdes_merge_ns: u64,
-    /// Per-thread exec time imbalance tracking. `pdes_imbalance_sum_ns`
-    /// accumulates (max_thread_exec - min_thread_exec) per dispatch;
-    /// pdes_max_total and pdes_min_total accumulate the max/min thread
-    /// times so the ratio reveals chronic load imbalance.
-    prof_pdes_imbalance_sum_ns: u64,
-    prof_pdes_max_total_ns: u64,
-    prof_pdes_min_total_ns: u64,
     prof_edge_waiters: u64,
     prof_edge_cg: u64,
     prof_waiter_iters: u64,
@@ -9026,6 +8879,100 @@ impl Simulator {
                 }
             }
         }
+    }
+
+    /// §26.3: the storage name of package `pkg`'s variable `name` when the
+    /// bare name is contested (see `split_contested_package_vars`), else
+    /// `None` (the bare hoisted entry is the package's own).
+    fn pkg_var_storage(&self, pkg: &str, name: &str) -> Option<String> {
+        if self.contested_pkg_vars.is_empty() || !self.contested_pkg_vars.contains(name) {
+            return None;
+        }
+        let q = format!("{}::{}", pkg, name);
+        self.signal_name_to_id.contains_key(q.as_str()).then_some(q)
+    }
+
+    /// §26.3: a package variable whose bare name another package also
+    /// declares, or that a module-scope declaration displaces, gets its own
+    /// storage under `<pkg>::<name>`. Package declarations are hoisted into
+    /// ONE design-wide bare namespace, so `pa::cnt` and `pc::cnt` were the
+    /// same cell (and `base_p::v` read the module's own `v`). The qualified
+    /// cells are added as signals here, a call-initialized one's static
+    /// initializer is retargeted to it, and the bare names are returned so
+    /// name resolution can route through the qualified cells.
+    fn split_contested_package_vars(module: &mut ElaboratedModule) -> HashSet<String> {
+        let mut owners: HashMap<&str, usize> = HashMap::default();
+        for key in module.pkg_var_decls.keys() {
+            if let Some((_, base)) = key.split_once("::") {
+                *owners.entry(base).or_default() += 1;
+            }
+        }
+        let contested: HashSet<String> = owners
+            .into_iter()
+            .filter(|(base, n)| {
+                *n >= 2
+                    || module.wildcard_shadowed.contains(*base)
+                    || module.foreign_displaced.contains(*base)
+            })
+            .map(|(b, _)| b.to_string())
+            .collect();
+        if contested.is_empty() {
+            return contested;
+        }
+        let mut keys: Vec<String> = module
+            .pkg_var_decls
+            .keys()
+            .filter(|k| {
+                k.split_once("::")
+                    .is_some_and(|(_, b)| contested.contains(b))
+            })
+            .cloned()
+            .collect();
+        keys.sort();
+        for k in keys {
+            if let Some(sig) = module.pkg_var_decls.get(&k).cloned() {
+                let (_, base) = k.split_once("::").unwrap();
+                if let Some(ty) = module.var_decl_types.get(base).cloned() {
+                    module.var_decl_types.entry(k.clone()).or_insert(ty);
+                }
+                if module.string_signals.contains(base) {
+                    module.string_signals.insert(k.clone());
+                }
+                if module.two_state_signals.contains(base) {
+                    module.two_state_signals.insert(k.clone());
+                }
+                module.signals.insert(k, sig);
+            }
+        }
+        for (idx, q) in module.pkg_var_init_blocks.clone() {
+            let Some((_, base)) = q.split_once("::") else {
+                continue;
+            };
+            if !contested.contains(base) {
+                continue;
+            }
+            if let Some(b) = module.static_init_blocks.get_mut(idx) {
+                if let StatementKind::BlockingAssign { lvalue, .. } = &mut b.stmt.kind {
+                    *lvalue = Expression::new(
+                        ExprKind::Ident(HierarchicalIdentifier {
+                            root: None,
+                            path: vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: q.clone(),
+                                    span: lvalue.span,
+                                },
+                                selects: Vec::new(),
+                            }],
+                            span: lvalue.span,
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        lvalue.span,
+                    );
+                }
+            }
+        }
+        contested
     }
 
     fn classify_typedef_collection_properties(module: &mut ElaboratedModule) {
@@ -9904,6 +9851,7 @@ impl Simulator {
         // collection typedef must be classified as a queue/assoc/array member
         // — elaborate_class only saw the class's OWN local typedefs.
         Self::classify_typedef_collection_properties(&mut module);
+        let contested_pkg_vars = Self::split_contested_package_vars(&mut module);
         Self::register_struct_member_packed_dims(&mut module);
         // §9.2.2.2: give every dynamic array / queue a REAL `<q>.size` signal.
         // It doubles as the queue's change proxy in the comb dependency graph:
@@ -10374,7 +10322,7 @@ impl Simulator {
         // called) through the running package's own entry. Every other name
         // resolves identically either way, so the set stays empty for
         // practically every design and both lookups short-circuit.
-        let mut pkg_ambiguous_names: HashSet<String> = HashSet::default();
+        let mut pkg_ambiguous_names: HashSet<String> = contested_pkg_vars.clone();
         {
             let mut first_owner: HashMap<&str, &str> = HashMap::default();
             for key in module.parameters.keys() {
@@ -11590,9 +11538,11 @@ impl Simulator {
             vpi_port_directions,
             widths,
             signed_signals,
+            array_local_packed_dims: HashSet::default(),
             real_signals,
             multi_dim_array_names,
             forced_signals: HashMap::default(),
+            partial_forces: HashMap::default(),
             pending_release_ids: Vec::new(),
             prop_raw_ty_cache: std::cell::RefCell::new(HashMap::default()),
             typedef_target_cache: std::cell::RefCell::new(HashMap::default()),
@@ -11608,6 +11558,7 @@ impl Simulator {
             name_stats_on: std::env::var("XEZIM_NAME_STATS").is_ok(),
             frame_pool: Vec::new(),
             fb_meta_saves: Vec::new(),
+            fb_frame_depths: Vec::new(),
             param_leaf_index_cell: std::cell::OnceCell::new(),
             var_decl_leaf_index_cell: std::cell::OnceCell::new(),
             forced_names: HashSet::default(),
@@ -11672,6 +11623,10 @@ impl Simulator {
             typedef_layouts_by_width: None,
             class_prop_dim_cache: std::cell::RefCell::new(HashMap::default()),
             sva_sites: Vec::new(),
+            sva_lv: Vec::new(),
+            sva_lv_types: Vec::new(),
+            sva_proc_pending: Vec::new(),
+            sva_default_disable: HashMap::default(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
             clocking_snapshots: HashMap::default(),
@@ -11691,6 +11646,10 @@ impl Simulator {
             clocking_last_edge: HashMap::default(),
             default_clocking_cb: None,
             clocking_preponed: HashMap::default(),
+            clocking_hist: HashMap::default(),
+            clocking_hist_slot: None,
+            clocking_inouts: HashMap::default(),
+            clocking_vis: HashMap::default(),
             deferred_clocking_conts: Vec::new(),
             pending_reactive: Vec::new(),
             active_union_tag: HashMap::default(),
@@ -11816,6 +11775,7 @@ impl Simulator {
             var_container_types: HashMap::default(),
             var_typedef_types: HashMap::default(),
             local_dyn: Vec::new(),
+            formal_dyn: Vec::new(),
             next_dyn_id: 0,
             string_signals: HashSet::default(),
             queue_frame_saves: Vec::new(),
@@ -11887,6 +11847,7 @@ impl Simulator {
             pkg_scope_stack: Vec::new(),
             pending_pkg_scope: None,
             pkg_ambiguous_names,
+            contested_pkg_vars,
             m_scope_stack: Vec::new(),
             static_local_vars: HashMap::default(),
             static_local_names: HashSet::default(),
@@ -11909,6 +11870,8 @@ impl Simulator {
             rand_receiver: None,
             randomize_subset: None,
             shadowed_prop_names: HashSet::default(),
+            shadowed_prop_mask: 0,
+            signed_class_colls: HashSet::default(),
             dep_base: HashMap::default(),
             dep_default: HashMap::default(),
             dep_names: Vec::new(),
@@ -11962,7 +11925,6 @@ impl Simulator {
             edge_block_parallel: Vec::new(),
             edge_block_partition: Vec::new(),
             edge_block_partition_count: 0,
-            signal_lp_writer: Vec::new(),
             edge_block_exec_counts: Vec::new(),
             edge_block_exec_ns: Vec::new(),
             signal_toggle_count: Vec::new(),
@@ -12002,6 +11964,11 @@ impl Simulator {
             parked_from_exec: false,
             exec_park_cont: None,
             dpi_export_depth: 0,
+            dpi_task_names: HashSet::default(),
+            dpi_tasks: HashMap::default(),
+            dpi_cur_task: None,
+            dpi_unwinding: false,
+            next_dpi_task: 1,
             sync_wakes: HashSet::default(),
             next_sync_wake: 0,
             mcd_names: HashMap::default(),
@@ -12011,6 +11978,11 @@ impl Simulator {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(64),
             disable_target: None,
+            disable_check_pending: false,
+            named_block_frames: HashMap::default(),
+            fork_spawn_cont: HashMap::default(),
+            fork_spawn_prune_at: 1024,
+            pending_block_disable: HashMap::default(),
             disable_labels: HashMap::default(),
             fork_block_children: HashMap::default(),
             warned_assoc_index: HashSet::default(),
@@ -12028,6 +12000,7 @@ impl Simulator {
             ref_binding_stack: Vec::new(),
             ref_alias_stack: Vec::new(),
             ref_identity_stack: Vec::new(),
+            pending_formal_dyn: Vec::new(),
             ref_redirect_hot: false,
             cg_type_options: HashMap::default(),
             method_receiver_cache: HashMap::default(),
@@ -12132,16 +12105,7 @@ impl Simulator {
             vcd_limit: None,
             vcd_bytes: 0,
             vcd_limit_hit: false,
-            pdes_worker_pool: None,
-            perlp_settle_prefix: None,
-            perlp_settle: None,
-            prof_perlp_settle_fast: 0,
-            prof_perlp_settle_fallback: 0,
-            perlp_shadow: false,
-            perlp_shadow_real_diffs: 0,
-            prof_perlp_compute_ns: 0,
-            prof_perlp_total_ns: 0,
-            perlp_after: 0,
+            bsp_shadow_checks: 0,
             stdout_sink: None,
             xtrace_file: None,
             xtrace_scopes: Vec::new(),
@@ -12253,9 +12217,7 @@ impl Simulator {
             ctl_rearm_pending: Vec::new(),
             ctl_on: !matches!(std::env::var("XEZIM_CTL_MASK").as_deref(), Ok("0"))
                 && std::env::var_os("XEZIM_BSP_SETTLE").is_none()
-                && std::env::var_os("XEZIM_BSP_SHADOW").is_none()
-                && std::env::var("XEZIM_PERLP_SETTLE").ok().as_deref() != Some("1")
-                && std::env::var("XEZIM_PERLP_SHADOW").ok().as_deref() != Some("1"),
+                && std::env::var_os("XEZIM_BSP_SHADOW").is_none(),
             ts_rec0: (0, 0),
             ts_rec_n: 0,
             ts_recs: Vec::new(),
@@ -12384,13 +12346,6 @@ impl Simulator {
             prof_edge_exec: 0,
             prof_par_dispatch_partition: 0,
             prof_par_dispatch_legacy: 0,
-            prof_par_dispatch_pdes: 0,
-            prof_pdes_spawn_ns: 0,
-            prof_pdes_exec_ns: 0,
-            prof_pdes_merge_ns: 0,
-            prof_pdes_imbalance_sum_ns: 0,
-            prof_pdes_max_total_ns: 0,
-            prof_pdes_min_total_ns: 0,
             prof_edge_waiters: 0,
             prof_edge_cg: 0,
             prof_waiter_iters: 0,
@@ -12688,6 +12643,7 @@ impl Simulator {
         }
         sim.load_dpi_libraries();
         sim.bind_all_dpi_imports();
+        sim.dpi_tasks_setup();
         // VPI modules register their $systf's before simulation starts. The
         // startup routines run with ACTIVE_SIMULATOR set, so a routine that
         // resolves a handle sees a built design.
@@ -13319,212 +13275,6 @@ impl Simulator {
             scc_unions
         );
         parent
-    }
-
-    /// Multikernel-scope partition: split parallel-eligible edge blocks
-    /// into two LPs by hierarchical scope. Blocks whose scope equals
-    /// `prefix` or starts with `"{prefix}."` go to partition 0 (LP-A);
-    /// all others go to partition 1 (LP-B). Sets the existing
-    /// `edge_block_partition` / `edge_block_partition_count` fields so
-    /// the parallel-block dispatcher at `event_loop` consumes the
-    /// scope-based split.
-    ///
-    /// This is the input data the PDES dispatcher needs to know which
-    /// blocks form each LP's chunk. Ported from main branch (see
-    /// xezim/docs/MULTIKERNEL.md). The PDES dispatcher integration
-    /// (XEZIM_DISPATCHER=pdes) adds the sparse-snapshot + barrier
-    /// machinery on top of this partition; without that arm wired in,
-    /// the current dispatchers (std::scope) still consume this
-    /// partition transparently — they just don't get any speedup from
-    /// the LP semantics since they share signal_table.
-    pub fn apply_multikernel_scope_partition(&mut self, prefix: &str) -> (usize, usize) {
-        let n = self.edge_blocks.len();
-        self.edge_block_partition = vec![1u32; n];
-        let mut n_lp_a = 0usize;
-        for bi in 0..n {
-            if let Some(Some(scope)) = self.edge_block_scope.get(bi) {
-                if scope == prefix || scope.starts_with(&format!("{}.", prefix)) {
-                    self.edge_block_partition[bi] = 0;
-                    n_lp_a += 1;
-                }
-            }
-        }
-        self.edge_block_partition_count = 2;
-        self.perlp_settle_prefix = Some(prefix.to_string());
-        let n_lp_b = n - n_lp_a;
-        eprintln!(
-            "[PART] multikernel-scope partition: LP-A '{}' = {} blocks, LP-B (everything else) = {} blocks",
-            prefix, n_lp_a, n_lp_b
-        );
-        self.classify_signal_lp_writers();
-        self.relax_parallel_eligibility_for_multikernel(prefix);
-        (n_lp_a, n_lp_b)
-    }
-
-    /// PDES Phase 1.3: relax mark_parallel_blocks's exclusion of
-    /// partial-range / array NBA writes when those writes are
-    /// LP-exclusive (proven by classifier). Re-promotes blocks
-    /// containing NbaAssignBitDyn / NbaAssignRange / NbaAssign (and
-    /// LP-local-array NbaAssignArray) to parallel-eligible when the
-    /// classifier shows no cross-LP races. Ported from main branch.
-    fn relax_parallel_eligibility_for_multikernel(&mut self, lp_a_prefix: &str) {
-        use super::bytecode::Insn;
-        if self.signal_lp_writer.is_empty() || self.edge_block_partition_count != 2 {
-            return;
-        }
-        let lp_writer = &self.signal_lp_writer;
-        let dot_prefix = format!("{}.", lp_a_prefix);
-        let array_name_lp = |name: &str| -> Option<u32> {
-            if name == lp_a_prefix || name.starts_with(&dot_prefix) {
-                Some(0)
-            } else {
-                Some(1)
-            }
-        };
-
-        let mut lifted = 0usize;
-        let n = self.compiled_edge_blocks.len();
-        for bi in 0..n {
-            if self.edge_block_parallel.get(bi).copied().unwrap_or(false) {
-                continue;
-            }
-            let Some(Some(cb)) = self.compiled_edge_blocks.get(bi) else {
-                continue;
-            };
-            let block_lp = self.edge_block_partition.get(bi).copied().unwrap_or(0);
-            let mut blocked_by_other = false;
-            let mut all_writes_lp_local = true;
-            for insn in &cb.instructions {
-                match insn {
-                    Insn::StmtFallback(..)
-                    | Insn::CovHit(..)
-                    | Insn::EvalExprFallback(..)
-                    | Insn::BlockingAssign(..)
-                    | Insn::BlockingAssignRange(..)
-                    | Insn::BlockingAssignRangeDyn(..)
-                    | Insn::BlockingAssignBitDyn(..)
-                    | Insn::BlockingAssignArray(..)
-                    | Insn::BlockingAssignArrayRange(..)
-                    | Insn::NbaAssignRangeDyn(..)
-                    | Insn::NbaAssignArrayRange(..) => {
-                        blocked_by_other = true;
-                        break;
-                    }
-                    Insn::NbaAssign(id, _, _)
-                    | Insn::NbaAssignConst(id, _, _)
-                    | Insn::NbaAssignRange(id, _, _, _)
-                    | Insn::NbaAssignArrayRead(id, _, _, _)
-                    | Insn::NbaAssignBitDyn(id, _, _) => {
-                        let id = &(*id as usize);
-                        let owner = lp_writer.get(*id).copied().unwrap_or(None);
-                        if owner != Some(block_lp) {
-                            all_writes_lp_local = false;
-                            break;
-                        }
-                    }
-                    Insn::NbaAssignArray(name, _, _, _) => match array_name_lp(name.name()) {
-                        Some(lp) if lp == block_lp => {}
-                        _ => {
-                            all_writes_lp_local = false;
-                            break;
-                        }
-                    },
-                    _ => {}
-                }
-            }
-            if blocked_by_other || !all_writes_lp_local {
-                continue;
-            }
-            if let Some(Some(scope)) = self.edge_block_scope.get(bi) {
-                let in_lp_a = scope == lp_a_prefix || scope.starts_with(&dot_prefix);
-                let expected_lp = if in_lp_a { 0u32 } else { 1u32 };
-                if expected_lp != block_lp {
-                    continue;
-                }
-            }
-            self.edge_block_parallel[bi] = true;
-            lifted += 1;
-        }
-        let total_parallel = self.edge_block_parallel.iter().filter(|p| **p).count();
-        eprintln!(
-            "[PART] multikernel NBA-exclusion lift: +{} blocks (total parallel-eligible: {}/{})",
-            lifted, total_parallel, n
-        );
-    }
-
-    /// PDES Phase 1.2: classify each signal by exclusive LP writer.
-    /// Scans every parallel-eligible compiled edge block's NBA
-    /// instructions and records which LP's blocks write each signal.
-    /// A signal becomes a "boundary" (None) if more than one LP writes
-    /// it, matching the semantics needed for per-LP NBA bucket apply
-    /// where LP-local NBAs can be applied to disjoint signal_table
-    /// slices and boundary NBAs run last on the serial path.
-    ///
-    /// Only fast-path NBA insns (`NbaAssign`, `NbaAssignRange`,
-    /// `NbaAssignBitDyn`, `NbaAssignRangeDyn`) are tracked — array
-    /// NBAs are already excluded from parallel-eligible blocks.
-    /// Ported verbatim from main branch.
-    fn classify_signal_lp_writers(&mut self) {
-        use super::bytecode::Insn;
-        let n_signals = self.signal_table.len();
-        let mut writer: Vec<Option<u32>> = vec![None; n_signals];
-        const BOUNDARY: u32 = u32::MAX;
-        let mut seen = vec![false; n_signals];
-        let n_blocks = self.compiled_edge_blocks.len();
-        for bi in 0..n_blocks {
-            if !self.edge_block_parallel.get(bi).copied().unwrap_or(false) {
-                continue;
-            }
-            let Some(Some(cb)) = self.compiled_edge_blocks.get(bi) else {
-                continue;
-            };
-            let lp = self.edge_block_partition.get(bi).copied().unwrap_or(0);
-            for insn in &cb.instructions {
-                let sig_id = match insn {
-                    Insn::NbaAssign(id, _, _) => *id,
-                    Insn::NbaAssignConst(id, _, _) => *id,
-                    Insn::NbaAssignRange(id, _, _, _) => *id,
-                    Insn::NbaAssignBitDyn(id, _, _) => *id,
-                    Insn::NbaAssignRangeDyn(id, _, _, _) => *id,
-                    Insn::NbaAssignArrayRead(id, _, _, _) => *id,
-                    _ => continue,
-                };
-                let sig_id = sig_id as usize;
-                if sig_id >= n_signals {
-                    continue;
-                }
-                if !seen[sig_id] {
-                    seen[sig_id] = true;
-                    writer[sig_id] = Some(lp);
-                } else if let Some(prev) = writer[sig_id] {
-                    if prev != BOUNDARY && prev != lp {
-                        writer[sig_id] = Some(BOUNDARY);
-                    }
-                }
-            }
-        }
-        // Convert sentinel back to None for the public field.
-        let mut n_lp_a = 0usize;
-        let mut n_lp_b = 0usize;
-        let mut n_boundary = 0usize;
-        let mut n_none = 0usize;
-        for w in writer.iter_mut() {
-            match *w {
-                None => n_none += 1,
-                Some(BOUNDARY) => {
-                    *w = None;
-                    n_boundary += 1;
-                }
-                Some(0) => n_lp_a += 1,
-                Some(1) => n_lp_b += 1,
-                Some(_) => {}
-            }
-        }
-        eprintln!(
-            "[PART] signal LP-writer classification: LP-A-only={}, LP-B-only={}, boundary={}, no-writer={} (total {})",
-            n_lp_a, n_lp_b, n_boundary, n_none, n_signals
-        );
-        self.signal_lp_writer = writer;
     }
 
     pub fn emit_edge_block_hypergraph(&self, path: &str) -> Result<(usize, usize), String> {
@@ -14998,6 +14748,28 @@ impl Simulator {
         }
     }
 
+    /// An exported subroutine's formal: its scalar kind, as a pointer kind
+    /// for an `output`/`inout` (§35.5.6: C passes those by reference).
+    fn dpi_export_port_kind(
+        &self,
+        dt: &crate::ast::types::DataType,
+        dir: PortDirection,
+    ) -> DpiExpKind {
+        let k = self.dpi_export_kind(dt);
+        if !matches!(
+            dir,
+            PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+        ) {
+            return k;
+        }
+        match k {
+            DpiExpKind::I32 => DpiExpKind::I32Out,
+            DpiExpKind::I64 => DpiExpKind::I64Out,
+            DpiExpKind::Real => DpiExpKind::RealOut,
+            _ => DpiExpKind::Bad,
+        }
+    }
+
     /// `(return_kind, arg_kinds)` for an exported subroutine. `void`-returning
     /// functions and tasks report `Void`. None if the name is neither a
     /// function nor a task. Any `Bad` kind means the C signature can't be
@@ -15017,16 +14789,18 @@ impl Simulator {
             let args = fd
                 .ports
                 .iter()
-                .map(|p| self.dpi_export_kind(&p.data_type))
+                .map(|p| self.dpi_export_port_kind(&p.data_type, p.direction))
                 .collect();
             Some((ret, args))
         } else if let Some(td) = self.module.tasks.get(name) {
             let args = td
                 .ports
                 .iter()
-                .map(|p| self.dpi_export_kind(&p.data_type))
+                .map(|p| self.dpi_export_port_kind(&p.data_type, p.direction))
                 .collect();
-            Some((DpiExpKind::Void, args))
+            // §35.9: the C function for an exported task returns int — 1
+            // when it returned because of a disable, else 0.
+            Some((DpiExpKind::I32, args))
         } else {
             None
         }
@@ -15048,6 +14822,9 @@ impl Simulator {
             DpiExpKind::I64 => "long long",
             DpiExpKind::Real => "double",
             DpiExpKind::StrIn => "const char*",
+            DpiExpKind::I32Out => "int*",
+            DpiExpKind::I64Out => "long long*",
+            DpiExpKind::RealOut => "double*",
             DpiExpKind::Bad => "long long",
         };
         let mut body = String::new();
@@ -15057,13 +14834,20 @@ impl Simulator {
         );
         let mut emitted = 0usize;
         let c_names = self.module.dpi_export_c_names.clone();
+        // §35.5.3: every instance of a module that exports a subroutine
+        // shares its C symbol; one entry point serves them all and the
+        // dispatch picks the instance by scope (`dpi_export_for_scope`).
+        let mut seen_c: HashSet<&str> = HashSet::default();
         for (id, name) in exports.iter().enumerate() {
-            let Some((ret, args)) = self.dpi_export_signature(name) else {
-                continue;
-            };
             // The symbol the C side links against: the export's alias when
             // one was declared, else the SV name.
             let c_name: &str = c_names.get(id).map(|s| s.as_str()).unwrap_or(name);
+            if !seen_c.insert(c_name) {
+                continue;
+            }
+            let Some((ret, args)) = self.dpi_export_signature(name) else {
+                continue;
+            };
             let supported = ret != DpiExpKind::Bad && !args.contains(&DpiExpKind::Bad);
             let params: Vec<String> = if supported {
                 args.iter()
@@ -15119,6 +14903,11 @@ impl Simulator {
                             "    {{ double __t = a{}; memcpy(&__a[{}], &__t, 8); }}\n",
                             i, i
                         )),
+                        DpiExpKind::I32Out | DpiExpKind::I64Out | DpiExpKind::RealOut => pack
+                            .push_str(&format!(
+                                "    __a[{}] = (long long)(unsigned long)a{};\n",
+                                i, i
+                            )),
                         _ => pack.push_str(&format!("    __a[{}] = (long long)a{};\n", i, i)),
                     }
                 }
@@ -15189,6 +14978,37 @@ impl Simulator {
     /// `nargs` 64-bit slots (integers by value, reals as IEEE-754 bits). The
     /// return is a 64-bit slot: an integer value, or a real's bit pattern.
     fn run_dpi_export(&mut self, id: usize, nargs: usize, args: *const i64) -> i64 {
+        // §35.9 d): an imported subroutine in the disabled state may not call
+        // an export any more.
+        if self.dpi_unwinding {
+            self.dpi_protocol_fatal(
+                "an exported subroutine was called after its imported caller was disabled",
+            );
+            return 1;
+        }
+        if self.dpi_cur_task.is_some() && self.dpi_stack_exhausted() {
+            return 0;
+        }
+        let Some(id) = self.dpi_export_for_scope(id) else {
+            let (c, scope) = (
+                self.module
+                    .dpi_export_c_names
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_default(),
+                dpi_task::dpi_scope_name(ACTIVE_SCOPE.with(|cell| cell.get())),
+            );
+            self.emit_severity_text(
+                "Fatal",
+                &format!(
+                    "DPI export '{}' is not declared in the calling scope '{}' or a scope above it (IEEE 1800 clause 35.5.3)",
+                    c, scope
+                ),
+            );
+            self.fatal_finish_number = Some(1);
+            self.finished = true;
+            return 0;
+        };
         let Some(name) = self.module.dpi_exports.get(id).cloned() else {
             return 0;
         };
@@ -15196,10 +15016,62 @@ impl Simulator {
             return 0;
         };
         let raw: Vec<i64> = (0..nargs).map(|i| unsafe { *args.add(i) }).collect();
+        // §35.5.6: an `output`/`inout` formal binds to a frame local of this
+        // dispatch holding the pointee; its final value is stored back
+        // through the C pointer after the call.
+        let out_name = |i: usize| format!("__dpi_export_out{}", i);
+        let mut out_frame: HashMap<String, Value> = HashMap::default();
+        let mut outs: Vec<(usize, DpiExpKind, i64)> = Vec::new();
+        for (i, &slot) in raw.iter().enumerate() {
+            let k = arg_kinds.get(i).copied().unwrap_or(DpiExpKind::Bad);
+            if slot == 0
+                || !matches!(
+                    k,
+                    DpiExpKind::I32Out | DpiExpKind::I64Out | DpiExpKind::RealOut
+                )
+            {
+                continue;
+            }
+            let v = unsafe {
+                match k {
+                    DpiExpKind::I32Out => {
+                        let mut v = Value::from_u64(*(slot as *const i32) as u32 as u64, 32);
+                        v.is_signed = true;
+                        v
+                    }
+                    DpiExpKind::I64Out => {
+                        let mut v = Value::from_u64(*(slot as *const i64) as u64, 64);
+                        v.is_signed = true;
+                        v
+                    }
+                    _ => Value::from_f64(*(slot as *const f64)),
+                }
+            };
+            out_frame.insert(out_name(i), v);
+            outs.push((i, k, slot));
+        }
         let arg_exprs: Vec<Expression> = raw
             .iter()
             .enumerate()
             .map(|(i, &slot)| {
+                if outs.iter().any(|&(j, ..)| j == i) {
+                    return Expression::new(
+                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                            root: None,
+                            path: vec![crate::ast::expr::HierPathSegment {
+                                name: crate::ast::Identifier {
+                                    name: out_name(i),
+                                    span: crate::ast::Span::dummy(),
+                                },
+                                selects: Vec::new(),
+                            }],
+                            span: crate::ast::Span::dummy(),
+                            cached_signal_id: std::cell::Cell::new(None),
+                            cached_resolved_name: std::cell::OnceCell::new(),
+                        }),
+                        crate::ast::Span::dummy(),
+                    );
+                }
                 match arg_kinds.get(i) {
                     Some(DpiExpKind::Real) => {
                         return Expression::new(
@@ -15236,23 +15108,68 @@ impl Simulator {
                 }
             })
             .collect();
+        let has_outs = !outs.is_empty();
+        if has_outs {
+            self.push_local_frame(out_frame);
+        }
+        let mut ret = 0i64;
+        // An instance's export runs in that instance, as a call through its
+        // hierarchical name does (`$time`, `%m` and bare names included).
+        let inst: Option<String> = name
+            .rsplit_once('.')
+            .filter(|_| !name.contains("::"))
+            .map(|(p, _)| p.to_string());
+        let saved_scope = inst.as_ref().map(|sc| {
+            let hint = self.name_resolve_hint.replace(Some(sc.clone()));
+            let ts = self.timescale_scope_override.replace(sc.clone());
+            (hint, ts)
+        });
+        let on_fiber = self.dpi_note_export(&name, true);
         if let Some(fd) = self.fn_decl_rc(&name) {
             self.dpi_export_depth += 1;
             let r = self.exec_function_call(&fd, &arg_exprs);
             self.dpi_export_depth -= 1;
-            return match ret_kind {
+            ret = match ret_kind {
                 DpiExpKind::Real => r.to_f64().to_bits() as i64,
                 DpiExpKind::Void => 0,
                 _ => r.to_i64().unwrap_or(0),
             };
-        }
-        if let Some(td) = self.task_decl_rc(&name) {
+        } else if let Some(td) = self.task_decl_rc(&name) {
             self.dpi_export_depth += 1;
+            if inst.is_some() {
+                self.task_clears_this = true;
+            }
             self.exec_task_call(&td, &arg_exprs);
             self.dpi_export_depth -= 1;
-            return 0;
+            // §35.9 a): an exported task returns 1 when it returns because
+            // its imported caller was disabled, else 0.
+            ret = self.dpi_unwinding as i64;
         }
-        0
+        if on_fiber {
+            self.dpi_note_export(&name, false);
+        }
+        if let Some((hint, ts)) = saved_scope {
+            *self.name_resolve_hint.borrow_mut() = hint;
+            self.timescale_scope_override = ts;
+        }
+        if has_outs {
+            let frame = self.pop_local_frame_take().unwrap_or_default();
+            for (i, k, slot) in outs {
+                let Some(v) = frame.get(&out_name(i)) else {
+                    continue;
+                };
+                unsafe {
+                    match k {
+                        DpiExpKind::I32Out => {
+                            *(slot as *mut i32) = v.to_u64().unwrap_or(0) as u32 as i32
+                        }
+                        DpiExpKind::I64Out => *(slot as *mut i64) = v.to_u64().unwrap_or(0) as i64,
+                        _ => *(slot as *mut f64) = v.to_f64(),
+                    }
+                }
+            }
+        }
+        ret
     }
 
     fn bind_all_dpi_imports(&mut self) {
@@ -15424,9 +15341,10 @@ impl Simulator {
                 DataType::Implicit { .. } if w <= 32 => DpiOaElem::I32,
                 _ => return None,
             };
-            // Only the outermost dimension may be open; a fixed inner one
-            // is outside this marshaling.
-            if dims.len() != 1 {
+            // §35.5.6.1 / H.12: a formal with several unpacked dimensions
+            // (`int a[][]`) is one handle over the whole array, row-major,
+            // with a shape per dimension — up to the header's four.
+            if dims.is_empty() || dims.len() > 4 {
                 return None;
             }
             return Some(if out_dir {
@@ -15515,6 +15433,38 @@ impl Simulator {
                     DpiArgKind::Real64In
                 }),
             },
+            // IEEE 1800-2023 §35.5.6 / H.7.7: a PACKED struct or union is
+            // passed like the packed array of its bits — `svBitVecVal*` when
+            // every member is 2-state, else `svLogicVecVal*` — for any width
+            // and direction. It mapped to no kind, the whole import was
+            // marked unsupported, and every call returned 0 without
+            // reaching the C side.
+            DataType::Struct(su) if su.packed => {
+                let w = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                if w == 0 {
+                    return None;
+                }
+                let is_2state = self.packed_aggregate_two_state(su);
+                Some(match (out_dir, is_2state) {
+                    (true, true) => DpiArgKind::VecBitOut(w),
+                    (true, false) => DpiArgKind::VecLogicOut(w),
+                    (false, true) => DpiArgKind::VecBitIn(w),
+                    (false, false) => DpiArgKind::VecLogicIn(w),
+                })
+            }
+            // §35.5.6: an enum passes as its base type (`int` by default).
+            DataType::Enum(e) => match e.base_type.as_deref() {
+                Some(bt) => self.dpi_atom_kind(bt, dims, dir),
+                None => Some(if out_dir {
+                    DpiArgKind::Int32Out
+                } else {
+                    DpiArgKind::Int32In
+                }),
+            },
             DataType::Simple { kind, .. } => match kind {
                 crate::ast::types::SimpleType::Chandle => Some(if out_dir {
                     DpiArgKind::ChandleOut
@@ -15530,6 +15480,19 @@ impl Simulator {
             },
             _ => None,
         }
+    }
+
+    /// §6.11 / §7.2.1: a packed struct or union is 2-state only when every
+    /// member (through typedefs and nested packed aggregates) is.
+    fn packed_aggregate_two_state(&self, su: &crate::ast::types::StructUnionType) -> bool {
+        su.members.iter().all(|m| {
+            let mdt =
+                super::elaborate::resolve_typedef_chain(&m.data_type, &self.module.typedef_types);
+            match mdt {
+                DataType::Struct(inner) => self.packed_aggregate_two_state(inner),
+                _ => super::elaborate::is_type_two_state_resolved(mdt, &self.module.typedef_types),
+            }
+        })
     }
 
     fn dpi_return_kind(dt: &DataType) -> Option<DpiRetKind> {
@@ -15580,7 +15543,10 @@ impl Simulator {
                 for p in &td.ports {
                     args.push(self.dpi_atom_kind(&p.data_type, &p.dimensions, p.direction)?);
                 }
-                Some((DpiRetKind::Void, args))
+                // §35.9: an imported task's C function returns int, 1 when
+                // it returns because of a disable (checked by the
+                // disable protocol, dpi_task.rs).
+                Some((DpiRetKind::Int32, args))
             }
         }
     }
@@ -15767,12 +15733,28 @@ impl Simulator {
     /// (`left`, `right`): a fixed unpacked array (`[7:0]` gives 7, 0), a
     /// dynamic array or queue (0 .. size-1, empty when size is 0), or any
     /// other expression as a one-element array.
-    fn dpi_collect_open_array(&mut self, expr: Option<&Expression>) -> (Vec<Value>, i64, i64) {
+    fn dpi_collect_open_array(
+        &mut self,
+        expr: Option<&Expression>,
+    ) -> (Vec<Value>, Vec<(i64, i64)>) {
         let Some(e) = expr else {
-            return (Vec::new(), 0, -1);
+            return (Vec::new(), vec![(0, -1)]);
         };
         if let ExprKind::Ident(hier) = &e.kind {
             let name = self.resolve_hier_name(hier);
+            // §35.5.6.1: a multi-dimensional actual (`int a[2][3]`) — every
+            // element, row-major.
+            if let Some(shape) = self.dpi_multi_dim_shape(&name) {
+                let elem_w = self.dpi_multi_dim_elem_width(&name);
+                let out = Self::dpi_multi_dim_names(&name, &shape)
+                    .into_iter()
+                    .map(|en| {
+                        self.get_signal_value_by_name(&en)
+                            .unwrap_or_else(|| Value::zero(elem_w))
+                    })
+                    .collect();
+                return (out, shape);
+            }
             // A dynamic array or queue also has a `module.arrays` entry, but
             // its range is storage capacity: the live size bounds it.
             let live = self.dpi_open_array_live_size(&name);
@@ -15800,12 +15782,13 @@ impl Simulator {
                         out.push(vv);
                     }
                 }
-                let (left, right) = if live.is_none() && self.module.descending_arrays.contains(&*name) {
-                    (hi, lo)
-                } else {
-                    (lo, hi)
-                };
-                return (out, left as i64, right as i64);
+                let (left, right) =
+                    if live.is_none() && self.module.descending_arrays.contains(&*name) {
+                        (hi, lo)
+                    } else {
+                        (lo, hi)
+                    };
+                return (out, vec![(left, right)]);
             }
             if let Some(n) = live {
                 let out = (0..n)
@@ -15814,17 +15797,54 @@ impl Simulator {
                             .unwrap_or_else(|| Value::zero(32))
                     })
                     .collect();
-                return (out, 0, n as i64 - 1);
+                return (out, vec![(0, n as i64 - 1)]);
             }
         }
-        (vec![self.eval_expr(e)], 0, 0)
+        (vec![self.eval_expr(e)], vec![(0, 0)])
+    }
+
+    /// The `(lo, hi)` of each unpacked dimension of a fixed MULTI-
+    /// dimensional array (`int a[2][3]`), outermost first; `None` for a
+    /// one-dimensional array or anything else.
+    fn dpi_multi_dim_shape(&self, name: &str) -> Option<Vec<(i64, i64)>> {
+        let shape = self.foreach_dims(name)?;
+        (shape.len() > 1 && shape.len() <= 4 && shape.iter().all(|&(lo, hi)| hi >= lo))
+            .then_some(shape)
+    }
+
+    fn dpi_multi_dim_elem_width(&self, name: &str) -> u32 {
+        if let Some(&(_, _, w)) = self.module.arrays_2d.get(name) {
+            return w.max(1);
+        }
+        self.module
+            .arrays_nd
+            .get(name)
+            .map_or(32, |(_, w)| (*w).max(1))
+    }
+
+    /// Element names of a multi-dimensional array, row-major, each
+    /// dimension in ascending index order (`a[0][0]`, `a[0][1]`, ...).
+    fn dpi_multi_dim_names(name: &str, shape: &[(i64, i64)]) -> Vec<String> {
+        let mut names = vec![name.to_string()];
+        for &(lo, hi) in shape {
+            let mut next = Vec::with_capacity(names.len() * (hi - lo + 1) as usize);
+            for n in &names {
+                for i in lo..=hi {
+                    next.push(format!("{}[{}]", n, i));
+                }
+            }
+            names = next;
+        }
+        names
     }
 
     /// The element count of a dynamic array or queue actual; None for a
     /// fixed-size array.
     fn dpi_open_array_live_size(&self, name: &str) -> Option<u64> {
         (self.module.dynamic_arrays.contains(name)
-            || self.signals.contains_key(&Self::name_with_suffix(name, ".size")))
+            || self
+                .signals
+                .contains_key(&Self::name_with_suffix(name, ".size")))
         .then(|| self.get_queue_size(name))
     }
 
@@ -15833,11 +15853,29 @@ impl Simulator {
     fn dpi_writeback_open_array(&mut self, expr: &Expression, data: &[Value]) {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
+            if let Some(shape) = self.dpi_multi_dim_shape(&name) {
+                let elem_w = self.dpi_multi_dim_elem_width(&name);
+                for (en, d) in Self::dpi_multi_dim_names(&name, &shape).iter().zip(data) {
+                    let v = if d.is_real {
+                        d.clone()
+                    } else {
+                        d.resize(elem_w)
+                    };
+                    self.set_signal_value_by_name(en, v);
+                }
+                return;
+            }
             let live = self.dpi_open_array_live_size(&name);
             if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
                 let hi = live.map_or(hi, |n| lo + n as i64 - 1);
                 let elem_w = elem_w.max(1) as u32;
-                let fit = |v: &Value| if v.is_real { v.clone() } else { v.resize(elem_w) };
+                let fit = |v: &Value| {
+                    if v.is_real {
+                        v.clone()
+                    } else {
+                        v.resize(elem_w)
+                    }
+                };
                 // Compact-resolver fast path.
                 if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
                     for (off, d) in data.iter().enumerate().take((hi - lo + 1).max(0) as usize) {
@@ -15896,7 +15934,11 @@ impl Simulator {
         }
         if let Some(v0) = data.first() {
             let w = self.infer_lhs_width(expr);
-            let v = if v0.is_real { v0.clone() } else { v0.resize(w as u32) };
+            let v = if v0.is_real {
+                v0.clone()
+            } else {
+                v0.resize(w as u32)
+            };
             self.assign_value(expr, &v);
         }
     }
@@ -16105,8 +16147,8 @@ impl Simulator {
                     }
                 }
                 DpiArgKind::OpenArrayIn(elem) | DpiArgKind::OpenArrayOut(elem) => {
-                    let (values, left, right) = self.dpi_collect_open_array(args.get(i));
-                    let mut oa = DpiOpenArrayArg::new(*elem, &values, left, right);
+                    let (values, shape) = self.dpi_collect_open_array(args.get(i));
+                    let mut oa = DpiOpenArrayArg::new(*elem, &values, &shape);
                     let p = Box::new(oa.handle());
                     open_arrays.push(oa);
                     ptr_vals.push(p);
@@ -16347,6 +16389,19 @@ impl Simulator {
             }
         }
 
+        // §35.9: a task that returns because of a disable must return 1, and
+        // its outputs are not propagated.
+        if self.dpi_unwinding {
+            if matches!(spec.proto, crate::ast::decl::DPIProto::Task(_))
+                && result.to_i64() != Some(1)
+            {
+                self.dpi_protocol_fatal(&format!(
+                    "imported task '{}' was disabled but did not return 1",
+                    sv_name
+                ));
+            }
+            writebacks.clear();
+        }
         // Write back output/ref/inout values.
         for (idx, kind, expr) in writebacks {
             match kind {
@@ -16497,6 +16552,7 @@ impl Simulator {
                 // §14.3 renaming: the meta/snapshot key on the RESOLVED NET;
                 // `alias_map` translates the clocking-visible name to it.
                 let mut alias_map: HashMap<String, String> = HashMap::default();
+                let mut inouts: HashSet<String> = HashSet::default();
                 let sigs: Vec<(String, bool)> = cd
                     .signals
                     .iter()
@@ -16514,9 +16570,21 @@ impl Simulator {
                             }
                             _ => s.name.name.clone(),
                         };
+                        if matches!(s.direction, crate::ast::types::PortDirection::Inout) {
+                            inouts.insert(net.clone());
+                        }
                         (net, is_input)
                     })
                     .collect();
+                let vis: Vec<String> = cd.signals.iter().map(|s| s.name.name.clone()).collect();
+                self.clocking_vis.insert(cb_name.clone(), vis);
+                if !inouts.is_empty() {
+                    if cd.is_default {
+                        self.clocking_inouts
+                            .insert("__xz_default_clocking".to_string(), inouts.clone());
+                    }
+                    self.clocking_inouts.insert(cb_name.clone(), inouts);
+                }
                 if !alias_map.is_empty() {
                     if cd.is_default {
                         self.clocking_sig_alias
@@ -16600,19 +16668,45 @@ impl Simulator {
                 )
             })
             .collect();
-        let skew_ticks = |slf: &mut Self, e: &Expression| -> u64 {
+        let skew_ticks = |slf: &mut Self, cb: &str, e: &Expression| -> u64 {
+            if let ExprKind::Ident(h) = &e.kind
+                && h.path.len() == 1
+                && h.path[0].name.name == crate::ast::decl::CLOCKING_ONE_STEP
+            {
+                return CB_SKEW_1STEP;
+            }
             // A `#1ns` skew is an ABSOLUTE time literal (stored in seconds);
             // convert against the global tick directly — eval_delay_ticks'
             // module-timescale context isn't established at compile time.
             if let ExprKind::Number(crate::ast::expr::NumberLiteral::Time(secs)) = &e.kind {
                 return (secs / slf.tick_s).round() as u64;
             }
-            slf.eval_delay_ticks(e)
+            // §14.4: a plain number is in the time unit of the module or
+            // interface declaring the block (unlike statement delays, the
+            // elaborator does not pre-scale clocking skews).
+            let scope = match cb.rsplit_once('.') {
+                Some((inst, _)) => inst.to_string(),
+                None => slf.module.name.clone(),
+            };
+            let saved = slf.timescale_scope_override.replace(scope);
+            let (unit_exp, _) = slf.current_timescale_exp();
+            slf.timescale_scope_override = saved;
+            let v = slf.eval_expr(e);
+            let f = if v.is_real {
+                v.to_f64()
+            } else {
+                v.to_u64().unwrap_or(0) as f64
+            };
+            let scale = 10f64.powi(unit_exp - Self::secs_to_exp(slf.tick_s));
+            (f * scale).round().max(0.0) as u64
         };
         for (cb, is_default, out_dskew, out_per_sig, in_dskew, in_per_sig) in skew_specs {
-            // Process output skew
+            // Process output skew. An output `#1step` skew drives one tick
+            // (the global time precision) after the clocking event, as the
+            // reference simulator does.
+            let out_ticks = |t: u64| if t == CB_SKEW_1STEP { 1 } else { t };
             if let Some(e) = out_dskew {
-                let t = skew_ticks(self, &e);
+                let t = out_ticks(skew_ticks(self, &cb, &e));
                 if t > 0 {
                     self.clocking_out_skew.insert(cb.clone(), t);
                     if is_default {
@@ -16623,16 +16717,18 @@ impl Simulator {
             }
             let mut out_m: HashMap<String, u64> = HashMap::default();
             for (net, e) in out_per_sig {
-                let t = skew_ticks(self, &e);
+                let t = out_ticks(skew_ticks(self, &cb, &e));
                 out_m.insert(net, t);
             }
             if !out_m.is_empty() {
                 self.clocking_sig_out_skew.insert(cb.clone(), out_m);
             }
-            // Process input skew
+            // Process input skew (§14.4): absent and `#1step` sample in the
+            // Preponed region; an explicit `#0` samples in the Observed
+            // region, so it is recorded too.
             if let Some(e) = in_dskew {
-                let t = skew_ticks(self, &e);
-                if t > 0 {
+                let t = skew_ticks(self, &cb, &e);
+                if t != CB_SKEW_1STEP {
                     self.clocking_in_skew.insert(cb.clone(), t);
                     if is_default {
                         self.clocking_in_skew
@@ -16642,12 +16738,42 @@ impl Simulator {
             }
             let mut in_m: HashMap<String, u64> = HashMap::default();
             for (net, e) in in_per_sig {
-                let t = skew_ticks(self, &e);
+                let t = skew_ticks(self, &cb, &e);
                 in_m.insert(net, t);
             }
             if !in_m.is_empty() {
                 self.clocking_sig_in_skew.insert(cb, in_m);
             }
+        }
+        // §14.4 `input #N`: track the history of every net some clocking
+        // input samples with an explicit positive skew.
+        let mut hist: Vec<(String, u64)> = Vec::new();
+        for (cb, (_, sigs)) in self.clocking_meta.iter() {
+            let dskew = self
+                .clocking_in_skew
+                .get(cb)
+                .copied()
+                .unwrap_or(CB_SKEW_1STEP);
+            let vis = self.clocking_vis.get(cb);
+            for (i, (net, is_input)) in sigs.iter().enumerate() {
+                if !*is_input {
+                    continue;
+                }
+                let v = vis.and_then(|l| l.get(i)).unwrap_or(net);
+                let skew = self
+                    .clocking_sig_in_skew
+                    .get(cb)
+                    .and_then(|m| m.get(v))
+                    .copied()
+                    .unwrap_or(dskew);
+                if skew != 0 && skew != CB_SKEW_1STEP {
+                    hist.push((net.clone(), skew));
+                }
+            }
+        }
+        for (net, skew) in hist {
+            let h = self.clocking_hist.entry(net).or_default();
+            h.span = h.span.max(skew);
         }
         // Friendly fallback: `##N` with a single clocking block and no
         // explicit `default` — unambiguous, so use it (strict LRM would
@@ -17612,6 +17738,7 @@ impl Simulator {
         self.snapshot_edge_signals_full();
         self.in_pre_process_settle = true;
         self.settle_combinatorial();
+        self.fire_time0_input_port_blocks();
         self.in_pre_process_settle = false;
         mark_compile_phase("time-0 settle", &mut compile_phase_start);
         let dt = t_settle0.elapsed();
@@ -18129,20 +18256,6 @@ impl Simulator {
         );
     }
 
-    /// PDES integration accessors: minimal read-only window into
-    /// per-block metadata so `crate::multikernel` can classify blocks
-    /// by hierarchical scope without making the private fields pub.
-    pub fn edge_block_count(&self) -> usize {
-        self.compiled_edge_blocks.len()
-    }
-
-    pub fn edge_block_compiled(&self, bi: usize) -> bool {
-        self.compiled_edge_blocks
-            .get(bi)
-            .and_then(|cb| cb.as_ref())
-            .is_some()
-    }
-
     /// Scope an edge block's fallback statements run under: the block's own
     /// inlining scope, else the instance prefix of its first sensitivity.
     /// Shared by the `edge_block_scope` table and the native compile of the
@@ -18162,392 +18275,6 @@ impl Simulator {
                     })
             }
         })
-    }
-
-    pub fn edge_block_scope_at(&self, bi: usize) -> Option<String> {
-        self.edge_block_scope.get(bi).and_then(|s| s.clone())
-    }
-
-    pub fn signal_table_len(&self) -> usize {
-        self.signal_table.len()
-    }
-
-    /// Borrow the compiled block at index `bi` (if any). Used by the
-    /// PDES classifier to scan NBA-write targets and LoadSignal-read
-    /// sources for boundary signal determination.
-    pub fn compiled_edge_block_at(&self, bi: usize) -> Option<&super::bytecode::CompiledBlock> {
-        self.compiled_edge_blocks.get(bi).and_then(|cb| cb.as_ref())
-    }
-
-    pub fn edge_block_parallel_at(&self, bi: usize) -> bool {
-        self.edge_block_parallel.get(bi).copied().unwrap_or(false)
-    }
-
-    pub fn comb_entry_count(&self) -> usize {
-        self.comb_entries.len()
-    }
-
-    /// Resolve signal id → hierarchical name. Used by the PDES
-    /// classifier to attribute signals to LPs by name prefix when block
-    /// scope_hint is missing (the common case in c910's comb table).
-    pub fn signal_name_at(&self, id: usize) -> &str {
-        self.name_for_id(id)
-    }
-
-    /// PDES integration: execute compiled edge block `bi` against a
-    /// caller-provided signal snapshot (Vec of Values indexed by global
-    /// signal_id). Returns the resulting NBA writes as (signal_id,
-    /// Value) tuples — directly usable by the multikernel coordinator
-    /// as cross-LP channel messages or local NBA bucket entries.
-    ///
-    /// This is the wrapper that lets `multikernel::PdesKernel` drive
-    /// real bytecode execution without exposing private types
-    /// (`NbaFast`, the VM register state) outside `compiler::simulator`.
-    /// The caller owns the snapshot lifetime and the vm_regs allocation
-    /// (allowing reuse across blocks within a kernel's per-tick batch).
-    pub fn pdes_exec_block(
-        &self,
-        bi: usize,
-        signal_snapshot: &[Value],
-        signal_signed: &[bool],
-        vm_regs: &mut Vec<Value>,
-    ) -> Vec<(usize, Value)> {
-        let Some(Some(cb)) = self.compiled_edge_blocks.get(bi) else {
-            return Vec::new();
-        };
-        // Ensure register file is large enough.
-        if vm_regs.len() < cb.num_regs as usize {
-            vm_regs.resize(cb.num_regs as usize, Value::new(1));
-        }
-        let nbas = Self::exec_insns_isolated(
-            &cb.instructions,
-            signal_snapshot,
-            signal_signed,
-            &self.signal_name_to_id,
-            &self.array_first_id,
-            Some(&self.packed),
-            vm_regs,
-            bi as u32,
-            cb.nba_dup_targets,
-        );
-        nbas.into_iter()
-            .map(|nba| (nba.signal_id, nba.value))
-            .collect()
-    }
-
-    /// Read-only signal_signed view — toy/test code needs this to drive
-    /// `pdes_exec_block` from outside the simulator.
-    pub fn signal_signed_slice(&self) -> &[bool] {
-        &self.signal_signed
-    }
-
-    /// Read-only signal_table view — used by PDES integration to build
-    /// snapshots without going through per-cell reads.
-    pub fn signal_table_slice(&self) -> &[Value] {
-        &self.signal_table
-    }
-
-    /// PDES Phase 2.4: drive a single compiled block against a per-LP
-    /// signal table. Builds a wide snapshot from the LP's local values
-    /// (falling back to the simulator's signal_table for ids outside
-    /// the LP's set), runs the block via exec_insns_isolated, applies
-    /// LP-local NBA writes back to the local table, and returns any
-    /// cross-LP NBA writes for the caller to ship via channels.
-    ///
-    /// This is the building block Phase 4's per-LP event_loop uses to
-    /// drive blocks within its tick. The caller pre-allocates vm_regs
-    /// for amortization.
-    pub fn pdes_exec_block_local(
-        &self,
-        per_lp: &mut crate::multikernel::PerLpSignalTable,
-        bi: usize,
-        vm_regs: &mut Vec<Value>,
-    ) -> Vec<(usize, Value)> {
-        let snapshot = per_lp.snapshot_for_tick(&self.signal_table);
-        let writes = self.pdes_exec_block(bi, &snapshot, &self.signal_signed, vm_regs);
-        per_lp.apply_nba_writes(&writes)
-    }
-
-    /// PDES Phase 2.2: build per-LP local signal tables. Each
-    /// returned `PerLpSignalTable` contains:
-    ///   - local_to_global: dense Vec of signal ids this LP touches
-    ///   - global_to_local: sparse hash map for translation
-    ///   - values: per-LP local Value cells, sized to read+write set
-    ///
-    /// The LP's read set = signals it reads (via LoadSignal in any of
-    /// its parallel-eligible blocks). Write set = signals it writes
-    /// (per signal_lp_writer classifier).
-    ///
-    /// Total memory: ~3-5 MB per LP at c910 scale vs 1.1 GB for the
-    /// full global signal_table (197× smaller per Phase-2 measurement).
-    pub fn build_per_lp_signal_tables(
-        &self,
-        n_lp: u32,
-    ) -> Vec<crate::multikernel::PerLpSignalTable> {
-        use super::bytecode::Insn;
-        let mut per_lp_signal_set: Vec<ahash::AHashSet<usize>> =
-            (0..n_lp).map(|_| ahash::AHashSet::default()).collect();
-        let n_blocks = self.compiled_edge_blocks.len();
-        let n_signals = self.signal_table.len();
-        for bi in 0..n_blocks {
-            if !self.edge_block_parallel.get(bi).copied().unwrap_or(false) {
-                continue;
-            }
-            let Some(Some(cb)) = self.compiled_edge_blocks.get(bi) else {
-                continue;
-            };
-            let lp = self.edge_block_partition.get(bi).copied().unwrap_or(0);
-            if lp >= n_lp {
-                continue;
-            }
-            for insn in &cb.instructions {
-                // The fused array-read NBA touches TWO signals (the index it
-                // reads and the destination it writes); everything else here
-                // touches one.
-                let (touched_id, extra_id) = match insn {
-                    Insn::LoadSignal(_, id) | Insn::LoadSignalSigned(_, id) => (Some(*id), None),
-                    Insn::LoadSignalRange(_, id, _, _) | Insn::LoadSignalBit(_, id, _) => {
-                        (Some(*id), None)
-                    }
-                    Insn::BranchIfSignalFalse(id, _, _) => (Some(*id), None),
-                    Insn::NbaAssign(id, _, _) => (Some(*id), None),
-                    Insn::NbaAssignConst(id, _, _) => (Some(*id), None),
-                    Insn::NbaAssignRange(id, _, _, _) => (Some(*id), None),
-                    Insn::NbaAssignBitDyn(id, _, _) => (Some(*id), None),
-                    Insn::NbaAssignRangeDyn(id, _, _, _) => (Some(*id), None),
-                    Insn::NbaAssignArrayRead(id, _, idx, _) => (Some(*id), Some(*idx)),
-                    _ => (None, None),
-                };
-                for id in touched_id.into_iter().chain(extra_id) {
-                    let id = id as usize;
-                    if id < n_signals {
-                        per_lp_signal_set[lp as usize].insert(id);
-                    }
-                }
-            }
-        }
-
-        per_lp_signal_set
-            .into_iter()
-            .enumerate()
-            .map(|(lp, set)| {
-                let mut ids: Vec<usize> = set.into_iter().collect();
-                ids.sort();
-                let local_to_global: Vec<u32> = ids.iter().map(|&id| id as u32).collect();
-                let mut global_to_local: ahash::AHashMap<usize, u32> =
-                    ahash::AHashMap::with_capacity(ids.len());
-                for (i, &id) in ids.iter().enumerate() {
-                    global_to_local.insert(id, i as u32);
-                }
-                let values: Vec<Value> = ids
-                    .iter()
-                    .map(|&id| self.signal_table[id].clone())
-                    .collect();
-                let widths: Vec<u32> = ids.iter().map(|&id| self.signal_widths[id]).collect();
-                let signed: Vec<bool> = ids.iter().map(|&id| self.signal_signed[id]).collect();
-                crate::multikernel::PerLpSignalTable {
-                    lp: lp as u32,
-                    local_to_global,
-                    global_to_local,
-                    values,
-                    widths,
-                    signed,
-                }
-            })
-            .collect()
-    }
-
-    /// Extract a Send + Sync subset of simulator state for use across
-    /// host threads (the full `Simulator` contains Rc<AST> and FFI
-    /// pointers that prevent cross-thread sharing). Clones only what
-    /// `pdes_exec_block` actually reads: compiled blocks, the name
-    /// lookups, signal width / signedness arrays.
-    pub fn extract_send_exec_context(&self) -> SendExecContext {
-        SendExecContext {
-            compiled_edge_blocks: self.compiled_edge_blocks.clone(),
-            signal_name_to_id: self.signal_name_to_id.clone(),
-            array_first_id: self.array_first_id.clone(),
-            signal_widths: self.signal_widths.clone(),
-            signal_signed: self.signal_signed.clone(),
-            id_to_name: self.id_to_name.clone(),
-        }
-    }
-
-    /// Phase-4 runtime construction dry-run for the c910-scale PDES path.
-    /// This builds the expensive structures the per-LP runtime will need
-    /// without replacing the normal simulator event loop.
-    pub fn pdes_phase4_runtime_dry_run(
-        &self,
-        lp_a_prefix: &str,
-        clock_period_ns: u64,
-    ) -> crate::multikernel::Phase4RuntimeStats {
-        let per_lp_tables = self.build_per_lp_signal_tables(2);
-        let local_table_signal_counts = per_lp_tables.iter().map(|table| table.len()).collect();
-        let local_table_bytes = per_lp_tables
-            .iter()
-            .map(|table| table.estimated_bytes())
-            .collect();
-
-        let io = crate::multikernel::classify_lp_io(self, lp_a_prefix);
-        let topology = crate::multikernel::build_boundary_channels(&io, clock_period_ns);
-        let ports_a = topology.for_lp(0);
-        let ports_b = topology.for_lp(1);
-        let ctx = self.extract_send_exec_context();
-        let lookahead_k = crate::multikernel::pdes_lookahead_k_from_env();
-
-        crate::multikernel::Phase4RuntimeStats {
-            lp_count: 2,
-            lookahead_k,
-            sync_rounds_for_100_ticks: crate::multikernel::pdes_sync_rounds_for_ticks(
-                100,
-                lookahead_k,
-            ),
-            local_table_signal_counts,
-            local_table_bytes,
-            boundary_channels: topology.channel_count(),
-            outbound_endpoints: vec![ports_a.outbound.len(), ports_b.outbound.len()],
-            inbound_endpoints: vec![ports_a.inbound.len(), ports_b.inbound.len()],
-            send_context_blocks: ctx.block_count(),
-            send_context_signals: ctx.signal_count(),
-        }
-    }
-
-    /// Read-only view of one comb entry's LP-classification inputs:
-    /// the pre-resolved hierarchical scope hint plus the read and write
-    /// signal-id sets. Used by `multikernel::classify_lp_io` to scan
-    /// the combinational layer where real cross-LP wires live.
-    pub fn comb_entry_io_at(&self, idx: usize) -> Option<(Option<&str>, &[usize], &[usize])> {
-        self.comb_entries.get(idx).map(|e| {
-            (
-                e.cold.scope_hint.as_deref(),
-                e.cold.read_signal_ids.as_slice(),
-                e.cold.write_signal_ids.as_slice(),
-            )
-        })
-    }
-
-    /// PDES Phase 4 validation: exercise `exec_comb_block_isolated` against
-    /// every bytecode-compiled comb entry at the current (fixpoint) state.
-    ///
-    /// Invariant: at a settle fixpoint, re-evaluating any comb block must
-    /// produce no change. So running each `CompiledContAssign` /
-    /// `CompiledAlwaysBlock` block's isolated evaluator against a copy of
-    /// the golden signal table should dirty nothing and defer no NBA. A
-    /// bug in the isolated evaluator (wrong opcode, wrong width, missing
-    /// arm) surfaces as a spurious write or an `unsupported` flag.
-    ///
-    /// Returns `(checked, bits_mismatch, repr_diff, unsupported, deferred_nba)`:
-    ///   - checked: bytecode comb blocks evaluated
-    ///   - bits_mismatch: blocks producing a write whose v/x bits differ from
-    ///     golden — the true logic-equivalence gate (must be ~0)
-    ///   - repr_diff: blocks producing a write with bit-identical value but a
-    ///     different width/storage/signed representation — benign
-    ///   - unsupported: blocks containing an insn the evaluator can't handle
-    ///   - deferred_nba: blocks that queued an NBA at fixpoint
-    /// Call AFTER the design has settled (e.g. post time-0 settle).
-    pub fn pdes_check_comb_isolated(&self) -> (usize, usize, usize, usize, usize) {
-        let mut view = self.signal_table.clone();
-        let mut vm_regs: Vec<Value> = Vec::new();
-        let mut dirtied: Vec<u32> = Vec::new();
-        let dump = std::env::var("XEZIM_PDES_CHK_KINDS").ok().as_deref() == Some("1");
-        // XEZIM_PDES_DUMP_SIG=<id>: when a block produces a bits_differ on this
-        // signal, dump the block's bytecode to find the divergent opcode.
-        let dump_sig: Option<usize> = std::env::var("XEZIM_PDES_DUMP_SIG")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        // checked: bytecode comb blocks evaluated.
-        // bits_mismatch: blocks where a dirtied signal's raw v/x bits differ
-        //   from golden (true logic difference — must be ~0; the few on
-        //   c910 are X-convergence-ordering artifacts, see notes).
-        // repr_diff: blocks that dirtied a signal whose bits MATCH golden
-        //   but whose representation (width/storage/signed) differs — benign.
-        let (mut checked, mut bits_mismatch, mut repr_diff, mut unsupported, mut deferred) =
-            (0usize, 0usize, 0usize, 0usize, 0usize);
-        for e in &self.comb_entries {
-            let compiled = match &e.item {
-                CombItem::CompiledContAssign { compiled, .. } => compiled,
-                CombItem::CompiledAlwaysBlock { compiled, .. } => compiled,
-                _ => continue,
-            };
-            checked += 1;
-            if vm_regs.len() < compiled.num_regs as usize {
-                vm_regs.resize(compiled.num_regs as usize, Value::zero(1));
-            }
-            dirtied.clear();
-            let (nba, unsup) = Self::exec_comb_block_isolated(
-                &compiled.instructions,
-                &mut view,
-                &self.signal_widths,
-                &self.signal_signed,
-                &self.signal_name_to_id,
-                &self.array_first_id,
-                &mut vm_regs,
-                &mut dirtied,
-                0,
-                compiled.nba_dup_targets,
-            );
-            if unsup {
-                unsupported += 1;
-            }
-            if !dirtied.is_empty() {
-                let mut any_bits_differ = false;
-                for &sid in &dirtied {
-                    let sid = sid as usize;
-                    let (gv, gx) = self.signal_table[sid].raw_bits();
-                    let (nv, nx) = view[sid].raw_bits();
-                    let bits_differ = gv != nv || gx != nx;
-                    any_bits_differ |= bits_differ;
-                    if dump {
-                        if bits_differ {
-                            eprintln!(
-                                "[PDES-CHK-MISMATCH] {} bits_differ=true gv={:#x} gx={:#x} nv={:#x} nx={:#x} {}",
-                                sid,
-                                gv,
-                                gx,
-                                nv,
-                                nx,
-                                self.name_for_id(sid),
-                            );
-                        } else {
-                            eprintln!(
-                                "[PDES-CHK-MISMATCH] {} bits_differ=false g_signed={} n_signed={} {}",
-                                sid,
-                                self.signal_table[sid].is_signed,
-                                view[sid].is_signed,
-                                self.name_for_id(sid),
-                            );
-                        }
-                    }
-                }
-                if any_bits_differ {
-                    bits_mismatch += 1;
-                    if let Some(target) = dump_sig {
-                        if dirtied.iter().any(|&d| d as usize == target) {
-                            eprintln!(
-                                "[PDES-DUMP-SIG {}] block num_regs={} insns={}:",
-                                target,
-                                compiled.num_regs,
-                                compiled.instructions.len()
-                            );
-                            for (i, insn) in compiled.instructions.iter().enumerate() {
-                                eprintln!("  [{:3}] {:?}", i, insn);
-                            }
-                        }
-                    }
-                } else {
-                    repr_diff += 1;
-                }
-                // Restore the cells we perturbed so later entries still see
-                // the golden table.
-                for &sid in &dirtied {
-                    view[sid as usize] = self.signal_table[sid as usize].clone();
-                }
-            }
-            if !nba.is_empty() {
-                deferred += 1;
-            }
-        }
-        (checked, bits_mismatch, repr_diff, unsupported, deferred)
     }
 
     /// Isolated counterpart of `exec_fused_gate`: evaluates a fused 1-bit
@@ -18710,8 +18437,7 @@ impl Simulator {
     /// Evaluate one comb entry against a mutable signal `view`, appending
     /// the ids of any signals it changes to `dirtied`. Returns false if the
     /// entry is an AST-fallback variant the isolated path can't handle (the
-    /// caller routes those to the main thread). Used by the per-LP settle
-    /// driver `pdes_settle_subset_view`.
+    /// caller routes those to the main thread). Used by the BSP settle.
     fn eval_comb_entry_isolated(
         &self,
         eidx: usize,
@@ -19009,1629 +18735,6 @@ impl Simulator {
             }
             CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => false,
         }
-    }
-
-    /// PDES Phase 4: run comb settle for ONE LP's entry subset against a
-    /// per-LP signal `view`, to fixpoint, using the isolated evaluators.
-    ///
-    /// `in_subset` is entry-indexed membership (true for this LP's entries).
-    /// `seed` are the initially-triggered entries. Worklist propagation
-    /// triggers dependents (via the global comb_dep CSR) ONLY within the
-    /// subset — cross-LP dependents are the boundary signals, read frozen
-    /// from `view` (the coordinator refreshes them via channels at tick
-    /// boundaries). Returns `(settle_iters, unsupported_evals)`.
-    fn pdes_settle_subset_view(
-        &self,
-        view: &mut [Value],
-        in_subset: &[bool],
-        seed: &[usize],
-        limit: u64,
-    ) -> (u64, u64) {
-        let n_entries = self.comb_entries.len();
-        let mut triggered = vec![false; n_entries];
-        let mut worklist: Vec<usize> = Vec::new();
-        let mut next: Vec<usize> = Vec::new();
-        let mut vm_regs: Vec<Value> = Vec::new();
-        let mut dirtied: Vec<u32> = Vec::new();
-        let mut unsupported = 0u64;
-        for &e in seed {
-            if in_subset.get(e).copied().unwrap_or(false) && !triggered[e] {
-                triggered[e] = true;
-                worklist.push(e);
-            }
-        }
-        let mut iters = 0u64;
-        while !worklist.is_empty() && iters < limit {
-            iters += 1;
-            next.clear();
-            for &eidx in &worklist {
-                if !triggered[eidx] {
-                    continue;
-                }
-                triggered[eidx] = false;
-                dirtied.clear();
-                if !self.eval_comb_entry_isolated(eidx, view, &mut vm_regs, &mut dirtied) {
-                    unsupported += 1;
-                }
-                for &sid_u32 in &dirtied {
-                    let sid = sid_u32 as usize;
-                    if sid + 1 < self.comb_dep_offsets.len() {
-                        let lo = self.comb_dep_offsets[sid] as usize;
-                        let hi = self.comb_dep_offsets[sid + 1] as usize;
-                        for &dep_u32 in &self.comb_dep_entries[lo..hi] {
-                            let dep = dep_u32 as usize;
-                            if in_subset.get(dep).copied().unwrap_or(false) && !triggered[dep] {
-                                triggered[dep] = true;
-                                next.push(dep);
-                            }
-                        }
-                    }
-                }
-            }
-            std::mem::swap(&mut worklist, &mut next);
-        }
-        (iters, unsupported)
-    }
-
-    /// PDES Phase 4 validation: prove that settling each LP's comb-entry
-    /// subset independently (boundary inputs frozen at the global fixpoint)
-    /// reconverges to the same per-signal values as the global settle.
-    ///
-    /// Precondition: the design is at a settle fixpoint (post time-0 settle).
-    /// For each LP, copies the golden table into `view`, triggers ALL of the
-    /// LP's entries, runs `pdes_settle_subset_view` to fixpoint, then
-    /// compares the LP-owned signals' v/x bits against golden. Straddle=0 on
-    /// c910 makes ownership (by name prefix) unambiguous, so the per-LP
-    /// results merge cleanly.
-    ///
-    /// Returns `(entries_a, entries_b, iters_a, iters_b, mismatches,
-    /// unsupported)`. mismatches ~0 confirms the per-LP settle driver is
-    /// correct end-to-end.
-    pub fn pdes_validate_perlp_settle(
-        &self,
-        lp_a_prefix: &str,
-    ) -> (usize, usize, u64, u64, usize, u64) {
-        let part = self.pdes_build_comb_partition(lp_a_prefix);
-        let n_entries = self.comb_entries.len();
-        let n_signals = self.signal_table.len();
-        let dot_prefix = format!("{}.", lp_a_prefix);
-
-        // Per-signal ownership by name prefix (LP-A=true).
-        let mut sig_is_a = vec![false; n_signals];
-        for id in 0..n_signals {
-            let name = self.name_for_id(id);
-            if name == lp_a_prefix || name.starts_with(&dot_prefix) {
-                sig_is_a[id] = true;
-            }
-        }
-
-        let mut view = self.signal_table.clone();
-        let limit = self.settle_limit as u64;
-        let mut mismatches = 0usize;
-        let mut unsupported_total = 0u64;
-        let mut iters = [0u64; 2];
-
-        for lp in 0..2usize {
-            // Reset view to golden.
-            view.clone_from(&self.signal_table);
-            // Entry-indexed membership for this LP.
-            let mut in_subset = vec![false; n_entries];
-            for &e in &part.lp_entries[lp] {
-                in_subset[e] = true;
-            }
-            let (it, unsup) =
-                self.pdes_settle_subset_view(&mut view, &in_subset, &part.lp_entries[lp], limit);
-            iters[lp] = it;
-            unsupported_total += unsup;
-            // Compare this LP's owned signals to golden.
-            let want_a = lp == 0;
-            for id in 0..n_signals {
-                if sig_is_a[id] != want_a {
-                    continue;
-                }
-                let (gv, gx) = self.signal_table[id].raw_bits();
-                let (nv, nx) = view[id].raw_bits();
-                if gv != nv || gx != nx {
-                    mismatches += 1;
-                }
-            }
-        }
-
-        (
-            part.lp_entries[0].len(),
-            part.lp_entries[1].len(),
-            iters[0],
-            iters[1],
-            mismatches,
-            unsupported_total,
-        )
-    }
-
-    /// PDES Phase 4: partition the parallel-eligible EDGE blocks (clocked
-    /// always) across two LPs for a dual-core split. A block's owning LP is
-    /// its hierarchical scope: core0→LP0, core1→LP1, uncore distributes by
-    /// running count for balance. Counts blocks that write a signal owned
-    /// (by name) by the other core — the registered cross-LP boundary.
-    pub fn pdes_build_edge_partition(
-        &self,
-        prefix0: &str,
-        prefix1: &str,
-    ) -> crate::multikernel::EdgePartition {
-        let n_signals = self.signal_table.len();
-        let dot0 = format!("{}.", prefix0);
-        let dot1 = format!("{}.", prefix1);
-        let scope_lp = |scope: Option<&str>| -> Option<u8> {
-            match scope {
-                Some(s) if s == prefix0 || s.starts_with(&dot0) => Some(0),
-                Some(s) if s == prefix1 || s.starts_with(&dot1) => Some(1),
-                _ => None, // uncore
-            }
-        };
-        // Per-signal owner core by name (for cross-LP NBA-write counting).
-        let sig_core = |id: usize| -> Option<u8> {
-            let name = self.name_for_id(id);
-            if name == prefix0 || name.starts_with(&dot0) {
-                Some(0)
-            } else if name == prefix1 || name.starts_with(&dot1) {
-                Some(1)
-            } else {
-                None
-            }
-        };
-
-        let mut lp_blocks: Vec<Vec<usize>> = vec![Vec::new(), Vec::new()];
-        let mut uncore_blocks = 0usize;
-        let mut total_parallel = 0usize;
-        let mut cross_lp_nba_writers = 0usize;
-        let (mut bal0, mut bal1) = (0i64, 0i64);
-        let n_blocks = self.compiled_edge_blocks.len();
-        for bi in 0..n_blocks {
-            if !self.edge_block_parallel.get(bi).copied().unwrap_or(false) {
-                continue;
-            }
-            if self
-                .compiled_edge_blocks
-                .get(bi)
-                .is_none_or(|c| c.is_none())
-            {
-                continue;
-            }
-            total_parallel += 1;
-            let scope = self.edge_block_scope.get(bi).and_then(|s| s.as_deref());
-            let lp = match scope_lp(scope) {
-                Some(l) => l,
-                None => {
-                    uncore_blocks += 1;
-                    if bal0 <= bal1 { 0 } else { 1 }
-                }
-            };
-            if lp == 0 {
-                bal0 += 1;
-            } else {
-                bal1 += 1;
-            }
-            // Count cross-LP NBA writers: any write target owned by the
-            // other core.
-            if let Some(Some(cb)) = self.compiled_edge_blocks.get(bi) {
-                use super::bytecode::Insn;
-                let mut crosses = false;
-                for insn in &cb.instructions {
-                    let wid = match insn {
-                        Insn::NbaAssign(id, _, _)
-                        | Insn::NbaAssignConst(id, _, _)
-                        | Insn::NbaAssignRange(id, _, _, _)
-                        | Insn::NbaAssignBitDyn(id, _, _)
-                        | Insn::NbaAssignArrayRead(id, _, _, _)
-                        | Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
-                        _ => None,
-                    };
-                    if let Some(id) = wid {
-                        let id = id as usize;
-                        if id < n_signals {
-                            if let Some(o) = sig_core(id) {
-                                if o != lp {
-                                    crosses = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if crosses {
-                    cross_lp_nba_writers += 1;
-                }
-            }
-            lp_blocks[lp as usize].push(bi);
-        }
-
-        crate::multikernel::EdgePartition {
-            lp_blocks,
-            uncore_blocks,
-            total_parallel,
-            cross_lp_nba_writers,
-        }
-    }
-
-    /// PDES Phase 4: run the parallel edge blocks CONCURRENTLY on two
-    /// worker threads against a SHARED read-only snapshot (no per-LP view
-    /// clone — edge exec only reads the snapshot and emits NBA writes), and
-    /// cross-check that the merged NBA-write set matches a sequential run.
-    /// Times seq vs parallel edge execution.
-    ///
-    /// Returns `(nba_writes, mismatches, seq_ms, par_ms)`. mismatches==0
-    /// confirms the threaded edge exec is equivalent to sequential.
-    pub fn pdes_validate_perlp_edge_threaded(
-        &self,
-        part: &crate::multikernel::EdgePartition,
-    ) -> (usize, usize, f64, f64) {
-        let ctx = self.extract_send_exec_context();
-        let snapshot = self.signal_table.clone();
-
-        // Sequential: run all parallel blocks (lp0 then lp1) into one map.
-        let seq_start = std::time::Instant::now();
-        let mut seq_map: ahash::AHashMap<usize, Value> = ahash::AHashMap::default();
-        {
-            let mut vm_regs: Vec<Value> = Vec::new();
-            for lp in 0..2usize {
-                for &bi in &part.lp_blocks[lp] {
-                    for (sid, val) in ctx.pdes_exec_block(bi, &snapshot, &mut vm_regs) {
-                        seq_map.insert(sid, val);
-                    }
-                }
-            }
-        }
-        let seq_ms = seq_start.elapsed().as_secs_f64() * 1000.0;
-
-        // Parallel: each LP runs its blocks against the SHARED snapshot.
-        let par_start = std::time::Instant::now();
-        let (writes_a, writes_b) = std::thread::scope(|s| {
-            let ctx_ref = &ctx;
-            let snap_ref = &snapshot;
-            let blocks_a = &part.lp_blocks[0];
-            let blocks_b = &part.lp_blocks[1];
-            let run = |blocks: &[usize]| -> Vec<(usize, Value)> {
-                let mut vm_regs: Vec<Value> = Vec::new();
-                let mut out: Vec<(usize, Value)> = Vec::new();
-                for &bi in blocks {
-                    out.extend(ctx_ref.pdes_exec_block(bi, snap_ref, &mut vm_regs));
-                }
-                out
-            };
-            let ha = s.spawn(move || run(blocks_a));
-            let hb = s.spawn(move || run(blocks_b));
-            (ha.join().unwrap(), hb.join().unwrap())
-        });
-        let par_ms = par_start.elapsed().as_secs_f64() * 1000.0;
-
-        // Merge parallel writes (lp0 then lp1 to match seq ordering).
-        let mut par_map: ahash::AHashMap<usize, Value> = ahash::AHashMap::default();
-        for (sid, val) in writes_a.into_iter().chain(writes_b) {
-            par_map.insert(sid, val);
-        }
-
-        let mut mismatches = 0usize;
-        for (sid, sval) in &seq_map {
-            match par_map.get(sid) {
-                Some(pval) => {
-                    if sval.raw_bits() != pval.raw_bits() {
-                        mismatches += 1;
-                    }
-                }
-                None => mismatches += 1,
-            }
-        }
-        for sid in par_map.keys() {
-            if !seq_map.contains_key(sid) {
-                mismatches += 1;
-            }
-        }
-
-        (seq_map.len(), mismatches, seq_ms, par_ms)
-    }
-
-    /// PDES Phase 4: validate ONE real tick of the combined parallel
-    /// pipeline — parallel edge exec → NBA apply → seeded parallel settle —
-    /// against the same pipeline run sequentially. Unlike the fixpoint
-    /// re-settle (trivially stable), this SEEDS settle from actual edge NBA
-    /// outputs, so it genuinely exercises cross-LP comb propagation and can
-    /// reveal whether a partition's cross-LP edges break within-tick
-    /// correctness.
-    ///
-    /// Per-LP views persist (cloned once, untimed) — no per-tick clone, so
-    /// the timed numbers reflect a real steady-state tick. Edge NBA writes
-    /// are broadcast to both views (models full boundary-channel sync at the
-    /// tick boundary). Returns `(mismatches, edge_nba, seq_ms, par_ms)`.
-    pub fn pdes_validate_perlp_tick(
-        &self,
-        comb_part: &crate::multikernel::CombPartition,
-        edge_part: &crate::multikernel::EdgePartition,
-    ) -> (usize, usize, f64, f64) {
-        let ctx_edge = self.extract_send_exec_context();
-        let ctx_comb = self.extract_comb_settle_ctx();
-        let limit = self.settle_limit as u64;
-        let n_entries = self.comb_entries.len();
-        let n_signals = self.signal_table.len();
-        let golden = &self.signal_table;
-
-        let mut in_a = vec![false; n_entries];
-        for &e in &comb_part.lp_entries[0] {
-            in_a[e] = true;
-        }
-        let mut in_b = vec![false; n_entries];
-        for &e in &comb_part.lp_entries[1] {
-            in_b[e] = true;
-        }
-
-        // Dependent entries of a set of changed signal ids (via comb_dep
-        // CSR), split by LP membership. Over-seeding is safe.
-        let dependents = |changed: &[u32]| -> (Vec<usize>, Vec<usize>) {
-            let mut seen = vec![false; n_entries];
-            let (mut sa, mut sb) = (Vec::new(), Vec::new());
-            for &sid_u in changed {
-                let sid = sid_u as usize;
-                if sid + 1 < self.comb_dep_offsets.len() {
-                    let lo = self.comb_dep_offsets[sid] as usize;
-                    let hi = self.comb_dep_offsets[sid + 1] as usize;
-                    for &dep_u in &self.comb_dep_entries[lo..hi] {
-                        let dep = dep_u as usize;
-                        if !seen[dep] {
-                            seen[dep] = true;
-                            if in_a[dep] {
-                                sa.push(dep);
-                            }
-                            if in_b[dep] {
-                                sb.push(dep);
-                            }
-                        }
-                    }
-                }
-            }
-            (sa, sb)
-        };
-
-        // ---- Sequential reference (single thread, full entry set) ----
-        // Pre-clone the working state UNTIMED (a real loop holds persistent
-        // views; the per-tick cost is compute, not the clone).
-        let in_all = vec![true; n_entries];
-        let mut seq_state = golden.clone();
-        let seq_start = std::time::Instant::now();
-        let mut edge_nba = 0usize;
-        let mut changed_seq: Vec<u32> = Vec::new();
-        {
-            let mut vm: Vec<Value> = Vec::new();
-            for lp in 0..2usize {
-                for &bi in &edge_part.lp_blocks[lp] {
-                    for (sid, val) in ctx_edge.pdes_exec_block(bi, golden, &mut vm) {
-                        if seq_state[sid].raw_bits() != val.raw_bits() {
-                            changed_seq.push(sid as u32);
-                        }
-                        seq_state[sid] = val;
-                    }
-                }
-            }
-            edge_nba = changed_seq.len();
-            let mut seed_all: Vec<usize> = {
-                let (mut a, b) = dependents(&changed_seq);
-                a.extend(b);
-                a.sort_unstable();
-                a.dedup();
-                a
-            };
-            ctx_comb.settle_subset(&mut seq_state, &in_all, &seed_all, limit);
-        }
-        let seq_ms = seq_start.elapsed().as_secs_f64() * 1000.0;
-
-        // ---- Parallel pipeline (persistent views, cloned untimed) ----
-        let mut view_a = golden.clone();
-        let mut view_b = golden.clone();
-        let par_start = std::time::Instant::now();
-        // Parallel edge exec against the shared read-only golden snapshot.
-        let (writes_a, writes_b) = std::thread::scope(|s| {
-            let ctx_ref = &ctx_edge;
-            let ba = &edge_part.lp_blocks[0];
-            let bb = &edge_part.lp_blocks[1];
-            let run = |blocks: &[usize]| -> Vec<(usize, Value)> {
-                let mut vm: Vec<Value> = Vec::new();
-                let mut out = Vec::new();
-                for &bi in blocks {
-                    out.extend(ctx_ref.pdes_exec_block(bi, golden, &mut vm));
-                }
-                out
-            };
-            let ha = s.spawn(move || run(ba));
-            let hb = s.spawn(move || run(bb));
-            (ha.join().unwrap(), hb.join().unwrap())
-        });
-        // Apply all edge NBA writes to BOTH views (boundary-sync broadcast).
-        let mut changed_par: Vec<u32> = Vec::new();
-        for (sid, val) in writes_a.iter().chain(writes_b.iter()) {
-            if view_a[*sid].raw_bits() != val.raw_bits() {
-                changed_par.push(*sid as u32);
-            }
-            view_a[*sid] = val.clone();
-            view_b[*sid] = val.clone();
-        }
-        let (mut seed_a, mut seed_b) = dependents(&changed_par);
-        // Parallel seeded settle on persistent per-LP views.
-        std::thread::scope(|s| {
-            let ctx_ref = &ctx_comb;
-            let in_a_ref = &in_a;
-            let in_b_ref = &in_b;
-            let va = &mut view_a;
-            let vb = &mut view_b;
-            let sa = &mut seed_a;
-            let sb = &mut seed_b;
-            let ha = s.spawn(move || ctx_ref.settle_subset(va, in_a_ref, sa, limit));
-            let hb = s.spawn(move || ctx_ref.settle_subset(vb, in_b_ref, sb, limit));
-            ha.join().unwrap();
-            hb.join().unwrap();
-        });
-        // ITERATED cross-LP boundary settle: exchange the comb cross-boundary
-        // set owner->other, reseed dependents of changed boundary signals,
-        // re-settle, repeat until stable. Depth-2 acyclic => ~2-3 rounds.
-        // Isolates whether iteration resolves the cross-LP comb boundary
-        // (the 9 BIU handshakes) within one tick from a consistent post-edge
-        // state (edges are broadcast to both views above, so no edge-
-        // partition confound here).
-        let owner = &comb_part.signal_owner_lp;
-        {
-            let boundary = &comb_part.boundary_signal_ids;
-            let max_rounds = 16u32;
-            let mut round = 0u32;
-            loop {
-                let mut to_a: Vec<u32> = Vec::new();
-                let mut to_b: Vec<u32> = Vec::new();
-                for &sid in boundary {
-                    match owner[sid] {
-                        0 if view_b[sid].raw_bits() != view_a[sid].raw_bits() => {
-                            view_b[sid] = view_a[sid].clone();
-                            to_b.push(sid as u32);
-                        }
-                        1 if view_a[sid].raw_bits() != view_b[sid].raw_bits() => {
-                            view_a[sid] = view_b[sid].clone();
-                            to_a.push(sid as u32);
-                        }
-                        _ => {}
-                    }
-                }
-                round += 1;
-                if (to_a.is_empty() && to_b.is_empty()) || round >= max_rounds {
-                    break;
-                }
-                let mut ra = dependents(&to_a).0;
-                let mut rb = dependents(&to_b).1;
-                std::thread::scope(|s| {
-                    let ctx_ref = &ctx_comb;
-                    let in_a_ref = &in_a;
-                    let in_b_ref = &in_b;
-                    let va = &mut view_a;
-                    let vb = &mut view_b;
-                    let sa = &mut ra;
-                    let sb = &mut rb;
-                    let ha = s.spawn(move || ctx_ref.settle_subset(va, in_a_ref, sa, limit));
-                    let hb = s.spawn(move || ctx_ref.settle_subset(vb, in_b_ref, sb, limit));
-                    ha.join().unwrap();
-                    hb.join().unwrap();
-                });
-            }
-        }
-        let par_ms = par_start.elapsed().as_secs_f64() * 1000.0;
-
-        // Merge by owner, compare to sequential reference.
-        let dump = std::env::var("XEZIM_PDES_CHK_KINDS").ok().as_deref() == Some("1");
-        let mut mismatches = 0usize;
-        for id in 0..n_signals {
-            let pv = match owner[id] {
-                1 => &view_b[id],
-                _ => &view_a[id], // owner 0 or unowned-> view_a (edge writes are in both)
-            };
-            if pv.raw_bits() != seq_state[id].raw_bits() {
-                mismatches += 1;
-                if dump {
-                    let (pv_v, pv_x) = pv.raw_bits();
-                    let (sv, sx) = seq_state[id].raw_bits();
-                    eprintln!(
-                        "[PDES-TICK-MM] {} owner={} par(v={:#x},x={:#x}) seq(v={:#x},x={:#x}) {}",
-                        id,
-                        owner[id],
-                        pv_v,
-                        pv_x,
-                        sv,
-                        sx,
-                        self.name_for_id(id),
-                    );
-                }
-            }
-        }
-        (mismatches, edge_nba, seq_ms, par_ms)
-    }
-
-    /// PDES Phase 4: a real MULTI-TICK parallel event loop with the
-    /// boundary channel, validated tick-by-tick against the same pipeline
-    /// run sequentially. Each tick: toggle the clocks, parallel edge exec
-    /// (each LP reads its own view), apply NBAs, BOUNDARY-CHANNEL EXCHANGE
-    /// (deliver each boundary signal from its owner LP to the other —
-    /// lookahead-1), parallel seeded settle. Clone-free per tick (views
-    /// persist). Edge exec reads the view directly (NBA semantics: writes
-    /// are collected and applied after, so reads see pre-tick values).
-    ///
-    /// The sequential reference settles monolithically (lookahead-0), so
-    /// the parallel run (lookahead-1 on boundary signals) is EXPECTED to
-    /// differ on boundary signals that change within the window — that skew
-    /// IS the PDES approximation, sound only because those signals are
-    /// registered. Returns per-tick mismatch counts plus seq/par wall time.
-    pub fn pdes_validate_parallel_multitick(
-        &self,
-        comb_part: &crate::multikernel::CombPartition,
-        edge_part: &crate::multikernel::EdgePartition,
-        n_ticks: usize,
-        edge_threads: usize,
-    ) -> (Vec<usize>, f64, f64) {
-        let ctx_edge = self.extract_send_exec_context();
-        let ctx_comb = self.extract_comb_settle_ctx();
-        let limit = self.settle_limit as u64;
-        let n_entries = self.comb_entries.len();
-        let n_signals = self.signal_table.len();
-        let owner = &comb_part.signal_owner_lp;
-        let clocks: Vec<usize> = self.clock_generators.iter().map(|c| c.signal_id).collect();
-        let boundary = &comb_part.boundary_signal_ids;
-
-        let mut in_a = vec![false; n_entries];
-        for &e in &comb_part.lp_entries[0] {
-            in_a[e] = true;
-        }
-        let mut in_b = vec![false; n_entries];
-        for &e in &comb_part.lp_entries[1] {
-            in_b[e] = true;
-        }
-
-        let dependents = |changed: &[u32], seen: &mut [bool]| -> (Vec<usize>, Vec<usize>) {
-            let (mut sa, mut sb) = (Vec::new(), Vec::new());
-            for &sid_u in changed {
-                let sid = sid_u as usize;
-                if sid + 1 < self.comb_dep_offsets.len() {
-                    let lo = self.comb_dep_offsets[sid] as usize;
-                    let hi = self.comb_dep_offsets[sid + 1] as usize;
-                    for &dep_u in &self.comb_dep_entries[lo..hi] {
-                        let dep = dep_u as usize;
-                        if !seen[dep] {
-                            seen[dep] = true;
-                            if in_a[dep] {
-                                sa.push(dep);
-                            }
-                            if in_b[dep] {
-                                sb.push(dep);
-                            }
-                        }
-                    }
-                }
-            }
-            (sa, sb)
-        };
-        let toggle = |state: &mut [Value], clocks: &[usize]| {
-            for &c in clocks {
-                if c < state.len() {
-                    let cur = state[c].get_bit_code(0);
-                    state[c].set_bit_code(0, if cur == 1 { 0 } else { 1 });
-                }
-            }
-        };
-        let run_edges =
-            |ctx: &SendExecContext, view: &[Value], blocks: &[usize]| -> Vec<(usize, Value)> {
-                let mut vm: Vec<Value> = Vec::new();
-                let mut out = Vec::new();
-                for &bi in blocks {
-                    out.extend(ctx.pdes_exec_block(bi, view, &mut vm));
-                }
-                out
-            };
-
-        let mut seq_state = self.signal_table.clone();
-        let mut view_a = self.signal_table.clone();
-        let mut view_b = self.signal_table.clone();
-        let mut per_tick_mm: Vec<usize> = Vec::with_capacity(n_ticks);
-        let mut seq_ms = 0.0f64;
-        let mut par_ms = 0.0f64;
-        let all_blocks: Vec<usize> = edge_part.lp_blocks[0]
-            .iter()
-            .chain(edge_part.lp_blocks[1].iter())
-            .copied()
-            .collect();
-
-        // Edge exec tasks: each LP's blocks split into edge_threads/2 chunks
-        // (settle stays 2-way — the sound cut). A task reads its LP's view.
-        // edge_threads=2 -> 1 chunk/LP (2 tasks); =4 -> 2 chunks/LP (4 tasks).
-        let chunks_per_lp = (edge_threads / 2).max(1);
-        let mut edge_tasks: Vec<(usize, Vec<usize>)> = Vec::new();
-        for lp in 0..2usize {
-            let blocks = &edge_part.lp_blocks[lp];
-            let csize = blocks.len().div_ceil(chunks_per_lp).max(1);
-            for chunk in blocks.chunks(csize) {
-                edge_tasks.push((lp, chunk.to_vec()));
-            }
-        }
-
-        for _tick in 0..n_ticks {
-            // ---- Sequential reference (monolithic, lookahead-0) ----
-            let t0 = std::time::Instant::now();
-            toggle(&mut seq_state, &clocks);
-            let mut seen = vec![false; n_entries];
-            let mut changed: Vec<u32> = Vec::new();
-            {
-                let writes = run_edges(&ctx_edge, &seq_state, &all_blocks);
-                for (sid, val) in writes {
-                    if seq_state[sid].raw_bits() != val.raw_bits() {
-                        changed.push(sid as u32);
-                    }
-                    seq_state[sid] = val;
-                }
-                let (mut a, b) = dependents(&changed, &mut seen);
-                a.extend(b);
-                let in_all = vec![true; n_entries];
-                ctx_comb.settle_subset(&mut seq_state, &in_all, &a, limit);
-            }
-            seq_ms += t0.elapsed().as_secs_f64() * 1000.0;
-
-            // ---- Parallel (per-LP views + boundary channel, lookahead-1) ----
-            let t1 = std::time::Instant::now();
-            toggle(&mut view_a, &clocks);
-            toggle(&mut view_b, &clocks);
-            // Parallel edge exec on edge_threads threads: each task reads
-            // its LP's view (immutable shared read — NBA writes collected,
-            // applied after).
-            let results: Vec<(usize, Vec<(usize, Value)>)> = std::thread::scope(|s| {
-                let ctx_ref = &ctx_edge;
-                let va = &view_a;
-                let vb = &view_b;
-                let handles: Vec<_> = edge_tasks
-                    .iter()
-                    .map(|(lp, blocks)| {
-                        let lp = *lp;
-                        let blocks = blocks.clone();
-                        let view: &[Value] = if lp == 0 { va } else { vb };
-                        s.spawn(move || (lp, run_edges(ctx_ref, view, &blocks)))
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            // Apply edge NBAs to BOTH views (broadcast — eliminates edge
-            // cross-LP staleness; the proven single-tick scheme). NBAs are
-            // sparse (~863/tick) so this is cheap.
-            let mut changed_par: Vec<u32> = Vec::new();
-            for (_lp, writes) in &results {
-                for (sid, val) in writes {
-                    if view_a[*sid].raw_bits() != val.raw_bits() {
-                        changed_par.push(*sid as u32);
-                    }
-                    view_a[*sid] = val.clone();
-                    view_b[*sid] = val.clone();
-                }
-            }
-            // ITERATED cross-LP settle (proven correct in
-            // pdes_validate_perlp_tick: depth-2 acyclic → converges to the
-            // monolithic fixpoint, mismatches=0). First settle from edge
-            // seeds, then exchange the comb boundary / reseed / re-settle
-            // until the boundary is stable.
-            let mut seen_p = vec![false; n_entries];
-            let (mut seed_a, mut seed_b) = dependents(&changed_par, &mut seen_p);
-            std::thread::scope(|s| {
-                let ctx_ref = &ctx_comb;
-                let ia = &in_a;
-                let ib = &in_b;
-                let va = &mut view_a;
-                let vb = &mut view_b;
-                let sa = &mut seed_a;
-                let sb = &mut seed_b;
-                let ha = s.spawn(move || ctx_ref.settle_subset(va, ia, sa, limit));
-                let hb = s.spawn(move || ctx_ref.settle_subset(vb, ib, sb, limit));
-                ha.join().unwrap();
-                hb.join().unwrap();
-            });
-            let max_rounds = 16u32;
-            let mut round = 0u32;
-            loop {
-                let mut to_a: Vec<u32> = Vec::new();
-                let mut to_b: Vec<u32> = Vec::new();
-                for &sid in boundary {
-                    match owner[sid] {
-                        0 if view_b[sid].raw_bits() != view_a[sid].raw_bits() => {
-                            view_b[sid] = view_a[sid].clone();
-                            to_b.push(sid as u32);
-                        }
-                        1 if view_a[sid].raw_bits() != view_b[sid].raw_bits() => {
-                            view_a[sid] = view_b[sid].clone();
-                            to_a.push(sid as u32);
-                        }
-                        _ => {}
-                    }
-                }
-                round += 1;
-                if (to_a.is_empty() && to_b.is_empty()) || round >= max_rounds {
-                    break;
-                }
-                let mut sa_seen = vec![false; n_entries];
-                let mut ra = dependents(&to_a, &mut sa_seen).0;
-                let mut sb_seen = vec![false; n_entries];
-                let mut rb = dependents(&to_b, &mut sb_seen).1;
-                std::thread::scope(|s| {
-                    let ctx_ref = &ctx_comb;
-                    let ia = &in_a;
-                    let ib = &in_b;
-                    let va = &mut view_a;
-                    let vb = &mut view_b;
-                    let sa = &mut ra;
-                    let sb = &mut rb;
-                    let ha = s.spawn(move || ctx_ref.settle_subset(va, ia, sa, limit));
-                    let hb = s.spawn(move || ctx_ref.settle_subset(vb, ib, sb, limit));
-                    ha.join().unwrap();
-                    hb.join().unwrap();
-                });
-            }
-            par_ms += t1.elapsed().as_secs_f64() * 1000.0;
-
-            // Compare merged parallel state to sequential reference.
-            let dump_last = _tick + 1 == n_ticks
-                && std::env::var("XEZIM_PDES_CHK_KINDS").ok().as_deref() == Some("1");
-            let mut mm = 0usize;
-            let mut x_only = 0usize; // diffs where at least one side is X (x-bits set)
-            let mut dumped = 0usize;
-            for id in 0..n_signals {
-                let pv = if owner[id] == 1 {
-                    &view_b[id]
-                } else {
-                    &view_a[id]
-                };
-                let (pvv, pvx) = pv.raw_bits();
-                let (sv, sx) = seq_state[id].raw_bits();
-                if pvv != sv || pvx != sx {
-                    mm += 1;
-                    if pvx != 0 || sx != 0 {
-                        x_only += 1;
-                    }
-                    if dump_last && dumped < 20 {
-                        eprintln!(
-                            "[PDES-MT-MM] {} par(v={:#x},x={:#x}) seq(v={:#x},x={:#x}) {}",
-                            id,
-                            pvv,
-                            pvx,
-                            sv,
-                            sx,
-                            self.name_for_id(id)
-                        );
-                        dumped += 1;
-                    }
-                }
-            }
-            if dump_last {
-                eprintln!(
-                    "[PDES-MT-MM] last-tick mismatches={} of which X-involved={} (value-only={})",
-                    mm,
-                    x_only,
-                    mm - x_only
-                );
-            }
-            per_tick_mm.push(mm);
-        }
-
-        (per_tick_mm, seq_ms, par_ms)
-    }
-
-    /// PDES Phase 4: parallel edge execution scaled to N threads. Edge
-    /// exec reads an immutable snapshot and emits NBA writes, so it's
-    /// embarrassingly parallel — all parallel-eligible blocks are chunked
-    /// into N even groups (by count) and run on N threads against the
-    /// shared snapshot, then merged. Correct for ANY N (no cross-thread
-    /// dependency during exec). Returns `(nba_writes, mismatches, seq_ms,
-    /// par_ms)`; mismatches==0 confirms equivalence to sequential.
-    pub fn pdes_validate_edge_nthreads(&self, n_threads: usize) -> (usize, usize, f64, f64) {
-        let ctx = self.extract_send_exec_context();
-        let snapshot = self.signal_table.clone();
-        let mut blocks: Vec<usize> = Vec::new();
-        for bi in 0..self.compiled_edge_blocks.len() {
-            if self.edge_block_parallel.get(bi).copied().unwrap_or(false)
-                && self
-                    .compiled_edge_blocks
-                    .get(bi)
-                    .is_some_and(|c| c.is_some())
-            {
-                blocks.push(bi);
-            }
-        }
-        let n = n_threads.max(1);
-        let chunk = blocks.len().div_ceil(n);
-        let groups: Vec<Vec<usize>> = blocks.chunks(chunk.max(1)).map(|c| c.to_vec()).collect();
-
-        let run_group =
-            |ctx: &SendExecContext, snap: &[Value], blocks: &[usize]| -> Vec<(usize, Value)> {
-                let mut vm: Vec<Value> = Vec::new();
-                let mut out: Vec<(usize, Value)> = Vec::new();
-                for &bi in blocks {
-                    out.extend(ctx.pdes_exec_block(bi, snap, &mut vm));
-                }
-                out
-            };
-
-        // Sequential (all blocks, in order).
-        let seq_start = std::time::Instant::now();
-        let seq_writes = run_group(&ctx, &snapshot, &blocks);
-        let seq_ms = seq_start.elapsed().as_secs_f64() * 1000.0;
-        let mut seq_map: ahash::AHashMap<usize, Value> = ahash::AHashMap::default();
-        for (sid, val) in &seq_writes {
-            seq_map.insert(*sid, val.clone());
-        }
-
-        // Parallel: one thread per group.
-        let par_start = std::time::Instant::now();
-        let results: Vec<Vec<(usize, Value)>> = std::thread::scope(|s| {
-            let ctx_ref = &ctx;
-            let snap_ref = &snapshot;
-            let handles: Vec<_> = groups
-                .iter()
-                .map(|g| {
-                    let g = g.clone();
-                    s.spawn(move || run_group(ctx_ref, snap_ref, &g))
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        let par_ms = par_start.elapsed().as_secs_f64() * 1000.0;
-
-        // Merge in group order (== block order) to match sequential.
-        let mut par_map: ahash::AHashMap<usize, Value> = ahash::AHashMap::default();
-        for group_writes in &results {
-            for (sid, val) in group_writes {
-                par_map.insert(*sid, val.clone());
-            }
-        }
-        let mut mismatches = 0usize;
-        for (sid, sval) in &seq_map {
-            match par_map.get(sid) {
-                Some(pval) if sval.raw_bits() == pval.raw_bits() => {}
-                _ => mismatches += 1,
-            }
-        }
-        for sid in par_map.keys() {
-            if !seq_map.contains_key(sid) {
-                mismatches += 1;
-            }
-        }
-        (seq_map.len(), mismatches, seq_ms, par_ms)
-    }
-
-    /// Build the `Send`-able comb-settle context (executable form of the
-    /// comb layer, no AST). Compiled blocks containing a `StmtFallback`
-    /// insn are demoted to `AstFallback` so the worker context carries no
-    /// `Arc<Statement>` it would execute.
-    pub fn extract_comb_settle_ctx(&self) -> CombSettleCtx {
-        use super::bytecode::Insn;
-        let items = self
-            .comb_entries
-            .iter()
-            .map(|e| match &e.item {
-                CombItem::Noop => SendCombItem::Noop,
-                // §29 UDPs disable parallel settle (has_udp forces serial), so a
-                // UDP never reaches a worker; represent it inertly here.
-                CombItem::Udp { .. } | CombItem::UdpBatch { .. } | CombItem::TimingCheck { .. } => {
-                    SendCombItem::Noop
-                }
-                // Not par-safe (see extract ctx safety list); never partitioned.
-                CombItem::GateRegion { .. }
-                | CombItem::VectorGate { .. }
-                | CombItem::ScatterGate { .. } => SendCombItem::Noop,
-                CombItem::FastDirectCopy { dst_id, src_id } => SendCombItem::FastDirectCopy {
-                    dst_id: *dst_id,
-                    src_id: *src_id,
-                },
-                CombItem::FastDirectFanout { src_id, dst_ids } => SendCombItem::FastDirectFanout {
-                    src_id: *src_id,
-                    dst_ids: dst_ids.clone(),
-                },
-                CombItem::DirectCopy {
-                    dst_id,
-                    src_id,
-                    width,
-                } => SendCombItem::DirectCopy {
-                    dst_id: *dst_id,
-                    src_id: *src_id,
-                    width: *width,
-                },
-                CombItem::CompiledContAssign { compiled, .. }
-                | CombItem::CompiledAlwaysBlock { compiled, .. } => {
-                    if compiled.instructions.iter().any(|i| {
-                        matches!(
-                            i,
-                            Insn::StmtFallback(..) | Insn::EvalExprFallback(..) | Insn::CovHit(..)
-                        )
-                    }) {
-                        SendCombItem::AstFallback
-                    } else {
-                        SendCombItem::Compiled(compiled.clone())
-                    }
-                }
-                CombItem::FusedGate { op } => SendCombItem::Fused(*op),
-                CombItem::CtlGate { slot } => {
-                    SendCombItem::Fused(self.ctl_gates[*slot as usize].op)
-                }
-                CombItem::FusedBufFanout { src, dsts, invert } => SendCombItem::FusedBufFanout {
-                    src: *src,
-                    dsts: dsts.clone(),
-                    invert: *invert,
-                },
-                CombItem::FusedAndFanout {
-                    common,
-                    branches,
-                    invert,
-                } => SendCombItem::FusedAndFanout {
-                    common: *common,
-                    branches: branches.clone(),
-                    invert: *invert,
-                },
-                CombItem::ContAssign { .. } | CombItem::AlwaysBlock { .. } => {
-                    SendCombItem::AstFallback
-                }
-            })
-            .collect();
-        CombSettleCtx {
-            items,
-            dep_offsets: self.comb_dep_offsets.clone(),
-            dep_entries: self.comb_dep_entries.clone(),
-            signal_widths: self.signal_widths.clone(),
-            signal_signed: self.signal_signed.clone(),
-            signal_two_state: self.signal_two_state.clone(),
-            signal_gate_driven: self.signal_gate_driven.clone(),
-            signal_name_to_id: self.signal_name_to_id.clone(),
-            array_first_id: self.array_first_id.clone(),
-        }
-    }
-
-    /// PDES Phase 4: run the two per-LP settles CONCURRENTLY on worker
-    /// threads via the `Send`-able `CombSettleCtx`, and cross-check the
-    /// merged result against the global settle. Also times a sequential
-    /// run of the same two settles for a speedup comparison.
-    ///
-    /// Returns `(mismatches, unsupported, seq_ms, par_ms, clone_ms)`, where
-    /// seq_ms/par_ms are SETTLE-ONLY (views pre-cloned) and clone_ms is one
-    /// view clone. mismatches==0 confirms the threaded driver matches the
-    /// global settle.
-    pub fn pdes_validate_perlp_settle_threaded(
-        &self,
-        part: &crate::multikernel::CombPartition,
-    ) -> (usize, u64, f64, f64, f64) {
-        let ctx = self.extract_comb_settle_ctx();
-        let n_entries = self.comb_entries.len();
-        let n_signals = self.signal_table.len();
-        let limit = self.settle_limit as u64;
-
-        let mut in_a = vec![false; n_entries];
-        for &e in &part.lp_entries[0] {
-            in_a[e] = true;
-        }
-        let mut in_b = vec![false; n_entries];
-        for &e in &part.lp_entries[1] {
-            in_b[e] = true;
-        }
-
-        let golden = &self.signal_table;
-        // Merge by writer-LP ownership: a signal owned by LP `want` must
-        // match golden after that LP's settle.
-        let owner = &part.signal_owner_lp;
-        let count_mismatch = |view: &[Value], want: u8| -> usize {
-            let mut m = 0usize;
-            for id in 0..n_signals {
-                if owner[id] != want {
-                    continue;
-                }
-                let (gv, gx) = golden[id].raw_bits();
-                let (nv, nx) = view[id].raw_bits();
-                if gv != nv || gx != nx {
-                    m += 1;
-                }
-            }
-            m
-        };
-
-        // Standalone view-clone cost (the per-tick overhead a real
-        // event_loop pays ONCE via persistent views, but which dominates
-        // this one-shot harness).
-        let clone_start = std::time::Instant::now();
-        let mut view_a = golden.clone();
-        let clone_ms = clone_start.elapsed().as_secs_f64() * 1000.0;
-        let mut view_b = golden.clone();
-
-        // Sequential SETTLE-ONLY timing (views pre-cloned above, untimed).
-        let seq_start = std::time::Instant::now();
-        let (_ia, _ua) = ctx.settle_subset(&mut view_a, &in_a, &part.lp_entries[0], limit);
-        let (_ib, _ub) = ctx.settle_subset(&mut view_b, &in_b, &part.lp_entries[1], limit);
-        let seq_ms = seq_start.elapsed().as_secs_f64() * 1000.0;
-
-        // Reset views to golden (untimed) for the parallel run.
-        view_a.clone_from(golden);
-        view_b.clone_from(golden);
-
-        // Parallel SETTLE-ONLY: each LP settles its pre-cloned view on its
-        // own thread. No clone inside the timed region.
-        let par_start = std::time::Instant::now();
-        let (ua, ub) = std::thread::scope(|s| {
-            let ctx_ref = &ctx;
-            let in_a_ref = &in_a;
-            let in_b_ref = &in_b;
-            let seed_a = &part.lp_entries[0];
-            let seed_b = &part.lp_entries[1];
-            let va = &mut view_a;
-            let vb = &mut view_b;
-            let ha = s.spawn(move || ctx_ref.settle_subset(va, in_a_ref, seed_a, limit).1);
-            let hb = s.spawn(move || ctx_ref.settle_subset(vb, in_b_ref, seed_b, limit).1);
-            (ha.join().unwrap(), hb.join().unwrap())
-        });
-        let par_ms = par_start.elapsed().as_secs_f64() * 1000.0;
-
-        let mismatches = count_mismatch(&view_a, 0) + count_mismatch(&view_b, 1);
-        let _ = clone_ms;
-        (mismatches, ua + ub, seq_ms, par_ms, clone_ms)
-    }
-
-    /// PDES Phase 4: partition the combinational settle layer across LPs.
-    /// Assigns each comb entry to the LP owning its first write target
-    /// (by hierarchical name prefix vs `lp_a_prefix`), separating entries
-    /// that straddle both LPs and those with no write target. Computes the
-    /// boundary signal set (signals read by an entry of a different LP than
-    /// the signal's own) and counts comb_dep edges crossing the LP cut.
-    ///
-    /// This is analysis-only — it mutates nothing. The returned
-    /// `CombPartition` is the worklist each per-LP settle worker iterates.
-    pub fn pdes_build_comb_partition(
-        &self,
-        lp_a_prefix: &str,
-    ) -> crate::multikernel::CombPartition {
-        const LP_A: u8 = 0;
-        const LP_B: u8 = 1;
-        let n_signals = self.signal_table.len();
-        let dot_prefix = format!("{}.", lp_a_prefix);
-
-        // sig_lp[id] = owning LP by the signal's own hierarchical name.
-        let mut sig_lp: Vec<u8> = vec![LP_B; n_signals];
-        for id in 0..n_signals {
-            let name = self.name_for_id(id);
-            if name == lp_a_prefix || name.starts_with(&dot_prefix) {
-                sig_lp[id] = LP_A;
-            }
-        }
-
-        // entry_lp[eidx]: LP_A / LP_B for cleanly-owned entries; the
-        // straddle/orphan cases are tracked separately and given a sentinel.
-        const LP_STRADDLE: u8 = 0xFE;
-        const LP_ORPHAN: u8 = 0xFF;
-        let n_entries = self.comb_entries.len();
-        let mut entry_lp: Vec<u8> = vec![LP_ORPHAN; n_entries];
-        let mut lp_entries: Vec<Vec<usize>> = vec![Vec::new(), Vec::new()];
-        let mut straddle_entries: Vec<usize> = Vec::new();
-        let mut orphan_entries: Vec<usize> = Vec::new();
-
-        for (eidx, e) in self.comb_entries.iter().enumerate() {
-            let mut lp: Option<u8> = None;
-            let mut straddles = false;
-            for &w in &e.cold.write_signal_ids {
-                if w >= n_signals {
-                    continue;
-                }
-                match lp {
-                    None => lp = Some(sig_lp[w]),
-                    Some(prev) if prev != sig_lp[w] => {
-                        straddles = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            match (straddles, lp) {
-                (true, _) => {
-                    entry_lp[eidx] = LP_STRADDLE;
-                    straddle_entries.push(eidx);
-                }
-                (false, Some(l)) => {
-                    entry_lp[eidx] = l;
-                    lp_entries[l as usize].push(eidx);
-                }
-                (false, None) => {
-                    entry_lp[eidx] = LP_ORPHAN;
-                    orphan_entries.push(eidx);
-                }
-            }
-        }
-
-        // Walk the comb_dep CSR: for each source signal, its dependent
-        // entries. An edge crosses the LP cut when the dependent entry's
-        // LP differs from the source signal's LP. The source of any such
-        // edge is a boundary signal (the channel set).
-        let mut is_boundary = vec![false; n_signals];
-        let mut dep_edges_total = 0u64;
-        let mut dep_edges_cross_lp = 0u64;
-        let dep_len = self.comb_dep_offsets.len().saturating_sub(1);
-        for src in 0..dep_len.min(n_signals) {
-            let lo = self.comb_dep_offsets[src] as usize;
-            let hi = self.comb_dep_offsets[src + 1] as usize;
-            if lo == hi {
-                continue;
-            }
-            let src_lp = sig_lp[src];
-            for &dep_eidx_u32 in &self.comb_dep_entries[lo..hi] {
-                let dep_eidx = dep_eidx_u32 as usize;
-                dep_edges_total += 1;
-                let elp = entry_lp.get(dep_eidx).copied().unwrap_or(LP_ORPHAN);
-                // Only A/B-owned entries can definitively cross; straddle/
-                // orphan entries run on the coordinator and read globally.
-                if (elp == LP_A || elp == LP_B) && elp != src_lp {
-                    dep_edges_cross_lp += 1;
-                    if !is_boundary[src] {
-                        is_boundary[src] = true;
-                    }
-                }
-            }
-        }
-        let boundary_signal_ids: Vec<usize> =
-            (0..n_signals).filter(|&id| is_boundary[id]).collect();
-
-        // Per-signal owner = LP of the entries that write it.
-        let mut signal_owner_lp = vec![0xFFu8; n_signals];
-        for lp in 0..2usize {
-            for &eidx in &lp_entries[lp] {
-                for &wid in &self.comb_entries[eidx].cold.write_signal_ids {
-                    if wid < n_signals {
-                        signal_owner_lp[wid] = lp as u8;
-                    }
-                }
-            }
-        }
-
-        crate::multikernel::CombPartition {
-            lp_entries,
-            straddle_entries,
-            orphan_entries,
-            total_entries: n_entries,
-            boundary_signal_ids,
-            dep_edges_total,
-            dep_edges_cross_lp,
-            signal_owner_lp,
-        }
-    }
-
-    /// PDES Phase 4: balanced 2-LP partition of the comb layer for a
-    /// dual-core split. LP-0 = `prefix0` subtree (core0), LP-1 = `prefix1`
-    /// subtree (core1) — symmetric and equal-sized. The remaining "uncore"
-    /// entries (L2 / fabric / peripherals) are distributed between the two
-    /// LPs by read-affinity: an uncore signal read by exactly one core's
-    /// logic goes to that core's LP; signals read by both/neither balance
-    /// by running count. All writer-entries of a given signal move together
-    /// (decision is per write-target signal), preserving single-writer-per-
-    /// LP so the merge stays unambiguous. Entries whose uncore write targets
-    /// disagree on owner become straddle (coordinator-run).
-    pub fn pdes_build_comb_partition_balanced(
-        &self,
-        prefix0: &str,
-        prefix1: &str,
-    ) -> crate::multikernel::CombPartition {
-        const C0: u8 = 0;
-        const C1: u8 = 1;
-        const UNCORE: u8 = 2;
-        let n_signals = self.signal_table.len();
-        let n_entries = self.comb_entries.len();
-        let dot0 = format!("{}.", prefix0);
-        let dot1 = format!("{}.", prefix1);
-
-        let mut sig_class = vec![UNCORE; n_signals];
-        for id in 0..n_signals {
-            let name = self.name_for_id(id);
-            if name == prefix0 || name.starts_with(&dot0) {
-                sig_class[id] = C0;
-            } else if name == prefix1 || name.starts_with(&dot1) {
-                sig_class[id] = C1;
-            }
-        }
-
-        // Class of an entry = class of its (first) write target.
-        let entry_class = |e: &CombEntry| -> u8 {
-            e.cold
-                .write_signal_ids
-                .first()
-                .and_then(|&w| {
-                    if w < n_signals {
-                        Some(sig_class[w])
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(UNCORE)
-        };
-
-        // Read-affinity of uncore signals: which core's entries read them.
-        let mut readby_c0 = vec![false; n_signals];
-        let mut readby_c1 = vec![false; n_signals];
-        for e in &self.comb_entries {
-            let ec = entry_class(e);
-            if ec == C0 || ec == C1 {
-                for &r in &e.cold.read_signal_ids {
-                    if r < n_signals && sig_class[r] == UNCORE {
-                        if ec == C0 {
-                            readby_c0[r] = true;
-                        } else {
-                            readby_c1[r] = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Owner LP per uncore signal (writers move with the signal).
-        let mut owner = vec![0xFFu8; n_signals];
-        let (mut bal0, mut bal1) = (0i64, 0i64);
-        for id in 0..n_signals {
-            if sig_class[id] != UNCORE {
-                continue;
-            }
-            let o = if readby_c0[id] && !readby_c1[id] {
-                0u8
-            } else if readby_c1[id] && !readby_c0[id] {
-                1u8
-            } else if bal0 <= bal1 {
-                0u8
-            } else {
-                1u8
-            };
-            owner[id] = o;
-            if o == 0 {
-                bal0 += 1;
-            } else {
-                bal1 += 1;
-            }
-        }
-
-        let mut lp_entries: Vec<Vec<usize>> = vec![Vec::new(), Vec::new()];
-        let mut straddle_entries: Vec<usize> = Vec::new();
-        let mut orphan_entries: Vec<usize> = Vec::new();
-        let mut entry_lp = vec![0xFFu8; n_entries];
-        for (eidx, e) in self.comb_entries.iter().enumerate() {
-            let ec = entry_class(e);
-            let lp = if ec == C0 {
-                0u8
-            } else if ec == C1 {
-                1u8
-            } else {
-                // Uncore: owner of its write target(s). Disagreement → straddle.
-                let mut chosen: Option<u8> = None;
-                let mut straddles = false;
-                for &w in &e.cold.write_signal_ids {
-                    if w >= n_signals {
-                        continue;
-                    }
-                    let o = owner[w];
-                    match chosen {
-                        None => chosen = Some(o),
-                        Some(p) if p != o => {
-                            straddles = true;
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-                if straddles {
-                    entry_lp[eidx] = 0xFE;
-                    straddle_entries.push(eidx);
-                    continue;
-                }
-                match chosen {
-                    Some(o) => o,
-                    None => {
-                        orphan_entries.push(eidx);
-                        continue;
-                    }
-                }
-            };
-            entry_lp[eidx] = lp;
-            lp_entries[lp as usize].push(eidx);
-        }
-
-        // Per-signal owner from final assignment.
-        let mut signal_owner_lp = vec![0xFFu8; n_signals];
-        for lp in 0..2usize {
-            for &eidx in &lp_entries[lp] {
-                for &wid in &self.comb_entries[eidx].cold.write_signal_ids {
-                    if wid < n_signals {
-                        signal_owner_lp[wid] = lp as u8;
-                    }
-                }
-            }
-        }
-
-        // Cross-LP comb_dep edges + boundary set, against the final owner.
-        let mut is_boundary = vec![false; n_signals];
-        let mut dep_edges_total = 0u64;
-        let mut dep_edges_cross_lp = 0u64;
-        let dep_len = self.comb_dep_offsets.len().saturating_sub(1);
-        for src in 0..dep_len.min(n_signals) {
-            let lo = self.comb_dep_offsets[src] as usize;
-            let hi = self.comb_dep_offsets[src + 1] as usize;
-            if lo == hi {
-                continue;
-            }
-            let src_lp = signal_owner_lp[src];
-            for &dep_eidx_u32 in &self.comb_dep_entries[lo..hi] {
-                let dep_eidx = dep_eidx_u32 as usize;
-                dep_edges_total += 1;
-                let elp = entry_lp.get(dep_eidx).copied().unwrap_or(0xFF);
-                if (elp == 0 || elp == 1) && src_lp != 0xFF && elp != src_lp {
-                    dep_edges_cross_lp += 1;
-                    is_boundary[src] = true;
-                }
-            }
-        }
-        let boundary_signal_ids: Vec<usize> =
-            (0..n_signals).filter(|&id| is_boundary[id]).collect();
-
-        crate::multikernel::CombPartition {
-            lp_entries,
-            straddle_entries,
-            orphan_entries,
-            total_entries: n_entries,
-            boundary_signal_ids,
-            dep_edges_total,
-            dep_edges_cross_lp,
-            signal_owner_lp,
-        }
-    }
-
-    /// PDES Phase 4 / Phase A de-risk: classify each cross-LP BOUNDARY
-    /// signal by its driver — REGISTERED (written by an edge block's NBA →
-    /// lookahead ≥1 cycle, sound for conservative PDES) vs COMBINATIONAL
-    /// (written by a comb entry → lookahead 0, requires merging both
-    /// endpoints into one LP). Semantic cut: `lp_a_prefix` subtree = LP-A,
-    /// everything else = LP-B. Boundary = a signal owned (by name) by one
-    /// LP and READ by a block/entry of the other.
-    ///
-    /// Returns `(n_boundary, registered, comb, both, undriven,
-    /// sample_comb_names)`. comb==0 → GO (lookahead-1 channel is
-    /// functionally sound). comb>0 → those signals' cones must be co-located.
-    pub fn pdes_boundary_lookahead_report(
-        &self,
-        lp_a_prefix: &str,
-    ) -> (usize, usize, usize, usize, usize, Vec<String>) {
-        use super::bytecode::Insn;
-        const A: u8 = 0;
-        const B: u8 = 1;
-        let n_signals = self.signal_table.len();
-        let dot = format!("{}.", lp_a_prefix);
-        let sig_lp = |id: usize| -> u8 {
-            let name = self.name_for_id(id);
-            if name == lp_a_prefix || name.starts_with(&dot) {
-                A
-            } else {
-                B
-            }
-        };
-
-        // Driver classification: registered (edge NBA) vs comb (comb entry).
-        let mut edge_written = vec![false; n_signals];
-        let mut comb_written = vec![false; n_signals];
-        for cb in self.compiled_edge_blocks.iter().flatten() {
-            for insn in &cb.instructions {
-                let wid = match insn {
-                    Insn::NbaAssign(id, _, _)
-                    | Insn::NbaAssignConst(id, _, _)
-                    | Insn::NbaAssignRange(id, _, _, _)
-                    | Insn::NbaAssignBitDyn(id, _, _)
-                    | Insn::NbaAssignArrayRead(id, _, _, _)
-                    | Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
-                    _ => None,
-                };
-                if let Some(id) = wid {
-                    let id = id as usize;
-                    if id < n_signals {
-                        edge_written[id] = true;
-                    }
-                }
-            }
-        }
-        for e in &self.comb_entries {
-            for &w in &e.cold.write_signal_ids {
-                if w < n_signals {
-                    comb_written[w] = true;
-                }
-            }
-        }
-
-        // Reader-LP bitsets: which LP reads each signal via COMB vs via EDGE
-        // block. A cross-LP read consumed only by EDGE blocks has effective
-        // lookahead-1 (the consumer registers it → sound). A cross-LP read
-        // consumed by a COMB entry is the true zero-lookahead blocker.
-        let mut read_comb = vec![0u8; n_signals];
-        let mut read_edge = vec![0u8; n_signals];
-        for e in &self.comb_entries {
-            let elp = e
-                .cold
-                .write_signal_ids
-                .first()
-                .map(|&w| sig_lp(w))
-                .unwrap_or(B);
-            for &r in &e.cold.read_signal_ids {
-                if r < n_signals {
-                    read_comb[r] |= 1 << elp;
-                }
-            }
-        }
-        for cb in self.compiled_edge_blocks.iter().flatten() {
-            let mut blp = B;
-            for insn in &cb.instructions {
-                let wid = match insn {
-                    Insn::NbaAssign(id, _, _)
-                    | Insn::NbaAssignConst(id, _, _)
-                    | Insn::NbaAssignRange(id, _, _, _)
-                    | Insn::NbaAssignBitDyn(id, _, _)
-                    | Insn::NbaAssignArrayRead(id, _, _, _)
-                    | Insn::NbaAssignRangeDyn(id, _, _, _) => Some(*id),
-                    _ => None,
-                };
-                if let Some(id) = wid {
-                    let id = id as usize;
-                    if id < n_signals {
-                        blp = sig_lp(id);
-                        break;
-                    }
-                }
-            }
-            for insn in &cb.instructions {
-                if let Insn::LoadSignal(_, id)
-                | Insn::LoadSignalSigned(_, id)
-                | Insn::LoadSignalRange(_, id, _, _)
-                | Insn::LoadSignalBit(_, id, _)
-                | Insn::NbaAssignArrayRead(_, _, id, _)
-                | Insn::BranchIfSignalFalse(id, _, _) = insn
-                {
-                    let id = &(*id as usize);
-                    if *id < n_signals {
-                        read_edge[*id] |= 1 << blp;
-                    }
-                }
-            }
-        }
-
-        // n_boundary: read across the cut by anything.
-        // comb_consumed: read across the cut by a COMB entry (TRUE blocker —
-        //   zero-lookahead cross-LP path). registered/comb/both/undriven now
-        //   describe ONLY the comb-consumed set's PRODUCER (the co-location
-        //   target). sample_comb lists comb-consumed signals.
-        let (mut n_boundary, mut comb_consumed) = (0usize, 0usize);
-        let (mut registered, mut comb, mut both, mut undriven) = (0, 0, 0, 0);
-        let mut sample_comb: Vec<String> = Vec::new();
-        for sid in 0..n_signals {
-            let owner = sig_lp(sid);
-            let other = if owner == A { 1 << B } else { 1 << A };
-            let read_other = (read_comb[sid] | read_edge[sid]) & other != 0;
-            if !read_other {
-                continue;
-            }
-            n_boundary += 1;
-            if read_comb[sid] & other == 0 {
-                continue; // consumed only by edge blocks across the cut → sound
-            }
-            comb_consumed += 1;
-            match (edge_written[sid], comb_written[sid]) {
-                (true, false) => registered += 1,
-                (false, true) => comb += 1,
-                (true, true) => both += 1,
-                (false, false) => undriven += 1,
-            }
-            if sample_comb.len() < 30 {
-                sample_comb.push(self.name_for_id(sid).to_string());
-            }
-        }
-        // Return: (boundary, comb_consumed, comb-produced, both-produced,
-        // undriven-produced, sample). comb_consumed==0 → GO.
-        let _ = registered;
-        (n_boundary, comb_consumed, comb, both, undriven, sample_comb)
-    }
-
-    /// PDES Phase A.2: cycle-vs-feedforward analysis of the cross-LP comb
-    /// coupling. Determines whether the 115 zero-lookahead cross-LP comb
-    /// paths can be resolved by producer-ordered settle (feedforward) or
-    /// require iterated boundary exchange (bidirectional), and how many
-    /// exchange rounds (the cross-LP wavefront depth). A true combinational
-    /// CYCLE shows as non-convergence of the wavefront propagation.
-    ///
-    /// Returns `(a_to_b_edges, b_to_a_edges, max_crossings, rounds,
-    /// converged)`. Unidirectional (one of a_to_b/b_to_a is 0) → feedforward
-    /// (1 producer-first pass). Bidirectional → needs `max_crossings`
-    /// exchange rounds. !converged → comb cycle (or depth > cap).
-    pub fn pdes_crosslp_cycle_analysis(&self, lp_a_prefix: &str) -> (u64, u64, u32, u32, bool) {
-        let n_signals = self.signal_table.len();
-        let dot = format!("{}.", lp_a_prefix);
-        let sig_lp: Vec<u8> = (0..n_signals)
-            .map(|id| {
-                let name = self.name_for_id(id);
-                if name == lp_a_prefix || name.starts_with(&dot) {
-                    0u8
-                } else {
-                    1u8
-                }
-            })
-            .collect();
-        let entry_lp = |e: &CombEntry| -> u8 {
-            e.cold
-                .write_signal_ids
-                .first()
-                .map(|&w| if w < n_signals { sig_lp[w] } else { 1 })
-                .unwrap_or(1)
-        };
-
-        // Direction of cross-LP comb dep edges (src signal LP -> consuming
-        // entry LP).
-        let (mut a_to_b, mut b_to_a) = (0u64, 0u64);
-        let dep_len = self.comb_dep_offsets.len().saturating_sub(1);
-        for src in 0..dep_len.min(n_signals) {
-            let lo = self.comb_dep_offsets[src] as usize;
-            let hi = self.comb_dep_offsets[src + 1] as usize;
-            if lo == hi {
-                continue;
-            }
-            let slp = sig_lp[src];
-            for &dep_u in &self.comb_dep_entries[lo..hi] {
-                let dep = dep_u as usize;
-                if let Some(e) = self.comb_entries.get(dep) {
-                    let elp = entry_lp(e);
-                    if slp != elp {
-                        if slp == 0 {
-                            a_to_b += 1;
-                        } else {
-                            b_to_a += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Wavefront: cross[out] = max LP-boundary crossings on any comb path
-        // ending at `out`. Propagate over entries (reads -> writes) to fix-
-        // point. Stable in <= longest-path rounds for a DAG; unbounded
-        // growth => comb cycle (capped).
-        let cap = 256u32;
-        let mut cross = vec![0u32; n_signals];
-        let mut rounds = 0u32;
-        let mut converged = false;
-        loop {
-            rounds += 1;
-            let mut changed = false;
-            for e in &self.comb_entries {
-                if e.cold.write_signal_ids.is_empty() {
-                    continue;
-                }
-                for &out in &e.cold.write_signal_ids {
-                    if out >= n_signals {
-                        continue;
-                    }
-                    let olp = sig_lp[out];
-                    let mut nl = 0u32;
-                    for &r in &e.cold.read_signal_ids {
-                        if r < n_signals {
-                            let c = cross[r] + if sig_lp[r] != olp { 1 } else { 0 };
-                            if c > nl {
-                                nl = c;
-                            }
-                        }
-                    }
-                    if nl > cross[out] {
-                        cross[out] = nl;
-                        changed = true;
-                    }
-                }
-            }
-            if !changed {
-                converged = true;
-                break;
-            }
-            if rounds >= cap {
-                break;
-            }
-        }
-        let max_crossings = cross.iter().copied().max().unwrap_or(0);
-        (a_to_b, b_to_a, max_crossings, rounds, converged)
     }
 
     /// `XEZIM_INIT_REG=0|random` — initialize REGISTER-class storage at t=0
@@ -22916,6 +21019,17 @@ impl Simulator {
             .into_iter()
             .map(|ev| (ev, None, None))
             .collect();
+        let wait_is_clocking: Vec<bool> = if self.clocking_meta.is_empty() {
+            vec![false; waits.len()]
+        } else {
+            let saved = self
+                .name_resolve_hint
+                .borrow_mut()
+                .replace(scope.to_string());
+            let v = waits.iter().map(|w| self.is_clocking_event(&w.0)).collect();
+            *self.name_resolve_hint.borrow_mut() = saved;
+            v
+        };
         let mut cb = compiler.finish();
         // Constant-delay fold: an integer bare delay elaborates to
         // `LoadConst(int) ; LoadConst(real scale) ; Mul ; WaitDelayReg`.
@@ -23029,6 +21143,7 @@ impl Simulator {
                 ts: self.lower_proc_fsm_ts(&cb),
                 compiled: cb,
                 waits,
+                wait_is_clocking,
                 pc: 0,
                 regs: Vec::new(),
                 scope: scope.to_string(),
@@ -25661,7 +23776,7 @@ impl Simulator {
     fn ctl_build(&mut self) {
         const CTL_MIN_FANOUT: u32 = 64;
         debug_assert!(self.ctl_gates.is_empty());
-        if !self.ctl_on || !self.sdf_delays.is_empty() || self.perlp_settle.is_some() {
+        if !self.ctl_on || !self.sdf_delays.is_empty() {
             return;
         }
         let n = self.comb_entries.len();
@@ -31874,8 +29989,8 @@ impl Simulator {
         _signal_signed: &[bool],
         signal_name_to_id: &NameMap,
         array_first_id: &HashMap<Arc<str>, (usize, i64, i64)>,
-        // Read-only view of the packed arena. None on the PDES paths, which
-        // carry only a cloned signal table: a packed cell then reads x.
+        // Read-only view of the packed arena. With None a packed cell
+        // reads x.
         packed: Option<&PackedMem>,
         vm_regs: &mut Vec<Value>,
         block_index: u32,
@@ -32613,6 +30728,7 @@ impl Simulator {
                 Insn::ClearSigned(reg) => {
                     vm_regs[*reg as usize].is_signed = false;
                 }
+                Insn::DropXz(reg) => drop_xz(&mut vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
@@ -32643,7 +30759,7 @@ impl Simulator {
 
     /// Comb-settle counterpart of `exec_insns_isolated`. Evaluates a
     /// compiled comb block (`CompiledContAssign` / `CompiledAlwaysBlock`)
-    /// against a mutable per-LP signal `view`:
+    /// against a mutable signal `view`:
     ///   - `BlockingAssign*` writes land IMMEDIATELY in `view` and append
     ///     the dirtied signal id to `dirtied` (for worklist propagation),
     ///     matching the immediate-write semantics of comb settle.
@@ -32651,8 +30767,7 @@ impl Simulator {
     ///     like the sequential settle queues comb-block NBAs for end-of-
     ///     tick application.
     /// Expression arms are identical to `exec_insns_isolated` but read
-    /// from `view` (the per-LP table holds all of the LP's reads, with
-    /// boundary inputs frozen at the channel-delivered value).
+    /// from `view`.
     ///
     /// Returns `(deferred_nbas, unsupported)`. `unsupported=true` means the
     /// block contains an insn this evaluator can't handle — the caller must
@@ -33149,6 +31264,7 @@ impl Simulator {
                 Insn::ClearSigned(reg) => {
                     vm_regs[*reg as usize].is_signed = false;
                 }
+                Insn::DropXz(reg) => drop_xz(&mut vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     vm_regs[*d as usize] = vm_regs[*l as usize].power(&vm_regs[*r as usize]);
                 }
@@ -33523,27 +31639,13 @@ impl Simulator {
                 // `is_supported` list rotted to 28% with no build error), and
                 // this match is the safety net for porting the exec loops to a
                 // new instruction representation, so it must not have a hole.
-                insn @ (Insn::NbaAssignRangeDyn(..)
+                Insn::NbaAssignRangeDyn(..)
                 | Insn::NbaAssignArrayRange(..)
                 | Insn::BlockingAssignArrayRange(..)
                 | Insn::StmtFallback(..)
                 | Insn::EvalExprFallback(..)
-                | Insn::CovHit(..)) => {
+                | Insn::CovHit(..) => {
                     unsupported = true;
-                    if std::env::var("XEZIM_PDES_CHK_KINDS").ok().as_deref() == Some("1") {
-                        let kind = match insn {
-                            Insn::StmtFallback(..) => "StmtFallback",
-                            Insn::CovHit(..) => "CovHit",
-                            Insn::EvalExprFallback(..) => "EvalExprFallback",
-                            Insn::BlockingAssignArrayRange(..) => "BlockingAssignArrayRange",
-                            Insn::NbaAssignRangeDyn(..) => "NbaAssignRangeDyn",
-                            Insn::NbaAssignArrayRange(..) => "NbaAssignArrayRange",
-                            // Unreachable: the arm pattern above admits only
-                            // the four listed variants.
-                            _ => unreachable!("exec_comb_block_isolated unsupported-arm kind"),
-                        };
-                        eprintln!("[PDES-CHK-UNSUP] {}", kind);
-                    }
                 }
             }
             pc += 1;
@@ -36699,6 +34801,7 @@ impl Simulator {
                 Insn::ClearSigned(reg) => {
                     self.vm_regs[*reg as usize].is_signed = false;
                 }
+                Insn::DropXz(reg) => drop_xz(&mut self.vm_regs[*reg as usize]),
                 Insn::Pow(d, l, r) => {
                     self.vm_regs[*d as usize] =
                         self.vm_regs[*l as usize].power(&self.vm_regs[*r as usize]);
@@ -43642,6 +41745,25 @@ impl Simulator {
                     Self::collect_expr_reads(e, module, r)
                 };
             }
+            // §9.2.2.2.1 / §16.3: an immediate or deferred assertion's
+            // expression and action blocks are part of the procedure, so an
+            // `always_comb` / `always @*` whose only reads are in an assertion
+            // still re-runs when they change. A concurrent assertion samples
+            // on its own clock and adds nothing.
+            StatementKind::Assertion(a) if !a.is_property => {
+                if let Some(r) = reads.as_deref_mut() {
+                    Self::collect_expr_reads(&a.expr, module, r)
+                };
+                for act in [&a.action, &a.else_action].into_iter().flatten() {
+                    Self::collect_stmt_rw(
+                        act,
+                        module,
+                        reads.as_deref_mut(),
+                        writes,
+                        arrays.as_deref_mut(),
+                    );
+                }
+            }
             StatementKind::VarDecl { declarators, .. } => {
                 for d in declarators {
                     // A block-local is written by this block, never an external
@@ -44380,6 +42502,13 @@ impl Simulator {
     }
 
     fn event_to_sens(&self, event: &EventControl) -> Vec<Sensitivity> {
+        // §13.5.2: inside a task, an event control on a `ref` formal waits
+        // on the ACTUAL (see `ref_event_control`).
+        if self.ref_redirect_possible() {
+            if let Some(ev) = self.ref_event_control(event) {
+                return self.event_to_sens(&ev);
+            }
+        }
         // Walk past Paren / RangeSelect / BitSelect / Concatenation wrappers
         // to find the underlying Ident(s). For E902 etc. that use
         // `always @(sig[5:0] or other)` the sensitivity expression is a
@@ -45683,6 +43812,71 @@ impl Simulator {
         }
     }
 
+    /// §14.13: an explicit `@(cb)` (not the `##N` default-clocking form)
+    /// whose block's clock edge is due in THIS time slot but not yet
+    /// processed by `tick_clocking_blocks` — a process that reached it in
+    /// the Active region after the raw edge (`@(posedge clk); @(cb);`) still
+    /// sees this slot's clocking event, which the block raises after it
+    /// samples. Such a continuation is resumed with the slot's clocking
+    /// waiters instead of waiting a whole cycle.
+    fn clocking_event_due_now(&self, event: &EventControl) -> bool {
+        if self.clocking_tick_cache.is_empty() {
+            return false;
+        }
+        let key = match event {
+            EventControl::Identifier(id) => {
+                if id.name.starts_with("__xz_default_clocking") {
+                    return false;
+                }
+                self.clocking_meta
+                    .contains_key(&id.name)
+                    .then(|| id.name.clone())
+            }
+            EventControl::HierIdentifier(e) => match &e.kind {
+                ExprKind::Ident(h) => {
+                    let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+                    self.resolve_clocking_key(&segs)
+                }
+                _ => None,
+            },
+            EventControl::EventExpr(exprs) if exprs.len() == 1 && exprs[0].edge.is_none() => {
+                let rebased = self.vif_rebase_expr(&exprs[0].expr);
+                let term = rebased.as_ref().unwrap_or(&exprs[0].expr);
+                let flat = Self::member_chain_as_flat_ident_for_sens(term);
+                let term = flat.as_ref().unwrap_or(term);
+                match &term.kind {
+                    ExprKind::Ident(h) => {
+                        let segs: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
+                        self.resolve_clocking_key(&segs)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(key) = key else {
+            return false;
+        };
+        if key.starts_with("__xz_default_clocking") {
+            return false;
+        }
+        let Some(ent) = self.clocking_tick_cache.iter().find(|t| t.cb == key) else {
+            return false;
+        };
+        let cur = match ent.id {
+            Some(id) => self.signal_table[id]
+                .to_u64()
+                .map(|u| (u & 1) as u8)
+                .unwrap_or(2),
+            None => return false,
+        };
+        match ent.edge {
+            EdgeKind::Negedge => ent.prev == 1 && cur == 0,
+            EdgeKind::Posedge => ent.prev == 0 && cur == 1,
+            _ => ent.prev != cur && ent.prev != 2 && cur != 2,
+        }
+    }
+
     /// Edge check against an EXPLICIT prior value (the waiter's arm-time
     /// snapshot) rather than `prev_val`. Used for a waiter registered in the
     /// current snapshot generation: comparing against the value the signal had
@@ -46337,9 +44531,8 @@ impl Simulator {
 
     /// One simulation tick: snap → delayed → fire-clocks → process batch →
     /// apply_nba → settle → check_edges → cascade drain → monitor/trace.
-    /// Factored out of `event_loop` (Phase 3 of PERLP-EVENTLOOP-PLAN.md) so
-    /// future per-LP threads can drive their own ticks via this entry
-    /// point.  Pure refactor — preserves single-threaded behavior exactly.
+    /// Factored out of `event_loop`.  Pure refactor — preserves
+    /// single-threaded behavior exactly.
     ///
     /// `#[inline(always)]` because LLVM's auto-inline heuristic refused
     /// the body's size and the un-inlined version regressed hello by 15×
@@ -47571,101 +45764,8 @@ impl Simulator {
         self.loop_iters += 1;
     }
 
-    /// Phase 4 entry point (PERLP-EVENTLOOP-PLAN.md). Gated by env var
-    /// `XEZIM_DISPATCHER=perlp` so the default path stays single-threaded.
-    /// Current state: scaffolding only — falls through to the
-    /// single-threaded `event_loop_singlethread` body.  See
-    /// `PER-LP-NEXT-STEPS.md` for the implementation plan.
-    ///
-    /// Future work (Phase 4 proper, ~500 LOC):
-    ///  1. Spawn N OS threads, each running `run_one_tick` on a per-LP
-    ///     `EventLoopState` against a per-LP `PerLpSignalTable`.
-    ///  2. Drain inbound `BoundaryChannel` writes into the local table
-    ///     before each tick.
-    ///  3. Push outbound writes onto channels after each tick.
-    ///  4. `ClockBarrier::wait()` rendezvous (K=1 initially; K>1 in Phase 5).
-    ///  5. Route `$display` / `$finish` / `$readmemh` through the I/O LP.
-    /// Per-LP loop — step 1: persistent barrier harness.
-    ///
-    /// Spawns N persistent worker threads (no-ops in this step) that
-    /// rendezvous with the coordinator via a `ClockBarrier` twice per tick
-    /// (tick-start + tick-end). The coordinator runs the *real* single-thread
-    /// loop, so this is correctness-neutral — it only proves the persistent
-    /// coordinator↔worker handshake + clean shutdown drive a full sim to
-    /// `$finish`. Steps 2/3 move edge exec then settle onto the workers.
-    ///
-    /// Shutdown protocol: the loop only ever exits at the *top* (while-cond
-    /// false, or a `break` before the tick-start wait), so when the
-    /// coordinator leaves the loop every worker is blocked at its tick-start
-    /// wait. The coordinator then sets `shutdown` and does ONE final
-    /// `barrier.wait()` — releasing the workers, which observe the flag and
-    /// break before their tick-end wait. Counts stay matched throughout.
-    fn event_loop_perlp(&mut self) {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let n_workers: usize = 2;
-        let barrier = Arc::new(crate::multikernel::ClockBarrier::new(n_workers + 1));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        eprintln!(
-            "[PERLP] step-1 barrier harness: {} persistent no-op workers, coordinator runs the loop",
-            n_workers
-        );
-        // B2a: build the per-LP settle state so settle_combinatorial routes
-        // to the partitioned + iterated settle. If unbuildable (no prefix /
-        // JIT inline-bits / activity-mon / SDF), settle stays canonical.
-        if self.build_perlp_settle_state() {
-            eprintln!("[PERLP] per-LP partitioned settle ENABLED");
-        }
-        std::thread::scope(|scope| {
-            for w in 0..n_workers {
-                let barrier = Arc::clone(&barrier);
-                let shutdown = Arc::clone(&shutdown);
-                scope.spawn(move || {
-                    let _ = w;
-                    loop {
-                        barrier.wait(); // tick-start rendezvous
-                        if shutdown.load(Ordering::Acquire) {
-                            break;
-                        }
-                        // step 1: no-op (steps 2/3: edge exec / settle here)
-                        barrier.wait(); // tick-end rendezvous
-                    }
-                });
-            }
-            // Coordinator drives the canonical loop, syncing each tick.
-            self.event_loop_singlethread(Some(&barrier));
-            // Loop done: release workers from their tick-start wait so they
-            // observe `shutdown` and exit. Exactly one wait — no tick-end.
-            shutdown.store(true, Ordering::Release);
-            barrier.wait();
-        });
-        eprintln!(
-            "[PERLP] step-1 barrier harness complete: {} workers joined",
-            n_workers
-        );
-        if self.prof_perlp_settle_fast + self.prof_perlp_settle_fallback > 0 {
-            eprintln!(
-                "[PERLP-SETTLE] settle calls: fast(partitioned)={} fallback(canonical)={}",
-                self.prof_perlp_settle_fast, self.prof_perlp_settle_fallback
-            );
-            let total = self.prof_perlp_total_ns.max(1);
-            eprintln!(
-                "[PERLP-SETTLE] perlp settle time: total={:.1}ms, parallelizable(2x settle_subset)={:.1}ms ({:.1}%) — B3 speedup ceiling: total/(total - compute/2) = {:.2}x",
-                self.prof_perlp_total_ns as f64 / 1e6,
-                self.prof_perlp_compute_ns as f64 / 1e6,
-                100.0 * self.prof_perlp_compute_ns as f64 / total as f64,
-                total as f64 / (total as f64 - self.prof_perlp_compute_ns as f64 / 2.0).max(1.0),
-            );
-        }
-    }
-
     fn event_loop(&mut self) {
-        // Dispatch: if XEZIM_DISPATCHER=perlp, attempt the per-LP path
-        // (Phase 4 — currently a stub that falls through to single-thread).
-        // Otherwise run the existing single-threaded driver.
-        if dispatcher_env_cached() == Some("perlp") && self.edge_block_partition_count >= 2 {
-            return self.event_loop_perlp();
-        }
-        self.event_loop_singlethread(None);
+        self.event_loop_singlethread();
     }
 
     /// Ask the event loop to stop at the next slot boundary and finalize.
@@ -47691,7 +45791,7 @@ impl Simulator {
         });
     }
 
-    fn event_loop_singlethread(&mut self, tick_barrier: Option<&crate::multikernel::ClockBarrier>) {
+    fn event_loop_singlethread(&mut self) {
         Self::install_interrupt_handler();
         let sim_start = std::time::Instant::now();
         // Realtime twin for the human-facing report (see crate::WallTimer).
@@ -48231,14 +46331,6 @@ impl Simulator {
                 }
             }
 
-            // Per-LP harness (step 1): rendezvous with persistent workers at
-            // tick start, run the tick, rendezvous again at tick end. Workers
-            // are no-ops in step 1 — this only proves the barrier skeleton.
-            // The two waits MUST bracket run_one_tick with no `break`/`return`
-            // between them so the worker/coordinator wait counts stay matched.
-            if let Some(b) = tick_barrier {
-                b.wait();
-            }
             // Complex synchronization handshakes legitimately spend many
             // delta cycles at one timestamp: every `#0` wait and each state resume
             // advances `cond_progress`. The zero-delay stall detector exists to catch
@@ -48253,9 +46345,6 @@ impl Simulator {
             self.run_one_tick(&mut accum, cascade_limit, iters, trace_loop);
             if self.cond_progress != cond_prog_before {
                 self.stall_iters = 0;
-            }
-            if let Some(b) = tick_barrier {
-                b.wait();
             }
             // The genuine library owns the full phase schedule
             // Periodic invariant check — every 1000 iters; bail on
@@ -48683,53 +46772,10 @@ impl Simulator {
         }
         if self.prof_par_dispatch_partition + self.prof_par_dispatch_legacy > 0 {
             chatter!(
-                "[PROF] par_dispatch partition={} legacy={} pdes={} (partition k={})",
+                "[PROF] par_dispatch partition={} legacy={} (partition k={})",
                 self.prof_par_dispatch_partition,
                 self.prof_par_dispatch_legacy,
-                self.prof_par_dispatch_pdes,
                 self.edge_block_partition_count
-            );
-        }
-        if self.prof_par_dispatch_pdes > 0 {
-            let spawn_ms = self.prof_pdes_spawn_ns as f64 / 1e6;
-            let exec_ms = self.prof_pdes_exec_ns as f64 / 1e6;
-            let merge_ms = self.prof_pdes_merge_ns as f64 / 1e6;
-            let total_ms = spawn_ms + exec_ms + merge_ms;
-            let n = self.prof_par_dispatch_pdes as f64;
-            chatter!(
-                "[PROF-pdes] {} dispatches, total {:.1}ms (spawn {:.1}ms {:.1}%, exec {:.1}ms {:.1}%, merge {:.1}ms {:.1}%); per-tick avg {:.1}µs spawn / {:.1}µs exec / {:.1}µs merge",
-                self.prof_par_dispatch_pdes,
-                total_ms,
-                spawn_ms,
-                100.0 * spawn_ms / total_ms.max(1e-9),
-                exec_ms,
-                100.0 * exec_ms / total_ms.max(1e-9),
-                merge_ms,
-                100.0 * merge_ms / total_ms.max(1e-9),
-                1000.0 * spawn_ms / n,
-                1000.0 * exec_ms / n,
-                1000.0 * merge_ms / n,
-            );
-            // Load imbalance: ratio of max-thread to min-thread total
-            // exec time across all dispatches. 1.0 = perfectly balanced.
-            // High ratio means the faster LP sits idle waiting for the
-            // slower LP — concrete optimization target (sub-chunking,
-            // work stealing, profile-guided partition).
-            let max_total_ms = self.prof_pdes_max_total_ns as f64 / 1e6;
-            let min_total_ms = self.prof_pdes_min_total_ns as f64 / 1e6;
-            let imbalance_ms = self.prof_pdes_imbalance_sum_ns as f64 / 1e6;
-            let ratio = if min_total_ms > 0.0 {
-                max_total_ms / min_total_ms
-            } else {
-                0.0
-            };
-            chatter!(
-                "[PROF-pdes] thread imbalance: max_total {:.1}ms / min_total {:.1}ms = {:.2}× ratio; idle wait sum {:.1}ms ({:.1}% of merge wall)",
-                max_total_ms,
-                min_total_ms,
-                ratio,
-                imbalance_ms,
-                100.0 * imbalance_ms / merge_ms.max(1e-9),
             );
         }
         let mut reasons: Vec<(&str, u64, u64)> = self
@@ -49572,6 +47618,7 @@ impl Simulator {
             Insn::ClearSigned(..) => "ClearSigned",
             Insn::Pow(..) => "Pow",
             Insn::SetSigned(..) => "SetSigned",
+            Insn::DropXz(..) => "DropXz",
             Insn::Nop => "Nop",
             Insn::LoadSignalRange(..) => "LoadSignalRange",
             Insn::LoadSignalBit(..) => "LoadSignalBit",
@@ -50006,6 +48053,7 @@ impl Simulator {
             queue_frame_saves: self.queue_frame_saves.clone(),
             task_cleanup: self.task_cleanup.clone(),
             local_dyn: self.local_dyn.clone(),
+            formal_dyn: self.formal_dyn.clone(),
             static_local_syncs: self.static_local_syncs.clone(),
             method_local_base: self.method_local_base.clone(),
         }
@@ -50060,6 +48108,7 @@ impl Simulator {
             && self.queue_frame_saves.is_empty()
             && self.task_cleanup.is_empty()
             && self.local_dyn.is_empty()
+            && self.formal_dyn.is_empty()
             && self.static_local_syncs.is_empty()
             && self.method_local_base.is_empty()
             && !self.ref_redirect_hot
@@ -50087,6 +48136,7 @@ impl Simulator {
             queue_frame_saves: std::mem::take(&mut self.queue_frame_saves),
             task_cleanup: std::mem::take(&mut self.task_cleanup),
             local_dyn: std::mem::take(&mut self.local_dyn),
+            formal_dyn: std::mem::take(&mut self.formal_dyn),
             static_local_syncs: std::mem::take(&mut self.static_local_syncs),
             method_local_base: std::mem::take(&mut self.method_local_base),
         }
@@ -50111,6 +48161,7 @@ impl Simulator {
         self.queue_frame_saves = ctx.queue_frame_saves;
         self.task_cleanup = ctx.task_cleanup;
         self.local_dyn = ctx.local_dyn;
+        self.formal_dyn = ctx.formal_dyn;
         self.static_local_syncs = ctx.static_local_syncs;
         self.method_local_base = ctx.method_local_base;
     }
@@ -50748,6 +48799,11 @@ impl Simulator {
         if self.killed_pids.contains(&pid) {
             return;
         }
+        // A stale `disable` target would keep later loops from consuming
+        // their own `break`; a disable posted by another process (§9.6.2)
+        // starts this activation's unwind instead.
+        self.disable_target = None;
+        self.disable_check_pending = false;
         // A freshly-activated scheduled process must resolve unqualified names
         // from a clean slate. `name_resolve_hint` is a transient sibling-scope
         // hint set while resolving DOTTED names (resolve_hier_name records the
@@ -50950,6 +49006,15 @@ impl Simulator {
     /// Dispatch a scheduled payload, recognizing the empty marker used by a
     /// retained dynamic-delay always assignment.
     fn run_process_payload(&mut self, pid: usize, stmts: &ProcCont) {
+        // §9.6.2: a disable posted by another process (`disable_remote_block`)
+        // starts this activation's unwind — after the process context (and
+        // its saved flags) is back in place.
+        if !self.pending_block_disable.is_empty() {
+            if let Some(x) = self.pending_block_disable.remove(&pid) {
+                self.disable_target = Some(x);
+                self.break_flag = true;
+            }
+        }
         if stmts.is_empty() && self.fast_delay_always.contains_key(&pid) {
             self.run_fast_delay_always(pid);
         } else if stmts.is_empty() && self.proc_fsm.contains_key(&pid) {
@@ -51363,9 +49428,14 @@ impl Simulator {
                     2 => {
                         let ix = out[1] as usize;
                         let terms = self.fsm_wait_terms(&mut f, ix);
-                        let w =
-                            self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), false);
-                        self.event_waiters.push(w);
+                        let clk = f.wait_is_clocking.get(ix).copied().unwrap_or(false);
+                        if clk && self.clocking_event_due_now(&f.waits[ix].0) {
+                            self.deferred_clocking_conts.push((pid, ProcCont::empty()));
+                        } else {
+                            let w =
+                                self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), clk);
+                            self.event_waiters.push(w);
+                        }
                         f.pc = npc;
                         break;
                     }
@@ -51443,9 +49513,19 @@ impl Simulator {
                     }
                     FsmWait::Edge(ix) => {
                         let terms = self.fsm_wait_terms(&mut f, ix as usize);
-                        let w =
-                            self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), false);
-                        self.event_waiters.push(w);
+                        // §14.13: a clocking event resumes after the block samples.
+                        let clk = f
+                            .wait_is_clocking
+                            .get(ix as usize)
+                            .copied()
+                            .unwrap_or(false);
+                        if clk && self.clocking_event_due_now(&f.waits[ix as usize].0) {
+                            self.deferred_clocking_conts.push((pid, ProcCont::empty()));
+                        } else {
+                            let w =
+                                self.make_event_waiter_resolved(pid, terms, ProcCont::empty(), clk);
+                            self.event_waiters.push(w);
+                        }
                     }
                 }
                 break;
@@ -52346,6 +50426,19 @@ impl Simulator {
             self.reset_hint_to_process_scope();
             let stmt = &stmts[i];
 
+            // §35.5.2: the resume marker of a process parked inside an
+            // imported task (dpi_task.rs). Ahead of the flag skips below: a
+            // disable posted meanwhile unwinds the task before the block.
+            if !self.dpi_task_names.is_empty() {
+                if let Some(carry_on) = self.dpi_task_marker(pc, i, stmt) {
+                    if !carry_on {
+                        return;
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+
             // An inlined task/method `return` (return_flag set) must unwind to
             // the enclosing task's `ScopePop` sentinel, skipping the rest of the
             // task body in between (including blocking statements after the `return`).
@@ -52360,6 +50453,17 @@ impl Simulator {
                     } else {
                         self.return_flag = false;
                     }
+                }
+                i += 1;
+                continue;
+            }
+
+            // §9.6.2 `disable <block|task>`: skip to the end of the named
+            // block's frame (or the task's `ScopePop`), running only the task
+            // cleanups passed on the way.
+            if self.break_flag && self.disable_target.is_some() && self.disable_unwinding(pid, pc) {
+                if let StatementKind::ScopePop = &stmt.kind {
+                    self.disable_pop_task_frame();
                 }
                 i += 1;
                 continue;
@@ -52444,13 +50548,28 @@ impl Simulator {
                 self.vpi_stmt_hook(stmt, true);
             }
 
+            // §35.5.2: a call of an imported task runs on its own stack, so
+            // the process can park while the task waits (dpi_task.rs).
+            if !self.dpi_task_names.is_empty() && self.dpi_cur_task.is_none() {
+                if let Some(returned) = self.dpi_task_start(pid, pc, i, stmt) {
+                    if !returned {
+                        return;
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+
             // Expand SeqBlocks: flatten begin/end so that timing controls and waits
             // inside them are properly handled with process suspension.
-            if let StatementKind::SeqBlock { stmts: inner, .. } = &stmt.kind {
+            if let StatementKind::SeqBlock { stmts: inner, name } = &stmt.kind {
                 if self.stmts_have_blocking(inner) {
                     // Immutable AST: share one Arc frame per (process, span)
                     // instead of cloning the whole list on every entry.
-                    let frame = self.blocking_cont_frame(pid, stmt.span, 0, inner);
+                    let frame = match name {
+                        None => self.blocking_cont_frame(pid, stmt.span, 0, inner),
+                        Some(n) => self.named_block_frame(pid, stmt, inner, &n.name),
+                    };
                     self.run_process_stmts(pid, &pc.pushed_frame(frame, pc.start + i + 1));
                     return;
                 }
@@ -53643,7 +51762,9 @@ impl Simulator {
                                 }
                             }
                             let has_real = sens.iter().any(|s| self.sens_term_resolves(s));
-                            if has_real {
+                            if has_real && is_clk_ev && self.clocking_event_due_now(event) {
+                                self.deferred_clocking_conts.push((pid, cont));
+                            } else if has_real {
                                 let w = self.make_event_waiter_kind(pid, sens, cont, is_clk_ev);
                                 self.event_waiters.push(w);
                             } else {
@@ -54250,6 +52371,7 @@ impl Simulator {
                     let pid_child = self.next_pid;
                     self.next_pid += 1;
                     self.process_parents.insert(pid_child, pid);
+                    self.note_fork_spawn(pid_child, pc);
                     // §9.3.2: a fork child executes in the forking process's
                     // scope, so it inherits the parent's instance-scope hint
                     // (additive — a child previously had none at all).
@@ -54672,9 +52794,298 @@ impl Simulator {
         // bounds it. What changed is that a level costs a pointer instead of a
         // copy of everything the caller had left.
         if !self.finished {
+            // §9.6.2: a `disable` of THIS named block ends here.
+            if self.break_flag
+                && self.disable_target.is_some()
+                && (self.disable_check_pending || !self.named_block_frames.is_empty())
+                && self.disable_unwinding(pid, pc)
+            {
+                if let Some(n) = self.named_block_frames.get(&Self::frame_key(&pc.stmts)) {
+                    if self
+                        .disable_target
+                        .as_deref()
+                        .is_some_and(|t| Self::block_name_matches(t, n))
+                        && !self.killed_pids.contains(&pid)
+                    {
+                        self.disable_target = None;
+                        self.break_flag = false;
+                        self.continue_flag = false;
+                    }
+                }
+            }
             if let Some(frame) = pc.next.clone() {
                 self.run_process_stmts(pid, &frame);
             }
+        }
+    }
+
+    /// §9.6.2: identity of a statement frame (its address).
+    fn frame_key(f: &Arc<[Statement]>) -> usize {
+        Arc::as_ptr(f) as *const Statement as usize
+    }
+
+    /// A `disable` target (possibly hierarchical, `top.blk`) naming block `n`.
+    fn block_name_matches(target: &str, n: &str) -> bool {
+        target == n || target.rsplit('.').next() == Some(n)
+    }
+
+    /// §9.6.2: whether continuation `pc` is inside the named block `x`.
+    fn cont_has_named_block(&self, pc: &ProcCont, x: &str) -> bool {
+        if self.named_block_frames.is_empty() {
+            return false;
+        }
+        let mut cur = Some(pc);
+        while let Some(f) = cur {
+            if let Some(n) = self.named_block_frames.get(&Self::frame_key(&f.stmts)) {
+                if Self::block_name_matches(x, n) {
+                    return true;
+                }
+            }
+            cur = f.next.as_deref();
+        }
+        false
+    }
+
+    /// §9.6.2: is process `pid` (running continuation `pc`) unwinding a
+    /// pending `disable` through its own frames? Resolves a freshly executed
+    /// `disable` first: a target that is not this process's own block or
+    /// task is handed to `disable_remote_block` and the flags cleared here.
+    fn disable_unwinding(&mut self, pid: usize, pc: &ProcCont) -> bool {
+        let Some(x) = self.disable_target.clone() else {
+            return false;
+        };
+        let own = |slf: &Self| {
+            slf.killed_pids.contains(&pid)
+                || slf.cont_has_named_block(pc, &x)
+                || slf
+                    .active_task_pids
+                    .get(&x)
+                    .is_some_and(|s| s.contains(&pid))
+        };
+        if self.disable_check_pending {
+            self.disable_check_pending = false;
+            if own(self) {
+                // The block's own fork children die with it.
+                if !self.killed_pids.contains(&pid) && self.cont_has_named_block(pc, &x) {
+                    let kids = self.children_forked_in(pid, &x);
+                    for k in kids {
+                        self.proc_kill(k);
+                    }
+                }
+            } else {
+                self.disable_target = None;
+                self.break_flag = false;
+                self.disable_remote_block(&x);
+                return self.break_flag
+                    && self.disable_target.is_some()
+                    && self.killed_pids.contains(&pid);
+            }
+        }
+        own(self)
+    }
+
+    /// Run a task-frame cleanup passed while unwinding a `disable`; the
+    /// unwind ends there when the task is the target.
+    fn disable_pop_task_frame(&mut self) {
+        let Some(c) = self.task_cleanup.pop() else {
+            return;
+        };
+        let tname = c.task_name.clone();
+        let target = self.disable_target.clone();
+        self.unwind_task_frame(c);
+        let consumed = match (tname.as_deref(), target.as_deref()) {
+            (Some(tn), Some(t)) => {
+                t == tn || Self::block_name_matches(t, tn.rsplit('.').next().unwrap_or(tn))
+            }
+            _ => false,
+        };
+        if consumed && !self.killed_pids.contains(&self.current_pid) {
+            self.disable_target = None;
+            self.break_flag = false;
+            self.continue_flag = false;
+        } else {
+            self.disable_target = target;
+            self.break_flag = true;
+        }
+    }
+
+    /// Record a run-loop fork child's spawn point (§9.6.2), pruning entries
+    /// of children that have ended.
+    fn note_fork_spawn(&mut self, child: usize, pc: &ProcCont) {
+        if self.named_block_frames.is_empty() {
+            return;
+        }
+        self.fork_spawn_cont.insert(child, pc.clone());
+        if self.fork_spawn_cont.len() > self.fork_spawn_prune_at {
+            let parents = &self.process_parents;
+            self.fork_spawn_cont.retain(|k, _| parents.contains_key(k));
+            self.fork_spawn_prune_at = (self.fork_spawn_cont.len() * 2).max(1024);
+        }
+    }
+
+    /// Is `anc` a fork ancestor of `pid`?
+    fn is_fork_ancestor(&self, anc: usize, pid: usize) -> bool {
+        let mut c = pid;
+        let mut steps = 0;
+        while let Some(&p) = self.process_parents.get(&c) {
+            if p == anc {
+                return true;
+            }
+            c = p;
+            steps += 1;
+            if steps > 100_000 {
+                break;
+            }
+        }
+        false
+    }
+
+    /// Direct fork children of `pid` that were spawned inside named block `x`.
+    fn children_forked_in(&self, pid: usize, x: &str) -> Vec<usize> {
+        let mut kids: Vec<usize> = self
+            .process_parents
+            .iter()
+            .filter(|&(_, &p)| p == pid)
+            .map(|(&c, _)| c)
+            .filter(|c| {
+                self.fork_spawn_cont
+                    .get(c)
+                    .is_some_and(|sp| self.cont_has_named_block(sp, x))
+            })
+            .collect();
+        kids.sort_unstable();
+        kids
+    }
+
+    /// The continuation process `pid` is parked on, if it is parked.
+    fn parked_cont_of(&self, pid: usize) -> Option<&ProcCont> {
+        if let Some(w) = self
+            .join_waiters
+            .iter()
+            .find(|w| w.parent_pid == pid && !w.wait_fork)
+        {
+            return Some(&w.continuation);
+        }
+        if let Some(c) = self.event_queue.pending_stmts_for(pid) {
+            return Some(c);
+        }
+        if let Some(w) = self.event_waiters.iter().find(|w| w.pid == pid) {
+            return Some(&w.continuation);
+        }
+        if let Some((_, c)) = self.condition_waiters.iter().find(|(p, _)| *p == pid) {
+            return Some(c);
+        }
+        if let Some((_, c)) = self.inactive_queue.iter().find(|(p, _)| *p == pid) {
+            return Some(c);
+        }
+        None
+    }
+
+    /// Remove process `pid` from wherever it is parked and return its
+    /// continuation.
+    fn take_parked_cont(&mut self, pid: usize) -> Option<ProcCont> {
+        if let Some(idx) = self
+            .join_waiters
+            .iter()
+            .position(|w| w.parent_pid == pid && !w.wait_fork)
+        {
+            return Some(self.join_waiters.remove(idx).continuation);
+        }
+        self.proc_suspend(pid);
+        let info = self.suspended_proc_info.remove(&pid)?;
+        self.suspended_pids.remove(&pid);
+        Some(info.continuation)
+    }
+
+    /// IEEE 1800-2023 §9.6.2: `disable x` where `x` is a block (or task)
+    /// that ANOTHER process is executing — an ancestor the disabling process
+    /// was forked inside, or any process parked inside it. That process
+    /// resumes at the end of the block, and every process forked inside the
+    /// block, the disabling one included, is terminated.
+    fn disable_remote_block(&mut self, x: &str) {
+        let me = self.current_pid;
+        let mut owner: Option<usize> = None;
+        let mut task_owner = false;
+        let mut c = me;
+        let mut steps = 0;
+        while let Some(&a) = self.process_parents.get(&c) {
+            if self
+                .fork_spawn_cont
+                .get(&c)
+                .is_some_and(|sp| self.cont_has_named_block(sp, x))
+            {
+                owner = Some(a);
+                break;
+            }
+            if self.active_task_pids.get(x).is_some_and(|s| s.contains(&a)) {
+                owner = Some(a);
+                task_owner = true;
+                break;
+            }
+            c = a;
+            steps += 1;
+            if steps > 100_000 {
+                break;
+            }
+        }
+        if owner.is_none() && !self.named_block_frames.is_empty() {
+            let mut cands: Vec<usize> = self.join_waiters.iter().map(|w| w.parent_pid).collect();
+            cands.extend(self.event_waiters.iter().map(|w| w.pid));
+            cands.extend(self.condition_waiters.iter().map(|(p, _)| *p));
+            cands.extend(self.inactive_queue.iter().map(|(p, _)| *p));
+            cands.extend(
+                self.event_queue
+                    .pending_pid_times()
+                    .into_iter()
+                    .map(|(p, _)| p),
+            );
+            cands.sort_unstable();
+            cands.dedup();
+            owner = cands.into_iter().find(|&p| {
+                p != me
+                    && !self.killed_pids.contains(&p)
+                    && self
+                        .parked_cont_of(p)
+                        .is_some_and(|pc| self.cont_has_named_block(pc, x))
+            });
+        }
+        let Some(a) = owner else {
+            return;
+        };
+        let parked_inside = self
+            .parked_cont_of(a)
+            .is_some_and(|pc| task_owner || self.cont_has_named_block(pc, x));
+        if !parked_inside {
+            return;
+        }
+        let kids: Vec<usize> = if task_owner {
+            let mut v: Vec<usize> = self
+                .process_parents
+                .iter()
+                .filter(|&(_, &p)| p == a)
+                .map(|(&c, _)| c)
+                .collect();
+            v.sort_unstable();
+            v
+        } else {
+            self.children_forked_in(a, x)
+        };
+        let mut doomed: HashSet<usize> = HashSet::default();
+        for &k in &kids {
+            doomed.insert(k);
+            doomed.extend(self.collect_fork_descendants(k));
+        }
+        let Some(cont) = self.take_parked_cont(a) else {
+            return;
+        };
+        for k in kids {
+            self.proc_kill(k);
+        }
+        self.pending_block_disable.insert(a, x.to_string());
+        self.event_queue.schedule(self.time, a, cont);
+        if doomed.contains(&me) {
+            self.disable_target = Some(x.to_string());
+            self.break_flag = true;
         }
     }
 
@@ -54778,6 +53189,9 @@ impl Simulator {
                 // run_process_stmts, where the await is intercepted and the
                 // process parks in await_waiters instead of busy-spinning.
                 if Self::expr_is_proc_await(e) {
+                    return true;
+                }
+                if self.expr_calls_dpi_task(e) {
                     return true;
                 }
                 // Follow user task calls into their bodies so blocking tasks
@@ -55474,6 +53888,32 @@ impl Simulator {
     /// from the process path (a blocking `begin/end` or a blocking chosen
     /// `if` branch). Keyed per process like `forever_cont_cache`: sibling
     /// instances share spans but never a pid.
+    /// §9.6.2: the frame of a flattened NAMED block — its statements and a
+    /// trailing `Null`, so the frame is never dropped from a continuation
+    /// chain as exhausted while the block is still running (`ProcCont::pushed`
+    /// elides spent frames) — registered so a `disable` can find where the
+    /// block ends.
+    fn named_block_frame(
+        &mut self,
+        pid: usize,
+        stmt: &Statement,
+        inner: &[Statement],
+        name: &str,
+    ) -> Arc<[Statement]> {
+        let key = (pid, stmt.span.start as usize, stmt.span.end as usize, 2u8);
+        if let Some(f) = self.blocking_cont_cache.get(&key) {
+            return f.clone();
+        }
+        let mut v: Vec<Statement> = Vec::with_capacity(inner.len() + 1);
+        v.extend_from_slice(inner);
+        v.push(Statement::new(StatementKind::Null, stmt.span));
+        let f: Arc<[Statement]> = Arc::from(v);
+        self.named_block_frames
+            .insert(Self::frame_key(&f), name.to_string());
+        self.blocking_cont_cache.insert(key, f.clone());
+        f
+    }
+
     fn blocking_cont_frame(
         &mut self,
         pid: usize,
@@ -56388,127 +54828,8 @@ impl Simulator {
         self.nba_fast_index.clear();
         let mut nba = std::mem::take(&mut self.nba_fast);
 
-        // PDES Phase 1.5/2: bucket NBAs by LP writer only when explicitly
-        // requested. The serial bucket path is useful for classifier
-        // experiments, and PAR_APPLY needs the buckets, but bucketing while
-        // still applying serially costs more than it saves on c910.
-        let parallel_apply = pdes_parallel_apply_enabled();
-        let bucket_nba = parallel_apply || pdes_bucket_nba_enabled();
-        if bucket_nba && !self.signal_lp_writer.is_empty() && self.edge_block_partition_count > 0 {
-            let n_lp = self.edge_block_partition_count as usize;
-            let mut per_lp: Vec<Vec<NbaFast>> = (0..n_lp).map(|_| Vec::new()).collect();
-            let mut boundary: Vec<NbaFast> = Vec::new();
-            for entry in nba.drain(..) {
-                match self
-                    .signal_lp_writer
-                    .get(entry.signal_id)
-                    .copied()
-                    .unwrap_or(None)
-                {
-                    Some(lp) => {
-                        let lp = lp as usize;
-                        if lp < per_lp.len() {
-                            per_lp[lp].push(entry);
-                        } else {
-                            boundary.push(entry);
-                        }
-                    }
-                    None => boundary.push(entry),
-                }
-            }
-            if parallel_apply && per_lp.iter().filter(|entries| !entries.is_empty()).count() >= 2 {
-                let signal_table_ptr = self.signal_table.as_mut_ptr() as usize;
-                let signal_has_xz_ptr = self.signal_has_xz.as_mut_ptr() as usize;
-                let signal_has_xz_len = self.signal_has_xz.len();
-                let signal_widths = &self.signal_widths;
-                let signal_signed = &self.signal_signed;
-                let mut dirty_by_lp: Vec<Vec<usize>> = Vec::with_capacity(per_lp.len());
-
-                std::thread::scope(|s| {
-                    let mut handles = Vec::new();
-                    for entries in per_lp.into_iter() {
-                        if entries.is_empty() {
-                            dirty_by_lp.push(Vec::new());
-                            continue;
-                        }
-                        let handle = s.spawn(move || -> Vec<usize> {
-                            let signal_table_ptr = signal_table_ptr as *mut Value;
-                            let signal_has_xz_ptr = signal_has_xz_ptr as *mut u8;
-                            let mut local_dirty = Vec::new();
-                            for entry in entries {
-                                let id = entry.signal_id;
-                                let width = signal_widths[id];
-                                let signed = signal_signed[id];
-                                let mut val = entry.value;
-                                if val.width != width {
-                                    val = val.resize(width);
-                                }
-                                if val.is_signed != signed {
-                                    val.is_signed = signed;
-                                }
-                                unsafe {
-                                    let slot = &mut *signal_table_ptr.add(id);
-                                    if *slot != val {
-                                        if id < signal_has_xz_len {
-                                            *signal_has_xz_ptr.add(id) =
-                                                if val.raw_bits().1 != 0 { 1 } else { 0 };
-                                        }
-                                        *slot = val;
-                                        local_dirty.push(id);
-                                    }
-                                }
-                            }
-                            local_dirty
-                        });
-                        handles.push(handle);
-                    }
-                    for handle in handles {
-                        if let Ok(dirty) = handle.join() {
-                            dirty_by_lp.push(dirty);
-                        }
-                    }
-                });
-
-                for dirty in dirty_by_lp {
-                    for id in dirty {
-                        if !self.dirty_signals[id] {
-                            self.dirty_signals[id] = true;
-                            self.dirty_list.push(id);
-                        }
-                        self.dirty_any = true;
-                        self.table_modified = true;
-                        // JIT-redesign Stage 1: parallel apply_nba threads
-                        // bypass write_sig! via raw pointers.  Refresh
-                        // signal_inline_bits on the main thread after
-                        // all writes have committed.  Also re-asserts
-                        // signal_has_xz consistency (the per-thread
-                        // raw-pointer code already updates it inline,
-                        // but after_signal_write is idempotent).
-                        self.after_signal_write(id);
-                        if self
-                            .is_edge_signal_non_clock
-                            .get(id)
-                            .copied()
-                            .unwrap_or(false)
-                        {
-                            self.nba_touched_edge_non_clock = true;
-                        }
-                    }
-                }
-            } else {
-                for lp_entries in per_lp.iter_mut() {
-                    for entry in lp_entries.drain(..) {
-                        self.apply_nba_entry(entry);
-                    }
-                }
-            }
-            for entry in boundary.drain(..) {
-                self.apply_nba_entry(entry);
-            }
-        } else {
-            for entry in nba.drain(..) {
-                self.apply_nba_entry(entry);
-            }
+        for entry in nba.drain(..) {
+            self.apply_nba_entry(entry);
         }
         self.nba_fast = nba;
         // Drain nba_queue by-value so the per-entry lhs Expression and value
@@ -56553,12 +54874,6 @@ impl Simulator {
         }
     }
 
-    /// PDES Phase 1.5: apply one fast-path NBA entry. Extracted from
-    /// `apply_nba` so the per-LP bucket path can reuse the exact
-    /// width/sign coercion + dirty-tracking logic. Phase 4's parallel
-    /// apply (per-LP thread + unsafe disjoint writes) will call this
-    /// from worker threads via the SendExecContext / raw-pointer
-    /// pattern.
     /// §10.7 implicit-conversion fit: coerce `val` to the type of signal `id`
     /// (real target, 2-state X/Z drop, sign/X-Z-aware width padding, signedness)
     /// exactly as an assignment / continuous-assign RHS is converted to its LHS.
@@ -59611,312 +57926,79 @@ impl Simulator {
                         .collect();
                 }
 
-                // XEZIM_DISPATCHER selects parallel-block backend:
-                //   pdes → PDES dispatcher (current: placeholder
-                //          delegating to std::scope; future: sparse
-                //          per-LP snapshot + boundary channels)
-                //   (default / unset) → std::thread::scope chunks
-                let dispatcher_env = dispatcher_env_cached();
-                let use_pdes = dispatcher_env == Some("pdes");
-
                 let mut all_nba: Vec<Vec<NbaFast>> = Vec::new();
-                if use_pdes {
-                    // PDES dispatcher arm. Current implementation uses
-                    // the same std::thread::scope mechanism as the
-                    // default path but is tagged with its own profiler
-                    // counter so the integration site can be exercised
-                    // end-to-end and verified. Replacement with sparse
-                    // per-LP signal_table snapshot + BoundaryChannel
-                    // delivery is the next-session piece (see
-                    // multikernel.rs `PdesKernel` for the per-LP
-                    // tick-loop protocol the dispatcher should drive).
-                    //
-                    // For now: identical work to std::scope arm; differs
-                    // only in the PROF tag and a one-line eprintln so
-                    // we can confirm activation at runtime.
-                    // Optional load balancing:
-                    //
-                    //   XEZIM_PDES_SUBCHUNK=N (N >= 1)
-                    //     Split-largest-only: the single largest
-                    //     partition is split into N+1 pieces. Crude but
-                    //     simple. =1 → 2 pieces.
-                    //
-                    //   XEZIM_PDES_CHUNK_TARGET=M
-                    //     Proportional: every partition with size > 1.3×M
-                    //     is split into ceil(size/M) pieces. Aims for
-                    //     all sub-chunks near M blocks → max/min ratio
-                    //     near 1.0. Defaults to 4000 blocks, matching
-                    //     the best conservative c910 hello/memcpy runs
-                    //     seen so far. Set XEZIM_PDES_CHUNK_TARGET=0 to
-                    //     recover the old per-LP-only split.
-                    //
-                    // SUBCHUNK is still available as a fallback when
-                    // proportional chunking is explicitly disabled.
-                    let chunk_target = pdes_chunk_target_from_env();
-                    let subchunk_split = pdes_subchunk_split_from_env();
-                    let mut sub_chunks: Vec<&[(usize, ParallelBlockSlice)]> =
-                        chunks.iter().map(|c| c.as_slice()).collect();
-                    if let Some(target) = chunk_target {
-                        // Proportional split: each chunk → ceil(size/target) pieces
-                        let mut rebuilt: Vec<&[(usize, ParallelBlockSlice)]> =
-                            Vec::with_capacity(sub_chunks.len() * 2);
-                        for c in sub_chunks.into_iter() {
-                            let n = c.len();
-                            let pieces = if (n as f64) > 1.3 * (target as f64) {
-                                n.div_ceil(target)
-                            } else {
-                                1
-                            };
-                            if pieces <= 1 {
-                                rebuilt.push(c);
-                            } else {
-                                let piece_size = n / pieces;
-                                let mut start = 0;
-                                for i in 0..pieces {
-                                    let end = if i + 1 == pieces {
-                                        n
-                                    } else {
-                                        start + piece_size
-                                    };
-                                    if end > start {
-                                        rebuilt.push(&c[start..end]);
-                                    }
-                                    start = end;
-                                }
+                // XEZIM_PARALLEL_SERIALIZE=1: run exec_insns_isolated
+                // sequentially in the main thread (chunks processed in
+                // spawn order). Diagnoses whether the parallel-mode
+                // c910 stall is in exec_insns_isolated's behavior vs
+                // multi-thread scheduling. If it still fails with this
+                // set, the bug is in exec_insns_isolated itself.
+                let serialize = parallel_serialize_enabled();
+                if serialize {
+                    for chunk in chunks.iter() {
+                        let chunk = chunk.as_slice();
+                        let mut thread_nba: Vec<NbaFast> = Vec::new();
+                        let max_regs = chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
+                        let mut vm_regs = vec![Value::zero(1); max_regs];
+                        for (bi, bs) in chunk {
+                            if vm_regs.len() < bs.num_regs {
+                                vm_regs.resize(bs.num_regs, Value::zero(1));
                             }
+                            let insns = unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
+                            let mut nba = Self::exec_insns_isolated(
+                                insns,
+                                signal_table,
+                                signal_signed,
+                                signal_name_to_id,
+                                array_first_id,
+                                Some(packed),
+                                &mut vm_regs,
+                                *bi as u32,
+                                bs.nba_dup,
+                            );
+                            thread_nba.append(&mut nba);
                         }
-                        sub_chunks = rebuilt;
-                    } else if subchunk_split >= 1 && !sub_chunks.is_empty() {
-                        // Split-largest-only.
-                        let sizes: Vec<usize> = sub_chunks.iter().map(|c| c.len()).collect();
-                        let max_size = sizes.iter().copied().max().unwrap_or(0);
-                        let min_size = sizes.iter().copied().min().unwrap_or(0);
-                        let imbalanced =
-                            min_size >= 100 && (max_size as f64) > 1.3 * (min_size as f64);
-                        if imbalanced {
-                            let split_into = subchunk_split + 1;
-                            let mut rebuilt: Vec<&[(usize, ParallelBlockSlice)]> =
-                                Vec::with_capacity(sub_chunks.len() + split_into - 1);
-                            for c in sub_chunks.into_iter() {
-                                if c.len() == max_size && split_into >= 2 {
-                                    let n = c.len();
-                                    let piece = n / split_into;
-                                    let mut start = 0;
-                                    for i in 0..split_into {
-                                        let end = if i + 1 == split_into {
-                                            n
-                                        } else {
-                                            start + piece
-                                        };
-                                        if end > start {
-                                            rebuilt.push(&c[start..end]);
-                                        }
-                                        start = end;
-                                    }
-                                } else {
-                                    rebuilt.push(c);
-                                }
-                            }
-                            sub_chunks = rebuilt;
-                        }
+                        all_nba.push(thread_nba);
                     }
-
-                    let mut thread_times: Vec<u128> = Vec::with_capacity(sub_chunks.len());
-                    let use_pdes_pool = pdes_pool_enabled();
-                    if use_pdes_pool {
-                        // Experimental: persistent workers avoid OS-thread
-                        // spawn, but current c910 measurements are slower
-                        // than the scoped path. Keep opt-in for comparison.
-                        let worker_count = std::thread::available_parallelism()
-                            .map(|n| n.get().min(sub_chunks.len()).min(8))
-                            .unwrap_or(2)
-                            .max(1);
-                        let recreate_pool = self
-                            .pdes_worker_pool
-                            .as_ref()
-                            .is_none_or(|pool| pool.worker_count() != worker_count);
-                        if recreate_pool {
-                            self.pdes_worker_pool = Some(ParallelWorkerPool::new(worker_count));
-                        }
-                        let shared = ParallelDispatchShared::new(
-                            signal_table,
-                            signal_signed,
-                            signal_name_to_id,
-                            array_first_id,
-                            packed,
-                        );
-                        let result = if let Some(pool) = self.pdes_worker_pool.as_mut() {
-                            pool.dispatch_refs(&sub_chunks, shared)
-                        } else {
-                            let t0 = std::time::Instant::now();
-                            let nba = sub_chunks
-                                .iter()
-                                .map(|chunk| {
-                                    exec_parallel_chunk(
-                                        chunk,
-                                        signal_table,
-                                        signal_signed,
-                                        signal_name_to_id,
-                                        array_first_id,
-                                        packed,
-                                    )
-                                })
-                                .collect();
-                            ParallelDispatchResult {
-                                nba,
-                                thread_ns: Vec::new(),
-                                enqueue_ns: 0,
-                                wait_ns: t0.elapsed().as_nanos(),
-                            }
-                        };
-                        all_nba = result.nba;
-                        thread_times = result.thread_ns;
-                        self.prof_pdes_spawn_ns = self
-                            .prof_pdes_spawn_ns
-                            .saturating_add(result.enqueue_ns as u64);
-                        self.prof_pdes_exec_ns = self.prof_pdes_exec_ns.saturating_add(0);
-                        self.prof_pdes_merge_ns = self
-                            .prof_pdes_merge_ns
-                            .saturating_add(result.wait_ns as u64);
-                    } else {
-                        let pdes_t_spawn = std::time::Instant::now();
-                        let exec_start_holder: std::sync::Mutex<Option<std::time::Instant>> =
-                            std::sync::Mutex::new(None);
-                        let exec_start_ref = &exec_start_holder;
-                        std::thread::scope(|s| {
-                            let mut handles = Vec::new();
-                            for chunk in sub_chunks.iter() {
-                                let chunk: &[(usize, ParallelBlockSlice)] = chunk;
-                                let handle = s.spawn(move || -> (Vec<NbaFast>, u128) {
-                                    if let Ok(mut g) = exec_start_ref.lock() {
-                                        if g.is_none() {
-                                            *g = Some(std::time::Instant::now());
-                                        }
-                                    }
-                                    let thread_t0 = std::time::Instant::now();
-                                    let nba = exec_parallel_chunk(
-                                        chunk,
-                                        signal_table,
-                                        signal_signed,
-                                        signal_name_to_id,
-                                        array_first_id,
-                                        packed,
-                                    );
-                                    (nba, thread_t0.elapsed().as_nanos())
-                                });
-                                handles.push(handle);
-                            }
-                            let pdes_t_exec_done = std::time::Instant::now();
-                            let exec_start = exec_start_holder
-                                .lock()
-                                .ok()
-                                .and_then(|g| *g)
-                                .unwrap_or(pdes_t_spawn);
-                            self.prof_pdes_spawn_ns = self
-                                .prof_pdes_spawn_ns
-                                .saturating_add((exec_start - pdes_t_spawn).as_nanos() as u64);
-                            self.prof_pdes_exec_ns = self
-                                .prof_pdes_exec_ns
-                                .saturating_add((pdes_t_exec_done - exec_start).as_nanos() as u64);
-                            let pdes_t_merge_start = std::time::Instant::now();
-                            for h in handles {
-                                if let Ok((nba, t_ns)) = h.join() {
-                                    all_nba.push(nba);
-                                    thread_times.push(t_ns);
-                                }
-                            }
-                            self.prof_pdes_merge_ns = self
-                                .prof_pdes_merge_ns
-                                .saturating_add(pdes_t_merge_start.elapsed().as_nanos() as u64);
-                        });
-                    }
-                    if let (Some(&max_t), Some(&min_t)) =
-                        (thread_times.iter().max(), thread_times.iter().min())
-                    {
-                        self.prof_pdes_max_total_ns =
-                            self.prof_pdes_max_total_ns.saturating_add(max_t as u64);
-                        self.prof_pdes_min_total_ns =
-                            self.prof_pdes_min_total_ns.saturating_add(min_t as u64);
-                        self.prof_pdes_imbalance_sum_ns = self
-                            .prof_pdes_imbalance_sum_ns
-                            .saturating_add((max_t - min_t) as u64);
-                    }
-                    self.prof_par_dispatch_pdes += 1;
                 } else {
-                    // XEZIM_PARALLEL_SERIALIZE=1: run exec_insns_isolated
-                    // sequentially in the main thread (chunks processed in
-                    // spawn order). Diagnoses whether the parallel-mode
-                    // c910 stall is in exec_insns_isolated's behavior vs
-                    // multi-thread scheduling. If it still fails with this
-                    // set, the bug is in exec_insns_isolated itself.
-                    let serialize = parallel_serialize_enabled();
-                    if serialize {
+                    std::thread::scope(|s| {
+                        let mut handles = Vec::new();
                         for chunk in chunks.iter() {
                             let chunk = chunk.as_slice();
-                            let mut thread_nba: Vec<NbaFast> = Vec::new();
-                            let max_regs =
-                                chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
-                            let mut vm_regs = vec![Value::zero(1); max_regs];
-                            for (bi, bs) in chunk {
-                                if vm_regs.len() < bs.num_regs {
-                                    vm_regs.resize(bs.num_regs, Value::zero(1));
-                                }
-                                let insns = unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
-                                let mut nba = Self::exec_insns_isolated(
-                                    insns,
-                                    signal_table,
-                                    signal_signed,
-                                    signal_name_to_id,
-                                    array_first_id,
-                                    Some(packed),
-                                    &mut vm_regs,
-                                    *bi as u32,
-                                    bs.nba_dup,
-                                );
-                                thread_nba.append(&mut nba);
-                            }
-                            all_nba.push(thread_nba);
-                        }
-                    } else {
-                        std::thread::scope(|s| {
-                            let mut handles = Vec::new();
-                            for chunk in chunks.iter() {
-                                let chunk = chunk.as_slice();
-                                let handle = s.spawn(move || {
-                                    let mut thread_nba: Vec<NbaFast> = Vec::new();
-                                    let max_regs =
-                                        chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
-                                    let mut vm_regs = vec![Value::zero(1); max_regs];
-                                    for (bi, bs) in chunk {
-                                        if vm_regs.len() < bs.num_regs {
-                                            vm_regs.resize(bs.num_regs, Value::zero(1));
-                                        }
-                                        let insns =
-                                            unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
-                                        let mut nba = Self::exec_insns_isolated(
-                                            insns,
-                                            signal_table,
-                                            signal_signed,
-                                            signal_name_to_id,
-                                            array_first_id,
-                                            Some(packed),
-                                            &mut vm_regs,
-                                            *bi as u32,
-                                            bs.nba_dup,
-                                        );
-                                        thread_nba.append(&mut nba);
+                            let handle = s.spawn(move || {
+                                let mut thread_nba: Vec<NbaFast> = Vec::new();
+                                let max_regs =
+                                    chunk.iter().map(|(_, bs)| bs.num_regs).max().unwrap_or(0);
+                                let mut vm_regs = vec![Value::zero(1); max_regs];
+                                for (bi, bs) in chunk {
+                                    if vm_regs.len() < bs.num_regs {
+                                        vm_regs.resize(bs.num_regs, Value::zero(1));
                                     }
-                                    thread_nba
-                                });
-                                handles.push(handle);
-                            }
-                            for h in handles {
-                                if let Ok(nba) = h.join() {
-                                    all_nba.push(nba);
+                                    let insns =
+                                        unsafe { std::slice::from_raw_parts(bs.ptr, bs.len) };
+                                    let mut nba = Self::exec_insns_isolated(
+                                        insns,
+                                        signal_table,
+                                        signal_signed,
+                                        signal_name_to_id,
+                                        array_first_id,
+                                        Some(packed),
+                                        &mut vm_regs,
+                                        *bi as u32,
+                                        bs.nba_dup,
+                                    );
+                                    thread_nba.append(&mut nba);
                                 }
+                                thread_nba
+                            });
+                            handles.push(handle);
+                        }
+                        for h in handles {
+                            if let Ok(nba) = h.join() {
+                                all_nba.push(nba);
                             }
-                        });
-                    }
+                        }
+                    });
                 }
                 // Apply NBAs.
                 //
@@ -59948,52 +58030,24 @@ impl Simulator {
                                 head[i] = Some(n);
                             }
                         }
-                        let use_scan_merge = pdes_scan_merge_enabled();
-                        if use_scan_merge {
-                            let mut emitted = 0usize;
-                            while emitted < total {
-                                let mut best: Option<(u32, usize)> = None;
-                                for (ci, entry) in head.iter().enumerate() {
-                                    if let Some(entry) = entry {
-                                        let candidate = (entry.block_index, ci);
-                                        if best.is_none_or(|b| candidate < b) {
-                                            best = Some(candidate);
-                                        }
-                                    }
-                                }
-                                let Some((_, ci)) = best else {
-                                    break;
-                                };
-                                if let Some(entry) = head[ci].take() {
-                                    self.nba_fast_index
-                                        .insert(entry.signal_id, self.nba_fast.len());
-                                    self.nba_fast.push(entry);
-                                    emitted += 1;
-                                }
-                                if let Some(n) = iters[ci].next() {
-                                    head[ci] = Some(n);
-                                }
+                        use std::cmp::Reverse;
+                        use std::collections::BinaryHeap;
+                        let mut heap: BinaryHeap<(Reverse<u32>, usize)> =
+                            BinaryHeap::with_capacity(iters.len());
+                        for (ci, entry) in head.iter().enumerate() {
+                            if let Some(entry) = entry {
+                                heap.push((Reverse(entry.block_index), ci));
                             }
-                        } else {
-                            use std::cmp::Reverse;
-                            use std::collections::BinaryHeap;
-                            let mut heap: BinaryHeap<(Reverse<u32>, usize)> =
-                                BinaryHeap::with_capacity(iters.len());
-                            for (ci, entry) in head.iter().enumerate() {
-                                if let Some(entry) = entry {
-                                    heap.push((Reverse(entry.block_index), ci));
-                                }
+                        }
+                        while let Some((_, ci)) = heap.pop() {
+                            if let Some(entry) = head[ci].take() {
+                                self.nba_fast_index
+                                    .insert(entry.signal_id, self.nba_fast.len());
+                                self.nba_fast.push(entry);
                             }
-                            while let Some((_, ci)) = heap.pop() {
-                                if let Some(entry) = head[ci].take() {
-                                    self.nba_fast_index
-                                        .insert(entry.signal_id, self.nba_fast.len());
-                                    self.nba_fast.push(entry);
-                                }
-                                if let Some(n) = iters[ci].next() {
-                                    heap.push((Reverse(n.block_index), ci));
-                                    head[ci] = Some(n);
-                                }
+                            if let Some(n) = iters[ci].next() {
+                                heap.push((Reverse(n.block_index), ci));
+                                head[ci] = Some(n);
                             }
                         }
                     }
@@ -60347,469 +58401,6 @@ impl Simulator {
         }
     }
 
-    /// Build (once) the per-LP settle state from the multikernel-scope
-    /// prefix. Returns false (and builds nothing) when the run uses a
-    /// subsystem the isolated evaluator doesn't replicate — the JIT
-    /// inline-bits mirror, activity monitor, or SDF delays — so the
-    /// dispatcher safely keeps using the canonical settle in those configs.
-    fn build_perlp_settle_state(&mut self) -> bool {
-        // The partitioned settle is EXPERIMENTAL and currently fails
-        // correctness (TEST FAILED) — the cross-LP reseed misses signals
-        // whose writer-LP differs from their name-prefix LP (is_boundary is
-        // name-prefix-based, but settle coupling is writer-based). Gated OFF
-        // by default so XEZIM_DISPATCHER=perlp keeps the canonical settle;
-        // opt in with XEZIM_PERLP_SETTLE=1 for debugging.
-        let want = std::env::var("XEZIM_PERLP_SETTLE").ok().as_deref() == Some("1");
-        let shadow = std::env::var("XEZIM_PERLP_SHADOW").ok().as_deref() == Some("1");
-        if !want && !shadow {
-            eprintln!(
-                "[PERLP-SETTLE] partitioned settle gated off (set XEZIM_PERLP_SETTLE=1) — settle stays canonical"
-            );
-            return false;
-        }
-        self.perlp_shadow = shadow;
-        self.perlp_after = std::env::var("XEZIM_PERLP_AFTER")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if self.perlp_after > 0 {
-            eprintln!(
-                "[PERLP-SETTLE] partitioned settle gated to sim_time >= {}",
-                self.perlp_after
-            );
-        } else if want {
-            // FOOTGUN: without a post-boot gate, the partitioned settle resolves
-            // boot-time 4-state X differently than canonical (order-dependent)
-            // and HANGS the core. Boot must run canonically — set
-            // XEZIM_PERLP_AFTER past the design's reset/X-resolution window
-            // (>=2000 works for c910 hello+memcpy).
-            eprintln!(
-                "[PERLP-SETTLE] WARNING: XEZIM_PERLP_AFTER not set — partitioned settle from t=0 will HANG on boot-time X. Set XEZIM_PERLP_AFTER>=2000."
-            );
-        }
-        let Some(prefix) = self.perlp_settle_prefix.clone() else {
-            eprintln!("[PERLP-SETTLE] no multikernel-scope prefix — settle stays serial");
-            return false;
-        };
-        if !self.signal_inline_bits.is_empty() {
-            eprintln!("[PERLP-SETTLE] signal_inline_bits active (JIT) — settle stays serial");
-            return false;
-        }
-        if self.activity_mon {
-            eprintln!("[PERLP-SETTLE] activity monitor active — settle stays serial");
-            return false;
-        }
-        if self.sdf_delays.iter().any(|&d| d != 0) {
-            eprintln!("[PERLP-SETTLE] SDF delays present — settle stays serial");
-            return false;
-        }
-
-        let part = self.pdes_build_comb_partition(&prefix);
-        let ctx = self.extract_comb_settle_ctx();
-        let n_entries = self.comb_entries.len();
-
-        let mut in_subset = [vec![false; n_entries], vec![false; n_entries]];
-        for &e in &part.lp_entries[0] {
-            in_subset[0][e] = true;
-        }
-        for &e in &part.lp_entries[1] {
-            in_subset[1][e] = true;
-        }
-        // Orphan entries (no resolved write target) are lumped into LP 0 so
-        // every non-AST entry is evaluated by exactly one LP. straddle=0 on
-        // the semantic cut; if any appear, lump them into LP 0 as well.
-        for &e in part
-            .orphan_entries
-            .iter()
-            .chain(part.straddle_entries.iter())
-        {
-            in_subset[0][e] = true;
-        }
-
-        let mut ast_eidxs: Vec<usize> = Vec::new();
-        for (e, item) in ctx.items.iter().enumerate() {
-            if matches!(item, SendCombItem::AstFallback) {
-                // The inline coordinator eval (eval_ast_contassign_entries)
-                // only handles raw ContAssign entries. If a design surfaces
-                // an AST entry of any other shape, refuse to build so settle
-                // stays canonical (correctness over speed).
-                if !matches!(&self.comb_entries[e].item, CombItem::ContAssign { .. }) {
-                    eprintln!(
-                        "[PERLP-SETTLE] AST entry eidx={} is not a ContAssign — settle stays serial",
-                        e
-                    );
-                    return false;
-                }
-                ast_eidxs.push(e);
-                // An AST entry is handled by neither LP isolated path.
-                in_subset[0][e] = false;
-                in_subset[1][e] = false;
-            }
-        }
-
-        eprintln!(
-            "[PERLP-SETTLE] built: LP-A entries={}, LP-B entries={}, orphan={}, ast={}, boundary={}",
-            part.lp_entries[0].len(),
-            part.lp_entries[1].len(),
-            part.orphan_entries.len(),
-            ast_eidxs.len(),
-            part.boundary_signal_ids.len(),
-        );
-
-        self.perlp_settle = Some(PerLpSettleState {
-            ctx,
-            in_subset,
-            ast_eidxs,
-            owner_lp: part.signal_owner_lp,
-            scratch: [SettleScratch::default(), SettleScratch::default()],
-        });
-        true
-    }
-
-    /// Evaluate the per-LP settle's AST-fallback comb entries (all raw
-    /// `ContAssign` — verified at build time) live on the coordinator, since
-    /// the isolated evaluator can't run them. Mirrors the `ContAssign` arm of
-    /// `settle_combinatorial_inner` (minus worklist propagation). Pushes any
-    /// signal whose value actually changed into `changed` for the cross-LP
-    /// reseed. dirty marks made by the write path are cleared by the caller.
-    fn eval_ast_contassign_entries(&mut self, ast_eidxs: &[usize], changed: &mut Vec<usize>) {
-        // Take comb_entries out so lhs/rhs/scope_hint borrow a local, not
-        // `self` (lets us call &mut self eval methods underneath).
-        let entries = std::mem::take(&mut self.comb_entries);
-        for &eidx in ast_eidxs {
-            let CombItem::ContAssign {
-                lhs,
-                rhs,
-                delay: explicit_delay,
-            } = &entries[eidx].item
-            else {
-                continue;
-            };
-            // Snapshot write targets to detect real changes for the reseed.
-            let write_ids = &entries[eidx].cold.write_signal_ids;
-            self.settle_prev_values.clear();
-            for &id in write_ids {
-                self.settle_prev_values
-                    .push((id, self.signal_table[id].clone()));
-            }
-
-            let scope_hint = entries[eidx].cold.scope_hint.clone();
-            let saved_hint = self.name_resolve_hint.borrow().clone();
-            if let Some(hint) = &scope_hint {
-                *self.name_resolve_hint.borrow_mut() = Some(hint.clone());
-            }
-            let lhs_id = self.get_lhs_signal_id(lhs);
-            if scope_hint.is_none() {
-                if let Some(id) = lhs_id {
-                    if let Some(full) = self.name_opt(id) {
-                        if let Some((parent, _)) = full.rsplit_once('.') {
-                            *self.name_resolve_hint.borrow_mut() = Some(parent.to_string());
-                        }
-                    }
-                }
-            }
-            let w = self.infer_lhs_width(lhs);
-            let val = self.eval_expr_ctx(rhs, w).resize(w);
-            let delay = if *explicit_delay > 0 {
-                *explicit_delay
-            } else {
-                lhs_id
-                    .and_then(|id| self.sdf_delays.get(id).copied())
-                    .unwrap_or(0)
-            };
-            if delay > 0 {
-                if let Some(id) = lhs_id {
-                    if self.signal_table[id] != val {
-                        if !self.delayed_update_pending_is(id, &val) {
-                            self.schedule_delayed_with_delay(id, val, delay);
-                        }
-                    } else {
-                        self.cancel_delayed(id);
-                    }
-                } else if let Some((base_id, lo, sel_w)) = self.delayed_lhs_select_range(lhs) {
-                    // §10.3.3 delayed assign with a SELECT LHS
-                    // (`assign #1 nxt_st_dly[8:0] = nxt_st[8:0];` — the C910
-                    // AXI-to-AHB bridge's FSM next-state). `get_lhs_signal_id`
-                    // is bare-Ident-only, so this silently DROPPED the write:
-                    // the bridge's state register read z forever, its rvalid
-                    // X-poisoned the SoC read arbiter, and the first
-                    // speculative fetch into the error region deadlocked the
-                    // whole read path. The splice composes against the
-                    // PENDING delayed value so several slice drivers on one
-                    // base keep each other's bits (issue #143).
-                    let sel_val = val.resize(sel_w);
-                    self.schedule_delayed_slice(base_id, lo, sel_w, &sel_val, delay);
-                }
-            } else if let Some(id) = lhs_id {
-                let width = self.signal_widths[id];
-                let mut resized = if self.signal_real[id] {
-                    if val.is_real {
-                        val.clone()
-                    } else {
-                        Value::from_f64(val.to_f64())
-                    }
-                } else if val.is_real {
-                    Self::real_to_int(val.to_f64(), width)
-                } else {
-                    val.resize(width)
-                };
-                resized.is_signed = self.signal_signed[id];
-                if self.signal_table[id] != resized {
-                    self.mark_dirty_id(id);
-                    write_sig!(self, id, resized);
-                    self.table_modified = true;
-                }
-            } else {
-                self.assign_value(lhs, &val);
-            }
-            *self.name_resolve_hint.borrow_mut() = saved_hint;
-
-            for i in 0..self.settle_prev_values.len() {
-                let (id, ref old) = self.settle_prev_values[i];
-                if self.signal_table[id] != *old {
-                    changed.push(id);
-                }
-            }
-        }
-        self.comb_entries = entries;
-    }
-
-    /// Per-LP partitioned + iterated incremental settle (XEZIM_DISPATCHER=
-    /// perlp). Single-threaded in this sub-step (B2a) — proves the
-    /// partition / incremental-seed / cross-LP-reseed scheme reaches the same
-    /// fixpoint as the canonical settle when driving the live loop. B3
-    /// parallelizes the two per-LP isolated settle calls onto persistent
-    /// workers (the AST-entry eval + reseed stays on the coordinator).
-    ///
-    /// Only built (perlp_settle.is_some()) when it is safe — JIT inline-bits,
-    /// activity-mon, SDF, and non-ContAssign AST entries all keep the run on
-    /// the canonical settle (see build_perlp_settle_state). So there is no
-    /// per-tick fallback here.
-    fn settle_combinatorial_perlp(&mut self) {
-        if self.settling || !self.dirty_any {
-            return;
-        }
-        // The time-0 init settle fires ALL comb entries (the full graph) and
-        // is one-time — there's no incremental win there and re-settling it
-        // via the partitioned full-cone path is what made the run ~4x slow.
-        // Do it canonically; the partitioned path handles only the small
-        // incremental steady-state cones at time > 0.
-        if self.time == 0 {
-            self.settle_combinatorial_inner();
-            return;
-        }
-        // Large settles (program-load memory init, or any big cone) are
-        // one-time and dominated by serial work; the partitioned path's win
-        // is the small incremental STEADY-STATE cones. Run big cones
-        // canonically (fast + exact) — same rationale as t=0. Threshold picked
-        // so steady-state clocked settles (seed ~10s of signals) use the
-        // partitioned path while load (1000s) stays canonical.
-        if self.dirty_list.len() > 256 {
-            self.settle_combinatorial_inner();
-            return;
-        }
-        // Run the X-rampant reset/boot phase canonically; partitioned settle
-        // only once signals have resolved (XEZIM_PERLP_AFTER).
-        if self.time < self.perlp_after {
-            self.settle_combinatorial_inner();
-            return;
-        }
-
-        // --- Phase 1: build the dirty cone (isolated-entry seed) read-only.
-        // AST entries are excluded from the LP in_subset masks, so leaving
-        // them in the seed is harmless; they are evaluated separately below.
-        let skip_deferred_at_t0 = self.time == 0 && !self.comb_time0_fired;
-        let mut cone: Vec<usize> = Vec::new();
-        for i in 0..self.dirty_list.len() {
-            let id = self.dirty_list[i];
-            if !self.dirty_signals[id] {
-                continue;
-            }
-            if id + 1 < self.comb_dep_offsets.len() {
-                let lo = self.comb_dep_offsets[id] as usize;
-                let hi = self.comb_dep_offsets[id + 1] as usize;
-                for &eidx_u32 in &self.comb_dep_entries[lo..hi] {
-                    let eidx = eidx_u32 as usize;
-                    if skip_deferred_at_t0 && self.comb_entries[eidx].defer_at_time0 {
-                        continue;
-                    }
-                    cone.push(eidx);
-                }
-            }
-        }
-        if skip_deferred_at_t0 {
-            for &eidx in self.comb_unresolved_idx.iter() {
-                if !self.comb_entries[eidx].defer_at_time0 {
-                    cone.push(eidx);
-                }
-            }
-        } else {
-            cone.extend_from_slice(&self.comb_unresolved_idx);
-        }
-        if self.time == 0 && !self.comb_time0_fired {
-            cone.extend_from_slice(&self.comb_time0_idx);
-        }
-
-        // --- Phase 2: consume dirty bookkeeping like the canonical settle.
-        self.settling = true;
-        self.settle_calls += 1;
-        self.prof_perlp_settle_fast += 1;
-        for i in 0..self.dirty_list.len() {
-            let id = self.dirty_list[i];
-            self.dirty_signals[id] = false;
-        }
-        self.dirty_list.clear();
-        self.dirty_any = false;
-        if self.time == 0 {
-            self.comb_time0_fired = true;
-        }
-
-        // --- Phase 3: iterate isolated per-LP settle + coordinator AST eval
-        // on the shared table until no cross-coupling change remains.
-        let t_total = std::time::Instant::now();
-        let limit = self.settle_limit as u64;
-        let mut st = self.perlp_settle.take().unwrap();
-        let mut seed_buf = cone;
-        let mut iso_changed: Vec<usize> = Vec::new();
-        let mut ast_changed: Vec<usize> = Vec::new();
-        let mut reseed: Vec<usize> = Vec::new();
-        const MAX_ROUNDS: u32 = 16;
-        let mut rounds_used = 0u32;
-        for _round in 0..MAX_ROUNDS {
-            rounds_used += 1;
-            iso_changed.clear();
-            ast_changed.clear();
-            {
-                let t_c = std::time::Instant::now();
-                let view = &mut self.signal_table;
-                st.ctx.settle_subset_tracked(
-                    view,
-                    &st.in_subset[0],
-                    &seed_buf,
-                    limit,
-                    &mut st.scratch[0],
-                    Some(&mut iso_changed),
-                );
-                st.ctx.settle_subset_tracked(
-                    view,
-                    &st.in_subset[1],
-                    &seed_buf,
-                    limit,
-                    &mut st.scratch[1],
-                    Some(&mut iso_changed),
-                );
-                self.prof_perlp_compute_ns += t_c.elapsed().as_nanos() as u64;
-            }
-            // AST-fallback ContAssign entries run on the coordinator (the
-            // isolated evaluator can't); they always re-eval (unresolved).
-            self.eval_ast_contassign_entries(&st.ast_eidxs, &mut ast_changed);
-
-            // Build the next-round seed CONSERVATIVELY: reseed ALL dependents
-            // of every changed signal (isolated + AST). settle_subset_tracked
-            // dedups via its `triggered` bitmap and only re-fires entries
-            // whose inputs actually changed, so re-seeding same-LP dependents
-            // that are already at fixpoint is a cheap no-op that produces no
-            // further change (the loop still terminates when nothing changes).
-            //
-            // AUDIT NOTE: the previous owner-LP skip (push_cross_lp_dependents)
-            // was correct ONLY for single-writer signals; a signal written by
-            // entries in BOTH LPs has an ambiguous owner_lp, and the skip then
-            // dropped the other LP's readers from the reseed → incomplete
-            // cross-LP propagation → wrong fixpoint. Reseeding all dependents
-            // removes that hazard.
-            reseed.clear();
-            for &sid in &iso_changed {
-                Self::push_dependents(&st.ctx, sid, &mut reseed);
-            }
-            for &sid in &ast_changed {
-                Self::push_dependents(&st.ctx, sid, &mut reseed);
-            }
-            if reseed.is_empty() {
-                break;
-            }
-            std::mem::swap(&mut seed_buf, &mut reseed);
-        }
-        if rounds_used >= MAX_ROUNDS {
-            self.prof_perlp_settle_fallback += 1; // reuse as "hit MAX_ROUNDS" count
-            if self.prof_perlp_settle_fallback <= 5 {
-                eprintln!(
-                    "[PERLP-SETTLE] WARN hit MAX_ROUNDS={} at time={} (seed0_entries={}, last iso_changed={}, ast_changed={}) — settle may not have converged",
-                    MAX_ROUNDS,
-                    self.time,
-                    seed_buf.len(),
-                    iso_changed.len(),
-                    ast_changed.len()
-                );
-            }
-        }
-        self.perlp_settle = Some(st);
-
-        // The coordinator AST eval re-dirtied signals via the normal write
-        // path; clear that bookkeeping so the loop's invariant (dirty empty
-        // after settle) holds, matching the canonical settle.
-        for i in 0..self.dirty_list.len() {
-            let id = self.dirty_list[i];
-            self.dirty_signals[id] = false;
-        }
-        self.dirty_list.clear();
-        self.dirty_any = false;
-        self.table_modified = true;
-        self.prof_perlp_total_ns += t_total.elapsed().as_nanos() as u64;
-        self.settling = false;
-    }
-
-    /// Append the comb-entry dependents of signal `sid` (via the ctx's dep
-    /// CSR) onto `out`. Duplicates are fine — settle_subset_tracked dedups.
-    #[inline]
-    fn push_dependents(ctx: &CombSettleCtx, sid: usize, out: &mut Vec<usize>) {
-        if sid + 1 < ctx.dep_offsets.len() {
-            let lo = ctx.dep_offsets[sid] as usize;
-            let hi = ctx.dep_offsets[sid + 1] as usize;
-            for &dep_u32 in &ctx.dep_entries[lo..hi] {
-                out.push(dep_u32 as usize);
-            }
-        }
-    }
-
-    /// Append the dependents of `sid` that belong to an LP DIFFERENT from
-    /// its writer `owner` (the writer LP already propagated `sid` within its
-    /// own settle worklist). When `owner` is not a valid LP (0xFF), append
-    /// all dependents. AST entries (in neither in_subset) are always
-    /// appended — harmless, they re-eval unconditionally anyway.
-    ///
-    /// NOTE: currently UNUSED — the reseed was made conservative (all
-    /// dependents) because this owner-skip is unsound for multi-LP-writer
-    /// signals (ambiguous owner_lp). Kept for a future re-optimization once a
-    /// correct per-signal writer map (incl. multi-writer handling) exists.
-    #[allow(dead_code)]
-    #[inline]
-    fn push_cross_lp_dependents(
-        ctx: &CombSettleCtx,
-        in_subset: &[Vec<bool>; 2],
-        owner: u8,
-        sid: usize,
-        out: &mut Vec<usize>,
-    ) {
-        if sid + 1 >= ctx.dep_offsets.len() {
-            return;
-        }
-        let lo = ctx.dep_offsets[sid] as usize;
-        let hi = ctx.dep_offsets[sid + 1] as usize;
-        for &dep_u32 in &ctx.dep_entries[lo..hi] {
-            let dep = dep_u32 as usize;
-            // Skip dependents owned by the writer LP — already settled there.
-            if (owner == 0 || owner == 1)
-                && in_subset[owner as usize].get(dep).copied().unwrap_or(false)
-            {
-                continue;
-            }
-            out.push(dep);
-        }
-    }
-
-    /// Settle dispatcher: under XEZIM_DISPATCHER=perlp (per-LP state built)
-    /// route to the partitioned settle; otherwise the canonical incremental
-    /// settle. Default path pays one `Option::is_some` check per call.
     fn settle_combinatorial(&mut self) {
         if self.event_measure {
             self.event_phase += 1; // comb SETTLE phase (distinct from sample)
@@ -60855,12 +58446,6 @@ impl Simulator {
             || !self.deferred_proc_entries.is_empty()
         {
             self.settle_combinatorial_inner();
-        } else if self.perlp_settle.is_some() {
-            if self.perlp_shadow {
-                self.settle_combinatorial_shadow();
-            } else {
-                self.settle_combinatorial_perlp();
-            }
         } else if self.bsp_shadow {
             self.settle_combinatorial_bsp_shadow();
         } else if self.bsp_settle {
@@ -61322,132 +58907,10 @@ impl Simulator {
         self.settling = false;
     }
 
-    /// Debug: run the partitioned settle on a clone, the canonical settle as
-    /// truth, and compare per-tick. Logs the first real (non-X) value
-    /// divergence with signal names, then aborts the sim so it surfaces in
-    /// seconds instead of after a full run. The sim continues on the
-    /// canonical result until then, so the comparison is always against the
-    /// correct state.
-    fn settle_combinatorial_shadow(&mut self) {
-        if self.settling || !self.dirty_any {
-            return;
-        }
-        // The time-0 init settle fires ALL comb entries and is enormous;
-        // running it twice + cloning the table is impractically slow, so just
-        // run the partitioned settle there (no comparison) and start
-        // shadow-comparing once the clocked sim begins (time > 0).
-        if self.time == 0 {
-            self.settle_combinatorial_perlp();
-            return;
-        }
-        // Skip detection (run canonical, fast) during the boot window
-        // time < perlp_after — lets the detector clear program-load quickly
-        // and start comparing right where the divergence lives (the
-        // (200,2000] boot-X window). Set XEZIM_PERLP_AFTER to the lower edge.
-        if self.time < self.perlp_after {
-            self.settle_combinatorial_inner();
-            return;
-        }
-        // Skip detection for LARGE settles (program-load memory init dirties
-        // thousands of signals → huge cones where the partitioned settle is
-        // pathologically slow and which are one-time anyway). Run those
-        // canonically (fast). Detect only the SMALL steady-state cones — the
-        // clocked-execution settles where the architecture's correctness
-        // actually matters and the offline analysis applies.
-        if self.dirty_list.len() > 256 {
-            self.settle_combinatorial_inner();
-            return;
-        }
-        // CHEAP detector — ONE table clone per settle, sim EVOLVES on the
-        // CANONICAL result (so it always completes / never hangs):
-        //   1. clone the pre-state table (the only full clone);
-        //   2. run canonical (real) — leaves canonical fixpoint in the table;
-        //   3. swap the pre-state back in, re-seed the (small) dirty set, run
-        //      the partitioned settle on it;
-        //   4. compare partitioned vs canonical, abort+classify on first diff;
-        //   5. restore the canonical result so the sim continues correctly.
-        // dirty bookkeeping is re-seeded cheaply from the dirty_list (a
-        // converged settle leaves dirty_signals all-false), so no big bool-vec
-        // clones are needed.
-        let pre_dirty_list = self.dirty_list.clone();
-        let pre_dirty_any = self.dirty_any;
-        let pre_time0 = self.comb_time0_fired;
-        let pre_table = self.signal_table.clone(); // the one clone
-
-        // (2) canonical, real.
-        self.settle_combinatorial_inner();
-
-        // (3) hold canonical, run partitioned from the pre-state.
-        let canon = std::mem::replace(&mut self.signal_table, pre_table);
-        self.dirty_any = pre_dirty_any;
-        for &id in &pre_dirty_list {
-            self.dirty_signals[id] = true;
-        }
-        self.dirty_list = pre_dirty_list;
-        self.comb_time0_fired = pre_time0;
-        self.settle_combinatorial_perlp();
-
-        // (4) compare partitioned (self.signal_table) vs canonical (canon).
-        let n = canon.len().min(self.signal_table.len());
-        let mut real = 0u64;
-        let mut xinv = 0u64;
-        let mut shown = 0;
-        for sid in 0..n {
-            let (cv, cx) = canon[sid].raw_bits();
-            let (pv, px) = self.signal_table[sid].raw_bits();
-            if cv == pv && cx == px {
-                continue;
-            }
-            let is_real = cx == 0 && px == 0;
-            if is_real {
-                real += 1;
-            } else {
-                xinv += 1;
-            }
-            if shown < 16 {
-                shown += 1;
-                eprintln!(
-                    "[PERLP-SHADOW] time={} {} diff sid={} '{}' canonical=(v{:#x},x{:#x}) perlp=(v{:#x},x{:#x})",
-                    self.time,
-                    if is_real { "REAL" } else { "X" },
-                    sid,
-                    self.name_for_id(sid),
-                    cv,
-                    cx,
-                    pv,
-                    px,
-                );
-            }
-        }
-        let diverged = real > 0 || xinv > 0;
-        // (5) restore the canonical result so the sim continues correctly.
-        self.signal_table = canon;
-        // dirty was consumed by the partitioned settle; both settles leave it
-        // clear at convergence, so the table is consistent for the next tick.
-
-        if diverged {
-            self.perlp_shadow_real_diffs += real;
-            eprintln!(
-                "[PERLP-SHADOW] time={} FIRST divergence: REAL={} X-involved={} — aborting",
-                self.time, real, xinv
-            );
-            self.finished = true;
-            return;
-        }
-        // No divergence — heartbeat every 5000 compared time>0 settles.
-        self.perlp_shadow_real_diffs += 1;
-        if self.perlp_shadow_real_diffs % 5000 == 0 {
-            eprintln!(
-                "[PERLP-SHADOW] checked {} time>0 settles, no divergence (now time={})",
-                self.perlp_shadow_real_diffs, self.time
-            );
-        }
-    }
-
     /// BSP-settle shadow comparator (XEZIM_BSP_SHADOW=1). Per settle: snapshot
     /// pre-state, run canonical (truth), restore pre-state, run BSP, diff, and
     /// abort at the first divergent signal with its name. The sim evolves on the
-    /// CANONICAL result (always completes). Mirrors settle_combinatorial_shadow.
+    /// CANONICAL result (always completes).
     fn settle_combinatorial_bsp_shadow(&mut self) {
         if self.settling || !self.dirty_any {
             return;
@@ -61510,11 +58973,11 @@ impl Simulator {
             self.finished = true;
             return;
         }
-        self.perlp_shadow_real_diffs += 1;
-        if self.perlp_shadow_real_diffs % 5000 == 0 {
+        self.bsp_shadow_checks += 1;
+        if self.bsp_shadow_checks % 5000 == 0 {
             eprintln!(
                 "[BSP-SHADOW] checked {} time>0 settles, no divergence (now time={})",
-                self.perlp_shadow_real_diffs, self.time
+                self.bsp_shadow_checks, self.time
             );
         }
     }
@@ -63984,6 +61447,7 @@ impl Simulator {
             read_signal_ids,
             read_epochs,
             has_unresolved_reads,
+            partial: false,
         });
     }
 
@@ -64060,6 +61524,22 @@ impl Simulator {
             if is_conservative {
                 conservative_done[idx] = true;
             }
+            if self.active_force_exprs[idx].partial {
+                if let Some((_, Some(id))) = self.force_target(&lvalue) {
+                    self.refresh_partial_force(id, &lvalue);
+                }
+                let ids = self.active_force_exprs[idx].read_signal_ids.clone();
+                self.active_force_exprs[idx].read_epochs = ids
+                    .iter()
+                    .map(|&id| {
+                        self.active_force_signal_epochs
+                            .get(id)
+                            .copied()
+                            .unwrap_or(0)
+                    })
+                    .collect();
+                continue;
+            }
             let saved_hint = self.name_resolve_hint.borrow().clone();
             *self.name_resolve_hint.borrow_mut() = hint;
             let v = self.eval_expr(&rvalue);
@@ -64115,6 +61595,9 @@ impl Simulator {
     /// slot `force_target` resolved, if any).
     fn release_override(&mut self, target: Option<(&str, Option<usize>)>) {
         if let Some((name, id)) = target {
+            if let Some(id) = id {
+                self.partial_forces.remove(&id);
+            }
             self.forced_names.remove(name);
             self.active_force_exprs.retain(|entry| entry.key != name);
             if let Some(id) = id.filter(|&id| is_packed_id(id)) {
@@ -64156,6 +61639,235 @@ impl Simulator {
             .iter_mut()
             .for_each(|v| *v |= EDGE_ARMED);
         self.dirty_any = true;
+    }
+
+    /// IEEE 1800-2023 §10.6.2: a constant bit- or part-select of a whole
+    /// NET (`w[0]`, `w[7:6]`, `w[i +: 2]`): the net's id, its base
+    /// identifier expression, and the physical (lo bit, width) selected.
+    fn force_select_range(&mut self, lv: &Expression) -> Option<(usize, Expression, u32, u32)> {
+        let (base, a, b) = match &lv.kind {
+            ExprKind::Index { expr, index } => {
+                let l = self.eval_expr(index).to_i64()?;
+                (expr, l, l)
+            }
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => {
+                let l = self.eval_expr(left).to_i64()?;
+                let r = self.eval_expr(right).to_i64()?;
+                match kind {
+                    RangeKind::Constant => (expr, l, r),
+                    RangeKind::IndexedUp if r > 0 => (expr, l + r - 1, l),
+                    RangeKind::IndexedDown if r > 0 => (expr, l, l - r + 1),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let ExprKind::Ident(h) = &base.kind else {
+            return None;
+        };
+        if !h.path.iter().all(|s| s.selects.is_empty()) {
+            return None;
+        }
+        let name = self.resolve_hier_name(h).to_string();
+        if !self.module.nets.contains(&name)
+            || self.module.arrays.contains_key(&name)
+            || self
+                .module
+                .packed_signal_elem_widths
+                .get(&name)
+                .copied()
+                .unwrap_or(0)
+                > 1
+        {
+            return None;
+        }
+        let id = *self.signal_name_to_id.get(name.as_str())?;
+        if is_packed_id(id) || id >= self.signal_widths.len() {
+            return None;
+        }
+        let phys = |lab: i64| -> i64 {
+            if let Some(&(_, hi_l)) = self.module.ascending_packed.get(&name) {
+                hi_l - lab
+            } else {
+                let off = self
+                    .module
+                    .packed_full_dims
+                    .get(&name)
+                    .and_then(|d| d.first())
+                    .map(|&(dl, dr)| dl.min(dr))
+                    .unwrap_or(0);
+                lab - off
+            }
+        };
+        let (pa, pb) = (phys(a), phys(b));
+        let lo = pa.min(pb);
+        let hi = pa.max(pb);
+        let w = self.signal_widths[id] as i64;
+        if lo < 0 || hi >= w {
+            return None;
+        }
+        Some((id, (**base).clone(), lo as u32, (hi - lo + 1) as u32))
+    }
+
+    /// §10.6.2 `force` of a net bit/part-select: those bits take `rvalue`
+    /// (tracked like a whole-net force expression); the others keep
+    /// following the net's drivers.
+    fn force_partial(&mut self, sel: (usize, Expression, u32, u32), rvalue: &Expression) {
+        let (id, base, lo, width) = sel;
+        let w = self.signal_widths[id] as usize;
+        let hint = self.name_resolve_hint.borrow().clone();
+        let pf = self
+            .partial_forces
+            .entry(id)
+            .or_insert_with(|| PartialForce {
+                bits: vec![None; w],
+                pieces: Vec::new(),
+            });
+        let p = pf.pieces.len();
+        pf.pieces.push((rvalue.clone(), width, hint));
+        for k in 0..width {
+            if let Some(slot) = pf.bits.get_mut((lo + k) as usize) {
+                *slot = Some((p, k));
+            }
+        }
+        self.arm_partial_force(id, &base);
+        self.refresh_partial_force(id, &base);
+    }
+
+    /// §10.6.2 `release` of a net bit/part-select: those bits return to the
+    /// net's drivers at once; the net is fully released with its last bit.
+    fn release_partial(&mut self, sel: (usize, Expression, u32, u32)) {
+        let (id, base, lo, width) = sel;
+        let Some(pf) = self.partial_forces.get_mut(&id) else {
+            return;
+        };
+        for k in 0..width {
+            if let Some(slot) = pf.bits.get_mut((lo + k) as usize) {
+                *slot = None;
+            }
+        }
+        if pf.bits.iter().all(|b| b.is_none()) {
+            let target = self.force_target(&base);
+            self.release_override(target.as_ref().map(|(n, id)| (n.as_str(), *id)));
+            return;
+        }
+        self.refresh_partial_force(id, &base);
+    }
+
+    /// Track the reads a partial force depends on: the net's drivers and its
+    /// forcing expressions (see `refresh_active_forces`).
+    fn arm_partial_force(&mut self, id: usize, base: &Expression) {
+        let Some((key, _)) = self.force_target(base) else {
+            return;
+        };
+        self.active_force_exprs.retain(|entry| entry.key != key);
+        let mut ids: Vec<usize> = Vec::new();
+        for e in self.comb_entries.iter() {
+            if e.cold.write_signal_ids.contains(&id) {
+                ids.extend(e.cold.read_signal_ids.iter().copied());
+            }
+        }
+        let mut reads: HashSet<String> = HashSet::default();
+        if let Some(pf) = self.partial_forces.get(&id) {
+            for (rv, _, _) in &pf.pieces {
+                Self::collect_expr_reads(rv, &self.module, &mut reads);
+            }
+        }
+        let top_prefix = format!("{}.", self.module.name);
+        let hint = self.name_resolve_hint.borrow().clone();
+        let mut has_unresolved_reads = false;
+        for read in reads {
+            let mut rid = self.resolve_read_name(&read, &top_prefix);
+            if rid.is_none()
+                && let Some(scope_hint) = hint.as_deref()
+            {
+                let mut scope = scope_hint;
+                loop {
+                    rid = self.resolve_read_name(&format!("{}.{}", scope, read), &top_prefix);
+                    if rid.is_some() {
+                        break;
+                    }
+                    let Some((parent, _)) = scope.rsplit_once('.') else {
+                        break;
+                    };
+                    scope = parent;
+                }
+            }
+            match rid {
+                Some(r) => ids.push(r),
+                None => has_unresolved_reads = true,
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let read_epochs = ids
+            .iter()
+            .map(|&r| self.active_force_signal_epochs.get(r).copied().unwrap_or(0))
+            .collect();
+        self.active_force_exprs.push(ActiveForceExpr {
+            key,
+            lvalue: base.clone(),
+            rvalue: Expression::new(ExprKind::Empty, base.span),
+            hint,
+            read_signal_ids: ids,
+            read_epochs,
+            has_unresolved_reads,
+            partial: true,
+        });
+    }
+
+    /// Recompute a partially forced net: lift the override, re-evaluate its
+    /// drivers, then pin the forced bits over the driven value.
+    fn refresh_partial_force(&mut self, id: usize, base: &Expression) {
+        let Some(pf) = self.partial_forces.get(&id) else {
+            return;
+        };
+        let pieces: Vec<(Expression, u32, Option<String>)> = pf.pieces.clone();
+        let bits = pf.bits.clone();
+        let mut vals: Vec<Option<Value>> = vec![None; pieces.len()];
+        for (pi, _) in bits.iter().flatten() {
+            if vals[*pi].is_none() {
+                let (rv, w, h) = &pieces[*pi];
+                let saved = self.name_resolve_hint.borrow().clone();
+                *self.name_resolve_hint.borrow_mut() = h.clone();
+                let v = self.eval_expr(rv).resize(*w);
+                *self.name_resolve_hint.borrow_mut() = saved;
+                vals[*pi] = Some(v);
+            }
+        }
+        self.forced_signals.remove(&id);
+        if !self.settling && !self.in_edge_block {
+            let drivers: Vec<CombEntry> = self
+                .comb_entries
+                .iter()
+                .filter(|e| e.cold.write_signal_ids.contains(&id))
+                .cloned()
+                .collect();
+            for entry in &drivers {
+                self.eval_comb_entry_full(entry);
+            }
+        }
+        let mut merged = self.signal_table[id].clone();
+        for (i, b) in bits.iter().enumerate() {
+            if let Some((pi, k)) = b {
+                if let Some(v) = &vals[*pi] {
+                    merged.set_bit(i, v.get_bit(*k as usize));
+                }
+            }
+        }
+        if merged != self.signal_table[id] {
+            self.assign_value(base, &merged);
+        }
+        // A gate driving the net must see the override (see the whole-net
+        // force path).
+        self.ctl_note_deposit(base);
+        let stored = self.signal_table[id].clone();
+        self.forced_signals.insert(id, stored);
     }
 
     fn force_target(&mut self, lv: &Expression) -> Option<(String, Option<usize>)> {
@@ -64788,11 +62500,77 @@ impl Simulator {
         {
             return changed;
         }
-        let changed = self.assign_value_inner(lhs, val);
+        // §6.8/§6.11.1: a write to a 2-state procedural local drops X/Z
+        // (whole, bit- or part-select). Probed only for an X/Z value.
+        let changed = if val.has_xz() {
+            self.assign_value_xz(lhs, val)
+        } else {
+            self.assign_value_inner(lhs, val)
+        };
         if changed && !self.condition_waiters.is_empty() {
             self.check_condition_waiters_for_write(lhs);
         }
         changed
+    }
+
+    /// `assign_value_inner` for a value carrying X/Z: a 2-state procedural
+    /// local target (`lvalue_is_two_state_local`) receives it with X/Z
+    /// mapped to 0.
+    #[cold]
+    #[inline(never)]
+    fn assign_value_xz(&mut self, lhs: &Expression, val: &Value) -> bool {
+        if self.lvalue_is_two_state_local(lhs) {
+            let v = val.to_two_state();
+            self.assign_value_inner(lhs, &v)
+        } else {
+            self.assign_value_inner(lhs, val)
+        }
+    }
+
+    /// Does `lhs` (a bare local, or a bit/part/element select of one) write
+    /// a procedural local declared with a 2-state type? Its declared type is
+    /// the latest `var_decl_types` entry for the name (every declaration
+    /// replaces it; a subroutine's are restored on return), so nothing is
+    /// paid per declaration — only a write carrying X/Z asks. Table signals
+    /// carry their own `signal_two_state` mark, a class property or module
+    /// variable seen from a subroutine is no local, and a fallback's carried
+    /// locals are fitted on copy-back.
+    fn lvalue_is_two_state_local(&self, lhs: &Expression) -> bool {
+        let mut root = lhs;
+        loop {
+            match &root.kind {
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => root = expr,
+                ExprKind::Paren(inner) => root = inner,
+                _ => break,
+            }
+        }
+        let ExprKind::Ident(h) = &root.kind else {
+            return false;
+        };
+        if h.root.is_some() || h.path.len() != 1 {
+            return false;
+        }
+        let name = h.path[0].name.name.as_str();
+        let in_frame = self
+            .local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(name));
+        if in_frame {
+            if self.fb_frame_depths.last().copied() == Some(self.local_stack.len() - 1) {
+                return false;
+            }
+        } else if !self.local_stack.is_empty()
+            || self.signal_name_to_id.contains_key(name)
+            || !(self.signals.contains_key(name) || self.module.arrays.contains_key(name))
+        {
+            // Inside a subroutine every local is in its frame: a name
+            // outside it is a class property or a module variable.
+            return false;
+        }
+        self.module.var_decl_types.get(name).is_some_and(|dt| {
+            !super::elaborate::is_type_real(dt)
+                && super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
+        })
     }
 
     /// §13.5.2: an element, bit or part-select access on a `ref` formal
@@ -64909,6 +62687,54 @@ impl Simulator {
             return None;
         }
         self.ref_formal_redirect_inner(e, false)
+    }
+
+    /// IEEE 1800-2023 §13.5.2: a `ref` formal names the actual's storage,
+    /// so an event control on it (`@(posedge sig)`, `@(sig)`, `@(b[2])`)
+    /// waits for a change of the ACTUAL. The formal itself is a frame value
+    /// with no signal behind it: the wait resolved to nothing, fell through
+    /// to the NBA-region fallback and resumed in the same time step. Each
+    /// term naming a formal aliased to module-visible storage (or an
+    /// identity-bound aggregate) is rewritten onto the actual. `None` when
+    /// no term changes.
+    fn ref_event_control(&self, event: &EventControl) -> Option<EventControl> {
+        let redirect = |e: &Expression| -> Option<Expression> {
+            let mut inner = e;
+            while let ExprKind::Paren(x) = &inner.kind {
+                inner = x;
+            }
+            self.ref_formal_redirect_inner(inner, true)
+        };
+        match event {
+            EventControl::HierIdentifier(e) => redirect(e).map(EventControl::HierIdentifier),
+            EventControl::Identifier(id) => {
+                let e = Expression::new(
+                    ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![crate::ast::expr::HierPathSegment {
+                            name: id.clone(),
+                            selects: Vec::new(),
+                        }],
+                        span: id.span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    }),
+                    id.span,
+                );
+                redirect(&e).map(EventControl::HierIdentifier)
+            }
+            EventControl::EventExpr(terms) => {
+                let mut out: Option<Vec<crate::ast::stmt::EventExpr>> = None;
+                for (k, t) in terms.iter().enumerate() {
+                    if let Some(ne) = redirect(&t.expr) {
+                        let v = out.get_or_insert_with(|| terms.clone());
+                        v[k].expr = ne;
+                    }
+                }
+                out.map(EventControl::EventExpr)
+            }
+            EventControl::Star | EventControl::ParenStar => None,
+        }
     }
 
     /// Cheap reject for the hot paths: only a call with an aliased or an
@@ -65545,6 +63371,8 @@ impl Simulator {
                 .filter(|_| !fitted.is_real && self.is_associative_array(&an))
             {
                 fitted.is_signed = sg;
+            } else if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&an) {
+                fitted = self.fit_signed_class_coll_elem(&an, fitted);
             }
             let changed = self.signals.get(&elem_name) != Some(&fitted);
             self.signals.insert(elem_name, fitted);
@@ -66173,6 +64001,8 @@ impl Simulator {
                     !fitted.is_real && !elem_is_string && self.is_associative_array(&name)
                 }) {
                     fitted.is_signed = sg;
+                } else if !fitted.is_real && !fitted.is_signed && self.signed_class_coll(&name) {
+                    fitted = self.fit_signed_class_coll_elem(&name, fitted);
                 }
                 if self.warn_x && self.time > 0 {
                     let prev = self.signals.get(&elem_name).cloned();
@@ -66482,6 +64312,11 @@ impl Simulator {
                     {
                         let mut ident = h.clone();
                         ident.path[0].name = member.clone();
+                        // §26.3: a contested package variable has its own
+                        // per-package storage under `<pkg>::<name>`.
+                        if let Some(q) = self.pkg_var_storage(&h.path[0].name.name, &member.name) {
+                            ident.path[0].name.name = q;
+                        }
                         // The stripped name names a NEW signal and must resolve
                         // under its own column, not the field the package
                         // qualifier's node carried. `h` here is the
@@ -66493,8 +64328,7 @@ impl Simulator {
                         // wrongly resolves back to the PACKAGE name, and every
                         // element read returns all-x. Reset the cache so the
                         // new name resolves from scratch.
-                        ident.cached_resolved_name =
-                            std::cell::OnceCell::new();
+                        ident.cached_resolved_name = std::cell::OnceCell::new();
                         return Some(Expression::new(ExprKind::Ident(ident), lhs.span));
                     }
                 }
@@ -66507,6 +64341,10 @@ impl Simulator {
             {
                 let mut ident = h.clone();
                 ident.path.remove(0);
+                // §26.3: a contested package variable's own storage.
+                if let Some(q) = self.pkg_var_storage(&h.path[0].name.name, &h.path[1].name.name) {
+                    ident.path[0].name.name = q;
+                }
                 // See the MemberAccess arm above: the cloned node inherits
                 // `cached_resolved_name` from the `<pkg>::<member>` reference;
                 // reset it so the bare `<member>` resolves fresh.
@@ -68219,7 +66057,8 @@ impl Simulator {
                             // mutable borrow below.
                             let (msb, lsb) = match self.class_prop_packed_shape(handle, &fname) {
                                 Some((_, total, left, right))
-                                    if class_dim.is_none() && left < right && total > 0 => {
+                                    if class_dim.is_none() && left < right && total > 0 =>
+                                {
                                     let top = total as usize - 1;
                                     (top.saturating_sub(lsb), top.saturating_sub(msb))
                                 }
@@ -69592,10 +67431,9 @@ impl Simulator {
     /// (which a 2-state value cannot express as x; reference simulators do
     /// the same) instead of x, for a 4-state (`logic`) array keeps x.
     fn packed_array_two_state(&self, name: &str) -> bool {
-        self.module
-            .var_decl_types
-            .get(name)
-            .is_some_and(|dt| super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types))
+        self.module.var_decl_types.get(name).is_some_and(|dt| {
+            super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
+        })
     }
 
     /// §7.4.1: bit position of LABEL `label` within one element of packed
@@ -69728,11 +67566,15 @@ impl Simulator {
                     .map(|m| m.iter().map(|x| x.1).collect::<Vec<u64>>())
             };
             if let Some(nm) = self.array_operand_name(lv) {
-                if self.module.arrays_nd.contains_key(&nm) || self.module.arrays_2d.contains_key(&nm) {
+                if self.module.arrays_nd.contains_key(&nm)
+                    || self.module.arrays_2d.contains_key(&nm)
+                {
                     return rand_csp::CspOutcome::NotApplicable;
                 }
                 let dynamic = self.module.dynamic_arrays.contains(&nm)
-                    || self.signals.contains_key(&Self::name_with_suffix(&nm, ".size"));
+                    || self
+                        .signals
+                        .contains_key(&Self::name_with_suffix(&nm, ".size"));
                 let idx: Vec<i64> = if dynamic {
                     (0..self.get_queue_size(&nm) as i64).collect()
                 } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&nm) {
@@ -69750,7 +67592,12 @@ impl Simulator {
                 if v0.is_real {
                     return rand_csp::CspOutcome::NotApplicable;
                 }
-                let w = self.module.arrays.get(&nm).map(|t| t.2 as u32).unwrap_or(v0.width);
+                let w = self
+                    .module
+                    .arrays
+                    .get(&nm)
+                    .map(|t| t.2 as u32)
+                    .unwrap_or(v0.width);
                 if w > 64 {
                     // Left as drawn: a constraint reading it is judged by the
                     // final check.
@@ -69780,7 +67627,13 @@ impl Simulator {
                 continue;
             }
             let ev = enum_vals(self, name);
-            scalars.push((name.clone(), lv.clone(), cur.width.max(1), cur.is_signed, ev));
+            scalars.push((
+                name.clone(),
+                lv.clone(),
+                cur.width.max(1),
+                cur.is_signed,
+                ev,
+            ));
         }
         self.rand_csp_solve_scope(items, &scalars, &arrays)
     }
@@ -70058,6 +67911,10 @@ impl Simulator {
             }
             // §6.24.1 literal size cast `N'(x)` — lowered by the parser.
             "$__xz_size_cast" => {
+                // §6.24.3: an unpacked operand packs its elements.
+                if let Some(v) = self.cast_of_unpacked_operand(expr, ctx_width, name, args) {
+                    return v;
+                }
                 let n = args
                     .first()
                     .map(|a| self.eval_expr(a).to_u64().unwrap_or(32))
@@ -71162,6 +69019,10 @@ impl Simulator {
             // → real cast widens; otherwise resize to the type's width and
             // stamp its signedness.
             "$__xz_type_cast" => {
+                // §6.24.3: an unpacked operand packs its elements.
+                if let Some(v) = self.cast_of_unpacked_operand(expr, ctx_width, name, args) {
+                    return v;
+                }
                 let Some(ExprKind::TypeLiteral(dt)) = args.first().map(|a| &a.kind) else {
                     return args
                         .get(1)
@@ -71257,6 +69118,10 @@ impl Simulator {
             // `id` gives the target width). Parser-lowered; resolved here
             // where both the typedef and parameter tables are visible.
             "$__xz_named_cast" => {
+                // §6.24.3: an unpacked operand packs its elements.
+                if let Some(v) = self.cast_of_unpacked_operand(expr, ctx_width, name, args) {
+                    return v;
+                }
                 let inner_is_call =
                     matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Call { .. }));
                 // §6.24.1: an integral target (typedef, enum, or a constant
@@ -71328,7 +69193,10 @@ impl Simulator {
                         // to the element width, or all but one element are lost.
                         if self.type_is_unpacked_collection_name(&nm) {
                             let mut out = if inner_v.is_real {
-                                Self::real_to_int(inner_v.to_f64(), self.cast_context_width(&dt).max(1))
+                                Self::real_to_int(
+                                    inner_v.to_f64(),
+                                    self.cast_context_width(&dt).max(1),
+                                )
                             } else {
                                 inner_v
                             };
@@ -72377,13 +70245,10 @@ impl Simulator {
                 if let Some(su) = self.packed_struct_elem_type(expr) {
                     let (fields, total) = self.packed_agg_layout(&su);
                     if total == base_val.width {
-                        if let Some((_, off, w)) = fields
-                            .iter()
-                            .find(|(m, _, _)| m == &member.name)
-                            .cloned()
+                        if let Some((_, off, w)) =
+                            fields.iter().find(|(m, _, _)| m == &member.name).cloned()
                         {
-                            return base_val
-                                .range_select((off + w - 1) as usize, off as usize);
+                            return base_val.range_select((off + w - 1) as usize, off as usize);
                         }
                     }
                 }
@@ -72521,47 +70386,52 @@ impl Simulator {
                             })
                             .collect()
                     });
-                let fields_opt: Option<Vec<(String, u32, u32, bool)>> = from_packed.or_else(|| {
-                    // For Call base: resolve the function's return type
-                    if let ExprKind::Call { func, .. } = &expr.kind {
-                        if let ExprKind::Ident(h) = &func.kind {
-                            let fn_name = h.path.last()?.name.name.as_str();
-                            let fd = self.module.functions.get(fn_name)?;
-                            let resolved =
-                                Self::resolve_type_ref(&fd.return_type, &self.module.typedef_types);
-                            Self::struct_field_layout(&resolved)
-                        } else {
-                            None
-                        }
-                    } else if let Some(type_name) = self.var_typedef_types.get(&*base_name) {
-                        // Local variable/parameter with typedef type
-                        let dt = self.module.typedef_types.get(type_name.as_str())?;
-                        let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
-                        Self::struct_field_layout(&resolved)
-                    } else {
-                        // Module-level signal with a typedef'd struct
-                        // type: resolve via signal_name_to_id →
-                        // signal_type_names → typedef_types.
-                        let sig_tn = self
-                            .signal_name_to_id
-                            .get(base_name.as_ref())
-                            .and_then(|id| self.signal_type_names.get(id).cloned());
-                        if let Some(tn) = sig_tn {
-                            let dt = self.module.typedef_types.get(tn.as_str())?;
+                let fields_opt: Option<Vec<(String, u32, u32, bool)>> = from_packed
+                    .or_else(|| {
+                        // For Call base: resolve the function's return type
+                        if let ExprKind::Call { func, .. } = &expr.kind {
+                            if let ExprKind::Ident(h) = &func.kind {
+                                let fn_name = h.path.last()?.name.name.as_str();
+                                let fd = self.module.functions.get(fn_name)?;
+                                let resolved = Self::resolve_type_ref(
+                                    &fd.return_type,
+                                    &self.module.typedef_types,
+                                );
+                                Self::struct_field_layout(&resolved)
+                            } else {
+                                None
+                            }
+                        } else if let Some(type_name) = self.var_typedef_types.get(&*base_name) {
+                            // Local variable/parameter with typedef type
+                            let dt = self.module.typedef_types.get(type_name.as_str())?;
                             let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
                             Self::struct_field_layout(&resolved)
                         } else {
-                            // Try resolving base_name as a typedef
-                            let dt = self.module.typedef_types.get(&*base_name)?;
-                            let resolved = Self::resolve_type_ref(dt, &self.module.typedef_types);
-                            Self::struct_field_layout(&resolved)
+                            // Module-level signal with a typedef'd struct
+                            // type: resolve via signal_name_to_id →
+                            // signal_type_names → typedef_types.
+                            let sig_tn = self
+                                .signal_name_to_id
+                                .get(base_name.as_ref())
+                                .and_then(|id| self.signal_type_names.get(id).cloned());
+                            if let Some(tn) = sig_tn {
+                                let dt = self.module.typedef_types.get(tn.as_str())?;
+                                let resolved =
+                                    Self::resolve_type_ref(dt, &self.module.typedef_types);
+                                Self::struct_field_layout(&resolved)
+                            } else {
+                                // Try resolving base_name as a typedef
+                                let dt = self.module.typedef_types.get(&*base_name)?;
+                                let resolved =
+                                    Self::resolve_type_ref(dt, &self.module.typedef_types);
+                                Self::struct_field_layout(&resolved)
+                            }
                         }
-                    }
-                })
-                // A class-object variable is never struct-spliced: skip the
-                // stale-layout path even if a same-named struct in a caller
-                // scope poisoned `var_typedef_types` (see `is_class_base`).
-                .filter(|_| !is_class_base);
+                    })
+                    // A class-object variable is never struct-spliced: skip the
+                    // stale-layout path even if a same-named struct in a caller
+                    // scope poisoned `var_typedef_types` (see `is_class_base`).
+                    .filter(|_| !is_class_base);
                 if let Some(fields) = fields_opt {
                     // Only trust this layout if it actually describes
                     // `base_val` (total width matches). Otherwise we'd
@@ -73263,7 +71133,7 @@ impl Simulator {
             }
         }
         let handle = recv.to_u64()? as usize;
-        if handle == 0 {
+        if handle == 0 || (self.shadowed_prop_mask != 0 && self.prop_maybe_shadowed(m)) {
             return None;
         }
         self.heap.get(handle)?.as_ref()?.properties.get(m).cloned()
@@ -73997,6 +71867,12 @@ impl Simulator {
                     if hier.path.len() >= 3 {
                         let mut stripped = hier.clone();
                         stripped.path.remove(0);
+                        // §26.3: a contested package variable's own storage.
+                        if let Some(q) =
+                            self.pkg_var_storage(&hier.path[0].name.name, &hier.path[1].name.name)
+                        {
+                            stripped.path[0].name.name = q;
+                        }
                         stripped.cached_signal_id = std::cell::Cell::new(None);
                         stripped.cached_resolved_name = std::cell::OnceCell::new();
                         let e2 = Expression::new(ExprKind::Ident(stripped), expr.span);
@@ -75886,27 +73762,62 @@ impl Simulator {
                 let mut concat = Value::zero(0);
                 for p in exprs.iter().rev() {
                     // Special case: dynamic array/queue ident → concat all elements, idx0 at MSB.
-                    let piece = if let ExprKind::Ident(h) = &p.kind {
-                        let n = self.resolve_hier_name(h);
-                        if self.module.arrays.contains_key(&*n) {
-                            let ew = self
-                                .lookup_signal_width(&format!("{}[0]", n))
-                                .unwrap_or_else(|| {
-                                    self.module.arrays.get(&*n).map(|t| t.2).unwrap_or(8)
-                                })
-                                .max(1);
-                            let sz = self.get_queue_size(&n) as usize;
-                            let mut acc = Value::zero(0);
-                            for i in 0..sz {
-                                let ev = self
-                                    .get_signal_value_by_name(&format!("{}[{}]", n, i))
-                                    .unwrap_or(Value::zero(ew));
-                                acc = acc.concat_with(&ev);
+                    // §11.4.14: an unpacked operand streams its elements
+                    // leftmost first (`stream_elem_order`) — a descending
+                    // `[2:0]` array starts at index 2, a 2-D array goes row
+                    // by row. A queue / dynamic-array SLICE `q[a:b]` streams
+                    // elements a..b.
+                    let elem_list: Option<(Vec<String>, u32)> = match &p.kind {
+                        ExprKind::Ident(h) => {
+                            let n = self.resolve_hier_name(h);
+                            // One probe for the common scalar operand;
+                            // the 2-D / N-D tables are usually empty.
+                            if self.module.arrays.contains_key(&*n)
+                                || (!self.module.arrays_2d.is_empty()
+                                    && self.module.arrays_2d.contains_key(&*n))
+                                || (!self.module.arrays_nd.is_empty()
+                                    && self.module.arrays_nd.contains_key(&*n))
+                            {
+                                self.stream_elem_order(&n)
+                            } else {
+                                None
                             }
-                            acc
-                        } else {
-                            self.eval_expr(p)
                         }
+                        ExprKind::RangeSelect {
+                            expr: base,
+                            left,
+                            right,
+                            ..
+                        } => match &base.kind {
+                            ExprKind::Ident(h)
+                                if self
+                                    .module
+                                    .dynamic_arrays
+                                    .contains(&*self.resolve_hier_name(h)) =>
+                            {
+                                let n = self.resolve_hier_name(h).to_string();
+                                let l = self.eval_expr(left).to_i64();
+                                let r = self.eval_expr(right).to_i64();
+                                match (l, r) {
+                                    (Some(l), Some(r)) if l <= r && r - l < 1 << 20 => {
+                                        self.stream_elem_order(&n).map(|(_, ew)| {
+                                            ((l..=r).map(|i| format!("{}[{}]", n, i)).collect(), ew)
+                                        })
+                                    }
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let piece = if let Some((names, ew)) = elem_list {
+                        let mut acc = Value::zero(0);
+                        for en in &names {
+                            let ev = self.get_signal_value_by_name(en).unwrap_or(Value::zero(ew));
+                            acc = acc.concat_with(&ev);
+                        }
+                        acc
                     } else {
                         self.eval_expr(p)
                     };
@@ -77094,6 +75005,12 @@ impl Simulator {
                         let l = self.eval_expr(left).to_i64().unwrap_or(0);
                         let r = self.eval_expr(right).to_i64().unwrap_or(0);
                         self.dollar_bound.pop();
+                        // §7.10.1: `q[a:b]` with a > b is the EMPTY queue
+                        // (`q[3:1]`, and `q[n:$]` on n elements) — not the
+                        // swapped range.
+                        if is_dyn && matches!(kind, RangeKind::Constant) && l > r {
+                            return Value::zero(0);
+                        }
                         let (lo, hi) = match kind {
                             RangeKind::Constant => (l.min(r), l.max(r)),
                             RangeKind::IndexedUp => (l, l + r - 1),
@@ -77266,8 +75183,7 @@ impl Simulator {
                             ri -= dr;
                         }
                     }
-                } else if let Some((dl, dr)) =
-                    plain_dim.or_else(|| self.select_base_elem_dim(expr))
+                } else if let Some((dl, dr)) = plain_dim.or_else(|| self.select_base_elem_dim(expr))
                 {
                     // ELEMENT of an unpacked array/queue/assoc (or a packed
                     // element): `logic [31:8] q[$]; q[0][31:8]` selects the
@@ -78539,10 +76455,6 @@ impl Simulator {
         true
     }
 
-    /// Outlined from `exec_statement` so the dispatcher's stack frame
-    /// stays small: this arm's locals inflated every call's frame (the
-    /// dispatcher recursed with a 7.8 KB frame per level).
-    #[inline(never)]
     fn exec_stmt_blocking_assign(
         &mut self,
         stmt: &Statement,
@@ -78556,7 +76468,58 @@ impl Simulator {
             self.recv_call_memo.truncate(base);
             return;
         }
+        if let ExprKind::SystemCall { name, args } = &rvalue.kind
+            && name == "$__xz_named_cast"
+            && self.unpacked_bitstream_cast_assign(stmt, lvalue, args)
+        {
+            return;
+        }
         self.exec_stmt_blocking_assign_body(stmt, lvalue, rvalue)
+    }
+
+    /// `lhs = T'(operand)` with `T` an unpacked array / queue type: assign
+    /// the operand's bit stream (`unpacked_bitstream_cast_rhs`). Returns
+    /// false (nothing done) for any other cast.
+    #[cold]
+    #[inline(never)]
+    fn unpacked_bitstream_cast_assign(
+        &mut self,
+        stmt: &Statement,
+        lvalue: &Expression,
+        args: &[Expression],
+    ) -> bool {
+        let Some(stream) = self.unpacked_bitstream_cast_rhs(args) else {
+            return false;
+        };
+        self.exec_stmt_blocking_assign_body(stmt, lvalue, &stream);
+        true
+    }
+
+    /// §6.24.3: a bit-stream cast to an UNPACKED array / queue type
+    /// (`barr_t'(32'h01020304)`, `q8_t'(24'habcdef)`, `q8_t'(ba)`) unpacks
+    /// the operand's bit stream into the target's elements, leftmost element
+    /// first — exactly `{>>{operand}}` assigned to the target (§11.4.14), whose
+    /// unpacking also sizes a dynamic array or queue from the stream length.
+    /// The cast was a pass-through of the packed operand, which an unpacked
+    /// target stored as all-zero (or x) elements. A call operand keeps the
+    /// collection-return path of the cast itself.
+    fn unpacked_bitstream_cast_rhs(&self, args: &[Expression]) -> Option<Expression> {
+        let inner = args.get(1)?;
+        if matches!(inner.kind, ExprKind::Call { .. }) {
+            return None;
+        }
+        let nm = self.named_cast_key(args.first()?)?;
+        if !self.type_is_unpacked_collection_name(&nm) {
+            return None;
+        }
+        Some(Expression::new(
+            ExprKind::StreamOp {
+                left_to_right: false,
+                slice_size: None,
+                exprs: vec![inner.clone()],
+            },
+            inner.span,
+        ))
     }
 
     fn exec_stmt_blocking_assign_body(
@@ -78761,24 +76724,22 @@ impl Simulator {
                 // object's member (UVM 4251: burst_read's 64-element
                 // `value` collapsed to 1). Prefer the `this`-scoped member
                 // store over the enclosing-frame/renamed resolution below.
-                let member_store: Option<std::borrow::Cow<str>> =
-                    if let ExprKind::Ident(lh) = &lvalue.kind
-                        && lh.path.len() == 1
-                        && lh.path[0].selects.is_empty()
-                    {
-                        let bare = &lh.path[0].name.name;
-                        let current_frame_local = self
-                            .dyn_name_lookup_innermost(bare)
-                            .is_some();
-                        if !current_frame_local {
-                            self.instance_assoc_member(bare)
-                                .map(std::borrow::Cow::Owned)
-                        } else {
-                            None
-                        }
+                let member_store: Option<std::borrow::Cow<str>> = if let ExprKind::Ident(lh) =
+                    &lvalue.kind
+                    && lh.path.len() == 1
+                    && lh.path[0].selects.is_empty()
+                {
+                    let bare = &lh.path[0].name.name;
+                    let current_frame_local = self.dyn_name_lookup_innermost(bare).is_some();
+                    if !current_frame_local {
+                        self.instance_assoc_member(bare)
+                            .map(std::borrow::Cow::Owned)
                     } else {
                         None
-                    };
+                    }
+                } else {
+                    None
+                };
                 let name = member_store.or_else(|| {
                     target
                         .filter(|n| self.module.dynamic_arrays.contains(n.as_ref()))
@@ -80068,7 +78029,40 @@ impl Simulator {
         // Distribute the streamed bits element-by-element (MSB first).
         if let ExprKind::StreamOp { .. } = &rvalue.kind {
             if let ExprKind::Ident(lh) = &lvalue.kind {
-                let lname = self.resolve_hier_name(lh);
+                let lname = self.resolve_hier_name(lh).to_string();
+                // §11.4.14.3: a FIXED-size target fills its elements in
+                // stream order (leftmost element first: a descending `[2:0]`
+                // array from index 2, a 2-D array row by row); elements the
+                // stream does not reach are zero.
+                if !self.module.dynamic_arrays.contains(&lname)
+                    && (self.module.arrays.contains_key(&lname)
+                        || self.module.arrays_2d.contains_key(&lname)
+                        || self.module.arrays_nd.contains_key(&lname))
+                    && let Some((names, elem_w)) = self.stream_elem_order(&lname)
+                {
+                    let sv = self.eval_expr_ctx(rvalue, 0);
+                    let total = sv.width as usize;
+                    let ew = elem_w as usize;
+                    for (k, en) in names.iter().enumerate() {
+                        let piece = if (k + 1) * ew <= total {
+                            sv.range_select(total - k * ew - 1, total - (k + 1) * ew)
+                        } else if k * ew < total {
+                            // A partial last element: the stream's low bits,
+                            // left-justified (zero padding on the right).
+                            let rem = total - k * ew;
+                            let mut v = Value::zero(elem_w);
+                            for b in 0..rem {
+                                v.set_bit(ew - rem + b, sv.get_bit(b));
+                            }
+                            v
+                        } else {
+                            Value::zero(elem_w)
+                        };
+                        self.set_signal_value_by_name(en, piece.resize(elem_w));
+                    }
+                    self.settle_after_proc_write();
+                    return;
+                }
                 if self.module.arrays.contains_key(&*lname) {
                     let elem_w = self
                         .lookup_signal_width(&format!("{}[0]", lname))
@@ -80187,12 +78181,17 @@ impl Simulator {
                         let n = self.resolve_hier_name(h);
                         if self.module.dynamic_arrays.contains(&*n)
                             || self.module.arrays.contains_key(&*n)
+                            || self.module.arrays_2d.contains_key(&*n)
+                            || self.module.arrays_nd.contains_key(&*n)
                         {
-                            let ew = self
-                                .lookup_signal_width(&format!("{}[0]", n))
-                                .unwrap_or_else(|| {
-                                    self.module.arrays.get(&*n).map(|t| t.2).unwrap_or(8)
-                                });
+                            let ew = match self.stream_elem_order(&n) {
+                                Some((_, ew)) if !self.module.dynamic_arrays.contains(&*n) => ew,
+                                _ => self
+                                    .lookup_signal_width(&format!("{}[0]", n))
+                                    .unwrap_or_else(|| {
+                                        self.module.arrays.get(&*n).map(|t| t.2).unwrap_or(8)
+                                    }),
+                            };
                             dyn_last = Some(n.to_string());
                             dyn_last_elem_w = ew;
                             continue;
@@ -80210,13 +78209,30 @@ impl Simulator {
                     let elem_w = dyn_last_elem_w.max(1);
                     let n_elems = (remaining / elem_w) as usize;
                     let dname = dyn_last.clone().unwrap();
-                    self.set_queue_size(&dname, n_elems as u64);
+                    // §11.4.14.3: a FIXED array fills in stream order (the
+                    // left bound first, row by row); only a dynamic array or
+                    // queue is resized and filled from index 0.
+                    let fixed_order = if self.module.dynamic_arrays.contains(&dname) {
+                        None
+                    } else {
+                        self.stream_elem_order(&dname).map(|(names, _)| names)
+                    };
+                    if fixed_order.is_none() {
+                        self.set_queue_size(&dname, n_elems as u64);
+                    }
                     for k in 0..n_elems {
                         let hi = msb.saturating_sub(k * elem_w as usize).saturating_sub(1);
                         let lo = msb.saturating_sub((k + 1) * elem_w as usize);
                         if hi >= lo {
                             let slice_v = ordered.range_select(hi, lo);
-                            self.set_signal_value_by_name(&format!("{}[{}]", dname, k), slice_v);
+                            let ename = match &fixed_order {
+                                Some(names) => match names.get(k) {
+                                    Some(n) => n.clone(),
+                                    None => break,
+                                },
+                                None => format!("{}[{}]", dname, k),
+                            };
+                            self.set_signal_value_by_name(&ename, slice_v);
                         }
                     }
                 } else {
@@ -82444,6 +80460,53 @@ impl Simulator {
     /// stays small: this arm's locals inflated every call's frame (the
     /// dispatcher recursed with a 7.8 KB frame per level).
     #[inline(never)]
+    /// §6.8/§10.7: a procedural local's declaration initializer is an
+    /// assignment to the declared type — it takes the type's width (an
+    /// unbased-unsized fill replicates), signedness and 2-state-ness, and a
+    /// real converts. `byte unsigned v = 200` read -56 and `bit [3:0] b =
+    /// 4'b1x0z` kept its x/z because the raw initializer value was stored.
+    /// A `string` keeps its text unresized: resizing to the placeholder
+    /// width padded it with NULs that later concatenations copied.
+    fn fit_local_decl_init(
+        raw: Value,
+        w: u32,
+        data_type: &DataType,
+        two_state: bool,
+        is_real_type: bool,
+        signed: bool,
+    ) -> Value {
+        if is_real_type {
+            return if raw.is_real {
+                raw
+            } else {
+                Value::from_f64(raw.to_f64())
+            };
+        }
+        if matches!(
+            data_type,
+            crate::ast::types::DataType::Simple {
+                kind: crate::ast::types::SimpleType::String,
+                ..
+            }
+        ) {
+            return raw;
+        }
+        let mut v = if raw.is_real {
+            Self::real_to_int(raw.to_f64(), w)
+        } else {
+            raw.resize_for_assign(w)
+        };
+        if two_state && v.has_xz() {
+            v = v.to_two_state();
+        }
+        v.is_signed = signed;
+        v
+    }
+
+    /// Outlined from `exec_statement` so the dispatcher's stack frame
+    /// stays small: this arm's locals inflated every call's frame (the
+    /// dispatcher recursed with a 7.8 KB frame per level).
+    #[inline(never)]
     fn exec_stmt_var_decl(
         &mut self,
         stmt: &Statement,
@@ -82540,6 +80603,9 @@ impl Simulator {
             };
         // §6.4: `real`/`shortreal` variables default to 0.0.
         let is_real_type = super::elaborate::is_type_real(data_type);
+        // §6.11.3: the declared signedness every declarator's value and
+        // later reads carry.
+        let decl_signed = !plain_class && self.type_is_signed_concrete(data_type);
         let default_v = if is_real_type {
             Value::from_f64(0.0)
         } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle {
@@ -82796,6 +80862,38 @@ impl Simulator {
                             .struct_members
                             .insert(d.name.name.clone(), names);
                     }
+                }
+            } else {
+                // §7.4/§20.7: an ARRAY local of a packed multi-dimensional
+                // element (`logic [7:0][3:0] pk [2][3];`) keeps its packed
+                // geometry, as a module-scope array does: the element width
+                // makes `pk[i][j][k]` a lane select and the full dims answer
+                // `$size(pk, 3)` / `$dimensions(pk)`. Only the flat element
+                // width was kept, so the packed dims read as one 32-bit one.
+                match super::elaborate::packed_full_dims_of(data_type, &self.module.parameters) {
+                    Some(fdims) if fdims.len() >= 2 => {
+                        if let Some(ew) = super::elaborate::packed_inner_elem_width(
+                            data_type,
+                            &self.module.parameters,
+                            &self.module.typedefs,
+                        ) {
+                            self.module
+                                .packed_signal_elem_widths
+                                .insert(d.name.name.clone(), ew);
+                        }
+                        self.module
+                            .packed_full_dims
+                            .insert(d.name.name.clone(), fdims);
+                        self.array_local_packed_dims.insert(d.name.name.clone());
+                    }
+                    // Only a name this arm registered can hold a stale
+                    // geometry: the common array local pays no lookup.
+                    _ if !self.array_local_packed_dims.is_empty()
+                        && self.array_local_packed_dims.remove(&d.name.name) =>
+                    {
+                        self.module.packed_full_dims.remove(&d.name.name);
+                    }
+                    _ => {}
                 }
             }
             // §6.18/§6.20.3: a typedef'd (or type-param-bound) local
@@ -83607,7 +81705,20 @@ impl Simulator {
                             }
                         }
                     }
-                    produced.unwrap_or_else(|| self.eval_expr_ctx(init_expr, w).resize(w))
+                    match produced {
+                        Some(p) => p,
+                        None => {
+                            let raw = self.eval_expr_ctx(init_expr, w);
+                            Self::fit_local_decl_init(
+                                raw,
+                                w,
+                                data_type,
+                                two_state,
+                                is_real_type,
+                                decl_signed,
+                            )
+                        }
+                    }
                 } else {
                     default_v.clone()
                 };
@@ -83730,11 +81841,51 @@ impl Simulator {
                         self.auto_loop_vars.push(d.name.name.clone());
                     }
                 }
+                // §6.8/§25.9/§7.3.2: a virtual-interface or tagged-union
+                // local's initializer is the assignment `name = init` — the
+                // assignment arm binds the interface instance and builds the
+                // tag + member value; evaluated as a plain expression the
+                // vif read x and the union matched no tag.
+                if let Some(init_expr) = d.init.as_ref().filter(|_| !plain) {
+                    // Followed through the typedef table by reference: this
+                    // runs for every non-scalar declaration with an
+                    // initializer, so no resolved-type clone.
+                    let via_assign = match self.typedef_chain_end(data_type) {
+                        crate::ast::types::DataType::Interface { .. } => true,
+                        crate::ast::types::DataType::Struct(su) => su.tagged,
+                        _ => false,
+                    };
+                    if via_assign {
+                        let lvalue = crate::ast::expr::Expression::new(
+                            crate::ast::expr::ExprKind::Ident(
+                                crate::ast::expr::HierarchicalIdentifier {
+                                    root: None,
+                                    path: vec![crate::ast::expr::HierPathSegment {
+                                        name: d.name.clone(),
+                                        selects: Vec::new(),
+                                    }],
+                                    span: d.name.span,
+                                    cached_signal_id: std::cell::Cell::new(None),
+                                    cached_resolved_name: std::cell::OnceCell::new(),
+                                },
+                            ),
+                            d.name.span,
+                        );
+                        let assign = crate::ast::stmt::Statement::new(
+                            crate::ast::stmt::StatementKind::BlockingAssign {
+                                lvalue,
+                                rvalue: init_expr.clone(),
+                            },
+                            d.name.span,
+                        );
+                        self.exec_statement(&assign);
+                    }
+                }
                 // Track `signed` scalars so reads carry `is_signed`
                 // (needed for signed division/modulo, comparison, and
                 // `%0d` display). A fresh decl also clears a stale
                 // same-named signed flag from another frame.
-                if !plain_class && self.type_is_signed_concrete(data_type) {
+                if decl_signed {
                     if !self.signed_signals.contains(d.name.name.as_str()) {
                         self.signed_signals.insert(d.name.name.clone());
                     }
@@ -84244,8 +82395,12 @@ impl Simulator {
                             .map(|s| s.as_str())
                             .unwrap_or(raw_sig);
                         if let Some((_, sigs)) = self.clocking_meta.get(&cb) {
+                            // §14.16.2: an `inout` clockvar is driven like an
+                            // output (it is registered as an input for sampling).
+                            let inouts = self.clocking_inouts.get(&cb);
                             let out_net = sigs.iter().find(|(n, is_in)| {
-                                !*is_in && (n == sig || n.rsplit('.').next() == Some(sig))
+                                (!*is_in || inouts.is_some_and(|s| s.contains(n)))
+                                    && (n == sig || n.rsplit('.').next() == Some(sig))
                             });
                             if let Some((net, _)) = out_net {
                                 let net = net.clone();
@@ -84267,7 +82422,7 @@ impl Simulator {
                                 let skew = self
                                     .clocking_sig_out_skew
                                     .get(&cb)
-                                    .and_then(|m| m.get(&net))
+                                    .and_then(|m| m.get(raw_sig).or_else(|| m.get(&net)))
                                     .copied()
                                     .or_else(|| self.clocking_out_skew.get(&cb).copied())
                                     .unwrap_or(0);
@@ -84925,8 +83080,9 @@ impl Simulator {
                 // A `disable` naming THIS block ends here; execution resumes
                 // after it (§9.6.2).
                 if let (Some(target), Some(n)) = (self.disable_target.as_deref(), name.as_ref()) {
-                    if target == n.name {
+                    if Self::block_name_matches(target, &n.name) {
                         self.disable_target = None;
+                        self.disable_check_pending = false;
                         self.break_flag = false;
                         self.continue_flag = false;
                     }
@@ -84980,16 +83136,16 @@ impl Simulator {
                     JoinType::Join | JoinType::JoinAny
                         if !child_set.is_empty() && self.dpi_export_depth > 0 =>
                     {
-                        let (id, wpid, wake) = self.new_sync_wake();
+                        let (id, wpid, wake) = self.sync_wait_target();
                         self.join_waiters.push(JoinWaiter {
                             parent_pid: wpid,
                             child_pids: child_set,
                             join_type: *join_type,
-                            continuation: vec![wake].into(),
+                            continuation: wake,
                             finished_children: HashSet::default(),
                             wait_fork: false,
                         });
-                        self.run_nested_until(|sim| sim.sync_wakes.remove(&id));
+                        self.sync_wait(id);
                     }
                     JoinType::Join | JoinType::JoinAny if !child_set.is_empty() => {
                         self.join_waiters.push(JoinWaiter {
@@ -85007,6 +83163,12 @@ impl Simulator {
             }
             StatementKind::TimingControl { control, stmt } => {
                 match control {
+                    // §35.5.2: a delay inside an imported task running on its
+                    // own stack parks the calling process (dpi_task.rs).
+                    TimingControl::Delay(d) if self.dpi_cur_task.is_some() => {
+                        self.dpi_wait_delay(d);
+                        self.exec_statement(stmt);
+                    }
                     TimingControl::Delay(d) => {
                         // The nested work below (run_events_until, settle,
                         // edge cascades) executes OTHER processes and comb
@@ -85096,7 +83258,7 @@ impl Simulator {
                     // the waiter on a wake marker and run the scheduler until
                     // the event fires; the body then runs below (#204).
                     TimingControl::Event(e) if self.dpi_export_depth > 0 => {
-                        let (id, wpid, wake) = self.new_sync_wake();
+                        let (id, wpid, wake) = self.sync_wait_target();
                         let mut key = None;
                         if let Some(fname) = self.event_control_field_name(e) {
                             key = self.resolve_this_event_field(&fname);
@@ -85113,20 +83275,15 @@ impl Simulator {
                             self.instance_event_waiters.push(InstanceEventWaiter {
                                 key,
                                 pid: wpid,
-                                continuation: vec![wake].into(),
+                                continuation: wake,
                             });
                         } else {
                             let sens = self.event_to_sens(e);
                             let is_clk_ev = self.is_clocking_event(e);
-                            let w = self.make_event_waiter_kind(
-                                wpid,
-                                sens,
-                                vec![wake].into(),
-                                is_clk_ev,
-                            );
+                            let w = self.make_event_waiter_kind(wpid, sens, wake, is_clk_ev);
                             self.event_waiters.push(w);
                         }
-                        self.run_nested_until(|sim| sim.sync_wakes.remove(&id));
+                        self.sync_wait(id);
                     }
                     TimingControl::Event(e) => {
                         // Class-field named event parked from the synchronous
@@ -85389,10 +83546,11 @@ impl Simulator {
                         to_kill.insert(c);
                         to_kill.extend(self.collect_fork_descendants(c));
                     }
-                    // If the disabling process is itself one of them (disabling
-                    // the block it is currently inside), fall through to the
-                    // unwind path rather than killing itself here.
-                    if !to_kill.contains(&self.current_pid) {
+                    // The disabling process may itself be one of them (a child
+                    // or deeper descendant disabling its own fork block): it
+                    // is terminated with its siblings and unwinds to its end.
+                    let self_doomed = to_kill.contains(&self.current_pid);
+                    {
                         for &pid in &to_kill {
                             self.killed_pids.insert(pid);
                             self.vc_cancel_process(pid);
@@ -85417,6 +83575,10 @@ impl Simulator {
                             .retain(|w| !to_kill.contains(&w.waiter_pid));
                         self.release_killed_from_join_waiters(&to_kill);
                         self.wake_await_waiters(&to_kill);
+                        if self_doomed {
+                            self.disable_target = Some(name.name.clone());
+                            self.break_flag = true;
+                        }
                         return;
                     }
                 }
@@ -85453,10 +83615,24 @@ impl Simulator {
                 // process is terminated — exact for the common `fork
                 // task_a; task_b; join` + `disable task_b` shape.)
                 if let Some(pids) = self.active_task_pids.get(&name.name).cloned() {
-                    let to_kill: HashSet<usize> = pids
+                    // An ANCESTOR executing the task (the disabling process was
+                    // forked inside it) is unwound out of the call instead —
+                    // see `disable_remote_block`.
+                    let mut to_kill: HashSet<usize> = pids
                         .into_iter()
-                        .filter(|&p| p != self.current_pid && !self.killed_pids.contains(&p))
+                        .filter(|&p| {
+                            p != self.current_pid
+                                && !self.killed_pids.contains(&p)
+                                && !self.is_fork_ancestor(p, self.current_pid)
+                        })
                         .collect();
+                    // §35.9: an EXPORTED task that is the target returns 0 to
+                    // its C caller, and the process carries on in the C code.
+                    let handled = !self.dpi_tasks.is_empty()
+                        && self.dpi_disable_exported_task(&name.name, &mut to_kill);
+                    if to_kill.is_empty() && handled {
+                        return;
+                    }
                     if !to_kill.is_empty() {
                         for &pid in &to_kill {
                             self.killed_pids.insert(pid);
@@ -85494,6 +83670,9 @@ impl Simulator {
                 // enclosing the loop it is `break`.
                 self.disable_target = Some(name.name.clone());
                 self.break_flag = true;
+                // Not yet known to be this process's own block: the process
+                // loop checks, and hands it to `disable_remote_block` if not.
+                self.disable_check_pending = true;
             }
             StatementKind::DisableFork => {
                 // LRM §9.6.2: terminate all active descendant processes of the
@@ -85532,7 +83711,9 @@ impl Simulator {
                 // §9.6.1 in a task entered from C (DPI export): the task cannot
                 // park, so wait here until every child of this process is done
                 // (#204). Elsewhere the suspend-aware runner handles it.
-                if self.dpi_export_depth > 0 {
+                if self.dpi_cur_task.is_some() {
+                    self.dpi_wait_fork();
+                } else if self.dpi_export_depth > 0 {
                     let me = self.current_pid;
                     self.run_nested_until(|sim| !sim.process_parents.values().any(|&p| p == me));
                 }
@@ -85556,6 +83737,14 @@ impl Simulator {
             StatementKind::Wait { condition, stmt } => {
                 if self.wait_condition_true(condition) {
                     self.exec_statement(stmt);
+                } else if self.dpi_cur_task.is_some() {
+                    // §35.5.2: inside an imported task running on its own
+                    // stack, the calling process parks until the condition
+                    // holds (dpi_task.rs).
+                    self.dpi_wait_condition(condition);
+                    if !self.finished {
+                        self.exec_statement(stmt);
+                    }
                 } else if self.dpi_export_depth > 0 {
                     // A task entered from C (DPI export) cannot park: wait
                     // here, running the scheduler until the condition holds
@@ -85599,6 +83788,29 @@ impl Simulator {
                 // today — they'd need to fire in the reactive region,
                 // which is its own follow-up.
                 if a.is_property {
+                    // §16.15 `default disable iff <guard>;` (a marker item
+                    // the parser emits in the declaring scope).
+                    if let ExprKind::SystemCall { name, args } = &a.expr.kind
+                        && name == "$sva_default_disable"
+                    {
+                        if let Some(g) = args.first() {
+                            let mut g = g.clone();
+                            self.sva_resolve_signals(&mut g);
+                            // Keyed by the declaring scope's full path (a
+                            // generate block included).
+                            let scope = self.m_path();
+                            self.sva_default_disable.insert(scope, g);
+                            // It governs the whole scope, so assertions
+                            // registered before it are covered too.
+                            for i in 0..self.sva_sites.len() {
+                                if !self.sva_sites[i].explicit_disable {
+                                    let key = self.sva_sites[i].disable_scope.clone();
+                                    self.sva_sites[i].disable = self.sva_default_disable_for(&key);
+                                }
+                            }
+                        }
+                        return;
+                    }
                     // LRM §16.6: `assert property (p_name);` —
                     // resolve a bare property-name reference to its
                     // stored body before dispatching to SVA. The
@@ -85685,6 +83897,22 @@ impl Simulator {
                                     (**body).clone(),
                                 ))
                             }
+                            // §16.14.6: a procedural assertion without a clock
+                            // of its own takes the one inferred from its
+                            // `always` procedure, ahead of the default clocking.
+                            _ if a.inferred_clock.is_some() => {
+                                let ev = a.inferred_clock.as_ref().unwrap();
+                                let clock_signal = match &ev.expr.kind {
+                                    ExprKind::Ident(h) => self.resolve_hier_name(h).into_owned(),
+                                    _ => String::new(),
+                                };
+                                let edge = match ev.edge {
+                                    Some(crate::ast::stmt::Edge::Negedge) => 1u8,
+                                    Some(crate::ast::stmt::Edge::Edge) => 2u8,
+                                    _ => 0u8,
+                                };
+                                Some((clock_signal, edge, ev.iff.clone(), resolved_expr.clone()))
+                            }
                             _ => match self.clocking_meta.get("__xz_default_clocking") {
                                 Some((clk, _)) => {
                                     let clk = clk.clone();
@@ -85700,68 +83928,34 @@ impl Simulator {
                         };
                     if let Some((clock_signal, edge, iff, body)) = clocked {
                         let span_key = a.span.start;
-                        if !self
-                            .sva_sites
-                            .iter()
-                            .any(|s| s.span_key == span_key && s.dedup_scope == self.current_scope)
-                        {
-                            // LRM §16.5.1: collect the ids of every signal
-                            // referenced in the property body so their
-                            // Preponed (slot-entry) values can be sampled
-                            // when the assertion fires (see eval_sva_sampled).
-                            let kind: u8 = match a.kind {
-                                AssertionKind::Assert => 0,
-                                AssertionKind::Assume => 1,
-                                AssertionKind::Cover => 2,
-                            };
-                            // Named sequence / property instances INSIDE the
-                            // body (`a |=> s`) expand here, once.
-                            let mut body_expanded = self.sva_expand_named(&body, 0);
-                            let mut sampled_ids = Vec::new();
-                            self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
-                            sampled_ids.sort_unstable();
-                            sampled_ids.dedup();
-                            let mut past_names = Vec::new();
-                            self.collect_past_arg_names(&body_expanded, &mut past_names);
-                            // A signal is sampled once per property clock,
-                            // however many sampled-value calls reference it.
-                            past_names.sort_unstable();
-                            past_names.dedup();
-                            self.sva_resolve_signals(&mut body_expanded);
-                            let (disable, node) = self.sva_compile_site(&body_expanded);
-                            let scope = self.active_instance_scope();
-                            let mut m_chain = self.m_scope_stack.clone();
-                            if let Some(l) = &a.label {
-                                m_chain.push(l.name.clone());
+                        let existing = self.sva_sites.iter().position(|s| {
+                            s.span_key == span_key && s.dedup_scope == self.current_scope
+                        });
+                        let idx = match existing {
+                            Some(i) => i,
+                            None => {
+                                self.register_sva_site(a, clock_signal, edge, iff, body);
+                                self.sva_sites.len() - 1
                             }
-                            let action_pid = self.next_pid;
-                            self.next_pid += 1;
-                            self.process_scope_hint.insert(action_pid, scope.clone());
-                            let src = self.scope_src_file(Some(scope.as_str()));
-                            self.sva_sites.push(SvaClockedSite {
-                                span_key,
-                                stat_key: Self::assert_stat_key(span_key, src),
-                                stat_loc: (src, span_key),
-                                dedup_scope: self.current_scope.clone(),
-                                kind,
-                                all_matches: a.is_sequence,
-                                clock_signal,
-                                edge,
-                                iff,
-                                body: body_expanded,
-                                past_names,
-                                node: std::sync::Arc::new(node),
-                                disable,
-                                prev_clock: 2, // sentinel
-                                attempts: Vec::new(),
-                                past_snapshots: HashMap::default(),
-                                pass_action: a.action.as_deref().cloned(),
-                                fail_action: a.else_action.as_deref().cloned(),
-                                scope,
-                                action_pid,
-                                m_chain,
-                                sampled_ids,
-                            });
+                        };
+                        // §16.14.6.2: each execution of a procedural
+                        // concurrent assertion queues one instance, with the
+                        // automatic variables it reads captured now.
+                        if self.sva_sites[idx].procedural {
+                            let mut env = self.sva_sites[idx].lv_init.clone();
+                            for (k, name) in &self.sva_sites[idx].captured {
+                                if let Some(v) =
+                                    self.local_stack.last().and_then(|m| m.get(name.as_str()))
+                                {
+                                    env[*k] = v.clone();
+                                }
+                            }
+                            let pid = if self.settling {
+                                usize::MAX
+                            } else {
+                                self.current_pid
+                            };
+                            self.sva_proc_pending.push((idx, pid, env));
                         }
                         return;
                     }
@@ -85803,6 +83997,10 @@ impl Simulator {
                 if !true_branch {
                     if let Some(ea) = &a.else_action {
                         self.exec_statement(ea);
+                    } else if kind_tag != 2 {
+                        // §16.3: with no `else` clause a failure calls
+                        // `$error` (a cover has no failure action).
+                        self.emit_severity_text("Error", ASSERT_DEFAULT_ERROR);
                     }
                 } else if let Some(ac) = &a.action {
                     self.exec_statement(ac);
@@ -85821,6 +84019,19 @@ impl Simulator {
                     // name-keyed fallbacks) drops writes to registered
                     // targets.
                     let v = self.eval_expr(rvalue);
+                    let partial_sel = if matches!(pc, ProceduralContinuous::Force { .. })
+                        && matches!(
+                            lvalue.kind,
+                            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+                        ) {
+                        self.force_select_range(lvalue)
+                    } else {
+                        None
+                    };
+                    if let Some(sel) = partial_sel {
+                        self.force_partial(sel, rvalue);
+                        return;
+                    }
                     let target = self.force_target(lvalue);
                     let vpi_target = target.as_ref().map(|(_, id)| *id);
                     // A second force/assign on an already-overridden target
@@ -85830,6 +84041,7 @@ impl Simulator {
                     if let Some((ref name, id)) = target {
                         if let Some(id) = id {
                             self.unforce_cell(id);
+                            self.partial_forces.remove(&id);
                         }
                         self.forced_names.remove(name);
                     }
@@ -85870,6 +84082,17 @@ impl Simulator {
                     // mark the source signals of every comb entry driving it
                     // dirty so the next settle re-evaluates the drivers.
                     // §10.6.1 `deassign` likewise retains the last value.
+                    if matches!(pc, ProceduralContinuous::Release(_))
+                        && matches!(
+                            lvalue.kind,
+                            ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+                        )
+                    {
+                        if let Some(sel) = self.force_select_range(lvalue) {
+                            self.release_partial(sel);
+                            return;
+                        }
+                    }
                     let target = self.force_target(lvalue);
                     self.release_override(target.as_ref().map(|(n, id)| (n.as_str(), *id)));
                     // §38.36.1 cbRelease / cbDeassign, reported once the
@@ -86086,9 +84309,22 @@ impl Simulator {
                     _ if Self::is_struct_elem_ref(&init_expr) => {
                         self.assign_struct_memberwise(&lv, &init_expr, &su, 0);
                     }
+                    // §5.10/§10.9.2: any other source (an assignment
+                    // pattern, a call, a conditional) is exactly the
+                    // assignment `name = init`, which gives the pattern
+                    // the struct's member layout as its context. Evaluated
+                    // self-determined, `'{a:5, b:6}` packed each item at
+                    // 32 bits and the spread mis-placed every member
+                    // (`a` read 5 << 24).
                     _ => {
-                        let v = self.eval_expr(&init_expr);
-                        let _ = self.spread_into_unpacked_struct(&d.name.name, &su, &v);
+                        let assign = crate::ast::stmt::Statement::new(
+                            crate::ast::stmt::StatementKind::BlockingAssign {
+                                lvalue: lv,
+                                rvalue: init_expr,
+                            },
+                            d.name.span,
+                        );
+                        self.exec_statement(&assign);
                     }
                 }
             }
@@ -86530,6 +84766,11 @@ impl Simulator {
     /// §9.6.2/§9.7: canceled processes cannot resume their captured waits.
     fn vc_cancel_process(&mut self, pid: usize) {
         self.vc_saved.retain(|_, (owner, _)| *owner != pid);
+        // Every kill site passes here: a process killed while suspended in
+        // an imported task unwinds it by the §35.9 disable protocol.
+        if !self.dpi_tasks.is_empty() {
+            self.dpi_task_killed(pid);
+        }
     }
 
     /// The Wait statement a value-change waiter resumes into.
@@ -88272,6 +86513,11 @@ impl Simulator {
     /// `emit_severity` with the message already formatted.
     fn emit_severity_text(&mut self, severity: &str, body: &str) {
         let scope = self.severity_scope();
+        self.emit_severity_text_in(severity, body, &scope);
+    }
+
+    /// `emit_severity_text` naming `scope` in the context line.
+    fn emit_severity_text_in(&mut self, severity: &str, body: &str, scope: &str) {
         let time_s = self.format_time_parts(self.time_in_current_unit()).0;
         let line = if body.is_empty() {
             format!("** {}", severity)
@@ -88999,6 +87245,7 @@ impl Simulator {
             ExprKind::MemberAccess { member, .. } => &member.name,
             ExprKind::Ident(hier) if hier.path.len() == 1 => &hier.path[0].name.name,
             ExprKind::Ident(hier) if hier.path.len() == 2 => &hier.path[1].name.name,
+            ExprKind::Ident(hier) if hier.path.len() >= 3 => &hier.path.last().unwrap().name.name,
             _ => return false,
         };
         if !self.class_member_names().string_props.contains(prop_name) {
@@ -89016,6 +87263,13 @@ impl Simulator {
                     ExprKind::This => self.this_stack.last().copied().flatten(),
                     ExprKind::Ident(hier) if hier.path.len() == 1 => {
                         self.peek_local_handle(&hier.path[0].name.name)
+                    }
+                    // §8.5: a receiver that is itself a handle chain
+                    // (`n.h.tag`, `this.h.tag`): `%s` padded the string to
+                    // its container width because only a one-level
+                    // receiver was resolved.
+                    ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                        self.eval_handle_expr(recv)
                     }
                     _ => None,
                 };
@@ -89048,6 +87302,14 @@ impl Simulator {
             ExprKind::Ident(hier) if hier.path.len() == 2 => {
                 let h = self.peek_local_handle(&hier.path[0].name.name);
                 (h, hier.path[1].name.name.clone())
+            }
+            // §8.5: `a.b.<prop>` flattened into one identifier.
+            ExprKind::Ident(hier) if hier.path.iter().all(|s| s.selects.is_empty()) => {
+                let prefix = Expression::new(ExprKind::Ident(hier_prefix(hier)), expr.span);
+                (
+                    self.eval_handle_expr(&prefix),
+                    hier.path.last().unwrap().name.name.clone(),
+                )
             }
             _ => return false,
         };
@@ -89676,6 +87938,12 @@ impl Simulator {
                                                 let mut r =
                                                     self.eval_expr(right).to_i64().unwrap_or(0);
                                                 self.dollar_bound.pop();
+                                                // §7.10.1: a queue slice `q[a:b]`
+                                                // with a > b is empty.
+                                                if is_dyn && l > r {
+                                                    result.push_str("'{}");
+                                                    continue;
+                                                }
                                                 if l > r {
                                                     std::mem::swap(&mut l, &mut r);
                                                 }
@@ -89741,7 +88009,12 @@ impl Simulator {
                                             if let Some(&(lo, hi, _w)) =
                                                 cd.array_properties.get(&prop)
                                             {
-                                                range = Some((lo, hi));
+                                                range = Some(self.inst_fixed_bounds(
+                                                    cd,
+                                                    h,
+                                                    &prop,
+                                                    (lo, hi),
+                                                ));
                                                 break;
                                             }
                                             cur = cd.extends.clone();
@@ -90369,6 +88642,20 @@ impl Simulator {
                         SvaSeq::FirstMatch(Box::new(self.sva_seq_from_expr(s)))
                     }
                     ("$sva_strong", Some(s)) | ("$sva_weak", Some(s)) => self.sva_seq_from_expr(s),
+                    // §16.10 / §16.11 `(seq, item...)`: the items run when
+                    // `seq` matches.
+                    ("$sva_match", Some(s)) => {
+                        let items = args[1..].iter().map(|a| self.sva_match_item(a)).collect();
+                        Self::sva_concat(self.sva_seq_from_expr(s), SvaSeq::Assign(items))
+                    }
+                    // §16.10: a sequence's local variable initialisers run
+                    // when its evaluation starts.
+                    ("$sva_locals", Some(_)) => {
+                        let (body, inits) = args.split_last().unwrap();
+                        let items: Vec<SvaMatchItem> =
+                            inits.iter().map(|a| self.sva_match_item(a)).collect();
+                        Self::sva_concat(SvaSeq::Assign(items), self.sva_seq_from_expr(body))
+                    }
                     _ => SvaSeq::Bool(e.clone()),
                 }
             }
@@ -90413,11 +88700,118 @@ impl Simulator {
         }
     }
 
+    /// A §16.10 / §16.11 match item: an assignment (`v = e`, `v += e`,
+    /// `v++`) to a local variable slot bound by `sva_bind_locals`, or a
+    /// subroutine call.
+    fn sva_match_item(&self, e: &Expression) -> SvaMatchItem {
+        use crate::ast::expr::{BinaryOp, UnaryOp};
+        let slot_of = |lv: &Expression| -> Option<(usize, u32, bool)> {
+            let k = Self::sva_lv_slot(lv)?;
+            let (w, signed, _) = self.sva_lv_types.get(k).copied()?;
+            Some((k, w, signed))
+        };
+        let one = |span| SvaNfaBuilder::true_lit(span);
+        match &e.kind {
+            ExprKind::Paren(inner) => return self.sva_match_item(inner),
+            ExprKind::AssignExpr { lvalue, rvalue }
+            | ExprKind::Binary {
+                op: BinaryOp::Assign,
+                left: lvalue,
+                right: rvalue,
+            } => {
+                if let Some(slot) = slot_of(lvalue) {
+                    return SvaMatchItem {
+                        slot: Some(slot),
+                        expr: (**rvalue).clone(),
+                    };
+                }
+            }
+            ExprKind::Unary { op, operand }
+                if matches!(
+                    op,
+                    UnaryOp::PostIncr | UnaryOp::PreIncr | UnaryOp::PostDecr | UnaryOp::PreDecr
+                ) =>
+            {
+                if let Some(slot) = slot_of(operand) {
+                    let bop = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) {
+                        BinaryOp::Add
+                    } else {
+                        BinaryOp::Sub
+                    };
+                    return SvaMatchItem {
+                        slot: Some(slot),
+                        expr: Expression::new(
+                            ExprKind::Binary {
+                                op: bop,
+                                left: operand.clone(),
+                                right: Box::new(one(e.span)),
+                            },
+                            e.span,
+                        ),
+                    };
+                }
+            }
+            _ => {}
+        }
+        SvaMatchItem {
+            slot: None,
+            expr: e.clone(),
+        }
+    }
+
+    /// The slot of a local variable read bound by `sva_bind_locals`.
+    fn sva_lv_slot(e: &Expression) -> Option<usize> {
+        match &e.kind {
+            ExprKind::Paren(inner) => Self::sva_lv_slot(inner),
+            ExprKind::SystemCall { name, args } if name == SVA_SIG_MARKER && args.len() == 2 => {
+                match &args[0].kind {
+                    ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.parse().ok(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// §16.10: run `init` (a property's local variable initialisers) when
+    /// each evaluation of `node` starts — ahead of its leading sequences.
+    fn sva_inject_init(node: &mut SvaNode, init: &[SvaMatchItem]) {
+        let inject = |nfa: &mut SvaNfa| {
+            nfa.states
+                .push(vec![SvaEdge::Assign(init.to_vec(), nfa.start)]);
+            nfa.start = nfa.states.len() - 1;
+        };
+        match node {
+            SvaNode::Seq(nfa, _) => inject(nfa),
+            SvaNode::Impl { ante, .. } => inject(ante),
+            SvaNode::Not(inner) => Self::sva_inject_init(inner, init),
+            SvaNode::And(a, b) | SvaNode::Or(a, b) => {
+                Self::sva_inject_init(a, init);
+                Self::sva_inject_init(b, init);
+            }
+            // Not modelled: initialisers ahead of `s_eventually` /
+            // `s_always` of a boolean.
+            SvaNode::Eventually(_) | SvaNode::Always(_) => {}
+        }
+    }
+
     /// Compile a property body (§16.12) into an `SvaNode`.
     fn sva_compile_node(&mut self, e: &Expression) -> SvaNode {
         use crate::ast::expr::{BinaryOp, UnaryOp};
         match &e.kind {
             ExprKind::Paren(inner) => self.sva_compile_node(inner),
+            // §16.10: a property's local variables; their initialisers run
+            // at the start of each evaluation.
+            ExprKind::SystemCall { name, args } if name == "$sva_locals" && !args.is_empty() => {
+                let (body, inits) = args.split_last().unwrap();
+                let items: Vec<SvaMatchItem> =
+                    inits.iter().map(|a| self.sva_match_item(a)).collect();
+                let mut node = self.sva_compile_node(body);
+                if !items.is_empty() {
+                    Self::sva_inject_init(&mut node, &items);
+                }
+                node
+            }
             ExprKind::Binary { op, left, right }
                 if matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow) =>
             {
@@ -90473,7 +88867,7 @@ impl Simulator {
     fn sva_strong_pending(node: &SvaNode, st: &SvaState) -> bool {
         match (node, st) {
             (SvaNode::Seq(_, strong), SvaState::Seq(_)) => *strong,
-            (SvaNode::Eventually(_), SvaState::Leaf) => true,
+            (SvaNode::Eventually(_), SvaState::Leaf(_)) => true,
             (SvaNode::Impl { cons: cn, .. }, SvaState::Impl { cons, .. }) => {
                 cons.iter().any(|(_, cs)| Self::sva_strong_pending(cn, cs))
             }
@@ -90517,6 +88911,9 @@ impl Simulator {
         use crate::ast::expr::{BinaryOp, UnaryOp};
         match &e.kind {
             ExprKind::Paren(inner) => Self::sva_has_property_op(inner),
+            ExprKind::SystemCall { name, args } if name == "$sva_locals" => {
+                args.last().is_some_and(Self::sva_has_property_op)
+            }
             ExprKind::Binary { op, left, right } => {
                 matches!(op, BinaryOp::OrMinusArrow | BinaryOp::OrFatArrow)
                     || (matches!(op, BinaryOp::SvaAnd | BinaryOp::SeqOr)
@@ -90545,90 +88942,160 @@ impl Simulator {
         (None, self.sva_compile_node(inner))
     }
 
-    fn sva_new_state(node: &SvaNode) -> SvaState {
+    fn sva_new_state(node: &SvaNode, env: &SvaEnv) -> SvaState {
         match node {
-            SvaNode::Seq(..) => SvaState::Seq(SvaRun::default()),
-            SvaNode::Not(inner) => SvaState::Not(Box::new(Self::sva_new_state(inner))),
+            SvaNode::Seq(..) => SvaState::Seq(SvaRun::with_env(env.clone())),
+            SvaNode::Not(inner) => SvaState::Not(Box::new(Self::sva_new_state(inner, env))),
             SvaNode::Impl { .. } => SvaState::Impl {
-                ante: SvaRun::default(),
+                ante: SvaRun::with_env(env.clone()),
                 ante_alive: true,
                 matched_any: false,
                 cons: Vec::new(),
             },
             SvaNode::And(a, b) => SvaState::And {
-                a: Box::new(Self::sva_new_state(a)),
-                b: Box::new(Self::sva_new_state(b)),
+                a: Box::new(Self::sva_new_state(a, env)),
+                b: Box::new(Self::sva_new_state(b, env)),
                 ra: None,
                 rb: None,
             },
             SvaNode::Or(a, b) => SvaState::Or {
-                a: Box::new(Self::sva_new_state(a)),
-                b: Box::new(Self::sva_new_state(b)),
+                a: Box::new(Self::sva_new_state(a, env)),
+                b: Box::new(Self::sva_new_state(b, env)),
                 ra: None,
                 rb: None,
             },
-            SvaNode::Eventually(_) | SvaNode::Always(_) => SvaState::Leaf,
+            SvaNode::Eventually(_) | SvaNode::Always(_) => SvaState::Leaf(env.clone()),
         }
     }
 
+    /// Evaluate `e` for a thread whose local variables (§16.10) are `env`:
+    /// they are installed as `sva_lv` for the reads of their slot markers.
+    fn sva_eval_env(&mut self, e: &Expression, env: &mut SvaEnv) -> Value {
+        if env.is_empty() {
+            return self.eval_expr(e);
+        }
+        std::mem::swap(&mut self.sva_lv, env);
+        let v = self.eval_expr(e);
+        std::mem::swap(&mut self.sva_lv, env);
+        v
+    }
+
+    /// Run match items on a copy of `env` (§16.10 assignments in order,
+    /// §16.11 subroutine calls for their side effects).
+    fn sva_run_match_items(&mut self, items: &[SvaMatchItem], env: &SvaEnv) -> SvaEnv {
+        let mut env = env.clone();
+        for it in items {
+            match it.slot {
+                Some((k, w, signed)) => {
+                    let v = self.sva_eval_env(&it.expr, &mut env);
+                    let mut v = v.resize_for_assign(w);
+                    v.is_signed = signed;
+                    if let Some(slot) = env.get_mut(k) {
+                        *slot = v;
+                    }
+                }
+                None => {
+                    let stmt = Statement::new(StatementKind::Expr(it.expr.clone()), it.expr.span);
+                    std::mem::swap(&mut self.sva_lv, &mut env);
+                    self.exec_statement(&stmt);
+                    std::mem::swap(&mut self.sva_lv, &mut env);
+                }
+            }
+        }
+        env
+    }
+
+    /// §16.10: the local variables after both operands of an `and` /
+    /// `intersect` matched: `a`'s, with every slot `b` assigned (changed from
+    /// the values the compound was entered with) taken from `b`.
+    fn sva_merge_env(a: &SvaEnv, b: &SvaEnv, base: &SvaEnv) -> SvaEnv {
+        let mut out = a.clone();
+        for (k, v) in b.iter().enumerate() {
+            if base.get(k) != Some(v) {
+                if let Some(o) = out.get_mut(k) {
+                    *o = v.clone();
+                }
+            }
+        }
+        out
+    }
+
     /// Advance a sequence automaton by one clock tick (the first call is the
-    /// start tick). Returns `(matched at this tick, still alive)`. With
-    /// `first_match` the run stops at its first match.
+    /// start tick). Returns the local variables of each thread that matched
+    /// at this tick (none: no match), and whether the run is still alive.
+    /// With `first_match` the run stops at its first match.
     fn sva_run_advance(
         &mut self,
         nfa: &SvaNfa,
         run: &mut SvaRun,
         first_match: bool,
-    ) -> (bool, bool) {
-        let mut work: Vec<usize> = Vec::new();
+    ) -> (Vec<SvaEnv>, bool) {
+        let mut work: Vec<(usize, SvaEnv)> = Vec::new();
         let mut subs: Vec<SvaSubRun> = Vec::new();
         if !run.started {
             run.started = true;
-            work.push(nfa.start);
+            work.push((nfa.start, std::mem::take(&mut run.init_env)));
         } else {
-            for &pc in &run.pcs {
+            for (pc, env) in run.pcs.drain(..) {
                 for e in &nfa.states[pc] {
                     if let SvaEdge::Tick(t) = e {
-                        work.push(*t);
+                        work.push((*t, env.clone()));
                     }
                 }
             }
             for mut sub in run.subs.drain(..) {
                 let (m, alive) = self.sva_sub_advance(nfa, &mut sub);
-                if m {
-                    work.push(sub.target);
+                for env in m {
+                    work.push((sub.target, env));
                 }
                 if alive {
                     subs.push(sub);
                 }
             }
         }
+        // A state is visited once per distinct set of local values; a run
+        // with no locals (every env empty) needs only the state.
         let mut visited = vec![false; nfa.states.len()];
-        let mut tick_pcs: Vec<usize> = Vec::new();
-        let mut matched = false;
-        while let Some(pc) = work.pop() {
-            if visited[pc] {
-                continue;
+        let mut seen: Vec<(usize, SvaEnv)> = Vec::new();
+        let mut tick_pcs: Vec<(usize, SvaEnv)> = Vec::new();
+        let mut matched: Vec<SvaEnv> = Vec::new();
+        while let Some((pc, mut env)) = work.pop() {
+            if env.is_empty() {
+                if visited[pc] {
+                    continue;
+                }
+                visited[pc] = true;
+            } else {
+                if seen.iter().any(|(p, e)| *p == pc && *e == env) {
+                    continue;
+                }
+                seen.push((pc, env.clone()));
             }
-            visited[pc] = true;
             if pc == nfa.accept {
-                matched = true;
+                if !matched.contains(&env) {
+                    matched.push(env.clone());
+                }
                 if first_match {
                     break;
                 }
             }
             for ei in 0..nfa.states[pc].len() {
                 match &nfa.states[pc][ei] {
-                    SvaEdge::Eps(t) => work.push(*t),
+                    SvaEdge::Eps(t) => work.push((*t, env.clone())),
                     SvaEdge::Check(c, t) => {
-                        if self.eval_expr(c).is_true() {
-                            work.push(*t);
+                        if self.sva_eval_env(c, &mut env).is_true() {
+                            work.push((*t, env.clone()));
                         }
                     }
                     SvaEdge::Tick(_) => {
-                        if !tick_pcs.contains(&pc) {
-                            tick_pcs.push(pc);
+                        if !tick_pcs.iter().any(|(p, e)| *p == pc && *e == env) {
+                            tick_pcs.push((pc, env.clone()));
                         }
+                    }
+                    SvaEdge::Assign(items, t) => {
+                        let items = items.clone();
+                        let next = self.sva_run_match_items(&items, &env);
+                        work.push((*t, next));
                     }
                     SvaEdge::Sub(comp, t) => {
                         let n = match &**comp {
@@ -90638,12 +89105,14 @@ impl Simulator {
                         let mut sub = SvaSubRun {
                             at: (pc, ei),
                             target: *t,
-                            runs: vec![SvaRun::default(); n],
+                            runs: vec![SvaRun::with_env(env.clone()); n],
                             ever: [false, false],
+                            env: env.clone(),
+                            ever_env: [Vec::new(), Vec::new()],
                         };
                         let (m, alive) = self.sva_sub_advance(nfa, &mut sub);
-                        if m {
-                            work.push(*t);
+                        for menv in m {
+                            work.push((*t, menv));
                         }
                         if alive {
                             subs.push(sub);
@@ -90652,45 +89121,72 @@ impl Simulator {
                 }
             }
         }
-        if matched && first_match {
+        if !matched.is_empty() && first_match {
             run.pcs.clear();
             run.subs.clear();
-            return (true, false);
+            return (matched, false);
         }
         run.pcs = tick_pcs;
         run.subs = subs;
-        (matched, !run.pcs.is_empty() || !run.subs.is_empty())
+        let alive = !run.pcs.is_empty() || !run.subs.is_empty();
+        (matched, alive)
     }
 
-    /// Advance one compound edge; `(matched at this tick, still alive)`.
-    fn sva_sub_advance(&mut self, nfa: &SvaNfa, sub: &mut SvaSubRun) -> (bool, bool) {
+    /// Advance one compound edge: the local variables of each match at this
+    /// tick, and whether it is still alive.
+    fn sva_sub_advance(&mut self, nfa: &SvaNfa, sub: &mut SvaSubRun) -> (Vec<SvaEnv>, bool) {
         let SvaEdge::Sub(comp, _) = &nfa.states[sub.at.0][sub.at.1] else {
-            return (false, false);
+            return (Vec::new(), false);
         };
         match &**comp {
             SvaCompound::FirstMatch(inner) => {
                 let (m, alive) = self.sva_run_advance(inner, &mut sub.runs[0], true);
-                if m { (true, false) } else { (false, alive) }
+                if !m.is_empty() {
+                    (m, false)
+                } else {
+                    (m, alive)
+                }
             }
             SvaCompound::Throughout(e, inner) => {
-                if !self.eval_expr(e).is_true() {
-                    return (false, false);
+                let mut env = std::mem::take(&mut sub.env);
+                let holds = self.sva_eval_env(e, &mut env).is_true();
+                sub.env = env;
+                if !holds {
+                    return (Vec::new(), false);
                 }
                 self.sva_run_advance(inner, &mut sub.runs[0], false)
             }
             SvaCompound::And(n1, n2) => {
                 let (m1, a1) = self.sva_run_advance(n1, &mut sub.runs[0], false);
                 let (m2, a2) = self.sva_run_advance(n2, &mut sub.runs[1], false);
-                let matched = (m1 && (m2 || sub.ever[1])) || (m2 && sub.ever[0]);
-                sub.ever[0] |= m1;
-                sub.ever[1] |= m2;
+                let mut out: Vec<SvaEnv> = Vec::new();
+                if !m1.is_empty() && !m2.is_empty() {
+                    out.push(Self::sva_merge_env(&m1[0], &m2[0], &sub.env));
+                } else if !m1.is_empty() && sub.ever[1] {
+                    out.push(Self::sva_merge_env(&m1[0], &sub.ever_env[1], &sub.env));
+                } else if !m2.is_empty() && sub.ever[0] {
+                    out.push(Self::sva_merge_env(&sub.ever_env[0], &m2[0], &sub.env));
+                }
+                if let Some(e) = m1.into_iter().next() {
+                    sub.ever[0] = true;
+                    sub.ever_env[0] = e;
+                }
+                if let Some(e) = m2.into_iter().next() {
+                    sub.ever[1] = true;
+                    sub.ever_env[1] = e;
+                }
                 let dead = (!a1 && !sub.ever[0]) || (!a2 && !sub.ever[1]) || (!a1 && !a2);
-                (matched, !dead)
+                (out, !dead)
             }
             SvaCompound::Intersect(n1, n2) => {
                 let (m1, a1) = self.sva_run_advance(n1, &mut sub.runs[0], false);
                 let (m2, a2) = self.sva_run_advance(n2, &mut sub.runs[1], false);
-                (m1 && m2, a1 && a2)
+                let out = if !m1.is_empty() && !m2.is_empty() {
+                    vec![Self::sva_merge_env(&m1[0], &m2[0], &sub.env)]
+                } else {
+                    Vec::new()
+                };
+                (out, a1 && a2)
             }
         }
     }
@@ -90700,7 +89196,7 @@ impl Simulator {
         match (node, st) {
             (SvaNode::Seq(nfa, _), SvaState::Seq(run)) => {
                 let (m, alive) = self.sva_run_advance(nfa, run, true);
-                if m {
+                if !m.is_empty() {
                     Some(SvaOutcome::Pass)
                 } else if !alive {
                     Some(SvaOutcome::Fail)
@@ -90726,13 +89222,17 @@ impl Simulator {
                     cons,
                 },
             ) => {
-                let mut fresh: Option<SvaState> = None;
+                // Every match of the antecedent starts one evaluation of the
+                // consequent, with the local variables of that match.
+                let mut fresh: Vec<SvaState> = Vec::new();
                 if *ante_alive {
                     let (m, alive) = self.sva_run_advance(ante, arun, false);
                     *ante_alive = alive;
-                    if m {
+                    if !m.is_empty() {
                         *matched_any = true;
-                        fresh = Some(Self::sva_new_state(cons_node));
+                        for env in &m {
+                            fresh.push(Self::sva_new_state(cons_node, env));
+                        }
                     }
                 }
                 let mut failed = false;
@@ -90751,7 +89251,7 @@ impl Simulator {
                         None => keep.push((0, cst)),
                     }
                 }
-                if let Some(mut cst) = fresh {
+                for mut cst in fresh {
                     if *overlap {
                         match self.sva_advance(cons_node, &mut cst) {
                             Some(SvaOutcome::Fail) => failed = true,
@@ -90817,15 +89317,15 @@ impl Simulator {
                     _ => None,
                 }
             }
-            (SvaNode::Eventually(e), SvaState::Leaf) => {
-                if self.eval_expr(e).is_true() {
+            (SvaNode::Eventually(e), SvaState::Leaf(env)) => {
+                if self.sva_eval_env(e, env).is_true() {
                     Some(SvaOutcome::Pass)
                 } else {
                     None
                 }
             }
-            (SvaNode::Always(e), SvaState::Leaf) => {
-                if self.eval_expr(e).is_true() {
+            (SvaNode::Always(e), SvaState::Leaf(env)) => {
+                if self.sva_eval_env(e, env).is_true() {
                     None
                 } else {
                     Some(SvaOutcome::Fail)
@@ -90833,6 +89333,131 @@ impl Simulator {
             }
             _ => Some(SvaOutcome::Vacuous),
         }
+    }
+
+    /// LRM §16.5: register the clocked site of a concurrent assertion
+    /// statement on its first execution: expand named sequences and
+    /// properties, bind its local variables (§16.10) and, for a procedural
+    /// assertion, the automatic variables it captures (§16.14.6.1), and
+    /// compile the property.
+    fn register_sva_site(
+        &mut self,
+        a: &crate::ast::stmt::AssertionStatement,
+        clock_signal: String,
+        edge: u8,
+        iff: Option<Expression>,
+        body: Expression,
+    ) {
+        use crate::ast::stmt::AssertionKind;
+        let span_key = a.span.start;
+        let kind: u8 = match a.kind {
+            AssertionKind::Assert => 0,
+            AssertionKind::Assume => 1,
+            AssertionKind::Cover => 2,
+        };
+        // Named sequence / property instances INSIDE the body (`a |=> s`)
+        // expand here, once.
+        let mut body_expanded = self.sva_expand_named(&body, 0);
+        let mut lv_init: Vec<Value> = Vec::new();
+        let mut lv_types =
+            self.sva_bind_locals(&mut body_expanded, &HashMap::default(), &mut lv_init);
+        let procedural = a.procedural;
+        let mut captured: Vec<(usize, String)> = Vec::new();
+        if procedural {
+            self.sva_capture_proc_locals(
+                &mut body_expanded,
+                &mut captured,
+                &mut lv_init,
+                &mut lv_types,
+            );
+        }
+        // LRM §16.5.1: collect the ids of every signal referenced in the
+        // property body so their Preponed (slot-entry) values can be sampled
+        // when the assertion fires (see eval_sva_sampled).
+        let mut sampled_ids = Vec::new();
+        self.collect_sva_signal_ids(&body_expanded, &mut sampled_ids);
+        sampled_ids.sort_unstable();
+        sampled_ids.dedup();
+        // A site registered mid-slot (a procedural assertion, while its
+        // procedure runs in the Active region) has no slot-entry samples yet:
+        // take the values now, before this slot's nonblocking updates.
+        for &id in &sampled_ids {
+            if id < self.signal_table.len() && !self.sva_preponed.contains_key(&id) {
+                self.sva_preponed.insert(id, self.signal_table[id].clone());
+            }
+        }
+        let mut past_names = Vec::new();
+        self.collect_past_arg_names(&body_expanded, &mut past_names);
+        // A signal is sampled once per property clock, however many
+        // sampled-value calls reference it.
+        past_names.sort_unstable();
+        past_names.dedup();
+        self.sva_resolve_signals(&mut body_expanded);
+        self.sva_lv_types = lv_types;
+        let (disable, node) = self.sva_compile_site(&body_expanded);
+        self.sva_lv_types = Vec::new();
+        let scope = self.active_instance_scope();
+        // §16.15: without a `disable iff` of its own, the scope's default
+        // disable condition applies.
+        let explicit_disable = disable.is_some();
+        let disable_scope = self.m_path();
+        let disable = disable.or_else(|| self.sva_default_disable_for(&disable_scope));
+        let mut m_chain = self.m_scope_stack.clone();
+        if let Some(l) = &a.label {
+            m_chain.push(l.name.clone());
+        }
+        let action_pid = self.next_pid;
+        self.next_pid += 1;
+        self.process_scope_hint.insert(action_pid, scope.clone());
+        let src = self.scope_src_file(Some(scope.as_str()));
+        // A procedural assertion registers while its procedure runs, which
+        // for an edge-triggered procedure is at the tick that starts its
+        // first attempt: take that edge as seen (§16.14.6).
+        let prev_clock = if procedural {
+            let cur = self
+                .get_signal_value_by_name(&clock_signal)
+                .and_then(|v| v.to_u64())
+                .map(|u| (u & 1) as u8)
+                .unwrap_or(2);
+            match (edge, cur) {
+                (0, 1) => 0,
+                (1, 0) => 1,
+                (2, 0 | 1) => cur ^ 1,
+                _ => cur,
+            }
+        } else {
+            2 // sentinel
+        };
+        self.sva_sites.push(SvaClockedSite {
+            span_key,
+            stat_key: Self::assert_stat_key(span_key, src),
+            stat_loc: (src, span_key),
+            dedup_scope: self.current_scope.clone(),
+            kind,
+            all_matches: a.is_sequence,
+            clock_signal,
+            edge,
+            iff,
+            body: body_expanded,
+            past_names,
+            node: std::sync::Arc::new(node),
+            disable,
+            prev_clock,
+            attempts: Vec::new(),
+            past_snapshots: HashMap::default(),
+            pass_action: a.action.as_deref().cloned(),
+            fail_action: a.else_action.as_deref().cloned(),
+            scope,
+            action_pid,
+            m_chain,
+            sampled_ids,
+            lv_init,
+            procedural,
+            captured,
+            matured: Vec::new(),
+            explicit_disable,
+            disable_scope,
+        });
     }
 
     /// Tally one finished attempt on a site: cover sites count matches only.
@@ -90863,7 +89488,26 @@ impl Simulator {
             let act = if passed {
                 s.pass_action.clone()
             } else {
-                s.fail_action.clone()
+                // §16.3: a failure with no `else` clause calls `$error`
+                // (a cover has no failure action).
+                s.fail_action.clone().or_else(|| {
+                    (s.kind != 2).then(|| {
+                        let span = crate::ast::Span::dummy();
+                        Statement::new(
+                            StatementKind::Expr(Expression::new(
+                                ExprKind::SystemCall {
+                                    name: "$error".to_string(),
+                                    args: vec![Expression::new(
+                                        ExprKind::StringLiteral(ASSERT_DEFAULT_ERROR.to_string()),
+                                        span,
+                                    )],
+                                },
+                                span,
+                            )),
+                            span,
+                        )
+                    })
+                })
             };
             act.map(|a| (a, s.scope.clone(), s.action_pid, s.m_chain.clone()))
         }) else {
@@ -91001,6 +89645,55 @@ impl Simulator {
                 self.clocking_preponed.insert(n, v);
             }
         }
+        if !self.clocking_hist.is_empty() {
+            self.record_clocking_hist();
+        }
+    }
+
+    /// §14.4 `input #N`: at slot entry, the value of each tracked net is its
+    /// value at the end of the previous slot; record it against that slot
+    /// when it changed, and drop entries no skew can reach any more.
+    fn record_clocking_hist(&mut self) {
+        let now = self.time;
+        let prev = self.clocking_hist_slot;
+        if prev == Some(now) {
+            return;
+        }
+        self.clocking_hist_slot = Some(now);
+        let nets: Vec<String> = self.clocking_hist.keys().cloned().collect();
+        for n in nets {
+            let Some(v) = self.get_signal_value_by_name(&n) else {
+                continue;
+            };
+            let Some(h) = self.clocking_hist.get_mut(&n) else {
+                continue;
+            };
+            let Some(prev) = prev else {
+                h.init = Some(v);
+                continue;
+            };
+            let last = h.changes.back().map(|(_, v)| v).or(h.init.as_ref());
+            if last != Some(&v) {
+                h.changes.push_back((prev, v));
+            }
+            let floor = now.saturating_sub(h.span);
+            while h.changes.len() >= 2 && h.changes[1].0 < floor {
+                h.changes.pop_front();
+            }
+        }
+    }
+
+    /// §14.4: the value net `n` had at the START of time `at` — its value at
+    /// the end of the last slot before `at` (a change made at `at` itself is
+    /// not yet visible to an `input #N` sample taken then).
+    fn clocking_hist_value(&self, n: &str, at: u64) -> Option<Value> {
+        let h = self.clocking_hist.get(n)?;
+        for (t, v) in h.changes.iter().rev() {
+            if *t < at {
+                return Some(v.clone());
+            }
+        }
+        h.init.clone()
     }
 
     fn refresh_sva_preponed(&mut self) {
@@ -91072,6 +89765,16 @@ impl Simulator {
     }
 
     fn tick_sva_sites_inner(&mut self) {
+        // §16.14.6.2: the procedural instances queued so far mature (no
+        // flush point can drop them any more); each starts an attempt at the
+        // next tick of its leading clock.
+        if !self.sva_proc_pending.is_empty() {
+            for (idx, _, env) in std::mem::take(&mut self.sva_proc_pending) {
+                if let Some(site) = self.sva_sites.get_mut(idx) {
+                    site.matured.push(env);
+                }
+            }
+        }
         // Use indices so we can call &mut self methods inside the loop
         // without holding a borrow on self.sva_sites.
         for i in 0..self.sva_sites.len() {
@@ -91125,13 +89828,21 @@ impl Simulator {
             self.sva_sites[i].disable = disable;
             if disabled {
                 self.sva_sites[i].attempts.clear();
+                self.sva_sites[i].matured.clear();
                 self.sva_sites[i].sampled_ids = sampled_ids;
                 self.active_sva_site = prev_active;
                 continue;
             }
             let saved = self.install_preponed(&sampled_ids);
             let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
-            attempts.push(Self::sva_new_state(&node));
+            if self.sva_sites[i].procedural {
+                // §16.14.6: one attempt per matured instance, none otherwise.
+                for env in std::mem::take(&mut self.sva_sites[i].matured) {
+                    attempts.push(Self::sva_new_state(&node, &env));
+                }
+            } else {
+                attempts.push(Self::sva_new_state(&node, &self.sva_sites[i].lv_init));
+            }
             let mut results: Vec<SvaOutcome> = Vec::new();
             let mut live: Vec<SvaState> = Vec::with_capacity(attempts.len());
             let all_matches = self.sva_sites[i].all_matches;
@@ -91144,7 +89855,7 @@ impl Simulator {
                         _ => None,
                     };
                     if let Some((matched, alive)) = step {
-                        if matched {
+                        if !matched.is_empty() {
                             results.push(SvaOutcome::Pass);
                         }
                         if alive {
@@ -91312,6 +90023,9 @@ impl Simulator {
 
     /// The value behind an `SVA_SIG_MARKER` read.
     fn sva_sig_read(&self, args: &[Expression]) -> Value {
+        if args.len() == 2 {
+            return self.sva_lv_read(args);
+        }
         let id = match args.first().map(|a| &a.kind) {
             Some(ExprKind::Number(NumberLiteral::Integer { value, .. })) => {
                 value.parse::<usize>().unwrap_or(usize::MAX)
@@ -91329,6 +90043,344 @@ impl Simulator {
             v.is_real = true;
         }
         v
+    }
+
+    /// §16.10: a local variable read (a two-argument `SVA_SIG_MARKER`: the
+    /// slot, then 1) from the thread being evaluated.
+    #[inline(never)]
+    fn sva_lv_read(&self, args: &[Expression]) -> Value {
+        let k = match &args[0].kind {
+            ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                value.parse::<usize>().unwrap_or(usize::MAX)
+            }
+            _ => usize::MAX,
+        };
+        self.sva_lv.get(k).cloned().unwrap_or_else(|| Value::new(1))
+    }
+
+    /// The marker read of local variable slot `k` (see `sva_lv_read`).
+    fn sva_lv_marker(k: usize, span: crate::ast::Span) -> Expression {
+        let num = |v: usize| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: Cell::new(None),
+                }),
+                span,
+            )
+        };
+        Expression::new(
+            ExprKind::SystemCall {
+                name: SVA_SIG_MARKER.to_string(),
+                args: vec![num(k), num(1)],
+            },
+            span,
+        )
+    }
+
+    /// §16.10: give each local variable declared in `e` (by a property or a
+    /// sequence instance: `$sva_locals(<decl>..., <body>)`) its own slot, and
+    /// turn every reference to it in its scope into a slot marker read. The
+    /// declarations become initialising assignments (dropped when there are
+    /// none); the slot types go to `sva_lv_types`, their initial values to
+    /// `init`.
+    fn sva_bind_locals(
+        &self,
+        e: &mut Expression,
+        names: &HashMap<String, usize>,
+        init: &mut Vec<Value>,
+    ) -> Vec<(u32, bool, bool)> {
+        let mut types = Vec::new();
+        self.sva_bind_locals_in(e, names, init, &mut types);
+        types
+    }
+
+    fn sva_bind_locals_in(
+        &self,
+        e: &mut Expression,
+        names: &HashMap<String, usize>,
+        init: &mut Vec<Value>,
+        types: &mut Vec<(u32, bool, bool)>,
+    ) {
+        let span = e.span;
+        match &mut e.kind {
+            ExprKind::SystemCall { name, args } if name == "$sva_locals" && !args.is_empty() => {
+                let mut body = args.pop().unwrap();
+                let mut scope = names.clone();
+                let mut assigns: Vec<Expression> = Vec::new();
+                for decl in args.iter() {
+                    let ExprKind::SystemCall { args: d, .. } = &decl.kind else {
+                        continue;
+                    };
+                    let (Some(ExprKind::TypeLiteral(dt)), Some(ExprKind::Ident(h))) =
+                        (d.first().map(|x| &x.kind), d.get(1).map(|x| &x.kind))
+                    else {
+                        continue;
+                    };
+                    let Some(seg) = h.path.last() else {
+                        continue;
+                    };
+                    let w = super::elaborate::resolve_type_width(
+                        dt,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    )
+                    .max(1);
+                    let signed = self.type_is_signed_concrete(dt);
+                    let two_state = super::elaborate::is_type_two_state(dt);
+                    let k = init.len();
+                    let mut v = if two_state {
+                        Value::zero(w)
+                    } else {
+                        Value::new(w)
+                    };
+                    v.is_signed = signed;
+                    init.push(v);
+                    types.push((w, signed, two_state));
+                    if let Some(iv) = d.get(2) {
+                        let mut iv = iv.clone();
+                        self.sva_bind_locals_in(&mut iv, &scope, init, types);
+                        assigns.push(Expression::new(
+                            ExprKind::AssignExpr {
+                                lvalue: Box::new(Self::sva_lv_marker(k, decl.span)),
+                                rvalue: Box::new(iv),
+                            },
+                            decl.span,
+                        ));
+                    }
+                    scope.insert(seg.name.name.clone(), k);
+                }
+                self.sva_bind_locals_in(&mut body, &scope, init, types);
+                if assigns.is_empty() {
+                    *e = body;
+                } else {
+                    assigns.push(body);
+                    *args = assigns;
+                }
+            }
+            ExprKind::Ident(h) => {
+                if names.is_empty() || h.root.is_some() || h.path.len() != 1 {
+                    return;
+                }
+                let Some(&k) = names.get(h.path[0].name.name.as_str()) else {
+                    return;
+                };
+                let selects = std::mem::take(&mut h.path[0].selects);
+                let mut out = Self::sva_lv_marker(k, span);
+                for mut sel in selects {
+                    self.sva_bind_locals_in(&mut sel, names, init, types);
+                    out = match sel.kind {
+                        ExprKind::Range(l, r) => Expression::new(
+                            ExprKind::RangeSelect {
+                                expr: Box::new(out),
+                                kind: crate::ast::expr::RangeKind::Constant,
+                                left: l,
+                                right: r,
+                            },
+                            span,
+                        ),
+                        _ => Expression::new(
+                            ExprKind::Index {
+                                expr: Box::new(out),
+                                index: Box::new(sel),
+                            },
+                            span,
+                        ),
+                    };
+                }
+                *e = out;
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.sva_bind_locals_in(operand, names, init, types)
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::AssignExpr {
+                lvalue: left,
+                rvalue: right,
+            }
+            | ExprKind::Range(left, right) => {
+                self.sva_bind_locals_in(left, names, init, types);
+                self.sva_bind_locals_in(right, names, init, types);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.sva_bind_locals_in(condition, names, init, types);
+                self.sva_bind_locals_in(then_expr, names, init, types);
+                self.sva_bind_locals_in(else_expr, names, init, types);
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::SystemCall { args, .. }
+            | ExprKind::Concatenation(args) => {
+                for a in args {
+                    self.sva_bind_locals_in(a, names, init, types);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                self.sva_bind_locals_in(count, names, init, types);
+                for a in exprs {
+                    self.sva_bind_locals_in(a, names, init, types);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                self.sva_bind_locals_in(expr, names, init, types);
+                self.sva_bind_locals_in(index, names, init, types);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.sva_bind_locals_in(expr, names, init, types);
+                self.sva_bind_locals_in(left, names, init, types);
+                self.sva_bind_locals_in(right, names, init, types);
+            }
+            ExprKind::Inside { expr, ranges } => {
+                self.sva_bind_locals_in(expr, names, init, types);
+                for r in ranges {
+                    self.sva_bind_locals_in(r, names, init, types);
+                }
+            }
+            ExprKind::MemberAccess { expr, .. } => {
+                self.sva_bind_locals_in(expr, names, init, types)
+            }
+            ExprKind::SvaClocked { body, .. } => self.sva_bind_locals_in(body, names, init, types),
+            _ => {}
+        }
+    }
+
+    /// §16.14.6.1: the automatic variables of the running procedure that a
+    /// procedural concurrent assertion reads become slots too, filled with
+    /// their values each time the statement executes (`captured`).
+    fn sva_capture_proc_locals(
+        &self,
+        e: &mut Expression,
+        captured: &mut Vec<(usize, String)>,
+        init: &mut Vec<Value>,
+        types: &mut Vec<(u32, bool, bool)>,
+    ) {
+        let span = e.span;
+        match &mut e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_some() || h.path.len() != 1 {
+                    return;
+                }
+                let name = h.path[0].name.name.clone();
+                let k = if let Some((k, _)) = captured.iter().find(|(_, n)| *n == name) {
+                    *k
+                } else {
+                    let Some(v) = self.local_stack.last().and_then(|m| m.get(name.as_str())) else {
+                        return;
+                    };
+                    let k = init.len();
+                    init.push(v.clone());
+                    types.push((v.width, v.is_signed, false));
+                    captured.push((k, name));
+                    k
+                };
+                let selects = std::mem::take(&mut h.path[0].selects);
+                let mut out = Self::sva_lv_marker(k, span);
+                for mut sel in selects {
+                    self.sva_capture_proc_locals(&mut sel, captured, init, types);
+                    out = match sel.kind {
+                        ExprKind::Range(l, r) => Expression::new(
+                            ExprKind::RangeSelect {
+                                expr: Box::new(out),
+                                kind: crate::ast::expr::RangeKind::Constant,
+                                left: l,
+                                right: r,
+                            },
+                            span,
+                        ),
+                        _ => Expression::new(
+                            ExprKind::Index {
+                                expr: Box::new(out),
+                                index: Box::new(sel),
+                            },
+                            span,
+                        ),
+                    };
+                }
+                *e = out;
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.sva_capture_proc_locals(operand, captured, init, types)
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::AssignExpr {
+                lvalue: left,
+                rvalue: right,
+            }
+            | ExprKind::Range(left, right) => {
+                self.sva_capture_proc_locals(left, captured, init, types);
+                self.sva_capture_proc_locals(right, captured, init, types);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.sva_capture_proc_locals(condition, captured, init, types);
+                self.sva_capture_proc_locals(then_expr, captured, init, types);
+                self.sva_capture_proc_locals(else_expr, captured, init, types);
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::SystemCall { args, .. }
+            | ExprKind::Concatenation(args) => {
+                for a in args {
+                    self.sva_capture_proc_locals(a, captured, init, types);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                self.sva_capture_proc_locals(expr, captured, init, types);
+                self.sva_capture_proc_locals(index, captured, init, types);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                self.sva_capture_proc_locals(expr, captured, init, types);
+                self.sva_capture_proc_locals(left, captured, init, types);
+                self.sva_capture_proc_locals(right, captured, init, types);
+            }
+            ExprKind::Inside { expr, ranges } => {
+                self.sva_capture_proc_locals(expr, captured, init, types);
+                for r in ranges {
+                    self.sva_capture_proc_locals(r, captured, init, types);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// §16.15: the `default disable iff` that governs an assertion in
+    /// `scope` — declared there or in an enclosing generate scope of the same
+    /// module instance.
+    fn sva_default_disable_for(&self, scope: &str) -> Option<Expression> {
+        if self.sva_default_disable.is_empty() {
+            return None;
+        }
+        let top = self.module.name.as_str();
+        let mut cur = scope;
+        loop {
+            if let Some(g) = self.sva_default_disable.get(cur) {
+                return Some(g.clone());
+            }
+            // A module instance's default does not reach its children.
+            let rel = cur
+                .strip_prefix(top)
+                .map(|r| r.trim_start_matches('.'))
+                .unwrap_or(cur);
+            if rel.is_empty() || self.module.instances.iter().any(|i| i.path == rel) {
+                return None;
+            }
+            match cur.rfind('.') {
+                Some(i) => cur = &cur[..i],
+                None => return None,
+            }
+        }
     }
 
     /// Walk `expr` and append every bare signal name referenced by a
@@ -91530,35 +90582,47 @@ impl Simulator {
                     self.assign_value(&lval, &val);
                 }
             }
-            // Posedge: refresh input snapshots. §14.4 input skew:
-            // - #0 (default): sample from preponed (before this edge)
-            // - #1step or more: sample from current state (after NBA updates at this edge)
-            // For each signal, check per-signal skew first, then default skew.
-            let in_dskew = self.clocking_in_skew.get(&cb).copied().unwrap_or(0);
+            // Refresh the input samples. IEEE 1800-2023 §14.4 input skew:
+            // - `#1step` (also the §14.3 default): the Preponed value, before
+            //   this edge's updates;
+            // - `#0`: the Observed-region value, after this edge's NBAs;
+            // - `#N`: the value N time units before the edge (`ClockingHist`).
+            // A per-signal skew overrides the block default. The `##N` /
+            // default-clocking aliases share the named block's skews.
+            let skey: &str = if cb.starts_with("__xz_default_clocking") {
+                self.default_clocking_cb.as_deref().unwrap_or(cb.as_str())
+            } else {
+                cb.as_str()
+            };
+            let in_dskew = self
+                .clocking_in_skew
+                .get(skey)
+                .copied()
+                .unwrap_or(CB_SKEW_1STEP);
+            let vis_list: Vec<String> = self.clocking_vis.get(skey).cloned().unwrap_or_default();
             let mut snap = HashMap::default();
-            for (sig, is_input) in &sigs {
+            for (i, (sig, is_input)) in sigs.iter().enumerate() {
                 if *is_input {
-                    // Determine the skew for this signal: per-signal override or default
+                    let vis = vis_list.get(i).unwrap_or(sig);
                     let skew = self
                         .clocking_sig_in_skew
-                        .get(&cb)
-                        .and_then(|m| m.get(sig))
+                        .get(skey)
+                        .and_then(|m| m.get(vis))
                         .copied()
                         .unwrap_or(in_dskew);
-                    // §14.4: skew > 0 means sample AFTER the edge (current value, post-NBA)
-                    // skew == 0 means sample AT the edge (preponed value, pre-NBA)
-                    let v = if skew > 0 {
-                        // Use current (post-NBA) value
-                        self.get_signal_value_by_name(sig)
-                    } else {
-                        // Use preponed (pre-NBA) value, fall back to current if not available
+                    let v = if skew == CB_SKEW_1STEP {
                         self.clocking_preponed
                             .get(sig)
                             .cloned()
                             .or_else(|| self.get_signal_value_by_name(sig))
+                    } else if skew == 0 {
+                        self.get_signal_value_by_name(sig)
+                    } else {
+                        self.clocking_hist_value(sig, self.time.saturating_sub(skew))
+                            .or_else(|| self.get_signal_value_by_name(sig))
                     };
                     if let Some(v) = v {
-                        snap.insert(sig.clone(), v);
+                        snap.insert(vis.clone(), v);
                     }
                 }
             }
@@ -91566,20 +90630,9 @@ impl Simulator {
             // `@(cb.sig)` fires at THIS edge, and only on an actual change.
             let mirror: Vec<(String, Value)> = snap
                 .iter()
-                .map(|(net, v)| (net.clone(), v.clone()))
+                .map(|(vis, v)| (vis.clone(), v.clone()))
                 .collect();
-            for (net, v) in mirror {
-                // meta stores resolved nets; the mirror is keyed by the
-                // clocking-visible name, so translate back through the alias.
-                let vis = self
-                    .clocking_sig_alias
-                    .get(&cb)
-                    .and_then(|m| {
-                        m.iter()
-                            .find(|(_, n)| **n == net)
-                            .map(|(vis, _)| vis.clone())
-                    })
-                    .unwrap_or_else(|| net.clone());
+            for (vis, v) in mirror {
                 let hidden = format!("{}{}.{}", CB_SAMPLE_PREFIX, cb, vis);
                 if let Some(&id) = self.signal_name_to_id.get(hidden.as_str()) {
                     let w = self.signal_widths[id];
@@ -91672,14 +90725,26 @@ impl Simulator {
         } else {
             entry.fail_count += 1;
         }
-        let pid = self.current_pid;
+        // An `always_comb` / `always @*` the settle runs as a comb entry is
+        // not the process that happens to be current (whose resumption, a
+        // §16.4.2 flush point, would drop the report): its reports belong to
+        // no process, keyed by the block's scope instead.
+        let (pid, comb_scope) = if self.settling {
+            (usize::MAX, self.name_resolve_hint.borrow().clone())
+        } else {
+            (self.current_pid, None)
+        };
         // A re-executed assertion of the same activation (an always_comb
         // evaluated twice in one slot) supersedes its earlier report.
         self.deferred_asserts
-            .retain(|d| !(d.pid == pid && d.span == a.span));
+            .retain(|d| !(d.pid == pid && d.span == a.span && d.comb_scope == comb_scope));
         let action = if passed { &a.action } else { &a.else_action };
         let action = action.as_deref().map(|st| self.capture_deferred_action(st));
-        if action.is_none() && passed {
+        // §16.3: a failure without an `else` clause calls `$error` (a cover
+        // has no failure action).
+        let default_error_scope =
+            (action.is_none() && !passed && kind_tag != 2).then(|| self.m_path());
+        if action.is_none() && default_error_scope.is_none() {
             return;
         }
         self.deferred_asserts.push(DeferredReport {
@@ -91688,6 +90753,8 @@ impl Simulator {
             span: a.span,
             passed,
             action,
+            default_error_scope,
+            comb_scope,
             this_handle: self.this_stack.last().copied().flatten(),
             class_context: self.class_context_stack.last().cloned().flatten(),
         });
@@ -91732,6 +90799,11 @@ impl Simulator {
         if !self.deferred_asserts.is_empty() {
             self.deferred_asserts.retain(|d| d.pid != pid);
         }
+        // §16.14.6.2: a flush point drops the process's pending procedural
+        // concurrent assertion instances too.
+        if !self.sva_proc_pending.is_empty() {
+            self.sva_proc_pending.retain(|p| p.1 != pid);
+        }
     }
 
     /// Mature the pending deferred reports at the end of the time slot:
@@ -91755,6 +90827,9 @@ impl Simulator {
                 continue;
             }
             let Some(action) = d.action else {
+                if let Some(scope) = d.default_error_scope {
+                    self.emit_severity_text_in("Error", ASSERT_DEFAULT_ERROR, &scope);
+                }
                 continue;
             };
             let saved_pid = self.current_pid;
@@ -92316,6 +91391,12 @@ impl Simulator {
                     if self.signal_name_to_id.contains_key(qual.as_str()) {
                         return std::borrow::Cow::Owned(qual);
                     }
+                } else if !self.contested_pkg_vars.is_empty()
+                    && self.contested_pkg_vars.contains(leaf)
+                {
+                    if let Some(qual) = self.contested_pkg_var_in_scope(leaf) {
+                        return std::borrow::Cow::Owned(qual);
+                    }
                 }
             }
         }
@@ -92328,6 +91409,93 @@ impl Simulator {
             return std::borrow::Cow::Borrowed(cached.as_str());
         }
         std::borrow::Cow::Owned(owned)
+    }
+
+    /// §26.3: the storage of a contested package variable `leaf` (see
+    /// `split_contested_package_vars`) referenced bare OUTSIDE a package
+    /// subroutine (those resolve in their own package before reaching here):
+    /// in a method of a package class that class's package's; in a module /
+    /// interface / program the package the design unit imports it from —
+    /// unless the scope declares the name itself. `None` keeps the plain
+    /// resolution.
+    #[cold]
+    #[inline(never)]
+    fn contested_pkg_var_in_scope(&self, leaf: &str) -> Option<String> {
+        let qual_in = |pkg: &str| -> Option<String> {
+            let q = format!("{}::{}", pkg, leaf);
+            self.signal_name_to_id.contains_key(q.as_str()).then_some(q)
+        };
+        if let Some(Some(ctx)) = self.class_context_stack.last() {
+            if let Some(pkg) = self.module.class_decl_pkg.get(ctx.as_str()) {
+                return qual_in(pkg);
+            }
+        }
+        self.scope_import_pkg(leaf, &|pkg| {
+            self.signal_name_to_id
+                .contains_key(format!("{}::{}", pkg, leaf).as_str())
+        })
+        .map(|pkg| format!("{}::{}", pkg, leaf))
+    }
+
+    /// §26.3: the package the running design unit (module / interface /
+    /// program instance) imports `leaf` from, among the packages for which
+    /// `has(pkg)` holds — an explicit `import P::leaf` first, else a unique
+    /// wildcard import. `None` when the scope declares `leaf` itself or no
+    /// single package supplies it.
+    #[inline(never)]
+    fn scope_import_pkg(&self, leaf: &str, has: &dyn Fn(&str) -> bool) -> Option<String> {
+        if self.module.def_pkg_imports.is_empty() {
+            return None;
+        }
+        // The running design unit: the instance scope of the process.
+        let scope: Option<String> = match self.activation_scope.borrow().as_deref() {
+            Some(s) => Some(s.to_string()),
+            None => self.name_resolve_hint.borrow().clone(),
+        };
+        let scope = scope.unwrap_or_default();
+        let def: String = if scope.is_empty() {
+            if self.module.wildcard_shadowed.contains(leaf)
+                || self.module.foreign_displaced.contains(leaf)
+            {
+                return None;
+            }
+            self.module.name.clone()
+        } else {
+            let mut cur: &str = scope.as_str();
+            loop {
+                let local = format!("{}.{}", cur, leaf);
+                if self.signal_name_to_id.contains_key(local.as_str())
+                    || self.signals.contains_key(&local)
+                {
+                    return None;
+                }
+                if let Some(inst) = self.instance_by_path(cur) {
+                    break inst.def_name.clone();
+                }
+                match cur.rsplit_once('.') {
+                    Some((p, _)) => cur = p,
+                    None => return None,
+                }
+            }
+        };
+        let imports = self.module.def_pkg_imports.get(&def)?;
+        if let Some((pkg, _)) = imports
+            .iter()
+            .find(|(_, item)| item.as_deref() == Some(leaf))
+        {
+            return has(pkg).then(|| pkg.clone());
+        }
+        let mut hit: Option<&String> = None;
+        for (pkg, item) in imports {
+            if item.is_some() || !has(pkg) {
+                continue;
+            }
+            if hit.is_some_and(|h| h != pkg) {
+                return None; // §26.3: imported from two packages
+            }
+            hit = Some(pkg);
+        }
+        hit.cloned()
     }
 
     fn resolve_hier_name_slow(&self, hier: &HierarchicalIdentifier) -> String {
@@ -92360,6 +91528,12 @@ impl Simulator {
                 if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
                     let qual = format!("{}::{}", pkg, leaf);
                     if self.signal_name_to_id.contains_key(qual.as_str()) {
+                        return qual;
+                    }
+                } else if !self.contested_pkg_vars.is_empty()
+                    && self.contested_pkg_vars.contains(leaf)
+                {
+                    if let Some(qual) = self.contested_pkg_var_in_scope(leaf) {
                         return qual;
                     }
                 }
@@ -92451,9 +91625,16 @@ impl Simulator {
                 .contains_key(hier.path[0].name.name.as_str())
             && !self.signals.contains_key(&hier.path[0].name.name)
         {
-            let stripped: String = hier.path[1..]
-                .iter()
-                .map(|s| s.name.name.as_str())
+            // §26.3: a contested package variable has its own storage.
+            let qual = self.pkg_var_storage(&hier.path[0].name.name, &hier.path[1].name.name);
+            let stripped: String = qual
+                .as_deref()
+                .into_iter()
+                .chain(
+                    hier.path[1 + qual.is_some() as usize..]
+                        .iter()
+                        .map(|s| s.name.name.as_str()),
+                )
                 .collect::<Vec<_>>()
                 .join(".");
             let _ = hier.cached_resolved_name.set(stripped.clone());
@@ -92786,6 +91967,20 @@ impl Simulator {
         // since the table is keyed by the full path itself, not nested deeper.
         // On c910, this scan over 35.7M signals dominated time-0 settle
         // (575s / 11K probes).
+        //
+        // §8.5 / §23.9: inside a class method a bare name its class (or an
+        // ancestor) declares as a property IS that property. The leaf scan
+        // below matched any design signal with that last segment — e.g. the
+        // member `h` of an unpacked-struct variable `r` (`r.h`) — so a
+        // method's `h = new` constructed nothing and every later `g.h.<m>`
+        // read x.
+        if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+            if let Some(Some(ctx)) = self.class_context_stack.last() {
+                if self.prop_owners(ctx).contains_key(leaf.as_str()) {
+                    return raw;
+                }
+            }
+        }
         if hier.path.len() == 1 && !leaf.contains('.') {
             // An elided input port with this leaf could have been the match
             // this heuristic picked before the port was left out.
@@ -93252,6 +92447,10 @@ impl Simulator {
         if (base_v ^ new_v) & mask == 0 && (base_x ^ new_x) & mask == 0 {
             return false;
         }
+        // §10.6.2: a forced net keeps its forced value against its gate driver.
+        if !self.forced_signals.is_empty() && self.forced_signals.contains_key(&id) {
+            return false;
+        }
         if sdf_any && self.sdf_delays.get(id).copied().unwrap_or(0) > 0 && self.time > 0 {
             let mut value = self.signal_table[id].clone();
             value.set_inline_bits(new_v, new_x);
@@ -93482,6 +92681,15 @@ impl Simulator {
             return false;
         }
         if self.signal_table[id].set_bit_code(dst.bit as usize, new_bit) {
+            // §10.6.2: a forced net keeps its forced value against its gate
+            // driver. Checked only on a change, off the common path.
+            if !self.forced_signals.is_empty() {
+                if let Some(fv) = self.forced_signals.get(&id) {
+                    let code = fv.get_bit_code(dst.bit as usize);
+                    self.signal_table[id].set_bit_code(dst.bit as usize, code);
+                    return false;
+                }
+            }
             self.sync_mirror(id);
             self.table_modified = true;
             // sync_mirror just refreshed the mirror — skip the repack
@@ -95147,6 +94355,105 @@ impl Simulator {
         // signal table.
         let stored = self.signal_table.get(id).cloned().unwrap_or(v);
         self.forced_signals.insert(id, stored);
+    }
+
+    /// IEEE 1800-2023 §23.3.3 / §10.3: an input port is a continuous
+    /// assignment from its actual, so the actual's time-0 value reaches the
+    /// port as an update event at time 0 — also when the actual got it from
+    /// its declaration initializer, which by itself is no event (§6.8). A
+    /// level-sensitive `always @(...)` / `always @*` in the instance that
+    /// reads such a port therefore runs once at time 0 instead of waiting for
+    /// the first later change. The instance body reads the actual itself
+    /// (the elaborator renames input ports), so the ports come from
+    /// `input_port_actuals`. An actual still all x/z (0 for 2-state) made no
+    /// change.
+    fn fire_time0_input_port_blocks(&mut self) {
+        if self.module.input_port_actuals.is_empty() || self.comb_entries.is_empty() {
+            return;
+        }
+        let top = format!("{}.", self.module.name);
+        let cands: Vec<(usize, String)> = self
+            .comb_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.defer_at_time0
+                    && matches!(
+                        e.item,
+                        CombItem::AlwaysBlock {
+                            is_always_comb: false,
+                            ..
+                        } | CombItem::CompiledAlwaysBlock {
+                            is_always_comb: false,
+                            ..
+                        }
+                    )
+            })
+            .filter_map(|(i, e)| {
+                let sc = e.cold.scope_hint.as_deref()?;
+                let sc = sc.strip_prefix(top.as_str()).unwrap_or(sc);
+                (!sc.is_empty()).then(|| (i, sc.to_string()))
+            })
+            .collect();
+        if cands.is_empty() {
+            return;
+        }
+        let scopes: HashSet<&str> = cands.iter().map(|(_, s)| s.as_str()).collect();
+        let actuals: Vec<(String, Expression)> = self
+            .module
+            .input_port_actuals
+            .iter()
+            .filter(|(inst, _)| scopes.contains(inst.as_str()))
+            .cloned()
+            .collect();
+        let mut port_ids: HashMap<String, Vec<usize>> = HashMap::default();
+        for (inst, actual) in &actuals {
+            let mut reads: HashSet<String> = HashSet::default();
+            Self::collect_expr_reads(actual, &self.module, &mut reads);
+            let ids: Vec<usize> = reads
+                .iter()
+                .filter_map(|r| self.resolve_read_name(r, &top))
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let v = self.eval_expr(actual);
+            let two_state = ids
+                .iter()
+                .all(|&id| self.signal_two_state.get(id).copied().unwrap_or(false));
+            let changed = if two_state {
+                v.is_nonzero().unwrap_or(false)
+            } else {
+                (0..v.width as usize)
+                    .any(|i| matches!(v.get_bit(i), LogicBit::Zero | LogicBit::One))
+            };
+            if changed {
+                port_ids.entry(inst.clone()).or_default().extend(ids);
+            }
+        }
+        if port_ids.is_empty() {
+            return;
+        }
+        let fire: Vec<usize> = cands
+            .iter()
+            .filter(|(i, sc)| {
+                port_ids.get(sc).is_some_and(|ids| {
+                    self.comb_entries[*i]
+                        .cold
+                        .read_signal_ids
+                        .iter()
+                        .any(|r| ids.contains(r))
+                })
+            })
+            .map(|(i, _)| *i)
+            .collect();
+        for eidx in fire {
+            let entry = self.comb_entries[eidx].clone();
+            self.eval_comb_entry_full(&entry);
+        }
+        if self.dirty_any {
+            self.settle_combinatorial();
+        }
     }
 
     /// Lift a force on cell `id` so a replacing force's own write lands.
@@ -102528,6 +101835,18 @@ impl Simulator {
                 && (self.module.dynamic_arrays.contains(base)
                     || self.module.associative_arrays.contains_key(base))
             {
+                // §6.11.1: an element of a signed-element class collection
+                // keeps the element type's width and signedness, not the
+                // rvalue's (`p.dyn[1] = 8'hff` stores the byte -1).
+                let val = if !self.signed_class_colls.is_empty()
+                    && !val.is_real
+                    && !val.is_signed
+                    && self.signed_class_colls.contains(base)
+                {
+                    self.fit_signed_class_coll_elem(base, val)
+                } else {
+                    val
+                };
                 let base = base.to_string();
                 self.signals.insert(name.to_string(), val);
                 self.touch_queue(&base);
@@ -102611,6 +101930,7 @@ impl Simulator {
         while let Some(c) = cur {
             if let Some(cd) = self.module.classes.get(&c) {
                 if let Some(&(lo, hi, _)) = cd.array_properties.get(member) {
+                    let (lo, hi) = self.inst_fixed_bounds(cd, h, member, (lo, hi));
                     return Some((hi - lo + 1) as u64);
                 }
                 cur = cd.extends.clone();
@@ -102644,6 +101964,7 @@ impl Simulator {
                         while let Some(c) = cur {
                             if let Some(cd) = self.module.classes.get(&c) {
                                 if let Some(&(lo, hi, _)) = cd.array_properties.get(member) {
+                                    let (lo, hi) = self.inst_fixed_bounds(cd, h, member, (lo, hi));
                                     return Some((scoped, lo, hi));
                                 }
                                 cur = cd.extends.clone();
@@ -103211,6 +102532,7 @@ impl Simulator {
         self.queue_frame_saves.push(saves);
         let dyns = self.local_dyn_pool.pop().unwrap_or_default();
         self.local_dyn.push(dyns);
+        self.formal_dyn.push(Vec::new());
     }
 
     /// Look up the process-unique storage key for a local dynamic-array /
@@ -103222,20 +102544,51 @@ impl Simulator {
     fn dyn_name_lookup(&self, bare: &str) -> Option<&str> {
         // Walk frames innermost-first: a local dyn array declared in an
         // enclosing call frame is visible in nested scopes (matches how
-        // inlined blocking calls share the caller's scope). A queue/assoc
-        // FORMAL records an identity mapping (see `bind_queue_param`) so it
-        // shadows a caller's same-named renamed local.
+        // inlined blocking calls share the caller's scope). A collection
+        // FORMAL (see `bind_queue_param`) shadows a caller's same-named
+        // renamed local, and reads as its bare name from a nested call.
+        let entry = self.dyn_entry(bare)?;
+        if entry.1.len() == entry.0.len() {
+            return Some(self.dyn_identity_hit(entry));
+        }
+        Some(entry.1.as_str())
+    }
+
+    /// The innermost rename-table entry for `bare` (see `dyn_name_lookup`).
+    #[inline(always)]
+    fn dyn_entry(&self, bare: &str) -> Option<&(String, String)> {
         for frame in self.local_dyn.iter().rev() {
             // Frames hold at most a handful of entries — a reverse linear
             // scan (later declaration shadows earlier) beats hashing `bare`
             // once per frame (this probe runs for every bare-name resolve).
-            for (k, uq) in frame.iter().rev() {
-                if k == bare {
-                    return Some(uq.as_str());
+            for e in frame.iter().rev() {
+                if e.0 == bare {
+                    return Some(e);
                 }
             }
         }
         None
+    }
+
+    /// `dyn_name_lookup`'s hit on an identity entry `(name, name)`: in the
+    /// innermost frame a collection formal resolves to its storage key (see
+    /// `formal_dyn`); anywhere else the bare name stands.
+    #[inline(never)]
+    fn dyn_identity_hit<'a>(&'a self, entry: &'a (String, String)) -> &'a str {
+        let in_top = self.local_dyn.last().is_some_and(|t| {
+            t.as_ptr_range()
+                .contains(&(entry as *const (String, String)))
+        });
+        if in_top {
+            if let Some((_, target)) = self
+                .formal_dyn
+                .last()
+                .and_then(|f| f.iter().rev().find(|(n, _)| *n == entry.0))
+            {
+                return target;
+            }
+        }
+        entry.1.as_str()
     }
 
     /// class-perf row 3: split a `\u{1}`-marked LOCAL collection receiver
@@ -103262,9 +102615,12 @@ impl Simulator {
     /// member does not get stolen by an enclosing method's same-named local.
     fn dyn_name_lookup_innermost(&self, bare: &str) -> Option<&str> {
         let frame = self.local_dyn.last()?;
-        for (k, uq) in frame.iter().rev() {
-            if k == bare {
-                return Some(uq.as_str());
+        for e in frame.iter().rev() {
+            if e.0 == bare {
+                if e.1.len() == e.0.len() {
+                    return Some(self.dyn_identity_hit(e));
+                }
+                return Some(e.1.as_str());
             }
         }
         None
@@ -103546,6 +102902,25 @@ impl Simulator {
             if self.local_dyn_pool.len() < 64 && dyn_frame.capacity() <= 32 {
                 dyn_frame.clear();
                 self.local_dyn_pool.push(dyn_frame);
+            }
+        }
+        if let Some(formals) = self.formal_dyn.pop() {
+            for (_bare, key) in &formals {
+                // A `ref` formal's alias (see `bind_queue_param`) names
+                // storage an enclosing frame owns: leave it alone.
+                if key.starts_with('@')
+                    && (self
+                        .local_dyn
+                        .iter()
+                        .any(|f| f.iter().any(|(_, k)| k == key))
+                        || self
+                            .formal_dyn
+                            .iter()
+                            .any(|f| f.iter().any(|(_, k)| k == key)))
+                {
+                    continue;
+                }
+                self.cleanup_dyn_storage(key);
             }
         }
     }
@@ -104054,6 +103429,124 @@ impl Simulator {
             }
             _ => None,
         }
+    }
+
+    /// The element names of the unpacked collection `name` in STREAM order
+    /// (§11.4.14 / §6.24.3: the leftmost element first — index 0 of a
+    /// dynamic array or queue, the left bound of each fixed dimension, rows
+    /// before columns) and the element width. None for anything else.
+    fn stream_elem_order(&self, name: &str) -> Option<(Vec<String>, u32)> {
+        let ew_of = |sim: &Self, first: &str, fallback: u32| {
+            sim.lookup_signal_width(first).unwrap_or(fallback).max(1)
+        };
+        if self.module.dynamic_arrays.contains(name) {
+            let n = self.get_queue_size(name) as usize;
+            let fallback = self.module.arrays.get(name).map(|t| t.2).unwrap_or(8);
+            let ew = ew_of(self, &format!("{}[0]", name), fallback);
+            return Some(((0..n).map(|i| format!("{}[{}]", name, i)).collect(), ew));
+        }
+        let (dims, ew): (Vec<(i64, i64)>, u32) =
+            if let Some(&(lo, hi, ew)) = self.module.arrays.get(name) {
+                let d = match self.module.unpacked_decl_dims.get(name) {
+                    Some(d) if d.len() == 1 => d[0],
+                    _ if self.module.descending_arrays.contains(name) => (hi, lo),
+                    _ => (lo, hi),
+                };
+                (vec![d], ew)
+            } else if let Some(&(r0, r1, ew)) = self.module.arrays_2d.get(name) {
+                match self.module.unpacked_decl_dims.get(name) {
+                    Some(d) if d.len() == 2 => (d.clone(), ew),
+                    _ => (vec![r0, r1], ew),
+                }
+            } else if let Some((shape, ew)) = self.module.arrays_nd.get(name) {
+                match self.module.unpacked_decl_dims.get(name) {
+                    Some(d) if d.len() == shape.len() => (d.clone(), *ew),
+                    _ => (shape.clone(), *ew),
+                }
+            } else {
+                return None;
+            };
+        let total: i64 = dims.iter().map(|(l, r)| (l - r).abs() + 1).product();
+        if total <= 0 || total > 1 << 20 {
+            return None;
+        }
+        let mut names = vec![name.to_string()];
+        for &(l, r) in &dims {
+            let idx: Vec<i64> = if l <= r {
+                (l..=r).collect()
+            } else {
+                (r..=l).rev().collect()
+            };
+            names = names
+                .iter()
+                .flat_map(|p| idx.iter().map(move |i| format!("{}[{}]", p, i)))
+                .collect();
+        }
+        let ew = names
+            .first()
+            .map(|f| ew_of(self, f, ew))
+            .unwrap_or(ew.max(1));
+        Some((names, ew))
+    }
+
+    /// §6.24.3: the operand of a cast to an integral type may be an
+    /// UNPACKED array or queue (`int'(barr)`, `24'(q)`): its elements are
+    /// packed left to right, which is `{>>{operand}}`. The operand read the
+    /// array's container signal instead (0 / stale). None when the cast is
+    /// not such a cast.
+    #[cold]
+    #[inline(never)]
+    fn cast_of_unpacked_operand(
+        &mut self,
+        expr: &Expression,
+        ctx_width: u32,
+        name: &String,
+        args: &[Expression],
+    ) -> Option<Value> {
+        if !matches!(
+            name.as_str(),
+            "$__xz_named_cast" | "$__xz_size_cast" | "$__xz_type_cast"
+        ) {
+            return None;
+        }
+        let a = args.get(1)?;
+        if !self.cast_operand_is_unpacked(a) {
+            return None;
+        }
+        let mut packed_args = args.to_vec();
+        packed_args[1] = Expression::new(
+            ExprKind::StreamOp {
+                left_to_right: false,
+                slice_size: None,
+                exprs: vec![a.clone()],
+            },
+            a.span,
+        );
+        Some(self.eval_expr_system_call(expr, ctx_width, name, &packed_args))
+    }
+
+    /// A cast operand that is a whole unpacked collection (or a slice of a
+    /// queue / dynamic array), whose bit stream is its packed elements.
+    fn cast_operand_is_unpacked(&mut self, e: &Expression) -> bool {
+        let e = match &e.kind {
+            ExprKind::Paren(i) => i.as_ref(),
+            ExprKind::RangeSelect { expr, .. } => match &expr.kind {
+                ExprKind::Ident(_) => expr.as_ref(),
+                _ => return false,
+            },
+            _ => e,
+        };
+        let ExprKind::Ident(h) = &e.kind else {
+            return false;
+        };
+        if h.path.iter().any(|s| !s.selects.is_empty()) {
+            return false;
+        }
+        let nm = self.resolve_hier_name(h);
+        self.module.arrays.contains_key(&*nm)
+            || self.module.dynamic_arrays.contains(&*nm)
+            || self.module.arrays_2d.contains_key(&*nm)
+            || self.module.arrays_nd.contains_key(&*nm)
     }
 
     /// If `expr` names a queue/array (possibly an instance-scoped member),
@@ -104800,7 +104293,10 @@ impl Simulator {
     /// `foreach (mask[i]) if (mask[i]) …` over a task-local `mask` read x,
     /// and writes to a task-local target were lost when the frame popped).
     /// Returns what to restore; outside any frame one is pushed.
-    fn bind_loop_vars(&mut self, binds: Vec<(String, Value)>) -> Option<Vec<(String, Option<Value>)>> {
+    fn bind_loop_vars(
+        &mut self,
+        binds: Vec<(String, Value)>,
+    ) -> Option<Vec<(String, Option<Value>)>> {
         let Some(top) = self.local_stack.last_mut() else {
             self.push_local_frame(binds.into_iter().collect());
             return None;
@@ -104867,13 +104363,14 @@ impl Simulator {
                     let ExprKind::Binary { op, left, right } = &e.kind else {
                         continue;
                     };
-                    let (arr, other, flip) = if let Some(a) = self.size_call_on_target(left, targets) {
-                        (a, right, false)
-                    } else if let Some(a) = self.size_call_on_target(right, targets) {
-                        (a, left, true)
-                    } else {
-                        continue;
-                    };
+                    let (arr, other, flip) =
+                        if let Some(a) = self.size_call_on_target(left, targets) {
+                            (a, right, false)
+                        } else if let Some(a) = self.size_call_on_target(right, targets) {
+                            (a, left, true)
+                        } else {
+                            continue;
+                        };
                     let b = bounds.entry(arr).or_insert((0, i32::MAX as i64, false));
                     if *op == BinaryOp::Eq {
                         b.2 = true;
@@ -108527,6 +108024,7 @@ impl Simulator {
         use super::bytecode::LocalKind;
         let depth = self.local_stack.len();
         let mark = self.fb_meta_saves.len();
+
         let mut f = self.take_pooled_frame();
         for l in locals {
             let v = Self::fb_fit(self.vm_regs[l.reg as usize].clone(), l.kind);
@@ -108539,7 +108037,7 @@ impl Simulator {
                 self.string_signals.contains(name),
             );
             let want = match l.kind {
-                LocalKind::Int { width, signed } => (Some(width), signed, false, false),
+                LocalKind::Int { width, signed, .. } => (Some(width), signed, false, false),
                 LocalKind::Real => (Some(64), false, true, false),
                 // Text is exempt from width fitting; leave `widths` alone.
                 LocalKind::Str => (cur.0, false, false, true),
@@ -108550,6 +108048,7 @@ impl Simulator {
                 self.fb_meta_apply(name, want);
             }
         }
+        self.fb_frame_depths.push(depth);
         self.push_local_frame(f);
         (depth, mark)
     }
@@ -108584,6 +108083,7 @@ impl Simulator {
     /// register, fitted to its declaration as a compiled assignment would.
     fn fb_frame_pop(&mut self, locals: &[super::bytecode::FbLocal], at: (usize, usize)) {
         let (depth, mark) = at;
+        self.fb_frame_depths.pop();
         while self.fb_meta_saves.len() > mark {
             if let Some((name, w, sg, re, st)) = self.fb_meta_saves.pop() {
                 self.fb_meta_apply(&name, (w, sg, re, st));
@@ -108620,7 +108120,11 @@ impl Simulator {
     fn fb_fit(v: Value, kind: super::bytecode::LocalKind) -> Value {
         use super::bytecode::LocalKind;
         match kind {
-            LocalKind::Int { width, signed } => {
+            LocalKind::Int {
+                width,
+                signed,
+                two_state,
+            } => {
                 let mut v = if v.is_real {
                     Self::real_to_int(v.to_f64(), width.max(1))
                 } else if v.width != width || v.is_fill {
@@ -108628,6 +108132,9 @@ impl Simulator {
                 } else {
                     v
                 };
+                if two_state && v.has_xz() {
+                    v = v.to_two_state();
+                }
                 v.is_signed = signed;
                 v
             }
@@ -108970,11 +108477,9 @@ impl Simulator {
                 if let Some(inst) = inst {
                     if let Some(bound) = inst.type_bindings.get(&concrete) {
                         concrete = bound.clone();
-                    } else if let Some(bound) = self.carried_ancestor_param(
-                        &ctx,
-                        &inst.type_bindings,
-                        &concrete,
-                    ) {
+                    } else if let Some(bound) =
+                        self.carried_ancestor_param(&ctx, &inst.type_bindings, &concrete)
+                    {
                         concrete = bound;
                     }
                 }
@@ -109902,29 +109407,34 @@ impl Simulator {
             if guard > 64 {
                 break;
             }
-            let Some(cd) = self.module.classes.get(&cn) else { break };
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
             if cd.properties.contains_key(&key.1) {
                 if let Some(dt) = self.class_prop_decl_type(cd, &key.1) {
-                    let dt = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+                    let dt =
+                        super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
                     if let DataType::IntegerVector { dimensions, .. } = dt {
                         if let [crate::ast::types::PackedDimension::Range { left, right, .. }] =
                             dimensions.as_slice()
                         {
                             let params = self.instance_param_scope(h);
-                            let l = super::elaborate::const_eval_i64_with_params(left, Some(&params))
-                                .or_else(|| {
-                                    super::elaborate::const_eval_i64_with_params(
-                                        left,
-                                        Some(&self.module.parameters),
-                                    )
-                                });
-                            let r = super::elaborate::const_eval_i64_with_params(right, Some(&params))
-                                .or_else(|| {
-                                    super::elaborate::const_eval_i64_with_params(
-                                        right,
-                                        Some(&self.module.parameters),
-                                    )
-                                });
+                            let l =
+                                super::elaborate::const_eval_i64_with_params(left, Some(&params))
+                                    .or_else(|| {
+                                        super::elaborate::const_eval_i64_with_params(
+                                            left,
+                                            Some(&self.module.parameters),
+                                        )
+                                    });
+                            let r =
+                                super::elaborate::const_eval_i64_with_params(right, Some(&params))
+                                    .or_else(|| {
+                                        super::elaborate::const_eval_i64_with_params(
+                                            right,
+                                            Some(&self.module.parameters),
+                                        )
+                                    });
                             if let (Some(l), Some(r)) = (l, r) {
                                 if l < r || r != 0 {
                                     found = Some((l, r));
@@ -110441,11 +109951,14 @@ impl Simulator {
         // an object member (`o.arr[0]` — the parser yields the dotted head as
         // an Ident with a 2-segment path), or a MemberAccess receiver.
         let (member, obj): (String, Option<usize>) = match &base.kind {
-            ExprKind::Ident(h) if h.path.len() == 1 => {
-                (h.path[0].name.name.clone(), self.this_stack.last().copied().flatten())
-            }
+            ExprKind::Ident(h) if h.path.len() == 1 => (
+                h.path[0].name.name.clone(),
+                self.this_stack.last().copied().flatten(),
+            ),
             ExprKind::Ident(h) if h.path.len() == 2 => {
-                let hh = self.eval_ident_handle(&h.path[0].name.name).filter(|&x| x != 0);
+                let hh = self
+                    .eval_ident_handle(&h.path[0].name.name)
+                    .filter(|&x| x != 0);
                 (h.path[1].name.name.clone(), hh)
             }
             ExprKind::MemberAccess { expr: ob, member } => {
@@ -110471,8 +109984,7 @@ impl Simulator {
             {
                 let tn = cd.properties.get(&member)?.type_name.clone()?;
                 let dt = self.module.typedef_types.get(tn.as_str())?;
-                if let DataType::Struct(su) =
-                    Self::resolve_type_ref(dt, &self.module.typedef_types)
+                if let DataType::Struct(su) = Self::resolve_type_ref(dt, &self.module.typedef_types)
                 {
                     if !Self::spreads_member_wise(&su) {
                         return Some(su);
@@ -110903,6 +110415,16 @@ impl Simulator {
     /// (or an array of them) and `<suffix>` is any chain of `.member` / `[i]`.
     /// Each leaf gets its own per-instance cell keyed `<prop><suffix>`.
     fn class_unpacked_leaf(&mut self, e: &Expression) -> Option<ClassAggRef> {
+        // §11.4.2 / §11.3.6: the probe below EVALUATES every index of the
+        // chain, and the real read or write evaluates them again. With a side
+        // effect in an index (`items[--sp]`, `q[i++].f`) that ran it twice
+        // whenever a property name of the chain COULD be a struct — e.g. any
+        // `T items[N]` whose type parameter might bind a struct — so a
+        // `return items[--sp];` popped two elements. Only probe such a chain
+        // when one of its receivers really is an unpacked-struct property.
+        if Self::chain_has_impure_index(e) && !self.chain_names_unpacked_struct_prop(e) {
+            return None;
+        }
         // A dotted reference is an IDENT with a multi-segment path outside a
         // method body and a MemberAccess/Index chain inside one; both shapes
         // reach here, and both used to resolve only one level below the
@@ -110955,6 +110477,82 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// Whether an index or select of the member/index chain `e` (not of a
+    /// receiver's own sub-expressions) has a side effect.
+    fn chain_has_impure_index(e: &Expression) -> bool {
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, .. } => cur = expr,
+                ExprKind::Index { expr, index } => {
+                    if !Self::cond_expr_is_effect_free(index, false) {
+                        return true;
+                    }
+                    cur = expr;
+                }
+                ExprKind::Ident(h) => {
+                    return h.path.iter().any(|s| {
+                        s.selects
+                            .iter()
+                            .any(|x| !Self::cond_expr_is_effect_free(x, false))
+                    });
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether some receiver of the chain `e` is an unpacked-struct class
+    /// property that spreads member-wise, found WITHOUT evaluating any index
+    /// of the chain (see `class_unpacked_leaf`).
+    #[inline(never)]
+    fn chain_names_unpacked_struct_prop(&mut self, e: &Expression) -> bool {
+        let mut bases: Vec<Expression> = Vec::new();
+        let mut cur = e;
+        loop {
+            match &cur.kind {
+                ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+                    cur = expr;
+                    if !matches!(cur.kind, ExprKind::Ident(_)) {
+                        bases.push(cur.clone());
+                    }
+                }
+                _ => break,
+            }
+        }
+        if let ExprKind::Ident(h) = &cur.kind {
+            for k in 0..h.path.len() {
+                let mut base_h = h.clone();
+                base_h.path.truncate(k + 1);
+                if let Some(seg) = base_h.path.last_mut() {
+                    seg.selects.clear();
+                }
+                base_h.cached_signal_id = std::cell::Cell::new(None);
+                base_h.cached_resolved_name = std::cell::OnceCell::new();
+                bases.push(Expression::new(ExprKind::Ident(base_h), cur.span));
+            }
+        }
+        for base in &bases {
+            if !Self::receiver_prop_name(base).is_some_and(|p| self.struct_prop_name_possible(p)) {
+                continue;
+            }
+            if Self::chain_has_impure_index(base) {
+                // A receiver with its own side effect: keep the old probe.
+                return true;
+            }
+            let Some((handle, prop)) = self.class_prop_receiver(base) else {
+                continue;
+            };
+            if self
+                .class_prop_struct(handle, &prop)
+                .is_some_and(|su| Self::spreads_member_wise(&su))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Candidate splits of a dotted identifier: each segment in turn is taken
@@ -112601,12 +112199,17 @@ impl Simulator {
             };
             if let Some((shape, _)) = class_def.array_nd_properties.get(member) {
                 if let Some(data_type) = class_def.property_types.get(member) {
-                    layout = Some((shape.clone(), data_type.clone()));
+                    let shape = self
+                        .inst_nd_shape(class_def, handle, member)
+                        .unwrap_or_else(|| shape.clone());
+                    layout = Some((shape, data_type.clone()));
                     break;
                 }
             }
             if let Some(&(low, high, _)) = class_def.array_properties.get(member) {
                 if let Some(data_type) = class_def.property_types.get(member) {
+                    let (low, high) =
+                        self.inst_fixed_bounds(class_def, handle, member, (low, high));
                     layout = Some((vec![(low, high)], data_type.clone()));
                     break;
                 }
@@ -112960,11 +112563,36 @@ impl Simulator {
             // var_decl_types drops unpacked dims — a queue/array/assoc OF
             // structs resolves to the element struct here. Seeding member
             // leaves on the CONTAINER name would corrupt its storage.
-            if self.module.arrays.contains_key(&vname)
-                || self.module.dynamic_arrays.contains(&vname)
-                || self.module.arrays_2d.contains_key(&vname)
-                || self.is_associative_array(&vname)
-            {
+            if self.module.dynamic_arrays.contains(&vname) || self.is_associative_array(&vname) {
+                continue;
+            }
+            // A FIXED array of unpacked structs: every element's 2-state
+            // members default to 0 as well (§7.2.1, §7.4) — seeded per
+            // element leaf (`arr[1].a`), never on the container name.
+            let fixed_1d = self.module.arrays.get(&vname).copied();
+            let fixed_2d = self.module.arrays_2d.get(&vname).copied();
+            if fixed_1d.is_some() || fixed_2d.is_some() {
+                let su = match self.resolve_dt(&dt) {
+                    DataType::Struct(su) if Self::spreads_member_wise(&su) => su,
+                    _ => continue,
+                };
+                let elems: Vec<String> = match (fixed_1d, fixed_2d) {
+                    (Some((lo, hi, _)), _) if hi >= lo && hi - lo < 1 << 16 => {
+                        (lo..=hi).map(|i| format!("{}[{}]", vname, i)).collect()
+                    }
+                    (None, Some(((l0, h0), (l1, h1), _)))
+                        if h0 >= l0 && h1 >= l1 && (h0 - l0 + 1) * (h1 - l1 + 1) <= 1 << 16 =>
+                    {
+                        (l0..=h0)
+                            .flat_map(|i| (l1..=h1).map(move |j| (i, j)))
+                            .map(|(i, j)| format!("{}[{}][{}]", vname, i, j))
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                };
+                for e in elems {
+                    self.zero_two_state_members(&e, &su);
+                }
                 continue;
             }
             if let DataType::Struct(su) = self.resolve_dt(&dt) {
@@ -113078,7 +112706,15 @@ impl Simulator {
                             // signal may be pre-registered x-filled. A restored
                             // declared initializer is never fully x, so it wins.
                             let cur = self.get_signal_value_by_name(&leaf);
-                            let untouched = cur.as_ref().is_none_or(|v| *v == Value::new(v.width));
+                            // Compared with the flag cleared: a signed
+                            // member (`int`, `byte`) is pre-registered as a
+                            // SIGNED all-x value, which never equalled the
+                            // unsigned `Value::new`, so those members kept x.
+                            let untouched = cur.as_ref().is_none_or(|v| {
+                                let mut u = v.clone();
+                                u.is_signed = false;
+                                u == Value::new(v.width)
+                            });
                             if untouched {
                                 let w = cur.map(|v| v.width).unwrap_or_else(|| {
                                     crate::elaborate::resolve_type_width(
@@ -114396,6 +114032,12 @@ impl Simulator {
             .var_decl_types
             .get(name)
             .map(Cow::Borrowed)
+            .or_else(|| {
+                // A collection formal's per-call key `@name#N` (see
+                // `formal_dyn_key`): the formal's own declared type.
+                let bare = name.strip_prefix('@')?.rsplit_once('#')?.0;
+                self.module.var_decl_types.get(bare).map(Cow::Borrowed)
+            })
             .or_else(|| match Self::flat_single_base(name) {
                 // `flat_path_type` of a one-segment path is its base's
                 // declared type: borrow it.
@@ -114732,6 +114374,16 @@ impl Simulator {
         // collection (`int q[3][$]`), so it goes back through `render_p_var`.
         if let Some(&(lo, hi, _)) = self.module.arrays.get(name) {
             if hi >= lo && (hi - lo) < 4096 {
+                // §21.2.1.7: elements print in declared (left to right)
+                // order — a descending `[2:0]` array starts at index 2.
+                let descending = match self.module.unpacked_decl_dims.get(name) {
+                    Some(d) if d.len() == 1 => d[0].0 > d[0].1,
+                    _ => self.module.descending_arrays.contains(name),
+                };
+                if descending {
+                    let list: Vec<i64> = (lo..=hi).rev().collect();
+                    return Some(self.render_p_dim_lists(name, &[list], &dt));
+                }
                 return Some(self.render_p_dims(name, &[(lo, hi)], &dt));
             }
             return None;
@@ -116572,26 +116224,36 @@ impl Simulator {
         }
     }
 
-    /// Bind a queue / dynamic-array subroutine parameter by value: copy the
-    /// caller's queue contents into the parameter's (global-scoped) storage and
-    /// register it as a dynamic array so the body's foreach/size/index resolve.
-    /// Returns true when it handled a queue parameter. (Pass-by-value copy;
-    /// parameter storage uses the bare parameter name, so deep recursion through
-    /// the same queue parameter is not isolated — acceptable for the generator's
-    /// non-recursive `gen_section`-style helpers.)
-    /// Bind a queue-typed argument into the call frame. Returns `Some(caller)`
-    /// on success — the caller's queue name, or an empty string for a literal
-    /// actual (nothing to write back to). `None` when `arg` is not a queue.
-    /// The caller writes the param's queue back to `caller` for a `ref`/
-    /// `output`/`inout` formal; without that, a `ref` queue's `push_back` was
-    /// lost on return (§13.5.2).
+    /// Bind a queue / dynamic-array FORMAL (`int q[$]`, `int d[]`, or a
+    /// typedef carrying those dims) into the call frame. Returns `None` when
+    /// the formal is not a queue/dynamic array, else `Some((storage, caller))`:
+    /// the key the formal's body accesses resolve to, and the caller's
+    /// collection to copy back to on return (empty when nothing is copied
+    /// back).
+    ///
+    /// IEEE 1800-2023 §13.5.1: an `input` formal is a COPY. It lives under a
+    /// per-call key (`@q#N`, mapped in the frame's rename table like an
+    /// automatic local), so writes in the body never reach the caller — not
+    /// even when the actual has the formal's own name — and recursive or
+    /// concurrent calls each own their copy. An `output` formal starts empty;
+    /// `output`/`inout` copy back on return.
+    ///
+    /// §13.5.2: a `ref` formal is an ALIAS of the actual's storage: the
+    /// formal's name maps to the actual's key, so every read and write goes
+    /// to the caller's collection while the call runs (two concurrently
+    /// forked tasks pushing into one `ref` queue both land), and nothing is
+    /// copied back.
+    ///
+    /// §7.10 / §13.5: a slice actual (`q[1:$]`, `q[a+:n]`) binds exactly the
+    /// slice's elements; `q[n:$]` past the end and `q[3:1]` bind none.
     fn bind_queue_param(
         &mut self,
         pname: &str,
         dims: &[crate::ast::types::UnpackedDimension],
         arg: &Expression,
         queue_data_type: &crate::ast::types::DataType,
-    ) -> Option<String> {
+        dir: PortDirection,
+    ) -> Option<(String, String)> {
         use crate::ast::types::{DataType, UnpackedDimension};
         self.meta_note(pname);
         if !matches!(
@@ -116602,10 +116264,7 @@ impl Simulator {
         }
         // A queue literal / assignment pattern (`{"a", "b"}` or `'{...}`) passed
         // directly as the actual: bind each top-level element as one queue
-        // entry. Without this the param falls back to a scalar bind while a
-        // stale same-named queue registration from a prior call survives, so
-        // `foreach(param[i])` iterates phantom (unset → garbage) elements.
-
+        // entry.
         let literal_elems: Option<Vec<&Expression>> = match &arg.kind {
             ExprKind::Concatenation(parts) => Some(parts.iter().collect()),
             ExprKind::AssignmentPattern(items) => Some(items.iter().map(|it| it.expr()).collect()),
@@ -116622,7 +116281,6 @@ impl Simulator {
             .var_decl_types
             .insert(pname.to_string(), queue_data_type.clone());
         let resolved_dt = Self::resolve_type_ref(queue_data_type, &self.module.typedef_types);
-        matches!(resolved_dt, DataType::Struct(_));
         if let crate::ast::types::DataType::Struct(su) = resolved_dt {
             if !su.packed {
                 // Record the element typedef name so MemberAccess reads can
@@ -116653,34 +116311,159 @@ impl Simulator {
             }
         }
         if let Some(parts) = literal_elems {
-            // Clear any stale storage/registration for this bare param name.
-            let mut stale: Vec<String> = self.signals.keys_with_elem_prefix(&format!("{}[", pname));
-            let pn_size = format!("{}.size", pname);
-            if self.signals.contains_key(&pn_size) {
-                stale.push(pn_size);
-            }
-            for k in stale {
-                self.signals.remove(&k);
-            }
-            self.module.arrays.insert(pname.to_string(), (0, -1, 32));
-            self.module.dynamic_arrays.insert(pname.to_string());
+            let key = self.formal_dyn_key(pname, queue_data_type);
+            self.module.arrays.insert(key.clone(), (0, -1, 32));
+            self.module.dynamic_arrays.insert(key.clone());
             // An element that is itself a `'{..}` pattern (a dynamic array of
             // UNPACKED structs) is scattered member-wise, not evaluated.
             for (j, part) in parts.iter().enumerate() {
                 if matches!(part.kind, ExprKind::AssignmentPattern(_)) {
-                    self.assign_pattern_or_leaf(
-                        &format!("{}[{}]", pname, j),
-                        queue_data_type,
-                        part,
-                    );
+                    self.assign_pattern_or_leaf(&format!("{}[{}]", key, j), queue_data_type, part);
                     continue;
                 }
                 let v = self.eval_expr(part);
-                self.set_signal_value_by_name(&format!("{}[{}]", pname, j), v);
+                self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
             }
-            self.set_queue_size(pname, parts.len() as u64);
-            return Some(String::new());
+            self.set_queue_size(&key, parts.len() as u64);
+            return Some((key, String::new()));
         }
+        if let Some((vals, w)) = self.collection_slice_values(arg) {
+            let key = self.formal_dyn_key(pname, queue_data_type);
+            self.module.arrays.insert(key.clone(), (0, -1, w));
+            self.module.dynamic_arrays.insert(key.clone());
+            let n = vals.len() as u64;
+            for (j, v) in vals.into_iter().enumerate() {
+                self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
+            }
+            self.set_queue_size(&key, n);
+            return Some((key, String::new()));
+        }
+        let cname = self.queue_actual_storage(arg)?;
+        if matches!(dir, PortDirection::Ref) {
+            // §13.5.2: alias — the formal resolves to the actual's storage.
+            self.map_formal_dyn(pname, &cname);
+            return Some((cname, String::new()));
+        }
+        let size = if matches!(dir, PortDirection::Output) {
+            0
+        } else {
+            self.get_queue_size(&cname)
+        };
+        let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
+        let key = self.formal_dyn_key(pname, queue_data_type);
+        // A queue of unpacked structs keeps its members as separate leaves
+        // (`q[0].addr`); those are copied element-wise below.
+        let elem_struct = (cname != key)
+            .then(|| self.queue_elem_struct(&cname))
+            .flatten();
+        let vals: Vec<Value> = if elem_struct.is_some() {
+            Vec::new()
+        } else {
+            (0..size)
+                .map(|j| {
+                    self.get_signal_value_by_name(&format!("{}[{}]", cname, j))
+                        .unwrap_or_else(|| Value::zero(w))
+                })
+                .collect()
+        };
+        self.module.arrays.insert(key.clone(), (0, -1, w));
+        self.module.dynamic_arrays.insert(key.clone());
+        if let Some(su) = &elem_struct {
+            for j in 0..size {
+                let (src, dst) = (format!("{}[{}]", cname, j), format!("{}[{}]", key, j));
+                self.copy_unpacked_struct(&dst, &src, su);
+            }
+        }
+        for (j, v) in vals.into_iter().enumerate() {
+            self.set_signal_value_by_name(&format!("{}[{}]", key, j), v);
+        }
+        self.set_queue_size(&key, size);
+        Some((key, cname))
+    }
+
+    /// The per-call storage key of a queue / dynamic-array / associative
+    /// formal (see `bind_queue_param`): an `@name#N` key like an automatic
+    /// local's, entered in the callee frame's rename table by
+    /// `commit_formal_dyn` and torn down with the frame.
+    fn formal_dyn_key(&mut self, pname: &str, dt: &crate::ast::types::DataType) -> String {
+        let id = self.next_dyn_id;
+        self.next_dyn_id += 1;
+        let mut key = String::with_capacity(pname.len() + 12);
+        key.push('@');
+        key.push_str(pname);
+        key.push('#');
+        Self::push_i64(&mut key, id as i64);
+        self.map_formal_dyn(pname, &key);
+        // The element type under the per-call key too: a queue of unpacked
+        // structs spreads its members by it, and a class-element queue
+        // constructs its `push_back(new(..))` elements by it. A plain
+        // integral / real / enum element needs no entry of its own
+        // (`p_elem_type_ref` maps the key back to the formal's), which spares
+        // a type clone on every call.
+        let plain = matches!(
+            Self::resolve_type_ref_borrowed(dt, &self.module.typedef_types),
+            DataType::IntegerAtom { .. }
+                | DataType::IntegerVector { .. }
+                | DataType::Real { .. }
+                | DataType::Enum(_)
+        );
+        if !plain {
+            self.module.var_decl_types.insert(key.clone(), dt.clone());
+        }
+        if let crate::ast::types::DataType::TypeReference { name: tn, .. } = dt {
+            if self.module.classes.contains_key(&tn.name.name) {
+                self.module
+                    .array_elem_class
+                    .insert(key.clone(), tn.name.name.clone());
+            }
+        }
+        key
+    }
+
+    /// Queue the rename-table entry `pname -> target` for the call being set
+    /// up (a by-value formal's own key, or a `ref` formal's alias of the
+    /// actual's storage); `commit_formal_dyn` enters it in the callee frame.
+    /// The entry also SHADOWS any enclosing renamed local of the same name:
+    /// without it `dyn_name_lookup` walks up and redirects the callee's
+    /// formal to the caller's storage.
+    fn map_formal_dyn(&mut self, pname: &str, target: &str) {
+        self.pending_formal_dyn
+            .push((pname.to_string(), target.to_string()));
+    }
+
+    /// Start binding a call's formals: the callee's (empty) rename frame,
+    /// just pushed by `push_queue_frame`, is held aside so every actual
+    /// resolves in the CALLER's view, and the formals' entries queue up from
+    /// the returned base (see `map_formal_dyn`).
+    fn begin_formal_dyn(&mut self) -> FormalDynSetup {
+        let names = self.local_dyn.pop().unwrap_or_default();
+        let formals = self.formal_dyn.pop().unwrap_or_default();
+        (self.pending_formal_dyn.len(), names, formals)
+    }
+
+    /// Reinstate the callee frame held by `begin_formal_dyn` with the
+    /// formals queued since `base` entered in it, once all the call's
+    /// actuals are evaluated.
+    fn commit_formal_dyn(&mut self, (base, mut names, mut formals): FormalDynSetup) {
+        for (pname, target) in self.pending_formal_dyn.drain(base..) {
+            match names.iter_mut().find(|(k, _)| *k == pname) {
+                Some(slot) => slot.1 = pname.clone(),
+                None => names.push((pname.clone(), pname.clone())),
+            }
+            match formals.iter_mut().find(|(k, _)| *k == pname) {
+                Some(slot) => slot.1 = target,
+                None => formals.push((pname, target)),
+            }
+        }
+        self.local_dyn.push(names);
+        self.formal_dyn.push(formals);
+    }
+
+    /// The storage key of a queue / dynamic-array (or fixed unpacked array)
+    /// ACTUAL: a plain name (a caller-local one under its per-process rename
+    /// `@q#7`), or a member chain `obj.q` / `a.b.q` mapped to the owning
+    /// object's `<handle>#q` storage. `None` when `arg` names no collection.
+    fn queue_actual_storage(&mut self, arg: &Expression) -> Option<String> {
         let cname = match &arg.kind {
             ExprKind::Ident(h) if h.path.len() == 1 => {
                 let mut n = self.resolve_hier_name(h);
@@ -116696,33 +116479,17 @@ impl Simulator {
                 } else if let Some(s) = self.instance_assoc_member(&n) {
                     n = std::borrow::Cow::Owned(s);
                 }
-                n
+                n.into_owned()
             }
-            // Flattened `obj.member` (parsed as Ident path [obj, member]) or
-            // explicit `ExprKind::MemberAccess`. §13.5.2: a queue/dynamic-
-            // array member of ANOTHER object passed as a `ref`/`output`/
-            // `inout` actual — e.g. callback macro `cb.doit(comp.q)` /
-            // `cb.doit(this.q)`. The member's per-instance storage lives at
-            // `<handle>#member`; resolve the base object to its heap handle,
-            // then map to that flat namespace so the element copy-in /
-            // writeback below targets the right collection. Without this the
-            // arg fell through to a scalar bind and a `push_back` inside the
-            // callee never reached the caller's member queue (the
-            // callback queue stayed empty, so callback iteration performed
-            // nothing).
-            // A member-access chain of arbitrary depth: `obj.q`, `a.b.q`,
-            // `a.b.c.q`, … (parsed as a flattened Ident path, all segments
-            // plain identifiers — no index/scope selects). The HEAD is the
-            // base object; each MIDDLE segment is a handle-valued property
-            // of the object the preceding segment resolves to; the LAST
-            // segment is the leaf member that names the queue/dynamic array.
-            // Walk the heap: head handle → member_handle per middle segment
-            // → then map the owning handle + leaf name to the per-instance
-            // `<handle>#member` storage namespace.
-            //
+            // §13.5.2: a queue/dynamic-array member of ANOTHER object passed
+            // as the actual — `cb.doit(comp.q)` / `cb.doit(this.q)`, or a
+            // member chain of any depth (`a.b.c.q`, parsed as a flattened
+            // Ident path of plain segments). The HEAD is the base object;
+            // each MIDDLE segment is a handle-valued property of the object
+            // the preceding segment resolves to; the LAST segment names the
+            // collection, stored per instance at `<handle>#member`.
             // (Scope-qualified names like `pkg::Class::queue` are a different
-            // AST shape — ClassScope, not a member chain — and resolve via
-            // static-property tables elsewhere; they don't reach this path.)
+            // AST shape and resolve via static-property tables elsewhere.)
             ExprKind::Ident(h)
                 if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
             {
@@ -116732,11 +116499,11 @@ impl Simulator {
                 for seg in h.path.iter().take(h.path.len() - 1).skip(1) {
                     handle = self.member_handle(handle, &seg.name.name)?;
                 }
-                std::borrow::Cow::Owned(self.handle_collection_name(handle, &leaf)?)
+                self.handle_collection_name(handle, &leaf)?
             }
             ExprKind::MemberAccess { expr, member } => {
                 let handle = self.eval_handle_expr(expr)?;
-                std::borrow::Cow::Owned(self.handle_collection_name(handle, &member.name)?)
+                self.handle_collection_name(handle, &member.name)?
             }
             _ => return None,
         };
@@ -116745,66 +116512,61 @@ impl Simulator {
         {
             return None;
         }
-        let size = self.get_queue_size(&cname);
-        let w = self.module.arrays.get(&*cname).map(|t| t.2).unwrap_or(32);
-        // A queue of unpacked structs keeps its members as separate leaves
-        // (`q[0].addr`); those are copied element-wise below.
-        let elem_struct = (*cname != *pname)
-            .then(|| self.queue_elem_struct(&cname))
-            .flatten();
-        let vals: Vec<Value> = if elem_struct.is_some() {
+        Some(cname)
+    }
+
+    /// §7.10 / §7.4.6: the elements of a SLICE of an unpacked collection
+    /// used as a value (`q[1:$]`, `q[a+:n]`, `fixed[1:3]`), with the
+    /// element width; `None` when `arg` is not such a slice (or one this
+    /// helper does not model: a descending fixed array, struct elements).
+    /// For a queue or dynamic array an empty or reversed range (`q[3:1]`,
+    /// `q[4:$]` on four elements) yields no elements, and bounds beyond
+    /// either end are clamped (§7.10.1).
+    fn collection_slice_values(&mut self, arg: &Expression) -> Option<(Vec<Value>, u32)> {
+        let ExprKind::RangeSelect {
+            expr: base,
+            kind,
+            left,
+            right,
+        } = &arg.kind
+        else {
+            return None;
+        };
+        let name = self.queue_actual_storage(base)?;
+        if self.module.descending_arrays.contains(&*name) || self.queue_elem_struct(&name).is_some()
+        {
+            return None;
+        }
+        let (lo_a, hi_a, w) = *self.module.arrays.get(&*name)?;
+        let is_dyn = self.module.dynamic_arrays.contains(&*name);
+        let upper = if is_dyn {
+            self.get_queue_size(&name) as i64 - 1
+        } else {
+            hi_a
+        };
+        self.dollar_bound.push(upper);
+        let l = self.eval_expr(left).to_i64();
+        let r = self.eval_expr(right).to_i64();
+        self.dollar_bound.pop();
+        let (l, r) = (l?, r?);
+        let (from, to) = match kind {
+            RangeKind::Constant => (l, r),
+            RangeKind::IndexedUp => (l, l + r - 1),
+            RangeKind::IndexedDown => (l - r + 1, l),
+        };
+        let lo_b = if is_dyn { 0 } else { lo_a };
+        let (from, to) = (from.max(lo_b), to.min(upper));
+        let vals = if from > to {
             Vec::new()
         } else {
-            (0..size)
-                .map(|j| {
-                    self.get_signal_value_by_name(&format!("{}[{}]", cname, j))
+            (from..=to)
+                .map(|idx| {
+                    self.get_signal_value_by_name(&format!("{}[{}]", name, idx))
                         .unwrap_or_else(|| Value::zero(w))
                 })
                 .collect()
         };
-        // §13.5.2: a queue FORMAL lives under its BARE name, so a nested
-        // call whose formal has the SAME name overwrites this frame's
-        // storage — and the outer frame then keeps appending to whatever the
-        // inner call left behind. Snapshot the caller-frame content the same
-        // way a declared local does; `pop_and_restore_queue_frame` puts it
-        // back on return. (UVM's `uvm_reg::get_full_hdl_path(ref paths[$])`
-        // calls `uvm_reg_block::get_full_hdl_path(ref paths[$])` — the inner
-        // string entry survived into the outer concat queue, so every
-        // backdoor read saw a bogus leading path and failed.)
-        // An IDENTITY binding (the actual IS the formal's bare storage —
-        // `f(paths)` into `ref paths[$]`) shares one storage by design:
-        // snapshotting it would restore the caller's pre-call content over
-        // the callee's writes on return.
-        if pname != cname {
-            self.snapshot_queue_local(pname);
-        }
-        self.module.arrays.insert(pname.to_string(), (0, -1, w));
-        self.module.dynamic_arrays.insert(pname.to_string());
-        if let Some(su) = &elem_struct {
-            for j in 0..size {
-                let (src, dst) = (format!("{}[{}]", cname, j), format!("{}[{}]", pname, j));
-                self.copy_unpacked_struct(&dst, &src, su);
-            }
-        }
-        for (j, v) in vals.into_iter().enumerate() {
-            self.set_signal_value_by_name(&format!("{}[{}]", pname, j), v);
-        }
-        self.set_queue_size(pname, size);
-        // Identity mapping so the formal SHADOWS any enclosing renamed local
-        // of the same name: without it `dyn_name_lookup` walks up and
-        // redirects the callee's formal `children` to the caller's renamed
-        // `@children#N`, so the body writes to the caller's storage while
-        // the writeback reads the (empty) bare formal and clobbers it.
-        // (`cleanup_dyn_storage` skips bare names, so this is never torn down
-        // here — the existing writeback/snapshot machinery owns the formal.)
-        if let Some(frame) = self.local_dyn.last_mut() {
-            if let Some(slot) = frame.iter_mut().find(|(k, _)| k == pname) {
-                slot.1 = pname.to_string();
-            } else {
-                frame.push((pname.to_string(), pname.to_string()));
-            }
-        }
-        Some(cname.into_owned())
+        Some((vals, w))
     }
 
     /// §13.5.2: stage a queue FORMAL's contents under a fresh temporary
@@ -117026,8 +116788,29 @@ impl Simulator {
                     _ => false,
                 }
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self.signed_class_coll(obj);
         (w, signed)
+    }
+
+    /// Whether `coll` is the instance-scoped storage of a class queue /
+    /// dynamic-array property with a signed integral element type (see
+    /// `signed_class_colls`).
+    #[inline]
+    fn signed_class_coll(&self, coll: &str) -> bool {
+        !self.signed_class_colls.is_empty() && self.signed_class_colls.contains(coll)
+    }
+
+    /// §6.11.1: an element stored into a signed-element class collection
+    /// takes the element type's width and signedness, not the rvalue's.
+    #[inline(never)]
+    fn fit_signed_class_coll_elem(&self, coll: &str, val: Value) -> Value {
+        let mut v = match self.module.arrays.get(coll) {
+            Some(&(_, _, w)) if w > 0 && w != val.width => val.resize(w),
+            _ => val,
+        };
+        v.is_signed = true;
+        v
     }
 
     fn eval_builtin_method(
@@ -117610,8 +117393,14 @@ impl Simulator {
                                 .and_then(|m| m.to_i64())
                                 .unwrap_or(i64::MAX)
                     } else {
+                        // The first element has nothing to compare against
+                        // (`min_val` is None): it was an unconditional unwrap
+                        // that panicked on every unsigned collection.
                         v.to_u64().unwrap_or(u64::MAX)
-                            < min_val.as_ref().unwrap().to_u64().unwrap_or(u64::MAX)
+                            < min_val
+                                .as_ref()
+                                .and_then(|m| m.to_u64())
+                                .unwrap_or(u64::MAX)
                     };
                     if min_val.is_none() || lt {
                         min_val = Some(v);
@@ -117633,7 +117422,8 @@ impl Simulator {
                                 .and_then(|m| m.to_i64())
                                 .unwrap_or(i64::MIN)
                     } else {
-                        v.to_u64().unwrap_or(0) > max_val.as_ref().unwrap().to_u64().unwrap_or(0)
+                        v.to_u64().unwrap_or(0)
+                            > max_val.as_ref().and_then(|m| m.to_u64()).unwrap_or(0)
                     };
                     if max_val.is_none() || gt {
                         max_val = Some(v);
@@ -121544,17 +121334,38 @@ impl Simulator {
             .unwrap_or(raw_sig);
         let matches_sig = |k: &str| k == sig || k.rsplit('.').next() == Some(sig);
         let snap = self.clocking_snapshots.get(&cb)?;
+        // Samples are keyed by the clocking-visible name (`clocking_vis`).
+        if let Some(v) = snap.get(raw_sig) {
+            return Some(v.clone());
+        }
+        if let Some((_, v)) = snap
+            .iter()
+            .find(|(k, _)| k.rsplit('.').next() == Some(raw_sig))
+        {
+            return Some(v.clone());
+        }
         if let Some(v) = snap.get(sig) {
             return Some(v.clone());
         }
         if let Some((_, v)) = snap.iter().find(|(k, _)| matches_sig(k)) {
             return Some(v.clone());
         }
-        // Known cb but not sampled yet (read before the first edge) — the
-        // live net value is the sensible answer.
+        // §14.13: a clockvar read before the block's first clocking event
+        // has not been sampled yet and holds its type's default (x for a
+        // 4-state net), not the live net value.
         let (_, sigs) = self.clocking_meta.get(&cb)?;
         let (net, _) = sigs.iter().find(|(n, is_in)| *is_in && matches_sig(n))?;
-        self.get_signal_value_by_name(net)
+        match self.signal_name_to_id.get(net.as_str()).copied() {
+            Some(id) if id < self.signal_widths.len() => {
+                let w = self.signal_widths[id];
+                if self.signal_two_state.get(id).copied().unwrap_or(false) {
+                    Some(Value::zero(w))
+                } else {
+                    Some(Value::all_x(w))
+                }
+            }
+            _ => self.get_signal_value_by_name(net),
+        }
     }
 
     /// §8.13/§25.9: the virtual-interface declaration of property `prop` as
@@ -123098,6 +122909,13 @@ impl Simulator {
         // Every store below is a collection some class declares under this
         // name (or types with a parameter or a dimensioned typedef).
         if !self.coll_member_possible(name) {
+            return None;
+        }
+        // §8.10 / §13.3: the running subroutine's own formal or automatic
+        // local of this name (an entry in its rename frame) shadows a
+        // same-named property — `uvm_packer::put_bits(ref bit bitstream[])`
+        // must read its formal, not the class's `static bit bitstream[]`.
+        if self.dyn_name_lookup_innermost(name).is_some() {
             return None;
         }
         // §8.9: inside a STATIC method there is no `this`; the lexical class
@@ -125902,6 +125720,55 @@ impl Simulator {
         None
     }
 
+    /// §8.25 + §8.10: a static method called through an object handle
+    /// (`c.depth()`) belongs to the object's specialization: `c` of type
+    /// `St#(2)` runs `St#(2)::depth`, whose bare parameter `N` reads 2, not
+    /// the default. The object carries its specialization in `spec`; for a
+    /// method inherited from a parameterized ancestor the ancestor's binding
+    /// is derived from it. A null handle (or an object built without a
+    /// specialization) keeps the plain class dispatch.
+    #[inline(never)]
+    fn exec_static_method_via_object(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        args: &[Expression],
+        handle: usize,
+    ) -> Option<Value> {
+        let spec = (handle != 0)
+            .then(|| self.heap.get(handle).and_then(|o| o.as_ref()))
+            .flatten()
+            .and_then(|inst| inst.spec.clone())
+            .and_then(|(base, sig)| {
+                // The class in the receiver's chain that declares the method.
+                let mut cur = Some(class_name.to_string());
+                let mut declaring = None;
+                while let Some(cn) = cur {
+                    let cd = self.module.classes.get(&cn)?;
+                    if cd.methods.contains_key(method_name) {
+                        declaring = Some(cn);
+                        break;
+                    }
+                    cur = cd.extends.clone();
+                }
+                let declaring = declaring?;
+                if self.class_origin(&declaring) == base {
+                    Some((base, sig))
+                } else {
+                    self.inherited_method_spec(handle, &declaring)
+                }
+            });
+        match spec {
+            Some(spec) => {
+                let saved = std::mem::replace(&mut self.current_spec, Some(spec));
+                let v = self.exec_static_method(class_name, method_name, args);
+                self.current_spec = saved;
+                v
+            }
+            None => self.exec_static_method(class_name, method_name, args),
+        }
+    }
+
     /// Internal helper: execute static method without config_db interception
     fn exec_static_method_internal(
         &mut self,
@@ -126200,7 +126067,7 @@ impl Simulator {
             }
         }
         // §23.6/§27.6: a subroutine of an instance inside a generate scope or
-        // an instance array — , 
+        // an instance array — ,
         // — is registered under its evaluated path. Such a callee parses as
         // one Ident with selects, which the receiver arms below took for an
         // object handle: a function call read 0 and a task call was dropped.
@@ -126624,7 +126491,10 @@ impl Simulator {
                         // value used to be tried as a handle first, so an
                         // `id` holding 1 switched off object #1 instead.
                         let this_scalar_prop = this_h.is_some_and(|th| {
-                            !self.local_stack.last().is_some_and(|f| f.contains_key(name))
+                            !self
+                                .local_stack
+                                .last()
+                                .is_some_and(|f| f.contains_key(name))
                                 && self.object_declares_property(th, name)
                                 && self.prop_class_type(th, name).is_none()
                         });
@@ -127910,7 +127780,9 @@ impl Simulator {
                 .map(|c| c.split('#').next().unwrap_or(&c).to_string())
             {
                 if self.is_static_method(&base_cls, &member.name) {
-                    if let Some(res) = self.exec_static_method(&base_cls, &member.name, args) {
+                    if let Some(res) =
+                        self.exec_static_method_via_object(&base_cls, &member.name, args, handle)
+                    {
                         return res;
                     }
                 }
@@ -129083,7 +128955,9 @@ impl Simulator {
                     {
                         let m = method_name.clone();
                         if self.is_static_method(&base_cls, &m) {
-                            if let Some(res) = self.exec_static_method(&base_cls, &m, args) {
+                            if let Some(res) =
+                                self.exec_static_method_via_object(&base_cls, &m, args, handle)
+                            {
                                 return res;
                             }
                         }
@@ -129401,8 +129275,26 @@ impl Simulator {
                 && !self.pkg_ambiguous_names.is_empty()
                 && self.pkg_ambiguous_names.contains(name.as_str())
             {
-                if let Some(Some(pkg)) = self.pkg_scope_stack.last() {
-                    let pkg = pkg.clone();
+                // Outside a package subroutine, the calling design unit's
+                // import of the name decides (§26.3: `import pc::who;` binds
+                // `who()` to pc's even when another package declares one).
+                let owner = match self.pkg_scope_stack.last() {
+                    Some(Some(pkg)) => Some(pkg.clone()),
+                    // Only a call made directly in a design unit's procedural
+                    // code consults its imports: inside any subroutine or
+                    // method the lookup below would run per call, and library
+                    // code (UVM) calls contested names on hot paths.
+                    _ if self.class_context_stack.last().is_some() => None,
+                    _ => {
+                        let n = name.to_string();
+                        self.scope_import_pkg(&n, &|pkg| {
+                            let q = format!("{}::{}", pkg, n);
+                            self.module.functions.get(&q).is_some()
+                                || self.module.tasks.contains_key(&q)
+                        })
+                    }
+                };
+                if let Some(pkg) = owner {
                     let qual = format!("{}::{}", pkg, name);
                     if let Some(fd) = self.fn_decl_rc(&qual) {
                         self.pending_pkg_scope = Some(pkg);
@@ -130085,12 +129977,41 @@ impl Simulator {
                         .collect(),
                     None => vec![mkey],
                 };
+                // §7.2.2: a member's declared default (`int a = 3;`) is the
+                // leaf's initial value, for a block-local as for a module
+                // variable (whose defaults run as elaboration-time
+                // assignments). Scalar members only; the default is an
+                // assignment to the member's type.
+                let member_default = match (&md.init, &nested) {
+                    (Some(init), None) if md.dimensions.is_empty() => {
+                        let raw = self.eval_expr_ctx(init, mw.max(1));
+                        let two_state = super::elaborate::is_type_two_state_resolved(
+                            &m.data_type,
+                            &self.module.typedef_types,
+                        );
+                        let is_real = super::elaborate::is_type_real(&m.data_type);
+                        let signed = self.type_is_signed_concrete(&m.data_type);
+                        Some(Self::fit_local_decl_init(
+                            raw,
+                            mw.max(1),
+                            &m.data_type,
+                            two_state,
+                            is_real,
+                            signed,
+                        ))
+                    }
+                    _ => None,
+                };
                 for k in keys {
                     match &nested {
                         Some(inner) => {
                             self.unpacked_struct_leaf_defaults(&k, &inner.clone(), depth + 1, out)
                         }
-                        None => out.push((k, dv.clone(), m.data_type.clone())),
+                        None => out.push((
+                            k,
+                            member_default.clone().unwrap_or_else(|| dv.clone()),
+                            m.data_type.clone(),
+                        )),
                     }
                 }
             }
@@ -130691,6 +130612,16 @@ impl Simulator {
         )
     }
 
+    /// Bind an ASSOCIATIVE-array formal. Returns `(storage, caller, prior)`:
+    /// the key the body's accesses resolve to, the caller's array, and the
+    /// storage key's registration before the call. `storage == caller` marks
+    /// an alias (nothing to copy back or purge).
+    ///
+    /// IEEE 1800-2023 §13.5.1: an `input`/`output`/`inout` formal is a COPY
+    /// under a per-call key (see `formal_dyn_key`), so the body's writes stay
+    /// local even when the actual has the formal's own name; `output` starts
+    /// empty. §13.5.2: a `ref` formal ALIASES the actual's storage, so
+    /// concurrent callers' writes all land in it.
     fn bind_assoc_param(
         &mut self,
         port: &crate::ast::decl::FunctionPort,
@@ -130702,38 +130633,42 @@ impl Simulator {
         let ExprKind::Ident(hier) = &arg.kind else {
             return None;
         };
-        let caller = self.resolve_hier_name(hier);
+        let caller = self.resolve_hier_name(hier).into_owned();
         let param = port.name.name.clone();
-        let prefix = format!("{}[", caller);
-        let entries: Vec<(String, Value)> = self
-            .signals
-            .keys_with_elem_prefix(&prefix)
-            .into_iter()
-            .filter(|k| k.ends_with(']'))
-            .filter_map(|k| {
-                let v = self.signals.get(&k)?.clone();
-                let key = &k[prefix.len()..k.len() - 1];
-                Some((format!("{}[{}]", param, key), v))
-            })
-            .collect();
-        for (k, v) in entries {
-            self.signals.insert(k, v);
+        if matches!(port.direction, PortDirection::Ref) {
+            self.map_formal_dyn(&param, &caller);
+            let prior = self.module.associative_arrays.get(&caller).copied();
+            return Some((caller.clone(), caller, prior));
         }
-        let is_string_key = self.is_string_keyed_array(&caller);
-        let prior = self.module.associative_arrays.get(&param).copied();
-        self.module
-            .associative_arrays
-            .insert(param.clone(), is_string_key);
-        // Identity mapping so the formal shadows any enclosing renamed local
-        // of the same name (see `bind_queue_param`).
-        if let Some(frame) = self.local_dyn.last_mut() {
-            if let Some(slot) = frame.iter_mut().find(|(k, _)| *k == param) {
-                slot.1 = param.clone();
-            } else {
-                frame.push((param.clone(), param.clone()));
+        let key = self.formal_dyn_key(&param, &port.data_type);
+        if !matches!(port.direction, PortDirection::Output) {
+            let prefix = format!("{}[", caller);
+            let entries: Vec<(String, Value)> = self
+                .signals
+                .keys_with_elem_prefix(&prefix)
+                .into_iter()
+                .filter(|k| k.ends_with(']'))
+                .filter_map(|k| {
+                    let v = self.signals.get(&k)?.clone();
+                    let sub = &k[prefix.len()..k.len() - 1];
+                    Some((format!("{}[{}]", key, sub), v))
+                })
+                .collect();
+            for (k, v) in entries {
+                self.signals.insert(k, v);
             }
         }
-        Some((param, caller.to_string(), prior))
+        let is_string_key = self.is_string_keyed_array(&caller);
+        self.module
+            .associative_arrays
+            .insert(key.clone(), is_string_key);
+        if let Some(&w) = self.widths.get(caller.as_str()) {
+            self.widths.insert(key.clone(), w);
+        }
+        if self.string_signals.contains(caller.as_str()) {
+            self.string_signals.insert(key.clone());
+        }
+        Some((key, caller, None))
     }
 
     /// Drop a formal associative array's entries and registration. Restores
@@ -131691,6 +131626,7 @@ impl Simulator {
         // The callee frame's type overlay, pushed together with `locals`.
         let mut frame_types = self.take_pooled_types();
         self.push_queue_frame();
+        let formal_dyn = self.begin_formal_dyn();
         // `output`/`inout`/`ref` formals copy back to the caller's actual on
         // return (e.g. `get_int_arg_value(string s, ref int val)`).
         let mut output_bindings: Vec<(String, Expression)> = Vec::new();
@@ -131788,11 +131724,15 @@ impl Simulator {
                     } else {
                         port.dimensions.clone()
                     };
-                if let Some(caller) =
-                    self.bind_queue_param(&port.name.name, &eff_dims, &args[i], &port.data_type)
-                {
+                if let Some((store, caller)) = self.bind_queue_param(
+                    &port.name.name,
+                    &eff_dims,
+                    &args[i],
+                    &port.data_type,
+                    port.direction,
+                ) {
                     if is_out && !caller.is_empty() {
-                        queue_writebacks.push((port.name.name.clone(), caller));
+                        queue_writebacks.push((store, caller));
                     }
                     continue;
                 }
@@ -132084,10 +132024,16 @@ impl Simulator {
             }
         }
         self.local_iface_aliases.push(iface_alias_frame);
+        self.commit_formal_dyn(formal_dyn);
         self.push_local_frame_typed(locals, frame_types);
         self.open_decl_shadow_frame();
         for port in &fd.ports {
-            if let DataType::TypeReference { name: tn, type_args, .. } = &port.data_type {
+            if let DataType::TypeReference {
+                name: tn,
+                type_args,
+                ..
+            } = &port.data_type
+            {
                 let type_name = tn.name.name.clone();
                 if self.module.classes.contains_key(&type_name) {
                     self.record_local_class_type(&port.name.name, &type_name);
@@ -132494,6 +132440,7 @@ impl Simulator {
         let tleaf = tname.rsplit('.').next().unwrap_or(tname);
         if matches!(self.disable_target.as_deref(), Some(t) if t == tname || t == tleaf) {
             self.disable_target = None;
+            self.disable_check_pending = false;
             self.break_flag = false;
         }
         self.unwind_task_frame(cleanup);
@@ -132579,8 +132526,8 @@ impl Simulator {
             }
             self.purge_array_formal(param_name);
         }
-        self.break_flag = c.saved_break;
-        self.return_flag = c.saved_return;
+        self.break_flag = c.saved_break || self.dpi_unwinding;
+        self.return_flag = c.saved_return || self.dpi_unwinding;
         self.pop_and_restore_queue_frame();
         for (tmp, caller) in staged_wb {
             self.writeback_queue_param(&tmp, &caller);
@@ -133260,6 +133207,7 @@ impl Simulator {
         let mut array_params: Vec<String> = Vec::new(); // param names with unpacked Range dim
         let mut identity_formals: Vec<String> = Vec::new(); // ref aggregates bound by identity
         self.push_queue_frame();
+        let formal_dyn = self.begin_formal_dyn();
         let mut array_writebacks: Vec<(String, String, i64, i64)> = Vec::new();
         let mut queue_writebacks: Vec<(String, String)> = Vec::new();
         for (i, port) in td.ports.iter().enumerate() {
@@ -133346,15 +133294,19 @@ impl Simulator {
                     } else {
                         port.dimensions.clone()
                     };
-                if let Some(caller) =
-                    self.bind_queue_param(&port.name.name, &eff_dims, &args[i], &port.data_type)
-                {
+                if let Some((store, caller)) = self.bind_queue_param(
+                    &port.name.name,
+                    &eff_dims,
+                    &args[i],
+                    &port.data_type,
+                    port.direction,
+                ) {
                     if matches!(
                         port.direction,
                         PortDirection::Output | PortDirection::Inout | PortDirection::Ref
                     ) && !caller.is_empty()
                     {
-                        queue_writebacks.push((port.name.name.clone(), caller));
+                        queue_writebacks.push((store, caller));
                     }
                     continue;
                 }
@@ -133381,33 +133333,12 @@ impl Simulator {
                 .iter()
                 .any(|d| matches!(d, crate::ast::types::UnpackedDimension::Associative { .. }));
             if is_assoc && i < args.len() {
-                if let ExprKind::Ident(hier) = &args[i].kind {
-                    let caller_name = self.resolve_hier_name(hier);
-                    let param_name = port.name.name.clone();
-                    let assoc_is_out = matches!(
-                        port.direction,
-                        PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-                    );
-                    let prefix = format!("{}[", caller_name);
-                    let entries: Vec<(String, Value)> = self
-                        .signals
-                        .keys_with_elem_prefix(&prefix)
-                        .into_iter()
-                        .filter(|k| k.ends_with(']'))
-                        .filter_map(|k| {
-                            let v = self.signals.get(&k)?.clone();
-                            let key = &k[prefix.len()..k.len() - 1];
-                            Some((format!("{}[{}]", param_name, key), v))
-                        })
-                        .collect();
-                    for (k, v) in entries {
-                        self.signals.insert(k, v);
-                    }
-                    let is_string_key = self.is_string_keyed_array(&caller_name);
-                    self.module
-                        .associative_arrays
-                        .insert(param_name.clone(), is_string_key);
-                    assoc_params.push((param_name, caller_name.to_string(), assoc_is_out));
+                let assoc_is_out = matches!(
+                    port.direction,
+                    PortDirection::Output | PortDirection::Inout | PortDirection::Ref
+                );
+                if let Some((param_name, caller_name, _)) = self.bind_assoc_param(port, &args[i]) {
+                    assoc_params.push((param_name, caller_name, assoc_is_out));
                 }
                 continue;
             }
@@ -133524,6 +133455,7 @@ impl Simulator {
                 }
             }
         }
+        self.commit_formal_dyn(formal_dyn);
         self.push_local_frame_typed(locals, frame_types);
         // §6.21: open a static-local sync frame keyed by this task name.
         let sync_name = self.sync_frame_name(&td.name.name.name);
@@ -137333,6 +137265,7 @@ impl Simulator {
                 }
                 let key = if seed == 2 {
                     if !self.shadowed_prop_names.contains(prop_name.as_str()) {
+                        self.shadowed_prop_mask |= meta_key_bits(prop_name);
                         self.shadowed_prop_names.insert(prop_name.clone());
                     }
                     format!("{}::{}", cdef.name, prop_name)
@@ -137481,6 +137414,14 @@ impl Simulator {
             // to independent storage with size starting at 0.
             for (prop, &(width, max)) in &cdef.queue_properties {
                 let scoped = format!("{}#{}", handle, prop);
+                if cdef.property_types.get(prop).is_some_and(|dt| {
+                    matches!(
+                        dt,
+                        DataType::IntegerAtom { .. } | DataType::IntegerVector { .. }
+                    ) && super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types)
+                }) {
+                    self.signed_class_colls.insert(scoped.clone());
+                }
                 self.module.dynamic_arrays.insert(scoped.clone());
                 self.module.arrays.insert(scoped.clone(), (0, 63, width));
                 if let Some(m) = max {
@@ -137493,6 +137434,15 @@ impl Simulator {
             // element to 0 so index reads / foreach see a populated range.
             for (prop, &(lo, hi, width)) in &cdef.array_properties {
                 let scoped = format!("{}#{}", handle, prop);
+                // §8.25: sized by a value parameter — this object's size.
+                let (lo, hi) = match cdef
+                    .param_sized_props
+                    .get(prop)
+                    .and_then(|d| self.param_sized_shape(d, &instance, &classes_to_init))
+                {
+                    Some(sh) if sh.len() == 1 => sh[0],
+                    _ => (lo, hi),
+                };
                 self.module.arrays.insert(scoped.clone(), (lo, hi, width));
                 for i in lo..=hi {
                     self.signals
@@ -137506,6 +137456,13 @@ impl Simulator {
             // element's default is null). Oversized shapes stay lazy.
             for (prop, (shape, width)) in &cdef.array_nd_properties {
                 let scoped = format!("{}#{}", handle, prop);
+                // §8.25: sized by a value parameter — this object's shape.
+                let own_shape = cdef
+                    .param_sized_props
+                    .get(prop)
+                    .and_then(|d| self.param_sized_shape(d, &instance, &classes_to_init))
+                    .filter(|sh| sh.len() == shape.len());
+                let shape = own_shape.as_ref().unwrap_or(shape);
                 if shape.len() == 2 {
                     self.module
                         .arrays_2d
@@ -137745,6 +137702,29 @@ impl Simulator {
         // computed them with no params, so defaults like `= NUM_HARTS` /
         // `= XLEN` would otherwise be 0. Base-class first so derived overrides.
         self.this_stack.push(Some(handle));
+        // §7.2.2: an unpacked-struct property starts with its members'
+        // declared defaults (its own initializer, if any, runs below and
+        // overrides them). The member cells used to stay absent and read 0.
+        if let Some(t) = tpl.as_ref().filter(|t| !t.struct_defaults.is_empty()) {
+            let defs = t.struct_defaults.clone();
+            for (key, init, mdt) in defs {
+                let w = super::elaborate::resolve_type_width(
+                    &mdt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+                .max(1);
+                let raw = self.eval_expr_ctx(&init, w);
+                let two_state =
+                    super::elaborate::is_type_two_state_resolved(&mdt, &self.module.typedef_types);
+                let is_real = super::elaborate::is_type_real(&mdt);
+                let signed = self.type_is_signed_concrete(&mdt);
+                let v = Self::fit_local_decl_init(raw, w, &mdt, two_state, is_real, signed);
+                if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                    inst.properties.insert(key, v);
+                }
+            }
+        }
         for cdef in classes_to_init.iter().rev() {
             if cdef.property_inits.is_empty() {
                 continue;
@@ -137924,6 +137904,7 @@ impl Simulator {
                 // `pattern_elems`, the same expansion the general array-pattern
                 // spread (`assign_pattern_array`) uses.
                 if let Some(&(lo, hi, _w)) = cdef.array_properties.get(&pname) {
+                    let (lo, hi) = self.inst_fixed_bounds(cdef, handle, &pname, (lo, hi));
                     let scoped = format!("{}#{}", handle, pname);
                     if let ExprKind::AssignmentPattern(items) = &init.kind {
                         let indices: Vec<i64> = (lo..=hi).collect();
@@ -138445,6 +138426,7 @@ impl Simulator {
                                 queue_frame_saves: Vec::new(),
                                 task_cleanup: Vec::new(),
                                 local_dyn: Vec::new(),
+                                formal_dyn: Vec::new(),
                                 static_local_syncs: Vec::new(),
                                 method_local_base: Vec::new(),
                             },
@@ -138832,6 +138814,7 @@ impl Simulator {
                     .and_then(|s| s.type_name.clone())
                     .is_some_and(|tn| self.module.classes.contains_key(&tn));
                 if let Some(&(lo, hi, w)) = cd.array_properties.get(prop) {
+                    let (lo, hi) = self.inst_fixed_bounds(cd, handle, prop, (lo, hi));
                     out.push(RandColl {
                         prop: prop.clone(),
                         scoped,
@@ -140740,7 +140723,8 @@ impl Simulator {
             let coupled = |k: &str| {
                 paths.iter().any(|o| {
                     o == k
-                        || k.strip_prefix(o.as_str()).is_some_and(|r| r.starts_with('.'))
+                        || k.strip_prefix(o.as_str())
+                            .is_some_and(|r| r.starts_with('.'))
                         || o.strip_prefix(k).is_some_and(|r| r.starts_with('.'))
                 })
             };
@@ -140798,7 +140782,12 @@ impl Simulator {
                     expr(b, out);
                     expr(index, out);
                 }
-                ExprKind::RangeSelect { expr: b, left, right, .. } => {
+                ExprKind::RangeSelect {
+                    expr: b,
+                    left,
+                    right,
+                    ..
+                } => {
                     expr(b, out);
                     expr(left, out);
                     expr(right, out);
@@ -140808,7 +140797,11 @@ impl Simulator {
                     expr(left, out);
                     expr(right, out);
                 }
-                ExprKind::Conditional { condition, then_expr, else_expr } => {
+                ExprKind::Conditional {
+                    condition,
+                    then_expr,
+                    else_expr,
+                } => {
                     expr(condition, out);
                     expr(then_expr, out);
                     expr(else_expr, out);
@@ -140844,17 +140837,31 @@ impl Simulator {
         }
         match item {
             ConstraintItem::Expr(e) => expr(e, out),
-            ConstraintItem::Inside { expr: x, range, is_dist, .. } => {
+            ConstraintItem::Inside {
+                expr: x,
+                range,
+                is_dist,
+                ..
+            } => {
                 if !*is_dist {
                     expr(x, out);
                 }
                 ranges(range, out);
             }
-            ConstraintItem::Implication { condition, constraint, .. } => {
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
                 expr(condition, out);
                 Simulator::collect_item_member_paths(constraint, out);
             }
-            ConstraintItem::IfElse { condition, then_item, else_item, .. } => {
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
                 expr(condition, out);
                 Simulator::collect_item_member_paths(then_item, out);
                 if let Some(e) = else_item {
@@ -140866,9 +140873,9 @@ impl Simulator {
                 Simulator::collect_item_member_paths(item, out);
             }
             ConstraintItem::Soft(i) => Simulator::collect_item_member_paths(i, out),
-            ConstraintItem::Block(items) => {
-                items.iter().for_each(|i| Simulator::collect_item_member_paths(i, out))
-            }
+            ConstraintItem::Block(items) => items
+                .iter()
+                .for_each(|i| Simulator::collect_item_member_paths(i, out)),
             ConstraintItem::Unique { exprs, .. } => exprs.iter().for_each(|e| expr(e, out)),
             ConstraintItem::Solve { .. } => {}
         }
@@ -141700,6 +141707,7 @@ impl Simulator {
                     if let Some(&(lo, hi, w)) = class_def.array_properties.get(prop)
                         && !is_handle
                     {
+                        let (lo, hi) = self.inst_fixed_bounds(class_def, handle, prop, (lo, hi));
                         rand_arrays.push((
                             prop.clone(),
                             format!("{}#{}", handle, prop),
@@ -144115,6 +144123,96 @@ impl Simulator {
     /// Re-register the per-instance storage of collection members whose
     /// element width depends on the object's parameters — see the call in
     /// `instantiate_class_with_type_args`.
+    /// §8.25: the shape of the param-sized fixed-array member `dims` for an
+    /// object under construction, from the parameter values it binds (leaf
+    /// first, so a derived class's parameter shadows an ancestor's), falling
+    /// back to the design's parameters for any other name. `None` when a bound
+    /// does not fold.
+    #[inline(never)]
+    fn param_sized_shape(
+        &self,
+        dims: &[crate::ast::types::UnpackedDimension],
+        instance: &ClassInstance,
+        chain: &[std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>],
+    ) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::UnpackedDimension as UD;
+        let mut m: HashMap<String, Value> = HashMap::default();
+        for c in chain {
+            for (pn, _) in &c.param_defaults {
+                if let Some(v) = instance.properties.get(pn) {
+                    m.entry(pn.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        let mut full: Option<HashMap<String, Value>> = None;
+        let mut ev = |e: &Expression| -> Option<i64> {
+            if let Some(v) = super::elaborate::const_eval_i64_with_params(e, Some(&m)) {
+                return Some(v);
+            }
+            let f = full.get_or_insert_with(|| {
+                let mut f = self.module.parameters.clone();
+                f.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())));
+                f
+            });
+            super::elaborate::const_eval_i64_with_params(e, Some(f))
+        };
+        dims.iter()
+            .map(|d| match d {
+                UD::Range { left, right, .. } => {
+                    let (l, r) = (ev(left)?, ev(right)?);
+                    Some((l.min(r), l.max(r)))
+                }
+                UD::Expression { expr, .. } => {
+                    let n = ev(expr)?;
+                    (n > 0).then_some((0, n - 1))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// §8.25: bounds of the 1-D fixed-array member `prop` of the object
+    /// `handle`. A member sized by a class value parameter has its own size
+    /// per object (registered at construction); everything else has the
+    /// class's `default`.
+    fn inst_fixed_bounds(
+        &self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        handle: usize,
+        prop: &str,
+        default: (i64, i64),
+    ) -> (i64, i64) {
+        if cdef.param_sized_props.is_empty() || !cdef.param_sized_props.contains_key(prop) {
+            return default;
+        }
+        self.module
+            .arrays
+            .get(format!("{}#{}", handle, prop).as_str())
+            .map(|&(lo, hi, _)| (lo, hi))
+            .unwrap_or(default)
+    }
+
+    /// §8.25: the per-object shape of a param-sized multi-dimensional member
+    /// (see `inst_fixed_bounds`); `None` for any other member.
+    fn inst_nd_shape(
+        &self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        handle: usize,
+        prop: &str,
+    ) -> Option<Vec<(i64, i64)>> {
+        if cdef.param_sized_props.is_empty() || !cdef.param_sized_props.contains_key(prop) {
+            return None;
+        }
+        let scoped = format!("{}#{}", handle, prop);
+        if let Some(&(a, b, _)) = self.module.arrays_2d.get(scoped.as_str()) {
+            return Some(vec![a, b]);
+        }
+        self.module
+            .arrays_nd
+            .get(scoped.as_str())
+            .map(|(sh, _)| sh.clone())
+    }
+
     fn respec_member_elem_widths(
         &mut self,
         handle: usize,
@@ -144128,6 +144226,7 @@ impl Simulator {
                 if w == width || w == 0 {
                     continue;
                 }
+                let (lo, hi) = self.inst_fixed_bounds(cdef, handle, prop, (lo, hi));
                 let scoped = format!("{}#{}", handle, prop);
                 self.module.arrays.insert(scoped.clone(), (lo, hi, w));
                 for i in lo..=hi {
@@ -144143,6 +144242,8 @@ impl Simulator {
                 if w == *width || w == 0 {
                     continue;
                 }
+                let own = self.inst_nd_shape(cdef, handle, prop);
+                let shape = own.as_ref().unwrap_or(shape);
                 let scoped = format!("{}#{}", handle, prop);
                 if let Some(e) = self.module.arrays_2d.get_mut(&scoped) {
                     e.2 = w;
@@ -145872,7 +145973,10 @@ impl Simulator {
         // Any array-shaped rand property (packed, fixed, or dynamic).
         if self.class_prop_packed_dims(handle, &name).is_some()
             || self.fixed_foreach_dims(handle, &name).is_some()
-            || self.module.dynamic_arrays.contains(&format!("{}#{}", handle, name))
+            || self
+                .module
+                .dynamic_arrays
+                .contains(&format!("{}#{}", handle, name))
         {
             return Some((name, suffix));
         }
@@ -146060,9 +146164,7 @@ impl Simulator {
                         let (ra, rs) = re.unwrap();
                         let src = self
                             .class_elem_load(handle, &ra, &rs)
-                            .or_else(|| {
-                                self.get_signal_value_by_name(&format!("{}{}", ra, rs))
-                            })
+                            .or_else(|| self.get_signal_value_by_name(&format!("{}{}", ra, rs)))
                             .unwrap_or_else(|| Value::zero(64));
                         self.class_elem_store(handle, &la, &ls, src.clone());
                         self.set_signal_value_by_name(&format!("{}{}", la, ls), src);
@@ -146636,6 +146738,7 @@ impl Simulator {
                 loop {
                     if let Some(cd) = self.module.classes.get(&cn) {
                         if let Some(&(lo, hi, w)) = cd.array_properties.get(&prop) {
+                            let (lo, hi) = self.inst_fixed_bounds(cd, handle, &prop, (lo, hi));
                             range = Some((lo, hi, w));
                             break;
                         }
@@ -146655,9 +146758,7 @@ impl Simulator {
                 let (suffixes, w): (Vec<String>, u32) = match range {
                     Some((lo, hi, w)) => ((lo..=hi).map(|i| format!("[{}]", i)).collect(), w),
                     None => match self.fixed_foreach_dims(handle, &prop) {
-                        Some((dims, w)) if dims.len() > 1 => {
-                            (Self::index_suffixes(&dims), w)
-                        }
+                        Some((dims, w)) if dims.len() > 1 => (Self::index_suffixes(&dims), w),
                         _ => return false,
                     },
                 };
@@ -147040,7 +147141,11 @@ impl Simulator {
             // the element's struct layout.
             let elem_expr = (**base).clone();
             let mut cur = base;
-            while let ExprKind::MemberAccess { expr: b2, member: m2 } = &cur.kind {
+            while let ExprKind::MemberAccess {
+                expr: b2,
+                member: m2,
+            } = &cur.kind
+            {
                 names.push(m2.name.clone());
                 cur = b2;
             }
@@ -147074,7 +147179,8 @@ impl Simulator {
             } => (Box::new((*inner).clone()), Op::Inside(range.clone())),
             ConstraintItem::Expr(e) => match &e.kind {
                 ExprKind::Inside {
-                    expr: inner, ranges,
+                    expr: inner,
+                    ranges,
                 } => {
                     let cr: Vec<ConstraintRange> = ranges
                         .iter()
@@ -147248,7 +147354,11 @@ impl Simulator {
     /// the member's fixed unpacked bounds, one `(lo, hi)` per dimension.
     /// `None` unless `array` is a member chain under a struct property of
     /// `handle` ending at a member with fixed (range or size) dimensions.
-    fn member_foreach_dims(&mut self, handle: usize, array: &Expression) -> Option<Vec<(i64, i64)>> {
+    fn member_foreach_dims(
+        &mut self,
+        handle: usize,
+        array: &Expression,
+    ) -> Option<Vec<(i64, i64)>> {
         use crate::ast::types::UnpackedDimension as UD;
         let (root, members) = Self::foreach_member_chain(array)?;
         let mut level = self.class_prop_struct(handle, &root)?;
@@ -147311,7 +147421,9 @@ impl Simulator {
             ExprKind::Ident(h)
                 if h.root.is_none()
                     && h.path.len() >= 2
-                    && h.path[..h.path.len() - 1].iter().all(|s| s.selects.is_empty()) =>
+                    && h.path[..h.path.len() - 1]
+                        .iter()
+                        .all(|s| s.selects.is_empty()) =>
             {
                 Some((
                     h.path[0].name.name.clone(),
@@ -147415,7 +147527,13 @@ impl Simulator {
         loop {
             let cd = self.module.classes.get(&cn)?;
             if let Some(&(lo, hi, w)) = cd.array_properties.get(arr_name) {
+                let (lo, hi) = self.inst_fixed_bounds(cd, handle, arr_name, (lo, hi));
                 return Some((vec![(lo, hi)], w));
+            }
+            if let Some(sh) = self.inst_nd_shape(cd, handle, arr_name) {
+                if let Some((_, w)) = cd.array_nd_properties.get(arr_name) {
+                    return Some((sh, *w));
+                }
             }
             if let Some((shape, w)) = cd.array_nd_properties.get(arr_name) {
                 return Some((shape.clone(), *w));
@@ -148708,15 +148826,86 @@ impl Simulator {
                 coll_candidates.push((ci, prop.clone()));
             }
         }
+        let mut struct_defaults = Vec::new();
+        for cdef in chain.iter().rev() {
+            for (prop, dt) in &cdef.property_types {
+                if cdef.static_properties.contains(prop)
+                    || cdef.property_inits.contains_key(prop)
+                    || !cdef.properties.contains_key(prop)
+                    || cdef.array_properties.contains_key(prop)
+                    || cdef.queue_properties.contains_key(prop)
+                    || cdef.assoc_properties.contains_key(prop)
+                {
+                    continue;
+                }
+                // Typedef chain by reference first: almost every property
+                // is not a struct, and this runs once per class chain.
+                if let DataType::Struct(su) = self.typedef_chain_end(dt) {
+                    if !su.packed {
+                        self.struct_member_defaults(prop, su, 0, &mut struct_defaults);
+                    }
+                }
+            }
+        }
         let t = std::rc::Rc::new(InstTemplate {
             chain: chain.to_vec(),
             seed,
             coll_candidates,
+            struct_defaults,
         });
         self.inst_templates
             .borrow_mut()
             .insert(leaf.to_string(), t.clone());
         t
+    }
+
+    /// `dt` followed through bare typedef names in `typedef_types`, by
+    /// reference (no resolved-type clone). Stops at the first non-alias.
+    fn typedef_chain_end<'a>(&'a self, dt: &'a DataType) -> &'a DataType {
+        let mut cur = dt;
+        for _ in 0..16 {
+            match cur {
+                DataType::TypeReference { name, .. } if name.scopes.is_empty() => {
+                    match self.module.typedef_types.get(&name.name.name) {
+                        Some(next) if !std::ptr::eq(next, cur) => cur = next,
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+        cur
+    }
+
+    /// The §7.2.2 member defaults of an unpacked struct rooted at `prefix`
+    /// (nested unpacked structs recurse), as `(cell key, default, type)`.
+    fn struct_member_defaults(
+        &self,
+        prefix: &str,
+        su: &crate::ast::types::StructUnionType,
+        depth: u32,
+        out: &mut Vec<(String, Expression, DataType)>,
+    ) {
+        if depth > 8 || !Self::spreads_member_wise(su) {
+            return;
+        }
+        for m in &su.members {
+            let nested = match self.resolve_dt(&m.data_type) {
+                DataType::Struct(inner) => Some(inner),
+                _ => None,
+            };
+            for md in &m.declarators {
+                if !md.dimensions.is_empty() {
+                    continue;
+                }
+                let key = format!("{}.{}", prefix, md.name.name);
+                match (&nested, &md.init) {
+                    (Some(inner), _) => self.struct_member_defaults(&key, inner, depth + 1, out),
+                    (None, Some(init)) => out.push((key, init.clone(), m.data_type.clone())),
+                    (None, None) => {}
+                }
+            }
+        }
     }
 
     /// The call plan of `method` (see `MethodCallPlan`).
@@ -149062,6 +149251,7 @@ impl Simulator {
                 let dyn_ret_type: Option<DataType> =
                     plan.ret.as_ref().and_then(|r| r.dyn_ret.clone());
                 self.push_queue_frame();
+                let formal_dyn = self.begin_formal_dyn();
                 // `output`/`inout`/`ref` formals copy back to the caller's
                 // actual on return (e.g. `randomize_instr(output riscv_instr
                 // instr, …)` writing the picked instruction to `instr_list[i]`).
@@ -149269,18 +149459,19 @@ impl Simulator {
                             } else {
                                 port.dimensions.clone()
                             };
-                        if let Some(caller) = self.bind_queue_param(
+                        if let Some((store, caller)) = self.bind_queue_param(
                             &port.name.name,
                             &eff_dims,
                             &args[i],
                             &port.data_type,
+                            port.direction,
                         ) {
                             let is_out = matches!(
                                 port.direction,
                                 PortDirection::Output | PortDirection::Inout | PortDirection::Ref
                             );
                             if is_out && !caller.is_empty() {
-                                queue_writebacks.push((port.name.name.clone(), caller));
+                                queue_writebacks.push((store, caller));
                             }
                             continue;
                         }
@@ -149815,6 +150006,7 @@ impl Simulator {
                         Some(prev)
                     }
                 };
+                self.commit_formal_dyn(formal_dyn);
                 self.push_local_frame_typed(locals, frame_types);
                 self.open_decl_shadow_frame();
                 // Record the `local_stack` depth BEFORE this method's own
@@ -153944,6 +154136,35 @@ impl Simulator {
                 // property's declared type comes from the head's runtime
                 // class. Without this, `h.prop = new` could not resolve the
                 // class to construct and silently stored garbage.
+                // §8.15: the same for a longer chain (`n.next.next = new(3)`):
+                // walk the live handles to the last owner. Without it the
+                // chain had no type, `new(3)` was not a construction and the
+                // write was lost.
+                if hier.path.len() >= 3
+                    && hier.path.iter().all(|s| s.selects.is_empty())
+                    && !self.signal_name_to_id.contains_key(name.as_ref())
+                    && self.bare_name_is_class_channel(hier.path[0].name.name.as_str())
+                {
+                    let n = hier.path.len();
+                    let mut h = self.eval_ident_handle(hier.path[0].name.name.as_str());
+                    for seg in &hier.path[1..n - 1] {
+                        h = h
+                            .filter(|&x| x != 0)
+                            .and_then(|x| self.member_handle(x, &seg.name.name));
+                    }
+                    if let Some(cn) = h
+                        .filter(|&x| x != 0)
+                        .and_then(|x| self.heap.get(x))
+                        .and_then(|o| o.as_ref())
+                        .map(|i| i.class_name.clone())
+                    {
+                        if let Some(t) =
+                            self.class_prop_type_named(&cn, &hier.path[n - 1].name.name)
+                        {
+                            return Some(t);
+                        }
+                    }
+                }
                 if hier.path.len() == 2
                     && hier.path.iter().all(|s| s.selects.is_empty())
                     && self
@@ -154283,6 +154504,14 @@ impl Simulator {
                     }
                 }
                 if let Some(base_type) = self.get_expr_type_name(base) {
+                    // §8.15: a member of a handle reached through a chain
+                    // (`next.next.next = new(40)` in a method): the base's
+                    // type is a class, whose declaration types the member.
+                    if self.module.classes.contains_key(&base_type) {
+                        if let Some(t) = self.class_prop_type_named(&base_type, &member.name) {
+                            return Some(t);
+                        }
+                    }
                     let dt_opt = self.module.typedef_types.get(&base_type).cloned();
                     if let Some(dt) = dt_opt {
                         let resolved = Self::resolve_type_ref(&dt, &self.module.typedef_types);
@@ -154667,9 +154896,122 @@ impl Simulator {
                         ));
                     }
                 }
+            } else if let Some(r) = self.shadowed_member_rewrite(e) {
+                return Some(r);
             }
         }
         Self::super_as_this(e)
+    }
+
+    /// §8.14 + §8.10: `h.p` (and `this.p`, `a.b.p`) where `p` is SHADOWED
+    /// names the copy declared by the nearest class at or above the STATIC
+    /// type of `h`, not the copy of the object's leaf class: a `Base` handle
+    /// to a `Derived` object reads and writes `Base`'s `p`. The member is
+    /// renamed to the qualified storage key (`"<Class>::p"`, see
+    /// `instantiate_class_with_type_args`) when the two declarers differ.
+    /// `None` keeps the bare-name path.
+    /// Whether `m` is a shadowed property name (see `shadowed_prop_names`).
+    #[inline]
+    fn prop_maybe_shadowed(&self, m: &str) -> bool {
+        let bits = meta_key_bits(m);
+        self.shadowed_prop_mask & bits == bits && self.shadowed_prop_names.contains(m)
+    }
+
+    #[inline(never)]
+    fn shadowed_member_rewrite(&self, e: &Expression) -> Option<Expression> {
+        let (prefix, m, span): (Expression, &str, crate::ast::Span) = match &e.kind {
+            ExprKind::Ident(h)
+                if h.path.len() >= 2
+                    && h.root.is_none()
+                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let m = h.path.last()?.name.name.as_str();
+                if !self.prop_maybe_shadowed(m) || h.path[0].name.name == "super" {
+                    return None;
+                }
+                let p = hier_prefix(h);
+                let prefix = if p.path.len() == 1 && p.path[0].name.name == "this" {
+                    Expression::new(ExprKind::This, e.span)
+                } else {
+                    Expression::new(ExprKind::Ident(p), e.span)
+                };
+                (prefix, m, e.span)
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                if !self.prop_maybe_shadowed(member.name.as_str()) {
+                    return None;
+                }
+                let prefix = match &base.kind {
+                    ExprKind::Ident(bh)
+                        if bh.path.len() == 1
+                            && bh.path[0].selects.is_empty()
+                            && bh.path[0].name.name == "this" =>
+                    {
+                        Expression::new(ExprKind::This, base.span)
+                    }
+                    ExprKind::Ident(bh) if bh.path.iter().any(|s| !s.selects.is_empty()) => {
+                        return None;
+                    }
+                    ExprKind::Ident(_) | ExprKind::This | ExprKind::MemberAccess { .. } => {
+                        (**base).clone()
+                    }
+                    ExprKind::Index { .. } => (**base).clone(),
+                    _ => return None,
+                };
+                (prefix, member.name.as_str(), e.span)
+            }
+            _ => return None,
+        };
+        // The static class of the prefix.
+        let static_cls: String = if matches!(prefix.kind, ExprKind::This) {
+            self.class_context_stack.last().cloned().flatten()?
+        } else {
+            let tn = self.get_expr_type_name(&prefix)?;
+            let tn = match self.extract_spec_from_string(&tn) {
+                Some((base, _)) => base,
+                None => tn,
+            };
+            if self.module.classes.contains_key(&tn) {
+                tn
+            } else {
+                self.resolve_simple_typedef_class(&tn)
+                    .filter(|c| self.module.classes.contains_key(c))?
+            }
+        };
+        let declarer_from = |start: &str| -> Option<String> {
+            let mut cur = Some(start.to_string());
+            let mut guard = 0;
+            while let Some(cn) = cur {
+                guard += 1;
+                if guard > 64 {
+                    return None;
+                }
+                let cd = self.module.classes.get(&cn)?;
+                if cd.properties.contains_key(m) {
+                    return Some(cn);
+                }
+                cur = cd.extends.clone();
+            }
+            None
+        };
+        let target = declarer_from(&static_cls)?;
+        let handle = self.eval_handle_expr(&prefix).filter(|&h| h != 0)?;
+        let inst = self.heap.get(handle)?.as_ref()?;
+        let leaf = declarer_from(&inst.class_name)?;
+        if leaf == target {
+            return None;
+        }
+        let qkey = format!("{}::{}", target, m);
+        if !inst.properties.contains_key(qkey.as_str()) {
+            return None;
+        }
+        Some(Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(prefix),
+                member: crate::ast::Identifier { name: qkey, span },
+            },
+            span,
+        ))
     }
 
     fn super_as_this(e: &Expression) -> Option<Expression> {
@@ -154775,416 +155117,6 @@ impl Simulator {
             return v.to_u64().map(|h| h as usize);
         }
         None
-    }
-}
-
-/// Send + Sync subset of Simulator state for use across host threads.
-/// Contains only what `pdes_exec_block` needs (compiled blocks +
-/// name maps + width/signed arrays). Constructed via
-/// `Simulator::extract_send_exec_context`. The full `Simulator` is not
-/// shareable because it holds `Rc<AST>` (parser) and FFI raw pointers
-/// (DPI), but the bytecode-execution subset is.
-#[derive(Clone)]
-pub struct SendExecContext {
-    pub compiled_edge_blocks: Vec<Option<super::bytecode::CompiledBlock>>,
-    pub signal_name_to_id: NameMap,
-    pub array_first_id: HashMap<Arc<str>, (usize, i64, i64)>,
-    pub signal_widths: Vec<u32>,
-    pub signal_signed: Vec<bool>,
-    pub id_to_name: IdNames,
-}
-
-// SAFETY: `CompiledBlock` may contain Insn variants whose embedded AST
-// nodes have interior-mutable `Cell`/`OnceCell` fields (cached signal-id
-// and resolved-name on hierarchical identifiers). These are populated
-// single-threaded during `Simulator::compile` and only READ during
-// `exec_insns_isolated` — no concurrent mutation. Sharing the context
-// across PDES worker threads is therefore sound for read-only dispatch.
-// For arbitrary parallel access the right fix is to replace Cell with
-// Atomic / OnceLock, or per-thread CompiledBlock clones; both are out
-// of scope for this PDES experiment.
-unsafe impl Send for SendExecContext {}
-unsafe impl Sync for SendExecContext {}
-
-/// One comb entry in `Send`-able executable form (no AST). Parallel to
-/// `Simulator::comb_entries`. AST-fallback entries become `AstFallback`
-/// (the coordinator runs them); blocks containing a `StmtFallback` insn
-/// are also demoted to `AstFallback` at build time.
-pub enum SendCombItem {
-    Noop,
-    FastDirectCopy {
-        dst_id: usize,
-        src_id: usize,
-    },
-    FastDirectFanout {
-        src_id: usize,
-        dst_ids: Box<[usize]>,
-    },
-    DirectCopy {
-        dst_id: usize,
-        src_id: usize,
-        width: u32,
-    },
-    Compiled(super::bytecode::CompiledBlock),
-    Fused(FusedGate),
-    FusedBufFanout {
-        src: BitRef,
-        dsts: Box<[BitRef]>,
-        invert: bool,
-    },
-    FusedAndFanout {
-        common: BitRef,
-        branches: Box<[FusedAndBranch]>,
-        invert: bool,
-    },
-    AstFallback,
-}
-
-/// `Send`-able subset of the combinational settle layer, sufficient to
-/// drive per-LP settle on a worker thread. Built by
-/// `Simulator::extract_comb_settle_ctx`. Same soundness rationale as
-/// `SendExecContext`: built single-threaded, read-only on workers.
-pub struct CombSettleCtx {
-    pub items: Vec<SendCombItem>,
-    pub dep_offsets: Vec<u32>,
-    pub dep_entries: Vec<u32>,
-    pub signal_widths: Vec<u32>,
-    pub signal_signed: Vec<bool>,
-    pub signal_two_state: Vec<bool>,
-    pub signal_gate_driven: Vec<bool>,
-    pub signal_name_to_id: NameMap,
-    pub array_first_id: HashMap<Arc<str>, (usize, i64, i64)>,
-}
-
-// SAFETY: see SendExecContext above. `CompiledBlock` is `!Send` only
-// because the `StmtFallback` Insn variant carries `Arc<Statement>`; we
-// never execute StmtFallback on a worker (the entry is demoted to
-// AstFallback) and the context is shared read-only. No concurrent
-// mutation of the embedded AST caches.
-unsafe impl Send for CombSettleCtx {}
-unsafe impl Sync for CombSettleCtx {}
-
-impl CombSettleCtx {
-    /// Evaluate one comb entry against `view`, recording dirtied ids.
-    /// Returns false for AstFallback (caller routes to the coordinator).
-    /// Mirror of `Simulator::eval_comb_entry_isolated` over the Send items.
-    fn eval_entry(
-        &self,
-        eidx: usize,
-        view: &mut [Value],
-        vm_regs: &mut Vec<Value>,
-        dirtied: &mut Vec<u32>,
-    ) -> bool {
-        match &self.items[eidx] {
-            SendCombItem::Noop => true,
-            SendCombItem::FastDirectCopy { dst_id, src_id } => {
-                let (mut sv, mut sx) = view[*src_id].raw_bits();
-                // §6.11.1/§10.7: a 2-state destination drops X/Z (X/Z -> 0).
-                if sx != 0 && self.signal_two_state.get(*dst_id).copied().unwrap_or(false) {
-                    sv &= !sx;
-                    sx = 0;
-                }
-                let (dv, dx) = view[*dst_id].raw_bits();
-                if (sv != dv || sx != dx) && view[*dst_id].set_inline_bits(sv, sx) {
-                    dirtied.push(*dst_id as u32);
-                }
-                true
-            }
-            SendCombItem::FastDirectFanout { src_id, dst_ids } => {
-                let (src_v, src_x) = view[*src_id].raw_bits();
-                for &dst_id in dst_ids.iter() {
-                    let (mut sv, mut sx) = (src_v, src_x);
-                    if sx != 0 && self.signal_two_state.get(dst_id).copied().unwrap_or(false) {
-                        sv &= !sx;
-                        sx = 0;
-                    }
-                    let (dv, dx) = view[dst_id].raw_bits();
-                    if (sv != dv || sx != dx) && view[dst_id].set_inline_bits(sv, sx) {
-                        dirtied.push(dst_id as u32);
-                    }
-                }
-                true
-            }
-            SendCombItem::DirectCopy {
-                dst_id,
-                src_id,
-                width,
-            } => {
-                let dst_w = self.signal_widths[*dst_id];
-                let dst_two_state = self.signal_two_state.get(*dst_id).copied().unwrap_or(false);
-                let mut handled = false;
-                // Inline raw-bit copy only when src and dst widths match;
-                // set_inline_bits does not mask, so narrowing must go through
-                // the resize branch below (pr2224949).
-                if *width <= 64
-                    && dst_w == *width
-                    && self.signal_widths[*src_id] == *width
-                    && !dst_two_state
-                {
-                    let (sv, sx) = view[*src_id].raw_bits();
-                    let (dv, dx) = view[*dst_id].raw_bits();
-                    if sv == dv && sx == dx {
-                        handled = true;
-                    } else if view[*dst_id].set_inline_bits(sv, sx) {
-                        dirtied.push(*dst_id as u32);
-                        handled = true;
-                    }
-                }
-                if !handled {
-                    let src_val = view[*src_id].clone();
-                    let mut resized = if src_val.width != *width {
-                        src_val.resize(*width)
-                    } else {
-                        src_val
-                    };
-                    if dst_two_state {
-                        resized = resized.to_two_state();
-                    }
-                    if view[*dst_id] != resized {
-                        view[*dst_id] = resized;
-                        dirtied.push(*dst_id as u32);
-                    }
-                }
-                true
-            }
-            SendCombItem::Compiled(compiled) => {
-                if vm_regs.len() < compiled.num_regs as usize {
-                    vm_regs.resize(compiled.num_regs as usize, Value::zero(1));
-                }
-                let (_nba, unsupported) = Simulator::exec_comb_block_isolated(
-                    &compiled.instructions,
-                    view,
-                    &self.signal_widths,
-                    &self.signal_signed,
-                    &self.signal_name_to_id,
-                    &self.array_first_id,
-                    vm_regs,
-                    dirtied,
-                    0,
-                    compiled.nba_dup_targets,
-                );
-                !unsupported
-            }
-            SendCombItem::Fused(op) => {
-                Simulator::exec_fused_gate_isolated(op, view, dirtied, &self.signal_gate_driven);
-                true
-            }
-            SendCombItem::FusedBufFanout { src, dsts, invert } => {
-                for &dst in dsts.iter() {
-                    Simulator::exec_fused_gate_isolated(
-                        &FusedGate::Buf1 {
-                            dst,
-                            src: *src,
-                            invert: *invert,
-                        },
-                        view,
-                        dirtied,
-                        &self.signal_gate_driven,
-                    );
-                }
-                true
-            }
-            SendCombItem::FusedAndFanout {
-                common,
-                branches,
-                invert,
-            } => {
-                Simulator::exec_fused_and_fanout_isolated(
-                    *common, branches, *invert, view, dirtied,
-                );
-                true
-            }
-            SendCombItem::AstFallback => false,
-        }
-    }
-
-    /// Run comb settle for one LP's entry subset against `view`, to
-    /// fixpoint. Send-able mirror of `Simulator::pdes_settle_subset_view`
-    /// — callable from a worker thread (takes no `&Simulator`).
-    pub fn settle_subset(
-        &self,
-        view: &mut [Value],
-        in_subset: &[bool],
-        seed: &[usize],
-        limit: u64,
-    ) -> (u64, u64) {
-        let mut scratch = SettleScratch::default();
-        self.settle_subset_tracked(view, in_subset, seed, limit, &mut scratch, None)
-    }
-
-    /// Like `settle_subset` but (1) reuses caller-owned scratch buffers
-    /// (no per-call `vec![false; n_entries]` alloc — required for the live
-    /// per-tick loop) and (2) optionally records the union of signal ids
-    /// written during this settle into `changed_out` (for incremental
-    /// cross-LP boundary reseed). `changed_out` may contain duplicates.
-    pub fn settle_subset_tracked(
-        &self,
-        view: &mut [Value],
-        in_subset: &[bool],
-        seed: &[usize],
-        limit: u64,
-        scratch: &mut SettleScratch,
-        mut changed_out: Option<&mut Vec<usize>>,
-    ) -> (u64, u64) {
-        let n_entries = self.items.len();
-        scratch.prepare(n_entries);
-        let SettleScratch {
-            triggered,
-            worklist,
-            next,
-            vm_regs,
-            dirtied,
-        } = scratch;
-        let mut unsupported = 0u64;
-        for &e in seed {
-            if in_subset.get(e).copied().unwrap_or(false) && !triggered[e] {
-                triggered[e] = true;
-                worklist.push(e);
-            }
-        }
-        let mut iters = 0u64;
-        while !worklist.is_empty() && iters < limit {
-            iters += 1;
-            next.clear();
-            for idx in 0..worklist.len() {
-                let eidx = worklist[idx];
-                if !triggered[eidx] {
-                    continue;
-                }
-                triggered[eidx] = false;
-                dirtied.clear();
-                if !self.eval_entry(eidx, view, vm_regs, dirtied) {
-                    unsupported += 1;
-                }
-                for &sid_u32 in dirtied.iter() {
-                    let sid = sid_u32 as usize;
-                    if let Some(out) = changed_out.as_deref_mut() {
-                        out.push(sid);
-                    }
-                    if sid + 1 < self.dep_offsets.len() {
-                        let lo = self.dep_offsets[sid] as usize;
-                        let hi = self.dep_offsets[sid + 1] as usize;
-                        for &dep_u32 in &self.dep_entries[lo..hi] {
-                            let dep = dep_u32 as usize;
-                            if in_subset.get(dep).copied().unwrap_or(false) && !triggered[dep] {
-                                triggered[dep] = true;
-                                next.push(dep);
-                            }
-                        }
-                    }
-                }
-            }
-            std::mem::swap(worklist, next);
-        }
-        // On convergence the worklist is empty and every triggered entry was
-        // consumed (set false). If we hit `limit` without converging, some
-        // `triggered` bits may still be set — clear them so the scratch is
-        // clean for the next call. (Rare; settle_limit is generous.)
-        if !worklist.is_empty() {
-            for &e in worklist.iter() {
-                triggered[e] = false;
-            }
-            worklist.clear();
-        }
-        (iters, unsupported)
-    }
-}
-
-/// Reusable scratch for `CombSettleCtx::settle_subset_tracked`. One per LP
-/// worker, persisted across ticks to avoid re-allocating the
-/// `triggered` bitmap (~n_entries bools) on every settle call.
-#[derive(Default)]
-pub struct SettleScratch {
-    triggered: Vec<bool>,
-    worklist: Vec<usize>,
-    next: Vec<usize>,
-    vm_regs: Vec<Value>,
-    dirtied: Vec<u32>,
-}
-
-impl SettleScratch {
-    /// Size the triggered bitmap to `n_entries` and clear the worklists.
-    /// `triggered` is left as-is when already sized: a converged settle
-    /// leaves it all-false, and the non-converged path clears its leftovers.
-    fn prepare(&mut self, n_entries: usize) {
-        if self.triggered.len() < n_entries {
-            self.triggered.resize(n_entries, false);
-        }
-        self.worklist.clear();
-        self.next.clear();
-    }
-}
-
-/// Cached state for the per-LP (XEZIM_DISPATCHER=perlp) live-loop settle.
-/// Built once from the comb partition; reused every tick.
-pub struct PerLpSettleState {
-    /// Send-safe comb evaluator (mirror of self's comb layer).
-    ctx: CombSettleCtx,
-    /// Per-LP entry membership masks (parallel to comb_entries). Orphan
-    /// entries are lumped into LP 0 so every non-AST entry is covered.
-    in_subset: [Vec<bool>; 2],
-    /// The AST-fallback (raw ContAssign) entry indices — the isolated
-    /// evaluator can't run these, so they're evaluated inline on the
-    /// coordinator each round.
-    ast_eidxs: Vec<usize>,
-    /// signal_owner_lp[sid] — the LP whose entries WRITE this signal (0/1,
-    /// or 0xFF if no LP-owned entry writes it). The reseed uses writer
-    /// ownership (not name-prefix): a changed signal only needs to re-trigger
-    /// dependent entries in a DIFFERENT LP than its writer, since the writer
-    /// LP's own settle worklist already propagated it internally.
-    owner_lp: Vec<u8>,
-    /// Persistent per-LP settle scratch (no per-call alloc).
-    scratch: [SettleScratch; 2],
-}
-
-impl SendExecContext {
-    /// Mirror of `Simulator::pdes_exec_block` but operating on the
-    /// Send-safe subset so it's callable from worker threads.
-    pub fn pdes_exec_block(
-        &self,
-        bi: usize,
-        signal_snapshot: &[Value],
-        vm_regs: &mut Vec<Value>,
-    ) -> Vec<(usize, Value)> {
-        let Some(Some(cb)) = self.compiled_edge_blocks.get(bi) else {
-            return Vec::new();
-        };
-        if vm_regs.len() < cb.num_regs as usize {
-            vm_regs.resize(cb.num_regs as usize, Value::new(1));
-        }
-        let nbas = Simulator::exec_insns_isolated(
-            &cb.instructions,
-            signal_snapshot,
-            &self.signal_signed,
-            &self.signal_name_to_id,
-            &self.array_first_id,
-            None,
-            vm_regs,
-            bi as u32,
-            cb.nba_dup_targets,
-        );
-        nbas.into_iter()
-            .map(|nba| (nba.signal_id, nba.value))
-            .collect()
-    }
-
-    pub fn signal_name_at(&self, id: usize) -> &str {
-        self.id_to_name.get(id).map(|a| a.as_ref()).unwrap_or("")
-    }
-
-    pub fn block_count(&self) -> usize {
-        self.compiled_edge_blocks.len()
-    }
-
-    pub fn block_compiled(&self, bi: usize) -> bool {
-        self.compiled_edge_blocks
-            .get(bi)
-            .and_then(|c| c.as_ref())
-            .is_some()
-    }
-
-    pub fn signal_count(&self) -> usize {
-        self.signal_widths.len()
     }
 }
 
@@ -158785,6 +158717,16 @@ endmodule
             assert_eq!(wide.width, w);
             assert_eq!(wide.is_signed, s);
         }
+    }
+}
+
+/// `Insn::DropXz`: map a register's X/Z bits to 0 (§6.11.1). Out of line so
+/// the VM dispatch loops carry one small arm for it.
+#[cold]
+#[inline(never)]
+fn drop_xz(r: &mut Value) {
+    if r.has_xz() {
+        *r = r.to_two_state();
     }
 }
 

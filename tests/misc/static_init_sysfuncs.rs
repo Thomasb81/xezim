@@ -122,7 +122,6 @@ endmodule
         None,
         None,
         false,
-        None,
     )
     .expect("simulate failed");
     assert_eq!(

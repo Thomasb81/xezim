@@ -25,10 +25,14 @@ fn find_uvm_root() -> Option<String> {
             return Some(home);
         }
     }
-    ["../1800.2-2020.3.1", "../UVM/1800.2-2020", "../UVM/1800.2-2017"]
-        .iter()
-        .map(|rel| format!("{}/{}", manifest, rel))
-        .find(|root| std::path::Path::new(&format!("{}/src/uvm_pkg.sv", root)).is_file())
+    [
+        "../1800.2-2020.3.1",
+        "../UVM/1800.2-2020",
+        "../UVM/1800.2-2017",
+    ]
+    .iter()
+    .map(|rel| format!("{}/{}", manifest, rel))
+    .find(|root| std::path::Path::new(&format!("{}/src/uvm_pkg.sv", root)).is_file())
 }
 
 /// Run the test source against the real UVM library in-process.
@@ -59,7 +63,6 @@ fn run_in_process(src: &str) -> Option<String> {
         None,
         None,
         false,
-        None,
     )
     .expect("simulation failed");
     Some(

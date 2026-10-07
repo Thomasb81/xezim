@@ -21,8 +21,7 @@ use std::process::Command;
 #[test]
 fn forward_class_formal_vs_caller_struct_collision() {
     let test_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
-    let test_file =
-        test_dir.join("classes/forward_class_formal_vs_caller_struct_collision.sv");
+    let test_file = test_dir.join("classes/forward_class_formal_vs_caller_struct_collision.sv");
     assert!(
         test_file.exists(),
         "Test file not found: {}",

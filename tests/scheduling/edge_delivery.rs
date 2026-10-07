@@ -41,7 +41,6 @@ fn run(src: &str, plusargs: &[String]) -> xezim::compiler::Simulator {
         None,
         None,
         false,
-        None,
     )
     .expect("simulate failed")
 }

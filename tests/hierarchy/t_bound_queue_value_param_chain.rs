@@ -76,7 +76,6 @@ endmodule
         None,
         None,
         false,
-        None,
     )
     .expect("sim")
     .output

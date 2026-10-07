@@ -43,7 +43,10 @@ module top;
   end
 endmodule
 "#);
-    expect(&o, &["bare 000000e0", "id 7", "outside 000000e0", "task 000000b2"]);
+    expect(
+        &o,
+        &["bare 000000e0", "id 7", "outside 000000e0", "task 000000b2"],
+    );
 }
 
 /// A different process parked with a same-named local of an unrelated class

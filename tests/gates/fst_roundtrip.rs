@@ -127,7 +127,6 @@ fn dump(tag: &str, src: &str) -> Fst {
         None,
         None,
         false,
-        None,
     )
     .expect("simulate failed");
 
@@ -446,7 +445,6 @@ fn scope_filter_restricts_the_dump_to_the_named_subtree() {
         None,
         None,
         false,
-        None,
     )
     .expect("simulate failed");
     let fst = decode(&path);

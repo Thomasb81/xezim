@@ -36,7 +36,6 @@ fn run(src: &str, top: &str) -> Result<xezim::compiler::Simulator, String> {
         None,
         None,
         false,
-        None,
     )
 }
 

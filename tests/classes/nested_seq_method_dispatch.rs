@@ -75,7 +75,6 @@ fn run_in_process(src: &str) -> Option<String> {
         None,
         None,
         false,
-        None,
     )
     .expect("simulation failed");
 

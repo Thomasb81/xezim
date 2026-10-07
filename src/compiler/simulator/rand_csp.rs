@@ -1012,8 +1012,10 @@ impl Simulator {
             self.csp_write(csp, v, x);
         }
         let accepted = if csp.scope.is_some() {
-            let items: Vec<ConstraintItem> =
-                constraints.iter().flat_map(|c| c.items.iter().cloned()).collect();
+            let items: Vec<ConstraintItem> = constraints
+                .iter()
+                .flat_map(|c| c.items.iter().cloned())
+                .collect();
             self.inline_constraints_satisfied(&items)
         } else {
             self.rand_items_accept(csp.handle, constraints, colls, &mut false)
@@ -2485,10 +2487,7 @@ impl Simulator {
         hi = hi.min(amax);
         // `!=` is the complement of the `==` interval, which Node::In's own
         // `neg` expresses; fold it together with the caller's negation.
-        let inv = matches!(
-            op,
-            BinaryOp::Neq | BinaryOp::CaseNeq
-        ) != neg;
+        let inv = matches!(op, BinaryOp::Neq | BinaryOp::CaseNeq) != neg;
         let mut fits = Vec::new();
         let lin = Self::csp_lin(&a, w, false, &mut fits)?;
         fits.push(Fit {
@@ -3432,7 +3431,6 @@ impl Simulator {
     }
 }
 
-
 /// §11.5.1/§7.2.1: a constant bit or part select, or a packed-struct field,
 /// of a solver scalar. The scalar is split into segments at every boundary
 /// such a select uses, tied to it by the exact identity `v == Σ seg·2^lsb`;
@@ -3503,7 +3501,10 @@ impl Simulator {
                 segs.push((lo, hi - lo, Self::csp_aux_var(csp, hi - lo)));
             }
             for &(lo, rw) in &ranges {
-                let covered = segs.iter().filter(|s| s.0 >= lo && s.0 + s.1 <= lo + rw).count();
+                let covered = segs
+                    .iter()
+                    .filter(|s| s.0 >= lo && s.0 + s.1 <= lo + rw)
+                    .count();
                 if covered > 1 && !csp.slice_vars.contains_key(&(v, lo, rw)) {
                     let x = Self::csp_aux_var(csp, rw);
                     csp.slice_vars.insert((v, lo, rw), x);
@@ -3554,7 +3555,9 @@ impl Simulator {
             let mut cur = class;
             let mut found = None;
             while let Some(cn) = cur {
-                let Some(cd) = self.module.classes.get(&cn) else { break };
+                let Some(cd) = self.module.classes.get(&cn) else {
+                    break;
+                };
                 if let Some(t) = self.class_prop_decl_type(cd, name) {
                     found = Some(t.clone());
                     break;
@@ -3566,7 +3569,8 @@ impl Simulator {
         let Some(dt) = dt else {
             return Some((Vec::new(), Some((0, 0))));
         };
-        let dt = crate::compiler::elaborate::resolve_typedef_chain(&dt, &self.module.typedef_types).clone();
+        let dt = crate::compiler::elaborate::resolve_typedef_chain(&dt, &self.module.typedef_types)
+            .clone();
         if let Some(f) = crate::compiler::elaborate::packed_struct_field_layout(
             &dt,
             &self.module.parameters,
@@ -3775,7 +3779,10 @@ impl Simulator {
         let pick = |me: &mut Self,
                     base: &Expression,
                     konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
-                    lo_hi: &mut dyn FnMut(&mut Self, &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>) -> Option<Option<(i64, i64)>>|
+                    lo_hi: &mut dyn FnMut(
+            &mut Self,
+            &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
+        ) -> Option<Option<(i64, i64)>>|
          -> Option<(usize, Option<(u32, u32)>)> {
             let (v, blo, bw, whole) = me.csp_slice_base_k(csp, base, konst)?;
             let origin = if whole {
@@ -3834,7 +3841,9 @@ impl Simulator {
             ExprKind::Ident(h)
                 if h.root.is_none()
                     && h.path.last().is_some_and(|s| s.selects.len() == 1)
-                    && h.path[..h.path.len() - 1].iter().all(|s| s.selects.is_empty()) =>
+                    && h.path[..h.path.len() - 1]
+                        .iter()
+                        .all(|s| s.selects.is_empty()) =>
             {
                 let mut bh = h.clone();
                 let idx = bh.path.last_mut().unwrap().selects.pop().unwrap();
@@ -3877,7 +3886,9 @@ impl Simulator {
             }
         }
         match &e.kind {
-            ExprKind::Ident(h) if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) => {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
                 let names: Vec<&str> = h.path.iter().map(|s| s.name.name.as_str()).collect();
                 // object-first binding: `p.f` is field f of the scalar p;
                 // `this.p.f` / `recv.p.f` likewise.
@@ -3928,7 +3939,9 @@ impl Simulator {
             links.push(Lin { t, k: 0 });
         }
         for (&(v, lo, w), &x) in &csp.slice_vars {
-            let Some(segs) = csp.segs.get(&v) else { continue };
+            let Some(segs) = csp.segs.get(&v) else {
+                continue;
+            };
             let mut t: Vec<(usize, i128)> = vec![(x, 1)];
             for &(slo, sw, sx) in segs {
                 if slo >= lo && slo + sw <= lo + w {

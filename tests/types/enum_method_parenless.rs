@@ -68,10 +68,19 @@ fn parenless_enum_methods_in_subroutine_bodies() {
 endmodule"
     );
     let out = lines(&src);
-    assert!(out.contains(&"T func 63".to_string()), "function body: {out:?}");
+    assert!(
+        out.contains(&"T func 63".to_string()),
+        "function body: {out:?}"
+    );
     assert!(out.contains(&"T task 63".to_string()), "task body: {out:?}");
-    assert!(out.contains(&"T meth 63".to_string()), "class method: {out:?}");
-    assert!(out.contains(&"T final 63".to_string()), "final block: {out:?}");
+    assert!(
+        out.contains(&"T meth 63".to_string()),
+        "class method: {out:?}"
+    );
+    assert!(
+        out.contains(&"T final 63".to_string()),
+        "final block: {out:?}"
+    );
 }
 
 /// A formal parameter is a receiver too.

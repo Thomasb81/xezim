@@ -14,7 +14,7 @@ Open an issue on [GitHub](https://github.com/aionhw/xezim/issues) with:
   or another simulator's result. When you checked against a commercial
   simulator, say "the reference simulator" rather than naming a product.
 * **The xezim version or commit.** `--verbose` prints the version banner
-  (`=== xezim 0.11.0 ===`).
+  (`=== xezim 0.11.1 ===`).
 
 ## Pull requests
 
@@ -56,6 +56,11 @@ in ten suites plus 42 unit tests (9 more are marked `#[ignore]`):
 | `upf` | 4 | power intent (`--upf`) |
 
 The xezim-core repository has its own tests for the parser and elaboration.
+
+The `lrm` suite, added after 0.11, is the IEEE 1800-2023 conformance group:
+one module per LRM clause, each test running a small probe design and
+comparing its output with the reference simulator's. Lines where xezim still
+differs are left out and listed as `Known gap` comments at the test.
 
 CI runs the suite twice: in a default build (`cargo test`) and in a build with
 the JIT compiled in (`cargo test --features jit`). JIT execution itself is

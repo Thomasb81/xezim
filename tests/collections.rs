@@ -109,9 +109,11 @@ mod class_member_semaphore_keys;
 mod foreach_live_size_bounds;
 #[path = "collections/foreach_packed_multidim.rs"]
 mod foreach_packed_multidim;
+#[path = "collections/lrm_audit_argument_passing.rs"]
+mod lrm_audit_argument_passing;
+#[path = "collections/mailbox_unpacked_struct.rs"]
+mod mailbox_unpacked_struct;
 #[path = "collections/queue_concat_index_prefilled_prefix.rs"]
 mod queue_concat_index_prefilled_prefix;
 #[path = "collections/std_randomize_multidim.rs"]
 mod std_randomize_multidim;
-#[path = "collections/mailbox_unpacked_struct.rs"]
-mod mailbox_unpacked_struct;

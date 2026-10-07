@@ -53,12 +53,12 @@ mod constructor_body_ports;
 mod ctor_bare_member_dynarray_size;
 #[path = "classes/explicit_param_static_coll_read.rs"]
 mod explicit_param_static_coll_read;
-#[path = "classes/function_local_struct_return_shadow.rs"]
-mod function_local_struct_return_shadow;
 #[path = "classes/foreach_cross_elem_whole_equality.rs"]
 mod foreach_cross_elem_whole_equality;
 #[path = "classes/foreach_packed_struct_member_inside.rs"]
 mod foreach_packed_struct_member_inside;
+#[path = "classes/function_local_struct_return_shadow.rs"]
+mod function_local_struct_return_shadow;
 #[path = "classes/implements_typedef_scope.rs"]
 mod implements_typedef_scope;
 #[path = "classes/inherited_local_member.rs"]
@@ -89,10 +89,10 @@ mod randomize_failure_diag;
 mod static_fixed_array_storage;
 #[path = "classes/static_param_class_collection_reuse.rs"]
 mod static_param_class_collection_reuse;
-#[path = "classes/struct_member_class_handle_new.rs"]
-mod struct_member_class_handle_new;
 #[path = "classes/struct_member_bitselect_frame_local.rs"]
 mod struct_member_bitselect_frame_local;
+#[path = "classes/struct_member_class_handle_new.rs"]
+mod struct_member_class_handle_new;
 #[path = "classes/subroutine_formal_frame_type.rs"]
 mod subroutine_formal_frame_type;
 #[path = "classes/this_collection_struct_members.rs"]
@@ -292,24 +292,26 @@ mod issue35_mixed_sign_constraints;
 mod issue4_coupled_constraints;
 #[path = "classes/ivtest_class_struct_cluster.rs"]
 mod ivtest_class_struct_cluster;
-#[path = "classes/localparam_class_not_parameterized.rs"]
-mod localparam_class_not_parameterized;
 #[path = "classes/local_shadows_sig.rs"]
 mod local_shadows_sig;
+#[path = "classes/localparam_class_not_parameterized.rs"]
+mod localparam_class_not_parameterized;
 #[path = "classes/method_default_this_call.rs"]
 mod method_default_this_call;
 #[path = "classes/module_scope_derived_constraints.rs"]
 mod module_scope_derived_constraints;
+#[path = "classes/nba_region_event_same_slot.rs"]
+mod nba_region_event_same_slot;
 #[path = "classes/nd_array_properties_and_foreach_constraints.rs"]
 mod nd_array_properties_and_foreach_constraints;
 #[path = "classes/nested_seq_method_dispatch.rs"]
 mod nested_seq_method_dispatch;
 #[path = "classes/nonvirtual_dispatch_fscanf_process.rs"]
 mod nonvirtual_dispatch_fscanf_process;
-#[path = "classes/out_of_class_method_shadow.rs"]
-mod out_of_class_method_shadow;
 #[path = "classes/oor_packed_index_2state.rs"]
 mod oor_packed_index_2state;
+#[path = "classes/out_of_class_method_shadow.rs"]
+mod out_of_class_method_shadow;
 #[path = "classes/param_typedef_ctor_resolution.rs"]
 mod param_typedef_ctor_resolution;
 #[path = "classes/process_class_9_7.rs"]
@@ -362,8 +364,6 @@ mod typedef_extends_cast;
 mod typedef_param_base_inherits_spec_arg;
 #[path = "classes/typename_param_class.rs"]
 mod typename_param_class;
-#[path = "classes/nba_region_event_same_slot.rs"]
-mod nba_region_event_same_slot;
 
 #[path = "classes/factory_vif_type_param_specialization.rs"]
 mod factory_vif_type_param_specialization;
@@ -380,16 +380,16 @@ mod forward_declared_class_formal_member_write;
 #[path = "classes/forward_class_formal_vs_caller_struct_collision.rs"]
 mod forward_class_formal_vs_caller_struct_collision;
 
-#[path = "classes/sibling_type_param_default_cast.rs"]
-mod sibling_type_param_default_cast;
-#[path = "classes/queue_eq_construction_path.rs"]
-mod queue_eq_construction_path;
-#[path = "classes/queue_elem_receiver_splice.rs"]
-mod queue_elem_receiver_splice;
-#[path = "classes/reg_field_byte_shift_stream_cast.rs"]
-mod reg_field_byte_shift_stream_cast;
 #[path = "classes/pkg_assoc_elem_read_neq.rs"]
 mod pkg_assoc_elem_read_neq;
+#[path = "classes/queue_elem_receiver_splice.rs"]
+mod queue_elem_receiver_splice;
+#[path = "classes/queue_eq_construction_path.rs"]
+mod queue_eq_construction_path;
+#[path = "classes/reg_field_byte_shift_stream_cast.rs"]
+mod reg_field_byte_shift_stream_cast;
+#[path = "classes/sibling_type_param_default_cast.rs"]
+mod sibling_type_param_default_cast;
 #[path = "classes/unpacked_struct_class_property_whole_value.rs"]
 mod unpacked_struct_class_property_whole_value;
 #[path = "classes/uvm_config_db_tests.rs"]
@@ -459,6 +459,8 @@ mod assoc_enum_key_class_property;
 mod array_of_collections_property;
 #[path = "classes/array_query_handle_qualified_member.rs"]
 mod array_query_handle_qualified_member;
+#[path = "classes/assoc_wide_packed_struct_key.rs"]
+mod assoc_wide_packed_struct_key;
 #[path = "classes/caller_local_shadows_this_cast.rs"]
 mod caller_local_shadows_this_cast;
 #[path = "classes/cast_dest_specialization.rs"]
@@ -483,14 +485,22 @@ mod compiled_method_admission_regression;
 mod compiled_task_and_free_fn_chain;
 #[path = "classes/compiled_method_test_env.rs"]
 mod compiled_method_test_env;
+#[path = "classes/concurrent_function_struct_local_shadow.rs"]
+mod concurrent_function_struct_local_shadow;
 #[path = "classes/condition_waiter_yields_to_inactive.rs"]
 mod condition_waiter_yields_to_inactive;
+#[path = "classes/constraint_shift_bounds.rs"]
+mod constraint_shift_bounds;
 #[path = "classes/covergroup_bin_arithmetic.rs"]
 mod covergroup_bin_arithmetic;
+#[path = "classes/dyn_array_struct_copy.rs"]
+mod dyn_array_struct_copy;
 #[path = "classes/enum_local_shadows_flat_maps.rs"]
 mod enum_local_shadows_flat_maps;
 #[path = "classes/field_init_once_in_order.rs"]
 mod field_init_once_in_order;
+#[path = "classes/formal_class_type_frame_scoped.rs"]
+mod formal_class_type_frame_scoped;
 #[path = "classes/handle_chain_read_in_instance_task.rs"]
 mod handle_chain_read_in_instance_task;
 #[path = "classes/heap_id_collision_member_access.rs"]
@@ -501,6 +511,24 @@ mod id_collision_in_heap;
 mod implication_joint_distribution;
 #[path = "classes/interface_class_extends_type_param.rs"]
 mod interface_class_extends_type_param;
+#[path = "classes/issue_246_struct_member_randomize.rs"]
+mod issue_246_struct_member_randomize;
+#[path = "classes/issue_249_rand_mode_receiver.rs"]
+mod issue_249_rand_mode_receiver;
+#[path = "classes/lrm_chained_handle_writes.rs"]
+mod lrm_chained_handle_writes;
+#[path = "classes/lrm_class_queue_locator_in_expr.rs"]
+mod lrm_class_queue_locator_in_expr;
+#[path = "classes/lrm_param_sized_array_member.rs"]
+mod lrm_param_sized_array_member;
+#[path = "classes/lrm_property_vs_struct_member_name.rs"]
+mod lrm_property_vs_struct_member_name;
+#[path = "classes/lrm_shadowed_property_static_type.rs"]
+mod lrm_shadowed_property_static_type;
+#[path = "classes/lrm_signed_class_collection_elements.rs"]
+mod lrm_signed_class_collection_elements;
+#[path = "classes/lrm_static_method_via_handle.rs"]
+mod lrm_static_method_via_handle;
 #[path = "classes/member_collection_runtime_class.rs"]
 mod member_collection_runtime_class;
 #[path = "classes/member_visibility_local_protected.rs"]
@@ -525,6 +553,8 @@ mod parked_task_local_vif_alias;
 mod pkg_class_scope_types;
 #[path = "classes/rand_collection_element_signedness.rs"]
 mod rand_collection_element_signedness;
+#[path = "classes/rand_width_overflow.rs"]
+mod rand_width_overflow;
 #[path = "classes/randomize_joint_constraints.rs"]
 mod randomize_joint_constraints;
 #[path = "classes/randomize_obj_array_property.rs"]
@@ -547,12 +577,24 @@ mod static_collection_qualified_access;
 mod static_instance_assoc_object;
 #[path = "classes/static_property_through_handle.rs"]
 mod static_property_through_handle;
+#[path = "classes/struct_array_field_read.rs"]
+mod struct_array_field_read;
 #[path = "classes/struct_prop_whole_copy.rs"]
 mod struct_prop_whole_copy;
+#[path = "classes/type_param_inherited_member_write.rs"]
+mod type_param_inherited_member_write;
+#[path = "classes/type_param_prop_member_write.rs"]
+mod type_param_prop_member_write;
 #[path = "classes/type_param_replication_localparam.rs"]
 mod type_param_replication_localparam;
 #[path = "classes/typedef_receiver_static_task.rs"]
 mod typedef_receiver_static_task;
+#[path = "classes/uvm_feature_coverage.rs"]
+mod uvm_feature_coverage;
+#[path = "classes/uvm_ral_coverage.rs"]
+mod uvm_ral_coverage;
+#[path = "classes/uvm_tlm_coverage.rs"]
+mod uvm_tlm_coverage;
 #[path = "classes/vif_member_read_nested_receiver.rs"]
 mod vif_member_read_nested_receiver;
 #[path = "classes/vif_property_named_like_instance.rs"]
@@ -565,31 +607,3 @@ mod vif_receiver_operation_matrix;
 mod vif_resource_db_shape;
 #[path = "classes/vif_static_roundtrip.rs"]
 mod vif_static_roundtrip;
-#[path = "classes/constraint_shift_bounds.rs"]
-mod constraint_shift_bounds;
-#[path = "classes/formal_class_type_frame_scoped.rs"]
-mod formal_class_type_frame_scoped;
-#[path = "classes/type_param_inherited_member_write.rs"]
-mod type_param_inherited_member_write;
-#[path = "classes/struct_array_field_read.rs"]
-mod struct_array_field_read;
-#[path = "classes/dyn_array_struct_copy.rs"]
-mod dyn_array_struct_copy;
-#[path = "classes/assoc_wide_packed_struct_key.rs"]
-mod assoc_wide_packed_struct_key;
-#[path = "classes/concurrent_function_struct_local_shadow.rs"]
-mod concurrent_function_struct_local_shadow;
-#[path = "classes/type_param_prop_member_write.rs"]
-mod type_param_prop_member_write;
-#[path = "classes/uvm_feature_coverage.rs"]
-mod uvm_feature_coverage;
-#[path = "classes/uvm_ral_coverage.rs"]
-mod uvm_ral_coverage;
-#[path = "classes/uvm_tlm_coverage.rs"]
-mod uvm_tlm_coverage;
-#[path = "classes/issue_246_struct_member_randomize.rs"]
-mod issue_246_struct_member_randomize;
-#[path = "classes/issue_249_rand_mode_receiver.rs"]
-mod issue_249_rand_mode_receiver;
-#[path = "classes/rand_width_overflow.rs"]
-mod rand_width_overflow;

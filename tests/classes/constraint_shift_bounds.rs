@@ -59,7 +59,11 @@ fn shr_eq_zero_bounds_the_variable() {
     }
     // Not degenerate: a point solution would be a different bug.
     assert!(
-        d.iter().map(|x| x.1).collect::<std::collections::HashSet<_>>().len() > 1,
+        d.iter()
+            .map(|x| x.1)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1,
         "the solver should spread over 0..255, got {d:?}"
     );
 }
@@ -148,7 +152,11 @@ module t; initial begin A a=new();\n\
     assert_eq!(out.len(), 8);
     for l in &out {
         let mut it = l.split_whitespace().skip(1);
-        assert_eq!(&it.next().unwrap()[2..], "1", "foreach shift must solve: {l}");
+        assert_eq!(
+            &it.next().unwrap()[2..],
+            "1",
+            "foreach shift must solve: {l}"
+        );
         for f in it {
             // the first element arrives as `a=<n>`, the rest bare
             let v: u64 = f.rsplit('=').next().unwrap().parse().unwrap();

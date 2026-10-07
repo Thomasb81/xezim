@@ -1758,9 +1758,6 @@ fn run_main() -> i32 {
     let mut write_profile: Option<String> = None;
     let mut profile_input: Option<String> = None;
     let mut collapse_islands: bool = false;
-    let mut pdes_c910_stub: Option<String> = None;
-    let mut pdes_c910_ticks: u64 = 100;
-    let mut multikernel_scope: Option<String> = None;
     // `--report-stats[=json]`; None = no flag given, fall back to the
     // XEZIM_REPORT_STATS environment switch (resolved after the loop).
     let mut report_stats_cli: Option<report::ReportMode> = None;
@@ -2473,37 +2470,6 @@ fn run_main() -> i32 {
             }
             _ if arg.starts_with("--load-partition=") => {
                 load_partition = Some(arg["--load-partition=".len()..].to_string());
-            }
-            "--pdes-c910-stub" => {
-                i += 1;
-                if i < args.len() {
-                    pdes_c910_stub = Some(args[i].clone());
-                }
-            }
-            _ if arg.starts_with("--pdes-c910-stub=") => {
-                pdes_c910_stub = Some(arg["--pdes-c910-stub=".len()..].to_string());
-            }
-            "--pdes-c910-ticks" => {
-                i += 1;
-                if i < args.len() {
-                    if let Ok(n) = args[i].parse::<u64>() {
-                        pdes_c910_ticks = n;
-                    }
-                }
-            }
-            _ if arg.starts_with("--pdes-c910-ticks=") => {
-                if let Ok(n) = arg["--pdes-c910-ticks=".len()..].parse::<u64>() {
-                    pdes_c910_ticks = n;
-                }
-            }
-            "--multikernel-scope" => {
-                i += 1;
-                if i < args.len() {
-                    multikernel_scope = Some(args[i].clone());
-                }
-            }
-            _ if arg.starts_with("--multikernel-scope=") => {
-                multikernel_scope = Some(arg["--multikernel-scope=".len()..].to_string());
             }
             "--write-profile" => {
                 i += 1;
@@ -3361,32 +3327,6 @@ suppressed but the explicit SDF annotation still applies."
     xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
     xezim::compiler::simulator::set_vpi_libs(&vpi_libs);
 
-    // PDES c910 stub mode: parse + elaborate + compile, then run the
-    // PdesCoordinator with stub blocks for `pdes_c910_ticks` ticks.
-    // Skips the regular event_loop. Front-half integration test for
-    // the worktree perlp-experiment branch.
-    if let Some(lp_a_prefix) = &pdes_c910_stub {
-        match xezim::pdes_c910_stub_multi(
-            &sources,
-            top_module.as_deref(),
-            &include_dirs,
-            &source_files,
-            &defines,
-            lp_a_prefix,
-            pdes_c910_ticks,
-        ) {
-            Ok(()) => {
-                println!("------------------------------");
-                println!("PDES c910 stub complete");
-            }
-            Err(e) => {
-                eprintln!("PDES stub error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return 0;
-    }
-
     // The front-end pass's preprocessed texts are needed after the run only
     // for `--dump-merged-sv`; the simulator preprocesses on its own. Don't
     // keep a spare copy of the whole design resident through simulation.
@@ -3402,7 +3342,7 @@ suppressed but the explicit SDF annotation still applies."
     // SOURCES cannot reach by name. Whatever reaches nets by name from
     // outside the sources is ruled out here: waveform dumps (--wave, --fst,
     // --xtrace), VPI and DPI libraries, SDF and UPF annotation, code
-    // coverage, x-warnings (they name the net that went x), the PDES
+    // coverage, x-warnings (they name the net that went x), the
     // partition tooling, and XEZIM_KEEP_PORTS=1. Library callers never turn
     // it on: they may look any signal up after the run.
     xezim_core::elaborate::set_port_elision(
@@ -3420,7 +3360,6 @@ suppressed but the explicit SDF annotation still applies."
             && load_partition.is_none()
             && write_profile.is_none()
             && profile_input.is_none()
-            && multikernel_scope.is_none()
             && std::env::var("XEZIM_KEEP_PORTS").ok().as_deref() != Some("1"),
     );
 
@@ -3447,7 +3386,6 @@ suppressed but the explicit SDF annotation still applies."
         write_profile.as_deref(),
         profile_input.as_deref(),
         collapse_islands,
-        multikernel_scope.as_deref(),
     ) {
         Ok(sim) => {
             chatter_out!("------------------------------");
