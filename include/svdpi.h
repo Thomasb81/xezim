@@ -1,13 +1,15 @@
 #ifndef SVDPI_H
 #define SVDPI_H
 
-/* Minimal SystemVerilog DPI (IEEE 1800 sections 35-36) header for xezim.
+/* SystemVerilog DPI-C header (IEEE 1800-2017 clause 35 and Annex H) for
+ * xezim: the canonical types, the scope and time primitives, the bit and
+ * part-select helpers, the open-array queries and element access, per-scope
+ * user data, svGetCallerInfo and the disable protocol.
  *
- * xezim implements the subset of DPI that user code actually calls:
- * scalar/vector import arguments, open arrays for unpacked array
- * passing, and the four SV scope primitives. The full IEEE 1800
- * header is ~900 lines and includes things xezim does not support
- * (c bit-select returns by reference, packed array handles, etc.).
+ * Open arrays: an open-array handle points at the element data, laid out in
+ * ascending index order in each element's canonical C form, so code that
+ * indexes it as a plain C array (`int *p = (int *)h;`) works as well as the
+ * svSize/svGetArrElemPtr1/... calls. One unpacked dimension is passed.
  */
 
 #include <stdint.h>
@@ -111,6 +113,98 @@ typedef s_vpi_time svTimeVal;
 DPI_CONTEXT int svGetTime(const svScope scope, svTimeVal *time);
 DPI_CONTEXT int svGetTimeUnit(const svScope scope, int32_t *time_unit);
 DPI_CONTEXT int svGetTimePrecision(const svScope scope, int32_t *time_precision);
+
+/* Number of 32-bit chunks a packed vector of `WIDTH` bits occupies (H.7.6). */
+#ifndef SV_PACKED_DATA_NELEMS
+#define SV_PACKED_DATA_NELEMS(WIDTH) (((WIDTH) + 31) >> 5)
+#endif
+#define SV_MASK(N) \
+    ((N) >= 32 ? UINT32_MAX : ((UINT32_C(1) << (N)) - UINT32_C(1)))
+#define SV_GET_UNSIGNED_BITS(VALUE, N) \
+    ((N) == 32 ? (VALUE) : ((VALUE) & SV_MASK(N)))
+#define SV_GET_SIGNED_BITS(VALUE, N) \
+    ((N) == 32 ? (VALUE) : \
+     (((VALUE) & (UINT32_C(1) << ((N) - 1))) ? \
+      ((VALUE) | ~SV_MASK(N)) : ((VALUE) & SV_MASK(N))))
+
+/* H.10.1: bit selects and part selects of canonical vectors. A part select
+ * of `w` bits (1..32) starts at bit `i` and lands in bits [w-1:0]. */
+DPI_CONTEXT svBit svGetBitselBit(const svBitVecVal *s, int i);
+DPI_CONTEXT svLogic svGetBitselLogic(const svLogicVecVal *s, int i);
+DPI_CONTEXT void svPutBitselBit(svBitVecVal *d, int i, svBit s);
+DPI_CONTEXT void svPutBitselLogic(svLogicVecVal *d, int i, svLogic s);
+DPI_CONTEXT void svGetPartselBit(svBitVecVal *d, const svBitVecVal *s, int i, int w);
+DPI_CONTEXT void svGetPartselLogic(svLogicVecVal *d, const svLogicVecVal *s, int i, int w);
+DPI_CONTEXT void svPutPartselBit(svBitVecVal *d, const svBitVecVal s, int i, int w);
+DPI_CONTEXT void svPutPartselLogic(svLogicVecVal *d, const svLogicVecVal s, int i, int w);
+
+/* H.12.2: open-array queries. Dimension 1 is the (first) unpacked
+ * dimension; dimension 0 is a packed element's range. */
+DPI_CONTEXT int svLeft(const svOpenArrayHandle h, int d);
+DPI_CONTEXT int svRight(const svOpenArrayHandle h, int d);
+DPI_CONTEXT int svLow(const svOpenArrayHandle h, int d);
+DPI_CONTEXT int svHigh(const svOpenArrayHandle h, int d);
+DPI_CONTEXT int svIncrement(const svOpenArrayHandle h, int d);
+DPI_CONTEXT int svSize(const svOpenArrayHandle h, int d);
+DPI_CONTEXT int svDimensions(const svOpenArrayHandle h);
+DPI_CONTEXT void *svGetArrayPtr(const svOpenArrayHandle h);
+DPI_CONTEXT int svSizeOfArray(const svOpenArrayHandle h);
+
+/* H.12.3: a pointer to one element, by its SV index; NULL when out of
+ * range. */
+DPI_CONTEXT void *svGetArrElemPtr(const svOpenArrayHandle h, int indx1, ...);
+DPI_CONTEXT void *svGetArrElemPtr1(const svOpenArrayHandle h, int indx1);
+DPI_CONTEXT void *svGetArrElemPtr2(const svOpenArrayHandle h, int indx1, int indx2);
+DPI_CONTEXT void *svGetArrElemPtr3(const svOpenArrayHandle h, int indx1, int indx2, int indx3);
+
+/* H.12.4/H.12.5: copy a packed element to or from canonical form. */
+DPI_CONTEXT void svPutBitArrElemVecVal(const svOpenArrayHandle d, const svBitVecVal *s, int indx1, ...);
+DPI_CONTEXT void svPutBitArrElem1VecVal(const svOpenArrayHandle d, const svBitVecVal *s, int indx1);
+DPI_CONTEXT void svPutBitArrElem2VecVal(const svOpenArrayHandle d, const svBitVecVal *s, int indx1, int indx2);
+DPI_CONTEXT void svPutBitArrElem3VecVal(const svOpenArrayHandle d, const svBitVecVal *s, int indx1, int indx2, int indx3);
+DPI_CONTEXT void svPutLogicArrElemVecVal(const svOpenArrayHandle d, const svLogicVecVal *s, int indx1, ...);
+DPI_CONTEXT void svPutLogicArrElem1VecVal(const svOpenArrayHandle d, const svLogicVecVal *s, int indx1);
+DPI_CONTEXT void svPutLogicArrElem2VecVal(const svOpenArrayHandle d, const svLogicVecVal *s, int indx1, int indx2);
+DPI_CONTEXT void svPutLogicArrElem3VecVal(const svOpenArrayHandle d, const svLogicVecVal *s, int indx1, int indx2, int indx3);
+DPI_CONTEXT void svGetBitArrElemVecVal(svBitVecVal *d, const svOpenArrayHandle s, int indx1, ...);
+DPI_CONTEXT void svGetBitArrElem1VecVal(svBitVecVal *d, const svOpenArrayHandle s, int indx1);
+DPI_CONTEXT void svGetBitArrElem2VecVal(svBitVecVal *d, const svOpenArrayHandle s, int indx1, int indx2);
+DPI_CONTEXT void svGetBitArrElem3VecVal(svBitVecVal *d, const svOpenArrayHandle s, int indx1, int indx2, int indx3);
+DPI_CONTEXT void svGetLogicArrElemVecVal(svLogicVecVal *d, const svOpenArrayHandle s, int indx1, ...);
+DPI_CONTEXT void svGetLogicArrElem1VecVal(svLogicVecVal *d, const svOpenArrayHandle s, int indx1);
+DPI_CONTEXT void svGetLogicArrElem2VecVal(svLogicVecVal *d, const svOpenArrayHandle s, int indx1, int indx2);
+DPI_CONTEXT void svGetLogicArrElem3VecVal(svLogicVecVal *d, const svOpenArrayHandle s, int indx1, int indx2, int indx3);
+
+/* H.12.6: scalar (single bit/logic) elements. */
+DPI_CONTEXT svBit svGetBitArrElem(const svOpenArrayHandle s, int indx1, ...);
+DPI_CONTEXT svBit svGetBitArrElem1(const svOpenArrayHandle s, int indx1);
+DPI_CONTEXT svBit svGetBitArrElem2(const svOpenArrayHandle s, int indx1, int indx2);
+DPI_CONTEXT svBit svGetBitArrElem3(const svOpenArrayHandle s, int indx1, int indx2, int indx3);
+DPI_CONTEXT svLogic svGetLogicArrElem(const svOpenArrayHandle s, int indx1, ...);
+DPI_CONTEXT svLogic svGetLogicArrElem1(const svOpenArrayHandle s, int indx1);
+DPI_CONTEXT svLogic svGetLogicArrElem2(const svOpenArrayHandle s, int indx1, int indx2);
+DPI_CONTEXT svLogic svGetLogicArrElem3(const svOpenArrayHandle s, int indx1, int indx2, int indx3);
+DPI_CONTEXT void svPutBitArrElem(const svOpenArrayHandle d, svBit value, int indx1, ...);
+DPI_CONTEXT void svPutBitArrElem1(const svOpenArrayHandle d, svBit value, int indx1);
+DPI_CONTEXT void svPutBitArrElem2(const svOpenArrayHandle d, svBit value, int indx1, int indx2);
+DPI_CONTEXT void svPutBitArrElem3(const svOpenArrayHandle d, svBit value, int indx1, int indx2, int indx3);
+DPI_CONTEXT void svPutLogicArrElem(const svOpenArrayHandle d, svLogic value, int indx1, ...);
+DPI_CONTEXT void svPutLogicArrElem1(const svOpenArrayHandle d, svLogic value, int indx1);
+DPI_CONTEXT void svPutLogicArrElem2(const svOpenArrayHandle d, svLogic value, int indx1, int indx2);
+DPI_CONTEXT void svPutLogicArrElem3(const svOpenArrayHandle d, svLogic value, int indx1, int indx2, int indx3);
+
+/* H.9.3: data a C library attaches to a scope under a key of its own.
+ * svPutUserData returns 0, or -1 for a NULL scope or key. */
+DPI_CONTEXT int svPutUserData(const svScope scope, void *userKey, void *userData);
+DPI_CONTEXT void *svGetUserData(const svScope scope, void *userKey);
+
+/* H.9.4: the calling statement's file and line; xezim returns 0 (not
+ * available). */
+DPI_CONTEXT int svGetCallerInfo(const char **fileName, int *lineNumber);
+
+/* H.9.5: the disable protocol; xezim never disables an import mid-call. */
+DPI_CONTEXT int svIsDisabledState(void);
+DPI_CONTEXT void svAckDisabledState(void);
 
 /* Compatibility marker for tools that test which DPI standard we
  * expose. The 1800-2005 value 0 is the UVM-required minimum. */

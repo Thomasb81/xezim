@@ -4309,14 +4309,186 @@ enum DpiArgKind {
     ChandleOut,
     StringIn,
     StringOut,
-    OpenArrayI32In,
-    OpenArrayI32Out,
+    /// An open-array formal (`int a[]`, `bit [7:0] a[]`): passed as an
+    /// Annex H open-array handle (see `DpiOpenArrayHeader`).
+    OpenArrayIn(DpiOaElem),
+    OpenArrayOut(DpiOaElem),
     VecLogicIn(u32),
     VecLogicOut(u32),
     /// 2-state packed vector (`bit [N]`) passed as plain `uint32_t*`
     /// (svBitVecVal*). ABI differs from VecLogicIn: no bval field.
     VecBitIn(u32),
     VecBitOut(u32),
+}
+
+/// The canonical C element of a DPI open array (IEEE 1800-2017 H.7):
+/// `char`, `short`, `int`, `long long`, `float`, `double`, or a packed
+/// vector as `svBitVecVal` / `svLogicVecVal` words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpiOaElem {
+    I8,
+    I16,
+    I32,
+    I64,
+    F32,
+    F64,
+    Bit(u32),
+    Logic(u32),
+}
+
+impl DpiOaElem {
+    fn bytes(self) -> usize {
+        match self {
+            DpiOaElem::I8 => 1,
+            DpiOaElem::I16 => 2,
+            DpiOaElem::I32 | DpiOaElem::F32 => 4,
+            DpiOaElem::I64 | DpiOaElem::F64 => 8,
+            DpiOaElem::Bit(w) => 4 * w.div_ceil(32).max(1) as usize,
+            DpiOaElem::Logic(w) => 8 * w.div_ceil(32).max(1) as usize,
+        }
+    }
+
+    /// The SV width of one element.
+    fn width(self) -> u32 {
+        match self {
+            DpiOaElem::I8 => 8,
+            DpiOaElem::I16 => 16,
+            DpiOaElem::I32 | DpiOaElem::F32 => 32,
+            DpiOaElem::I64 | DpiOaElem::F64 => 64,
+            DpiOaElem::Bit(w) | DpiOaElem::Logic(w) => w.max(1),
+        }
+    }
+}
+
+/// The header placed immediately BEFORE the element data of a DPI open
+/// array; the handle C receives points at the data, so code indexing it as
+/// a plain C array keeps working while `svSize`, `svLeft`,
+/// `svGetArrElemPtr1`, ... (src/svdpi_shim.c, which mirrors this layout as
+/// `xz_oa_hdr`) read the shape from here.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DpiOpenArrayHeader {
+    magic: u32,
+    elem_bytes: u32,
+    ndims: i32,
+    packed: i32,
+    packed_left: i32,
+    packed_right: i32,
+    left: [i32; 4],
+    right: [i32; 4],
+    total_bytes: u32,
+    elem_count: u32,
+}
+
+const DPI_OA_MAGIC: u32 = 0x414f_5a58; // "XZOA"
+const DPI_OA_HDR_BYTES: usize = std::mem::size_of::<DpiOpenArrayHeader>();
+const _: () = assert!(DPI_OA_HDR_BYTES == 64);
+
+/// One open-array argument: its buffer (header + data, 8-byte aligned) and
+/// shape, kept alive for the call and decoded again for an output.
+struct DpiOpenArrayArg {
+    buf: Vec<u64>,
+    elem: DpiOaElem,
+    count: usize,
+}
+
+impl DpiOpenArrayArg {
+    fn new(elem: DpiOaElem, values: &[Value], left: i64, right: i64) -> Self {
+        let count = values.len();
+        let eb = elem.bytes();
+        let data_bytes = eb * count;
+        let mut buf = vec![0u64; (DPI_OA_HDR_BYTES + data_bytes).div_ceil(8)];
+        let packed = matches!(elem, DpiOaElem::Bit(_) | DpiOaElem::Logic(_));
+        let hdr = DpiOpenArrayHeader {
+            magic: DPI_OA_MAGIC,
+            elem_bytes: eb as u32,
+            ndims: 1,
+            packed: packed as i32,
+            packed_left: if packed { elem.width() as i32 - 1 } else { 0 },
+            packed_right: 0,
+            left: [left as i32, 0, 0, 0],
+            right: [right as i32, 0, 0, 0],
+            total_bytes: data_bytes as u32,
+            elem_count: count as u32,
+        };
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), buf.len() * 8)
+        };
+        bytes[..DPI_OA_HDR_BYTES].copy_from_slice(unsafe {
+            std::slice::from_raw_parts((&hdr as *const DpiOpenArrayHeader).cast::<u8>(), DPI_OA_HDR_BYTES)
+        });
+        for (i, v) in values.iter().enumerate() {
+            let at = DPI_OA_HDR_BYTES + i * eb;
+            let dst = &mut bytes[at..at + eb];
+            match elem {
+                DpiOaElem::I8 | DpiOaElem::I16 | DpiOaElem::I32 | DpiOaElem::I64 => {
+                    let x = if v.is_real { v.to_f64() as i64 as u64 } else { v.to_u64().unwrap_or(0) };
+                    dst.copy_from_slice(&x.to_le_bytes()[..eb]);
+                }
+                DpiOaElem::F32 => dst.copy_from_slice(&(Self::real_of(v) as f32).to_le_bytes()),
+                DpiOaElem::F64 => dst.copy_from_slice(&Self::real_of(v).to_le_bytes()),
+                DpiOaElem::Bit(w) => {
+                    let (aval, _) = Simulator::dpi_value_to_logic_words(v, w);
+                    for (k, word) in aval.iter().enumerate().take(eb / 4) {
+                        dst[k * 4..k * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+                DpiOaElem::Logic(w) => {
+                    let il = Simulator::dpi_value_to_logic_interleaved(v, w);
+                    for (k, word) in il.iter().enumerate().take(eb / 4) {
+                        dst[k * 4..k * 4 + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+            }
+        }
+        DpiOpenArrayArg { buf, elem, count }
+    }
+
+    fn real_of(v: &Value) -> f64 {
+        if v.is_real {
+            v.to_f64()
+        } else {
+            v.to_u64().unwrap_or(0) as i64 as f64
+        }
+    }
+
+    /// The handle C receives: the start of the element data.
+    fn handle(&mut self) -> *mut std::ffi::c_void {
+        unsafe { self.buf.as_mut_ptr().cast::<u8>().add(DPI_OA_HDR_BYTES).cast() }
+    }
+
+    /// The elements as C left them.
+    fn values(&self) -> Vec<Value> {
+        let eb = self.elem.bytes();
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.buf.len() * 8)
+        };
+        (0..self.count)
+            .map(|i| {
+                let at = DPI_OA_HDR_BYTES + i * eb;
+                let src = &bytes[at..at + eb];
+                let word = |k: usize| u32::from_le_bytes(src[k * 4..k * 4 + 4].try_into().unwrap());
+                match self.elem {
+                    DpiOaElem::I8 => Value::from_u64(src[0] as i8 as i64 as u64, 8),
+                    DpiOaElem::I16 => {
+                        Value::from_u64(i16::from_le_bytes([src[0], src[1]]) as i64 as u64, 16)
+                    }
+                    DpiOaElem::I32 => Value::from_u64(word(0) as u64, 32),
+                    DpiOaElem::I64 => Value::from_u64(u64::from_le_bytes(src.try_into().unwrap()), 64),
+                    DpiOaElem::F32 => Value::from_f64(f32::from_le_bytes(src.try_into().unwrap()) as f64),
+                    DpiOaElem::F64 => Value::from_f64(f64::from_le_bytes(src.try_into().unwrap())),
+                    DpiOaElem::Bit(w) => {
+                        let aval: Vec<u32> = (0..eb / 4).map(word).collect();
+                        Simulator::dpi_logic_words_to_value(&aval, &[], w)
+                    }
+                    DpiOaElem::Logic(w) => {
+                        let il: Vec<u32> = (0..eb / 4).map(word).collect();
+                        Simulator::dpi_logic_interleaved_to_value(&il, w)
+                    }
+                }
+            })
+            .collect()
+    }
 }
 
 struct DpiBinding {
@@ -5839,6 +6011,9 @@ pub struct Simulator {
     /// `typedef_layout_member`'s unpacked-struct typedef layouts by total
     /// width; dropped when a block-local typedef is registered.
     typedef_layouts_by_width: Option<HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>>>,
+    /// Class packed ranges needing label translation, keyed by (class,
+    /// property); None for descending ranges ending at zero.
+    class_prop_dim_cache: std::cell::RefCell<HashMap<(String, String), Option<(i64, i64)>>>,
     /// LRM §16.5 SVA clocked-assertion sites. Populated lazily on
     /// the first time the AssertionStatement{is_property,
     /// expr:SvaClocked} executes. Each site's `prev_clock` lets us
@@ -11495,6 +11670,7 @@ impl Simulator {
             pending_observed: Vec::new(),
             deferred_asserts: Vec::new(),
             typedef_layouts_by_width: None,
+            class_prop_dim_cache: std::cell::RefCell::new(HashMap::default()),
             sva_sites: Vec::new(),
             active_sva_site: None,
             sva_preponed: HashMap::default(),
@@ -15228,24 +15404,36 @@ impl Simulator {
                 Some(&self.module.parameters),
                 Some(&self.module.typedefs),
             );
-            let is_i32 = matches!(
-                dt,
-                DataType::IntegerAtom {
-                    kind: IntegerAtomType::Int
-                        | IntegerAtomType::Integer
-                        | IntegerAtomType::Byte
-                        | IntegerAtomType::ShortInt,
-                    ..
-                }
-            ) || (matches!(dt, DataType::Implicit { .. }) && w <= 32);
-            if is_i32 {
-                return Some(if out_dir {
-                    DpiArgKind::OpenArrayI32Out
-                } else {
-                    DpiArgKind::OpenArrayI32In
-                });
+            // §35.5.6.1/H.7: an open array's elements take their canonical
+            // C form — a `byte` array is `char`s, not `int`s.
+            let elem = match dt {
+                DataType::IntegerAtom { kind, .. } => match kind {
+                    IntegerAtomType::Byte => DpiOaElem::I8,
+                    IntegerAtomType::ShortInt => DpiOaElem::I16,
+                    IntegerAtomType::Int | IntegerAtomType::Integer => DpiOaElem::I32,
+                    IntegerAtomType::LongInt | IntegerAtomType::Time => DpiOaElem::I64,
+                },
+                DataType::Real { kind, .. } => match kind {
+                    crate::ast::types::RealType::ShortReal => DpiOaElem::F32,
+                    _ => DpiOaElem::F64,
+                },
+                DataType::IntegerVector { kind, .. } => match kind {
+                    crate::ast::types::IntegerVectorType::Bit => DpiOaElem::Bit(w),
+                    _ => DpiOaElem::Logic(w),
+                },
+                DataType::Implicit { .. } if w <= 32 => DpiOaElem::I32,
+                _ => return None,
+            };
+            // Only the outermost dimension may be open; a fixed inner one
+            // is outside this marshaling.
+            if dims.len() != 1 {
+                return None;
             }
-            return None;
+            return Some(if out_dir {
+                DpiArgKind::OpenArrayOut(elem)
+            } else {
+                DpiArgKind::OpenArrayIn(elem)
+            });
         }
         match dt {
             DataType::IntegerAtom { kind, .. } => match kind {
@@ -15473,8 +15661,7 @@ impl Simulator {
                 DpiArgKind::ChandleOut => Type::pointer(),
                 DpiArgKind::StringIn => Type::pointer(),
                 DpiArgKind::StringOut => Type::pointer(),
-                DpiArgKind::OpenArrayI32In => Type::pointer(),
-                DpiArgKind::OpenArrayI32Out => Type::pointer(),
+                DpiArgKind::OpenArrayIn(_) | DpiArgKind::OpenArrayOut(_) => Type::pointer(),
                 DpiArgKind::VecLogicIn(_) => Type::pointer(),
                 DpiArgKind::VecLogicOut(_) => Type::pointer(),
                 DpiArgKind::VecBitIn(_) => Type::pointer(),
@@ -15576,24 +15763,28 @@ impl Simulator {
         out.resize(width)
     }
 
-    fn dpi_collect_i32_array_arg(
-        &mut self,
-        expr: Option<&Expression>,
-    ) -> (Option<String>, Vec<i32>) {
+    /// The elements of an open-array actual and its declared bounds
+    /// (`left`, `right`): a fixed unpacked array (`[7:0]` gives 7, 0), a
+    /// dynamic array or queue (0 .. size-1, empty when size is 0), or any
+    /// other expression as a one-element array.
+    fn dpi_collect_open_array(&mut self, expr: Option<&Expression>) -> (Vec<Value>, i64, i64) {
         let Some(e) = expr else {
-            return (None, Vec::new());
+            return (Vec::new(), 0, -1);
         };
         if let ExprKind::Ident(hier) = &e.kind {
             let name = self.resolve_hier_name(hier);
-            if let Some((lo, hi, _elem_w)) = self.module.arrays.get(&*name).copied() {
-                let mut out = Vec::new();
+            // A dynamic array or queue also has a `module.arrays` entry, but
+            // its range is storage capacity: the live size bounds it.
+            let live = self.dpi_open_array_live_size(&name);
+            if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
+                let hi = live.map_or(hi, |n| lo + n as i64 - 1);
+                let mut out = Vec::with_capacity((hi - lo + 1).max(0) as usize);
                 // Compact-resolver fast path: if the array is in
                 // array_first_id, walk the contiguous id range with no
                 // per-element name allocation.
                 if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
-                    for off in 0..=(hi - lo) as usize {
-                        let id = first_id + off;
-                        out.push(self.cell_read(id).to_i64().unwrap_or(0) as i32);
+                    for off in 0..(hi - lo + 1).max(0) as usize {
+                        out.push(self.cell_read(first_id + off));
                     }
                 } else {
                     for idx in lo..=hi {
@@ -15604,33 +15795,56 @@ impl Simulator {
                             self.signals
                                 .get(&elem_name)
                                 .cloned()
-                                .unwrap_or_else(|| Value::zero(32))
+                                .unwrap_or_else(|| Value::zero(elem_w.max(1) as u32))
                         };
-                        out.push(vv.to_i64().unwrap_or(0) as i32);
+                        out.push(vv);
                     }
                 }
-                return (Some(name.to_string()), out);
+                let (left, right) = if live.is_none() && self.module.descending_arrays.contains(&*name) {
+                    (hi, lo)
+                } else {
+                    (lo, hi)
+                };
+                return (out, left as i64, right as i64);
+            }
+            if let Some(n) = live {
+                let out = (0..n)
+                    .map(|i| {
+                        self.get_signal_value_by_name(&format!("{}[{}]", name, i))
+                            .unwrap_or_else(|| Value::zero(32))
+                    })
+                    .collect();
+                return (out, 0, n as i64 - 1);
             }
         }
-        (None, vec![self.eval_expr(e).to_i64().unwrap_or(0) as i32])
+        (vec![self.eval_expr(e)], 0, 0)
     }
 
-    fn dpi_writeback_i32_array_arg(&mut self, expr: &Expression, data: &[i32]) {
+    /// The element count of a dynamic array or queue actual; None for a
+    /// fixed-size array.
+    fn dpi_open_array_live_size(&self, name: &str) -> Option<u64> {
+        (self.module.dynamic_arrays.contains(name)
+            || self.signals.contains_key(&Self::name_with_suffix(name, ".size")))
+        .then(|| self.get_queue_size(name))
+    }
+
+    /// Write an output open array back to its actual, element by element
+    /// in the order `dpi_collect_open_array` read them.
+    fn dpi_writeback_open_array(&mut self, expr: &Expression, data: &[Value]) {
         if let ExprKind::Ident(hier) = &expr.kind {
             let name = self.resolve_hier_name(hier);
+            let live = self.dpi_open_array_live_size(&name);
             if let Some((lo, hi, elem_w)) = self.module.arrays.get(&*name).copied() {
-                let mut k = 0usize;
+                let hi = live.map_or(hi, |n| lo + n as i64 - 1);
+                let elem_w = elem_w.max(1) as u32;
+                let fit = |v: &Value| if v.is_real { v.clone() } else { v.resize(elem_w) };
                 // Compact-resolver fast path.
                 if let Some(&(first_id, _, _)) = self.array_first_id.get(name.as_ref()) {
-                    for off in 0..=(hi - lo) as usize {
-                        if k >= data.len() {
-                            break;
-                        }
+                    for (off, d) in data.iter().enumerate().take((hi - lo + 1).max(0) as usize) {
                         let id = first_id + off;
-                        let mut val = Value::from_u64(data[k] as u32 as u64, elem_w);
+                        let mut val = fit(d);
                         if is_packed_id(id) {
                             self.packed_store_value(id, &val);
-                            k += 1;
                             continue;
                         }
                         val.is_signed = self.signal_signed[id];
@@ -15639,47 +15853,66 @@ impl Simulator {
                             write_sig!(self, id, val);
                             self.table_modified = true;
                         }
-                        k += 1;
                     }
                     return;
                 }
-                for idx in lo..=hi {
-                    if k >= data.len() {
-                        break;
-                    }
+                for (idx, d) in (lo..=hi).zip(data) {
                     let elem_name = format!("{}[{}]", name, idx);
-                    let mut val = Value::from_u64(data[k] as u32 as u64, elem_w);
+                    let mut val = fit(d);
                     if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
                         val.is_signed = self.signal_signed[id];
-                    } else if self.signed_signals.contains(&elem_name) {
-                        val.is_signed = true;
-                    }
-                    if let Some(&id) = self.signal_name_to_id.get(elem_name.as_str()) {
-                        let changed = self.signal_table[id] != val;
-                        if changed {
+                        if self.signal_table[id] != val {
                             self.mark_dirty_id(id);
                             write_sig!(self, id, val);
                             self.table_modified = true;
                         }
                     } else {
+                        if self.signed_signals.contains(&elem_name) {
+                            val.is_signed = true;
+                        }
                         let changed = self.signals.get(&elem_name).is_none_or(|p| *p != val);
                         if changed {
                             self.mark_dirty(&elem_name);
                         }
                         self.signals.insert(elem_name, val);
                     }
-                    k += 1;
+                }
+                return;
+            }
+            if let Some(n) = live {
+                for (i, d) in data.iter().enumerate().take(n as usize) {
+                    let elem_name = format!("{}[{}]", name, i);
+                    let mut val = d.clone();
+                    if let Some(old) = self.get_signal_value_by_name(&elem_name) {
+                        if !val.is_real && !old.is_real {
+                            val = val.resize(old.width);
+                            val.is_signed = old.is_signed;
+                        }
+                    }
+                    self.set_signal_value_by_name(&elem_name, val);
                 }
                 return;
             }
         }
         if let Some(v0) = data.first() {
             let w = self.infer_lhs_width(expr);
-            self.assign_value(expr, &Value::from_u64(*v0 as u32 as u64, w));
+            let v = if v0.is_real { v0.clone() } else { v0.resize(w as u32) };
+            self.assign_value(expr, &v);
         }
     }
 
     fn exec_dpi_import_call(&mut self, sv_name: &str, args: &[Expression]) -> Option<Value> {
+        self.exec_dpi_import_call_in(sv_name, args, None)
+    }
+
+    /// `exec_dpi_import_call` for a call reached through a hierarchical
+    /// prefix (`u_a.c_fn()`): `via` is that instance path (`u_a`).
+    fn exec_dpi_import_call_in(
+        &mut self,
+        sv_name: &str,
+        args: &[Expression],
+        via: Option<&str>,
+    ) -> Option<Value> {
         let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
         if !self.dpi_bindings.contains_key(sv_name) {
             let c_name = self.module.dpi_imports.get(sv_name)?.c_name.clone();
@@ -15742,7 +15975,7 @@ impl Simulator {
         let mut ptr_vals: Vec<Box<*mut c_void>> = Vec::with_capacity(arg_kinds.len());
         let mut string_ptr_cells: Vec<Box<*const std::ffi::c_char>> =
             Vec::with_capacity(arg_kinds.len());
-        let mut open_i32_vals: Vec<Vec<i32>> = Vec::with_capacity(arg_kinds.len());
+        let mut open_arrays: Vec<DpiOpenArrayArg> = Vec::with_capacity(arg_kinds.len());
         let mut cstrings: Vec<CString> = Vec::with_capacity(arg_kinds.len());
         let mut logic_aval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
         let mut writebacks: Vec<(usize, DpiArgKind, Expression)> = Vec::new();
@@ -15871,21 +16104,17 @@ impl Simulator {
                         writebacks.push((string_ptr_cells.len() - 1, *kind, expr.clone()));
                     }
                 }
-                DpiArgKind::OpenArrayI32In => {
-                    let (_aname, mut arr) = self.dpi_collect_i32_array_arg(args.get(i));
-                    let p = Box::new(arr.as_mut_ptr().cast::<c_void>());
-                    open_i32_vals.push(arr);
+                DpiArgKind::OpenArrayIn(elem) | DpiArgKind::OpenArrayOut(elem) => {
+                    let (values, left, right) = self.dpi_collect_open_array(args.get(i));
+                    let mut oa = DpiOpenArrayArg::new(*elem, &values, left, right);
+                    let p = Box::new(oa.handle());
+                    open_arrays.push(oa);
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
-                }
-                DpiArgKind::OpenArrayI32Out => {
-                    let (_aname, mut arr) = self.dpi_collect_i32_array_arg(args.get(i));
-                    let p = Box::new(arr.as_mut_ptr().cast::<c_void>());
-                    open_i32_vals.push(arr);
-                    ptr_vals.push(p);
-                    arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
-                    if let Some(expr) = args.get(i) {
-                        writebacks.push((open_i32_vals.len() - 1, *kind, expr.clone()));
+                    if matches!(kind, DpiArgKind::OpenArrayOut(_)) {
+                        if let Some(expr) = args.get(i) {
+                            writebacks.push((open_arrays.len() - 1, *kind, expr.clone()));
+                        }
                     }
                 }
                 DpiArgKind::VecLogicIn(width) => {
@@ -16026,9 +16255,21 @@ impl Simulator {
         // Set the active DPI scope to match the import's declaration
         // site. DPI routines rely on `svGetScope` returning the caller's
         // enclosing scope so that scope-aware helpers find the right
-        // package/module context. We synthesise a scope handle from the
-        // import name's leading package/module path (e.g. `pkg::foo` → `pkg`).
-        let scope_name: String = sv_name.split("::").next().unwrap_or("").to_string();
+        // package/module context (§35.5.3). A package import is in its
+        // package (`pkg::foo` → `pkg`, or a bare name the package owns); a
+        // module import is in the instance it is called through or running
+        // in (`top.u_a`). The bare import name used to be taken as the
+        // scope, so a module's context import saw a scope named after
+        // itself.
+        let scope_name: String = if let Some((pkg, _)) = sv_name.split_once("::") {
+            pkg.to_string()
+        } else if let Some(prefix) = via {
+            self.hier_path(prefix)
+        } else if let Some(pkg) = self.module.pkg_subr_owner.get(sv_name) {
+            pkg.clone()
+        } else {
+            self.hier_path(&self.active_instance_scope())
+        };
         let prev_scope = ACTIVE_SCOPE.with(|cell| cell.get());
         if !scope_name.is_empty() {
             // Look up or create a scope handle and pin it for the
@@ -16148,9 +16389,10 @@ impl Simulator {
                         self.assign_value(&expr, &Value::from_string(&s));
                     }
                 }
-                DpiArgKind::OpenArrayI32Out => {
-                    if let Some(arr) = open_i32_vals.get(idx) {
-                        self.dpi_writeback_i32_array_arg(&expr, arr);
+                DpiArgKind::OpenArrayOut(_) => {
+                    if let Some(oa) = open_arrays.get(idx) {
+                        let values = oa.values();
+                        self.dpi_writeback_open_array(&expr, &values);
                     }
                 }
                 DpiArgKind::VecLogicOut(width) => {
@@ -16537,6 +16779,7 @@ impl Simulator {
                 ));
             }
         }
+        self.register_struct_member_collections();
         for (name, is_assoc, width, is_str) in static_cols {
             if is_assoc {
                 self.module
@@ -67470,7 +67713,24 @@ impl Simulator {
                 // excluded here. Bit-selects are already correct in both
                 // directions; this closes the part-select WRITE gap.
                 let mut elem_ascending_dim: Option<(i64, i64)> = None;
-                if let ExprKind::Ident(h) = &expr.kind {
+                let class_dim = self.class_prop_select_dim(expr);
+                if let Some((dl, dr)) = class_dim {
+                    if dl < dr {
+                        li = match kind {
+                            RangeKind::Constant => dr - li,
+                            RangeKind::IndexedUp => dr - li - (ri - 1),
+                            RangeKind::IndexedDown => dr - li + (ri - 1),
+                        };
+                        if matches!(kind, RangeKind::Constant) {
+                            ri = dr - ri;
+                        }
+                    } else {
+                        li -= dr;
+                        if matches!(kind, RangeKind::Constant) {
+                            ri -= dr;
+                        }
+                    }
+                } else if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
                     let is_multi_d = self
                         .module
@@ -67958,7 +68218,8 @@ impl Simulator {
                             // property landed correctly. Resolved before the
                             // mutable borrow below.
                             let (msb, lsb) = match self.class_prop_packed_shape(handle, &fname) {
-                                Some((_, total, left, right)) if left < right && total > 0 => {
+                                Some((_, total, left, right))
+                                    if class_dim.is_none() && left < right && total > 0 => {
                                     let top = total as usize - 1;
                                     (top.saturating_sub(lsb), top.saturating_sub(msb))
                                 }
@@ -69449,6 +69710,94 @@ impl Simulator {
 
     /// Leaf identifier name of an expression, if it is a plain (possibly
     /// scoped/dotted) identifier.
+    /// `std::randomize(targets) with {items}` through the joint solver
+    /// (`rand_csp_solve_scope`): plain integral scalars and 1-D arrays (at
+    /// their current size) are its variables. NotApplicable when a target
+    /// is anything else.
+    fn std_randomize_joint(
+        &mut self,
+        items: &[crate::ast::decl::ConstraintItem],
+        targets: &[(String, Expression)],
+    ) -> rand_csp::CspOutcome {
+        let mut scalars = Vec::new();
+        let mut arrays = Vec::new();
+        for (name, lv) in targets {
+            let enum_vals = |me: &Self, n: &str| {
+                me.declared_enum_members(n)
+                    .filter(|m| !m.is_empty())
+                    .map(|m| m.iter().map(|x| x.1).collect::<Vec<u64>>())
+            };
+            if let Some(nm) = self.array_operand_name(lv) {
+                if self.module.arrays_nd.contains_key(&nm) || self.module.arrays_2d.contains_key(&nm) {
+                    return rand_csp::CspOutcome::NotApplicable;
+                }
+                let dynamic = self.module.dynamic_arrays.contains(&nm)
+                    || self.signals.contains_key(&Self::name_with_suffix(&nm, ".size"));
+                let idx: Vec<i64> = if dynamic {
+                    (0..self.get_queue_size(&nm) as i64).collect()
+                } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&nm) {
+                    (lo.min(hi)..=lo.max(hi)).collect()
+                } else {
+                    return rand_csp::CspOutcome::NotApplicable;
+                };
+                let Some(first) = idx.first() else {
+                    // An empty array has no element variables.
+                    continue;
+                };
+                let Some(v0) = self.get_signal_value_by_name(&format!("{}[{}]", nm, first)) else {
+                    return rand_csp::CspOutcome::NotApplicable;
+                };
+                if v0.is_real {
+                    return rand_csp::CspOutcome::NotApplicable;
+                }
+                let w = self.module.arrays.get(&nm).map(|t| t.2 as u32).unwrap_or(v0.width);
+                if w > 64 {
+                    // Left as drawn: a constraint reading it is judged by the
+                    // final check.
+                    continue;
+                }
+                let signed = v0.is_signed || self.signed_signals.contains(&nm);
+                let ev = enum_vals(self, &nm);
+                arrays.push((nm, idx, w.max(1), signed, ev));
+                continue;
+            }
+            if let Some((root, _)) = name.split_once('.') {
+                // A field of a packed struct that is itself a target: a view
+                // of that variable, not a variable of its own.
+                if targets.iter().any(|(n, _)| n == root) {
+                    continue;
+                }
+                return rand_csp::CspOutcome::NotApplicable;
+            }
+            if !matches!(lv.kind, ExprKind::Ident(_)) {
+                return rand_csp::CspOutcome::NotApplicable;
+            }
+            let cur = self.eval_expr(lv);
+            if cur.is_real {
+                return rand_csp::CspOutcome::NotApplicable;
+            }
+            if cur.width > 64 {
+                continue;
+            }
+            let ev = enum_vals(self, name);
+            scalars.push((name.clone(), lv.clone(), cur.width.max(1), cur.is_signed, ev));
+        }
+        self.rand_csp_solve_scope(items, &scalars, &arrays)
+    }
+
+    /// The root variable a `std::randomize` target names: `v`, `s.f`,
+    /// `a[i]` all name `v`/`s`/`a`.
+    fn randomize_target_root(e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) => h.path.first().map(|s| s.name.name.clone()),
+            ExprKind::Paren(x)
+            | ExprKind::MemberAccess { expr: x, .. }
+            | ExprKind::Index { expr: x, .. }
+            | ExprKind::RangeSelect { expr: x, .. } => Self::randomize_target_root(x),
+            _ => None,
+        }
+    }
+
     fn expr_leaf_name(e: &Expression) -> Option<String> {
         match &e.kind {
             ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()),
@@ -76692,6 +77041,15 @@ impl Simulator {
                     }
                 }
                 // Fall back to bit select
+                if let Some((dl, dr)) = self.class_prop_select_dim(expr) {
+                    return match self.eval_expr(index).to_index() {
+                        Some(i) if i >= dl.min(dr) && i <= dl.max(dr) => {
+                            let physical = if dl < dr { dr - i } else { i - dr };
+                            self.eval_expr(expr).bit_select(physical as usize)
+                        }
+                        _ => Value::new(1),
+                    };
+                }
                 if let ExprKind::Ident(h) = &expr.kind {
                     let nm = self.resolve_hier_name(h);
                     if let Some(dims) = self.module.packed_full_dims.get(&*nm) {
@@ -76898,7 +77256,8 @@ impl Simulator {
                             .copied()
                     }
                     _ => None,
-                };
+                }
+                .or_else(|| self.class_prop_select_dim(expr));
                 if let Some((dl, dr)) = plain_dim.filter(|&(l, r)| l >= r) {
                     let _ = dl;
                     if dr != 0 {
@@ -76907,7 +77266,9 @@ impl Simulator {
                             ri -= dr;
                         }
                     }
-                } else if let Some((dl, dr)) = self.select_base_elem_dim(expr) {
+                } else if let Some((dl, dr)) =
+                    plain_dim.or_else(|| self.select_base_elem_dim(expr))
+                {
                     // ELEMENT of an unpacked array/queue/assoc (or a packed
                     // element): `logic [31:8] q[$]; q[0][31:8]` selects the
                     // whole element (this read xxabcd — bits 23:8 plus
@@ -103328,6 +103689,14 @@ impl Simulator {
                                     targets.push((n, a.clone()));
                                 }
                             }
+                            // Guards decided by state variables alone pick
+                            // their branch now (see `fold_state_guards`).
+                            let rand_roots: HashSet<String> = args
+                                .iter()
+                                .filter_map(Self::randomize_target_root)
+                                .collect();
+                            let folded = self.fold_state_guards(constraints, &rand_roots);
+                            let constraints: &[crate::ast::decl::ConstraintItem] = &folded;
                             let mut satisfied = false;
                             for attempt in 0..10 {
                                 if attempt > 0 {
@@ -103335,6 +103704,11 @@ impl Simulator {
                                     // constraint violated — reseed and retry.
                                     self.exec_std_randomize(args);
                                 }
+                                // §18.4: a dynamic-array target whose size is
+                                // only bounded (`a.size() >= n`, `inside`) gets
+                                // a size inside the bounds; an `==` is left to
+                                // the item itself.
+                                self.size_bounded_dyn_targets(constraints, &targets);
                                 // §18.5.12 (issue #4): COUPLED affine constraints
                                 // (`A + B < 1000`, `A < B`, `A + B == 50`) tie two
                                 // targets together, so per-target narrowing below
@@ -103474,6 +103848,18 @@ impl Simulator {
                                 // ascending cross-element chain that exhausts
                                 // its headroom); a fresh seed usually escapes.
                                 if self.inline_constraints_satisfied(constraints) {
+                                    satisfied = true;
+                                    break;
+                                }
+                                // The per-variable repair above cannot satisfy
+                                // constraints that tie several variables
+                                // together (`sum()`, chains, guarded
+                                // relations): solve them jointly, with the
+                                // array sizes this pass chose.
+                                if matches!(
+                                    self.std_randomize_joint(constraints, &targets),
+                                    rand_csp::CspOutcome::Sat
+                                ) {
                                     satisfied = true;
                                     break;
                                 }
@@ -104339,13 +104725,13 @@ impl Simulator {
                         // §18.5.7.1: bind the index variable so body
                         // expressions (`arr[i]`, `i + 5`) see the concrete
                         // index value.
-                        let mut frame: HashMap<String, Value> = HashMap::default();
-                        if let Some(iv) = &idx_var {
-                            frame.insert(iv.clone(), Self::signed_loop_val(i));
-                        }
-                        self.push_local_frame(frame);
+                        let binds: Vec<(String, Value)> = idx_var
+                            .iter()
+                            .map(|iv| (iv.clone(), Self::signed_loop_val(i)))
+                            .collect();
+                        let saved = self.bind_loop_vars(binds);
                         self.solve_inline_foreach_elem(item, &arr_name, i, elem_w);
-                        self.pop_local_frame();
+                        self.unbind_loop_vars(saved);
                     }
                 } else if let Some(w) = Self::plain_ident_name(base)
                     .and_then(|n| self.lookup_signal_width(&n))
@@ -104363,13 +104749,13 @@ impl Simulator {
                         .first()
                         .and_then(|v| v.as_ref().map(|id| id.name.clone()));
                     for i in 0..w as i64 {
-                        let mut frame: HashMap<String, Value> = HashMap::default();
-                        if let Some(iv) = &idx_var {
-                            frame.insert(iv.clone(), Self::signed_loop_val(i));
-                        }
-                        self.push_local_frame(frame);
+                        let binds: Vec<(String, Value)> = idx_var
+                            .iter()
+                            .map(|iv| (iv.clone(), Self::signed_loop_val(i)))
+                            .collect();
+                        let saved = self.bind_loop_vars(binds);
                         self.apply_inline_constraint(item, targets);
-                        self.pop_local_frame();
+                        self.unbind_loop_vars(saved);
                     }
                 }
             }
@@ -104405,6 +104791,271 @@ impl Simulator {
             Some(nm.to_string())
         } else {
             None
+        }
+    }
+
+    /// Bind `foreach` index variables for a `std::randomize` constraint walk.
+    /// They go into the CURRENT local frame (a fresh frame would hide the
+    /// caller's automatic locals — lookups see only the top frame — so a
+    /// `foreach (mask[i]) if (mask[i]) …` over a task-local `mask` read x,
+    /// and writes to a task-local target were lost when the frame popped).
+    /// Returns what to restore; outside any frame one is pushed.
+    fn bind_loop_vars(&mut self, binds: Vec<(String, Value)>) -> Option<Vec<(String, Option<Value>)>> {
+        let Some(top) = self.local_stack.last_mut() else {
+            self.push_local_frame(binds.into_iter().collect());
+            return None;
+        };
+        Some(
+            binds
+                .into_iter()
+                .map(|(k, v)| {
+                    let old = top.insert(k.clone(), v);
+                    (k, old)
+                })
+                .collect(),
+        )
+    }
+
+    fn unbind_loop_vars(&mut self, saved: Option<Vec<(String, Option<Value>)>>) {
+        let Some(saved) = saved else {
+            self.pop_local_frame();
+            return;
+        };
+        if let Some(top) = self.local_stack.last_mut() {
+            for (k, old) in saved.into_iter().rev() {
+                match old {
+                    Some(v) => {
+                        top.insert(k, v);
+                    }
+                    None => {
+                        top.remove(&k);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `std::randomize` sizing for dynamic-array targets constrained only by
+    /// bounds on `size()`: collect `size() REL e` / `e REL size()` (with `e`
+    /// reading no target) and `size() inside {…}` over the top-level items,
+    /// and draw a size inside them. An array with an `==` on its size, or no
+    /// bound at all, is left alone.
+    fn size_bounded_dyn_targets(
+        &mut self,
+        constraints: &[crate::ast::decl::ConstraintItem],
+        targets: &[(String, Expression)],
+    ) {
+        use crate::ast::decl::ConstraintItem as CI;
+        use rand::Rng;
+        let roots: HashSet<String> = targets
+            .iter()
+            .filter_map(|(_, lv)| Self::randomize_target_root(lv))
+            .collect();
+        let mut flat: Vec<&CI> = Vec::new();
+        let mut stack: Vec<&CI> = constraints.iter().collect();
+        while let Some(it) = stack.pop() {
+            match it {
+                CI::Block(xs) => stack.extend(xs.iter()),
+                other => flat.push(other),
+            }
+        }
+        // array -> (lo, hi, pinned by ==)
+        let mut bounds: HashMap<String, (i64, i64, bool)> = HashMap::default();
+        for it in flat {
+            match it {
+                CI::Expr(e) => {
+                    let ExprKind::Binary { op, left, right } = &e.kind else {
+                        continue;
+                    };
+                    let (arr, other, flip) = if let Some(a) = self.size_call_on_target(left, targets) {
+                        (a, right, false)
+                    } else if let Some(a) = self.size_call_on_target(right, targets) {
+                        (a, left, true)
+                    } else {
+                        continue;
+                    };
+                    let b = bounds.entry(arr).or_insert((0, i32::MAX as i64, false));
+                    if *op == BinaryOp::Eq {
+                        b.2 = true;
+                        continue;
+                    }
+                    let mut reads = false;
+                    Self::walk_operands(other, &mut |x| {
+                        if let ExprKind::Ident(h) = &x.kind {
+                            if h.path.first().is_some_and(|f| roots.contains(&f.name.name)) {
+                                reads = true;
+                            }
+                        }
+                    });
+                    if reads {
+                        b.2 = true;
+                        continue;
+                    }
+                    let Some(k) = self.eval_expr(other).to_i64() else {
+                        continue;
+                    };
+                    // Read as `size OP k`.
+                    let op = if flip {
+                        match op {
+                            BinaryOp::Lt => BinaryOp::Gt,
+                            BinaryOp::Leq => BinaryOp::Geq,
+                            BinaryOp::Gt => BinaryOp::Lt,
+                            BinaryOp::Geq => BinaryOp::Leq,
+                            o => *o,
+                        }
+                    } else {
+                        *op
+                    };
+                    match op {
+                        BinaryOp::Gt => b.0 = b.0.max(k.saturating_add(1)),
+                        BinaryOp::Geq => b.0 = b.0.max(k),
+                        BinaryOp::Lt => b.1 = b.1.min(k.saturating_sub(1)),
+                        BinaryOp::Leq => b.1 = b.1.min(k),
+                        _ => {}
+                    }
+                }
+                CI::Inside { expr, range, .. } => {
+                    if let Some(arr) = self.size_call_on_target(expr, targets) {
+                        // A set membership pins the choice to the set.
+                        let b = bounds.entry(arr).or_insert((0, i32::MAX as i64, false));
+                        if range.len() == 1 {
+                            if let crate::ast::decl::ConstraintRange::Range { lo, hi } = &range[0] {
+                                if let (Some(l), Some(h)) =
+                                    (self.eval_expr(lo).to_i64(), self.eval_expr(hi).to_i64())
+                                {
+                                    b.0 = b.0.max(l);
+                                    b.1 = b.1.min(h);
+                                    continue;
+                                }
+                            }
+                        }
+                        b.2 = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (arr, (lo, hi, pinned)) in bounds {
+            if pinned || lo > hi || (lo == 0 && hi == i32::MAX as i64) {
+                continue;
+            }
+            // An open upper bound stays near the lower one: an unbounded
+            // draw would build an enormous array.
+            let hi = hi.min(lo.saturating_add(1024));
+            let n = self.cur_rng().gen_range(lo.max(0)..=hi.max(lo.max(0)));
+            self.resize_random_dyn_target(&arr, n as u64);
+        }
+    }
+
+    /// §7.2.1/§7.4.5: a struct member that is a dynamic collection is its
+    /// own collection object. Elaboration registers it for a plain struct
+    /// variable with a one-dimension member (`s.q` for `int q[$]`), but an
+    /// element of an ARRAY of structs (`sa[1].q`) was left out of
+    /// `dynamic_arrays` — `push_back` was dropped and `size()` read the
+    /// storage placeholder — and a member that is an ARRAY of queues
+    /// (`rg_t q[7:0][$]`) was registered as a 2-D array of scalars. Register
+    /// both the way a standalone `int q[$]` / `int aq[7:0][$]` is.
+    fn register_struct_member_collections(&mut self) {
+        use crate::ast::types::UnpackedDimension as UD;
+        let roots: Vec<(String, DataType)> = self
+            .module
+            .var_decl_types
+            .iter()
+            .filter(|(k, _)| !k.contains(['.', '[', ':']))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let params = self.module.parameters.clone();
+        let fixed = |d: &UD| -> Option<(i64, i64)> {
+            match d {
+                UD::Range { left, right, .. } => {
+                    let l = super::elaborate::const_eval_i64_with_params(left, Some(&params))?;
+                    let r = super::elaborate::const_eval_i64_with_params(right, Some(&params))?;
+                    Some((l.min(r), l.max(r)))
+                }
+                UD::Expression { expr, .. } => {
+                    let n = super::elaborate::const_eval_i64_with_params(expr, Some(&params))?;
+                    (n > 0).then_some((0, n - 1))
+                }
+                _ => None,
+            }
+        };
+        let mut new_dyn: Vec<(String, u32, bool)> = Vec::new();
+        let mut new_outer: Vec<(String, (i64, i64), u32)> = Vec::new();
+        for (root, dt) in roots {
+            let resolved =
+                super::elaborate::resolve_typedef_chain(&dt, &self.module.typedef_types).clone();
+            let DataType::Struct(su) = resolved else {
+                continue;
+            };
+            if su.packed {
+                continue;
+            }
+            // The struct variables: the root itself, or each element of a
+            // 1-D array of structs.
+            let elem_array = self
+                .module
+                .arrays
+                .get(&root)
+                .copied()
+                .filter(|_| !self.module.dynamic_arrays.contains(&root));
+            let prefixes: Vec<String> = match elem_array {
+                Some((lo, hi, _)) => (lo.min(hi)..=lo.max(hi))
+                    .map(|i| format!("{}[{}]", root, i))
+                    .collect(),
+                None => vec![root.clone()],
+            };
+            for m in &su.members {
+                let mw = super::elaborate::resolve_type_width(
+                    &m.data_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+                .max(1);
+                for d in &m.declarators {
+                    let dyn_kind = |x: &UD| match x {
+                        UD::Queue { .. } => Some(true),
+                        UD::Unsized(_) => Some(false),
+                        _ => None,
+                    };
+                    match d.dimensions.as_slice() {
+                        [one] if elem_array.is_some() => {
+                            if let Some(is_q) = dyn_kind(one) {
+                                for p in &prefixes {
+                                    new_dyn.push((format!("{}.{}", p, d.name.name), mw, is_q));
+                                }
+                            }
+                        }
+                        [outer, last] => {
+                            let (Some(range), Some(is_q)) = (fixed(outer), dyn_kind(last)) else {
+                                continue;
+                            };
+                            for p in &prefixes {
+                                let base = format!("{}.{}", p, d.name.name);
+                                for i in range.0..=range.1 {
+                                    new_dyn.push((format!("{}[{}]", base, i), mw, is_q));
+                                }
+                                new_outer.push((base, range, mw));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for (base, (lo, hi), w) in new_outer {
+            self.module.arrays_2d.remove(&base);
+            self.module.arrays.insert(base, (lo, hi, w));
+        }
+        for (name, w, is_q) in new_dyn {
+            if self.module.dynamic_arrays.contains(&name) {
+                continue;
+            }
+            self.module.dynamic_arrays.insert(name.clone());
+            if is_q {
+                self.module.queue_vars.insert(name.clone());
+            }
+            self.module.arrays.insert(name.clone(), (0, 63, w));
+            self.set_queue_size(&name, 0);
         }
     }
 
@@ -104823,13 +105474,13 @@ impl Simulator {
             return;
         }
         loop {
-            let mut frame: HashMap<String, Value> = HashMap::default();
+            let mut binds: Vec<(String, Value)> = Vec::new();
             for (k, n) in names.iter().enumerate() {
                 if let Some(n) = n {
-                    frame.insert(n.clone(), Self::signed_loop_val(idx[k]));
+                    binds.push((n.clone(), Self::signed_loop_val(idx[k])));
                 }
             }
-            self.push_local_frame(frame);
+            let saved = self.bind_loop_vars(binds);
             let cur = self.eval_expr(&elem);
             let w = cur.width.max(1);
             let (mut lo, mut hi): (i64, i64) =
@@ -104923,7 +105574,7 @@ impl Simulator {
                     self.assign_value(&t, &v);
                 }
             }
-            self.pop_local_frame();
+            self.unbind_loop_vars(saved);
             let mut k = idx.len();
             loop {
                 if k == 0 {
@@ -105279,7 +105930,10 @@ impl Simulator {
                 item: body,
                 ..
             } => {
-                if Self::constraint_unmodeled(body) {
+                // §18.12: the scope's collections are already sized, so a
+                // `size()`/`sum()`/`min()`… term is an ordinary value here —
+                // only `solve…before` carries no condition.
+                if matches!(**body, CI::Solve { .. }) {
                     return true;
                 }
                 let base = match &array.kind {
@@ -105309,15 +105963,15 @@ impl Simulator {
                     return true;
                 }
                 loop {
-                    let mut frame: HashMap<String, Value> = HashMap::default();
+                    let mut binds: Vec<(String, Value)> = Vec::new();
                     for (k, iv) in idx_vars.iter().enumerate() {
                         if let (Some(iv), Some(&i)) = (iv, idx.get(k)) {
-                            frame.insert(iv.clone(), Self::signed_loop_val(i));
+                            binds.push((iv.clone(), Self::signed_loop_val(i)));
                         }
                     }
-                    self.push_local_frame(frame);
+                    let saved = self.bind_loop_vars(binds);
                     let ok = self.check_constraint_item_impl(body);
-                    self.pop_local_frame();
+                    self.unbind_loop_vars(saved);
                     if !ok {
                         return false;
                     }
@@ -105345,12 +105999,8 @@ impl Simulator {
                 }
                 true
             }
-            _ => {
-                if Self::constraint_unmodeled(item) {
-                    return true;
-                }
-                self.check_constraint_item_impl(item)
-            }
+            CI::Solve { .. } => true,
+            _ => self.check_constraint_item_impl(item),
         }
     }
 
@@ -109213,6 +109863,84 @@ impl Simulator {
             return None;
         }
         Some((handle, nm.clone()))
+    }
+
+    /// §7.4.1/§11.5.1: the declared (left, right) range of the class
+    /// property a select's base names (`a`, `this.a`, `obj.a`) when that
+    /// range is ascending or does not end at bit 0 (`logic [31:8] a`):
+    /// select labels map relative to `right`. Class properties are not in the
+    /// signal tables that give a module vector its declared range, so
+    /// `a[31:16]` read bits 31..16 of the 24 stored ones.
+    fn class_prop_select_dim(&mut self, base: &Expression) -> Option<(i64, i64)> {
+        if self.no_class_objects() {
+            return None;
+        }
+        let (h, prop) = match self.class_prop_receiver(base) {
+            Some(r) => r,
+            // Inside a solve the receiver local of `obj.randomize() with
+            // { obj.p[…] … }` is out of scope; it names the object being
+            // randomized (`this`).
+            None => {
+                let (recv, prop) = Self::split_trailing_member(base)?;
+                let rn = Self::plain_ident_name(&recv)?;
+                if self.rand_receiver.as_deref() != Some(rn.as_str()) {
+                    return None;
+                }
+                (self.this_stack.last().copied().flatten()?, prop)
+            }
+        };
+        let class = self.heap.get(h)?.as_ref()?.class_name.clone();
+        let key = (class, prop);
+        if let Some(hit) = self.class_prop_dim_cache.borrow().get(&key) {
+            return *hit;
+        }
+        let mut found: Option<(i64, i64)> = None;
+        let mut cur = Some(key.0.clone());
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+            let Some(cd) = self.module.classes.get(&cn) else { break };
+            if cd.properties.contains_key(&key.1) {
+                if let Some(dt) = self.class_prop_decl_type(cd, &key.1) {
+                    let dt = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+                    if let DataType::IntegerVector { dimensions, .. } = dt {
+                        if let [crate::ast::types::PackedDimension::Range { left, right, .. }] =
+                            dimensions.as_slice()
+                        {
+                            let params = self.instance_param_scope(h);
+                            let l = super::elaborate::const_eval_i64_with_params(left, Some(&params))
+                                .or_else(|| {
+                                    super::elaborate::const_eval_i64_with_params(
+                                        left,
+                                        Some(&self.module.parameters),
+                                    )
+                                });
+                            let r = super::elaborate::const_eval_i64_with_params(right, Some(&params))
+                                .or_else(|| {
+                                    super::elaborate::const_eval_i64_with_params(
+                                        right,
+                                        Some(&self.module.parameters),
+                                    )
+                                });
+                            if let (Some(l), Some(r)) = (l, r) {
+                                if l < r || r != 0 {
+                                    found = Some((l, r));
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        // A type parameter can bind differently per specialization: cache
+        // only a class-chain answer that does not depend on one.
+        self.class_prop_dim_cache.borrow_mut().insert(key, found);
+        found
     }
 
     /// The declared struct/union type of class property `prop` on `handle`.
@@ -128546,8 +129274,18 @@ impl Simulator {
             if let Some(cg_def) = self.covergroup_def_for(name) {
                 return self.instantiate_covergroup(&cg_def, args);
             }
-            // DPI import call
-            if let Some(v) = self.exec_dpi_import_call(name, args) {
+            // DPI import call — through an instance path (`u_a.c_fn()`), the
+            // call runs in that instance's scope (§35.5.3).
+            let via: Option<String> = (hier.path.len() > 1)
+                .then(|| {
+                    hier.path[..hier.path.len() - 1]
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")
+                })
+                .filter(|p| self.module.instances.iter().any(|i| &i.path == p));
+            if let Some(v) = self.exec_dpi_import_call_in(name, args, via.as_deref()) {
                 return v;
             }
             // Unqualified call inside a class method — resolve to a method

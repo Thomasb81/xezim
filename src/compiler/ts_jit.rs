@@ -10,7 +10,7 @@
 pub mod enabled {
     use super::super::bytecode::TsInsn;
     use super::super::simulator::Simulator;
-    use cranelift::codegen::ir::MemFlagsData;
+    use cranelift::codegen::ir::MemFlags;
     use cranelift::prelude::*;
     use cranelift_jit::{JITBuilder, JITModule as ClJitModule};
     use cranelift_module::{FuncId, Linkage, Module};
@@ -589,7 +589,7 @@ pub mod enabled {
             let sim = b.block_params(entry)[0];
             let table = b.block_params(entry)[1];
             let mut regs: Vec<Option<Value>> = vec![None; num_regs as usize];
-            let flags = MemFlagsData::trusted();
+            let flags = MemFlags::trusted();
             macro_rules! reg {
                 ($r:expr) => {{
                     let i = $r as usize;
@@ -936,8 +936,7 @@ pub mod enabled {
             b.ins().return_(&[two]);
             let _ = &bail_abort;
             b.seal_all_blocks();
-            let tcfg = self.module.target_config();
-            b.finalize(tcfg);
+            b.finalize();
             if std::env::var_os("XEZIM_TS_JIT_CLIF").is_some() {
                 eprintln!("[TS-JIT CLIF]\n{}", ctx.func.display());
             }

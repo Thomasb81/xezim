@@ -7,6 +7,8 @@ on:
 env:
   # Surface a panic location instead of just "exit code 101" in the job log.
   RUST_BACKTRACE: 1
+  CARGO_BUILD_JOBS: 1
+  RUST_TEST_THREADS: 2
 
 jobs:
   test:

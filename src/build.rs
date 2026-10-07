@@ -126,27 +126,37 @@ fn main() {
     // stable (`c_variadic` is unstable). Compile a small C shim and link it
     // in. Invoked through `cc` directly rather than via the `cc` crate so
     // this adds no build dependency.
-    let src = "src/vpi_printf_shim.c";
-    println!("cargo:rerun-if-changed={}", src);
+    // svdpi_shim.c holds the IEEE 1800 Annex H DPI-C utilities that work on
+    // C memory (open arrays, bit/part selects, user data) — several of them
+    // C-variadic too.
+    let srcs = ["src/vpi_printf_shim.c", "src/svdpi_shim.c"];
+    for src in srcs {
+        println!("cargo:rerun-if-changed={}", src);
+    }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let obj = out_dir.join("vpi_printf_shim.o");
     let lib = out_dir.join("libvpishim.a");
 
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let status = Command::new(&cc)
-        .args(["-c", "-fPIC", "-O2", src, "-o"])
-        .arg(&obj)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to run {}: {}", cc, e));
-    assert!(status.success(), "{} failed on {}", cc, src);
+    let mut objs = Vec::new();
+    for src in srcs {
+        let stem = std::path::Path::new(src).file_stem().unwrap().to_string_lossy().to_string();
+        let obj = out_dir.join(format!("{}.o", stem));
+        let status = Command::new(&cc)
+            .args(["-c", "-fPIC", "-O2", src, "-o"])
+            .arg(&obj)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run {}: {}", cc, e));
+        assert!(status.success(), "{} failed on {}", cc, src);
+        objs.push(obj);
+    }
 
     let ar = std::env::var("AR").unwrap_or_else(|_| "ar".to_string());
     let _ = std::fs::remove_file(&lib);
     let status = Command::new(&ar)
         .arg("crs")
         .arg(&lib)
-        .arg(&obj)
+        .args(&objs)
         .status()
         .unwrap_or_else(|e| panic!("failed to run {}: {}", ar, e));
     assert!(status.success(), "{} failed", ar);
