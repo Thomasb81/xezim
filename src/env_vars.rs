@@ -864,7 +864,11 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_UVM_DIR",
-        "Path to a UVM source tree auto-added for UVM designs",
+        "UVM source tree (src dir, release root or multi-release checkout) added to UVM designs",
+    ),
+    (
+        "XEZIM_UVM_VERSION",
+        "Release subdirectory of a multi-release XEZIM_UVM_DIR checkout (default: newest present)",
     ),
     (
         "XEZIM_VALUE_TRACE",

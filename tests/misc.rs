@@ -271,6 +271,8 @@ mod unnamed_block_end_label;
 mod unsized_decimal_wrap_warning;
 #[path = "misc/uvm_agent_active_config.rs"]
 mod uvm_agent_active_config;
+#[path = "misc/uvm_dir_env.rs"]
+mod uvm_dir_env;
 #[path = "misc/uvm_dpi_builtins.rs"]
 mod uvm_dpi_builtins;
 #[path = "misc/value_trace.rs"]

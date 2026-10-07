@@ -31,6 +31,29 @@ xezim --simulate -s top \
   from a built-in library — see [UVM's DPI-C library](#uvms-dpi-c-library).
 - `+UVM_TESTNAME=<name>` selects the test; it overrides the `run_test("...")` argument.
 
+### Adding the UVM library with `-uvm`
+
+Set `XEZIM_UVM_DIR` once and pass `-uvm` instead of naming the library:
+
+```bash
+export XEZIM_UVM_DIR=/path/to/UVM        # or a release root, or its src/ directory
+xezim -uvm -s top -I <rtl> -I <sv> -I <tb> \
+  <design and testbench files...> +UVM_TESTNAME=<test_name>
+```
+
+`-uvm` puts the library's `src` directory on the include path, after your own
+`-I` directories, and its `uvm_pkg.sv` first in the file list. It works with
+`--compile`, `--parse` and `--preprocess` as well as simulation, and inside
+`-f`/`-F` args files. A file list that already contains a `uvm_pkg.sv` is left
+as it is. Without `-uvm`, nothing is added even when `XEZIM_UVM_DIR` is set.
+
+`XEZIM_UVM_DIR` may name the `src` directory, a release root that holds
+`src/`, or a checkout holding several releases as subdirectories, such as
+https://github.com/nitronis/UVM (`1.1d`, `1.2`, `1800.2-2017`, `1800.2-2020`).
+For such a checkout, `XEZIM_UVM_VERSION=<release>` picks the release; the
+default is the newest present. `-uvm` without a usable `XEZIM_UVM_DIR` stops
+with an error that says what is missing.
+
 ### Worked example — GettingVerilatorStartedWithUVM
 
 ```bash

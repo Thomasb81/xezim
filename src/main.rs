@@ -7,6 +7,7 @@ mod report;
 
 // Other simulators' command-line spellings (`-do`, `-g`, `-sv_seed`, ...).
 mod cli_compat;
+mod uvm_dir;
 
 /// The library's `chatter!` for the CLI: internal lines (run banner, `[PHASE]`
 /// timings) print only under `--verbose`/`--profile`/`--sim-debug`.
@@ -155,6 +156,8 @@ fn print_usage() {
     eprintln!("  -V               Print version and exit");
     eprintln!("  -I <dir>         Add directory to include search path");
     eprintln!("  -D <name>[=val]  Define a macro");
+    eprintln!("  -uvm, --uvm      Add the UVM library named by XEZIM_UVM_DIR (its src include");
+    eprintln!("                   dir and uvm_pkg.sv); XEZIM_UVM_VERSION picks a release");
     eprintln!("  -s <topmodule>   Specify the top-level module to elaborate");
     eprintln!("  --no-sim         Alias for --compile (deprecated)");
     eprintln!("  --preprocess     Run the preprocessor only; emit expanded text");
@@ -2699,6 +2702,29 @@ fn run_main() -> i32 {
     xezim::set_verbose(
         verbose || sim_debug || env_on("XEZIM_PROFILE_REPORT") || env_on("XEZIM_PROFILE_TIMING"),
     );
+
+    // `-uvm`: add the UVM library that `XEZIM_UVM_DIR` names (its `src`
+    // include directory and `uvm_pkg.sv`; src/uvm_dir.rs). Before
+    // `--dump-files-list`, so the list shows what was added.
+    match uvm_dir::apply_uvm_dir(
+        compat.uvm,
+        env::var("XEZIM_UVM_DIR").ok().as_deref(),
+        env::var("XEZIM_UVM_VERSION").ok().as_deref(),
+        &mut source_files,
+        &mut include_dirs,
+    ) {
+        uvm_dir::UvmDirAction::Added(src) if verbose => {
+            eprintln!(
+                "[xezim] -uvm: added {}/uvm_pkg.sv and its include directory",
+                src.display()
+            );
+        }
+        uvm_dir::UvmDirAction::Error(why) => {
+            eprintln!("Error: {}", why);
+            std::process::exit(1);
+        }
+        _ => {}
+    }
 
     // `--dump-files-list`: the fully resolved compilation file set, after every
     // `-f` args file has been expanded. Printed BEFORE the files are read so

@@ -36,6 +36,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   range that uses another parameter of the same instance uses the instance's
   own value. (#237, from xezim-core PR #52 and PR #264 by Ganesh T S)
 
+**Usability**
+
+* `-uvm` (or `--uvm`) adds the UVM library that `XEZIM_UVM_DIR` names, for
+  compile and simulation alike: its `src` directory joins the include path and
+  its `uvm_pkg.sv` the file list, so a UVM testbench needs only its own files.
+  `XEZIM_UVM_DIR` may name the `src` directory, a release root, or a checkout
+  of several releases, where `XEZIM_UVM_VERSION` picks one (default: the
+  newest). Without `-uvm` nothing is added.
+
 ### 0.11.1 — complete VPI, faster memory models, IEEE 1800 conformance fixes (October 2026)
 
 **Correctness**

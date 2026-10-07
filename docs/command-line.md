@@ -15,6 +15,7 @@ how to use them together, see the [user guide](user-guide.md).
 |---|---|
 | `-D<MACRO>[=val]` | Define a preprocessor macro |
 | `-I<dir>` | Add an include directory |
+| `-uvm`, `--uvm` | Add the UVM library that `XEZIM_UVM_DIR` names: its `src` directory goes on the include path and its `uvm_pkg.sv` becomes the first source file, unless the file list already has a `uvm_pkg.sv`. Works in every mode and inside `-f`/`-F` files. Without `-uvm` nothing is added. See the [UVM guide](uvm-guide.md#adding-the-uvm-library-with--uvm) |
 | `--simulate` | Run the simulation (vs `--parse` / `--compile` / `--preprocess`) |
 | `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); each is a root of its own in `%m`, messages, `$root` paths and waveform scopes, as when several tops are found automatically. A bare module name that is not a file does the same (see [below](#command-lines-from-other-simulators)) |
 | `--no-strict-top` | When an `-s` names no module, warn and find the tops automatically instead of exiting 1 |
@@ -83,6 +84,8 @@ unless noted.
 | `XEZIM_COV_DB=<path>` | Write the coverage results somewhere other than `xezim_cov.json` |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
 | `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
+| `XEZIM_UVM_DIR=<dir>` | The UVM library `-uvm` adds: a `src` directory, a release root holding `src/`, or a checkout holding several releases (`1.1d`, `1.2`, `1800.2-2017`, `1800.2-2020`) |
+| `XEZIM_UVM_VERSION=<release>` | With a multi-release `XEZIM_UVM_DIR`, the release subdirectory to use (default: the newest present) |
 | `XEZIM_VALUE_TRACE=<substr>[,...]` | Print every committed change of signals whose hierarchical name contains a pattern: time, name, old→new value, dispatch phase, writing process origin (file:line). NBA commits are labeled `nba` |
 | `XEZIM_VALUE_TRACE_LIMIT=N` | Cap value-trace output lines (default 20000) |
 
