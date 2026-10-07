@@ -2568,6 +2568,7 @@ impl NbaFastIndex {
 }
 
 mod code_cov;
+mod dpi_task;
 mod event_bits;
 mod module_paths;
 mod names;
@@ -7361,6 +7362,16 @@ pub struct Simulator {
     /// statements run on the synchronous path and cannot park, so a wait
     /// there runs the scheduler nested instead (`run_nested_until`).
     dpi_export_depth: u32,
+    /// §35.5.2/§35.9: imported tasks running on their own stacks
+    /// (`dpi_task.rs`): the SV names of the imported tasks a loaded library
+    /// implements (empty: none, and the mechanism costs nothing), the live
+    /// calls by id, the one running now, and whether that one is unwinding
+    /// after a disable.
+    dpi_task_names: HashSet<String>,
+    dpi_tasks: HashMap<u64, Box<dpi_task::DpiTask>>,
+    dpi_cur_task: Option<u64>,
+    dpi_unwinding: bool,
+    next_dpi_task: u64,
     /// Wake markers fired by waiters registered from that nested path.
     sync_wakes: HashSet<u64>,
     next_sync_wake: u64,
@@ -12322,6 +12333,11 @@ impl Simulator {
             parked_from_exec: false,
             exec_park_cont: None,
             dpi_export_depth: 0,
+            dpi_task_names: HashSet::default(),
+            dpi_tasks: HashMap::default(),
+            dpi_cur_task: None,
+            dpi_unwinding: false,
+            next_dpi_task: 1,
             sync_wakes: HashSet::default(),
             next_sync_wake: 0,
             mcd_names: HashMap::default(),
@@ -13014,6 +13030,7 @@ impl Simulator {
         }
         sim.load_dpi_libraries();
         sim.bind_all_dpi_imports();
+        sim.dpi_tasks_setup();
         // VPI modules register their $systf's before simulation starts. The
         // startup routines run with ACTIVE_SIMULATOR set, so a routine that
         // resolves a handle sees a built design.
@@ -15374,7 +15391,9 @@ impl Simulator {
                 .iter()
                 .map(|p| self.dpi_export_port_kind(&p.data_type, p.direction))
                 .collect();
-            Some((DpiExpKind::Void, args))
+            // §35.9: the C function for an exported task returns int — 1
+            // when it returned because of a disable, else 0.
+            Some((DpiExpKind::I32, args))
         } else {
             None
         }
@@ -15408,13 +15427,20 @@ impl Simulator {
         );
         let mut emitted = 0usize;
         let c_names = self.module.dpi_export_c_names.clone();
+        // §35.5.3: every instance of a module that exports a subroutine
+        // shares its C symbol; one entry point serves them all and the
+        // dispatch picks the instance by scope (`dpi_export_for_scope`).
+        let mut seen_c: HashSet<&str> = HashSet::default();
         for (id, name) in exports.iter().enumerate() {
-            let Some((ret, args)) = self.dpi_export_signature(name) else {
-                continue;
-            };
             // The symbol the C side links against: the export's alias when
             // one was declared, else the SV name.
             let c_name: &str = c_names.get(id).map(|s| s.as_str()).unwrap_or(name);
+            if !seen_c.insert(c_name) {
+                continue;
+            }
+            let Some((ret, args)) = self.dpi_export_signature(name) else {
+                continue;
+            };
             let supported = ret != DpiExpKind::Bad && !args.contains(&DpiExpKind::Bad);
             let params: Vec<String> = if supported {
                 args.iter()
@@ -15545,6 +15571,37 @@ impl Simulator {
     /// `nargs` 64-bit slots (integers by value, reals as IEEE-754 bits). The
     /// return is a 64-bit slot: an integer value, or a real's bit pattern.
     fn run_dpi_export(&mut self, id: usize, nargs: usize, args: *const i64) -> i64 {
+        // §35.9 d): an imported subroutine in the disabled state may not call
+        // an export any more.
+        if self.dpi_unwinding {
+            self.dpi_protocol_fatal(
+                "an exported subroutine was called after its imported caller was disabled",
+            );
+            return 1;
+        }
+        if self.dpi_cur_task.is_some() && self.dpi_stack_exhausted() {
+            return 0;
+        }
+        let Some(id) = self.dpi_export_for_scope(id) else {
+            let (c, scope) = (
+                self.module
+                    .dpi_export_c_names
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_default(),
+                dpi_task::dpi_scope_name(ACTIVE_SCOPE.with(|cell| cell.get())),
+            );
+            self.emit_severity_text(
+                "Fatal",
+                &format!(
+                    "DPI export '{}' is not declared in the calling scope '{}' or a scope above it (IEEE 1800 clause 35.5.3)",
+                    c, scope
+                ),
+            );
+            self.fatal_finish_number = Some(1);
+            self.finished = true;
+            return 0;
+        };
         let Some(name) = self.module.dpi_exports.get(id).cloned() else {
             return 0;
         };
@@ -15649,6 +15706,18 @@ impl Simulator {
             self.push_local_frame(out_frame);
         }
         let mut ret = 0i64;
+        // An instance's export runs in that instance, as a call through its
+        // hierarchical name does (`$time`, `%m` and bare names included).
+        let inst: Option<String> = name
+            .rsplit_once('.')
+            .filter(|_| !name.contains("::"))
+            .map(|(p, _)| p.to_string());
+        let saved_scope = inst.as_ref().map(|sc| {
+            let hint = self.name_resolve_hint.replace(Some(sc.clone()));
+            let ts = self.timescale_scope_override.replace(sc.clone());
+            (hint, ts)
+        });
+        let on_fiber = self.dpi_note_export(&name, true);
         if let Some(fd) = self.fn_decl_rc(&name) {
             self.dpi_export_depth += 1;
             let r = self.exec_function_call(&fd, &arg_exprs);
@@ -15660,8 +15729,21 @@ impl Simulator {
             };
         } else if let Some(td) = self.task_decl_rc(&name) {
             self.dpi_export_depth += 1;
+            if inst.is_some() {
+                self.task_clears_this = true;
+            }
             self.exec_task_call(&td, &arg_exprs);
             self.dpi_export_depth -= 1;
+            // §35.9 a): an exported task returns 1 when it returns because
+            // its imported caller was disabled, else 0.
+            ret = self.dpi_unwinding as i64;
+        }
+        if on_fiber {
+            self.dpi_note_export(&name, false);
+        }
+        if let Some((hint, ts)) = saved_scope {
+            *self.name_resolve_hint.borrow_mut() = hint;
+            self.timescale_scope_override = ts;
         }
         if has_outs {
             let frame = self.pop_local_frame_take().unwrap_or_default();
@@ -16054,7 +16136,10 @@ impl Simulator {
                 for p in &td.ports {
                     args.push(self.dpi_atom_kind(&p.data_type, &p.dimensions, p.direction)?);
                 }
-                Some((DpiRetKind::Void, args))
+                // §35.9: an imported task's C function returns int, 1 when
+                // it returns because of a disable (checked by the
+                // disable protocol, dpi_task.rs).
+                Some((DpiRetKind::Int32, args))
             }
         }
     }
@@ -16886,6 +16971,19 @@ impl Simulator {
             }
         }
 
+        // §35.9: a task that returns because of a disable must return 1, and
+        // its outputs are not propagated.
+        if self.dpi_unwinding {
+            if matches!(spec.proto, crate::ast::decl::DPIProto::Task(_))
+                && result.to_i64() != Some(1)
+            {
+                self.dpi_protocol_fatal(&format!(
+                    "imported task '{}' was disabled but did not return 1",
+                    sv_name
+                ));
+            }
+            writebacks.clear();
+        }
         // Write back output/ref/inout values.
         for (idx, kind, expr) in writebacks {
             match kind {
@@ -52953,6 +53051,19 @@ impl Simulator {
             self.reset_hint_to_process_scope();
             let stmt = &stmts[i];
 
+            // §35.5.2: the resume marker of a process parked inside an
+            // imported task (dpi_task.rs). Ahead of the flag skips below: a
+            // disable posted meanwhile unwinds the task before the block.
+            if !self.dpi_task_names.is_empty() {
+                if let Some(carry_on) = self.dpi_task_marker(pc, i, stmt) {
+                    if !carry_on {
+                        return;
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+
             // An inlined task/method `return` (return_flag set) must unwind to
             // the enclosing task's `ScopePop` sentinel, skipping the rest of the
             // task body in between (including blocking statements after the `return`).
@@ -53060,6 +53171,18 @@ impl Simulator {
             // here (see `vpi_stmt_hook`).
             if self.vpi_cb_mask & vpi_cb::m(vpi_cb::CB_STMT) != 0 {
                 self.vpi_stmt_hook(stmt, true);
+            }
+
+            // §35.5.2: a call of an imported task runs on its own stack, so
+            // the process can park while the task waits (dpi_task.rs).
+            if !self.dpi_task_names.is_empty() && self.dpi_cur_task.is_none() {
+                if let Some(returned) = self.dpi_task_start(pid, pc, i, stmt) {
+                    if !returned {
+                        return;
+                    }
+                    i += 1;
+                    continue;
+                }
             }
 
             // Expand SeqBlocks: flatten begin/end so that timing controls and waits
@@ -55640,6 +55763,9 @@ impl Simulator {
                 // run_process_stmts, where the await is intercepted and the
                 // process parks in await_waiters instead of busy-spinning.
                 if Self::expr_is_proc_await(e) {
+                    return true;
+                }
+                if self.expr_calls_dpi_task(e) {
                     return true;
                 }
                 // Follow user task calls into their bodies so blocking tasks
@@ -86251,16 +86377,16 @@ impl Simulator {
                     JoinType::Join | JoinType::JoinAny
                         if !child_set.is_empty() && self.dpi_export_depth > 0 =>
                     {
-                        let (id, wpid, wake) = self.new_sync_wake();
+                        let (id, wpid, wake) = self.sync_wait_target();
                         self.join_waiters.push(JoinWaiter {
                             parent_pid: wpid,
                             child_pids: child_set,
                             join_type: *join_type,
-                            continuation: vec![wake].into(),
+                            continuation: wake,
                             finished_children: HashSet::default(),
                             wait_fork: false,
                         });
-                        self.run_nested_until(|sim| sim.sync_wakes.remove(&id));
+                        self.sync_wait(id);
                     }
                     JoinType::Join | JoinType::JoinAny if !child_set.is_empty() => {
                         self.join_waiters.push(JoinWaiter {
@@ -86278,6 +86404,12 @@ impl Simulator {
             }
             StatementKind::TimingControl { control, stmt } => {
                 match control {
+                    // §35.5.2: a delay inside an imported task running on its
+                    // own stack parks the calling process (dpi_task.rs).
+                    TimingControl::Delay(d) if self.dpi_cur_task.is_some() => {
+                        self.dpi_wait_delay(d);
+                        self.exec_statement(stmt);
+                    }
                     TimingControl::Delay(d) => {
                         // The nested work below (run_events_until, settle,
                         // edge cascades) executes OTHER processes and comb
@@ -86367,7 +86499,7 @@ impl Simulator {
                     // the waiter on a wake marker and run the scheduler until
                     // the event fires; the body then runs below (#204).
                     TimingControl::Event(e) if self.dpi_export_depth > 0 => {
-                        let (id, wpid, wake) = self.new_sync_wake();
+                        let (id, wpid, wake) = self.sync_wait_target();
                         let mut key = None;
                         if let Some(fname) = self.event_control_field_name(e) {
                             key = self.resolve_this_event_field(&fname);
@@ -86384,20 +86516,15 @@ impl Simulator {
                             self.instance_event_waiters.push(InstanceEventWaiter {
                                 key,
                                 pid: wpid,
-                                continuation: vec![wake].into(),
+                                continuation: wake,
                             });
                         } else {
                             let sens = self.event_to_sens(e);
                             let is_clk_ev = self.is_clocking_event(e);
-                            let w = self.make_event_waiter_kind(
-                                wpid,
-                                sens,
-                                vec![wake].into(),
-                                is_clk_ev,
-                            );
+                            let w = self.make_event_waiter_kind(wpid, sens, wake, is_clk_ev);
                             self.event_waiters.push(w);
                         }
-                        self.run_nested_until(|sim| sim.sync_wakes.remove(&id));
+                        self.sync_wait(id);
                     }
                     TimingControl::Event(e) => {
                         // Class-field named event parked from the synchronous
@@ -86732,7 +86859,7 @@ impl Simulator {
                     // An ANCESTOR executing the task (the disabling process was
                     // forked inside it) is unwound out of the call instead —
                     // see `disable_remote_block`.
-                    let to_kill: HashSet<usize> = pids
+                    let mut to_kill: HashSet<usize> = pids
                         .into_iter()
                         .filter(|&p| {
                             p != self.current_pid
@@ -86740,6 +86867,13 @@ impl Simulator {
                                 && !self.is_fork_ancestor(p, self.current_pid)
                         })
                         .collect();
+                    // §35.9: an EXPORTED task that is the target returns 0 to
+                    // its C caller, and the process carries on in the C code.
+                    let handled = !self.dpi_tasks.is_empty()
+                        && self.dpi_disable_exported_task(&name.name, &mut to_kill);
+                    if to_kill.is_empty() && handled {
+                        return;
+                    }
                     if !to_kill.is_empty() {
                         for &pid in &to_kill {
                             self.killed_pids.insert(pid);
@@ -86818,7 +86952,9 @@ impl Simulator {
                 // §9.6.1 in a task entered from C (DPI export): the task cannot
                 // park, so wait here until every child of this process is done
                 // (#204). Elsewhere the suspend-aware runner handles it.
-                if self.dpi_export_depth > 0 {
+                if self.dpi_cur_task.is_some() {
+                    self.dpi_wait_fork();
+                } else if self.dpi_export_depth > 0 {
                     let me = self.current_pid;
                     self.run_nested_until(|sim| !sim.process_parents.values().any(|&p| p == me));
                 }
@@ -86842,6 +86978,14 @@ impl Simulator {
             StatementKind::Wait { condition, stmt } => {
                 if self.wait_condition_true(condition) {
                     self.exec_statement(stmt);
+                } else if self.dpi_cur_task.is_some() {
+                    // §35.5.2: inside an imported task running on its own
+                    // stack, the calling process parks until the condition
+                    // holds (dpi_task.rs).
+                    self.dpi_wait_condition(condition);
+                    if !self.finished {
+                        self.exec_statement(stmt);
+                    }
                 } else if self.dpi_export_depth > 0 {
                     // A task entered from C (DPI export) cannot park: wait
                     // here, running the scheduler until the condition holds
@@ -87863,6 +88007,11 @@ impl Simulator {
     /// §9.6.2/§9.7: canceled processes cannot resume their captured waits.
     fn vc_cancel_process(&mut self, pid: usize) {
         self.vc_saved.retain(|_, (owner, _)| *owner != pid);
+        // Every kill site passes here: a process killed while suspended in
+        // an imported task unwinds it by the §35.9 disable protocol.
+        if !self.dpi_tasks.is_empty() {
+            self.dpi_task_killed(pid);
+        }
     }
 
     /// The Wait statement a value-change waiter resumes into.
@@ -135445,8 +135594,8 @@ impl Simulator {
             }
             self.purge_array_formal(param_name);
         }
-        self.break_flag = c.saved_break;
-        self.return_flag = c.saved_return;
+        self.break_flag = c.saved_break || self.dpi_unwinding;
+        self.return_flag = c.saved_return || self.dpi_unwinding;
         self.pop_and_restore_queue_frame();
         for (tmp, caller) in staged_wb {
             self.writeback_queue_param(&tmp, &caller);

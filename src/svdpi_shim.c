@@ -1,7 +1,6 @@
 /* IEEE 1800-2017 Annex H: the DPI-C utility functions that operate on data
  * in C memory - bit/part selects of canonical vectors, the open-array
- * queries and element access, per-scope user data, svGetCallerInfo and the
- * disable-protocol pair.
+ * queries and element access, per-scope user data and svGetCallerInfo.
  *
  * They live in C because several are C-variadic (svGetArrElemPtr,
  * svPutBitArrElemVecVal, ...), which Rust cannot define on stable. Compiled
@@ -428,6 +427,5 @@ int svGetCallerInfo(const char **fileName, int *lineNumber) {
     return 0;
 }
 
-int svIsDisabledState(void) { return 0; }
-
-void svAckDisabledState(void) {}
+/* svIsDisabledState / svAckDisabledState live with the imported-task
+ * machinery in src/compiler/simulator/dpi_task.rs (sec. 35.9). */

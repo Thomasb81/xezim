@@ -286,6 +286,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Select process dispatcher implementation (debug)",
     ),
     (
+        "XEZIM_DPI_STACK_MB",
+        "Stack size in MB reserved for each running DPI imported-task call (default 256)",
+    ),
+    (
         "XEZIM_DUMP_CA_READS",
         "Dump continuous-assign read sets after elaboration",
     ),

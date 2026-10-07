@@ -294,6 +294,25 @@ xezim --dpi-lib /abs/path/to/libfoo.so [more --dpi-lib paths …] <sv files>
   the task has finished: `#` delays, `wait(...)`, `@(...)`, `fork ... join`
   and `wait fork` inside it all run to completion first, with the rest of the
   simulation advancing meanwhile.
+* Each call of an imported task (`import "DPI-C" task t;`) runs on its own
+  stack, so several processes can be inside imported tasks at once and each
+  resumes when its own wait is over (IEEE 1800 §35.5.2, §35.9). The C
+  function returns `int`, and so does the C side of an exported task. The
+  stacks are reserved, not committed, 256 MiB each by default;
+  `XEZIM_DPI_STACK_MB` changes the size. This needs Linux with glibc;
+  elsewhere a wait inside an imported task runs the scheduler nested in the
+  C call, so concurrent calls return in last-in, first-out order.
+* Disabling a process while it waits inside an imported task (`disable` of a
+  block around the call, `disable fork`, `process::kill()`) follows the
+  §35.9 protocol. The waiting exported task returns 1, and
+  `svIsDisabledState()` returns 1. The C code must call
+  `svAckDisabledState()`, return 1 and call no more exports. If it does
+  otherwise, the run ends with a `Fatal`. Outputs of a disabled call are not
+  written back.
+* An export declared in a module that is instantiated belongs to each
+  instance. All instances share the one C symbol, and a call from C runs the
+  copy in the current DPI scope: the instance that a `context` import was
+  called from or through, or the scope set with `svSetScope`.
 * The SV file must `import "DPI-C" function …` (or include a `.svh` that does)
   for every symbol you call from SV. Symbols that exist in the `.so` but
   aren't imported are simply ignored — there's no eager validation.

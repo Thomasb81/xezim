@@ -5,7 +5,8 @@
 //! a C-owned object carried as a chandle, one call writing outputs of
 //! several types, and the Annex H utility API. Each bench prints `T|` lines;
 //! the expected values were worked out by hand from IEEE 1800-2017 clause 35
-//! and Annex H.
+//! and Annex H, and those of the imported-task and instance-export benches
+//! (`dpi_task_*`, `dpi_instance_*`) checked on the reference simulator.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -65,8 +66,8 @@ fn compile(c_file: &str) -> PathBuf {
     so
 }
 
-/// Run `sv_file` against the library and return its `T|` lines.
-fn tagged(so: &Path, sv_file: &str) -> Vec<String> {
+/// Run `sv_file` against the library: whether it exited 0, and its output.
+fn run(so: &Path, sv_file: &str) -> (bool, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
         .arg("--dpi-lib")
         .arg(so)
@@ -74,17 +75,37 @@ fn tagged(so: &Path, sv_file: &str) -> Vec<String> {
         .arg(manifest_path(sv_file))
         .output()
         .expect("failed to run xezim");
+    let _ = std::fs::remove_file(so);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(out.status.success(), "xezim failed for {sv_file}:\n{text}");
-    let _ = std::fs::remove_file(so);
+    (out.status.success(), text)
+}
+
+/// Run `sv_file` against the library and return its `T|` lines.
+fn tagged(so: &Path, sv_file: &str) -> Vec<String> {
+    let (ok, text) = run(so, sv_file);
+    assert!(ok, "xezim failed for {sv_file}:\n{text}");
     text.lines()
         .filter(|l| l.starts_with("T|"))
         .map(str::to_string)
         .collect()
+}
+
+/// The `T|` lines with the same-time steps of different processes sorted
+/// (their order within a time slot is not defined).
+fn tagged_sorted(so: &Path, sv_file: &str) -> Vec<String> {
+    let mut out = tagged(so, sv_file);
+    out.sort();
+    out
+}
+
+fn sorted(lines: &[&str]) -> Vec<String> {
+    let mut v: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    v.sort();
+    v
 }
 
 /// §35.5.2/§35.6.1: an imported task consumes time through an exported task
@@ -112,15 +133,10 @@ fn dpi_imported_task_consumes_time() {
 
 /// §35.5.2: two processes inside the same imported task at once, each
 /// waiting on its own period, interleave and each returns when its own
-/// waits are done.
-///
-/// Ignored: xezim runs an exported task's delay by nesting the scheduler
-/// inside the C call, so the second caller's C frame sits above the first's
-/// and the first cannot return until the second has: the 7-cycle worker's
-/// steps land at 9 and 16 instead of 7 and 14. Running each imported-task
-/// call on its own stack would lift this.
+/// waits are done. Each call runs on its own stack, so the 7-cycle worker
+/// does not wait for the 3-cycle one's C frame to return (its steps used to
+/// land at 9 and 16).
 #[test]
-#[ignore = "concurrent imported tasks unwind last-in first-out (nested scheduler)"]
 fn dpi_concurrent_imported_tasks_interleave() {
     let so = compile("tests/dpi/dpi_tasks.c");
     let mut out = tagged(&so, "tests/dpi/dpi_tasks_concurrent_test.sv");
@@ -166,17 +182,238 @@ fn dpi_context_scope_and_recursion() {
 
 /// §35.5.3: a function exported from an INSTANTIATED module is called, from
 /// a context import, in the instance the import was called through.
-///
-/// Ignored: exports are registered by bare name at elaboration, and not
-/// from instantiated modules — the library's (weak) reference to the export
-/// stays unresolved, and a strong one fails to load (`undefined symbol`).
 #[test]
-#[ignore = "exports from instantiated modules are not registered"]
 fn dpi_export_from_instantiated_module() {
     let so = compile("tests/dpi/dpi_scope_exports.c");
     assert_eq!(
         tagged(&so, "tests/dpi/dpi_instance_exports_test.sv"),
         ["T|ids a=11 b=22", "T|done"]
+    );
+}
+
+/// §35.5.3: three instances (one nested) export the same subroutines under
+/// one C name each. A context import reaches its instance's copy, called
+/// through the instance or from inside it, svSetScope selects one by path,
+/// an imported task in each instance waits through its own exported task,
+/// `%m` in the export names the instance, and an export of top is found
+/// from an instance's scope (the lookup goes upward).
+#[test]
+fn dpi_instance_exports_follow_the_scope() {
+    let so = compile("tests/dpi/dpi_instance_scopes.c");
+    assert_eq!(
+        tagged(&so, "tests/dpi/dpi_instance_scopes_test.sv"),
+        [
+            "T|ids a=3 b=5 w=7",
+            "T|set a=3 b=5 w=7",
+            "T|where top.ua.sv_where t=4",
+            "T|ticked top.ua id=3 t=4",
+            "T|where top.ub.sv_where t=6",
+            "T|ticked top.ub id=5 t=6",
+            "T|where top.w.u.sv_where t=8",
+            "T|ticked top.w.u id=7 t=8",
+            "T|up top.ua=42",
+            "T|up top.ub=42",
+            "T|up top.w.u=42",
+            "T|done",
+        ]
+    );
+}
+
+/// §35.5.2/§35.5.3: imported tasks called through two instance paths at
+/// once each wait through their own instance's exported task.
+#[test]
+fn dpi_imported_tasks_called_through_instances() {
+    let so = compile("tests/dpi/dpi_instance_scopes.c");
+    assert_eq!(
+        tagged(&so, "tests/dpi/dpi_instance_task_via_test.sv"),
+        [
+            "T|where top.ub.sv_where t=2",
+            "T|where top.ua.sv_where t=4",
+            "T|done t=4",
+        ]
+    );
+}
+
+/// §35.5.3: an export declared only in an instance is not visible from
+/// top's scope; the reference simulator stops with a fatal error too.
+#[test]
+fn dpi_instance_export_outside_its_scope_is_fatal() {
+    let so = compile("tests/dpi/dpi_instance_scopes.c");
+    let (ok, text) = run(&so, "tests/dpi/dpi_instance_scope_missing_test.sv");
+    assert!(!ok, "expected a failing run:\n{text}");
+    assert!(
+        text.contains("DPI export 'sv_get_id' is not declared in the calling scope 'top'"),
+        "{text}"
+    );
+    assert!(!text.contains("T|done"), "{text}");
+}
+
+/// §35.5.2: the C code of an imported task waits through exported tasks
+/// that make each kind of wait — an edge, a level `wait`, `fork ... join`,
+/// `wait fork`, an output written after a delay — with two callers at once;
+/// a call inside a loop and inside a user task; and C -> SV -> C recursion
+/// that waits at every level, 41 and 26 levels deep at once.
+#[test]
+fn dpi_imported_task_wait_kinds_and_recursion() {
+    let so = compile("tests/dpi/dpi_task_shapes.c");
+    assert_eq!(
+        tagged_sorted(&so, "tests/dpi/dpi_task_waits_test.sv"),
+        sorted(&[
+            "T|log who=2 v=105 t=5",
+            "T|log who=1 v=105 t=5",
+            "T|log who=1 v=225 t=25",
+            "T|log who=2 v=225 t=25",
+            "T|log who=1 v=330 t=30",
+            "T|log who=2 v=330 t=30",
+            "T|log who=1 v=434 t=34",
+            "T|log who=2 v=434 t=34",
+            "T|log who=1 v=577 t=35",
+            "T|log who=2 v=577 t=35",
+            "T|kinds f1=35 f2=35 t=35",
+            "T|log who=20 v=0 t=38",
+            "T|log who=10 v=0 t=39",
+            "T|log who=20 v=1 t=41",
+            "T|log who=10 v=1 t=43",
+            "T|log who=20 v=2 t=44",
+            "T|wrap who=20 done f=44 t=44",
+            "T|log who=11 v=0 t=47",
+            "T|log who=11 v=1 t=51",
+            "T|loop f3=51 t=51",
+            "T|nest lv1=41 lv2=26 t=91",
+            "T|done",
+        ])
+    );
+}
+
+/// §35.5.2: two hundred processes inside one imported task at once, each on
+/// its own period.
+#[test]
+fn dpi_many_concurrent_imported_tasks() {
+    let so = compile("tests/dpi/dpi_task_shapes.c");
+    assert_eq!(
+        tagged(&so, "tests/dpi/dpi_task_many_test.sv"),
+        ["T|many sum=2382 max=21 t=21", "T|done"]
+    );
+}
+
+/// §35.9: a process killed while it waits inside an imported task — by
+/// `disable` of its fork block, process::kill() and `disable fork` — unwinds
+/// the call by the disable protocol: the exported task returns 1,
+/// svIsDisabledState() is 1 (seen = 11), the C code returns 1, and the
+/// killing process carries on.
+#[test]
+fn dpi_imported_task_disable_protocol() {
+    let so = compile("tests/dpi/dpi_task_shapes.c");
+    assert_eq!(
+        tagged(&so, "tests/dpi/dpi_task_disable_test.sv"),
+        [
+            "T|log who=1 step=0 t=10",
+            "T|log who=1 step=1 t=20",
+            "T|fork-block seen=11 t=26",
+            "T|log who=2 step=0 t=36",
+            "T|log who=2 step=1 t=46",
+            "T|kill seen=11 t=52",
+            "T|log who=3 step=0 t=62",
+            "T|log who=3 step=1 t=72",
+            "T|disable-fork seen=11 t=78",
+            "T|log who=4 step=0 t=81",
+            "T|log who=4 step=1 t=84",
+            "T|normal seen=1 t=84",
+            "T|done",
+        ]
+    );
+}
+
+/// §35.9, §9.6.2: another process disables a named block around the call:
+/// the imported task unwinds by the protocol, the rest of the block is
+/// skipped and the process carries on after it.
+#[test]
+fn dpi_imported_task_disabled_block_unwinds() {
+    let so = compile("tests/dpi/dpi_task_shapes.c");
+    assert_eq!(
+        tagged(&so, "tests/dpi/dpi_task_disable_block_test.sv"),
+        [
+            "T|log who=5 step=0 t=10",
+            "T|log who=5 step=1 t=20",
+            "T|log who=5 step=2 t=30",
+            "T|after inner seen=11 t=35",
+            "T|done",
+        ]
+    );
+}
+
+/// §35.9: the waiting exported task's own code kills the calling process
+/// (process::self().kill()): the export returns 1, the C code acknowledges
+/// and returns 1, and the process does not carry on.
+#[test]
+fn dpi_imported_task_process_killed_from_its_export() {
+    let so = compile("tests/dpi/dpi_task_shapes.c");
+    assert_eq!(
+        tagged(&so, "tests/dpi/dpi_task_self_kill_test.sv"),
+        [
+            "T|log who=6 step=0 t=10",
+            "T|self-kill t=20",
+            "T|seen=11 t=30",
+            "T|done",
+        ]
+    );
+}
+
+/// §35.9: `disable` of the exported task the C code waits in ends that
+/// export with 0; the imported task is not disabled and carries on.
+#[test]
+fn dpi_disabled_export_returns_zero() {
+    let so = compile("tests/dpi/dpi_task_shapes.c");
+    assert_eq!(
+        tagged(&so, "tests/dpi/dpi_task_disable_export_test.sv"),
+        [
+            "T|log who=7 step=0 t=10",
+            "T|log who=7 step=1 t=15",
+            "T|log who=7 step=2 t=25",
+            "T|returned seen=1 t=25",
+            "T|done",
+        ]
+    );
+}
+
+/// §35.9 b) and d): a disabled imported task that returns 0, or that calls
+/// another export, is a fatal error, as in the reference simulator.
+#[test]
+fn dpi_disable_protocol_violations_are_fatal() {
+    for (bench, what) in [
+        (
+            "tests/dpi/dpi_task_bad_return_test.sv",
+            "imported task 'c_bad_return' was disabled but did not return 1",
+        ),
+        (
+            "tests/dpi/dpi_task_bad_export_test.sv",
+            "an exported subroutine was called after its imported caller was disabled",
+        ),
+    ] {
+        let so = compile("tests/dpi/dpi_task_shapes.c");
+        let (ok, text) = run(&so, bench);
+        assert!(!ok, "{bench}: expected a failing run:\n{text}");
+        assert!(text.contains(what), "{bench}:\n{text}");
+        assert!(!text.contains("T|log who=99"), "{bench}:\n{text}");
+        assert!(!text.contains("T|done"), "{bench}:\n{text}");
+    }
+}
+
+/// §20.2: `$finish` while two processes wait inside imported tasks ends the
+/// run at once and cleanly; the suspended calls are left.
+#[test]
+fn dpi_finish_while_imported_tasks_wait() {
+    let so = compile("tests/dpi/dpi_task_shapes.c");
+    assert_eq!(
+        tagged(&so, "tests/dpi/dpi_task_finish_test.sv"),
+        [
+            "T|log who=2 step=0 t=7",
+            "T|log who=1 step=0 t=10",
+            "T|log who=2 step=1 t=14",
+            "T|log who=1 step=1 t=20",
+            "T|log who=2 step=2 t=21",
+            "T|finish t=25",
+        ]
     );
 }
 
