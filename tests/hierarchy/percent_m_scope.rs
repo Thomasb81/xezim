@@ -31,7 +31,6 @@ fn line(src: &str, top: &str) -> Vec<String> {
         None,
         None,
         false,
-        None,
     )
     .expect("sim")
     .output

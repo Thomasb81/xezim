@@ -46,7 +46,6 @@ fn elab_err(files: &[(&str, &str)]) -> String {
         None,
         None,
         false,
-        None,
     );
     match res {
         Ok(_) => panic!("expected a duplicate-declaration error, but it elaborated"),
@@ -162,7 +161,6 @@ fn local_declaration_beats_an_unimported_packages_enum_member() {
         None,
         None,
         false,
-        None,
     )
     .expect("a local declaration must not collide with an unimported package's enum member");
     let v = sim

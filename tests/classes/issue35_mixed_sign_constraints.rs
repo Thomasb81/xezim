@@ -173,7 +173,6 @@ endmodule
             None,
             None,
             false,
-            None,
         )
         .expect("simulate failed");
         assert_eq!(u(&sim, "ok_flag"), 1, "seed {}: solve must succeed", seed);

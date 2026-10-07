@@ -77,7 +77,6 @@ fn uvm_dpi_builtins_regex_hdl_and_argv() {
         None,
         None,
         false,
-        None,
     )
     .expect("simulate failed");
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();
@@ -166,7 +165,6 @@ fn uvm_dpi_builtins_later_regex_api_and_legacy_argv() {
         None,
         None,
         false,
-        None,
     )
     .expect("simulate failed");
     let got: Vec<String> = sim
@@ -296,7 +294,6 @@ fn uvm_dpi_builtins_2020_regex_and_polling() {
         None,
         None,
         false,
-        None,
     )
     .expect("simulate failed");
     let got: Vec<String> = sim

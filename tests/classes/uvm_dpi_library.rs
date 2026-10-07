@@ -44,7 +44,6 @@ fn run_uvm_dpi(version: &str, src: &str, plusargs: &[&str]) -> compiler::Simulat
         None,
         None,
         false,
-        None,
     )
     .unwrap_or_else(|e| panic!("UVM {} bench failed to simulate: {}", version, e))
 }

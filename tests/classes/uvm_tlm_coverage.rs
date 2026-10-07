@@ -59,7 +59,6 @@ fn run(version: &str, src: &str) -> Vec<String> {
         None,
         None,
         false,
-        None,
     )
     .unwrap_or_else(|e| panic!("UVM {} bench failed to simulate: {}", version, e));
     sim.output

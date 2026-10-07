@@ -62,7 +62,6 @@ fn sim_with_plusargs(src: &str, plusargs: &[&str]) -> xezim::compiler::Simulator
         None,
         None,
         false,
-        None,
     )
     .expect("simulate failed")
 }

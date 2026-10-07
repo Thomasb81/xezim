@@ -136,7 +136,6 @@ fn run_uvm_opt(
         None,
         None,
         false,
-        None,
     )
 }
 
@@ -478,7 +477,6 @@ endmodule
         None,
         None,
         false,
-        None,
     )
     .expect("UVM 2017 with DPI builtins failed to simulate");
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();

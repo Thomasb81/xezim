@@ -57,7 +57,6 @@ pub fn t_lines(src: &str, top: &str) -> Result<Vec<String>, String> {
         None,
         None,
         false,
-        None,
     )?;
     Ok(extract(sim.output.iter().map(|o| o.message.as_str())))
 }

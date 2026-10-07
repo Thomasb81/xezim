@@ -56,7 +56,6 @@ fn run(version: &str, src: &str, plusargs: &[&str]) -> compiler::Simulator {
         None,
         None,
         false,
-        None,
     )
     .unwrap_or_else(|e| panic!("UVM {} bench failed to simulate: {}", version, e))
 }

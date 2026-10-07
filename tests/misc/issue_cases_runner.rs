@@ -185,7 +185,6 @@ fn issue_26_static_init_sysfuncs() {
         None,
         None,
         false,
-        None,
     )
     .expect("simulate failed");
     let msgs: Vec<String> = sim.output.iter().map(|o| o.message.clone()).collect();

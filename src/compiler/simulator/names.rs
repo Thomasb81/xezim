@@ -436,17 +436,9 @@ impl IdNames {
     }
 
     /// Ids covered (named and gap).
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.total
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.total == 0
-    }
-
-    /// Stored names (excluding gap ids).
-    pub fn named_len(&self) -> usize {
-        self.names.len()
     }
 
     /// Registered names, virtual elements included — the length the table

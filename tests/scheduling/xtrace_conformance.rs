@@ -85,7 +85,6 @@ fn dump_scoped(tag: &str, src: &str, scopes: &[String]) -> String {
         None,
         None,
         false,
-        None,
     );
     sim.expect("simulate failed");
     let text = fs::read_to_string(&path)
