@@ -1713,6 +1713,7 @@ pub struct BytecodeCompiler<'a> {
     /// and narrows the fallback to just the inner $write/$display.
     tasks: Option<&'a HashMap<String, TaskDeclaration>>,
     functions: Option<&'a HashMap<String, FunctionDeclaration>>,
+    dpi_import_fds: Option<std::rc::Rc<HashMap<String, FunctionDeclaration>>>,
     inlining_stack: Vec<String>,
     pub tasks_inlined: u32,
     /// Elaborated module parameters — used by `eval_const_expr` so that
@@ -1944,6 +1945,7 @@ impl<'a> BytecodeCompiler<'a> {
             allow_expr_fallback: false,
             tasks: None,
             functions: None,
+            dpi_import_fds: None,
             inlining_stack: Vec::new(),
             tasks_inlined: 0,
             params: None,
@@ -2539,6 +2541,17 @@ impl<'a> BytecodeCompiler<'a> {
         self.functions = Some(functions);
     }
 
+    /// DPI import prototypes by SV-visible name. A compiled body may call an
+    /// import directly (e.g. `uvm_re_compexecfree` under `uvm_re_match`);
+    /// imports are not in `functions`, so the pure-call planner needs their
+    /// ports to shape `CallFreeFunction` emission.
+    pub fn set_dpi_import_fds(
+        &mut self,
+        m: std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>,
+    ) {
+        self.dpi_import_fds = Some(m);
+    }
+
     pub fn set_tasks(&mut self, tasks: &'a HashMap<String, TaskDeclaration>) {
         self.tasks = Some(tasks);
     }
@@ -2687,10 +2700,189 @@ impl<'a> BytecodeCompiler<'a> {
             self.bail("Expr_Call_depth");
             return None;
         }
+        // DPI import callee: not in the function table, but the interpreter
+        // can execute it (exec_dpi_import_call). Emit a CallFreeFunction —
+        // the exec arm falls back to the DPI dispatch when fn_decl_rc
+        // misses. Admission mirrors the inlinable shape: input-only ports
+        // (plus assignable `output` formals for functions like
+        // uvm_re_compexecfree), no dimensions, arity matches after named-arg
+        // normalization. Same register-file context as the existing
+        // CallFreeFunction lowering, so method mode only. Structural only.
+        if self.method_mode
+            && let Some(idf) = self
+                .dpi_import_fds
+                .as_deref()
+                .and_then(|m| m.get(&name))
+                .cloned()
+        {
+            let args: Vec<Expression> =
+                crate::compiler::simulator::Simulator::normalize_call_args(&idf.ports, args)
+                    .unwrap_or_else(|| args.to_vec());
+            if idf.ports.len() != args.len()
+                || !idf
+                    .ports
+                    .iter()
+                    .all(|p| matches!(p.direction, PortDirection::Input | PortDirection::Output))
+                || idf
+                    .ports
+                    .iter()
+                    .any(|p| !p.dimensions.is_empty())
+            {
+                self.bail("Expr_Call_ports");
+                return None;
+            }
+            let mut ok = true;
+            let call_start = self.insns.len();
+            let call_next = self.next_reg;
+            let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+            for a in &args {
+                match self.compile_expr(a, 0) {
+                    Some(r) => arg_values.push(r),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                let dest = self.alloc_reg();
+                let n = arg_values.len() as u32;
+                let arg_start = self.alloc_reg();
+                for _ in 1..arg_values.len() {
+                    self.alloc_reg();
+                }
+                for (i, &v) in arg_values.iter().enumerate() {
+                    let slot = (arg_start as usize + i) as RegId;
+                    if slot != v {
+                        self.emit(Insn::Move(slot, v));
+                    }
+                }
+                self.emit(Insn::CallFreeFunction(
+                    dest,
+                    Box::new(Name(name.into_boxed_str())),
+                    arg_start,
+                    n,
+                ));
+                // `output` formals of the import: the callee writes the
+                // synthesized actuals in place; copy them back to the
+                // caller's lvalues.
+                for (i, p) in idf.ports.iter().enumerate() {
+                    if matches!(p.direction, PortDirection::Output) {
+                        if !self.compile_blocking_target(
+                            &args[i],
+                            (arg_start as usize + i) as RegId,
+                            0,
+                        ) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    return Some(dest);
+                }
+            }
+            self.insns.truncate(call_start);
+            self.next_reg = call_next;
+            self.bail("Expr_Call_dpi");
+            return None;
+        }
         let Some(fd) = self.functions.and_then(|f| f.get(&name)).cloned() else {
             self.bail("Expr_Call");
             return None;
         };
+        // §13.5.4 named actuals (`.re(expr)`) normalize to positional order
+        // (with §13.5.3 defaults filled) so every path below — delegation and
+        // inline — sees a plain positional actual list.
+        let owned_args;
+        let args: &[Expression] = if args
+            .iter()
+            .any(|a| matches!(a.kind, ExprKind::NamedArg { .. } | ExprKind::Empty))
+        {
+            owned_args =
+                crate::compiler::simulator::Simulator::normalize_call_args(&fd.ports, args)
+                    .unwrap_or_default();
+            &owned_args
+        } else {
+            args
+        };
+        // class-perf delegation: a callee that cannot be INLINED (impure, or
+        // a `string` formal the inline shape rejects) but whose ports are
+        // all scalar inputs with a matching arity is still callable from
+        // compiled code: emit CallFreeFunction and let the exec arm
+        // re-enter the interpreter (exec_function_call), exactly like the
+        // class-method CallMethod lowering. This keeps the caller compiled
+        // — the callee's side effects run with full interpreter semantics.
+        {
+            let input_only_scalar = fd
+                .ports
+                .iter()
+                .all(|p| matches!(p.direction, PortDirection::Input) && p.dimensions.is_empty());
+            let arity_le = args.len() <= fd.ports.len()
+                && !args
+                    .iter()
+                    .any(|a| matches!(a.kind, ExprKind::NamedArg { .. } | ExprKind::Empty));
+            let has_string_port = fd.ports.iter().any(|p| {
+                matches!(
+                    &p.data_type,
+                    crate::ast::types::DataType::Simple {
+                        kind: crate::ast::types::SimpleType::String,
+                        ..
+                    }
+                )
+            });
+            let allow_ext_reads = name.contains('.')
+                || self.functions.is_some_and(|f| {
+                    let suffix = format!(".{}", name);
+                    !f.keys().any(|k| k.ends_with(suffix.as_str()))
+                });
+            let callee_pure =
+                self.fn_is_pure_in_ext(&fd, name.rsplit_once('.').map(|(p, _)| p), allow_ext_reads)
+                    && !has_string_port;
+            if self.method_mode && input_only_scalar && arity_le && !callee_pure {
+                let call_start = self.insns.len();
+                let call_next = self.next_reg;
+                let mut ok = true;
+                let mut arg_values: Vec<RegId> = Vec::with_capacity(args.len());
+                for a in args {
+                    match self.compile_expr(a, 0) {
+                        Some(r) => arg_values.push(r),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    let dest = self.alloc_reg();
+                    let n = arg_values.len() as u32;
+                    let arg_start = self.alloc_reg();
+                    for _ in 1..arg_values.len() {
+                        self.alloc_reg();
+                    }
+                    for (i, &v) in arg_values.iter().enumerate() {
+                        let slot = (arg_start as usize + i) as RegId;
+                        if slot != v {
+                            self.emit(Insn::Move(slot, v));
+                        }
+                    }
+                    self.emit(Insn::CallFreeFunction(
+                        dest,
+                        Box::new(Name(name.clone().into_boxed_str())),
+                        arg_start,
+                        n,
+                    ));
+                    // The defaulted tail is bound by exec_function_call's
+                    // own §13.5.3 normalization; outputs are excluded by
+                    // input_only_scalar.
+                    return Some(dest);
+                }
+                self.insns.truncate(call_start);
+                self.next_reg = call_next;
+                self.bail("Expr_Call_delegate");
+                return None;
+            }
+        }
 
         // §6.6.7 resolver dispatch: a DYNAMIC-ARRAY formal (`input real
         // drivers[]`) whose actual is a FIXED assignment pattern is
@@ -5733,19 +5925,74 @@ impl<'a> BytecodeCompiler<'a> {
                         return false;
                     }
                     let name = BytecodeCompiler::hier_raw_name(h);
-                    let Some(fd2) = me.functions.and_then(|f| {
+                    if let Some(fd2) = me.functions.and_then(|f| {
                         f.get(&name)
                             .or_else(|| name.rsplit('.').next().and_then(|leaf| f.get(leaf)))
-                    }) else {
+                    }) {
+                        // Input-only callees here (an output arg would write a
+                        // caller name this walker cannot track). A callee that
+                        // is not itself inlinable may still be DELEGATED to the
+                        // interpreter via CallFreeFunction (impure body, or a
+                        // `string` formal the inline shape rejects): scalar
+                        // inputs with arity ≤ ports is delegatable, so the
+                        // caller stays compilable. §13.5.4 named actuals are
+                        // normalized to positional order first.
+                        let owned;
+                        let args = if args
+                            .iter()
+                            .any(|a| matches!(a.kind, ExprKind::NamedArg { .. } | ExprKind::Empty))
+                        {
+                            owned = crate::compiler::simulator::Simulator::normalize_call_args(
+                                &fd2.ports, args,
+                            )
+                            .unwrap_or_default();
+                            owned.as_slice()
+                        } else {
+                            args
+                        };
+                        let input_only = fd2
+                            .ports
+                            .iter()
+                            .all(|p| matches!(p.direction, PortDirection::Input));
+                        let scalar_ports = fd2.ports.iter().all(|p| p.dimensions.is_empty());
+                        let arity_le = fd2.ports.len() >= args.len();
+                        let args_ok = args.iter().all(|a| expr_ok(a, bound, me, ext));
+                        return input_only
+                            && args_ok
+                            && (me.fn_is_pure(fd2) || (scalar_ports && arity_le));
+                    }
+                    // Not a declared function — a DPI IMPORT is still a
+                    // legitimate callee: the interpreter executes it through
+                    // exec_dpi_import_call and the compiled body lowers it to
+                    // a CallFreeFunction whose exec arm falls back to the DPI
+                    // dispatch. Treat the import as a leaf: input-only ports,
+                    // argument-contained actuals; an `output` formal only
+                    // when its actual is a plain assignable lvalue (the
+                    // copyback target).
+                    let Some(idf) = me
+                        .dpi_import_fds
+                        .as_deref()
+                        .and_then(|m| m.get(&name))
+                        .cloned()
+                    else {
                         return false;
                     };
-                    // Input-only callees here (an output arg would write a
-                    // caller name this walker cannot track).
-                    fd2.ports
-                        .iter()
-                        .all(|p| matches!(p.direction, PortDirection::Input))
-                        && args.iter().all(|a| expr_ok(a, bound, me, ext))
-                        && me.fn_is_pure(fd2)
+                    let normalized = crate::compiler::simulator::Simulator::normalize_call_args(
+                        &idf.ports, args,
+                    );
+                    let args = normalized.as_deref().unwrap_or(args);
+                    idf.ports.len() == args.len()
+                        && idf.ports.iter().zip(args).all(|(p, a)| match p.direction {
+                            PortDirection::Input => expr_ok(a, bound, me, ext),
+                            PortDirection::Output => matches!(
+                                &a.kind,
+                                ExprKind::Ident(h)
+                                    if h.root.is_none()
+                                        && h.path.len() == 1
+                                        && h.path[0].selects.is_empty()
+                            ),
+                            _ => false,
+                        })
                 }
                 // §10.9.2: a pattern builds its value from nothing but the
                 // expressions inside it, so it is exactly as pure as they are.
@@ -5797,6 +6044,16 @@ impl<'a> BytecodeCompiler<'a> {
                     expr_ok(lvalue, bound, me, false) && expr_ok(rvalue, bound, me, ext)
                 }
                 StatementKind::Return(e) => e.as_ref().is_none_or(|e| expr_ok(e, bound, me, ext)),
+                // A void call in statement position (`uvm_report_error(...)`)
+                // is as pure as the expression walker says: an inlinable,
+                // delegatable (scalar-input) or DPI-import callee is a leaf.
+                StatementKind::Expr(e) => {
+                    let mut e = e;
+                    while let ExprKind::Paren(inner) = &e.kind {
+                        e = inner;
+                    }
+                    expr_ok(e, bound, me, ext)
+                }
                 StatementKind::While { condition, body } => {
                     // Same gap as the Foreach arm (issue #146): no arm meant
                     // `_ => false`, branding a pure while-loop helper
@@ -10716,6 +10973,32 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     _ => {}
                 }
+                // Void diagnostic system tasks ($display family, $finish,
+                // $stop): they never produce a value, so route them through
+                // the AST-fallback insn — the runtime interpreter prints
+                // byte-identical output. This arm also applies in method
+                // mode (allow_ast_fallback is deliberately not consulted):
+                // these are leaf statements with no control-flow effect.
+                if let ExprKind::SystemCall { name, .. } = &e.kind
+                    && matches!(
+                        name.as_str(),
+                        "$display" | "$write" | "$strobe" | "$monitor" | "$finish" | "$stop"
+                    )
+                {
+                    let locals = if self.fb_live() {
+                        match self.fb_stmt_locals(stmt) {
+                            Ok(l) => l,
+                            Err(why) => {
+                                self.bail(why);
+                                return false;
+                            }
+                        }
+                    } else {
+                        FbLocals::default()
+                    };
+                    self.push_stmt_fallback(stmt, "Expr_syscall_void", locals);
+                    return true;
+                }
                 let n: &'static str = match &e.kind {
                     ExprKind::SystemCall { name, .. } => match name.as_str() {
                         "$display" => "Expr_display",
@@ -10912,6 +11195,55 @@ impl<'a> BytecodeCompiler<'a> {
                             self.for_loop_var_ids = saved_for_vars;
                             self.local_var_regs = saved_locals;
                             return true;
+                        }
+                        #[allow(unreachable_patterns)]
+                        ForInit::VarDecl {
+                            data_type,
+                            name,
+                            init,
+                        } if self.method_mode => {
+                            // General loop-scoped declaration (METHOD bodies
+                            // only): bind the induction variable to a plain
+                            // register (no reg-bank fast path, no unrolling)
+                            // and let the ordinary loop skeleton below drive
+                            // it. Module-process loops keep the AST path —
+                            // exec_statement's vectorized collapses (packed
+                            // fill / copy, fused array NBA) fire there and a
+                            // compiled loop would bypass them.
+                            let w = self.decl_width(data_type);
+                            let slot = self.alloc_reg();
+                            let Some(v) = self.compile_expr(init, w) else {
+                                self.for_loop_var_ids = saved_for_vars;
+                                self.local_var_regs = saved_locals;
+                                self.bail("For_init_vardecl_rvalue");
+                                return false;
+                            };
+                            self.emit(Insn::Move(slot, v));
+                            if w > 0 {
+                                self.emit(Insn::Resize(slot, w));
+                            }
+                            use crate::ast::types::{
+                                DataType as GDt, IntegerAtomType as GIat, Signing as GSg,
+                            };
+                            let decl_signed = match data_type {
+                                GDt::IntegerAtom { kind, signing, .. } => {
+                                    !matches!(signing, Some(GSg::Unsigned))
+                                        && !matches!(kind, GIat::Time)
+                                }
+                                GDt::IntegerVector { signing, .. } => {
+                                    matches!(signing, Some(GSg::Signed))
+                                }
+                                _ => false,
+                            };
+                            if decl_signed {
+                                self.emit(Insn::SetSigned(slot));
+                            } else {
+                                self.emit(Insn::ClearSigned(slot));
+                            }
+                            if let Some(k) = self.local_kind_of(data_type, None) {
+                                self.local_kinds.insert(slot, k);
+                            }
+                            self.local_var_regs.insert(name.name.clone(), (slot, w));
                         }
                         #[allow(unreachable_patterns)]
                         ForInit::VarDecl { .. } => {
@@ -17354,6 +17686,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.method_string_ret_names.clear();
             self.pkg_enum_consts.clear();
             self.functions = None;
+            self.dpi_import_fds = None;
             self.method_class = None;
             self.handle_member_types = None;
             self.class_method_names.clear();

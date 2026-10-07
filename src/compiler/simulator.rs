@@ -6153,6 +6153,15 @@ pub struct Simulator {
     /// instead of the name whitelist. Keyed by bare name (over-approx across a
     /// free task / same-named method). See `subroutine_name_blocks`.
     tb_cache: std::cell::RefCell<HashMap<String, bool>>,
+    /// Memo for `subroutine_name_can_suspend` (the real-suspension analysis
+    /// that gates TASK compilation). Keyed by bare callee name; a tentative
+    /// `false` is cached before recursing so cyclic call graphs terminate.
+    ts_cache: std::cell::RefCell<HashMap<String, bool>>,
+    /// Receiver-type frames for the real-suspension analysis: one entry
+    /// per in-analysis method body — (owning class, ident → declared class)
+    /// collected from the method's formals, body VarDecls and the owning
+    /// chain's class-typed members.
+    ts_recv: std::cell::RefCell<Vec<(String, HashMap<String, String>)>>,
     /// LRM §25.9: stack of per-call virtual-interface formal-arg
     /// aliases. When a task or function takes `virtual <iface> <name>`,
     /// the call hooks add a frame mapping `<name>` to the caller's
@@ -11792,6 +11801,8 @@ impl Simulator {
             recv_call_memo: Vec::new(),
             vif_tokens_stored: false,
             tb_cache: std::cell::RefCell::new(HashMap::default()),
+            ts_cache: std::cell::RefCell::new(HashMap::default()),
+            ts_recv: std::cell::RefCell::new(Vec::new()),
             local_iface_aliases: Vec::new(),
             viface_var_aliases: HashMap::default(),
             last_vif_return: None,
@@ -15959,6 +15970,16 @@ impl Simulator {
         if self.dpi_bindings.contains_key(sv_name) || self.dpi_unsupported.contains(sv_name) {
             return;
         }
+        // Built-in implementations of the UVM distribution's DPI-C helpers
+        // (a faithful port of src/dpi/*.cc) take precedence over a loaded
+        // shared library: no FFI marshalling, and their caches (compiled
+        // regexes behind `uvm_re_compexecfree`, whose chandle never escapes
+        // to SV) keep hot loops from recompiling patterns per call. Leave
+        // these unbound so exec_dpi_import_call serves them from the
+        // built-in table; anything else binds to the library as before.
+        if Self::uvm_dpi_builtin_implements(&spec.c_name) {
+            return;
+        }
         // LRM §35.5.3: a DPI import declared `pure` must (a) return non-void
         // and (b) have ONLY `input` ports — no output/inout/ref. A `pure`
         // task is illegal. Catch the violations at bind time so a misdeclared
@@ -16352,23 +16373,24 @@ impl Simulator {
         let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
         if !self.dpi_bindings.contains_key(sv_name) {
             let c_name = self.module.dpi_imports.get(sv_name)?.c_name.clone();
+            // Built-in implementations of the UVM distribution's DPI-C
+            // helpers (src/compiler/simulator/uvm_dpi.rs) take precedence
+            // over a user-loaded shared library for the symbols they
+            // implement: they are a faithful port of the same src/dpi/*.cc
+            // sources, without FFI marshalling, and can cache (compiled
+            // regexes behind `uvm_re_compexecfree`, whose chandle never
+            // escapes to SV). Symbols outside the built-in table still
+            // bind to the library as before.
+            if let Some(v) = self.exec_uvm_dpi_builtin(&c_name, sv_name, args) {
+                ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
+                return Some(v);
+            }
             // Binding is attempted once per import; UVM's regex helpers are
             // called often enough that re-cloning the prototype showed.
             if !self.dpi_unsupported.contains(sv_name) && self.dpi_bind_tried.insert(sv_name.into())
             {
                 let spec = self.module.dpi_imports.get(sv_name)?.clone();
                 self.try_bind_dpi(sv_name, &spec);
-            }
-            // Built-in implementations of the UVM distribution's DPI-C
-            // helpers (src/compiler/simulator/uvm_dpi.rs), so UVM runs
-            // without +define+UVM_NO_DPI. A user-loaded shared library that
-            // defines one of these symbols wins — the builtin only serves
-            // symbols no library resolved.
-            if !self.dpi_bindings.contains_key(sv_name) {
-                if let Some(v) = self.exec_uvm_dpi_builtin(&c_name, sv_name, args) {
-                    ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
-                    return Some(v);
-                }
             }
         }
         let spec = self.module.dpi_imports.get(sv_name)?.clone();
@@ -32785,6 +32807,31 @@ impl Simulator {
                 // admitted it from; a vanishing entry (module swap)
                 // yields a benign zero like every other missing fn.
                 let fd = self.fn_decl_rc(&fname.0);
+                // DPI imports are NOT in the function table. When the callee
+                // resolves to an import, `output` formals must be written
+                // back into the argument registers: the DPI bridge assigns
+                // through `assign_value` on the synthesized actuals, so an
+                // `output` position gets a scratch lvalue whose landing in
+                // `self.signals` is copied back into `vm_regs` after the
+                // call. The compiled caller then moves the register into its
+                // own lvalue (compile-time copyback).
+                let import_ports: Option<Vec<crate::ast::decl::FunctionPort>> = if fd.is_none() {
+                    self.module.dpi_imports.get(fname.0.as_ref()).and_then(|s| {
+                        match &s.proto {
+                            crate::ast::decl::DPIProto::Function(f) => {
+                                Some(f.ports.clone())
+                            }
+                            _ => None,
+                        }
+                    })
+                } else {
+                    None
+                };
+                let mut out_slots: Vec<(usize, String)> = Vec::new();
+                let port_types: Option<&Vec<crate::ast::decl::FunctionPort>> = fd
+                    .as_ref()
+                    .map(|f| &f.ports)
+                    .or(import_ports.as_ref());
                 let mut args = Vec::with_capacity(n);
                 for i in 0..n {
                     let v = self
@@ -32792,12 +32839,81 @@ impl Simulator {
                         .get(base + i)
                         .cloned()
                         .unwrap_or_else(|| Value::zero(32));
-                    args.push(self.value_method_arg_expr(&v));
+                    let port_is_string = port_types
+                        .and_then(|p| p.get(i))
+                        .is_some_and(|p| {
+                            matches!(
+                                &p.data_type,
+                                crate::ast::types::DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    ..
+                                }
+                            )
+                        });
+                    let is_output = import_ports
+                        .as_ref()
+                        .and_then(|p| p.get(i))
+                        .is_some_and(|p| p.direction == PortDirection::Output);
+                    if is_output {
+                        let nm = format!("__xz_dpi_out_{i}");
+                        args.push(Expression::new(
+                            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                                root: None,
+                                path: vec![crate::ast::expr::HierPathSegment {
+                                    name: crate::ast::Identifier {
+                                        name: nm.clone(),
+                                        span: crate::ast::Span::dummy(),
+                                    },
+                                    selects: Vec::new(),
+                                }],
+                                span: crate::ast::Span::dummy(),
+                                cached_signal_id: std::cell::Cell::new(None),
+                                cached_resolved_name: std::cell::OnceCell::new(),
+                            }),
+                            crate::ast::Span::dummy(),
+                        ));
+                        out_slots.push((base + i, nm));
+                    } else if port_is_string && !v.is_real {
+                        // A string actual must arrive as a STRING expression:
+                        // the callee's §13.5 binding and the DPI string
+                        // readers consume the text, not the packed bits.
+                        args.push(Expression::new(
+                            ExprKind::StringLiteral(v.to_sv_string()),
+                            crate::ast::Span::dummy(),
+                        ));
+                    } else {
+                        args.push(self.value_method_arg_expr(&v));
+                    }
                 }
                 let result = match fd {
-                    Some(fd) => self.exec_function_call(&fd, &args),
-                    None => Value::zero(32),
+                    Some(fd) => {
+                        // Fast dispatch when this callee has a compiled block
+                        // (compiled→compiled chain, no AST arg synthesis on
+                        // the fast route).
+                        let fname = fd.name.name.name.clone();
+                        let pkg = self
+                            .module
+                            .func_decl_scope
+                            .get(&fname)
+                            .cloned()
+                            .unwrap_or_else(|| "-".to_string());
+                        let cname = format!("__free_fn__{pkg}");
+                        match self.vm_try_direct_free_fn_call(&fd, &cname, &pkg, base, n) {
+                            Some(v) => v,
+                            None => self.exec_function_call(&fd, &args),
+                        }
+                    }
+                    None => self
+                        .exec_dpi_import_call(&fname.0, &args)
+                        .unwrap_or_else(|| Value::zero(32)),
                 };
+                for (slot, nm) in out_slots {
+                    if let Some(v) = self.signals.remove(&nm) {
+                        if slot < self.vm_regs.len() {
+                            self.vm_regs[slot] = v;
+                        }
+                    }
+                }
                 self.vm_regs[*dest as usize] = result;
                 local_count += 1;
             }
@@ -51402,8 +51518,29 @@ impl Simulator {
                                         // Even a same-object bare call changes
                                         // the defining-class context used by
                                         // `super`; push both stacks uniformly.
-                                        self.push_task_method_this(Some(rh), mclass, &mut cleanup);
+                                        self.push_task_method_this(Some(rh), mclass.clone(), &mut cleanup);
                                         self.task_cleanup.push(cleanup);
+                                        // Wait-free compiled fast path (see the
+                                        // twin site below): a compiling task
+                                        // body runs synchronously; skip the
+                                        // process-frame machinery.
+                                        if let Some(_v) = self.try_compiled_task_body(
+                                            rh, &mclass, &mn, td, &tm,
+                                        ) {
+                                            if let Some(c) = self.task_cleanup.pop() {
+                                                self.unwind_task_frame(c);
+                                            }
+                                            // The body ran synchronously; fall
+                                            // through to the caller's next
+                                            // statement (`i += 1`) instead of
+                                            // returning — `return` would drop
+                                            // the rest of this process's slice
+                                            // (the `#5`/item_done tail of a
+                                            // tx_driver loop), killing the
+                                            // handshake pipeline.
+                                            i += 1;
+                                            continue;
+                                        }
                                         let frame = self.class_task_body_frame(&tm, stmt.span);
                                         // Chain the caller's tail instead of copying it onto the end of
                                         // the spliced body (ProcCont::pushed_frame).
@@ -51582,7 +51719,7 @@ impl Simulator {
                                 // member/static resolution, with a null `this`.
                                 self.m_scope_stack.clear();
                                 self.this_stack.push(None);
-                                self.class_context_stack.push(Some(mclass));
+                                self.class_context_stack.push(Some(mclass.clone()));
                                 self.method_local_base
                                     .push(self.local_stack.len().saturating_sub(1));
                                 cleanup.pushed_method_this = true;
@@ -51592,6 +51729,36 @@ impl Simulator {
                                     self.current_spec = Some((sb, ss));
                                 }
                                 self.task_cleanup.push(cleanup);
+                                // Wait-free compiled fast path: a task body
+                                // that compiles (the compiler declines every
+                                // timing control) can only run to completion
+                                // synchronously, so the scheduling machinery
+                                // is bypassed entirely — semantics identical
+                                // to the scheduled run below, minus the
+                                // process-frame overhead. A bare implicit-this
+                                // call resolves the receiver here.
+                                let rh_this = self
+                                    .this_stack
+                                    .last()
+                                    .copied()
+                                    .flatten()
+                                    .unwrap_or(0);
+                                if rh_this != 0
+                                    && let Some(_v) = self.try_compiled_task_body(
+                                        rh_this, &mclass, &mn, td, &tm,
+                                    )
+                                {
+                                    if let Some(c) = self.task_cleanup.pop() {
+                                        self.unwind_task_frame(c);
+                                    }
+                                    self.current_spec = saved_spec;
+                                    // Body ran synchronously — continue the
+                                    // caller's slice (see the twin site above:
+                                    // `return` would strand the process's
+                                    // remaining statements).
+                                    i += 1;
+                                    continue;
+                                }
                                 let frame = self.class_task_body_frame(&tm, stmt.span);
                                 // Chain the caller's tail instead of copying it onto the end of
                                 // the spliced body (ProcCont::pushed_frame).
@@ -53647,6 +53814,324 @@ impl Simulator {
             StatementKind::Repeat { body, .. } => self.stmt_is_blocking(body),
             _ => false,
         }
+    }
+
+    /// Real-suspension analysis for compiled TASKS. Unlike
+    /// `stmt_is_blocking` — which over-approximates (canonical blocking
+    /// names, join..join) so statements route through the suspend-aware
+    /// runner — this answers a narrower question with real waits only:
+    /// can executing this body ever PARK the running process?
+    ///
+    /// Why it exists: a compiled task runs synchronously inside
+    /// `exec_insns`; if a callee suspends there, the suspension unwinds
+    /// through the compiled frame and can never resume into it (the insn
+    /// pointer is not checkpointable). A `true` verdict must therefore
+    /// DECLINE compilation, whatever the call-count tier says. The direct
+    /// timing statements (TimingControl / Wait / WaitFork / WaitOrder,
+    /// fork..join / join_any, intra-assignment timing, `process::await`)
+    /// are the same set `stmt_is_blocking` uses; the difference is callee
+    /// resolution: real waits in the callee's body, by name, resolved
+    /// against the free tasks/functions, hierarchical tasks and EVERY
+    /// same-named class method (the receiver's dynamic type is unknown).
+    /// The canonical-name whitelist is NOT consulted for user-declared
+    /// callees — only for names with no user declaration at all, which may
+    /// still be builtin container methods (mailbox `get`/`put`/`peek`,
+    /// semaphore `get`, event `wait_on`).
+    fn stmts_can_suspend(&self, stmts: &[Statement]) -> bool {
+        stmts.iter().any(|s| self.stmt_can_suspend(s))
+    }
+    /// Analyze a class-method body with receiver context: the owning
+    /// class plus a ident→class map from the method's formals, its body
+    /// VarDecls and the owning chain's class-typed members. Callee names
+    /// are then resolved through the DECLARING chain instead of any
+    /// same-named class — `uvm_report_fatal` declared by
+    /// `uvm_report_object` must not be poisoned by a same-named method on
+    /// the unrelated `uvm_sequence_item` chain.
+    fn method_body_can_suspend(
+        &self,
+        cname: &str,
+        ports: &[crate::ast::decl::FunctionPort],
+        body: &[Statement],
+    ) -> bool {
+        let mut recv: HashMap<String, String> = HashMap::default();
+        for p in ports {
+            if let Some(c) = self.typeref_class_name(&p.data_type) {
+                recv.insert(p.name.name.clone(), c);
+            }
+        }
+        for (n, t) in self.class_typed_local_types(body) {
+            recv.entry(n).or_insert(t);
+        }
+        let mut cur = cname.to_string();
+        let mut seen = HashSet::default();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            for (p, dt) in cd.property_types.iter() {
+                if let Some(c) = self.typeref_class_name(dt) {
+                    recv.entry(p.clone()).or_insert(c);
+                }
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        self.ts_recv
+            .borrow_mut()
+            .push((cname.to_string(), recv));
+        let r = self.stmts_can_suspend(body);
+        self.ts_recv.borrow_mut().pop();
+        r
+    }
+    fn stmt_can_suspend(&self, stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::TimingControl { .. }
+            | StatementKind::Wait { .. }
+            | StatementKind::WaitOrder { .. }
+            | StatementKind::WaitFork => true,
+            StatementKind::RandCase { items } => {
+                items.iter().any(|(_, s)| self.stmt_can_suspend(s))
+            }
+            StatementKind::BlockingAssign { rvalue, .. } => Self::intra_timing_suspends(rvalue),
+            StatementKind::SeqBlock { stmts, .. } => {
+                stmts.iter().any(|s| self.stmt_can_suspend(s))
+            }
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.stmt_can_suspend(then_stmt)
+                    || else_stmt.as_ref().is_some_and(|e| self.stmt_can_suspend(e))
+            }
+            StatementKind::Forever { body } => self.stmt_can_suspend(body),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Foreach { body, .. } => self.stmt_can_suspend(body),
+            StatementKind::Case { items, .. } => {
+                items.iter().any(|it| self.stmt_can_suspend(&it.stmt))
+            }
+            // fork..join / join_any park the caller; a join_none's children
+            // run as separate processes that cannot park THIS frame.
+            StatementKind::ParBlock { join_type, .. } => {
+                !matches!(join_type, JoinType::JoinNone)
+            }
+            StatementKind::Repeat { body, .. } => self.stmt_can_suspend(body),
+            StatementKind::Expr(e) => {
+                Self::expr_is_proc_await(e) || self.callee_can_suspend(e)
+            }
+            _ => false,
+        }
+    }
+    /// Extract a statement-position callee (Call / bare Ident / dotted
+    /// MemberAccess enable) and resolve it. The resolution base comes
+    /// from the receiver frames: a declared class for `obj.m(...)` when
+    /// `obj` is a known class-typed ident, a class name for a static
+    /// `Class::m(...)` scope call, the owning class for a bare `m(...)`
+    /// (this-bounded) enable. Unresolvable receivers keep the any-class
+    /// name scan (sound, merely conservative).
+    fn callee_can_suspend(&self, expr: &Expression) -> bool {
+        let callee = match &expr.kind {
+            ExprKind::Call { func, .. } => &**func,
+            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => expr,
+            _ => return false,
+        };
+        let name = match &callee.kind {
+            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
+            ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
+            _ => None,
+        };
+        let Some(name) = name else { return false };
+        let base = match &callee.kind {
+            ExprKind::MemberAccess { expr, .. } => {
+                let mut b: Option<String> = None;
+                if let ExprKind::Ident(h) = &expr.kind {
+                    if h.path.len() == 1 {
+                        let on = h.path[0].name.name.as_str();
+                        let frames = self.ts_recv.borrow();
+                        if let Some((_, map)) = frames.last() {
+                            if let Some(c) = map.get(on) {
+                                b = Some(c.clone());
+                            }
+                        }
+                        if b.is_none() && self.module.classes.contains_key(on) {
+                            b = Some(on.to_string()); // Class::static() call
+                        }
+                    }
+                }
+                b
+            }
+            ExprKind::Ident(_) => self.ts_recv.borrow().last().map(|(c, _)| c.clone()),
+            _ => None,
+        };
+        match base {
+            Some(b) => self.subroutine_name_can_suspend_in(&b, name),
+            None => self.subroutine_name_can_suspend(name),
+        }
+    }
+    /// Nearest ancestor of `base` (inclusive) that declares a method
+    /// named `name`; virtual dispatch on a `base`-typed handle can only
+    /// reach overrides of THAT declaration.
+    fn chain_declares(&self, base: &str, name: &str) -> Option<String> {
+        let mut cur = base.to_string();
+        let mut seen = HashSet::default();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                return None;
+            }
+            if cd.methods.contains_key(name) {
+                return Some(cur);
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => return None,
+            }
+        }
+        None
+    }
+    /// Is `d` an ancestor of (or equal to) `c` in the extends chain?
+    fn class_chain_contains(&self, c: &str, d: &str) -> bool {
+        let mut cur = c.to_string();
+        let mut seen = HashSet::default();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                return false;
+            }
+            if cur == d {
+                return true;
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => return false,
+            }
+        }
+        false
+    }
+    /// Real-suspension resolution of `name` as seen from a `base`-typed
+    /// receiver: free module tasks/functions first (bare names inside a
+    /// class body still resolve against the module tables), then the
+    /// nearest declaring chain class, then every override of that exact
+    /// declaration (a class whose own nearest declarer is the same).
+    fn subroutine_name_can_suspend_in(&self, base: &str, name: &str) -> bool {
+        let key = format!("{}::{}", base, name);
+        if let Some(&b) = self.ts_cache.borrow().get(&key) {
+            return b;
+        }
+        self.ts_cache.borrow_mut().insert(key.clone(), false);
+        let mut suspends = false;
+        'resolve: {
+            if let Some(t) = self.module.tasks.get(name) {
+                if self.stmts_can_suspend(&t.items) {
+                    suspends = true;
+                    break 'resolve;
+                }
+            }
+            if let Some(f) = self.module.functions.get(name) {
+                if self.stmts_can_suspend(&f.items) {
+                    suspends = true;
+                    break 'resolve;
+                }
+            }
+            let Some(d) = self.chain_declares(base, name) else {
+                break 'resolve; // unresolvable on this receiver: not reached
+            };
+            for cls in self.module.classes.values() {
+                if let Some(m) = cls.methods.get(name) {
+                    // Virtual dispatch on a `base`-typed handle reaches only
+                    // overrides of D's declaration: classes in D's subtree
+                    // (D is their ancestor) that redeclare `name` — plus D
+                    // itself. Same-named methods on unrelated chains never
+                    // dispatch here.
+                    if !self.class_chain_contains(cls.name.as_str(), d.as_str()) {
+                        continue;
+                    }
+                    let (items, ports) = match &m.kind {
+                        crate::ast::decl::ClassMethodKind::Function(f)
+                        | crate::ast::decl::ClassMethodKind::Extern(f)
+                        | crate::ast::decl::ClassMethodKind::PureVirtual(f) => {
+                            (&f.items, &f.ports)
+                        }
+                        crate::ast::decl::ClassMethodKind::Task(t) => (&t.items, &t.ports),
+                    };
+                    if self.method_body_can_suspend(cls.name.as_str(), ports, items) {
+                        suspends = true;
+                        break 'resolve;
+                    }
+                }
+            }
+        }
+        self.ts_cache.borrow_mut().insert(key, suspends);
+        suspends
+    }
+    /// Memoized any-receiver fallback: does the subroutine named `name`
+    /// (free task/function, hierarchical task, or ANY same-named class
+    /// method — the receiver's type is unknown) transitively reach a REAL
+    /// suspension point? Used when a receiver's declared class cannot be
+    /// resolved; sound, merely coarser.
+    fn subroutine_name_can_suspend(&self, name: &str) -> bool {
+        if let Some(&b) = self.ts_cache.borrow().get(name) {
+            return b;
+        }
+        self.ts_cache
+            .borrow_mut()
+            .insert(name.to_string(), false);
+        let mut suspends = false;
+        'resolve: {
+            if let Some(t) = self.module.tasks.get(name) {
+                if self.stmts_can_suspend(&t.items) {
+                    suspends = true;
+                    break 'resolve;
+                }
+            }
+            if let Some(f) = self.module.functions.get(name) {
+                if self.stmts_can_suspend(&f.items) {
+                    suspends = true;
+                    break 'resolve;
+                }
+            }
+            let dotted = format!(".{}", name);
+            for (k, t) in self.module.tasks.iter() {
+                if k.ends_with(dotted.as_str()) && self.stmts_can_suspend(&t.items) {
+                    suspends = true;
+                    break 'resolve;
+                }
+            }
+            let mut any_decl = false;
+            for cls in self.module.classes.values() {
+                if let Some(m) = cls.methods.get(name) {
+                    any_decl = true;
+                    let (items, ports) = match &m.kind {
+                        crate::ast::decl::ClassMethodKind::Function(f)
+                        | crate::ast::decl::ClassMethodKind::Extern(f)
+                        | crate::ast::decl::ClassMethodKind::PureVirtual(f) => {
+                            (&f.items, &f.ports)
+                        }
+                        crate::ast::decl::ClassMethodKind::Task(t) => (&t.items, &t.ports),
+                    };
+                    let hit = self.method_body_can_suspend(cls.name.as_str(), ports, items);
+                    if hit {
+                        suspends = true;
+                        break 'resolve;
+                    }
+                }
+            }
+            // No user declaration under this name anywhere: the call may
+            // still reach a builtin container method that parks the caller
+            // (mailbox get/put/peek, semaphore get, event wait_on). Those
+            // have no AST to scan, so the leaf name decides.
+            if !any_decl
+                && matches!(name, "get" | "put" | "peek" | "wait_on" | "wait_for")
+            {
+                suspends = true;
+            }
+        }
+        self.ts_cache
+            .borrow_mut()
+            .insert(name.to_string(), suspends);
+        suspends
     }
 
     /// Does this statement need a real *process* context (the ability to
@@ -132660,7 +133145,7 @@ impl Simulator {
     /// this a `.name(expr)` actual was evaluated as an opaque expression in
     /// whatever position it happened to occupy — silently binding the wrong
     /// formal, or nothing at all.
-    fn normalize_call_args(
+    pub(crate) fn normalize_call_args(
         ports: &[crate::ast::decl::FunctionPort],
         args: &[Expression],
     ) -> Option<Vec<Expression>> {
@@ -133158,6 +133643,25 @@ impl Simulator {
         self.fn_decl_cache.insert(name.to_string(), rc.clone());
         Some(rc)
     }
+
+    /// DPI import FUNCTION prototypes by SV-visible name, for the bytecode
+    /// compiler: a compiled body may call an import directly (e.g.
+    /// `uvm_re_compexecfree` under `uvm_re_match`), and the pure-call planner
+    /// needs the import's ports to shape the `CallFreeFunction` emission. The
+    /// table is immutable after elaboration, so build it once. Task imports
+    /// are not callable as expressions and are excluded.
+    fn dpi_import_fd_table(
+        &self,
+    ) -> std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>> {
+        let mut m: HashMap<String, crate::ast::decl::FunctionDeclaration> = HashMap::default();
+        for (name, spec) in &self.module.dpi_imports {
+            if let crate::ast::decl::DPIProto::Function(fd) = &spec.proto {
+                m.insert(name.clone(), fd.clone());
+            }
+        }
+        std::rc::Rc::new(m)
+    }
+
 
     /// `fn_decl_rc` for tasks: the task table is never modified after
     /// elaboration, so one shared copy per name serves every call.
@@ -152229,6 +152733,11 @@ impl Simulator {
                 // (the compiled block reads `this` members and locals from
                 // the same heap / register file the AST path uses). Gated off
                 // by default.
+                // Tasks bypass the call-count tier: a task's body is where
+                // the loop work usually lives (phase tasks), so its invocation
+                // count says nothing about the cost inside. A failed compile
+                // lands in compiled_method_skip and is never retried.
+                let tier_bypass = matches!(method.kind, ClassMethodKind::Task(_));
                 if let Some(cval) = compiled_methods_enabled()
                     .then(|| {
                         self.try_run_compiled_method(
@@ -152240,6 +152749,7 @@ impl Simulator {
                             fn_ret_name,
                             ret_is_string,
                             &method.kind,
+                            tier_bypass,
                         )
                     })
                     .flatten()
@@ -153456,6 +153966,69 @@ impl Simulator {
     /// would — and a body that touches `this`-relative names was never
     /// compilable anyway (the compiler's handle-chain gates require a
     /// class-typed root, which no free-function frame provides).
+    /// Wait-free compiled execution of a task-method body dispatched from a
+    /// process statement runner. The caller has already bound the task frame
+    /// (`bind_task_frame` + method-this context) exactly as the scheduled
+    /// path would. If the body compiles — the compiler declines every timing
+    /// control — it can only run to completion synchronously, so the
+    /// scheduling machinery is skipped entirely and the caller continues as
+    /// if the scheduled frame had finished. Returns `None` when the body does
+    /// not (yet) compile; the caller falls back to the scheduled path.
+    /// `tier_bypass` is set: this dispatch point already pays the scheduling
+    /// prologue, so warming up on the interpreter would cost more than the
+    /// single one-shot compile.
+    #[allow(clippy::too_many_arguments)]
+    fn try_compiled_task_body(
+        &mut self,
+        handle: usize,
+        mclass: &str,
+        mname: &str,
+        td: &TaskDeclaration,
+        tm: &std::sync::Arc<crate::ast::decl::ClassMethod>,
+    ) -> Option<Value> {
+        if !compiled_methods_enabled() || handle == 0 {
+            return None;
+        }
+        let sync_name = self.sync_frame_name(mname);
+        self.static_local_syncs.push((sync_name, Vec::new()));
+        let saved_meth = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
+            sampler_register_name(fnv_name(mname), mname);
+            Some(CUR_METHOD_HASH.swap(fnv_name(mname), std::sync::atomic::Ordering::Relaxed))
+        } else {
+            None
+        };
+        let saved_compiled = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(CUR_METHOD_COMPILED.swap(false, std::sync::atomic::Ordering::Relaxed))
+        } else {
+            None
+        };
+        let r = self.try_run_compiled_method(
+            handle,
+            mclass,
+            mname,
+            &td.ports,
+            &td.items,
+            None,
+            false,
+            &tm.kind,
+            true,
+        );
+        if let Some(prev) = saved_meth {
+            CUR_METHOD_HASH.store(prev, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(prev) = saved_compiled {
+            CUR_METHOD_COMPILED.store(prev, std::sync::atomic::Ordering::Relaxed);
+        }
+        if r.is_some() {
+            // Persist static locals seeded by the block (mirrors the
+            // interpreter epilogue's sync pass).
+            self.sync_static_locals();
+        } else {
+            self.static_local_syncs.pop();
+        }
+        r
+    }
+
     fn try_run_compiled_free_function(
         &mut self,
         fd: &crate::ast::decl::FunctionDeclaration,
@@ -153475,6 +154048,7 @@ impl Simulator {
             Some(&fd.name.name.name),
             ret_is_string,
             &crate::ast::decl::ClassMethodKind::Function(fd.clone()),
+            false,
         )
     }
 
@@ -153488,6 +154062,7 @@ impl Simulator {
         fn_ret_name: Option<&str>,
         ret_is_string: bool,
         kind: &crate::ast::decl::ClassMethodKind,
+        tier_bypass: bool,
     ) -> Option<Value> {
         use super::bytecode::BytecodeCompiler;
         use crate::ast::decl::ClassMethodKind;
@@ -153543,7 +154118,7 @@ impl Simulator {
         // the counter only while below the threshold, and the count is
         // keyed by u32 ids (the same key the block cache uses).
         let tier = method_tier_threshold();
-        if tier > 0 {
+        if tier > 0 && !tier_bypass {
             let calls = self
                 .compiled_method_call_counts
                 .entry((cid, mid))
@@ -153572,10 +154147,49 @@ impl Simulator {
                     true
                 }
             };
-            let ClassMethodKind::Function(_f) = kind else {
-                trace_decline("task");
-                self.compiled_method_skip.insert((cid, mid));
-                return None; // Tasks keep waits/scheduling on the AST interpreter.
+            // A wait-free TASK compiles exactly like a `function void`: the
+            // compiler bails on any timing control (allow_waits=false), so a
+            // task whose body compiles is purely sequential and the
+            // interpreter's scheduling machinery is never needed. Tasks
+            // carrying waits simply fail to compile here and keep the AST
+            // path. Synthesize a void `FunctionDeclaration` so every
+            // downstream decision (result-width, writeback, plan, compiler)
+            // sees the ordinary function shape.
+            let task_fd_storage;
+            let _f = match kind {
+                ClassMethodKind::Function(f) => f,
+                ClassMethodKind::Task(t) => {
+                    // A compiled task runs synchronously inside `exec_insns`;
+                    // if its body (or any transitively reached callee) can
+                    // park the process, the suspension can never resume into
+                    // the compiled frame. Decline on the real-suspension
+                    // analysis — NOT the tier counter, which measures call
+                    // frequency and says nothing about this.
+                    if self.method_body_can_suspend(cname, &t.ports, &t.items) {
+                        trace_decline("task-suspends");
+                        self.compiled_method_skip.insert((cid, mid));
+                        return None;
+                    }
+                    task_fd_storage = crate::ast::decl::FunctionDeclaration {
+                        lifetime: t.lifetime.clone(),
+                        specifier: t.specifier.clone(),
+                        return_type: crate::ast::types::DataType::Void(
+                            crate::ast::Span::dummy(),
+                        ),
+                        name: t.name.clone(),
+                        ports: t.ports.clone(),
+                        items: Vec::new(),
+                        endlabel: t.endlabel.clone(),
+                        strict_body_ports: Vec::new(),
+                        span: t.span,
+                    };
+                    &task_fd_storage
+                }
+                _ => {
+                    trace_decline("kind");
+                    self.compiled_method_skip.insert((cid, mid));
+                    return None;
+                }
             };
             // Step 8: a STRING return compiles like a class handle — the
             // result Value is a byte-vector register passed through untouched
@@ -153585,13 +154199,12 @@ impl Simulator {
             // only services interpreter concat writes — the block computes
             // the identical bytes in-register.)
             let is_string_result = ret_is_string;
-            let Some(rname) = fn_ret_name.map(str::to_string) else {
-                // No implicit return-variable name: the method is a plain
-                // `function void ...` body with no result cell. Keep AST.
-                trace_decline("no_result_cell");
-                self.compiled_method_skip.insert((cid, mid));
-                return None;
-            }; // class-perf row 2: NON-INPUT formals (output / inout / ref) are
+            // Tasks and plain `function void` bodies have no implicit result
+            // cell; the empty name gives the plan/compiler a void shape
+            // (never a live local name).
+            let rname = fn_ret_name
+                .map(str::to_string)
+                .unwrap_or_default(); // class-perf row 2: NON-INPUT formals (output / inout / ref) are
             // admitted as plain scalars (integral / string / enum / class
             // handle, `dimensions.is_empty()`): the interpreter implements
             // exactly these as copy-in/copy-out through `output_bindings`
@@ -154233,6 +154846,8 @@ impl Simulator {
                         &self.widths,
                     );
                     compiler.method_admission = Some(admission);
+                    compiler
+                        .set_dpi_import_fds(self.dpi_import_fd_table());
                     if method_trace_enabled() {
                         compiler.scope_hint = Some(format!("{}.{}", cname, method_name));
                     }
@@ -154842,6 +155457,293 @@ impl Simulator {
         self.compiled_fast_calls
             .insert((cid, mid), FastCallState::Entry(entry.clone()));
         Some(entry)
+    }
+    /// Fast-call twin of `vm_fast_entry_for` for free (package-scope)
+    /// functions compiled under the synthetic `__free_fn__<pkg>` class.
+    /// Same plan gates minus the receiver-specific ones (no `this`, no
+    /// accessors, no parameterized-class or static-method concerns).
+    fn vm_fast_free_fn_entry_for(
+        &mut self,
+        cname: &str,
+        fname: &str,
+        fd: &FunctionDeclaration,
+    ) -> Option<std::rc::Rc<FastCallEntry>> {
+        use super::bytecode::Insn;
+        let ids = &self.compiled_class_method_ids;
+        let (cid, mid) = match (ids.get(cname), ids.get(fname)) {
+            (Some(&c), Some(&m)) => (c, m),
+            _ => return None, // never interned: never compiled
+        };
+        if let Some(state) = self.compiled_fast_calls.get(&(cid, mid)) {
+            return match state {
+                FastCallState::Entry(rc) => Some(rc.clone()),
+                FastCallState::Never => None,
+                FastCallState::Pending => None, // re-probed below
+            };
+        }
+        let never = |sim: &mut Self| {
+            sim.compiled_fast_calls
+                .insert((cid, mid), FastCallState::Never);
+        };
+        let Some(pre) = self.compiled_method_plans.get(&(cid, mid)).cloned() else {
+            return None; // no plan yet: this call goes the interpreter route
+        };
+        if !pre.writeback_formals.is_empty() {
+            never(self);
+            return None;
+        }
+        if pre.is_collection_result {
+            never(self);
+            return None;
+        }
+        // A param-able result type is fine here: a free function has no
+        // receiver, so its scope is fixed (handle 0) and the slow path's
+        // width resolution is fully deterministic. Mirror it so the block
+        // cache key matches.
+        let result_width = if pre.param_able_result {
+            let scope = self.instance_param_scope(0);
+            let w = super::elaborate::resolve_type_width(
+                &pre.return_type,
+                Some(&scope),
+                Some(&self.module.typedefs),
+            );
+            if w > 0 {
+                w
+            } else {
+                pre.static_result_width
+            }
+        } else {
+            pre.static_result_width
+        };
+        let key = (cid, mid, pre.formal_widths.clone(), result_width);
+        let Some(super::bytecode::CompiledMethodOutcome::Block(rc_entry)) =
+            self.compiled_method_block_cache.get(&key).cloned()
+        else {
+            return None; // block not compiled yet (Pending)
+        };
+        // Static locals are synced through interpreter frames keyed on the
+        // caller's class context — a free-function fast call cannot provide
+        // the callee's own scope, so keep those functions on the slow path.
+        let body_has_static_local = fd.items.iter().any(|st| {
+            fn has_static(st: &crate::ast::stmt::Statement) -> bool {
+                if let crate::ast::stmt::StatementKind::VarDecl {
+                    lifetime: Some(crate::ast::types::Lifetime::Static),
+                    declarators,
+                    ..
+                } = &st.kind
+                    && !declarators.is_empty()
+                {
+                    return true;
+                }
+                Simulator::sub_stmts(st).into_iter().any(has_static)
+            }
+            has_static(st)
+        });
+        if body_has_static_local {
+            never(self);
+            return None;
+        }
+        let block = rc_entry.block.clone();
+        let has_forbidden = block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Insn::EvalExprFallback(..)
+                    | Insn::StmtFallback(..)
+                    | Insn::LoadProcessLocal(..)
+                    | Insn::Cast(..)
+            )
+        });
+        if has_forbidden {
+            never(self);
+            return None;
+        }
+        use crate::ast::types::DataType as DT;
+        let mut coerce: Vec<(Box<str>, u32, Option<bool>)> = Vec::with_capacity(fd.ports.len());
+        for port in fd.ports.iter() {
+            let dt = &port.data_type;
+            let c = if self.typeref_names_class(dt) || Self::is_string_data_type(dt) {
+                (0, None)
+            } else if matches!(dt, DT::TypeReference { .. }) {
+                if let Some((pw, signed)) = self.scalar_formal_integral(dt) {
+                    (pw, Some(signed))
+                } else if self.type_is_signed_concrete(dt) {
+                    (0, Some(true))
+                } else {
+                    (0, None)
+                }
+            } else if matches!(dt, DT::IntegerAtom { .. }) || Self::packed_dims_are_literal(dt) {
+                let pw = super::elaborate::resolve_type_width(
+                    dt,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                );
+                (pw.max(1), Some(super::elaborate::is_type_signed(dt)))
+            } else if super::elaborate::is_type_signed(dt) {
+                (0, Some(true))
+            } else {
+                (0, None)
+            };
+            coerce.push((port.name.name.clone().into_boxed_str(), c.0, c.1));
+        }
+        let seed = if Self::is_string_data_type(&pre.return_type) {
+            Value::from_string("")
+        } else {
+            let rw = super::elaborate::resolve_type_width(
+                &pre.return_type,
+                Some(&self.module.parameters),
+                Some(&self.module.typedefs),
+            )
+            .max(1);
+            if super::elaborate::is_type_real(&pre.return_type) {
+                Value::from_f64(0.0)
+            } else if super::elaborate::is_type_two_state(&pre.return_type) {
+                Value::zero(rw)
+            } else {
+                Value::new(rw)
+            }
+        };
+        let entry = std::rc::Rc::new(FastCallEntry {
+            block,
+            defining_class: Box::from(cname),
+            this_reg: rc_entry.this_reg,
+            result_reg: rc_entry.result_reg,
+            coerce,
+            seed,
+            result_width,
+            result_signed: pre.result_signed,
+            is_class_result: pre.is_class_result,
+            is_void_result: pre.is_void_result,
+            accessor: FastAccessor::None,
+        });
+        self.compiled_fast_calls
+            .insert((cid, mid), FastCallState::Entry(entry.clone()));
+        Some(entry)
+    }
+    /// Register-machine fast dispatch for a compiled free function invoked
+    /// from compiled code (`Insn::CallFreeFunction`). Mirrors
+    /// `vm_try_direct_call` minus the receiver (free functions carry no
+    /// `this`); `pkg` is the callee's package scope, pushed so that nested
+    /// interpreter re-entries resolve names exactly as the slow path would.
+    fn vm_try_direct_free_fn_call(
+        &mut self,
+        fd: &FunctionDeclaration,
+        cname: &str,
+        pkg: &str,
+        arg_base: usize,
+        n: usize,
+    ) -> Option<Value> {
+        if !fast_calls_enabled() {
+            return None;
+        }
+        let fname = fd.name.name.name.as_str();
+        let tier = method_tier_threshold();
+        if tier > 0 {
+            let ids = &mut self.compiled_class_method_ids;
+            let cid = match ids.get(cname) {
+                Some(&id) => id,
+                None => {
+                    let next = ids.len() as u32;
+                    *ids.entry(cname.to_string()).or_insert(next)
+                }
+            };
+            let mid = match ids.get(fname) {
+                Some(&id) => id,
+                None => {
+                    let next = ids.len() as u32;
+                    *ids.entry(fname.to_string()).or_insert(next)
+                }
+            };
+            let calls = self
+                .compiled_method_call_counts
+                .entry((cid, mid))
+                .or_insert(0);
+            if *calls < tier {
+                *calls += 1;
+                return None;
+            }
+        }
+        let Some(entry) = self.vm_fast_free_fn_entry_for(cname, fname, fd) else {
+            return None;
+        };
+        if n != entry.coerce.len() {
+            return None; // default-valued formals: interpreter fills them
+        }
+        let mut args: Vec<Value> = Vec::with_capacity(n);
+        for (i, (_, w, sgn)) in entry.coerce.iter().enumerate() {
+            let Some(src) = self.vm_regs.get(arg_base + i) else {
+                return None;
+            };
+            if src.is_real {
+                return None;
+            }
+            let mut v = src.clone();
+            if *w > 0 && v.width != *w {
+                v = v.resize_for_assign(*w);
+            }
+            if let Some(s) = sgn {
+                v.is_signed = *s;
+            }
+            args.push(v);
+        }
+        self.push_queue_frame();
+        self.this_stack.push(None);
+        self.class_context_stack.push(None);
+        let mut locals = self.take_pooled_frame();
+        for ((name, _, _), v) in entry.coerce.iter().zip(args.iter()) {
+            locals.insert(name.to_string(), v.clone());
+        }
+        self.push_local_frame(locals);
+        self.pkg_scope_stack.push(Some(pkg.to_string()));
+        self.func_call_stack.push(fd.name.name.name.clone());
+        let _prev_compiled = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(CUR_METHOD_COMPILED.swap(true, std::sync::atomic::Ordering::Relaxed))
+        } else {
+            None
+        };
+        let caller_regs = std::mem::take(&mut self.vm_regs);
+        let saved_foreach_arena = std::mem::take(&mut self.foreach_arena);
+        let saved_return = self.return_flag;
+        self.return_flag = false;
+        let mut regs = vec![Value::zero(1); entry.block.num_regs as usize];
+        regs[entry.this_reg as usize] = Value::from_u64(0, 32);
+        for (i, v) in args.into_iter().enumerate() {
+            let reg = entry.this_reg as usize + 1 + i;
+            if reg < entry.block.num_regs as usize {
+                regs[reg] = v;
+            }
+        }
+        if (entry.is_void_result || entry.is_class_result)
+            && (entry.result_reg as usize) < entry.block.num_regs as usize
+        {
+            regs[entry.result_reg as usize] = entry.seed.clone();
+        }
+        self.vm_regs = regs;
+        self.exec_insns(&entry.block.instructions);
+        let result = self
+            .vm_regs
+            .get(entry.result_reg as usize)
+            .cloned()
+            .unwrap_or_else(|| Value::zero(32));
+        self.vm_regs = caller_regs;
+        self.foreach_arena = saved_foreach_arena;
+        if let Some(prev) = _prev_compiled {
+            CUR_METHOD_COMPILED.store(prev, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.return_flag = saved_return;
+        self.func_call_stack.pop();
+        self.pkg_scope_stack.pop();
+        self.pop_local_frame();
+        self.class_context_stack.pop();
+        self.this_stack.pop();
+        self.pop_and_restore_queue_frame();
+        let mut result = result;
+        if entry.result_width > 0 && result.width != entry.result_width {
+            result = result.resize_for_assign(entry.result_width);
+        }
+        if !entry.is_class_result && !entry.is_void_result && !result.is_real {
+            result.is_signed = entry.result_signed;
+        }
+        Some(result)
     }
 
     /// class-perf P3: direct VM->VM dispatch for `CallMethod` — run a
