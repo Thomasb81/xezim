@@ -13881,7 +13881,7 @@ impl Simulator {
     }
 
     /// Like `sv_sscanf`, but also returns how many CHARS of `src` were
-    /// consumed, so `$fscanf` can push the unread remainder back (§21.3.4.2:
+    /// consumed, so `$fscanf` can push the unread remainder back (§21.3.4.3:
     /// the file position advances only past what the format matched — reading
     /// one `%s` of a two-word line must leave the second word readable, and
     /// `$feof` false).
@@ -14031,6 +14031,98 @@ impl Simulator {
             }
         }
         (assigned, si)
+    }
+
+    /// §21.3.4.3 `$fscanf(fd, format, …)`: line-buffered scan of `fd`.
+    /// Returns the number of assigned conversions, or -1 at end of file.
+    /// Shared by the function form (`n = $fscanf(…)`) and the task form
+    /// (`$fscanf(…);`), which discards the count.
+    fn fscanf_impl(&mut self, args: &[Expression]) -> i64 {
+        let fd = args
+            .first()
+            .map(|a| self.eval_file_handle_arg(a))
+            .unwrap_or(0);
+        let fmt = args
+            .get(1)
+            .map(|a| {
+                if let ExprKind::StringLiteral(f) = &a.kind {
+                    f.clone()
+                } else {
+                    self.eval_expr(a).to_sv_string()
+                }
+            })
+            .unwrap_or_default();
+        // A previous partial read may have pushed back just the tail
+        // whitespace of its line ("\n"). For conversions that skip leading
+        // whitespace (§21.3.4.3: the numeric/string ones do, across lines) a
+        // whitespace-only line is transparent — pull the next. But when the
+        // format's first item matches WITHOUT skipping (`%c` reads exactly
+        // one character, whitespace included; a literal must match exactly),
+        // that line carries the very byte the format must see (issue #262: a
+        // file holding one space read as empty, and repeated `%c` lost every
+        // '\n' between lines).
+        let mut first_line = self.sv_read_line(fd);
+        if Self::scanf_leading_item_skips_ws(&fmt) {
+            while first_line.as_deref().is_some_and(|l| l.trim().is_empty()) {
+                first_line = self.sv_read_line(fd);
+            }
+        }
+        match first_line {
+            Some(line) => {
+                let (n, consumed) = self.sv_sscanf_consumed(&line, &fmt, &args[2..]);
+                // §21.3.4.3: the position advances only past what the format
+                // matched. `sv_read_line` pulled a whole line, so push the
+                // unread tail back (reversed — the pushback buffer is a LIFO
+                // whose top is the next char). Without this,
+                // `$fscanf(fd, "%s", w)` on a two-word line dropped the
+                // second word and `$feof` reported end-of-file with data
+                // left. `sv_read_line` maps bytes onto chars one-to-one
+                // (Latin-1), so the reverse mapping `ch as u8` restores the
+                // ORIGINAL byte — re-encoding as UTF-8 turned a pushed-back
+                // 0xff into the two bytes C3 BF.
+                let rest: Vec<char> = line.chars().skip(consumed).collect();
+                if !rest.is_empty() {
+                    let buf = self.ungetc_buf.entry(fd).or_default();
+                    for ch in rest.iter().rev() {
+                        buf.push(*ch as u8);
+                    }
+                    // Data is readable again: an end-of-file flag that the
+                    // final line's read raised must come down, the way
+                    // `$ungetc` lowers it — `$feof` must not report EOF
+                    // while the pushed-back tail is still unread.
+                    self.file_eof.remove(&fd);
+                }
+                n
+            }
+            None => -1, // EOF (§21.3.4.3)
+        }
+    }
+
+    /// Does the FIRST item of a scanf format skip leading input whitespace
+    /// before it matches? Explicit whitespace in the format does, and so do
+    /// the numeric/string conversions (`%d %i %h %x %X %o %b %s %f %e %g`).
+    /// `%c` matches any single character — whitespace included
+    /// (§21.3.4.3, issue #262) — and `%%` and literal characters must match
+    /// exactly, so for those the input's leading whitespace is significant
+    /// and the line-buffered reader must not step over it.
+    fn scanf_leading_item_skips_ws(fmt: &str) -> bool {
+        let mut it = fmt.chars().peekable();
+        while let Some(c) = it.next() {
+            if c.is_whitespace() {
+                return true;
+            }
+            if c != '%' {
+                return false; // literal: exact match, no skipping
+            }
+            while it.peek().is_some_and(|d| d.is_ascii_digit()) {
+                it.next(); // field width
+            }
+            return match it.next() {
+                Some('d' | 'i' | 'h' | 'x' | 'X' | 'o' | 'b' | 's' | 'f' | 'e' | 'g') => true,
+                _ => false, // %c, %%, unknown: no whitespace skipping
+            };
+        }
+        false
     }
 
     fn eval_file_handle_arg(&mut self, expr: &Expression) -> i32 {
@@ -14226,9 +14318,31 @@ impl Simulator {
         if newline {
             payload.push('\n');
         }
-        let nbytes = payload.len() as u64;
+        // The count is the number of BYTES written — in the simulator's
+        // byte convention (see `sv_payload_bytes`), not the UTF-8 length
+        // of the Rust string.
+        let nbytes = Self::sv_payload_bytes(&payload).len() as u64;
         self.write_channels(raw, &payload);
         Value::from_u64(nbytes, 32)
+    }
+
+    /// Bytes a `$fwrite`/`$fdisplay` payload writes to a file: the mirror of
+    /// `sv_read_line`'s byte→char mapping. Chars up to U+00FF are the
+    /// simulator's byte representation — a `%c` of 8'hff is the single byte
+    /// 0xff, not its two-byte UTF-8 encoding (issue #262's all-256 round
+    /// trip) — so each transcodes back to one byte; higher code points
+    /// (text from beyond Latin-1) keep their UTF-8 encoding.
+    fn sv_payload_bytes(payload: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(payload.len());
+        for ch in payload.chars() {
+            if (ch as u32) <= 0xff {
+                out.push(ch as u8);
+            } else {
+                let mut tmp = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
+            }
+        }
+        out
     }
 
     /// Write `payload` to every channel `raw` (MCD or FD) selects. Shared with
@@ -14244,10 +14358,12 @@ impl Simulator {
             } else if ku == 0x8000_0002 {
                 // FD STDERR
                 let mut e = std::io::stderr();
-                let _ = e.write_all(payload.as_bytes());
+                let _ = e.write_all(&Self::sv_payload_bytes(payload));
                 let _ = e.flush();
             } else if let Some(f) = self.file_handles.get_mut(&k) {
-                let _ = f.write_all(payload.as_bytes());
+                // Byte-exact (Latin-1) so `%c` round-trips every byte value
+                // through a file — see `sv_payload_bytes`.
+                let _ = f.write_all(&Self::sv_payload_bytes(payload));
                 self.file_writes_pending |= f.has_pending();
             }
             // else: closed/unknown fd (e.g. STDIN) → silently drop.
@@ -14293,14 +14409,34 @@ impl Simulator {
 
     /// Read up to `buf.len()` bytes from file descriptor `fd`, looping until
     /// the buffer is full or EOF. Returns the byte count actually read.
-    /// Pending `$ungetc` bytes are not consulted (mixing `$ungetc` with
-    /// `$fread` is not modeled).
+    /// Pending pushback (`$ungetc`, or the unread tail of a partially
+    /// matched `$fscanf` line) is consumed first, like C stdio.
     fn fread_bytes(&mut self, fd: i32, buf: &mut [u8]) -> usize {
         use std::io::Read;
-        let Some(f) = self.file_handles.get_mut(&fd) else {
-            return 0;
-        };
+        // Pushback first: bytes `$fscanf` returned to the stream (and
+        // `$ungetc`'s) must come back before anything the OS file holds —
+        // C stdio reads consume ungetc'd characters first. Without this,
+        // `$fread` after a partial `$fscanf` stranded the pushed-back tail
+        // in the buffer and read from the wrong stream position.
         let mut got = 0usize;
+        while got < buf.len() {
+            let Some(b) = self.ungetc_buf.get_mut(&fd).and_then(|b| b.pop()) else {
+                break;
+            };
+            buf[got] = b;
+            got += 1;
+        }
+        if got > 0 {
+            // Data was available, so the end-of-file flag a previous read
+            // may have raised no longer holds.
+            self.file_eof.remove(&fd);
+        }
+        if got == buf.len() {
+            return got; // filled entirely from pushback
+        }
+        let Some(f) = self.file_handles.get_mut(&fd) else {
+            return got;
+        };
         let mut hit_end = false;
         while got < buf.len() {
             match f.read(&mut buf[got..]) {
@@ -67890,12 +68026,18 @@ impl Simulator {
                     .first()
                     .map(|a| self.eval_file_handle_arg(a))
                     .unwrap_or(0);
+                // The LOGICAL position: bytes sitting in the pushback buffer
+                // (the unread tail of a partially matched `$fscanf` line, or
+                // `$ungetc`) are still unread, so they lie before the
+                // position. Reporting the raw OS position made a
+                // `$ftell`/`$fseek` round-trip land PAST them.
+                let pushback = self.ungetc_buf.get(&fd).map_or(0, Vec::len) as u64;
                 let pos = self
                     .file_handles
                     .get_mut(&fd)
                     .and_then(|f| f.stream_position().ok())
                     .unwrap_or(0);
-                Value::from_u64(pos, 32)
+                Value::from_u64(pos.saturating_sub(pushback), 32)
             }
             "$fseek" => {
                 use std::io::{Seek, SeekFrom};
@@ -67919,6 +68061,12 @@ impl Simulator {
                 if let Some(f) = self.file_handles.get_mut(&fd) {
                     let _ = f.seek(from);
                     self.file_eof.remove(&fd);
+                    // Seeking discards pushed-back characters (§21.3.4.1
+                    // NOTE: "Operations like $fseek might erase any pushed
+                    // back characters"). A stale pushback made a post-
+                    // `$fseek` read return the pre-seek tail instead of the
+                    // sought-to data.
+                    self.ungetc_buf.remove(&fd);
                 }
                 Value::zero(32)
             }
@@ -67931,6 +68079,7 @@ impl Simulator {
                 if let Some(f) = self.file_handles.get_mut(&fd) {
                     let _ = f.seek(SeekFrom::Start(0));
                     self.file_eof.remove(&fd);
+                    self.ungetc_buf.remove(&fd);
                 }
                 Value::zero(32)
             }
@@ -67966,54 +68115,9 @@ impl Simulator {
             // §21.3.4.4 binary read; returns bytes read (0 on EOF).
             "$fread" => self.fread_impl(args),
             "$fscanf" => {
-                let fd = args
-                    .first()
-                    .map(|a| self.eval_file_handle_arg(a))
-                    .unwrap_or(0);
-                let fmt = args
-                    .get(1)
-                    .map(|a| {
-                        if let ExprKind::StringLiteral(f) = &a.kind {
-                            f.clone()
-                        } else {
-                            self.eval_expr(a).to_sv_string()
-                        }
-                    })
-                    .unwrap_or_default();
-                // A previous partial read may have pushed back just the
-                // tail whitespace of its line ("\n"); the numeric/string
-                // conversions all skip leading whitespace across lines, so
-                // a whitespace-only line is transparent — pull the next.
-                let mut first_line = self.sv_read_line(fd);
-                while first_line.as_deref().is_some_and(|l| l.trim().is_empty()) {
-                    first_line = self.sv_read_line(fd);
-                }
-                match first_line {
-                    Some(line) => {
-                        let (n, consumed) = self.sv_sscanf_consumed(&line, &fmt, &args[2..]);
-                        // §21.3.4.2: the position advances only past what
-                        // the format matched. `sv_read_line` pulled a whole
-                        // line, so push the unread tail back (reversed —
-                        // the pushback buffer is a LIFO whose top is the
-                        // next char). Without this, `$fscanf(fd, "%s", w)`
-                        // on a two-word line dropped the second word and
-                        // `$feof` reported end-of-file with data left.
-                        let rest: Vec<char> = line.chars().skip(consumed).collect();
-                        if !rest.is_empty() {
-                            let buf = self.ungetc_buf.entry(fd).or_default();
-                            let mut bytes: Vec<u8> = Vec::new();
-                            for ch in rest {
-                                let mut tmp = [0u8; 4];
-                                bytes.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
-                            }
-                            for &b in bytes.iter().rev() {
-                                buf.push(b);
-                            }
-                        }
-                        Value::from_u64(n as u64, 32)
-                    }
-                    None => Value::from_u64(u32::MAX as u64, 32), // EOF = -1
-                }
+                let n = self.fscanf_impl(args);
+                // EOF reports as -1 (§21.3.4.3); the match count otherwise.
+                Value::from_u64(n as u32 as u64, 32)
             }
             "$feof" => {
                 let fd = args
@@ -85555,6 +85659,10 @@ impl Simulator {
                 };
                 if let Some(f) = self.file_handles.get_mut(&fd) {
                     let _ = f.seek(from);
+                    self.file_eof.remove(&fd);
+                    // Seeking discards pushed-back characters (§21.3.4.1
+                    // NOTE: "$fseek might erase any pushed back characters").
+                    self.ungetc_buf.remove(&fd);
                 }
             }
             "$rewind" => {
@@ -85565,6 +85673,8 @@ impl Simulator {
                     .unwrap_or(0);
                 if let Some(f) = self.file_handles.get_mut(&fd) {
                     let _ = f.seek(SeekFrom::Start(0));
+                    self.file_eof.remove(&fd);
+                    self.ungetc_buf.remove(&fd);
                 }
             }
             "$ungetc" => {
@@ -85577,6 +85687,12 @@ impl Simulator {
                     .map(|a| self.eval_file_handle_arg(a))
                     .unwrap_or(0);
                 self.ungetc_buf.entry(fd).or_default().push(ch);
+            }
+            // §21.3.4.3 task form: scan and assign, discarding the count.
+            // Previously this form had no arm at all and silently did
+            // nothing — `$fscanf(fd, "%c", c);` left `c` untouched.
+            "$fscanf" => {
+                let _ = self.fscanf_impl(args);
             }
             "$fgets" => {
                 // task form: discard return value, just write to the string arg
