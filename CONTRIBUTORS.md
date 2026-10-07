@@ -6,8 +6,10 @@ Thank you to everyone who has improved xezim through pull requests:
   object handles (§8.25), associative-array method dispatch and ref-writeback,
   `ClassName::static_prop` access, parser-gap self-tests, test-harness
   hardening, per-process bookkeeping for methods that park mid-body, the
-  condition-waiter drain de-duplication, and the NBA-region lane in the
-  `--max-time` hang report.
+  condition-waiter drain de-duplication, the NBA-region lane in the
+  `--max-time` hang report, class-method performance (fast accessor inlining,
+  peephole branch fusion), packed-struct rand-array constraints, and queue and
+  associative-array returns.
 - **Vrajesh Prakhya** — real-number modelling: Verilog-AMS `wreal` nets
   resolved by summing, user-defined nettypes across the hierarchy and in
   packages (§6.6.7, §6.6.8), real-ness of members projected from call results,
@@ -22,12 +24,21 @@ Thank you to everyone who has improved xezim through pull requests:
   installer with UVM setup.
 - **Ganesh T S** — wide-number parsing for `$sscanf`/`$fscanf`/`$value$plusargs`
   and the string conversion methods (arbitrary-precision decimal in the core),
-  loop-variable scoping against same-named identifiers in child instances, and
-  detailed self-checking bug reports for struct and class member access.
+  loop-variable scoping against same-named identifiers in child instances,
+  parameter values converted to their declared type's width and sign (§6.20),
+  `%c` in `$fscanf`/`$sscanf` matching exactly one character, and detailed
+  self-checking bug reports for struct and class member access.
 - **eenky** — declared defaults for parameters a class leaves out when it
   extends a parameterized class, and virtual-interface reads through
   class-handle chains (`cfg.vif.data`).
 - **Francesco Urbani** — `+incdir+` directories in `-F` args files resolved
   against the args file's own directory.
+- **Taichi Ishitani** — constrained-random fixes (members of rand object array
+  elements, `pre_randomize` before the rand and constraint modes are read,
+  `this.` member paths in the joint solver, and `XEZIM_RAND_DIAG` reports of
+  why `randomize()` failed), named `extends` lists and type-parameter formals
+  resolved from the receiver's own bindings, class handles resolved before
+  same-named structs, unpacked-struct mailbox messages through task formals,
+  and array signs preserved through subroutine frames.
 
 New contributors are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
