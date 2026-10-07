@@ -14,7 +14,7 @@ Open an issue on [GitHub](https://github.com/aionhw/xezim/issues) with:
   or another simulator's result. When you checked against a commercial
   simulator, say "the reference simulator" rather than naming a product.
 * **The xezim version or commit.** `--verbose` prints the version banner
-  (`=== xezim 0.11.0 ===`).
+  (`=== xezim 0.11.1 ===`).
 
 ## Pull requests
 

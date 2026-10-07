@@ -6,7 +6,7 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
-### Unreleased
+### 0.11.1 — complete VPI, faster memory models, IEEE 1800 conformance fixes (October 2026)
 
 **Correctness**
 
