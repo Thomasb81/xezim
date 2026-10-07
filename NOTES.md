@@ -185,6 +185,60 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   gives inherited properties, locals and function returns that type's width
   and signedness. A ranged type argument (`#(bit [5:0])`) in a typedef keeps
   its range.
+* Variables declared inside functions, tasks, class methods, `begin`/`fork`
+  blocks, loops and `always` blocks keep their full declared type (IEEE 1800
+  §6.8). A 2-state local no longer holds x or z, an initializer is converted to
+  the declared type (`byte unsigned v = 200` used to read -56, `int unsigned
+  v = -1` compared as negative), and struct literals, strings, virtual
+  interfaces and tagged unions initialize correctly. Packed multi-dimensional
+  array locals keep their dimensions.
+* 2-state members of an unpacked struct (`int`, `byte`, ...) start at 0
+  wherever the struct lives; they used to read x until first written. Member
+  defaults (`int a = 3;`) apply to block-local and class-property structs too.
+* Bit-stream casts to and from unpacked arrays, dynamic arrays and queues
+  (`barr_t'(32'h01020304)`, `int'(barr)`) unpack and pack the elements in
+  declared order (§6.24.3); they used to give zeros.
+* A base-class handle to a derived object reads and writes the base's copy
+  of a property the derived class redeclares (§8.14). Writing through the
+  base handle used to change the derived copy.
+* A class fixed array sized by a value parameter (`int items[N]`) has each
+  specialization's own size, and a static method called through a handle to a
+  specialized class sees that specialization's parameters (§8.25).
+* Elements of class `byte`, `shortint` and signed-vector queues and dynamic
+  arrays keep their sign (`-1` used to read as `255`).
+* Writes through a chain of handles of any depth (`n.next.next = new(3)`,
+  `a.b.c.x = 5`) are no longer lost (§8.15).
+* A class property no longer resolves to a same-named member of an unrelated
+  struct variable elsewhere in the design, which used to leave handles null
+  and their members x. `%s` of a string read through two handles prints the
+  text without padding.
+* `q.min() == q.max()` on a class queue property no longer crashes.
+* Same-named variables in different packages, or in a package and a module
+  that imports it, are separate variables (§26.3). They used to share storage.
+* Queue, dynamic-array and associative-array arguments follow §13.5: an
+  `input` is a copy (it used to alias the caller's variable), an `output`
+  starts empty and is copied back on return, and a `ref` aliases the actual,
+  so concurrently forked tasks see each other's writes.
+* `@(posedge x)` and other event controls on a `ref` argument wait for the
+  actual to change; they used to return at once.
+* A queue slice passed directly as an argument (`f(q[1:$])`) passes exactly
+  the slice; it used to pass one element, and a recursive function over
+  slices overflowed the stack. `q[a:b]` with `a > b` is empty.
+* Clocking blocks (§14): `#1step`, `#0` and `#N` input skews sample the
+  Preponed, Observed and time-minus-N values (inputs used to return the value
+  after the clock edge), output skews including `#1step` are honored, `inout`
+  clockvars can be driven, and an `@(cb)` reached right after the raw clock
+  edge sees that edge's samples. `#1step` used to be read as `#1`, which also
+  dropped the rest of a `default` clocking item.
+* `disable` of a named block or task from a process forked inside it ends the
+  whole block, kills the processes forked in it and resumes the block's owner
+  after it (§9.6.2). The sibling branches used to keep running.
+* `force` and `release` on bit- and part-selects of nets hold against the
+  net's drivers and hand back only the released bits (§10.6.2). Forces also
+  hold on gate-driven nets.
+* A level-sensitive `always` block in an instance runs at time 0 when an
+  input port's actual has a declaration-initialized value; its outputs used to
+  stay x.
 
 **Performance**
 
@@ -259,6 +313,60 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   with `vpiFile`/`vpiLineNo`; `vpiType` is the declared type through
   typedefs, with ranges and typespecs. Ports iterate in port-list order and
   SystemVerilog unpacked arrays report `vpiRegArray`.
+
+**Assertions**
+
+* A failing assertion with no `else` clause (immediate, deferred or
+  concurrent, `assume` included) reports `** Error: Assertion error.` with its
+  time and scope, as §16.3 requires. It used to print nothing.
+* Property and sequence local variables (§16.10) are supported: declarations
+  with initializers, match-item assignments `(seq, v = e)` and `local input`
+  formals, with a separate copy per attempt. Subroutine calls in match items
+  (§16.11) run at each match.
+* A concurrent assertion inside an `always` procedure takes its clock from the
+  procedure's event control and starts only when the procedure reaches it, so
+  an enclosing `if`, `case` or loop gates it (§16.14.6).
+* `default disable iff` (§16.15) applies to the assertions of its scope; an
+  explicit `disable iff` still wins.
+* An `always_comb` or `always @*` whose only reads are inside an assertion
+  re-runs when those values change; it used to run once at time 0.
+* `a ##1 b == c` delays the comparison, as the operator precedence requires.
+  Each copy of an assertion in a generate loop runs (only the first used to),
+  and `%m` in its action names the generate block. A named property without a
+  clock uses the default clocking.
+
+**DPI**
+
+* Imported DPI tasks that wait through exported tasks suspend and resume
+  independently (§35.5.2, Linux with glibc), so concurrent callers no longer
+  return in last-in first-out order. Each active call reserves its own stack,
+  256 MiB by default; `XEZIM_DPI_STACK_MB` changes the size.
+* The §35.9 disable protocol is implemented: `svIsDisabledState()` reports a
+  call whose process was disabled, a disabled exported task returns 1, and
+  protocol violations are fatal. The C side of imported and exported tasks
+  returns `int`.
+* `export "DPI-C"` declared in an instantiated module works. Each instance's
+  copy is called according to the current DPI scope (`svSetScope`, or the
+  calling context import).
+* Packed struct and union arguments pass as `svBitVecVal` or
+  `svLogicVecVal` in every direction; they used to arrive and return as 0. Multi-dimensional
+  open arrays are supported, and output and inout arguments of exported
+  functions and tasks are written back to C.
+
+**Tests**
+
+* A new `lrm` test group checks 409 subclauses of IEEE 1800-2023, chapters 3
+  to 38 and Annexes D and E, against values taken from the reference
+  simulator (169 tests). The test suite has no ignored tests.
+
+**Removed**
+
+* The experimental multikernel / PDES code: the `--multikernel-scope`,
+  `--pdes-c910-stub` and `--pdes-c910-ticks` options, the
+  `XEZIM_DISPATCHER=pdes`/`perlp` modes and the `XEZIM_PDES_*` /
+  `XEZIM_PERLP_*` variables. The library function `simulate_multi` no longer
+  takes a `multikernel_scope` argument. Partition-based parallel dispatch
+  (`--load-partition`, `XEZIM_PARTITION_*`) is unchanged.
 
 ### 0.11.0 — code coverage, reference-parity fixes, faster UVM (September 2026)
 
