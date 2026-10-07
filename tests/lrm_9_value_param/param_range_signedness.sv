@@ -24,64 +24,48 @@ end
 `endif
 
 // ============================================================================
-// mwe_param_range_signedness_svtest.sv — consolidated single-file MWE for the
-// localparam/parameter EXPLICIT-RANGE value-semantics bug family (the
-// "locparam2sig" original bug + the cousin bugs found hunting around the
-// parameter-value path in src/elaborate.rs: eval_param_value / eval_param_init
-// / add_params_from_items / resolve_type_width / is_type_signed).
+// param_range_signedness.sv: value semantics of parameters and localparams
+// declared with an EXPLICIT type or range.
 //
-// IEEE 1800 §6.20.2 / §10.7: a parameter or localparam declared with an
-// explicit type or range is ASSIGNED its initializer (and each override):
-// the value is evaluated in the declared width context, then wrapped to that
-// width with the DECLARED signedness.  A bare range `[3:0]` is UNSIGNED
-// (`-1` -> 15, `256` in `[7:0]` -> 0); `signed [3:0]` wraps (`15` -> -1);
-// an untyped parameter keeps the RHS value/sign unchanged.
+// IEEE 1800 §6.20.2 / §10.7 / §23.10.2: a parameter or localparam declared
+// with an explicit type or range is ASSIGNED its initializer, and each
+// override (`#(...)` or defparam) is likewise an assignment to the formal's
+// type. The value is evaluated in the declared width context, then wrapped
+// to that width with the DECLARED signedness:
+//  * a bare range `[3:0]` is UNSIGNED (`-1` -> 15, `256` in `[7:0]` -> 0),
+//    and a value read through it never sign-extends: through an assign, a
+//    `bit [1:0]`, a generate-if or ternary condition, `C + C`, or a range
+//    `logic [C-1:0]` (PART 1);
+//  * `signed [3:0]` wraps (`15` -> -1), for a default and an override;
+//  * a typedef'd SIGNED type keeps its sign, including a typedef local to
+//    the module (`typedef logic signed [1:0] T; localparam T C = ...`);
+//  * defaults, named `.P(-1)` and positional `#(-1)` overrides, and
+//    localparams in the parameter port list all wrap (PART 2), and the
+//    wrapped value is what hierarchical reads and child ports see (PART 3);
+//  * an override is evaluated in the formal's width: `.P(4'hF + 4'h1)` on
+//    `parameter [7:0] P` is 16, and a formal whose range uses another
+//    formal (`parameter [W-1:0] P`) takes the instance's own W (PART 4);
+//  * a value parameter typed by a type parameter takes that type's full
+//    width, for the default type and an overriding one (PART 4);
+//  * defparam values, unpacked-array elements, `signed` with no range, 2-state
+//    types (X/Z -> 0) and real initializers (rounded) convert the same way
+//    (PART 5).
+// An untyped parameter keeps its value and signedness unchanged (§6.20.2).
 //
-// ORIGINAL BUG (before the fix): `localparam [1:0] C = 1 + P;` with P=1 gives
-// C=2, but every use of C sees the 2-bit pattern treated as SIGNED (-2) and
-// sign-extended — `assign y = C` drives 126 instead of 2, and the production
-// shape (C feeding a child port) drives 126 through the hierarchy.  NOTE:
-// upstream xezim-core d0997ba "Use a typed parameter's width as its value
-// context" (included: xezim 289ff7bd pins core d7bd60a) fixed only the WIDTH
-// context (`localparam int P = A + B` -> 300, not the 8-bit wrap 44); the
-// range wrap + signedness semantics below are still wrong.
+// Checks marked [control] pin neighbouring behaviour (signed wrap, typedef'd
+// unsigned, int, shift and replication amounts, real, untyped parameters, the
+// width context of `localparam [7:0] C = P + P`) so the conversion does not
+// overcorrect.
 //
-// COUSIN BUGS (all failed on xezim 0.11.0 git 289ff7bd + core d7bd60a, before the fix):
-//  P1. localparam bare range `[1:0]` — value wrapped but treated SIGNED:
-//      sign-extends through assign (A1), `bit [1:0]` (A3), generate-if
-//      condition (A6), ternary condition (A7), arithmetic `C + C` (A8), and
-//      width ranges `logic [C-1:0]` -> $bits=4 not 2 (A11).
-//  P2. localparam via a typedef'd SIGNED type — sign LOST, the inverse
-//      direction: `typedef logic signed [1:0] T` gives +2 not -2 (A4B).
-//  P3. parameter bare range — the DEFAULT value is not wrapped/unsignedified:
-//      `parameter [3:0] P = -1` keeps -1 (B1), `[7:0] P = 256` keeps 256 (B5).
-//  P4. parameter overrides — same for named `.P(-1)` (B2) and positional
-//      `#(-1)` (B3) overrides of a `[3:0]` parameter.
-//  P5. parameter `signed [3:0]` — value NOT wrapped to the range: default 15
-//      stays +15 (B4) and override `.P(15)` stays +15 (B8); expected -1.
-//  P6. localparam declared IN the parameter_port_list — `localparam [3:0]
-//      LP = -1` keeps -1 (B6).
-//  P7. hierarchical read of the mangled localparam `u.C` returns the signed
-//      value -2 (C1) — the wrong value is visible cross-module too.
-//  P8. the original shape: localparam C feeding a CHILD PORT `.n(C)` drives
-//      126 (ORIG).
-//
-// [control] checks that PASS today and must keep passing after a fix (they
-// pin the correct semantics so the fix does not overcorrect): A2 (signed
-// [1:0] wraps 2 -> -2 -> 126), A4 (typedef'd unsigned), A5 (int), A9 (shift
-// amount), A10 (replication count), A12 (real), B7 (untyped parameter keeps
-// -1), B9 / B9TOP (parameter [3:0] P=15 consumed by localparam [7:0] C=P+P).
-//
-// SVTEST style: only FAILING checks print ("FAIL @<time> : <msg>"); the
-// final block prints the TEST_PASS / TEST_FAIL count=N verdict.
-//
+// Self-checking: only failing checks print ("FAIL @<time> : <msg>"); the
+// final block prints TEST_PASS, or TEST_FAIL count=N.
 // ============================================================================
 
 // ----- PART 1 modules: localparam with an explicit range/type -----
 
 module mid_a1  #(parameter P = 1) (output [6:0] y);
   localparam [1:0] C = 1 + P;         // 2, wrapped to 2'b10, UNSIGNED
-  assign y = C;                       // BROKEN: sign-extends to 126
+  assign y = C;                       // 2: an unsigned range does not sign-extend
 endmodule
 
 module mid_a2  #(parameter P = 1) (output [6:0] y);
@@ -91,7 +75,7 @@ endmodule
 
 module mid_a3  #(parameter P = 1) (output [6:0] y);
   localparam bit [1:0] C = 1 + P;     // 2-state 2-bit unsigned
-  assign y = C;                       // BROKEN: 126
+  assign y = C;                       // 2
 endmodule
 
 module mid_a4  #(parameter P = 1) (output [6:0] y);
@@ -103,7 +87,7 @@ endmodule
 module mid_a4b #(parameter P = 1) (output [6:0] y);
   typedef logic signed [1:0] T;
   localparam T C = 1 + P;             // 2 wraps to -2 (signed typedef)
-  assign y = C;                       // BROKEN: sign lost, gives 2
+  assign y = C;                       // 126: the typedef's sign is kept
 endmodule
 
 module mid_a5  #(parameter P = 1) (output [6:0] y);
@@ -113,18 +97,18 @@ endmodule
 
 module mid_a6  #(parameter P = 1) (output [6:0] y);
   localparam [1:0] C = 1 + P;
-  if (C == 2) assign y = 7'd2;        // generate-if condition: BROKEN (C==-2)
+  if (C == 2) assign y = 7'd2;        // generate-if condition sees C == 2
   else        assign y = 7'd126;
 endmodule
 
 module mid_a7  #(parameter P = 1) (output [6:0] y);
   localparam [1:0] C = 1 + P;
-  assign y = (C == 2) ? 7'd2 : 7'd126;  // ternary condition: BROKEN
+  assign y = (C == 2) ? 7'd2 : 7'd126;  // ternary condition sees C == 2
 endmodule
 
 module mid_a8  #(parameter P = 1) (output [6:0] y);
   localparam [1:0] C = 1 + P;
-  assign y = C + C;                   // BROKEN: -2 + -2 = -4 -> 124
+  assign y = C + C;                   // 4, unsigned arithmetic
 endmodule
 
 module mid_a9  #(parameter P = 1) (output [6:0] y);
@@ -140,7 +124,7 @@ endmodule
 module mid_a11 #(parameter P = 1) (output [6:0] y);
   localparam [1:0] C = 1 + P;
   logic [C-1:0] r;                    // [1:0] -> 2 bits
-  assign y = $bits(r);                // BROKEN: range sees C=-2 -> 4 bits
+  assign y = $bits(r);                // 2
 endmodule
 
 module mid_a12 #(parameter P = 1) (output [6:0] y);
@@ -151,27 +135,27 @@ endmodule
 // ----- PART 2 modules: parameter with an explicit range (default/override) -----
 
 module mid_b1 #(parameter [3:0] P = -1) (output [6:0] y);
-  assign y = P;                       // BROKEN: -1 kept, sign-extends to 127
+  assign y = P;                       // 15: -1 wrapped to [3:0], unsigned
 endmodule
 
 module mid_b2 #(parameter [3:0] P = 0) (output [6:0] y);
-  assign y = P;                       // BROKEN: .P(-1) override not wrapped
+  assign y = P;                       // 15: the .P(-1) override wraps
 endmodule
 
 module mid_b3 #(parameter [3:0] P = 0) (output [6:0] y);
-  assign y = P;                       // BROKEN: positional #(-1) not wrapped
+  assign y = P;                       // 15: the positional #(-1) override wraps
 endmodule
 
 module mid_b4 #(parameter signed [3:0] P = 15) (output [6:0] y);
-  assign y = P;                       // BROKEN: 15 not wrapped to -1 -> 15
+  assign y = P;                       // 127: 15 wraps to -1, sign-extends
 endmodule
 
 module mid_b5 #(parameter [7:0] P = 256) (output [31:0] y);
-  assign y = P;                       // BROKEN: 256 not wrapped to 0
+  assign y = P;                       // 0: 256 wraps
 endmodule
 
 module mid_b6 #(parameter P = 1, localparam [3:0] LP = -1) (output [6:0] y);
-  assign y = LP;                      // BROKEN: localparam in #() list, -1 kept
+  assign y = LP;                      // 15: a localparam in the #() list wraps
 endmodule
 
 module mid_b7 #(parameter P = -1) (output [6:0] y);
@@ -179,7 +163,7 @@ module mid_b7 #(parameter P = -1) (output [6:0] y);
 endmodule
 
 module mid_b8 #(parameter signed [3:0] P = 0) (output [6:0] y);
-  assign y = P;                       // BROKEN: .P(15) stays +15, not -1
+  assign y = P;                       // 127: the .P(15) override wraps to -1
 endmodule
 
 module mid_b9 #(parameter [3:0] P = 15) (output [6:0] y);
@@ -199,9 +183,60 @@ module mid_c1 #(parameter P = 1) (output [6:0] y);
 endmodule
 
 module mid_orig #(parameter P = 0) (output [6:0] y);
-  localparam [1:0] C = 1 + P;         // the ORIGINAL bug shape
-  child u (.n(C), .y(y));             // BROKEN: 126 reaches the child port
+  localparam [1:0] C = 1 + P;         // C feeding a child port
+  child u (.n(C), .y(y));             // the child port sees 2
 endmodule
+
+// ----- PART 4 modules: override width context, type-parameter typing -----
+
+module mid_d1 #(parameter type T = logic [63:0], parameter T P = 64'h1234_5678_9abc_def0) ();
+endmodule  // P keeps all 64 bits of the default type
+
+module mid_d2 #(parameter type T = int, parameter T P = 0) ();
+endmodule  // overridden with T = logic [47:0]: P has 48 bits; default T: int
+
+module mid_d3 #(parameter type T = logic [63:0], parameter T P = '1) ();
+endmodule  // '1 fills the 64-bit type
+
+module mid_d5 #(parameter [7:0] P = 0) ();
+endmodule  // .P(4'hF + 4'h1) is evaluated in 8 bits: 16
+
+module mid_d6 #(parameter W = 8, parameter [W-1:0] P = 0) ();
+endmodule  // the range uses this instance's W, not the parent's
+
+module mid_d7 #(parameter W = 8, parameter type T = logic [W-1:0], parameter T P = '1) ();
+endmodule  // T's default sized by the instance's W
+
+// ----- PART 5 modules: defparam, arrays, no-range signed, 2-state, real -----
+
+module mid_e1 #(parameter [3:0] P = 0) ();
+endmodule  // defparam -1: 15
+
+module mid_e2 #(parameter signed [3:0] P = 0) ();
+endmodule  // defparam 4'hF: -1
+
+module mid_e3 #(parameter logic [3:0] A [0:1] = '{-1, 17}) ();
+endmodule  // each element wraps: 15, 1
+
+module mid_e4 #(parameter logic [3:0] A [0:1] = '{0, 0}) ();
+endmodule  // .A('{-1, 18}): 15, 2
+
+module mid_e5 #(parameter signed P = 4'b1111) ();
+endmodule  // signed, width of the value: 4-bit -1
+
+module mid_e6 #(parameter signed P = 0) ();
+endmodule  // .P(4'b1111): -1
+
+module mid_e7 #(parameter bit [3:0] P = 4'bx01z) ();
+  localparam bit [3:0] LB = 4'bz10x;  // 2-state: X/Z become 0
+  localparam int LR = 2.6;            // real rounds: 3
+endmodule
+
+module mid_e8 #(parameter int P = 2.6) ();
+endmodule  // 3; .P(2.6) also 3
+
+module mid_e9 #(parameter [7:0] P = 0) ();
+endmodule  // .P(300.4): 300 wraps to 44
 
 // ----- top: instantiate everything, check, verdict -----
 
@@ -243,6 +278,31 @@ module top;
 
   mid_c1   u_c1  (.y(yc1));
   mid_orig #(.P(1)) u_orig (.y(yorig));
+
+  // PART 4: a parent W that differs from the child's own W.
+  parameter W = 4;
+  mid_d1 u_d1 ();
+  mid_d2 #(.T(logic [47:0]), .P(48'hFFFF_0000_1234)) u_d2 ();
+  mid_d2 #(.P(-5)) u_d2i ();
+  mid_d3 u_d3 ();
+  mid_d5 #(.P(4'hF + 4'h1)) u_d5 ();
+  mid_d6 #(.W(16), .P(16'hABCD)) u_d6 ();
+  mid_d6 #(16, 16'h1234) u_d6o ();
+  mid_d7 #(.W(48)) u_d7 ();
+
+  // PART 5
+  mid_e1 u_e1 ();
+  defparam u_e1.P = -1;
+  mid_e2 u_e2 ();
+  defparam u_e2.P = 4'hF;
+  mid_e3 u_e3 ();
+  mid_e4 #(.A('{-1, 18})) u_e4 ();
+  mid_e5 u_e5 ();
+  mid_e6 #(.P(4'b1111)) u_e6 ();
+  mid_e7 u_e7 ();
+  mid_e8 u_e8 ();
+  mid_e8 #(.P(2.6)) u_e8o ();
+  mid_e9 #(.P(300.4)) u_e9 ();
 
   initial begin
     #1;
@@ -318,6 +378,50 @@ module top;
       $sformatf("C1Y localparam to signal y=%0d (expect 2)", yc1))
     `SVTEST_CHECK(yorig === 7'd2,
       $sformatf("ORIG localparam C to child port y=%0d (expect 2)", yorig))
+
+    // ---- PART 4: override width context, type-parameter typing ----
+    `SVTEST_CHECK(u_d1.P === 64'h1234_5678_9abc_def0,
+      $sformatf("D1 parameter T P, default T = logic [63:0]: P=%h", u_d1.P))
+    `SVTEST_CHECK(u_d2.P === 48'hFFFF_0000_1234 && $bits(u_d2.P) == 48,
+      $sformatf("D2 parameter T P, .T(logic [47:0]) override: P=%h", u_d2.P))
+    `SVTEST_CHECK(u_d2i.P === -5,
+      $sformatf("D2I parameter T P, default T = int, .P(-5): P=%0d", u_d2i.P))
+    `SVTEST_CHECK(u_d3.P === 64'hFFFF_FFFF_FFFF_FFFF,
+      $sformatf("D3 parameter T P = '1, T = logic [63:0]: P=%h", u_d3.P))
+    `SVTEST_CHECK(u_d5.P === 16,
+      $sformatf("D5 [7:0] .P(4'hF + 4'h1)=%0d (expect 16)", u_d5.P))
+    `SVTEST_CHECK(u_d6.P === 16'hABCD,
+      $sformatf("D6 [W-1:0] .W(16) .P(16'hABCD)=%h", u_d6.P))
+    `SVTEST_CHECK(u_d6o.P === 16'h1234,
+      $sformatf("D6O [W-1:0] #(16, 16'h1234)=%h", u_d6o.P))
+    `SVTEST_CHECK(u_d7.P === 48'hFFFF_FFFF_FFFF,
+      $sformatf("D7 T = logic [W-1:0], .W(48), P = '1: P=%h", u_d7.P))
+
+    // ---- PART 5: defparam, arrays, no-range signed, 2-state, real ----
+    `SVTEST_CHECK(u_e1.P === 15,
+      $sformatf("E1 defparam [3:0] P = -1: P=%0d (expect 15)", u_e1.P))
+    `SVTEST_CHECK(u_e2.P === -1,
+      $sformatf("E2 defparam signed [3:0] P = 4'hF: P=%0d (expect -1)", u_e2.P))
+    `SVTEST_CHECK(u_e3.A[0] === 15 && u_e3.A[1] === 1,
+      $sformatf("E3 [3:0] A = '{-1, 17}: %0d %0d (expect 15 1)", u_e3.A[0], u_e3.A[1]))
+    `SVTEST_CHECK(u_e4.A[0] === 15 && u_e4.A[1] === 2,
+      $sformatf("E4 .A('{-1, 18}): %0d %0d (expect 15 2)", u_e4.A[0], u_e4.A[1]))
+    `SVTEST_CHECK(u_e5.P === -1 && $bits(u_e5.P) == 4,
+      $sformatf("E5 signed P = 4'b1111: P=%0d (expect -1)", u_e5.P))
+    `SVTEST_CHECK(u_e6.P === -1,
+      $sformatf("E6 signed P, .P(4'b1111): P=%0d (expect -1)", u_e6.P))
+    `SVTEST_CHECK(u_e7.P === 4'b0010,
+      $sformatf("E7 bit [3:0] P = 4'bx01z: P=%b (expect 0010)", u_e7.P))
+    `SVTEST_CHECK(u_e7.LB === 4'b0100,
+      $sformatf("E7LB bit [3:0] LB = 4'bz10x: LB=%b (expect 0100)", u_e7.LB))
+    `SVTEST_CHECK(u_e7.LR === 3,
+      $sformatf("E7LR int LR = 2.6: LR=%0d (expect 3)", u_e7.LR))
+    `SVTEST_CHECK(u_e8.P === 3,
+      $sformatf("E8 int P = 2.6: P=%0d (expect 3)", u_e8.P))
+    `SVTEST_CHECK(u_e8o.P === 3,
+      $sformatf("E8O int .P(2.6): P=%0d (expect 3)", u_e8o.P))
+    `SVTEST_CHECK(u_e9.P === 44,
+      $sformatf("E9 [7:0] .P(300.4): P=%0d (expect 44)", u_e9.P))
   end
 
   final begin
