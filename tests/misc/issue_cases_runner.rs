@@ -243,3 +243,19 @@ fn rand_width_overflow_and_dist_mwe() {
     );
     assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
 }
+
+/// Issue #262: $fscanf %c must match exactly one character (§21.3.4.3) —
+/// no whitespace skipping for %c or literal-only formats, newlines kept
+/// across repeated %c, all 256 byte values round-tripping through
+/// $fwrite/$fscanf %c, task-form $fscanf converting, and C-stdio pushback
+/// semantics ($ftell subtracts, $fread drains, $fseek/$rewind discard).
+#[test]
+fn issue_262_fscanf_percent_c() {
+    let msgs = outputs(include_str!("../issue_cases/fscanf_262.sv"), 100_000);
+    assert!(
+        !msgs.iter().any(|m| m.starts_with("FAIL")),
+        "{:#?}",
+        msgs
+    );
+    assert!(msgs.iter().any(|m| m == "TEST_PASS"), "{:#?}", msgs);
+}
