@@ -6,6 +6,36 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
+### Unreleased
+
+**Correctness**
+
+* `randomize()` with a soft constraint and an array sized by the constraints
+  no longer fails when a constraint reads a member path through `this`
+  (`this.lo`, `this.lim.lo`) that names state rather than a random variable.
+  (#256, from PR #257 by Taichi Ishitani)
+* A member read through a class handle (`item.item.len`) no longer picks up
+  an unrelated struct variable of the same name in another scope or another
+  process, and a class handle sent through a mailbox from a parameterized
+  class reaches the receiver while another specialization's struct receiver
+  is waiting. A `ref` or `const ref` class-handle formal keeps following the
+  caller's variable after the caller reassigns it. (#258, #260, from PR #259
+  by Taichi Ishitani)
+* A base class specialized with named parameter assignments inside an
+  `extends` argument (`extends wrap #(.BASE(base #(.REQ(REQ))))`) binds its
+  parameters by name; it used to bind them by position, which could end in a
+  null dereference.
+* A parameter declared with a type or range takes its value as an assignment
+  to that type, for its default, a `#(...)` override and a `defparam`: the
+  value is evaluated in the declared width, wrapped to it and given the
+  declared signedness. `parameter [3:0] P = -1` is 15, `signed [3:0]` turns 15
+  into -1, and `#(.P(4'hF + 4'h1))` on `[7:0]` is 16. Real values round
+  (`parameter int P = 2.6` is 3), 2-state types drop x and z, and
+  unpacked-array elements and pattern overrides wrap per element. A value
+  parameter typed by a type parameter keeps that type's full width, and a
+  range that uses another parameter of the same instance uses the instance's
+  own value. (#237, from xezim-core PR #52 and PR #264 by Ganesh T S)
+
 ### 0.11.1 — complete VPI, faster memory models, IEEE 1800 conformance fixes (October 2026)
 
 **Correctness**
