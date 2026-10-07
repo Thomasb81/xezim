@@ -151,3 +151,70 @@ endmodule
         ["formal=108 local=108 property=108 module=1"]
     );
 }
+
+/// §13.5.2: a member read through a `ref` or `const ref` class-handle formal
+/// follows the caller's actual, not the handle the formal held on entry: the
+/// caller reassigns the actual while each task waits, and every read sees the
+/// new object — in a class task and in a module task, and for a formal named
+/// `item` while a module-scope struct `item` with a member `item` exists.
+#[test]
+fn ref_formal_member_read_follows_the_reassigned_actual() {
+    let src = format!(
+        "{COMMON}{}",
+        r#"
+class watcher;
+  task automatic by_ref(ref resp h);
+    #5;
+    $display("class ref=%0d", h.item.len);
+  endtask
+  task automatic by_const_ref(const ref resp h);
+    #5;
+    $display("class const ref=%0d", h.item.get_len());
+  endtask
+endclass
+
+module top;
+  wrap_t item;
+  resp r;
+  task automatic by_ref(ref resp h);
+    #5;
+    $display("module ref=%0d", h.item.len);
+  endtask
+  task automatic by_const_ref(const ref resp h);
+    #5;
+    $display("module const ref=%0d", h.item.len);
+  endtask
+  task automatic named_item(ref resp item);
+    #5;
+    $display("ref named item=%0d", item.item.len);
+  endtask
+  initial begin
+    watcher w = new();
+    req a = new(1), b = new(2), m = new(7);
+    item.item = m;
+    r = new(a);
+    fork
+      w.by_ref(r);
+      w.by_const_ref(r);
+      by_ref(r);
+      by_const_ref(r);
+      named_item(r);
+      begin #1; r = new(b); end
+    join
+    $display("module item=%0d", item.item.len);
+  end
+endmodule
+"#
+    );
+    assert_eq!(
+        messages(&src),
+        [
+            "class ref=2",
+            "class const ref=2",
+            "module ref=2",
+            "module const ref=2",
+            "ref named item=2",
+            "module item=7",
+        ]
+    );
+}

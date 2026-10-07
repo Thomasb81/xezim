@@ -71135,15 +71135,15 @@ impl Simulator {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
-        if matches!(expr.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. })
-            && !self.local_stack.is_empty()
-            && let Some(v) = self.frame_handle_path_read(expr)
-        {
-            return v;
-        }
         match &expr.kind {
             ExprKind::Ident(h) => {
                 if let Some(v) = self.plain_ident_read(h) {
+                    return v;
+                }
+                if h.path.len() >= 2
+                    && !self.local_stack.is_empty()
+                    && let Some(v) = self.frame_handle_path_read(expr)
+                {
                     return v;
                 }
             }
@@ -71152,6 +71152,11 @@ impl Simulator {
             }
             ExprKind::MemberAccess { expr: base, member } => {
                 if let Some(v) = self.plain_member_read(base, member) {
+                    return v;
+                }
+                if !self.local_stack.is_empty()
+                    && let Some(v) = self.frame_handle_path_read(expr)
+                {
                     return v;
                 }
                 if matches!(
@@ -75752,12 +75757,20 @@ impl Simulator {
         }
     }
 
-    /// The handle held by `name` when it is a class-handle variable of the
-    /// innermost frame (declared class-typed in that frame's overlay).
-    fn frame_class_handle(&self, name: &str) -> Option<usize> {
-        let v = self.local_stack.last()?.get(name)?;
-        self.local_class_type_of(name)?;
-        v.to_u64().map(|h| h as usize)
+    /// The handle held by `name`, with its declared class, when `name` is a
+    /// class-handle variable of the innermost frame. Value and type both come
+    /// from that one frame: its slot in `local_type_stack`, which is kept in
+    /// lockstep with `local_stack`, not an outer frame's same-named local.
+    /// Inside a class method the frame must be one of the method's own (see
+    /// `local_class_type_of`).
+    fn frame_class_handle(&self, name: &str) -> Option<(usize, &str)> {
+        let depth = self.local_stack.len().checked_sub(1)?;
+        if self.method_local_base.last().is_some_and(|&b| depth < b) {
+            return None;
+        }
+        let v = self.local_stack[depth].get(name)?;
+        let cls = self.local_type_stack.get(depth)?.0.get(name)?;
+        Some((v.to_u64()? as usize, cls.as_str()))
     }
 
     /// Whether `name`, not a variable of the innermost frame, is a
@@ -75765,7 +75778,11 @@ impl Simulator {
     /// out (§8.11) after the frame, ahead of any same-named variable outside
     /// the class.
     fn this_class_handle_prop(&self, name: &str) -> bool {
-        if self.local_stack.last().is_some_and(|f| f.contains_key(name)) {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(name))
+        {
             return false;
         }
         let Some(Some(h)) = self.this_stack.last().copied() else {
@@ -75784,6 +75801,7 @@ impl Simulator {
     /// struct variable elsewhere — a module-scope `item` with a member `item`
     /// — which the local name shadows (#258). `None` for anything else, or
     /// when a segment is not a plain property, so the general paths decide.
+    #[inline(never)]
     fn frame_handle_path_read(&self, expr: &Expression) -> Option<Value> {
         fn names<'a>(e: &'a Expression, out: &mut Vec<&'a str>) -> Option<()> {
             match &e.kind {
@@ -75815,8 +75833,24 @@ impl Simulator {
             }
             _ => return None,
         };
-        let mut h = self.frame_class_handle(root)?;
-        let mut cls = self.local_class_type_of(root)?;
+        let (mut h, cls) = self.frame_class_handle(root)?;
+        // §13.5.2: a `ref` formal is read THROUGH to the actual; the frame's
+        // copy goes stale once the caller reassigns the handle while this
+        // call waits. A formal aliased to module-visible storage reads the
+        // handle from that storage now; one bound by identity is left to the
+        // general path.
+        if self.ref_redirect_possible() {
+            if let Some(storage) = self.ref_alias_stack.last().and_then(|m| m.get(root)) {
+                h = self.get_signal_value_by_name(storage)?.to_u64()? as usize;
+            } else if self
+                .ref_identity_stack
+                .last()
+                .is_some_and(|v| v.iter().any(|n| n == root))
+            {
+                return None;
+            }
+        }
+        let mut cls = cls.to_string();
         let mut path = Vec::new();
         names(expr, &mut path)?;
         let segs = &path[1..];
@@ -75852,13 +75886,6 @@ impl Simulator {
         &self,
         dst: String,
     ) -> (String, Option<crate::ast::types::StructUnionType>) {
-        // §13.3 / §8.11: a class-handle variable of the running subroutine,
-        // or a class-handle property of its object, is not a struct, whatever
-        // a same-named variable elsewhere is declared as — `var_decl_types`
-        // is keyed by the bare name and shared by every process (#258).
-        if self.frame_class_handle(&dst).is_some() || self.this_class_handle_prop(&dst) {
-            return (dst, None);
-        }
         // A whole dynamic/fixed/associative ARRAY of structs is not itself a
         // struct target: `b = a` copies elements (the collection copy), and
         // spreading it member-wise would drop every element's leaves.
@@ -75878,16 +75905,27 @@ impl Simulator {
                     _ => None,
                 })
         };
-        match spread_of(self, &dst) {
-            Some(su) => (dst, su),
+        let (scoped, su) = match spread_of(self, &dst) {
+            Some(su) => (None, su),
             None => match self.hint_scoped(&dst) {
                 Some(scoped) => match spread_of(self, &scoped) {
-                    Some(su) => (scoped, su),
-                    None => (dst, None),
+                    Some(su) => (Some(scoped), su),
+                    None => (None, None),
                 },
-                None => (dst, None),
+                None => (None, None),
             },
+        };
+        // §13.3 / §8.11: a class-handle variable of the running subroutine,
+        // or a class-handle property of its object, is not a struct, whatever
+        // a same-named variable elsewhere is declared as — `var_decl_types`
+        // is keyed by the bare name and shared by every process (#258).
+        // Checked only once a struct was found, the one answer it can change.
+        if su.is_some()
+            && (self.frame_class_handle(&dst).is_some() || self.this_class_handle_prop(&dst))
+        {
+            return (dst, None);
         }
+        (scoped.unwrap_or(dst), su)
     }
 
     /// `name = <literal | unary | binary | name>` on a select-free
@@ -117332,6 +117370,93 @@ impl Simulator {
         None
     }
 
+    /// §8.25 / A.4.1.1: a class specialization written inside an `extends`
+    /// argument with named parameter assignments (`base #(.REQ(REQ))` in
+    /// `extends wrap #(.BASE(base #(.REQ(REQ))))`), spelled by POSITION in
+    /// that class's `param_order`, the way `place_named_extends_args` places
+    /// the outer list: an argument projected out of the binding (`BASE#[i]`)
+    /// is read by position, and read `.REQ(REQ)` as the first argument. A
+    /// slot the list does not name takes the class's default, folded against
+    /// the slots before it; a trailing one is left off. Nested lists are
+    /// placed first. `None` when there is nothing to place, or a default
+    /// cannot be spelled here (the text is then kept as written).
+    fn positional_spec_text(&self, frag: &str) -> Option<String> {
+        let f = frag.trim();
+        let open = f.find("#(")?;
+        let inner = f[open + 2..].strip_suffix(')')?;
+        let head = f[..open].trim();
+        let mut args: Vec<String> = Self::split_spec_args(inner)
+            .into_iter()
+            .map(|a| a.trim().to_string())
+            .collect();
+        let mut changed = false;
+        for a in args.iter_mut() {
+            let (name, value) = match Self::named_spec_arg(a) {
+                Some((n, v)) => (Some(n.to_string()), v.to_string()),
+                None => (None, a.clone()),
+            };
+            if let Some(placed) = self.positional_spec_text(&value) {
+                *a = match name {
+                    Some(n) => format!(".{}({})", n, placed),
+                    None => placed,
+                };
+                changed = true;
+            }
+        }
+        // A.4.1.1: a list is all-named or all-ordered.
+        if args.is_empty() || !args.iter().all(|a| Self::named_spec_arg(a).is_some()) {
+            return changed.then(|| format!("{}#({})", head, args.join(",")));
+        }
+        let cd = self.module.classes.get(head)?;
+        let order = &cd.param_order;
+        let mut slots: Vec<Option<String>> = vec![None; order.len()];
+        for a in &args {
+            let (n, v) = Self::named_spec_arg(a)?;
+            let i = order.iter().position(|p| p == n)?;
+            slots[i] = (!v.is_empty()).then(|| v.to_string());
+        }
+        let used = slots.iter().rposition(|s| s.is_some()).map_or(0, |i| i + 1);
+        let mut placed: Vec<String> = Vec::with_capacity(used);
+        for (i, slot) in slots.into_iter().take(used).enumerate() {
+            let v = match slot {
+                Some(v) => v,
+                None => self.param_default_fragment(cd, i, &placed)?,
+            };
+            placed.push(v);
+        }
+        Some(format!("{}#({})", head, placed.join(",")))
+    }
+
+    /// `positional_spec_text` over each `extends` argument of `cname`.
+    fn place_nested_named_spec_args(&mut self, cname: &str) {
+        let Some(cd) = self.module.classes.get(cname) else {
+            return;
+        };
+        if !cd.extends_type_args.iter().any(|a| a.contains("#(")) {
+            return;
+        }
+        let texts: Vec<Option<String>> = cd
+            .extends_type_args
+            .iter()
+            .map(|a| self.positional_spec_text(a))
+            .collect();
+        if texts.iter().all(Option::is_none) {
+            return;
+        }
+        if let Some(cd) = self
+            .module
+            .classes
+            .get_mut(cname)
+            .map(std::sync::Arc::make_mut)
+        {
+            for (a, t) in cd.extends_type_args.iter_mut().zip(texts) {
+                if let Some(t) = t {
+                    *a = t;
+                }
+            }
+        }
+    }
+
     /// §8.25 / A.4.1.1: `class d extends base #(.W(X));` names the parameters it
     /// sets. Every walk over `extends_type_args` / `extends_args` reads them
     /// by POSITION in the base's `param_order`, so place each named value at
@@ -117707,7 +117832,10 @@ impl Simulator {
     /// `class sqr #(type REQ) extends wrap #(.BASE(base #(REQ)))`) with the
     /// child's parameter names inside its `#(...)` replaced by their carried
     /// bindings, in one pass so a binding is never re-substituted (§8.25).
-    /// Anything else is returned as written.
+    /// A name written after `.` or `::` is a formal of a named argument
+    /// (`base #(.REQ(REQ))`, §23.3.2.2 / §8.25) or a scoped member, not a
+    /// reference to the child's parameter, and is kept. Anything else is
+    /// returned as written.
     fn carry_spec_arg_names(
         arg: &str,
         carried: &std::collections::HashMap<String, String>,
@@ -117719,18 +117847,35 @@ impl Simulator {
         let mut out = String::with_capacity(arg.len());
         out.push_str(head);
         let mut ident = String::new();
+        // The last non-blank character before the identifier being read.
+        let mut before = ' ';
+        let flush = |out: &mut String, ident: &mut String, before: char| {
+            if !ident.is_empty() {
+                let keep = matches!(before, '.' | ':');
+                out.push_str(
+                    carried
+                        .get(ident.as_str())
+                        .filter(|_| !keep)
+                        .map_or(ident.as_str(), |b| b),
+                );
+                ident.clear();
+            }
+        };
         for ch in args.chars() {
             if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
                 ident.push(ch);
                 continue;
             }
             if !ident.is_empty() {
-                out.push_str(carried.get(&ident).map_or(&ident, |b| b));
-                ident.clear();
+                flush(&mut out, &mut ident, before);
+                before = 'a';
+            }
+            if !ch.is_whitespace() {
+                before = ch;
             }
             out.push(ch);
         }
-        out.push_str(carried.get(&ident).map_or(&ident, |b| b));
+        flush(&mut out, &mut ident, before);
         out
     }
 
@@ -118028,6 +118173,7 @@ impl Simulator {
         // parameter reference cannot rewrite the corresponding argument label.
         for c in &names {
             self.place_named_extends_args(c);
+            self.place_nested_named_spec_args(c);
         }
         for c in &names {
             let Some(cd) = self.module.classes.get(c) else {
@@ -118265,6 +118411,7 @@ impl Simulator {
         }
         for cname in &names {
             self.place_named_extends_args(cname);
+            self.place_nested_named_spec_args(cname);
         }
         // §25.9: a property typed by a TYPEDEF of a virtual interface
         // (`typedef virtual bus_if vif_t; vif_t vif;`) is a virtual-interface

@@ -170,3 +170,79 @@ endmodule
     );
     assert_eq!(lines(&src), vec!["T handle n=3", "T struct k=9"]);
 }
+
+/// §8.25 / §23.3.2.2: the same, with the base specialization written with
+/// named parameter assignments (`base #(.REQ(REQ))`, also reordered): the
+/// formal name after `.` is not the child's parameter, and the base's `REQ`
+/// and `RSP` are bound by name.
+#[test]
+fn try_put_handle_through_a_named_base_specialization() {
+    let src = format!(
+        "{COMMON}{}",
+        r#"
+class base #(type REQ = int, type RSP = REQ);
+  fifo #(REQ) f;
+  fifo #(RSP) g;
+  function new();
+    f = new();
+    g = new();
+  endfunction
+endclass
+
+class wrap #(type BASE = int) extends BASE;
+endclass
+
+class sqr #(type REQ = int) extends wrap #(.BASE(base #(.REQ(REQ))));
+endclass
+
+class sqp #(type REQ = int, type RSP = int) extends wrap #(base #(.RSP(RSP), .REQ(REQ)));
+endclass
+
+typedef sqr #(item) item_sqr;
+class my_sqr extends wrap #(.BASE(item_sqr));
+endclass
+class my_sqp extends sqp #(item, item);
+endclass
+
+module top;
+  my_sqr        s = new();
+  my_sqp        p = new();
+  fifo #(msg_t) fs = new();
+  initial begin
+    item it;
+    s.f.get(it);
+    $display("T handle n=%0d", it == null ? -1 : it.n);
+  end
+  initial begin
+    item i1, i2;
+    p.f.get(i1);
+    p.g.get(i2);
+    $display("T reordered f=%0d g=%0d", i1 == null ? -1 : i1.n, i2 == null ? -1 : i2.n);
+  end
+  initial begin
+    msg_t m;
+    fs.get(m);
+    $display("T struct k=%0d", m.k);
+  end
+  initial begin
+    item x, y, z;
+    msg_t s2;
+    #1;
+    x = new(3);
+    y = new(4);
+    z = new(5);
+    void'(s.f.try_put(x));
+    void'(p.f.try_put(y));
+    void'(p.g.try_put(z));
+    #1;
+    s2.k = 9;
+    void'(fs.try_put(s2));
+  end
+endmodule
+"#
+    );
+    assert_eq!(
+        lines(&src),
+        vec!["T handle n=3", "T reordered f=4 g=5", "T struct k=9"]
+    );
+}
