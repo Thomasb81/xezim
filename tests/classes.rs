@@ -320,6 +320,8 @@ mod localparam_class_not_parameterized;
 mod method_default_this_call;
 #[path = "classes/method_output_assoc_writeback.rs"]
 mod method_output_assoc_writeback;
+#[path = "classes/method_output_class_property_writeback.rs"]
+mod method_output_class_property_writeback;
 #[path = "classes/module_scope_derived_constraints.rs"]
 mod module_scope_derived_constraints;
 #[path = "classes/nba_region_event_same_slot.rs"]
