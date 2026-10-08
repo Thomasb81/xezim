@@ -326,6 +326,8 @@ mod pure_sv_phase_objection;
 mod randomize_dist_weights;
 #[path = "classes/randomize_inside_range.rs"]
 mod randomize_inside_range;
+#[path = "classes/randomize_issue_255_shapes.rs"]
+mod randomize_issue_255_shapes;
 #[path = "classes/randomize_member_subset.rs"]
 mod randomize_member_subset;
 #[path = "classes/randomize_nonrand_members.rs"]
