@@ -67,6 +67,8 @@ mod interface_class_inherited_names;
 mod memory_tasks_fixed_property;
 #[path = "classes/nested_same_named_ref_assoc_formal.rs"]
 mod nested_same_named_ref_assoc_formal;
+#[path = "classes/nested_static_call_named_args.rs"]
+mod nested_static_call_named_args;
 #[path = "classes/param_type_binding_resolves_enclosing_value_param.rs"]
 mod param_type_binding_resolves_enclosing_value_param;
 #[path = "classes/parameterized_class_scope.rs"]

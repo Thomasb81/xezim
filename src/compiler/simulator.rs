@@ -136263,89 +136263,80 @@ impl Simulator {
         let (base, sig) = spec?;
         let resolved = Self::split_spec_args(&sig)
             .iter()
-            .map(|part| {
-                let p = part.trim();
-                if let Some(r) = self.resolve_type_param_with(p, enclosing) {
-                    return Self::normalize_spec_ws(&r);
-                }
-                // Top-level VALUE parameter of the enclosing class — resolve
-                // to the enclosing specialization's argument at that param's
-                // position. E.g. inside `Mid#(int,"hello")`, the static call
-                // `Inner#(Name)::get()` must specialize Inner with "hello",
-                // not the symbolic bare name `Name` (which, left symbolic,
-                // loops forever in `resolve_value_param_from_spec` when
-                // Inner's static method reads `Name`, or falls back to the
-                // wrong default). Mirrors the value-param substitution the
-                // nested-`Class#(args)` branch below already performs.
-                if let Some((eb, es)) = enclosing {
-                    if let Some(ecd) = self.module.classes.get(eb) {
-                        if let Some(idx) = ecd.param_order.iter().position(|x| x == p) {
-                            let frags = Self::split_spec_args(es);
-                            if let Some(v) = frags.get(idx) {
-                                return v.trim().to_string();
-                            }
-                        }
-                    }
-                }
-                // Resolve a class-local TYPEDEF name (e.g. `special_comp_type`,
-                // a `typedef special_comp#(N) special_comp_type;` inside
-                // `special_comp#(N)`) to its concrete specialization through
-                // the enclosing spec. Without this, a static initializer
-                // (`register_cb(special_comp_type, special_cb_type)` →
-                // `callbacks#(special_comp_type,...)::m_register_pair`)
-                // keys the typeid under the bare typedef name, while the
-                // matching `add`/query uses the explicit `special_comp#(1)`
-                // form — the two never meet and typewide callbacks
-                // cross-propagate across value specializations.
-                // `resolve_typedef_spec` reads `self.current_spec`, which the
-                // caller (`eval_expr_ctx`) leaves set to `enclosing` for
-                // this purpose.
-                if let Some((tb, ts)) = self.resolve_typedef_spec(p) {
-                    let ts = Self::normalize_spec_ws(&ts);
-                    return format!("{}#({})", tb, ts);
-                }
-                // Resolve a `Class#(args)` part whose args contain bare
-                // type/value-parameter names of the enclosing class — e.g.
-                // `special_comp#(N)` inside `special_comp#(N)`'s own
-                // `run_phase`, where callback macro expands to
-                // `callbacks#(special_comp#(N),CB)::get_first`. The
-                // literal `N` (a value param) must resolve to the enclosing
-                // specialization's value (1 or 2), else every instance's
-                // do_callbacks keys the SAME `special_comp#(N)` cell —
-                // distinct from the `#(1)`/`#(2)` cells that `add` and
-                // `m_register_pair` populate.
-                if let Some((cb, cs)) = self.extract_spec_from_string(p) {
-                    let inner = Self::split_spec_args(&cs);
-                    let r_inner: Vec<String> = inner
-                        .iter()
-                        .map(|frag| {
-                            let f = frag.trim();
-                            if let Some(r) = self.resolve_type_param_with(f, enclosing) {
-                                return r;
-                            }
-                            // value param of the enclosing class?
-                            if let Some((eb, es)) = enclosing {
-                                if let Some(ecd) = self.module.classes.get(eb) {
-                                    if let Some(idx) = ecd.param_order.iter().position(|x| x == f) {
-                                        let frags = Self::split_spec_args(es);
-                                        if let Some(v) = frags.get(idx) {
-                                            return v.trim().to_string();
-                                        }
-                                    }
-                                }
-                            }
-                            f.to_string()
-                        })
-                        .collect();
-                    let r_sig = Self::normalize_spec_ws(&r_inner.join(","));
-                    return format!("{}#({})", cb, r_sig);
-                }
-                Self::normalize_spec_ws(p)
-            })
+            .map(|part| self.resolve_spec_arg(part, enclosing))
             .collect::<Vec<_>>()
             .join(",");
         let canon_sig = self.canonicalize_spec_sig(&base, &resolved);
         Some((base, canon_sig))
+    }
+
+    /// One argument of a static call's specialization with the enclosing
+    /// class's parameters substituted; recurses into named (`.N(v)`) and
+    /// nested (`C#(...)`) arguments.
+    fn resolve_spec_arg(&self, part: &str, enclosing: &Option<(String, String)>) -> String {
+        let p = part.trim();
+        if let Some((n, v)) = Self::named_spec_arg(p) {
+            return format!(".{}({})", n, self.resolve_spec_arg(v, enclosing));
+        }
+        if let Some(r) = self.resolve_type_param_with(p, enclosing) {
+            return Self::normalize_spec_ws(&r);
+        }
+        // Top-level VALUE parameter of the enclosing class — resolve
+        // to the enclosing specialization's argument at that param's
+        // position. E.g. inside `Mid#(int,"hello")`, the static call
+        // `Inner#(Name)::get()` must specialize Inner with "hello",
+        // not the symbolic bare name `Name` (which, left symbolic,
+        // loops forever in `resolve_value_param_from_spec` when
+        // Inner's static method reads `Name`, or falls back to the
+        // wrong default). Mirrors the value-param substitution the
+        // nested-`Class#(args)` branch below already performs.
+        if let Some((eb, es)) = enclosing {
+            if let Some(ecd) = self.module.classes.get(eb) {
+                if let Some(idx) = ecd.param_order.iter().position(|x| x == p) {
+                    let frags = Self::split_spec_args(es);
+                    if let Some(v) = frags.get(idx) {
+                        return v.trim().to_string();
+                    }
+                }
+            }
+        }
+        // Resolve a class-local TYPEDEF name (e.g. `special_comp_type`,
+        // a `typedef special_comp#(N) special_comp_type;` inside
+        // `special_comp#(N)`) to its concrete specialization through
+        // the enclosing spec. Without this, a static initializer
+        // (`register_cb(special_comp_type, special_cb_type)` →
+        // `callbacks#(special_comp_type,...)::m_register_pair`)
+        // keys the typeid under the bare typedef name, while the
+        // matching `add`/query uses the explicit `special_comp#(1)`
+        // form — the two never meet and typewide callbacks
+        // cross-propagate across value specializations.
+        // `resolve_typedef_spec` reads `self.current_spec`, which the
+        // caller (`eval_expr_ctx`) leaves set to `enclosing` for
+        // this purpose.
+        if let Some((tb, ts)) = self.resolve_typedef_spec(p) {
+            let ts = Self::normalize_spec_ws(&ts);
+            return format!("{}#({})", tb, ts);
+        }
+        // Resolve a `Class#(args)` part whose args contain bare
+        // type/value-parameter names of the enclosing class — e.g.
+        // `special_comp#(N)` inside `special_comp#(N)`'s own
+        // `run_phase`, where callback macro expands to
+        // `callbacks#(special_comp#(N),CB)::get_first`. The
+        // literal `N` (a value param) must resolve to the enclosing
+        // specialization's value (1 or 2), else every instance's
+        // do_callbacks keys the SAME `special_comp#(N)` cell —
+        // distinct from the `#(1)`/`#(2)` cells that `add` and
+        // `m_register_pair` populate.
+        if let Some((cb, cs)) = self.extract_spec_from_string(p) {
+            let r_sig = Self::split_spec_args(&cs)
+                .iter()
+                .map(|frag| self.resolve_spec_arg(frag, enclosing))
+                .collect::<Vec<_>>()
+                .join(",");
+            let r_sig = self.canonicalize_spec_sig(&cb, &r_sig);
+            return format!("{}#({})", cb, r_sig);
+        }
+        Self::normalize_spec_ws(p)
     }
 
     /// Remove whitespace outside of double-quoted string literals so that
