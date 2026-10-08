@@ -11,6 +11,22 @@ fn descending_loop_return_discards_rolled_back_fixups() {
 }
 
 #[test]
+fn descending_signed_loop_over_budget_discards_rolled_back_fixups() {
+    // #278 made `i >= 0` stop at -1, so the loop above now unrolls in two
+    // trips. A descending signed loop past the unroll budget still compiles
+    // part of the body (with its return fixups) before rolling back.
+    let src = include_str!("inline_return_rollback.sv")
+        .replace("int i = 1; i >= 0; i--", "int i = 1; i >= -1000; i--")
+        .replace("if (x[i])", "if (i >= 0 && x[i & 1])");
+    let sim = xezim::simulate(&src, 20).expect("unroll budget must allow fallback without a crash");
+    assert!(
+        sim.output
+            .iter()
+            .any(|line| line.message == "INLINE_RETURN_ROLLBACK_PASS")
+    );
+}
+
+#[test]
 fn long_loop_return_discards_rolled_back_fixups() {
     // Exercise the unroll budget independently of signed descending bounds.
     let src = include_str!("inline_return_rollback.sv")

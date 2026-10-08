@@ -6730,12 +6730,12 @@ impl<'a> BytecodeCompiler<'a> {
                 if Self::hier_raw_name(lh) != vname {
                     return false;
                 }
-                let Some(c) = self.fold_const(right).and_then(|v| v.to_u64()) else {
+                let Some(c) = self.fold_const(right).and_then(|v| v.to_i64()) else {
                     return false;
                 };
                 match op {
-                    BinaryOp::Add => c as i64,
-                    BinaryOp::Sub => -(c as i64),
+                    BinaryOp::Add => c,
+                    BinaryOp::Sub => c.wrapping_neg(),
                     _ => return false,
                 }
             }
@@ -6744,10 +6744,33 @@ impl<'a> BytecodeCompiler<'a> {
         if step_delta == 0 {
             return false;
         }
+        // The loop variable is bound with its declared width and signedness
+        // (§6.11, §6.8): the condition compares it as signed when both
+        // operands are signed (§11.8.1), so `for (int i = 1; i > -1; i--)`
+        // needs `i` signed, and the step wraps at the declared width.
+        let kind = self.local_kind_of(data_type, None);
+        let Some(LocalKind::Int { width, signed, .. }) = kind else {
+            return false;
+        };
+        if width == 0 || width > 64 {
+            return false;
+        }
+        let fit = |x: i64| -> i64 {
+            if width == 64 {
+                return x;
+            }
+            let mask = (1u64 << width) - 1;
+            let u = (x as u64) & mask;
+            if signed && (u >> (width - 1)) & 1 == 1 {
+                (u | !mask) as i64
+            } else {
+                u as i64
+            }
+        };
         let Some(mut cur) = self
             .fold_const(init)
-            .and_then(|v| v.to_u64())
-            .map(|v| v as i64)
+            .and_then(|v| if v.has_xz() { None } else { v.to_i64() })
+            .map(fit)
         else {
             return false;
         };
@@ -6756,16 +6779,26 @@ impl<'a> BytecodeCompiler<'a> {
         let start_reg = self.next_reg;
         let outer_const = self.local_const_vars.remove(&vname);
         // How a fallback in the body hands the constant to the interpreter.
-        let kind = self.local_kind_of(data_type, None);
-        let outer_kind = match kind {
-            Some(k) => self.local_const_kinds.insert(vname.clone(), k),
-            None => self.local_const_kinds.remove(&vname),
-        };
+        let outer_kind = self.local_const_kinds.insert(
+            vname.clone(),
+            LocalKind::Int {
+                width,
+                signed,
+                two_state: matches!(
+                    kind,
+                    Some(LocalKind::Int {
+                        two_state: true,
+                        ..
+                    })
+                ),
+            },
+        );
         let mut ok = true;
         let mut trips = 0usize;
         loop {
-            self.local_const_vars
-                .insert(vname.clone(), Value::from_u64(cur as u64, 32));
+            let mut bound = Value::from_u64(cur as u64, width);
+            bound.is_signed = signed;
+            self.local_const_vars.insert(vname.clone(), bound);
             let c = match self.fold_const(cond) {
                 Some(v) => v.is_true(),
                 None => {
@@ -6790,7 +6823,7 @@ impl<'a> BytecodeCompiler<'a> {
                 ok = false;
                 break;
             }
-            cur += step_delta;
+            cur = fit(cur.wrapping_add(step_delta));
         }
         self.local_const_vars.remove(&vname);
         if let Some(v) = outer_const {
@@ -7429,7 +7462,14 @@ impl<'a> BytecodeCompiler<'a> {
                 let v = self.fold_const(operand)?;
                 match op {
                     UnaryOp::Plus => v,
-                    UnaryOp::Minus => Value::zero(v.width.max(32)).sub(&v),
+                    // §11.4.3/§11.8.1: negation keeps its operand's
+                    // signedness — `-1` is a signed constant, so `i > -1`
+                    // on a signed `i` compares signed.
+                    UnaryOp::Minus => {
+                        let mut r = Value::zero(v.width.max(32)).sub(&v);
+                        r.is_signed = v.is_signed;
+                        r
+                    }
                     UnaryOp::BitNot => v.bitwise_not(),
                     UnaryOp::LogNot => v.logic_not(),
                     _ => return None,
