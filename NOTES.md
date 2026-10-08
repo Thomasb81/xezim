@@ -87,6 +87,26 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   concurrent, immediate and deferred assertions and to covers; they used to
   print "assertion control is not modeled" and be ignored, so assertions kept
   firing after `$assertoff`.
+* `size()` on queues and dynamic arrays, `num()`/`size()` on associative
+  arrays, `len()` on strings, `num()` on enums and mailboxes, and the array
+  query functions (`$size`, `$bits`, `$unpacked_dimensions`, ...) return a
+  signed `int`, so `q.size() - 2` on an empty queue is -2 and a loop such as
+  `for (i = 0; i < q.size() - 1; i++)` no longer runs about 4 billion times.
+  `$size` of an associative array is its number of entries, and `$bits` of a
+  queue is its current size in bits. (#280)
+* A `wait (...)` inside a DPI-exported task called from C blocks until its
+  condition holds even when a timed event (a clock) is pending; it used to
+  hang until the run ended. This covers event `.triggered`, nets and the
+  task's own automatic variables, other processes' `wait`s keep resuming
+  meanwhile, and a wait that can never be satisfied ends the run with the
+  task still waiting. (#279, reported by Dragon-Git)
+* `randomize()` solves classes with rand variables wider than 64 bits: a wide
+  member that no constraint reads no longer blocks the rest of the class, and
+  shifts by a constant, masks, part and bit selects, struct fields,
+  `==`/`!=`, `inside` and comparisons on wide scalars, wide array elements
+  and wide packed structs are solved over 64-bit segments. Arithmetic on a
+  wide variable is still left to the trial loop. (#261, reported by Taichi
+  Ishitani)
 
 **Usability**
 
