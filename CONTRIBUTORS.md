@@ -40,5 +40,10 @@ Thank you to everyone who has improved xezim through pull requests:
   resolved from the receiver's own bindings, class handles resolved before
   same-named structs, unpacked-struct mailbox messages through task formals,
   and array signs preserved through subroutine frames.
+- **AaronKel** — bytecode-compiler rollback that discards stale jump fixups
+  (an early `return` inside a loop that cannot be unrolled used to crash the
+  compiler or hang the caller's loop), and nested type arguments kept in
+  static-call specializations, so `uvm_config_db#(cfg#(AW,DW))::get` reaches
+  the configuration that was set.
 
 New contributors are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
