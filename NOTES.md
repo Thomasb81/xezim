@@ -79,6 +79,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   elements or bits at positions chosen by random variables, equalities whose
   sides wrap at their width, `$countones`, and `foreach` over a state vector.
   (#255, reported by rharikrishna25)
+* Assertion control (§20.11, §20.12) is implemented: `$asserton`,
+  `$assertoff`, `$assertkill`, `$assertpasson`/`$assertpassoff`,
+  `$assertfailon`/`$assertfailoff`, `$assertnonvacuouson`/`$assertvacuousoff`
+  and `$assertcontrol` (Lock/Unlock, assertion-type and directive-type masks,
+  `levels` and a list of scopes or assertion names). They apply to
+  concurrent, immediate and deferred assertions and to covers; they used to
+  print "assertion control is not modeled" and be ignored, so assertions kept
+  firing after `$assertoff`.
 
 **Usability**
 
