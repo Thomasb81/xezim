@@ -71651,6 +71651,54 @@ impl Simulator {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
+        // §18.7 — inside `obj.randomize() with { … }`, an ELEMENT read of a
+        // receiver-prefixed member (`obj.member[i]`, `obj.member[i:j]`) must
+        // resolve against the randomized object's per-element stores, exactly
+        // like the bare spelling `member[i]` does inside the solve. The
+        // whole-property member read below serves the object's SNAPSHOT
+        // value, and for a dynamic array / queue the elements live in the
+        // `<handle>#member[i]` cells the solver writes — so index the
+        // receiver-stripped chain instead.
+        if self.rand_receiver.is_some()
+            && matches!(
+                expr.kind,
+                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+            )
+        {
+            let rebuilt = match &expr.kind {
+                ExprKind::Index { expr: base, index } => {
+                    self.strip_rand_receiver_prefix(base).map(|b| {
+                        Expression::new(
+                            ExprKind::Index {
+                                expr: Box::new(b),
+                                index: index.clone(),
+                            },
+                            expr.span,
+                        )
+                    })
+                }
+                ExprKind::RangeSelect {
+                    expr: base,
+                    kind,
+                    left,
+                    right,
+                } => self.strip_rand_receiver_prefix(base).map(|b| {
+                    Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(b),
+                            kind: *kind,
+                            left: left.clone(),
+                            right: right.clone(),
+                        },
+                        expr.span,
+                    )
+                }),
+                _ => None,
+            };
+            if let Some(stripped) = rebuilt {
+                return self.eval_expr_ctx(&stripped, ctx_width);
+            }
+        }
         match &expr.kind {
             ExprKind::Ident(h) => {
                 if let Some(v) = self.plain_ident_read(h) {
@@ -140253,7 +140301,10 @@ impl Simulator {
             }
             return None;
         }
-        let bn = self.expr_assoc_name(base)?;
+        let bn = match self.strip_rand_receiver_prefix(base) {
+            Some(b) => self.expr_assoc_name(&b)?,
+            None => self.expr_assoc_name(base)?,
+        };
         let idx_val = self.eval_expr(index);
         let key = if self.is_associative_array(&bn) {
             self.assoc_key_str(&bn, &idx_val)
@@ -144940,6 +144991,153 @@ impl Simulator {
         None
     }
 
+    /// §18.5 — `(x >> k) == c` / `(x & m) == c` with a CONSTANT other side:
+    /// force the rand scalar directly. The constraint's solution set is a
+    /// 2^-24-style sliver of the domain, so generate-and-test essentially
+    /// never finds it, and the joint CSP refuses the whole class when it
+    /// carries a >64-bit rand member (or the target itself is wide), so
+    /// nothing else solves it (issue #261). Shift: pick uniformly in
+    /// `[c<<k, c<<k + 2^k)`. Mask: OR random bits into the holes of `m`
+    /// (unsatisfiable when `c` sets bits outside `m` — `None` leaves it to
+    /// the rejection backstop, so `randomize()` reports 0).
+    fn force_shift_mask_eq(
+        &mut self,
+        handle: usize,
+        shifted: &Expression,
+        other: &Expression,
+        rand_set: &HashSet<String>,
+    ) -> Option<(String, Value)> {
+        use rand::Rng;
+        let mut s = shifted;
+        while let ExprKind::Paren(inner) = &s.kind {
+            s = inner;
+        }
+        let ExprKind::Binary { op, left, right } = &s.kind else {
+            return None;
+        };
+        let (base, is_shift, arg) = match op {
+            BinaryOp::ShiftRight => (left, true, right),
+            BinaryOp::BitAnd => {
+                // The rand base and the constant mask may sit on either side.
+                if self.rand_lvalue_name(left, rand_set).is_some() {
+                    (left, false, right)
+                } else {
+                    (right, false, left)
+                }
+            }
+            _ => return None,
+        };
+        let name = self.rand_lvalue_name(base, rand_set)?;
+        let width = self
+            .class_prop_width_of(handle, &name)
+            .or_else(|| {
+                self.heap
+                    .get(handle)
+                    .and_then(|o| o.as_ref())
+                    .and_then(|i| i.properties.get(&name))
+                    .map(|v| v.width)
+            })?
+            .max(1);
+        // Everything else in the shape must be constant NOW.
+        let arg = self.eval_expr(arg).to_u128();
+        let c = self.eval_expr(other).to_u128();
+        let wmask: u128 = if width >= 128 {
+            u128::MAX
+        } else {
+            (1u128 << width) - 1
+        };
+        let v: u128 = if is_shift {
+            let k = arg;
+            if k == 0 || k >= 127 {
+                return None;
+            }
+            // `c` must still fit the unshifted width.
+            if c.checked_shl(k as u32).is_none_or(|x| x > wmask) {
+                return None;
+            }
+            let span: u128 = (1u128 << k) - 1;
+            let r = if span == 0 {
+                0
+            } else {
+                self.cur_rng().gen_range(0..=span)
+            };
+            (c << k) | r
+        } else {
+            let m = arg & wmask;
+            // Unsatisfiable: `c` sets bits the mask cannot reproduce.
+            if c & !m != 0 {
+                return None;
+            }
+            let holes = !m & wmask;
+            let r = if holes == 0 {
+                0
+            } else {
+                // Uniform over the holes, bit by bit (width can exceed 64).
+                let mut acc = 0u128;
+                for b in 0..128u32 {
+                    if holes & (1u128 << b) != 0 && self.cur_rng().gen_bool(0.5) {
+                        acc |= 1u128 << b;
+                    }
+                }
+                acc
+            };
+            c | r
+        };
+        // Assemble the value at the property's width (from_u64 caps at 64).
+        let mut val = if width <= 64 {
+            Value::from_u64((v & ((1u128 << width) - 1)) as u64, width)
+        } else {
+            let mut wide = Value::zero(width);
+            for b in 0..width {
+                if v & (1u128 << b) != 0 {
+                    wide.set_bit(b as usize, LogicBit::One);
+                }
+            }
+            wide
+        };
+        val.is_signed = self.class_prop_signed_of(handle, &name);
+        Some((name, val))
+    }
+
+    /// §18.7 — inside `obj.randomize() with { … }`, a receiver-prefixed
+    /// reference (`obj.member`, then indexed as `obj.member[i]`) names the
+    /// randomized object's OWN property. The element and whole-element
+    /// constraint paths (`coll_elem_expr_key`, `rand_whole_elem_lvalue`)
+    /// key by the bare member name, and the receiver local is out of scope
+    /// in the solver frame, so hand them the prefix-stripped base while the
+    /// root matches the in-flight `rand_receiver`. `None` when `expr` is
+    /// not such a reference (either parse shape: `MemberAccess` or a
+    /// two-segment dotted `Ident`).
+    fn strip_rand_receiver_prefix(&self, expr: &Expression) -> Option<Expression> {
+        let recv = self.rand_receiver.as_deref()?;
+        let member: crate::ast::Identifier = match &expr.kind {
+            ExprKind::MemberAccess { expr: base, member } => {
+                if Self::plain_ident_name(base).as_deref() != Some(recv) {
+                    return None;
+                }
+                member.clone()
+            }
+            ExprKind::Ident(h) if h.path.len() == 2 && h.path[0].selects.is_empty() => {
+                if h.path[0].name.name != recv {
+                    return None;
+                }
+                h.path[1].name.clone()
+            }
+            _ => return None,
+        };
+        let fh = crate::ast::expr::HierarchicalIdentifier {
+            root: None,
+            path: vec![crate::ast::expr::HierPathSegment {
+                name: member.clone(),
+                selects: Vec::new(),
+            }],
+            span: expr.span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        };
+        Some(Expression::new(ExprKind::Ident(fh), expr.span))
+    }
+
     /// §18.7 — an inline `obj.randomize() with { obj.member == … }` constraint
     /// refers to the randomized object's own rand property through its
     /// RECEIVER (the bare handle `obj`, possibly `obj.field`). The forcing
@@ -147152,6 +147350,14 @@ impl Simulator {
         if suffix.is_empty() {
             return None;
         }
+        let peeled;
+        let base = match self.strip_rand_receiver_prefix(base) {
+            Some(b) => {
+                peeled = b;
+                &peeled
+            }
+            None => base,
+        };
         let ExprKind::Ident(h) = &base.kind else {
             return None;
         };
@@ -147383,7 +147589,23 @@ impl Simulator {
                     // §18.5.12 — neither side is a bare rand target: the
                     // equality is ALGEBRAIC (`int_val + $signed({1'b0, l_val})
                     // == 32'd50`, `(r_val - 8'd10) * (l_val + 8'd5) == 16'd0`).
-                    // Solve it as an affine equation in one rand variable.
+                    // §18.5.12 — a shift/mask shape (`(x >> 8) == 0`,
+                    // `(x & 'hffff_ff00) == 0`) is NOT affine, and its
+                    // solution is a domain sliver generate-and-test cannot
+                    // reach when the joint CSP declined the class (e.g. a
+                    // >64-bit rand member or a wide target — issue #261).
+                    // Force the rand scalar directly, then let the affine
+                    // path handle everything else.
+                    if let Some((name, val)) =
+                        self.force_shift_mask_eq(handle, left, right, rand_set)
+                    {
+                        return self.set_prop_if_changed(handle, &name, val);
+                    }
+                    if let Some((name, val)) =
+                        self.force_shift_mask_eq(handle, right, left, rand_set)
+                    {
+                        return self.set_prop_if_changed(handle, &name, val);
+                    }
                     self.solve_affine_eq(handle, left, right, rand_set)
                 }
                 // `a != b` (the desugared form of `unique {…}`, §18.5.5, and
