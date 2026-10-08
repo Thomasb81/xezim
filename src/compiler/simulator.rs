@@ -44217,13 +44217,18 @@ impl Simulator {
         let cond_held = if let Some(ctx) = self.process_contexts.remove(&waiter_pid) {
             // The caller's context is moved aside, not cloned: the waiter's
             // context replaces it wholesale and the original comes back
-            // untouched afterwards.
+            // untouched afterwards. `take_process_context` clears the
+            // ref-redirect hot flag as a side effect; save/restore it so the
+            // interrupted process's ref-argument redirections keep working
+            // (UVM phase machinery runs ref-heavy code between waits).
+            let saved_rrh = self.ref_redirect_hot;
             let saved = self.take_process_context();
             self.restore_process_context(ctx);
             let val = self.wait_condition_true(cond);
             let ctx = self.take_process_context();
             self.process_contexts.insert(waiter_pid, ctx);
             self.restore_process_context(saved);
+            self.ref_redirect_hot = saved_rrh;
             val
         } else {
             let saved = self.snapshot_process_context();
@@ -55847,11 +55852,16 @@ impl Simulator {
                 // LRM §9.4.2.3: `@(posedge clk iff g)` only fires when the
                 // guard `g` holds at edge time. A false guard re-arms the
                 // waiter (it stays in event_waiters for the next edge)
-                // rather than resuming the process. Evaluated in the module
-                // scope the signal table exposes — sufficient for the usual
-                // reset/enable guards (`iff rst_l === 1'b1`, `iff en`).
-                let guard_ok = match &sid.iff {
-                    Some(g) => self.eval_expr(g).is_true(),
+                // rather than resuming the process. The guard is evaluated
+                // in the WAITING PROCESS's context (`eval_waiter_condition`
+                // swaps in that pid's parked class frames + scope): a
+                // class-task guard like `vif.sig_grant[master_id] === 1`
+                // reads its virtual interface through the object's `this`
+                // frame and `master_id` from the parked locals — a bare
+                // module-scope eval cannot resolve either name and reads X,
+                // so the waiter would never fire (ubus arbitration).
+                let guard_ok = match sid.iff.as_deref() {
+                    Some(g) => self.eval_waiter_condition(waiter.pid, g),
                     None => true,
                 };
                 // §9.4.2: a non-trivial event expression fires only when its
