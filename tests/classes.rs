@@ -324,10 +324,14 @@ mod process_class_9_7;
 mod pure_sv_phase_objection;
 #[path = "classes/randomize_dist_weights.rs"]
 mod randomize_dist_weights;
+#[path = "classes/randomize_shift_mask_wide_peer.rs"]
+mod randomize_shift_mask_wide_peer;
 #[path = "classes/randomize_inside_range.rs"]
 mod randomize_inside_range;
 #[path = "classes/randomize_issue_255_shapes.rs"]
 mod randomize_issue_255_shapes;
+#[path = "classes/randomize_with_receiver_qualified_element.rs"]
+mod randomize_with_receiver_qualified_element;
 #[path = "classes/randomize_member_subset.rs"]
 mod randomize_member_subset;
 #[path = "classes/randomize_nonrand_members.rs"]
@@ -511,6 +515,8 @@ mod formal_class_type_frame_scoped;
 mod handle_chain_read_in_instance_task;
 #[path = "classes/heap_id_collision_member_access.rs"]
 mod heap_id_collision_member_access;
+#[path = "classes/iff_guard_parked_context.rs"]
+mod iff_guard_parked_context;
 #[path = "classes/id_collision_in_heap.rs"]
 mod id_collision_in_heap;
 #[path = "classes/implication_joint_distribution.rs"]
