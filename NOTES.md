@@ -70,6 +70,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   argument or a declaration initializer, and the initializer form pops only
   once. A scalar `bit` argument of a class method has the formal's one-bit
   width. (#272, reported by AaronKel)
+* `randomize()` with a soft constraint and an array sized by the
+  constraints no longer returns 0 when the joint solver gives up: once its
+  runs are used up, an assignment that satisfies every constraint is
+  accepted. (#256, reported by Taichi Ishitani)
+* The constraint solver handles more shapes: packed-struct fields set from
+  other random variables, bit and part selects of random array elements,
+  elements or bits at positions chosen by random variables, equalities whose
+  sides wrap at their width, `$countones`, and `foreach` over a state vector.
+  (#255, reported by rharikrishna25)
 
 **Usability**
 
