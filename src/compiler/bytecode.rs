@@ -9280,6 +9280,10 @@ impl<'a> BytecodeCompiler<'a> {
         let start_reg = self.next_reg;
         let saved_reason = self.bail_reason;
         let saved_overflow = self.register_overflow;
+        let loop_depth = (
+            self.loop_break_patches.len(),
+            self.loop_continue_patches.len(),
+        );
         self.bail_reason = None;
         self.register_overflow = false;
         let strict_ok = self.compile_stmt_strict(stmt);
@@ -9288,6 +9292,9 @@ impl<'a> BytecodeCompiler<'a> {
             self.register_overflow = saved_overflow;
             return true;
         }
+        // A loop that bailed part-way may leave its own patch frames pushed.
+        self.loop_break_patches.truncate(loop_depth.0);
+        self.loop_continue_patches.truncate(loop_depth.1);
         if self.register_overflow {
             self.bail("bytecode_register_limit");
         }
