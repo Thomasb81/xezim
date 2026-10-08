@@ -31,6 +31,8 @@ pub(crate) struct CompatArgs {
     /// `-uvm` / `--uvm`: add the UVM library named by `XEZIM_UVM_DIR`
     /// (see src/uvm_dir.rs).
     pub uvm: bool,
+    /// `--fst-scope-file` files named inside args files (src/cli_files.rs).
+    pub fst_scope_files: Vec<String>,
 }
 
 /// The code coverage `+cover[=<letters>]` and `-coverage` ask for, as

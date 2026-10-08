@@ -7,6 +7,7 @@ mod report;
 
 // Other simulators' command-line spellings (`-do`, `-g`, `-sv_seed`, ...).
 mod cli_compat;
+mod cli_files;
 mod uvm_dir;
 
 /// The library's `chatter!` for the CLI: internal lines (run banner, `[PHASE]`
@@ -144,6 +145,46 @@ fn spawn_memory_watchdog() {
             }
         }
     });
+}
+
+/// `-xezim_env <file>`: set (or with `unsetenv`, remove) the `XEZIM_*`
+/// variables a file lists, overriding the shell environment. Files apply in
+/// command-line order; a later setting wins.
+fn apply_xezim_env_files() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let files = match cli_files::env_files_in_args(&args) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    for f in files {
+        let text = match std::fs::read_to_string(&f) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Error: cannot read -xezim_env file '{}': {}", f, e);
+                std::process::exit(1);
+            }
+        };
+        let settings = match cli_files::parse_env_file(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error: -xezim_env file '{}': {}", f, e);
+                std::process::exit(1);
+            }
+        };
+        for (name, value) in settings {
+            // SAFETY: called first thing in `main`, before any other thread
+            // exists, so nothing reads the environment concurrently.
+            unsafe {
+                match value {
+                    Some(v) => env::set_var(&name, v),
+                    None => env::remove_var(&name),
+                }
+            }
+        }
+    }
 }
 
 fn print_usage() {
@@ -307,6 +348,11 @@ fn print_usage() {
     eprintln!("  --fst <file>     Emit an FST (GTKWave binary) waveform dump to <file>.");
     eprintln!("  --fst-scope <hier>  Restrict the FST dump to signals under <hier>");
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
+    eprintln!("  -fst_scope_file <file>  (--fst-scope-file) FST scopes from a file: one or");
+    eprintln!("                   more per line, '#' or '//' comments. Adds to --fst-scope.");
+    eprintln!("  -xezim_env <file>  (--xezim-env) Set XEZIM_* variables from a file before");
+    eprintln!("                   anything reads them: NAME=value, export NAME=value,");
+    eprintln!("                   setenv NAME value, unsetenv NAME. Overrides the shell.");
     eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
     eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
     eprintln!("  --no-strict      Disable strict negative-test diagnostics (accept LRM-illegal");
@@ -884,6 +930,31 @@ fn process_command_file(
                 // `-F` differs from `-f` only in resolving `+incdir+` paths
                 // against the args file's own directory, else as given (see
                 // resolve_rel_file_first). `-file` is a long spelling of `-f`.
+                // `--fst-scope-file <file>` (path relative to this args
+                // file); ahead of the `-f<file>` prefix form below.
+                _ if cli_files::option_value(t, cli_files::FST_SCOPE_FILE_NAMES).is_some() => {
+                    let v = match cli_files::option_value(t, cli_files::FST_SCOPE_FILE_NAMES) {
+                        Some(Some(v)) => Some(v.to_string()),
+                        _ => {
+                            i += 1;
+                            toks.get(i).map(|s| s.to_string())
+                        }
+                    };
+                    if let Some(v) = v {
+                        compat.fst_scope_files.push(resolve_rel(base, &v));
+                    }
+                }
+                // `-xezim_env` must be on the command line: the environment
+                // is set before any args file is read.
+                _ if cli_files::option_value(t, cli_files::XEZIM_ENV_NAMES).is_some() => {
+                    if cli_files::option_value(t, cli_files::XEZIM_ENV_NAMES) == Some(None) {
+                        i += 1;
+                    }
+                    eprintln!(
+                        "Warning: -xezim_env in args file '{}' is ignored; give it on the command line",
+                        path
+                    );
+                }
                 "-f" | "-c" | "-F" | "-file" => {
                     let nested_rel = t == "-F";
                     i += 1;
@@ -1648,6 +1719,10 @@ fn append_adopted_libs_to_merged(
 }
 
 fn main() {
+    // `-xezim_env <file>` before anything reads an `XEZIM_*` variable (this
+    // very function reads XEZIM_HUGEPAGE and XEZIM_STACK_MB). The process is
+    // still single-threaded here, so setting the environment is sound.
+    apply_xezim_env_files();
     // FIRST thing, before any large allocation: a parent can disable transparent
     // huge pages for its whole descendant tree with prctl(PR_SET_THP_DISABLE, 1),
     // and the flag is inherited across fork+exec. While set, madvise(MADV_HUGEPAGE)
@@ -1915,6 +1990,37 @@ fn run_main() -> i32 {
             ) => {}
             // `-F` also resolves `+incdir+` paths against the args file's
             // directory first (resolve_rel_file_first); `-file` is `-f`.
+            // `--fst-scope-file <file>`: one `--fst-scope` per listed scope.
+            // Ahead of the `-f<file>` args-file prefix form, which would
+            // otherwise take `-fst_scope_file`.
+            _ if cli_files::option_value(arg, cli_files::FST_SCOPE_FILE_NAMES).is_some() => {
+                let path = match cli_files::option_value(arg, cli_files::FST_SCOPE_FILE_NAMES) {
+                    Some(Some(v)) => v.to_string(),
+                    _ => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => {
+                                eprintln!("Error: -fst_scope_file requires a file");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => fst_scopes.extend(cli_files::parse_scope_file(&text)),
+                    Err(e) => {
+                        eprintln!("Error: cannot read -fst_scope_file '{}': {}", path, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // `-xezim_env <file>` was applied at start-up (apply_xezim_env_files).
+            _ if cli_files::option_value(arg, cli_files::XEZIM_ENV_NAMES).is_some() => {
+                if cli_files::option_value(arg, cli_files::XEZIM_ENV_NAMES) == Some(None) {
+                    i += 1;
+                }
+            }
             "-c" | "-f" | "-F" | "-file" => {
                 let incdir_rel = arg == "-F";
                 i += 1;
@@ -2766,6 +2872,17 @@ fn run_main() -> i32 {
     xezim::set_verbose(
         verbose || sim_debug || env_on("XEZIM_PROFILE_REPORT") || env_on("XEZIM_PROFILE_TIMING"),
     );
+
+    // `--fst-scope-file` given inside an args file.
+    for f in std::mem::take(&mut compat.fst_scope_files) {
+        match std::fs::read_to_string(&f) {
+            Ok(text) => fst_scopes.extend(cli_files::parse_scope_file(&text)),
+            Err(e) => {
+                eprintln!("Error: cannot read -fst_scope_file '{}': {}", f, e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // `-uvm`: add the UVM library that `XEZIM_UVM_DIR` names (its `src`
     // include directory and `uvm_pkg.sv`; src/uvm_dir.rs). Before

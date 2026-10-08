@@ -73,6 +73,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Usability**
 
+* `-fst_scope_file <file>` reads FST dump scopes from a file (one or more per
+  line, `#`/`//` comments), and `-xezim_env <file>` sets `XEZIM_*` variables
+  from a file (`NAME=value`, `export`, `setenv`, `unsetenv` lines) before xezim
+  reads any of them, so a run's settings can live next to its file list
+  whatever shell starts it.
+
 * `-uvm` (or `--uvm`) adds the UVM library that `XEZIM_UVM_DIR` names, for
   compile and simulation alike: its `src` directory joins the include path and
   its `uvm_pkg.sv` the file list, so a UVM testbench needs only its own files.
