@@ -29,3 +29,17 @@ fn factory_typedef_chain_inside_class_method() {
         "c = new; rm = c.make();",
     ));
 }
+
+#[test]
+fn parameterized_hop_in_the_chain_keeps_its_parameters() {
+    // Expected values are the reference simulator's.
+    let sim = xezim::simulate(include_str!("factory_typedef_chain_param_hop.sv"), 10)
+        .expect("factory alias must simulate");
+    let out: Vec<_> = sim
+        .output
+        .iter()
+        .map(|o| o.message.as_str())
+        .filter(|m| m.starts_with("T|"))
+        .collect();
+    assert_eq!(out, vec!["T|a.w=8 b.w=8"]);
+}

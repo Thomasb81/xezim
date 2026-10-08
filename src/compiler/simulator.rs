@@ -100443,6 +100443,37 @@ impl Simulator {
         None
     }
 
+    /// Follow plain `typedef A B;` hops from `name` to the class they name.
+    /// Stops early at the first alias in the chain that names a
+    /// parameterized specialization (`typedef C#(8) A;`) and returns that
+    /// alias, so the caller keeps its `#(...)` arguments.
+    fn resolve_plain_alias_chain(&self, name: &str) -> Option<String> {
+        use crate::ast::types::DataType;
+        let mut cur = name.to_string();
+        for _ in 0..16 {
+            let DataType::TypeReference {
+                name: tn,
+                type_args,
+                ..
+            } = self.lookup_typedef_target(&cur)?
+            else {
+                return None;
+            };
+            if !type_args.is_empty() {
+                return (cur != name).then_some(cur);
+            }
+            let next = tn.name.name;
+            if self.module.classes.contains_key(&next) {
+                return Some(next);
+            }
+            if next == cur {
+                return None;
+            }
+            cur = next;
+        }
+        None
+    }
+
     fn resolve_typedef_spec(&self, name: &str) -> Option<(String, String)> {
         let dt = self.lookup_typedef_target(name)?;
         self.spec_from_typedef_dt(&dt)
@@ -126419,8 +126450,9 @@ impl Simulator {
                         {
                             if let Some((alias_base, alias_sig)) =
                                 self.resolve_typedef_spec(pkg).or_else(|| {
-                                    self.resolve_simple_typedef_class(pkg)
-                                        .map(|base| (base, String::new()))
+                                    let hop = self.resolve_plain_alias_chain(pkg)?;
+                                    self.resolve_typedef_spec(&hop)
+                                        .or_else(|| Some((hop, String::new())))
                                 })
                                 && self.module.classes.contains_key(&alias_base)
                             {
@@ -127884,7 +127916,7 @@ impl Simulator {
                 let receiver = len - 3;
                 if !self.module.classes.contains_key(&path[receiver].name.name)
                     && let Some(class_name) =
-                        self.resolve_simple_typedef_class(&path[receiver].name.name)
+                        self.resolve_plain_alias_chain(&path[receiver].name.name)
                 {
                     let mut resolved = hier.clone();
                     resolved.path[receiver].name.name = class_name;
