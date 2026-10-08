@@ -7065,6 +7065,10 @@ pub struct Simulator {
     next_dpi_task: u64,
     /// Wake markers fired by waiters registered from that nested path.
     sync_wakes: HashSet<u64>,
+    /// The run ended while a task entered from C was still waiting: nothing
+    /// was left to wake it, or `--max-time` came first (`run_nested_until`).
+    /// `finished` is raised to stop it, but no `$finish` was called.
+    ended_waiting_in_c: bool,
     next_sync_wake: u64,
     /// File names of open multichannel descriptors (`vpi_mcd_name`).
     mcd_names: HashMap<i32, String>,
@@ -11991,6 +11995,7 @@ impl Simulator {
             dpi_unwinding: false,
             next_dpi_task: 1,
             sync_wakes: HashSet::default(),
+            ended_waiting_in_c: false,
             next_sync_wake: 0,
             mcd_names: HashMap::default(),
             foreach_replay_parks: HashMap::default(),
@@ -19137,6 +19142,10 @@ impl Simulator {
             self.build_sig_wake_rank();
         }
         self.event_loop();
+        if self.ended_waiting_in_c {
+            // Stopped, not finished: no `$finish` was called.
+            self.finished = false;
+        }
         // Loops in the `final` blocks below run to completion again.
         super::interrupt::end_loop_stop();
         // §16.4: reports of the last time slot (or, after $finish, notes),
@@ -48402,7 +48411,17 @@ impl Simulator {
         let _ = self.drain_edge_cascade(self.cascade_limit);
         self.snapshot_edge_signals();
         let mut stalled = 0u32;
-        while !self.finished && !done(self) {
+        let mut idle_flushed = false;
+        loop {
+            if self.finished {
+                break;
+            }
+            // `done` may evaluate the waiting task's own expressions: give it
+            // the task's scope back from the processes the last slot ran.
+            *self.name_resolve_hint.borrow_mut() = saved_hint.clone();
+            if done(self) {
+                break;
+            }
             let next = [
                 self.event_queue.next_time(),
                 self.clock_generators
@@ -48418,9 +48437,30 @@ impl Simulator {
             let t = match next {
                 Some(t) => t,
                 None if !self.inactive_queue.is_empty() => self.time,
-                None => break,
+                // Nothing scheduled: finish this time slot's own work (an
+                // NBA, a waiter it frees) once, then look again.
+                None if !idle_flushed => {
+                    idle_flushed = true;
+                    if !self.in_edge_block {
+                        self.apply_nba();
+                    }
+                    self.settle_combinatorial();
+                    self.check_edges();
+                    let _ = self.drain_edge_cascade(self.cascade_limit);
+                    if self.dpi_export_depth > 0 && !self.condition_waiters.is_empty() {
+                        self.nested_drain_condition_waiters();
+                    }
+                    self.snapshot_edge_signals();
+                    continue;
+                }
+                None => {
+                    self.end_run_waiting_in_c(false);
+                    break;
+                }
             };
+            idle_flushed = false;
             if t > self.max_time {
+                self.end_run_waiting_in_c(true);
                 break;
             }
             let before = self.time;
@@ -48435,6 +48475,41 @@ impl Simulator {
             }
         }
         *self.name_resolve_hint.borrow_mut() = saved_hint;
+    }
+
+    /// `run_nested_until` gave up: the run ends with the task entered from C
+    /// still waiting. §35.8: the call returns only when the task has
+    /// finished, so neither the rest of the task nor its caller may run —
+    /// they used to, at whatever time the run had reached, as though the
+    /// wait had been satisfied (#279). Stop the run as the main loop would
+    /// have stopped it, without a `$finish`.
+    fn end_run_waiting_in_c(&mut self, max_time: bool) {
+        if max_time && !RUN_LENGTH_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[xezim][hang-report] simulation reached --max-time ({} ticks) without $finish",
+                self.max_time
+            );
+            self.report_parked_waiters(8);
+        }
+        self.ended_waiting_in_c = true;
+        self.finished = true;
+    }
+
+    /// The end-of-tick condition-waiter pass, for a time slot the nested loop
+    /// (`run_events_until`) runs while a task entered from C waits: resume
+    /// the waiters whose condition holds, then deliver the edges their
+    /// continuations made, as `run_one_tick`'s late-region re-pass does.
+    fn nested_drain_condition_waiters(&mut self) {
+        let epoch = self.late_resume_epoch;
+        self.drain_condition_waiters(false, false);
+        if self.late_resume_epoch != epoch && !self.finished {
+            if self.dirty_any {
+                self.settle_combinatorial();
+            }
+            self.check_edges();
+            let _ = self.drain_edge_cascade(self.cascade_limit);
+            self.snapshot_edge_signals();
+        }
     }
 
     fn run_events_until(&mut self, target: u64) {
@@ -48601,6 +48676,15 @@ impl Simulator {
                 self.check_edges();
                 let _ = self.drain_edge_cascade(self.cascade_limit);
                 self.snapshot_edge_signals();
+            }
+            // §9.7.4: `wait (expr)` is level-sensitive and resumes whenever the
+            // expression is true. The main loop re-checks parked waiters at the
+            // end of every tick (`drain_condition_waiters`); this nested loop
+            // did not, so while a task entered from C (§35.8) waited, other
+            // processes' waits on an RTL variable or an event's triggered
+            // state stayed parked until the C call returned (#279).
+            if self.dpi_export_depth > 0 && !self.condition_waiters.is_empty() {
+                self.nested_drain_condition_waiters();
             }
             // §4.4.2.3: a process resumed above may have parked a `#0`
             // continuation in the Inactive queue. apply_nba for this pass
@@ -83687,19 +83771,18 @@ impl Simulator {
                         self.exec_statement(stmt);
                     }
                 } else if self.dpi_export_depth > 0 {
-                    // A task entered from C (DPI export) cannot park: wait
-                    // here, running the scheduler until the condition holds
-                    // (#204). The waiter re-checks the condition when woken.
-                    let (id, wpid, wake) = self.new_sync_wake();
-                    let recheck = Statement::new(
-                        StatementKind::Wait {
-                            condition: condition.clone(),
-                            stmt: Box::new(wake),
-                        },
-                        crate::ast::Span::dummy(),
-                    );
-                    self.park_condition_waiter(wpid, vec![recheck].into(), condition);
-                    self.run_nested_until(|sim| sim.sync_wakes.remove(&id));
+                    // A task entered from C (DPI export, §35.8) cannot park:
+                    // wait here, running the scheduler until the condition
+                    // holds (#204). §9.7.4: the condition is level-sensitive,
+                    // so it is evaluated here, in the task's own frame, after
+                    // every time slot the scheduler runs. It used to be parked
+                    // as a condition waiter of a fresh process instead, which
+                    // the nested loop never re-checked unless a recognised
+                    // write named one of its operands: an event's triggered
+                    // state or a pending clock left it parked until the run
+                    // ended, and the fresh process could not see the task's
+                    // automatic variables at all (#279).
+                    self.run_nested_until(|sim| sim.wait_condition_true(condition));
                     if !self.finished {
                         self.exec_statement(stmt);
                     }
