@@ -81386,7 +81386,18 @@ impl Simulator {
                     } else {
                         None
                     };
-                let v = if let Some(init_expr) = d.init.as_ref() {
+                // §6.8/§7.2: an unpacked-struct local is initialized member-
+                // wise below (`init_unpacked_struct_local`), which runs the
+                // initializer itself. Evaluating it here too ran it twice:
+                // `receipt_t r = q.pop_front();` popped two elements.
+                let struct_init_later = d.init.is_some()
+                    && d.dimensions.is_empty()
+                    && !plain
+                    && matches!(
+                        self.resolve_dt(data_type),
+                        crate::ast::types::DataType::Struct(su) if Self::spreads_member_wise(&su)
+                    );
+                let v = if let Some(init_expr) = d.init.as_ref().filter(|_| !struct_init_later) {
                     let mut produced: Option<Value> = None;
                     if let Some(cn) = &class_name {
                         // `T x = new(...);` / `T x = new;` — detect the
@@ -109045,20 +109056,20 @@ impl Simulator {
     /// `<obj>.prop` access from outside.
     /// A packed integer vector whose every dimension is a literal range
     /// (`[15:0]`, not `[W-1:0]`): its width is known without any parameter
-    /// or class type-argument lookup.
+    /// or class type-argument lookup. A scalar `bit`/`logic`/`reg` (no
+    /// dimension) is one bit wide (§6.11): a class-method formal `bit a`
+    /// bound to the literal `1` kept the actual's 32 bits, so `%b` printed
+    /// 32 digits and `a` given 2 read nonzero (#272).
     fn packed_dims_are_literal(dt: &DataType) -> bool {
         use crate::ast::types::PackedDimension;
         match dt {
-            DataType::IntegerVector { dimensions, .. } => {
-                !dimensions.is_empty()
-                    && dimensions.iter().all(|d| match d {
-                        PackedDimension::Range { left, right, .. } => {
-                            matches!(left.kind, ExprKind::Number(_))
-                                && matches!(right.kind, ExprKind::Number(_))
-                        }
-                        PackedDimension::Unsized(_) => false,
-                    })
-            }
+            DataType::IntegerVector { dimensions, .. } => dimensions.iter().all(|d| match d {
+                PackedDimension::Range { left, right, .. } => {
+                    matches!(left.kind, ExprKind::Number(_))
+                        && matches!(right.kind, ExprKind::Number(_))
+                }
+                PackedDimension::Unsized(_) => false,
+            }),
             _ => false,
         }
     }
@@ -110124,6 +110135,22 @@ impl Simulator {
         let su = self.class_prop_struct(handle, &prop)?;
         if !Self::spreads_member_wise(&su) {
             return None;
+        }
+        // §10.6/§13.4.1: a CALL source (`last = q.pop_front()`, `p = mk()`)
+        // is evaluated once and its value spread over the leaves; the
+        // member-wise read below would re-run it per member.
+        let mut src = rvalue;
+        while let ExprKind::Paren(i) = &src.kind {
+            src = i;
+        }
+        if matches!(src.kind, ExprKind::Call { .. }) {
+            let v = self.eval_expr(src);
+            for (key, mv) in self.split_packed_struct("X", &su, &v) {
+                if let Some(lv) = Self::leaf_lvalue_of(lvalue, &key[1..]) {
+                    self.assign_value(&lv, &mv);
+                }
+            }
+            return Some(());
         }
         // Member-wise assign. Nested struct/array members recurse naturally:
         // `lhs.m = eval(rhs.m)` re-enters this path (for a nested struct
@@ -113116,6 +113143,23 @@ impl Simulator {
         } else {
             None
         }
+    }
+
+    /// §7.10.2.5/§7.10.2.6: the value `pop_front`/`pop_back` returns, element
+    /// `idx` of queue `obj`. An UNPACKED-STRUCT element has no packed cell of
+    /// its own, only its members' leaves, so it travels packed like a struct
+    /// function result (`pack_unpacked_struct`): `r = q.pop_front()` on a
+    /// class-property queue, `return q.pop_front()` or a declaration
+    /// initializer then spread it back over the target's members.
+    fn queue_elem_value(&mut self, obj: &str, idx: i64) -> Value {
+        let elem = Self::name_with_index(obj, idx);
+        if let Some(su) = self.queue_elem_struct(obj) {
+            if let Some(v) = self.pack_unpacked_struct(&elem, &su) {
+                return v;
+            }
+        }
+        self.get_signal_value_by_name(&elem)
+            .unwrap_or_else(|| Value::zero(32))
     }
 
     /// `q.pop_front()` / `q.pop_back()` — the queue name and which end.
@@ -117134,9 +117178,7 @@ impl Simulator {
         if bm == BuiltinM::PopFront {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
-                let val = self
-                    .get_signal_value_by_name(&Self::name_with_index(obj_name, 0))
-                    .unwrap_or_else(|| Value::zero(32));
+                let val = self.queue_elem_value(obj_name, 0);
                 for i in 1..cur_size {
                     self.queue_move_elem(obj_name, i, i - 1);
                 }
@@ -117148,9 +117190,7 @@ impl Simulator {
         if bm == BuiltinM::PopBack {
             let cur_size = self.get_queue_size(obj_name);
             if cur_size > 0 {
-                let val = self
-                    .get_signal_value_by_name(&Self::name_with_index(obj_name, cur_size as i64 - 1))
-                    .unwrap_or_else(|| Value::zero(32));
+                let val = self.queue_elem_value(obj_name, cur_size as i64 - 1);
                 self.set_queue_size(obj_name, cur_size - 1);
                 return Some(val);
             }
@@ -130339,6 +130379,71 @@ impl Simulator {
         true
     }
 
+    /// The leaves of a packed struct VALUE `v` (laid out as
+    /// `pack_unpacked_struct` lays out `su`), keyed as `struct_leaf_layout`
+    /// keys them under `base`.
+    fn split_packed_struct(
+        &mut self,
+        base: &str,
+        su: &crate::ast::types::StructUnionType,
+        v: &Value,
+    ) -> Vec<(String, Value)> {
+        let fields = self.struct_leaf_layout(base, su);
+        let mut out = Vec::with_capacity(fields.len());
+        for (leaf, off, w, is_real) in fields {
+            let mut mv = Value::new(w);
+            for i in 0..w {
+                mv.set_bit(i as usize, v.get_bit((off + i) as usize));
+            }
+            if is_real {
+                mv = Value::from_f64(f64::from_bits(mv.to_u64().unwrap_or(0)));
+            }
+            out.push((leaf, mv));
+        }
+        out
+    }
+
+    /// §13.5.1/§7.2: an unpacked-struct actual that is a CALL (`f()`,
+    /// `q.pop_front()`) is one value: evaluate it ONCE and hand out its
+    /// leaves by their keys under `base`. Reading `arg.member` per member
+    /// re-ran the call for every member — a `pop_front()` actual popped once
+    /// per member and bound nothing.
+    fn call_struct_leaf_values(
+        &mut self,
+        base: &str,
+        su: &crate::ast::types::StructUnionType,
+        arg: &Expression,
+    ) -> Option<HashMap<String, Value>> {
+        let mut e = arg;
+        while let ExprKind::Paren(i) = &e.kind {
+            e = i;
+        }
+        if !matches!(e.kind, ExprKind::Call { .. }) {
+            return None;
+        }
+        let v = self.eval_expr(e);
+        Some(self.split_packed_struct(base, su, &v).into_iter().collect())
+    }
+
+    /// The lvalue naming leaf `tail` (`.a`, `.inner.x`, `.arr[2].y`, as
+    /// `struct_leaf_layout` spells a key after its base) under `base`.
+    fn leaf_lvalue_of(base: &Expression, tail: &str) -> Option<Expression> {
+        let mut lv = base.clone();
+        for seg in tail.strip_prefix('.')?.split('.') {
+            match seg.split_once('[') {
+                Some((name, rest)) => {
+                    let mut idx = Vec::new();
+                    for part in rest.split('[') {
+                        idx.push(part.trim_end_matches(']').parse::<i64>().ok()?);
+                    }
+                    lv = Self::append_elem_path(&lv, name, &idx);
+                }
+                None => lv = Self::append_member_expr(&lv, seg),
+            }
+        }
+        Some(lv)
+    }
+
     /// The resolved struct type when `dt` is an UNPACKED struct whose members
     /// are stored one-per-leaf (§7.2), else `None`.
     fn unpacked_struct_of(&self, dt: &DataType) -> Option<crate::ast::types::StructUnionType> {
@@ -130391,12 +130496,19 @@ impl Simulator {
             })
             .count();
         let pattern_vals = self.eval_flat_struct_pattern(arg, leaf_count);
+        let call_vals = if copies_in && pattern_vals.is_none() {
+            self.call_struct_leaf_values(port_name, &su, arg)
+        } else {
+            None
+        };
         let mut leaf_pos = 0usize;
         let mut backs = Vec::new();
         for (key, caller_expr, w, is_real) in leaves {
             if copies_in {
                 let v = if let Some(pv) = &pattern_vals {
                     pv[leaf_pos].clone()
+                } else if let Some(cv) = &call_vals {
+                    cv.get(&key).cloned().unwrap_or_else(|| Value::new(w))
                 } else {
                     self.eval_expr(&caller_expr)
                 };
@@ -130653,10 +130765,16 @@ impl Simulator {
             self.note_struct_root(port_name);
             locals.insert(format!("{}.", port_name), Value::zero(1));
             let pattern_vals = self.eval_flat_struct_pattern(arg, leaves.len());
-            for (pos, (key, caller_expr, _, _)) in leaves.into_iter().enumerate() {
-                let v = match &pattern_vals {
-                    Some(pv) => pv[pos].clone(),
-                    None => self.eval_expr(&caller_expr),
+            let call_vals = if pattern_vals.is_none() {
+                self.call_struct_leaf_values(port_name, &su, arg)
+            } else {
+                None
+            };
+            for (pos, (key, caller_expr, w, _)) in leaves.into_iter().enumerate() {
+                let v = match (&pattern_vals, &call_vals) {
+                    (Some(pv), _) => pv[pos].clone(),
+                    (None, Some(cv)) => cv.get(&key).cloned().unwrap_or_else(|| Value::new(w)),
+                    (None, None) => self.eval_expr(&caller_expr),
                 };
                 locals.insert(key.clone(), v);
                 // A top-level member writes back through the same lvalue
@@ -130674,6 +130792,11 @@ impl Simulator {
             return Some(entries);
         }
         let pattern_vals = self.eval_flat_struct_pattern(arg, flat_names.len());
+        let call_vals = if pattern_vals.is_none() {
+            self.call_struct_leaf_values(port_name, &su, arg)
+        } else {
+            None
+        };
         let mut member_pos = 0usize;
         for m in &su.members {
             for md in &m.declarators {
@@ -130681,6 +130804,8 @@ impl Simulator {
                 let local_key = format!("{}.{}", port_name, fname);
                 let v = if let Some(pv) = &pattern_vals {
                     pv[member_pos].clone()
+                } else if let Some(v) = call_vals.as_ref().and_then(|cv| cv.get(&local_key)) {
+                    v.clone()
                 } else {
                     let member_expr = Expression::new(
                         ExprKind::MemberAccess {

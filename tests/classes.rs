@@ -611,7 +611,7 @@ mod vif_resource_db_shape;
 mod vif_static_roundtrip;
 #[path = "classes/class_member_named_like_instance.rs"]
 mod class_member_named_like_instance;
-#[path = "classes/class_member_named_like_instance.rs"]
-mod class_member_named_like_instance;
 #[path = "classes/covergroup_class_param_bins.rs"]
 mod covergroup_class_param_bins;
+#[path = "classes/class_method_scalar_formal_width.rs"]
+mod class_method_scalar_formal_width;

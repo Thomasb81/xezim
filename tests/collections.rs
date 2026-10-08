@@ -119,3 +119,5 @@ mod mailbox_unpacked_struct;
 mod queue_concat_index_prefilled_prefix;
 #[path = "collections/std_randomize_multidim.rs"]
 mod std_randomize_multidim;
+#[path = "collections/queue_struct_pop.rs"]
+mod queue_struct_pop;
