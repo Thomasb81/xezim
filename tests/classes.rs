@@ -609,3 +609,5 @@ mod vif_receiver_operation_matrix;
 mod vif_resource_db_shape;
 #[path = "classes/vif_static_roundtrip.rs"]
 mod vif_static_roundtrip;
+#[path = "classes/class_member_named_like_instance.rs"]
+mod class_member_named_like_instance;

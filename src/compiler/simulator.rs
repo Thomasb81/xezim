@@ -120164,6 +120164,54 @@ impl Simulator {
         true
     }
 
+    /// §23.9: does a nearer declaration hide a same-named interface instance
+    /// or vif alias for a BARE name? A local or formal of the current frame,
+    /// or a non-vif property of `this` (§8.5), is found before any enclosing
+    /// scope's instance: a class's `bit irq` read as `irq` in its own method
+    /// is that bit, whatever instance `irq` the module holds. A vif local or
+    /// property is bound through `__vif_local__` / the binding map, both
+    /// consulted before this.
+    fn data_name_shadows_iface(&self, raw: &str) -> bool {
+        if self
+            .local_iface_aliases
+            .last()
+            .is_some_and(|frame| frame.contains_key(raw))
+        {
+            return false;
+        }
+        if self.local_stack.last().is_some_and(|l| l.contains_key(raw)) {
+            return true;
+        }
+        let Some(th) = self.this_stack.last().copied().flatten() else {
+            return false;
+        };
+        let mut cur = self
+            .heap
+            .get(th)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.as_str());
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(cn) else {
+                break;
+            };
+            if cd.virtual_iface_properties.contains_key(raw) {
+                return false;
+            }
+            if cd.properties.contains_key(raw) {
+                return true;
+            }
+            cur = cd.extends.as_deref();
+        }
+        false
+    }
+
+    /// §8.5/§23.6: is `head` of `head.leaf` a variable (a class handle, a
+    /// struct, `this`/`super`) rather than a scope? Then `head.leaf` selects
+    /// a member and never names the interface instance `leaf`.
+    fn names_data_object(&self, head: &str) -> bool {
+        matches!(head, "this" | "super") || self.eval_ident_handle(head).is_some()
+    }
+
     /// Classify an equality operand as a VIRTUAL-INTERFACE VARIABLE:
     /// `None` — not one; `Some(Some(n))` — bound to instance `n`;
     /// `Some(None)` — a declared vif variable with no binding (null).
@@ -120207,9 +120255,11 @@ impl Simulator {
                     }
                 }
                 if let Some(b) = self.iface_alias_for(raw) {
-                    return Some(Some(b));
+                    if !self.data_name_shadows_iface(raw) {
+                        return Some(Some(b));
+                    }
                 }
-                if self.is_interface_instance(raw) {
+                if self.is_interface_instance(raw) && !self.data_name_shadows_iface(raw) {
                     return Some(Some(raw.clone()));
                 }
                 // A DECLARED vif property of `this` with no binding: unbound.
@@ -120241,7 +120291,11 @@ impl Simulator {
                 // §23.6: a scope-qualified interface instance (`top.pif`) —
                 // the LEAF names the instance; `vif_operand_obj_prop` would
                 // reject it since no class declares `pif` as a vif property.
-                if self.is_interface_instance(&h.path[1].name.name) {
+                // §8.5: a head naming a variable makes this a member select
+                // (`t.irq`), never the same-named instance.
+                if self.is_interface_instance(&h.path[1].name.name)
+                    && !self.names_data_object(&h.path[0].name.name)
+                {
                     return Some(Some(h.path[1].name.name.clone()));
                 }
                 self.vif_operand_obj_prop(&h.path[0].name.name, &h.path[1].name.name)
@@ -120269,7 +120323,9 @@ impl Simulator {
             ExprKind::MemberAccess { expr, member } => {
                 if let ExprKind::Ident(bh) = &expr.kind {
                     if bh.path.len() == 1 && !self.is_interface_instance(&bh.path[0].name.name) {
-                        if self.is_interface_instance(&member.name) {
+                        if self.is_interface_instance(&member.name)
+                            && !self.names_data_object(&bh.path[0].name.name)
+                        {
                             return Some(Some(member.name.clone()));
                         }
                         return self.vif_operand_obj_prop(&bh.path[0].name.name, &member.name);
@@ -120910,6 +120966,11 @@ impl Simulator {
                     if !s.is_empty() && self.vif_flat_key_applies(&raw) {
                         return Some(s);
                     }
+                }
+                // §23.9: a local or a property of `this` hides a same-named
+                // interface instance (or vif alias) of an enclosing scope.
+                if self.data_name_shadows_iface(&raw) {
+                    return None;
                 }
                 if let Some(b) = self.iface_alias_for(&raw) {
                     return Some(b);
