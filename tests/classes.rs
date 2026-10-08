@@ -330,6 +330,8 @@ mod randomize_inside_range;
 mod randomize_member_subset;
 #[path = "classes/randomize_nonrand_members.rs"]
 mod randomize_nonrand_members;
+#[path = "classes/randomize_soft_solver_gave_up.rs"]
+mod randomize_soft_solver_gave_up;
 #[path = "classes/randomize_solve_before.rs"]
 mod randomize_solve_before;
 #[path = "classes/randomize_with_this_and_subset.rs"]

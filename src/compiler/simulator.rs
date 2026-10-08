@@ -143685,6 +143685,16 @@ impl Simulator {
                     rand_csp::CspOutcome::GaveUp if !sized => csp_ok = false,
                     _ => {}
                 }
+                // §18.5.14/§18.6.1: with soft items present a trial is left
+                // to the joint solver, which honours every soft item it can.
+                // Once its runs are used up without an answer, the trials
+                // judge their own assignments again (their repair drops a
+                // soft item only after it fought a hard one), so an
+                // assignment satisfying every hard constraint is accepted
+                // rather than failing randomize() for the solver's sake.
+                if csp_runs >= 8 {
+                    csp_ok = false;
+                }
             }
             if fixed_fe_fail_streak >= 12 {
                 if let Some(Some(inst)) = self.heap.get_mut(handle) {
