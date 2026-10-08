@@ -128,6 +128,17 @@ pub unsafe extern "C" fn xezim_jit_stmt_fallback(
     }
 }
 
+/// A loop back-edge in JIT'd code saw the Ctrl-C flag: stop the run the way
+/// the interpreter's back-edges do (`Simulator::take_interrupt`). The JIT'd
+/// function then returns as if the block had completed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xezim_jit_take_interrupt(sim: *mut u8) {
+    unsafe {
+        let sim = &mut *(sim as *mut crate::compiler::simulator::Simulator);
+        sim.take_interrupt();
+    }
+}
+
 /// Fused two-plane load: writes val/xz planes of `signal_table[id]`
 /// through out-pointers (the JIT passes its register stack-slot
 /// addresses), replacing two bridge calls per signal read with one.
@@ -390,7 +401,7 @@ mod enabled {
         xezim_jit_load_signal_slice_xz, xezim_jit_load_signal_xz, xezim_jit_load_signal2,
         xezim_jit_schedule_nba, xezim_jit_schedule_nba_4s, xezim_jit_schedule_nba_bit_dyn,
         xezim_jit_schedule_nba_fast, xezim_jit_schedule_nba_range_dyn, xezim_jit_stmt_fallback,
-        xezim_jit_store_signal, xezim_jit_store_signal_4s,
+        xezim_jit_store_signal, xezim_jit_store_signal_4s, xezim_jit_take_interrupt,
     };
     use cranelift::codegen::ir::{
         BlockArg, BlockCall, FuncRef, JumpTableData, MemFlags, StackSlot,
@@ -515,6 +526,10 @@ mod enabled {
             builder.symbol(
                 "xezim_jit_inputs_have_xz",
                 xezim_jit_inputs_have_xz as *const u8,
+            );
+            builder.symbol(
+                "xezim_jit_take_interrupt",
+                xezim_jit_take_interrupt as *const u8,
             );
             Some(Self {
                 module: ClJitModule::new(builder),
@@ -819,6 +834,12 @@ mod enabled {
                 .module
                 .declare_function("xezim_jit_inputs_have_xz", Linkage::Import, &xz_check_sig)
                 .map_err(|_| ())?;
+            let mut intr_sig = self.module.make_signature();
+            intr_sig.params.push(AbiParam::new(pointer_type)); // sim
+            let intr_id: FuncId = self
+                .module
+                .declare_function("xezim_jit_take_interrupt", Linkage::Import, &intr_sig)
+                .map_err(|_| ())?;
 
             // Function signature: extern "C" fn(sim: *mut u8) -> u32
             let mut ctx = self.module.make_context();
@@ -936,6 +957,12 @@ mod enabled {
             let xz_check_ref = self
                 .module
                 .declare_func_in_func(xz_check_id, &mut builder.func);
+            let intr_ref = self.module.declare_func_in_func(intr_id, &mut builder.func);
+            // Ctrl-C poll on loop back-edges (see `xezim_jit_take_interrupt`):
+            // the flag's address and the shared block that takes the
+            // interrupt, created on the first backward branch.
+            let loop_stop_addr = crate::compiler::interrupt::loop_stop_flag_addr() as i64;
+            let mut intr_block: Option<cranelift::codegen::ir::Block> = None;
 
             // EXPERIMENT: skip the X/Z prelude entirely to measure how
             // much it costs vs the JIT body itself. This is UNSOUND for
@@ -1128,7 +1155,16 @@ mod enabled {
                     }
                     Insn::Jump(target) => {
                         let target_b = resolve_target(*target as usize, &pc_to_block);
-                        builder.ins().jump(target_b, &[]);
+                        if (*target as usize) <= i {
+                            // Loop back-edge: poll the Ctrl-C flag, or a long
+                            // loop inside one time slot never stops.
+                            let ib = *intr_block.get_or_insert_with(|| builder.create_block());
+                            let fa = builder.ins().iconst(pointer_type, loop_stop_addr);
+                            let f = builder.ins().load(types::I8, MemFlags::trusted(), fa, 0);
+                            builder.ins().brif(f, ib, &[], target_b, &[]);
+                        } else {
+                            builder.ins().jump(target_b, &[]);
+                        }
                         live = false;
                     }
                     // Fused LogNot + BranchIfFalse: jump unless DEFINITE
@@ -1144,7 +1180,18 @@ mod enabled {
                         } else {
                             exit_block
                         };
-                        builder.ins().brif(nz, target_b, &[], fall_b, &[]);
+                        if (*target as usize) <= i {
+                            // do-while back-edge: poll as `Insn::Jump` does.
+                            let ib = *intr_block.get_or_insert_with(|| builder.create_block());
+                            let check_b = builder.create_block();
+                            builder.ins().brif(nz, check_b, &[], fall_b, &[]);
+                            builder.switch_to_block(check_b);
+                            let fa = builder.ins().iconst(pointer_type, loop_stop_addr);
+                            let f = builder.ins().load(types::I8, MemFlags::trusted(), fa, 0);
+                            builder.ins().brif(f, ib, &[], target_b, &[]);
+                        } else {
+                            builder.ins().brif(nz, target_b, &[], fall_b, &[]);
+                        }
                         live = false;
                     }
                     // Fused compare+branch: compute the compare into the
@@ -1469,6 +1516,11 @@ mod enabled {
             }
             // If control falls off the end still live, jump to exit.
             if live {
+                builder.ins().jump(exit_block, &[]);
+            }
+            if let Some(ib) = intr_block {
+                builder.switch_to_block(ib);
+                builder.ins().call(intr_ref, &[sim_ptr]);
                 builder.ins().jump(exit_block, &[]);
             }
             // Emit return in exit_block.

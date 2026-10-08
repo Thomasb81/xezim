@@ -35,6 +35,8 @@ mod fst_roundtrip;
 mod fst_time_table_breakeven;
 #[path = "gates/interrupt_finalizes_dumps.rs"]
 mod interrupt_finalizes_dumps;
+#[path = "gates/interrupt_fst_tail.rs"]
+mod interrupt_fst_tail;
 #[path = "gates/nameless_udp_instance.rs"]
 mod nameless_udp_instance;
 #[path = "gates/net_declaration_delay.rs"]

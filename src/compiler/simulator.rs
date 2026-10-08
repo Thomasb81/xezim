@@ -17,6 +17,10 @@ use crate::ast::types::{DataType, IntegerAtomType, PortDirection};
 #[allow(unused_imports)]
 use crate::{log_eprintln as eprintln, log_println as println};
 
+use super::interrupt::{
+    INTERRUPT_SIGNAL, acknowledge_interrupt, interrupt_requested, loop_stop_requested,
+    publish_sim_time,
+};
 use fst_writer::{
     FstBodyWriter, FstHeaderWriter, FstScopeType, FstSignalId, FstSignalType, FstVarDirection,
     FstVarType,
@@ -52,6 +56,12 @@ static DPI_LIB_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 /// `PROCESS_HANDLE_BASE + pid`, chosen far above any real heap index so a
 /// process handle can never be mistaken for a class-object handle.
 const PROCESS_HANDLE_BASE: u64 = 0x7000_0000;
+
+/// Interpreted loops poll the Ctrl-C flag once every this-many-plus-one
+/// iterations: a long loop inside one time slot never reaches the event
+/// loop's slot-boundary poll, and the backstop would otherwise kill it with
+/// the dumps unfinalized.
+const LOOP_INTERRUPT_POLL_MASK: u64 = 0x3ff;
 
 /// A random stream (IEEE 1800-2023 §18.14 "Random stability").
 ///
@@ -7565,9 +7575,6 @@ pub struct Simulator {
     /// Value packing, block compression and I/O run on a background thread
     /// (`XEZIM_DUMP_INLINE=1` keeps them here); see `fst_sink::FstSink`.
     fst_writer: Option<super::fst_sink::FstSink>,
-    /// Path of the open FST dump, kept so `fst_finish` can repair the file
-    /// after the writer has closed it. See `fst_repair_time_tables`.
-    fst_path: Option<String>,
     /// Named-cast targets resolvable at COMPILE time: name -> (width,
     /// signed). Built once at construction; handed to every bytecode
     /// compiler so `type'(expr)` compiles instead of falling back.
@@ -12116,7 +12123,6 @@ impl Simulator {
             fst_file: None,
             fst_scopes: Vec::new(),
             fst_writer: None,
-            fst_path: None,
             cast_widths,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
@@ -19105,6 +19111,8 @@ impl Simulator {
             self.build_sig_wake_rank();
         }
         self.event_loop();
+        // Loops in the `final` blocks below run to completion again.
+        super::interrupt::end_loop_stop();
         // §16.4: reports of the last time slot (or, after $finish, notes),
         // before the clock moves to a `run <time>` stop point.
         if !self.deferred_asserts.is_empty() {
@@ -25668,13 +25676,12 @@ impl Simulator {
                 | TsInsn::RangeStoreNbaDyn { .. }
                 | TsInsn::SaveSigW { .. }
                 | TsInsn::WNbaFromElem(..)
-                | TsInsn::RangeFillXW { .. }) => {
-                    match unsafe { self.ts_exec_dyn(insn, regs.as_mut_ptr()) } {
-                        0 => {}
-                        1 => return false,
-                        _ => xbail!(),
-                    }
-                }
+                | TsInsn::RangeFillXW { .. }
+                | TsInsn::LoopPoll) => match unsafe { self.ts_exec_dyn(insn, regs.as_mut_ptr()) } {
+                    0 => {}
+                    1 => return false,
+                    _ => xbail!(),
+                },
                 TsInsn::ConstStoreX { sig, v, x } => {
                     self.ts_store_xz(*sig as usize, *v, *x);
                 }
@@ -25810,6 +25817,13 @@ impl Simulator {
                     }
                 }
                 TsInsn::Jmp { t } => {
+                    pc = *t as usize;
+                    continue;
+                }
+                TsInsn::JmpPoll { t } => {
+                    if loop_stop_requested() {
+                        return false;
+                    }
                     pc = *t as usize;
                     continue;
                 }
@@ -26606,7 +26620,8 @@ impl Simulator {
                     | TsInsn::RangeStoreNbaDyn { .. }
                     | TsInsn::SaveSigW { .. }
                     | TsInsn::WNbaFromElem(..)
-                    | TsInsn::RangeFillXW { .. } => match unsafe { self.ts_exec_dyn(insn, rp) } {
+                    | TsInsn::RangeFillXW { .. }
+                    | TsInsn::LoopPoll => match unsafe { self.ts_exec_dyn(insn, rp) } {
                         0 => {}
                         1 => return false,
                         _ => xbail!(),
@@ -26861,6 +26876,7 @@ impl Simulator {
                     | TsInsn::BrFalseLoadSig { .. }
                     | TsInsn::EqBrFalse { .. }
                     | TsInsn::Jmp { .. }
+                    | TsInsn::JmpPoll { .. }
                     | TsInsn::CaseJmp { .. }
                     | TsInsn::CaseMaskJmp { .. } => {
                         unreachable!("ctrl insn in straight-line block")
@@ -27319,6 +27335,9 @@ impl Simulator {
     unsafe fn ts_exec_dyn(&mut self, insn: &super::bytecode::TsInsn, regs: *mut u64) -> u8 {
         use super::bytecode::TsInsn;
         match insn {
+            // 1 = bail: the four-state re-run takes the interrupt at the
+            // same back-edge (`Insn::Jump`'s poll in `exec_insns`).
+            TsInsn::LoopPoll => u8::from(loop_stop_requested()),
             TsInsn::SigRangeDyn {
                 d,
                 sig,
@@ -28041,7 +28060,8 @@ impl Simulator {
                     | TsInsn::RangeStoreNbaDyn { .. }
                     | TsInsn::SaveSigW { .. }
                     | TsInsn::WNbaFromElem(..)
-                    | TsInsn::RangeFillXW { .. }) => match unsafe { self.ts_exec_dyn(insn, rp) } {
+                    | TsInsn::RangeFillXW { .. }
+                    | TsInsn::LoopPoll) => match unsafe { self.ts_exec_dyn(insn, rp) } {
                         0 => {}
                         1 => return false,
                         _ => xbail!(),
@@ -28168,6 +28188,14 @@ impl Simulator {
                         }
                     }
                     TsInsn::Jmp { t } => {
+                        pc = *t as usize;
+                        continue;
+                    }
+                    // Back-edge: bail on Ctrl-C (see `TsInsn::JmpPoll`).
+                    TsInsn::JmpPoll { t } => {
+                        if loop_stop_requested() {
+                            return false;
+                        }
                         pc = *t as usize;
                         continue;
                     }
@@ -33654,6 +33682,11 @@ impl Simulator {
                     // Fused LogNot+BranchIfFalse: jump unless DEFINITE zero —
                     // exact composition of logic_not with !is_true (X branches).
                     if self.vm_regs[*reg as usize].is_nonzero() != Some(false) {
+                        // do-while back-edge: see `Insn::Jump`.
+                        if (*target as usize) <= pc && loop_stop_requested() {
+                            self.take_interrupt();
+                            break;
+                        }
                         pc = *target as usize;
                         continue;
                     }
@@ -33721,6 +33754,13 @@ impl Simulator {
                     self.vm_regs[*dest as usize] = v;
                 }
                 Insn::Jump(target) => {
+                    // A backward jump closes a loop iteration: poll Ctrl-C
+                    // here, or a long loop inside one time slot never
+                    // reaches the event loop's slot-boundary poll.
+                    if (*target as usize) <= pc && loop_stop_requested() {
+                        self.take_interrupt();
+                        break;
+                    }
                     pc = *target as usize;
                     continue;
                 }
@@ -44636,6 +44676,7 @@ impl Simulator {
         // re-date the livelocked slot's changes onto `ft` in both `$monitor`
         // and the dump.
         self.time = ft;
+        publish_sim_time(ft);
         self.stall_iters = 0;
         self.stall_time = ft;
         self.stall_pid_hits.clear();
@@ -45754,12 +45795,28 @@ impl Simulator {
     /// default disposition and re-raises, so an interrupt is never ignored if
     /// finalizing is itself what is stuck.
     fn install_interrupt_handler() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| unsafe {
-            libc::signal(libc::SIGINT, handle_interrupt as libc::sighandler_t);
-            libc::signal(libc::SIGTERM, handle_interrupt as libc::sighandler_t);
-            libc::signal(libc::SIGALRM, handle_interrupt_alarm as libc::sighandler_t);
-        });
+        super::interrupt::install_interrupt_handler();
+    }
+
+    /// Take a Ctrl-C / SIGTERM: disarm the backstop and stop the run, so it
+    /// leaves through the normal exit and `run()` finalizes the dumps. Called
+    /// at slot boundaries and from loop back-edges (a long loop inside one
+    /// time slot never reaches a boundary); the first call wins.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn take_interrupt(&mut self) {
+        if self.finished {
+            return;
+        }
+        acknowledge_interrupt();
+        eprintln!(
+            "[xezim] interrupted at time {} — finalizing waveform dumps",
+            self.time
+        );
+        if self.vpi_cb_mask != 0 {
+            self.vpi_notify_signal();
+        }
+        self.finished = true;
     }
 
     fn event_loop_singlethread(&mut self) {
@@ -46132,16 +46189,8 @@ impl Simulator {
 
             // Ctrl-C / SIGTERM: leave through the normal exit so the dumps are
             // finalized rather than truncated.
-            if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
-                acknowledge_interrupt();
-                eprintln!(
-                    "[xezim] interrupted at time {} — finalizing waveform dumps",
-                    self.time
-                );
-                if self.vpi_cb_mask != 0 {
-                    self.vpi_notify_signal();
-                }
-                self.finished = true;
+            if interrupt_requested() {
+                self.take_interrupt();
                 break;
             }
             let has_timed = !self.event_queue.is_empty();
@@ -46253,6 +46302,7 @@ impl Simulator {
             }
             if next_time > self.time {
                 self.time = next_time;
+                publish_sim_time(next_time);
                 // Lines printed near the end of a burst stay buffered until the
                 // next line; release them once they are stale (core #49).
                 if let Some(sink) = self.stdout_sink.as_mut() {
@@ -48353,16 +48403,8 @@ impl Simulator {
             if self.finished {
                 break;
             }
-            if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
-                acknowledge_interrupt();
-                eprintln!(
-                    "[xezim] interrupted at time {} — finalizing waveform dumps",
-                    self.time
-                );
-                if self.vpi_cb_mask != 0 {
-                    self.vpi_notify_signal();
-                }
-                self.finished = true;
+            if interrupt_requested() {
+                self.take_interrupt();
                 break;
             }
             // Advance to the EARLIEST of: event_queue, clock_generators,
@@ -48400,6 +48442,7 @@ impl Simulator {
                     self.run_postponed_region();
                 }
                 self.time = nt;
+                publish_sim_time(nt);
                 if let Some(sink) = self.stdout_sink.as_mut() {
                     sink.flush_if_stale();
                 }
@@ -53748,6 +53791,10 @@ impl Simulator {
         let mut broke = false;
         while !self.finished && safety < cap {
             safety += 1;
+            if safety & LOOP_INTERRUPT_POLL_MASK == 0 && loop_stop_requested() {
+                self.take_interrupt();
+                break;
+            }
             for s in body_stmts {
                 self.exec_statement(s);
                 // §12.7.2: `break` (and a `return` out of the enclosing
@@ -82570,6 +82617,10 @@ impl Simulator {
                         break;
                     }
                     iters += 1;
+                    if iters & LOOP_INTERRUPT_POLL_MASK == 0 && loop_stop_requested() {
+                        self.take_interrupt();
+                        break;
+                    }
                     if let Some(c) = condition {
                         self.reset_hint_to_process_scope();
                         if !self.eval_expr(c).is_true() {
@@ -82643,6 +82694,10 @@ impl Simulator {
                         break;
                     }
                     i += 1;
+                    if i & LOOP_INTERRUPT_POLL_MASK == 0 && loop_stop_requested() {
+                        self.take_interrupt();
+                        break;
+                    }
                     self.reset_hint_to_process_scope();
                     if !self.eval_expr(condition).is_true() {
                         // §12.7.2: a `continue` on the FINAL iteration reaches
@@ -82687,6 +82742,10 @@ impl Simulator {
                         break;
                     }
                     i += 1;
+                    if i & LOOP_INTERRUPT_POLL_MASK == 0 && loop_stop_requested() {
+                        self.take_interrupt();
+                        break;
+                    }
                     self.break_flag = false;
                     self.continue_flag = false;
                     self.exec_statement(body);
@@ -82708,8 +82767,14 @@ impl Simulator {
                 // §12.7.2: full count — the old 10000 cap silently truncated
                 // large loops (and negatives-as-unsigned hit it constantly).
                 let n = self.repeat_count(count);
-                for _ in 0..n {
+                for k in 0..n {
                     if self.finished {
+                        break;
+                    }
+                    if k & LOOP_INTERRUPT_POLL_MASK == LOOP_INTERRUPT_POLL_MASK
+                        && loop_stop_requested()
+                    {
+                        self.take_interrupt();
                         break;
                     }
                     self.break_flag = false;
@@ -82727,12 +82792,16 @@ impl Simulator {
                 }
             }
             StatementKind::Forever { body } => {
-                let mut i = 0;
+                let mut i: u64 = 0;
                 loop {
                     if i > 100000 || self.finished || self.time > self.max_time {
                         break;
                     }
                     i += 1;
+                    if i & LOOP_INTERRUPT_POLL_MASK == 0 && loop_stop_requested() {
+                        self.take_interrupt();
+                        break;
+                    }
                     // §9.3.3 / §12.7.2 loop control, exactly as `while` does
                     // above. This arm honoured NO flag: a `break` left the
                     // body no-opping for the rest of the cap, and — the real
@@ -82934,6 +83003,7 @@ impl Simulator {
                         self.run_events_until(target);
                         if self.time < target {
                             self.time = target;
+                            publish_sim_time(target);
                         }
                         // Full active→inactive→NBA traversal at the new
                         // time, per LRM §4.4: a delayed update or clocked
@@ -99122,11 +99192,10 @@ impl Simulator {
         self.fst_prev_signals = prev;
         self.fst_event_last = vec![u64::MAX; events.len()];
         self.fst_events = events;
-        self.fst_path = Some(filename.to_string());
         self.fst_writer = Some(if self.dump_writer_threaded() {
-            super::fst_sink::FstSink::threaded(body)
+            super::fst_sink::FstSink::threaded(body, &filename, self.time)
         } else {
-            super::fst_sink::FstSink::inline(body)
+            super::fst_sink::FstSink::inline(body, &filename, self.time)
         });
     }
 
@@ -99221,110 +99290,11 @@ impl Simulator {
                 changes: Vec::new(),
             });
         }
+        // `finish()` joined the writer thread, so the trailer is on disk (and
+        // the time tables repaired, see `fst_sink::repair_time_tables`).
         if let Some(sink) = self.fst_writer.take() {
             sink.finish();
         }
-        // `finish()` joined the writer thread, so the trailer is on disk and
-        // the file is ours again.
-        if let Some(path) = self.fst_path.take() {
-            Self::fst_repair_time_tables(&path);
-        }
-    }
-
-    /// Undo `fst-writer`'s break-even time-table encoding.
-    ///
-    /// `write_time_table` picks raw vs zlib storage with `compressed.len() >
-    /// raw.len()`. The format needs `>=`: a reader treats "compressed length ==
-    /// uncompressed length" as the sentinel for a section stored RAW, so when
-    /// zlib output comes out EXACTLY the size of its input the writer emits
-    /// compressed bytes while recording equal lengths. Readers then skip the
-    /// inflate and parse zlib's own header as varints — the first two
-    /// timestamps decode from the `78 5e` magic as 120 and 214 for any design.
-    ///
-    /// Nothing else about such a file is wrong: header, block chain, GEOM and
-    /// the declared start/end times all validate, so it passes every structural
-    /// check and only the per-change times are nonsense. gtkwave's `fst2vcd`
-    /// "succeeds" on one and prints times orders of magnitude off, which reads
-    /// as a simulator timing bug rather than a dump bug.
-    ///
-    /// Break-even needs only a short run whose delta-encoded table is small and
-    /// incompressible — 19 irregular time steps is enough — so this is not a
-    /// rare corner. Repairing here keeps the fix inside xezim instead of
-    /// carrying a patched copy of the crate.
-    ///
-    /// Best-effort by construction: every failure path leaves the file exactly
-    /// as the writer left it, because a dump that is merely mis-flagged is far
-    /// better than one this pass half-rewrote.
-    fn fst_repair_time_tables(path: &str) {
-        use std::io::{Read, Seek, SeekFrom, Write};
-        const ZLIB_MAGIC: [[u8; 2]; 4] = [[0x78, 0x9c], [0x78, 0x5e], [0x78, 0x01], [0x78, 0xda]];
-        // Value-change block types that carry a trailing time table.
-        const VC_TYPES: [u8; 3] = [1, 5, 8];
-
-        let Ok(mut f) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-        else {
-            return;
-        };
-        let Ok(size) = f.metadata().map(|m| m.len()) else {
-            return;
-        };
-        let mut off: u64 = 0;
-        while off < size {
-            if f.seek(SeekFrom::Start(off)).is_err() {
-                return;
-            }
-            let mut head = [0u8; 9];
-            if f.read_exact(&mut head).is_err() {
-                return;
-            }
-            let btype = head[0];
-            let blen = u64::from_be_bytes(head[1..9].try_into().unwrap_or([0; 8]));
-            if blen == 0 || off + 1 + blen > size {
-                return; // malformed chain: leave everything alone
-            }
-            let end = off + 1 + blen;
-            if VC_TYPES.contains(&btype) {
-                // Trailer is (uncompressed_len, compressed_len, item_count).
-                let mut tr = [0u8; 24];
-                if f.seek(SeekFrom::Start(end - 24)).is_ok() && f.read_exact(&mut tr).is_ok() {
-                    let unc = u64::from_be_bytes(tr[0..8].try_into().unwrap_or([0; 8]));
-                    let comp = u64::from_be_bytes(tr[8..16].try_into().unwrap_or([0; 8]));
-                    if unc == comp && comp >= 2 && comp <= blen {
-                        let start = end - 24 - comp;
-                        let mut payload = vec![0u8; comp as usize];
-                        if f.seek(SeekFrom::Start(start)).is_ok()
-                            && f.read_exact(&mut payload).is_ok()
-                            && ZLIB_MAGIC.iter().any(|m| payload[..2] == *m)
-                        {
-                            if let Ok(raw) = miniz_oxide::inflate::decompress_to_vec_zlib(&payload)
-                            {
-                                if raw.len() as u64 == comp {
-                                    // The break-even case itself: the lengths are
-                                    // LEGITIMATELY equal, so correcting a length
-                                    // would change nothing. Store what should have
-                                    // been stored. Same byte count, so no offset in
-                                    // the file moves.
-                                    let _ = f
-                                        .seek(SeekFrom::Start(start))
-                                        .and_then(|_| f.write_all(&raw));
-                                } else {
-                                    // They only looked equal; recording the true
-                                    // uncompressed length makes the reader inflate.
-                                    let _ = f.seek(SeekFrom::Start(end - 24)).and_then(|_| {
-                                        f.write_all(&(raw.len() as u64).to_be_bytes())
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            off = end;
-        }
-        let _ = f.flush();
     }
 
     /// Declared element width of an associative array, when the elaborator
@@ -141922,12 +141892,7 @@ impl Simulator {
         for _trial in 0..trials {
             // Ctrl-C / SIGTERM: stop searching and let the run shut down.
             if interrupt_requested() {
-                acknowledge_interrupt();
-                eprintln!(
-                    "[xezim] interrupted at time {} — finalizing waveform dumps",
-                    self.time
-                );
-                self.finished = true;
+                self.take_interrupt();
                 break;
             }
             if !self.take_randomize_budget(handle, &class_name, &constraints) {
@@ -154610,62 +154575,6 @@ fn vpi_radix_string(v: &Value, bits_per_digit: usize) -> String {
         s.push('0');
     }
     s
-}
-
-/// Set by the SIGINT/SIGTERM handler; polled by the event loop so an
-/// interrupted run still finalizes its waveform dumps.
-static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// The signal that set `INTERRUPTED`, for the SIGALRM backstop to re-raise.
-static INTERRUPT_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-/// Seconds an interrupt may go unnoticed before the process is ended anyway.
-const INTERRUPT_GRACE_SECS: libc::c_uint = 5;
-
-/// Signal handler. Does the minimum that is async-signal-safe: set a flag. A
-/// second signal restores the default action and re-raises, so the user can
-/// always force the issue. The first one also arms an alarm: a run stuck in
-/// a loop that never polls the flag (`timeout` sends a single SIGTERM) still
-/// ends, through `handle_interrupt_alarm`, unless the event loop takes the
-/// interrupt in time and disarms it (`acknowledge_interrupt`).
-extern "C" fn handle_interrupt(sig: libc::c_int) {
-    if INTERRUPTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        unsafe {
-            libc::signal(sig, libc::SIG_DFL);
-            libc::raise(sig);
-        }
-    } else {
-        INTERRUPT_SIGNAL.store(sig, std::sync::atomic::Ordering::Relaxed);
-        unsafe {
-            libc::alarm(INTERRUPT_GRACE_SECS);
-        }
-    }
-}
-
-/// SIGALRM after an unanswered interrupt: end the process by the original
-/// signal's default action.
-extern "C" fn handle_interrupt_alarm(_sig: libc::c_int) {
-    let sig = INTERRUPT_SIGNAL.load(std::sync::atomic::Ordering::Relaxed);
-    if sig != 0 {
-        unsafe {
-            libc::signal(sig, libc::SIG_DFL);
-            libc::raise(sig);
-        }
-    }
-}
-
-/// Whether Ctrl-C / SIGTERM asked the run to stop. Long loops outside the
-/// event loop (constraint solving) poll this to give up early.
-pub(crate) fn interrupt_requested() -> bool {
-    INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// The event loop has taken the interrupt and is shutting down normally:
-/// cancel the backstop so finalizing the dumps is not cut short.
-fn acknowledge_interrupt() {
-    unsafe {
-        libc::alarm(0);
-    }
 }
 
 /// Thread-local pointer to the current simulator instance.

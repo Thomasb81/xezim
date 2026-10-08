@@ -659,6 +659,15 @@ impl Simulator {
                         pc = *t as usize;
                         continue;
                     }
+                    // This executor has no bail path; stop the run here.
+                    TsInsn::JmpPoll { t } => {
+                        if loop_stop_requested() {
+                            self.take_interrupt();
+                            return true;
+                        }
+                        pc = *t as usize;
+                        continue;
+                    }
                     TsInsn::CaseJmp { s, cj } => {
                         pc = if x!(*s) != 0 {
                             cj.default as usize
@@ -886,6 +895,13 @@ impl Simulator {
                     // never aborts.
                     TsInsn::SaveSig { .. } | TsInsn::SaveSigW { .. } => {}
                     TsInsn::CovHit(c) => self.ts_cov_hit(*c),
+                    // This executor has no bail path; stop the run here.
+                    TsInsn::LoopPoll => {
+                        if loop_stop_requested() {
+                            self.take_interrupt();
+                            return true;
+                        }
+                    }
                     TsInsn::Fallback(..)
                     | TsInsn::WaitEdge { .. }
                     | TsInsn::WaitDelayRaw { .. }

@@ -20623,6 +20623,16 @@ pub enum TsInsn {
     Jmp {
         t: u32,
     },
+    /// A backward `Jmp` (a loop back-edge; rewritten once the stream is
+    /// final): Ctrl-C bails the block to the four-state VM, whose back-edge
+    /// poll stops the run. A long loop inside one time slot never reaches the
+    /// event loop's own poll. A separate instruction rather than a test in
+    /// `Jmp`, so forward jumps pay nothing.
+    JmpPoll {
+        t: u32,
+    },
+    /// Ahead of a do-while back-edge (`BrNz`), same purpose as `JmpPoll`.
+    LoopPoll,
     /// Jump-table dispatch (§12.5 `case`). Two-state registers are X-free by
     /// the eval-site prefilter, so the 4-state arm's "any x/z bit matches no
     /// pattern -> default" branch cannot arise and this reduces to a bounds-
@@ -21316,6 +21326,8 @@ pub fn ts_read_masks(insns: &[TsInsn], widths: &[u32]) -> Option<(Vec<(u32, u64)
             | TsInsn::BrFalse { .. }
             | TsInsn::BrNz { .. }
             | TsInsn::Jmp { .. }
+            | TsInsn::JmpPoll { .. }
+            | TsInsn::LoopPoll
             | TsInsn::CaseJmp { .. }
             | TsInsn::CaseMaskJmp { .. }
             | TsInsn::RedOr { .. }
@@ -23397,6 +23409,10 @@ pub fn lower_two_state(
             }
             Insn::BranchUnlessZero(s, t) => {
                 narrow_reg!(rw, *s, "wide branch condition");
+                // do-while back-edge: see `TsInsn::LoopPoll`.
+                if (*t as usize) <= ins_i {
+                    out.push(TsInsn::LoopPoll);
+                }
                 out.push(TsInsn::BrNz {
                     s: *s as u16,
                     t: *t,
@@ -24554,6 +24570,15 @@ pub fn lower_two_state(
         // Fusion re-indexes the stream; a wait-bearing stream keeps its
         // four-state index map exact instead.
         fuse_ts_pairs(&mut out);
+    }
+    // Loop back-edges poll Ctrl-C (see `TsInsn::JmpPoll`). In place, so no
+    // index moves; nothing after this point re-reads branch targets.
+    for (i, insn) in out.iter_mut().enumerate() {
+        if let TsInsn::Jmp { t } = *insn {
+            if (t as usize) <= i {
+                *insn = TsInsn::JmpPoll { t };
+            }
+        }
     }
     if track && std::env::var_os("XEZIM_TS_DUMP").is_some() {
         eprintln!("[TS-DUMP] {} insns:", out.len());
