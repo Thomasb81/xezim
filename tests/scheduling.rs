@@ -72,6 +72,8 @@ mod condition_waiter_name_gate;
 mod dead_clock_watchdog;
 #[path = "scheduling/decl_init_time_literal_scaling.rs"]
 mod decl_init_time_literal_scaling;
+#[path = "scheduling/assertion_control.rs"]
+mod assertion_control;
 #[path = "scheduling/deferred_immediate_assertions.rs"]
 mod deferred_immediate_assertions;
 #[path = "scheduling/delay_lands_on_clock_edge.rs"]

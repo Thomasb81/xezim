@@ -421,7 +421,6 @@ fn c16_3_always_comb_assert_not_rerun() {
 // §16.3: immediate and deferred assertions
 #[test]
 fn c16_3_immediate_assertions() {
-    // Known gap (§20.12): `20.12`: xezim prints extra `BAD s5 not off`
     check(
         "c16_imm",
         include_str!("sv/c16_imm.sv"),
@@ -440,7 +439,7 @@ fn c16_3_immediate_assertions() {
             "T|20.12|s5b fires",
             "T|16.4|final pass a=9 t=4",
         ],
-        &["T|20.12|BAD s5 not off"],
+        &[],
     );
 }
 

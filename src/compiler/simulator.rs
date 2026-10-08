@@ -2254,6 +2254,7 @@ impl NbaFastIndex {
     }
 }
 
+mod assert_ctl;
 mod code_cov;
 mod dpi_task;
 mod event_bits;
@@ -2272,6 +2273,7 @@ mod uvm_dpi;
 mod vpi_api;
 mod vpi_cb;
 mod vpi_model;
+use assert_ctl::{AssertCtl, CtlIdent, CtlSite};
 pub(crate) use code_cov::{
     COND_FN as COV_COND_FN, HIT_TASK as COV_HIT_TASK, marker_id as cov_marker_id,
 };
@@ -3098,6 +3100,8 @@ struct DeferredReport {
     comb_scope: Option<String>,
     this_handle: Option<usize>,
     class_context: Option<String>,
+    /// §20.12: what an assertion control selects the assertion by.
+    ctl: CtlIdent,
 }
 
 /// LRM §4.4 / §16 observed-region probe entry. A concurrent property's
@@ -3206,6 +3210,8 @@ struct SvaClockedSite {
     /// The full path of the scope the assertion executes in, which selects
     /// the `default disable iff` that governs it.
     disable_scope: String,
+    /// §20.12: the site's identity for assertion control, and its state.
+    ctl: CtlSite,
 }
 
 /// A sequence (§16.9) as parsed, before it is turned into an automaton.
@@ -5856,6 +5862,10 @@ pub struct Simulator {
     pending_observed: Vec<ObservedProbe>,
     /// §16.4 deferred immediate assertion reports awaiting maturity.
     deferred_asserts: Vec<DeferredReport>,
+    /// §20.12: an assertion control is in force (the control log is not
+    /// empty); every assertion path tests only this until then.
+    assert_ctl_on: bool,
+    assert_ctl: Option<Box<AssertCtl>>,
     /// `typedef_layout_member`'s unpacked-struct typedef layouts by total
     /// width; dropped when a block-local typedef is registered.
     typedef_layouts_by_width: Option<HashMap<u32, Vec<Vec<(String, u32, u32, bool)>>>>,
@@ -11626,6 +11636,8 @@ impl Simulator {
             pending_strobes: Vec::new(),
             pending_observed: Vec::new(),
             deferred_asserts: Vec::new(),
+            assert_ctl_on: false,
+            assert_ctl: None,
             typedef_layouts_by_width: None,
             class_prop_dim_cache: std::cell::RefCell::new(HashMap::default()),
             sva_sites: Vec::new(),
@@ -82491,7 +82503,10 @@ impl Simulator {
                 // SV-2023: under unique/unique0/priority, pre-pass the items
                 // and emit a violation message if multiple match or (for
                 // unique/priority) none match without a default.
-                if sv_parser::is_sv2023() && unique_priority.is_some() {
+                if sv_parser::is_sv2023()
+                    && unique_priority.is_some()
+                    && self.unique_check_enabled(unique_priority.as_ref())
+                {
                     let mut match_count = 0usize;
                     let mut has_default = false;
                     for item in items.iter() {
@@ -83857,6 +83872,16 @@ impl Simulator {
                     });
                     return;
                 }
+                // §20.12: an assertion that is off is not evaluated.
+                let ctl = if self.assert_ctl_on {
+                    let st = self.assert_ctl_state(&self.imm_assert_ident(a));
+                    if !st.enabled() {
+                        return;
+                    }
+                    st
+                } else {
+                    Default::default()
+                };
                 let true_branch = self.eval_expr(&a.expr).is_true();
                 if let Some(kind) = a.deferred {
                     self.queue_deferred_assert(a, kind, true_branch);
@@ -83884,7 +83909,8 @@ impl Simulator {
                     entry.fail_count += 1;
                 }
                 if !true_branch {
-                    if let Some(ea) = &a.else_action {
+                    if !ctl.fail_action() {
+                    } else if let Some(ea) = &a.else_action {
                         self.exec_statement(ea);
                     } else if kind_tag != 2 {
                         // §16.3: with no `else` clause a failure calls
@@ -83892,7 +83918,9 @@ impl Simulator {
                         self.emit_severity_text("Error", ASSERT_DEFAULT_ERROR);
                     }
                 } else if let Some(ac) = &a.action {
-                    self.exec_statement(ac);
+                    if ctl.pass_action(false) {
+                        self.exec_statement(ac);
+                    }
                 }
             }
             StatementKind::ProceduralContinuous(pc) => match pc {
@@ -86305,6 +86333,7 @@ impl Simulator {
             // a specific reason; NOT silently ignored, NOT the generic
             // unknown-task diagnostic). Wording avoids the word "err\u{6f}r"
             // so log-grepping harnesses don't reclassify a passing run.
+            // §20.11/§20.12 assertion control.
             "$asserton"
             | "$assertoff"
             | "$assertkill"
@@ -86315,11 +86344,7 @@ impl Simulator {
             | "$assertfailoff"
             | "$assertnonvacuouson"
             | "$assertvacuousoff" => {
-                let msg = format!(
-                    "Warning: {} ignored — assertion control is not modeled",
-                    name
-                );
-                self.warn_system_task_once(name, &msg);
+                self.exec_assert_control(name, args);
             }
             "$save" | "$restart" | "$incsave" => {
                 let msg = format!("Warning: {} ignored — checkpointing is not supported", name);
@@ -89327,6 +89352,16 @@ impl Simulator {
         let action_pid = self.next_pid;
         self.next_pid += 1;
         self.process_scope_hint.insert(action_pid, scope.clone());
+        let ctl = CtlSite::new(CtlIdent {
+            scope: self.instance_relative_scope(&self.m_path()),
+            label: a.label.as_ref().map(|l| l.name.clone()),
+            atype: assert_ctl::AT_CONCURRENT,
+            dtype: [
+                assert_ctl::DT_ASSERT,
+                assert_ctl::DT_ASSUME,
+                assert_ctl::DT_COVER,
+            ][kind as usize],
+        });
         let src = self.scope_src_file(Some(scope.as_str()));
         // A procedural assertion registers while its procedure runs, which
         // for an edge-triggered procedure is at the tick that starts its
@@ -89375,6 +89410,7 @@ impl Simulator {
             matured: Vec::new(),
             explicit_disable,
             disable_scope,
+            ctl,
         });
     }
 
@@ -89402,6 +89438,17 @@ impl Simulator {
     }
 
     fn fire_sva_action(&mut self, site_idx: usize, passed: bool) {
+        // §20.12 PassOff/FailOff, decided when the attempt finishes.
+        if self.assert_ctl_on {
+            let st = self.sva_site_ctl(site_idx);
+            if !(if passed {
+                st.pass_action(false)
+            } else {
+                st.fail_action()
+            }) {
+                return;
+            }
+        }
         let Some((stmt, scope, pid, m_chain)) = self.sva_sites.get(site_idx).and_then(|s| {
             let act = if passed {
                 s.pass_action.clone()
@@ -89753,12 +89800,16 @@ impl Simulator {
             }
             let saved = self.install_preponed(&sampled_ids);
             let mut attempts = std::mem::take(&mut self.sva_sites[i].attempts);
+            // §20.12 Off/Kill: no new attempt; those in flight go on.
+            let starts = !self.assert_ctl_on || self.sva_site_ctl(i).enabled();
             if self.sva_sites[i].procedural {
                 // §16.14.6: one attempt per matured instance, none otherwise.
                 for env in std::mem::take(&mut self.sva_sites[i].matured) {
-                    attempts.push(Self::sva_new_state(&node, &env));
+                    if starts {
+                        attempts.push(Self::sva_new_state(&node, &env));
+                    }
                 }
-            } else {
+            } else if starts {
                 attempts.push(Self::sva_new_state(&node, &self.sva_sites[i].lv_init));
             }
             let mut results: Vec<SvaOutcome> = Vec::new();
@@ -89811,9 +89862,13 @@ impl Simulator {
                                     fail_count: 0,
                                 });
                         stat.kind = site_kind;
-                        // §16.12.1: holds, but no pass action.
+                        // §16.12.1: holds, but no pass action unless a
+                        // §20.12 PassOn enabled it for vacuous successes.
                         if site_kind != 2 {
                             stat.pass_count += 1;
+                            if self.assert_ctl_on && self.sva_site_ctl(i).pass_action(true) {
+                                self.fire_sva_action(i, true);
+                            }
                         }
                     }
                 }
@@ -90665,6 +90720,7 @@ impl Simulator {
         if action.is_none() && default_error_scope.is_none() {
             return;
         }
+        let ctl = self.imm_assert_ident(a);
         self.deferred_asserts.push(DeferredReport {
             pid,
             kind,
@@ -90675,6 +90731,7 @@ impl Simulator {
             comb_scope,
             this_handle: self.this_stack.last().copied().flatten(),
             class_context: self.class_context_stack.last().cloned().flatten(),
+            ctl,
         });
     }
 
@@ -90743,6 +90800,17 @@ impl Simulator {
                     );
                 }
                 continue;
+            }
+            // §20.12 PassOff/FailOff as the report matures.
+            if self.assert_ctl_on {
+                let st = self.assert_ctl_state(&d.ctl);
+                if !(if d.passed {
+                    st.pass_action(false)
+                } else {
+                    st.fail_action()
+                }) {
+                    continue;
+                }
             }
             let Some(action) = d.action else {
                 if let Some(scope) = d.default_error_scope {
