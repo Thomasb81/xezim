@@ -203,6 +203,8 @@ mod nonzero_lsb_indexed_part_select;
 mod obj_assocd_event_disable_fork;
 #[path = "misc/operators_11_select_reduce.rs"]
 mod operators_11_select_reduce;
+#[path = "misc/override_timescale.rs"]
+mod override_timescale;
 #[path = "misc/package_exports.rs"]
 mod package_exports;
 #[path = "misc/package_qualified_access_in_subroutine.rs"]

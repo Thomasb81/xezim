@@ -45,6 +45,13 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   of several releases, where `XEZIM_UVM_VERSION` picks one (default: the
   newest). Without `-uvm` nothing is added.
 
+* `-override_timescale <unit>/<precision>` (also `--override-timescale`)
+  gives every design element, package and compilation unit one timescale,
+  replacing every `` `timescale `` directive, `timeunit`/`timeprecision`
+  declaration and `--module-timescale`: with `1ns/1ns` a bare `#10` is 10 ns
+  everywhere, with `1ps/1ps` 10 ps. Literals with a unit (`#3ns`) keep their
+  absolute value. It works on the command line and in `-f`/`-F` files.
+
 ### 0.11.1 — complete VPI, faster memory models, IEEE 1800 conformance fixes (October 2026)
 
 **Correctness**

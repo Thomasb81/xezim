@@ -115,6 +115,7 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `-sv_seed <n>`, `-sv_seed random` | Same as `+seed=<n>` / `+seed=random` |
 | `-sv_lib <name>`, `-sv_root <dir>` | Load `<dir>/<name>.so` as a DPI library (`--dpi-lib`) |
 | `-timescale <u>/<p>` | Default timescale for design elements without one (`--module-timescale`) |
+| `-override_timescale <u>/<p>` (also `--override-timescale`, `=` form) | One timescale for every design element, package and compilation unit: every `` `timescale `` directive, `timeunit`/`timeprecision` declaration and `--module-timescale` is ignored. Bare delays count in `<u>`; literals with a unit (`#3ns`) keep their absolute value |
 | `-l <file>`, `-logfile <file>` | xezim's `-l`: all output goes to the file, none to the terminal |
 | `-c` | xezim's args-file flag when a file (or a path) follows; otherwise the batch-mode switch, accepted |
 | `-v <file>`, `-y <dir>`, `+libext+` | Library file / directory |

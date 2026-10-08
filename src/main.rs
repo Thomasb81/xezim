@@ -246,6 +246,11 @@ fn print_usage() {
     eprintln!("  -timescale <unit>/<prec>     spelled as other simulators spell it. Same rule:");
     eprintln!("                     it is a DEFAULT for design elements with no timescale");
     eprintln!("                     directive, and never overrides an explicit one.");
+    eprintln!("  -override_timescale <unit>/<prec>  One timescale for EVERY design element,");
+    eprintln!("                     package and compilation unit: every `timescale directive,");
+    eprintln!("                     `timeunit`/`timeprecision` decl and --module-timescale is");
+    eprintln!("                     ignored (e.g. 1ns/1ns, 1ps/1ps). Unit-suffixed literals");
+    eprintln!("                     such as #3ns keep their absolute value.");
     eprintln!("  --report-stats[=json]  Print an end-of-run statistics footer on stderr");
     eprintln!("                   (human text; '=json' emits one JSON line instead). Off by");
     eprintln!("                   default. XEZIM_REPORT_STATS=1|json enables it too; the");
@@ -472,9 +477,35 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     Ok(rounded as u64)
 }
 
+/// Marks an `-override_timescale` value inside the `--module-timescale`
+/// argument list (a module name cannot start with `+`).
+const OVERRIDE_TIMESCALE_TAG: &str = "+force+";
+
+/// The `<unit>/<prec>` value of an `-override_timescale` spelling at `t`
+/// (`-override_timescale`, `--override_timescale`, `-override-timescale`,
+/// `--override-timescale`, each with a following value or `=value`), as
+/// `Some(Some(value))`; `Some(None)` when the value is the next token; `None`
+/// when `t` is not one of these spellings.
+fn override_timescale_flag(t: &str) -> Option<Option<&str>> {
+    let body = t.strip_prefix("--").or_else(|| t.strip_prefix('-'))?;
+    let (name, value) = match body.split_once('=') {
+        Some((n, v)) => (n, Some(v)),
+        None => (body, None),
+    };
+    matches!(name, "override_timescale" | "override-timescale").then_some(value)
+}
+
 fn build_module_timescale_cli(raw: &[String]) -> Result<xezim::ModuleTimescaleCli, String> {
     let mut cli = xezim::ModuleTimescaleCli::default();
     for spec in raw {
+        // `-override_timescale`: the last one given wins.
+        if let Some(v) = spec.strip_prefix(OVERRIDE_TIMESCALE_TAG) {
+            cli.force = Some(
+                parse_timescale_value(v)
+                    .map_err(|e| e.replace("--module-timescale", "-override_timescale"))?,
+            );
+            continue;
+        }
         let (modules, value) = match spec.split_once('=') {
             Some((m, v)) => (Some(m), v),
             None => (None, spec.as_str()),
@@ -960,6 +991,20 @@ fn process_command_file(
                 _ if t.starts_with("--timescale=") => {
                     module_timescale_args.push(t["--timescale=".len()..].to_string());
                 }
+                // `-override_timescale <unit>/<prec>`: one timescale for every
+                // design element, replacing all source-level timescales.
+                _ if override_timescale_flag(t).is_some() => match override_timescale_flag(t) {
+                    Some(Some(v)) => {
+                        module_timescale_args.push(format!("{}{}", OVERRIDE_TIMESCALE_TAG, v))
+                    }
+                    _ => {
+                        if i + 1 < toks.len() {
+                            i += 1;
+                            module_timescale_args
+                                .push(format!("{}{}", OVERRIDE_TIMESCALE_TAG, toks[i]));
+                        }
+                    }
+                },
                 // commercial-simulator-compatible seed aliases: `-svseed <n>` / `-svseed=<n>`
                 // (and `-seed` likewise) lower onto the `+seed=` plusarg the
                 // simulator already consumes.
@@ -1814,6 +1859,25 @@ fn run_main() -> i32 {
             _ if arg.starts_with("-D") && arg.len() > 2 => {
                 push_define_token(&arg[2..], &mut defines);
             }
+            // `-override_timescale <unit>/<prec>` (ahead of the `-o<file>` prefix
+            // form, which would take it): one timescale for every
+            // design element, replacing every `timescale directive and
+            // `timeunit`/`timeprecision` declaration.
+            _ if override_timescale_flag(arg).is_some() => match override_timescale_flag(arg) {
+                Some(Some(v)) => {
+                    module_timescale_args.push(format!("{}{}", OVERRIDE_TIMESCALE_TAG, v))
+                }
+                _ => {
+                    i += 1;
+                    if i < args.len() {
+                        module_timescale_args
+                            .push(format!("{}{}", OVERRIDE_TIMESCALE_TAG, args[i]));
+                    } else {
+                        eprintln!("Error: -override_timescale requires <unit>/<precision>");
+                        std::process::exit(1);
+                    }
+                }
+            },
             "-o" => {
                 i += 1;
                 if i < args.len() {
