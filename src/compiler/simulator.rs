@@ -131321,6 +131321,34 @@ impl Simulator {
         }
     }
 
+    /// Stage an OUTPUT associative formal's element data onto a fresh temp
+    /// key, so the writeback can run AFTER the caller's shadowed storage is
+    /// restored. The formal's own per-call key (`@p#0`) is torn down by
+    /// `pop_and_restore_queue_frame`; staging it here (before that restore)
+    /// keeps the data alive for `writeback_assoc_param` to copy afterwards.
+    /// Returns the temp key.
+    fn stage_assoc_formal(&mut self, param: &str) -> String {
+        let id = self.next_dyn_id;
+        self.next_dyn_id += 1;
+        let tmp = format!("@wb#{}", id);
+        let pre = format!("{}[", param);
+        let moved: Vec<(String, Value)> = self
+            .signals
+            .keys_with_elem_prefix(&pre)
+            .into_iter()
+            .filter(|k| k.ends_with(']'))
+            .filter_map(|k| {
+                let v = self.signals.get(&k)?.clone();
+                let nk = format!("{}{}", tmp, &k[param.len()..]);
+                Some((nk, v))
+            })
+            .collect();
+        for (k, v) in moved {
+            self.signals.insert(k, v);
+        }
+        tmp
+    }
+
     /// Copy a `ref`/`output`/`inout` associative formal back onto the caller's
     /// array, replacing its contents.
     fn writeback_assoc_param(&mut self, param: &str, caller: &str) {
@@ -132758,29 +132786,12 @@ impl Simulator {
             }
             result.is_signed = super::elaborate::is_type_signed(&fd.return_type);
         }
-        // Array formals copy element-wise; scalars go through `output_bindings`.
-        for (param, caller, is_out, prior) in std::mem::take(&mut assoc_params) {
-            if param == caller {
-                // Formal aliases the caller's namespace; the body's writes
-                // already live there. Copying back would duplicate, and
-                // purging would delete the caller's data. Restore the prior
-                // registration (a nested same-name formal must not leave the
-                // flat `module.associative_arrays` entry wrong).
-                match prior {
-                    Some(v) => {
-                        self.module.associative_arrays.insert(param.clone(), v);
-                    }
-                    None => {
-                        self.module.associative_arrays.remove(&param);
-                    }
-                }
-                continue;
-            }
-            if is_out {
-                self.writeback_assoc_param(&param, &caller);
-            }
-            self.purge_assoc_param(&param, prior);
-        }
+        // Assoc / fixed-array formals copy element-wise, but the copy is
+        // applied only after the caller's shadowed storage is restored
+        // below — a callee local with the same bare name as the caller's
+        // actual would otherwise let the restore wipe the output writeback.
+        let assoc_params = std::mem::take(&mut assoc_params);
+        let array_writebacks = std::mem::take(&mut array_writebacks);
         // Capture the callee's queue formals now; the caller's shadowed
         // storage is restored below, and only then is the writeback
         // applied — see `stage_queue_param`.
@@ -132792,21 +132803,21 @@ impl Simulator {
             let tmp = self.stage_queue_param(param);
             staged_wb.push((tmp, caller.clone()));
         }
-        self.writeback_array_args(&array_writebacks);
-        for (param, caller, ..) in &array_writebacks {
-            // An IDENTITY binding (formal named like the caller's actual —
-            // `task bump(ref int arr[3]); ... bump(arr)`) shares the
-            // caller's storage: purging the formal's keys deleted the
-            // caller's whole array (audit46 a10 — post-call all-x).
+        // An assoc formal's per-call key (`@p#0`) is itself torn down by the
+        // restore below, so its element data is staged onto a temp key while
+        // the storage is still live (mirroring ``stage_queue_param``); fixed-
+        // array formals keep bare keys that survive, so their writeback reads
+        // ``param`` directly after the restore.
+        let mut assoc_wb: Vec<(String, String, Option<bool>)> = Vec::new();
+        for (param, caller, is_out, prior) in &assoc_params {
             if param == caller {
                 continue;
             }
-            let prefix = format!("{}[", param);
-            let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
-            for k in keys {
-                self.signals.remove(&k);
+            if !is_out {
+                continue;
             }
-            self.purge_array_formal(param);
+            let tmp = self.stage_assoc_formal(param);
+            assoc_wb.push((tmp, caller.clone(), *prior));
         }
         // Copy `output`/`inout`/`ref` formals back to the caller's actuals
         // before popping this frame's locals.
@@ -132856,6 +132867,61 @@ impl Simulator {
         self.continue_flag = saved_continue;
         self.return_flag = saved_return;
         self.pop_and_restore_queue_frame();
+        // The caller's shadowed storage is restored above — only now can we
+        // write back assoc formals (from the staged temp key) and fixed-array
+        // formals (from the surviving bare keys), then purge each formal
+        // registration. See the deferred-capture block before the pop.
+        for (tmp, caller, _prior) in assoc_wb {
+            self.writeback_assoc_param(&tmp, &caller);
+            // A callee local shadowing the caller's actual removed the
+            // caller's flat `module.associative_arrays` registration at its
+            // declaration; the queue-frame restore does not put it back.
+            // Re-register so a later `A["x"]` read resolves the writeback.
+            if !self.module.associative_arrays.contains_key(&caller) {
+                self.module.associative_arrays.insert(caller.clone(), true);
+            }
+            // Drop the staged temp-plus elements.
+            let tprefix = format!("{}[", tmp);
+            let keys: Vec<String> = self.signals.keys_with_elem_prefix(&tprefix);
+            for k in keys {
+                self.signals.remove(&k);
+            }
+            self.signals.remove(&format!("{}.size", tmp));
+        }
+        for (param, caller, _is_out, prior) in assoc_params {
+            if param == caller {
+                // Formal aliases the caller's namespace; the body's writes
+                // already live there. Restore the prior registration (a
+                // nested same-name formal must not leave the flat
+                // `module.associative_arrays` entry wrong).
+                match prior {
+                    Some(v) => {
+                        self.module.associative_arrays.insert(param.clone(), v);
+                    }
+                    None => {
+                        self.module.associative_arrays.remove(&param);
+                    }
+                }
+                continue;
+            }
+            self.purge_assoc_param(&param, prior);
+        }
+        self.writeback_array_args(&array_writebacks);
+        for (param, caller, ..) in &array_writebacks {
+            // An IDENTITY binding (formal named like the caller's actual —
+            // `task bump(ref int arr[3]); ... bump(arr)`) shares the
+            // caller's storage: purging the formal's keys deleted the
+            // caller's whole array (audit46 a10 — post-call all-x).
+            if param == caller {
+                continue;
+            }
+            let prefix = format!("{}[", param);
+            let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
+            for k in keys {
+                self.signals.remove(&k);
+            }
+            self.purge_array_formal(param);
+        }
         for (tmp, caller) in staged_wb {
             self.writeback_queue_param(&tmp, &caller);
             self.drop_staged_queue(&tmp);
@@ -132908,7 +132974,7 @@ impl Simulator {
     /// Replay the deferred teardown of an inlined (or synchronous) task call:
     /// the work that `exec_task_call` runs after the body. Mirrors the original
     /// inline cleanup exactly.
-    fn unwind_task_frame(&mut self, c: TaskCleanup) {
+    fn unwind_task_frame(&mut self, mut c: TaskCleanup) {
         if c.frame_scope_hint.is_some() {
             *self.name_resolve_hint.borrow_mut() = c.prev_hint.clone();
         }
@@ -132948,16 +133014,53 @@ impl Simulator {
             let tmp = self.stage_queue_param(param);
             staged_wb.push((tmp, caller.clone()));
         }
+        // Assoc / fixed-array formals copy element-wise, but the copy must be
+        // APPLIED only after the caller's shadowed storage is restored below:
+        // if the callee declares a local with the same bare name as the
+        // caller's actual, the restore (`pop_and_restore_queue_frame`) wipes
+        // the caller's bare-name elements — destroying an output/inout/ref
+        // writeback done now. Mirror the function path (and the queue staging
+        // above). An assoc formal's per-call key is torn down by the restore,
+        // so its element data is staged onto a temp key; fixed-array formals
+        // keep bare keys that survive.
+        let assoc_params = std::mem::take(&mut c.assoc_params);
         let wb = c.array_writebacks.clone();
-        self.writeback_array_args(&wb);
-        for (param_name, caller_name, is_out) in &c.assoc_params.clone() {
-            // §13.5.2: an out/inout/ref ASSOCIATIVE-array formal copies back,
-            // exactly as the function path does. The task path only ever
-            // purged the formal's entries, so `task set(ref int a[string])`
-            // left the caller's array empty.
+        let array_params = std::mem::take(&mut c.array_params);
+        let mut assoc_wb: Vec<(String, String)> = Vec::new();
+        for (param_name, caller_name, is_out) in &assoc_params {
             if *is_out && param_name != caller_name {
-                self.writeback_assoc_param(param_name, caller_name);
+                let tmp = self.stage_assoc_formal(param_name);
+                assoc_wb.push((tmp, caller_name.clone()));
             }
+        }
+        let identity_params: std::collections::HashSet<&String> = wb
+            .iter()
+            .filter(|(p, c2, ..)| p == c2)
+            .map(|(p, ..)| p)
+            .collect();
+        self.break_flag = c.saved_break || self.dpi_unwinding;
+        self.return_flag = c.saved_return || self.dpi_unwinding;
+        self.pop_and_restore_queue_frame();
+        // The caller's shadowed storage is restored above — now apply the
+        // deferred assoc (from staged temp keys) and fixed-array writebacks,
+        // then purge each formal.
+        for (tmp, caller_name) in assoc_wb {
+            self.writeback_assoc_param(&tmp, &caller_name);
+            if !self.module.associative_arrays.contains_key(&caller_name) {
+                self.module.associative_arrays.insert(caller_name.clone(), true);
+            }
+            let tprefix = format!("{}[", tmp);
+            let tkeys: Vec<String> = self.signals.keys_with_elem_prefix(&tprefix);
+            for k in tkeys {
+                self.signals.remove(&k);
+            }
+            self.signals.remove(&format!("{}.size", tmp));
+        }
+        for (param_name, caller_name, _is_out) in assoc_params {
+            // `is_out` element copy already applied from the staged temp key
+            // above — the formal's per-call key is gone by now, so calling
+            // ``writeback_assoc_param`` again would wipe the restored
+            // caller's data. Purge the formal's entries/registration alone.
             if param_name == caller_name {
                 continue; // identity binding — the keys ARE the caller's
             }
@@ -132966,14 +133069,10 @@ impl Simulator {
             for k in keys {
                 self.signals.remove(&k);
             }
-            self.module.associative_arrays.remove(param_name);
+            self.module.associative_arrays.remove(&param_name);
         }
-        let identity_params: std::collections::HashSet<&String> = wb
-            .iter()
-            .filter(|(p, c2, ..)| p == c2)
-            .map(|(p, ..)| p)
-            .collect();
-        for param_name in &c.array_params {
+        self.writeback_array_args(&wb);
+        for param_name in &array_params {
             // Identity-bound formals share the caller's storage — see the
             // function-path twin above (audit46 a10).
             if identity_params.contains(param_name) {
@@ -132986,9 +133085,6 @@ impl Simulator {
             }
             self.purge_array_formal(param_name);
         }
-        self.break_flag = c.saved_break || self.dpi_unwinding;
-        self.return_flag = c.saved_return || self.dpi_unwinding;
-        self.pop_and_restore_queue_frame();
         for (tmp, caller) in staged_wb {
             self.writeback_queue_param(&tmp, &caller);
             self.drop_staged_queue(&tmp);
@@ -150837,14 +150933,49 @@ impl Simulator {
                     .collect();
                 self.pop_local_frame();
                 self.this_stack.pop();
-                // §13.5.2: copy `output`/`inout`/`ref` associative-array
-                // formals back onto the caller's AA (signal-namespace merge)
-                // BEFORE `pop_and_restore_queue_frame` — that unwind deletes
-                // every element signal under the formal's dyn key (`@o#N[..]`
-                // is registered in the callee's queue frame), so a writeback
-                // after it copied nothing and `output edges_t o` left the
-                // caller's array empty (UVM `get_predecessors_for_successors`).
-                for (param, caller, is_out, prior) in std::mem::take(&mut assoc_params) {
+                // Capture the callee's formals, restore the caller's
+                // shadowed storage, then apply — see `stage_queue_param`.
+                let mut staged_wb: Vec<(String, String)> = Vec::new();
+                for (param, caller) in &queue_writebacks {
+                    if caller.is_empty() || param == caller {
+                        continue;
+                    }
+                    let tmp = self.stage_queue_param(param);
+                    staged_wb.push((tmp, caller.clone()));
+                }
+                // An assoc OUTPUT formal's per-call key is torn down by the
+                // restore below, so stage its element data onto a temp key
+                // now; the writeback applies after the restore (the caller's
+                // shadowed storage is then put back — doing the copy now
+                // would let a same-name callee local wipe it).
+                let assoc_params = std::mem::take(&mut assoc_params);
+                let mut assoc_wb: Vec<(String, String, Option<bool>)> = Vec::new();
+                for (param, caller, is_out, prior) in &assoc_params {
+                    if *is_out && param != caller {
+                        let tmp = self.stage_assoc_formal(param);
+                        assoc_wb.push((tmp, caller.clone(), *prior));
+                    }
+                }
+                self.pop_and_restore_queue_frame();
+                for (tmp, caller) in staged_wb {
+                    self.writeback_queue_param(&tmp, &caller);
+                    self.drop_staged_queue(&tmp);
+                }
+                // The caller's shadowed storage is now restored — apply the
+                // deferred assoc writebacks (from staged temp keys).
+                for (tmp, caller, _prior) in assoc_wb {
+                    self.writeback_assoc_param(&tmp, &caller);
+                    if !self.module.associative_arrays.contains_key(&caller) {
+                        self.module.associative_arrays.insert(caller.clone(), true);
+                    }
+                    let tprefix = format!("{}[", tmp);
+                    let tkeys: Vec<String> = self.signals.keys_with_elem_prefix(&tprefix);
+                    for k in tkeys {
+                        self.signals.remove(&k);
+                    }
+                    self.signals.remove(&format!("{}.size", tmp));
+                }
+                for (param, caller, _is_out, prior) in assoc_params {
                     if param == caller {
                         // Identity binding — the body's writes landed directly
                         // in the caller's namespace; just restore the prior
@@ -150861,25 +150992,11 @@ impl Simulator {
                         }
                         continue;
                     }
-                    if is_out {
-                        self.writeback_assoc_param(&param, &caller);
-                    }
+                    // `is_out` element copy already applied from the staged
+                    // temp key above — the formal's per-call key is gone now,
+                    // so calling ``writeback_assoc_param`` would wipe the
+                    // restored caller's data. Purge alone.
                     self.purge_assoc_param(&param, prior);
-                }
-                // Capture the callee's formals, restore the caller's
-                // shadowed storage, then apply — see `stage_queue_param`.
-                let mut staged_wb: Vec<(String, String)> = Vec::new();
-                for (param, caller) in &queue_writebacks {
-                    if caller.is_empty() || param == caller {
-                        continue;
-                    }
-                    let tmp = self.stage_queue_param(param);
-                    staged_wb.push((tmp, caller.clone()));
-                }
-                self.pop_and_restore_queue_frame();
-                for (tmp, caller) in staged_wb {
-                    self.writeback_queue_param(&tmp, &caller);
-                    self.drop_staged_queue(&tmp);
                 }
                 // §13.5.2: copy `output`/`inout`/`ref` fixed-array formals
                 // back onto the caller's array (a plain `input` formal is
