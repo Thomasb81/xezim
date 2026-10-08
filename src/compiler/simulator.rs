@@ -45400,13 +45400,17 @@ impl Simulator {
                         still_parked.push((cpid, cont));
                         continue;
                     }
-                } else if from_repass
-                    && self.cond_repass_recheck.get(&cpid) == Some(&self.time)
-                {
+                } else if from_repass && self.cond_repass_recheck.get(&cpid) == Some(&self.time) {
                     still_parked.push((cpid, cont));
                     continue;
                 }
                 if from_repass {
+                    // Entries only matter for the current time slot; drop
+                    // older ones so the map stays bounded.
+                    if self.cond_repass_recheck.len() > 4096 {
+                        let now = self.time;
+                        self.cond_repass_recheck.retain(|_, t| *t == now);
+                    }
                     self.cond_repass_recheck.insert(cpid, self.time);
                 }
                 self.cond_waiter_gate.remove(&cpid);
@@ -88266,38 +88270,21 @@ impl Simulator {
             return;
         }
         // IEEE 1800-2017 §4.4.2/§4.5: the NBA region runs only after ALL
-        // active-region work of this time slot has settled. A `fork ...
-        // join_none` child whose continuation is still queued at the
-        // current time (scheduled, not yet started — the parent parked on
-        // `@(nba)` immediately after forking) must get its first slice
-        // BEFORE processes parked on `uvm_wait_for_nba_region` resume, or
-        // the resuming parent observes pre-child state. Reference-verified
-        // shape: UVM `execute_phase` forks `master_phase_process`
-        // (traverse -> phase task -> `raise_objection`), then parks on
-        // `uvm_wait_for_nba_region`; the NBA-region resume that follows
-        // checks `phase_done.get_objection_total(top)` and with the child
-        // un-run saw 0, skipped the ALL_DROPPED wait and ran the
-        // READY_TO_END traverse one iteration early.
-        // Bounded: children forked by the drained entries join the queue
-        // and run too; a genuine loop self-limits via the scheduler's own
-        // parking.
-        let mut drain_guard = 0u32;
-        while self.event_queue.next_time() == Some(self.time)
-            && !self.finished
-            && !self.zero_delay_defer_pending
-        {
-            let Some((bpid, stmts)) = self.event_queue.pop_front(self.time) else {
-                break;
-            };
-            self.late_resume_epoch += 1;
-            self.run_scheduled_process(bpid, &stmts);
-            if !self.is_pid_suspended(bpid) {
-                self.child_finished(bpid);
-            }
-            drain_guard += 1;
-            if drain_guard > 100_000 {
-                break;
-            }
+        // active and inactive work of this time slot has settled. A `fork ...
+        // join_none` child still queued at the current time (scheduled, not
+        // yet started: the parent parked on `@(nba)` right after forking)
+        // must get its first slice, its `#0` continuations and its own NBA
+        // commits BEFORE processes parked on `uvm_wait_for_nba_region`
+        // resume. Running that queued work inline here would skip the
+        // Inactive region and the NBA commit, so a child that hops itself
+        // would resume before its own NBA lands. Instead, leave the waiters
+        // parked while same-time Active or Inactive work remains; the next
+        // delta runs it, commits the NBAs, and comes back here.
+        // Reference-verified shape: UVM `execute_phase` forks
+        // `master_phase_process` (traverse -> phase task ->
+        // `raise_objection`), then parks on `uvm_wait_for_nba_region`.
+        if self.event_queue.next_time() == Some(self.time) || !self.inactive_queue.is_empty() {
+            return;
         }
         let waiters = std::mem::take(&mut self.nba_region_waiters);
         self.late_resume_epoch += waiters.len() as u64;
@@ -115764,9 +115751,7 @@ impl Simulator {
         };
         let recv_handle = match &recv.kind {
             ExprKind::MemberAccess { expr: inner, .. } => self.eval_handle_expr(inner),
-            ExprKind::Ident(h) if h.path.len() >= 2 => {
-                self.eval_ident_handle(&h.path[0].name.name)
-            }
+            ExprKind::Ident(h) if h.path.len() >= 2 => self.eval_ident_handle(&h.path[0].name.name),
             _ => None,
         };
         let handle = match recv_handle {

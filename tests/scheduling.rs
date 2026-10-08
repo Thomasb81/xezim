@@ -13,6 +13,8 @@
 
 #[path = "scheduling/loop_frame_bail_rollback.rs"]
 mod loop_frame_bail_rollback;
+#[path = "scheduling/nba_region_waiter_order.rs"]
+mod nba_region_waiter_order;
 #[path = "scheduling/property_wait_shapes.rs"]
 mod property_wait_shapes;
 
