@@ -10261,19 +10261,24 @@ impl Simulator {
             .collect();
         for q in queue_names {
             let sz_name = format!("{}.size", q);
-            module
-                .signals
-                .entry(sz_name.clone())
-                .or_insert_with(|| super::elaborate::Signal {
-                    name: sz_name,
-                    width: 32,
-                    is_signed: false,
-                    is_real: false,
-                    is_const: false,
-                    direction: None,
-                    value: Value::zero(32),
-                    type_name: None,
-                });
+            let sig =
+                module
+                    .signals
+                    .entry(sz_name.clone())
+                    .or_insert_with(|| super::elaborate::Signal {
+                        name: sz_name,
+                        width: 32,
+                        is_signed: false,
+                        is_real: false,
+                        is_const: false,
+                        direction: None,
+                        value: Value::zero(32),
+                        type_name: None,
+                    });
+            // It is also what a paren-less `q.size` / `a.num` reads, and
+            // those return `int` (§7.5.2, §7.9.1, §7.10.2.1): SIGNED.
+            sig.is_signed = true;
+            sig.value.is_signed = true;
         }
         let materialize_ms = phase_materialize.elapsed().as_secs_f64() * 1000.0;
         crate::rss_trace("sim::new materialize");
@@ -67447,7 +67452,29 @@ impl Simulator {
         name: &String,
         args: &Vec<Expression>,
     ) -> Value {
-        let mut sys_result = match name.as_str() {
+        let mut sys_result = self.eval_expr_system_call_body(expr, ctx_width, name, args);
+        // §20/§21: an `int`/`integer`-valued function returns a SIGNED
+        // value (`$countones(x) - 8 < 0`, `$fgetc(fd) < 0` on EOF, and the
+        // §20.6.2/§20.7 queries `$bits(a) - 200`, `$unpacked_dimensions(a)
+        // - 3`). The arms build unsigned words, and several of them return
+        // early; stamp the sign here, once, from the shared result-type
+        // table, so every arm is covered.
+        if let Some((32, true)) = super::bytecode::system_function_result(name) {
+            if sys_result.width == 32 && !sys_result.is_real {
+                sys_result.is_signed = true;
+            }
+        }
+        sys_result
+    }
+
+    fn eval_expr_system_call_body(
+        &mut self,
+        expr: &Expression,
+        ctx_width: u32,
+        name: &String,
+        args: &Vec<Expression>,
+    ) -> Value {
+        match name.as_str() {
             COV_COND_FN => return self.cov_cond(args),
             // §9.4.5: retrieve a pre-evaluated intra-assignment RHS
             // (stashed by the suspend path; see make_intra_saved_expr).
@@ -67806,6 +67833,16 @@ impl Simulator {
                                     }
                                     return Value::from_u64(self.eval_expr(arg).width as u64, 32);
                                 }
+                            }
+                        }
+                        // §20.6.2: a DYNAMIC array or queue is sized by its
+                        // CURRENT contents — element_bits × size(), 0 when
+                        // empty. Its `arrays` row holds a (0, 63)
+                        // registration placeholder, which read 64 elements.
+                        if self.module.dynamic_arrays.contains(&*name) {
+                            if let Some(&(_, _, ew)) = self.module.arrays.get(&*name) {
+                                let n = self.get_queue_size(&name);
+                                return Value::from_u64(n * ew as u64, 32);
                             }
                         }
                         // Unpacked array: $bits = element_bits * product of
@@ -69062,6 +69099,16 @@ impl Simulator {
                 // what §18.5.12 needs for `array_size == $size(dyn_array)`.
                 if dim <= 1 {
                     if let Some(arg) = args.first() {
+                        // §20.7: `$size` of an ASSOCIATIVE array is its
+                        // number of entries, `num()` — the declared-dims
+                        // table has no row for it, so it fell through to the
+                        // packed-vector branch and reported the element
+                        // width (32 for `int a[int]`).
+                        if sn == "$size" {
+                            if let Some(an) = self.assoc_operand_name(arg) {
+                                return Self::int_count(self.assoc_top_level_keys(&an).len() as u64);
+                            }
+                        }
                         if let Some(nm) = self.array_operand_name(arg) {
                             if self.module.dynamic_arrays.contains(&nm) {
                                 let size = self.get_queue_size(&nm);
@@ -69538,17 +69585,7 @@ impl Simulator {
                 self.warn_unknown_system_task(name, args);
                 Value::zero(32)
             }
-        };
-        // §20/§21: an `int`/`integer`-valued function returns a SIGNED
-        // value (`$countones(x) - 8 < 0`, `$fgetc(fd) < 0` on EOF).
-        // The arms above build unsigned words; stamp the sign here,
-        // once, from the shared result-type table.
-        if let Some((32, true)) = super::bytecode::system_function_result(name) {
-            if sys_result.width == 32 && !sys_result.is_real {
-                sys_result.is_signed = true;
-            }
         }
-        sys_result
     }
 
     /// Outlined from `eval_expr_ctx` (see `exec_stmt_blocking_assign`): keeps
@@ -70465,7 +70502,7 @@ impl Simulator {
                 let mname = member.name.as_str();
                 if mname == "size" || mname == "num" {
                     let count = self.assoc_top_level_keys(&name).len();
-                    return Value::from_u64(count as u64, 32);
+                    return Self::int_count(count as u64);
                 }
                 if mname == "delete" {
                     let prefix = format!("{}[", name);
@@ -70498,13 +70535,13 @@ impl Simulator {
                         // (`<h>#<name>[<key>` prefix).
                         if self.is_associative_array(&scoped) {
                             let count = self.assoc_top_level_keys(&scoped).len();
-                            return Value::from_u64(count as u64, 32);
+                            return Self::int_count(count as u64);
                         }
                         // Queue / dynamic array: read `.size` signal.
                         if self.module.dynamic_arrays.contains(&scoped)
                             || self.signals.contains_key(&format!("{}.size", scoped))
                         {
-                            return Value::from_u64(self.get_queue_size(&scoped), 32);
+                            return Self::int_count(self.get_queue_size(&scoped));
                         }
                     }
                     // Module-level queue/dynamic/fixed array —
@@ -70516,7 +70553,7 @@ impl Simulator {
                             || self.module.dynamic_arrays.contains(&*name)
                             || self.signals.contains_key(&format!("{}.size", name)))
                     {
-                        return Value::from_u64(self.get_queue_size(&name), 32);
+                        return Self::int_count(self.get_queue_size(&name));
                     }
                 }
             }
@@ -72387,7 +72424,7 @@ impl Simulator {
                         if self.is_associative_array(obj_name) {
                             if mname == "size" || mname == "num" {
                                 let count = self.assoc_top_level_keys(obj_name).len();
-                                return Value::from_u64(count as u64, 32);
+                                return Self::int_count(count as u64);
                             }
                             if mname == "delete" {
                                 let prefix = format!("{}[", obj_name);
@@ -72423,12 +72460,12 @@ impl Simulator {
                             && let Some(q) =
                                 self.mailboxes.get(&(hv.to_u64().unwrap_or(0) as usize))
                         {
-                            return Value::from_u64(q.len() as u64, 32);
+                            return Self::int_count(q.len() as u64);
                         }
                         if (mname == "size" || mname == "num")
                             && self.module.arrays.contains_key(obj_name)
                         {
-                            return Value::from_u64(self.get_queue_size(obj_name), 32);
+                            return Self::int_count(self.get_queue_size(obj_name));
                         }
                         if mname == "pop_front" && self.module.arrays.contains_key(obj_name) {
                             return self
@@ -101809,14 +101846,17 @@ impl Simulator {
         // Simulator::new): route through the table write so a size change
         // marks it dirty and re-fires comb readers of `q.size()` / `q[i]`.
         if let Some(&id) = self.signal_name_to_id.get(key.as_str()) {
-            let v = Value::from_u64(size, 32);
+            // Compare at the slot's declared (signed) type, as `write_sig!`
+            // stores it, so an unchanged size is not seen as a change.
+            let mut v = Value::from_u64(size, 32);
+            v.is_signed = self.signal_signed[id];
             if self.signal_table[id] != v {
                 write_sig!(self, id, v);
                 self.table_modified = true;
                 self.mark_dirty_id(id);
             }
         }
-        self.signals.insert(key, Value::from_u64(size, 32));
+        self.signals.insert(key, Self::int_count(size));
     }
 
     /// Mark a queue's `.size` proxy dirty WITHOUT changing the size — used by
@@ -103466,6 +103506,22 @@ impl Simulator {
             || self.module.arrays_nd.contains_key(&*nm)
     }
 
+    /// Storage name of an ASSOCIATIVE-array operand (`a`, `this.a`,
+    /// `obj.a`), or None for any other expression.
+    fn assoc_operand_name(&mut self, expr: &Expression) -> Option<String> {
+        if let ExprKind::Ident(h) = &expr.kind {
+            let nm = self.resolve_hier_name(h);
+            let nm = self
+                .instance_assoc_member(&nm)
+                .unwrap_or_else(|| nm.to_string());
+            if self.is_associative_array(&nm) {
+                return Some(nm);
+            }
+        }
+        self.expr_assoc_name(expr)
+            .filter(|nm| self.is_associative_array(nm))
+    }
+
     /// If `expr` names a queue/array (possibly an instance-scoped member),
     /// return its resolved storage name — used for `inside {arr}` membership.
     fn array_operand_name(&mut self, expr: &Expression) -> Option<String> {
@@ -103619,6 +103675,17 @@ impl Simulator {
         let mut v = Value::from_u64(i as u64, 32);
         v.is_signed = true;
         v
+    }
+
+    /// The result of a built-in COUNT method: `size()` on a queue or dynamic
+    /// array (IEEE 1800-2023 §7.10.2.1, §7.5.2), `num()`/`size()` on an
+    /// associative array (§7.9.1), `len()` on a string (§6.16.1), `num()` on
+    /// an enum (§6.19.5.3) or a mailbox (§15.4.3). Each is declared
+    /// `function int`, so the value is SIGNED 32-bit: `q.size() - 2` on an
+    /// empty queue is -2, and `i < q.size() - 1` does not wrap to ~4e9.
+    #[inline]
+    fn int_count(n: u64) -> Value {
+        Self::signed_loop_val(n as i64)
     }
 
     /// Run `body` once per index tuple, last dimension varying fastest.
@@ -106674,7 +106741,7 @@ impl Simulator {
         use super::bytecode::StrOpKind as K;
         let v = |i: usize| -> &Value { &regs[args[i] as usize] };
         match kind {
-            K::Len => Value::from_u64(v(0).sv_string_bytes().len() as u64, 32),
+            K::Len => Self::int_count(v(0).sv_string_bytes().len() as u64),
             K::GetC => {
                 let idx = v(1).to_u64().unwrap_or(0) as usize;
                 let b = v(0).sv_string_bytes().get(idx).copied().unwrap_or(0);
@@ -117005,7 +117072,7 @@ impl Simulator {
                         v
                     };
                     return Some(match bm {
-                        BuiltinM::Num => Value::from_u64(members.len() as u64, 32),
+                        BuiltinM::Num => Self::int_count(members.len() as u64),
                         BuiltinM::First => mk(members[0].1),
                         BuiltinM::Last => mk(members[members.len() - 1].1),
                         BuiltinM::Next | BuiltinM::Prev => {
@@ -117084,10 +117151,10 @@ impl Simulator {
                 let prefix = Self::name_with_suffix(obj_name, "[");
                 let c1 = self.signals.keys_with_elem_prefix(&prefix).len();
                 let c2 = self.assoc_static_keys(&prefix).len();
-                return Some(Value::from_u64((c1 + c2) as u64, 32));
+                return Some(Self::int_count((c1 + c2) as u64));
             }
             if let Some(v) = self.signals.get(&Self::name_with_suffix(obj_name, ".size")) {
-                return Some(v.clone());
+                return Some(Self::int_count(v.to_u64().unwrap_or(0)));
             }
             // Dynamic-array/queue size may live in the compact signal table
             // (e.g. package- or module-scope `arr[] = {...}` whose `.size`
@@ -117100,12 +117167,12 @@ impl Simulator {
                 if let Some(v) =
                     self.get_signal_value_by_name(&Self::name_with_suffix(obj_name, ".size"))
                 {
-                    return Some(v);
+                    return Some(Self::int_count(v.to_u64().unwrap_or(0)));
                 }
-                return Some(Value::from_u64(0, 32));
+                return Some(Self::int_count(0));
             }
             if let Some((lo, hi, _)) = self.module.arrays.get(obj_name) {
-                return Some(Value::from_u64((hi - lo + 1) as u64, 32));
+                return Some(Self::int_count((hi - lo + 1) as u64));
             }
             // Fallback for strings (value may be a frame-local/parameter).
             // Counts the content bytes — including embedded/trailing NULs,
@@ -117115,9 +117182,9 @@ impl Simulator {
                 .or_else(|| self.get_signal_value_by_name(obj_name));
 
             if let Some(base) = base_val {
-                return Some(Value::from_u64(base.sv_string_bytes().len() as u64, 32));
+                return Some(Self::int_count(base.sv_string_bytes().len() as u64));
             }
-            return Some(Value::zero(32));
+            return Some(Self::int_count(0));
         }
         // §6.16.9 str.getc(i) — the byte value of character i (0 past the end).
         // Was unimplemented (returned 0), which made string glob matchers compare
@@ -117358,7 +117425,7 @@ impl Simulator {
             if let Some(handle_val) = self.get_signal_value_by_name(obj_name) {
                 let handle = handle_val.to_u64().unwrap_or(0) as usize;
                 if let Some(q) = self.mailboxes.get(&handle) {
-                    return Some(Value::from_u64(q.len() as u64, 32));
+                    return Some(Self::int_count(q.len() as u64));
                 }
             }
             // Count distinct TOP-LEVEL keys: for `obj[KEY]` storage this is
@@ -117368,9 +117435,8 @@ impl Simulator {
             // of associative keys, not the total element count). The
             // first-`]` extraction + dedup is uniform across plain assoc,
             // assoc-of-queue, queues, and dynamic arrays.
-            return Some(Value::from_u64(
-                self.assoc_top_level_keys(obj_name).len() as u64,
-                32,
+            return Some(Self::int_count(
+                self.assoc_top_level_keys(obj_name).len() as u64
             ));
         }
         if matches!(bm, BuiltinM::Sum | BuiltinM::Product) {
@@ -127248,7 +127314,7 @@ impl Simulator {
                             v
                         };
                         match mname {
-                            "num" => return Value::from_u64(members.len() as u64, 32),
+                            "num" => return Self::int_count(members.len() as u64),
                             "first" => return mk(members[0].1),
                             "last" => return mk(members[members.len() - 1].1),
                             "next" | "prev" => {
@@ -127693,7 +127759,7 @@ impl Simulator {
                         }
                     }
                 }
-                return Value::from_u64(base.sv_string_bytes().len() as u64, 32);
+                return Self::int_count(base.sv_string_bytes().len() as u64);
             }
 
             // §6.16 query methods on a receiver that is not a plain identifier
@@ -128265,7 +128331,7 @@ impl Simulator {
                                 .map(|a| this.eval_expr(a).to_i64().unwrap_or(-1))
                         };
                         match m.as_str() {
-                            "len" => return Value::from_u64(bytes.len() as u64, 32),
+                            "len" => return Self::int_count(bytes.len() as u64),
                             "getc" => {
                                 let i = arg(self, 0).unwrap_or(-1);
                                 let b = if i >= 0 {
@@ -128305,7 +128371,7 @@ impl Simulator {
                         // Compute len/size directly from the string value bytes.
                         if matches!(m.as_str(), "len" | "size") {
                             let bytes = recv.sv_string_bytes();
-                            return Value::from_u64(bytes.len() as u64, 32);
+                            return Self::int_count(bytes.len() as u64);
                         }
                     } else if let Some(v) = self.string_method(&base_expr, &m, args) {
                         return v;
@@ -128385,7 +128451,7 @@ impl Simulator {
                                 .unwrap_or(32);
                             match m.as_str() {
                                 "num" => {
-                                    return Value::from_u64(members.len() as u64, 32);
+                                    return Self::int_count(members.len() as u64);
                                 }
                                 "first" => {
                                     return Value::from_u64(members[0].1, mw);
@@ -128421,7 +128487,7 @@ impl Simulator {
                 if m == "num" {
                     let h = self.eval_expr(&base_expr).to_u64().unwrap_or(0) as usize;
                     if let Some(q) = self.mailboxes.get(&h) {
-                        return Value::from_u64(q.len() as u64, 32);
+                        return Self::int_count(q.len() as u64);
                     }
                 }
                 if m == "name" {
@@ -138492,7 +138558,7 @@ impl Simulator {
                 }
                 "num" => {
                     let n = self.mailboxes.get(&handle).map(|q| q.len()).unwrap_or(0);
-                    return Value::from_u64(n as u64, 32);
+                    return Self::int_count(n as u64);
                 }
                 _ => {}
             }
