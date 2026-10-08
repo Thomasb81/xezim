@@ -67,6 +67,12 @@ unless noted.
 |---|---|
 | `XEZIM_EVENT_EDGE=0` | On by default: clocked flop fires whose data inputs have not changed are skipped (1.13–1.30× wall on the C910/C906 benchmarks). `0` turns it off |
 | `XEZIM_PACKED_MEM=0` | On by default: large integral memories (elements up to 64 bits, arrays of more than 100,000 cells) live in a packed arena. `0` turns it off |
+| `XEZIM_COMPILE_METHODS=1` | On by default (see `XEZIM_METHOD_TIER`): compile hot class-function method bodies to bytecode and execute them. `0` forces the AST interpreter |
+| `XEZIM_METHOD_TIER=N` | Compile a class method only after N calls (default 1000; `0` compiles on the first call). A method that never crosses the threshold stays on the interpreter with no compilation overhead |
+| `XEZIM_FAST_CALLS=1` | On by default: direct VM-to-VM dispatch of compiled methods without re-entering the interpreter's formal binding loop. `0` disables it |
+| `XEZIM_METHOD_CACHE=<dir>` | Persistent compiled-method cache directory across runs. `1` uses `~/.cache/xezim/method-cache`; unset (default) disables it. Corrupt entries transparently trigger recompilation |
+| `XEZIM_METHOD_PROFILE=1` | In-process sampling profiler for class methods. When `1`, prints AST-vs-bytecode execution-time histograms on simulation completion (default off) |
+| `XEZIM_FALLBACK_SITES=1` | Log each construct handed to the AST interpreter: the reason, source byte span and scope of the compile-fail / plan-decline site (default off) |
 | `XEZIM_JIT=1` | Compile bytecode blocks to machine code in-process (needs a `--features jit` build) |
 | `XEZIM_AOT=1` | Compile eligible blocks to native code via generated Rust + `rustc` instead of cranelift. **Requires `XEZIM_JIT=1` as well** — on its own it is a no-op. Needs `--features jit`. See the [user guide](user-guide.md#native-compilation) |
 | `XEZIM_AOT_OPT=0..3` | `rustc` optimization level for the generated crate (default 2) |
