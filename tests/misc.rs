@@ -55,6 +55,8 @@ mod case_default_arm;
 mod chained_member_access;
 #[path = "misc/child_decl_init_and_wide_rand.rs"]
 mod child_decl_init_and_wide_rand;
+#[path = "misc/cli_files.rs"]
+mod cli_files;
 #[path = "misc/clocked_loop_case_nest_compiled.rs"]
 mod clocked_loop_case_nest_compiled;
 #[path = "misc/code_coverage.rs"]
@@ -203,6 +205,8 @@ mod nonzero_lsb_indexed_part_select;
 mod obj_assocd_event_disable_fork;
 #[path = "misc/operators_11_select_reduce.rs"]
 mod operators_11_select_reduce;
+#[path = "misc/override_timescale.rs"]
+mod override_timescale;
 #[path = "misc/package_exports.rs"]
 mod package_exports;
 #[path = "misc/package_qualified_access_in_subroutine.rs"]
@@ -271,6 +275,8 @@ mod unnamed_block_end_label;
 mod unsized_decimal_wrap_warning;
 #[path = "misc/uvm_agent_active_config.rs"]
 mod uvm_agent_active_config;
+#[path = "misc/uvm_dir_env.rs"]
+mod uvm_dir_env;
 #[path = "misc/uvm_dpi_builtins.rs"]
 mod uvm_dpi_builtins;
 #[path = "misc/value_trace.rs"]

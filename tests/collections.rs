@@ -63,6 +63,8 @@ mod lrm_clause7_arrays;
 mod mailbox_array_new;
 #[path = "collections/mailbox_bounded.rs"]
 mod mailbox_bounded;
+#[path = "collections/mailbox_handle_named_like_struct.rs"]
+mod mailbox_handle_named_like_struct;
 #[path = "collections/multidim_assoc_array.rs"]
 mod multidim_assoc_array;
 #[path = "collections/noparen_array_methods.rs"]
@@ -117,3 +119,5 @@ mod mailbox_unpacked_struct;
 mod queue_concat_index_prefilled_prefix;
 #[path = "collections/std_randomize_multidim.rs"]
 mod std_randomize_multidim;
+#[path = "collections/queue_struct_pop.rs"]
+mod queue_struct_pop;

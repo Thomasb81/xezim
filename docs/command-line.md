@@ -15,6 +15,7 @@ how to use them together, see the [user guide](user-guide.md).
 |---|---|
 | `-D<MACRO>[=val]` | Define a preprocessor macro |
 | `-I<dir>` | Add an include directory |
+| `-uvm`, `--uvm` | Add the UVM library that `XEZIM_UVM_DIR` names: its `src` directory goes on the include path and its `uvm_pkg.sv` becomes the first source file, unless the file list already has a `uvm_pkg.sv`. Works in every mode and inside `-f`/`-F` files. Without `-uvm` nothing is added. See the [UVM guide](uvm-guide.md#adding-the-uvm-library-with--uvm) |
 | `--simulate` | Run the simulation (vs `--parse` / `--compile` / `--preprocess`) |
 | `-s <module>` | Select a top-level module. Repeat for multiple roots (e.g. `-s hdl_top -s hvl_top`); each is a root of its own in `%m`, messages, `$root` paths and waveform scopes, as when several tops are found automatically. A bare module name that is not a file does the same (see [below](#command-lines-from-other-simulators)) |
 | `--no-strict-top` | When an `-s` names no module, warn and find the tops automatically instead of exiting 1 |
@@ -46,6 +47,8 @@ how to use them together, see the [user guide](user-guide.md).
 | `--wave` | Compile the model with waveform support, enabling `$dumpfile`/`$dumpvars` (off by default; `--fst`/`--xtrace` imply it) |
 | `--fst <file>` | Emit an FST (GTKWave binary) waveform dump |
 | `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable) |
+| `-fst_scope_file <file>` (also `--fst-scope-file`, `=` form) | FST scopes from a file: one or more per line, separated by spaces or commas, with `#` or `//` comments. Each adds a `--fst-scope`. Works in `-f`/`-F` files, where a relative path resolves as given, else next to the args file |
+| `-xezim_env <file>` (also `--xezim-env`, `=` form) | Set `XEZIM_*` variables from a file before xezim reads any of them: `NAME=value`, `export NAME=value`, `setenv NAME value`, `NAME value`, `unsetenv NAME`; `#`/`//` comments, quoted values. Values override the shell; several files apply in order. Command line only (an args file is read too late) |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for third-party sources you cannot edit |
@@ -72,6 +75,7 @@ unless noted.
 | `XEZIM_REGIONS=1` | Fuse dependency-connected compiled combinational entries into region blocks (experimental; currently net-negative on the benchmark set) |
 | `XEZIM_STUCK_CLOCK=1` | Flag a process parked on a clock/reset that never changes while the design keeps churning edges (`abort` variant for CI) |
 | `XEZIM_INIT_ZERO=1` | Coerce X-initialized signals/arrays to 0 (required for some C910/C906 workloads, e.g. CoreMark) |
+| `XEZIM_FST_FLUSH_SECS=N` | `--fst`: write the in-memory value-change block to the file at least every N wall seconds (default 2; fractions allowed; `0` flushes only when the block reaches 64 MB). A run that is killed (`kill -9`, out of memory) keeps everything up to the last flush, and the file stays readable |
 | `XEZIM_PROGRESS=N` | Emit a `[PROGRESS]` line every N wall-seconds (sim_time, iters, edges_fired, nba_q) |
 | `XEZIM_CACHE_DIR=<dir>` | Override the elaborated-design cache directory |
 | `XEZIM_NO_CACHE=1` | Disable the automatic elaborated-design cache |
@@ -83,6 +87,8 @@ unless noted.
 | `XEZIM_COV_DB=<path>` | Write the coverage results somewhere other than `xezim_cov.json` |
 | `XEZIM_MAX_INST_DEPTH=N` | Instantiation-depth cap (default 200) — turns unbounded recursive instantiation into a clean error instead of memory exhaustion |
 | `XEZIM_STACK_MB=N` | Stack size of the simulation worker thread (default 1024; `0` runs on the main thread) |
+| `XEZIM_UVM_DIR=<dir>` | The UVM library `-uvm` adds: a `src` directory, a release root holding `src/`, or a checkout holding several releases (`1.1d`, `1.2`, `1800.2-2017`, `1800.2-2020`) |
+| `XEZIM_UVM_VERSION=<release>` | With a multi-release `XEZIM_UVM_DIR`, the release subdirectory to use (default: the newest present) |
 | `XEZIM_VALUE_TRACE=<substr>[,...]` | Print every committed change of signals whose hierarchical name contains a pattern: time, name, old→new value, dispatch phase, writing process origin (file:line). NBA commits are labeled `nba` |
 | `XEZIM_VALUE_TRACE_LIMIT=N` | Cap value-trace output lines (default 20000) |
 
@@ -111,6 +117,7 @@ xezim -sv +define+UVM_NO_DPI+DEPTH=4 +incdir+tb+rtl -F files.f -work work \
 | `-sv_seed <n>`, `-sv_seed random` | Same as `+seed=<n>` / `+seed=random` |
 | `-sv_lib <name>`, `-sv_root <dir>` | Load `<dir>/<name>.so` as a DPI library (`--dpi-lib`) |
 | `-timescale <u>/<p>` | Default timescale for design elements without one (`--module-timescale`) |
+| `-override_timescale <u>/<p>` (also `--override-timescale`, `=` form) | One timescale for every design element, package and compilation unit: every `` `timescale `` directive, `timeunit`/`timeprecision` declaration and `--module-timescale` is ignored. Bare delays count in `<u>`; literals with a unit (`#3ns`) keep their absolute value |
 | `-l <file>`, `-logfile <file>` | xezim's `-l`: all output goes to the file, none to the terminal |
 | `-c` | xezim's args-file flag when a file (or a path) follows; otherwise the batch-mode switch, accepted |
 | `-v <file>`, `-y <dir>`, `+libext+` | Library file / directory |

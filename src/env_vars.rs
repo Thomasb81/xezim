@@ -399,6 +399,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Bytecode: max foreach unroll replay count",
     ),
     (
+        "XEZIM_FST_FLUSH_SECS",
+        "FST: write the in-memory value-change block to disk every N wall seconds (default 2; 0 = only at 64 MB)",
+    ),
+    (
         "XEZIM_FUSE",
         "Bytecode: enable/disable insn fusion peepholes (0/1)",
     ),
@@ -864,7 +868,11 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_UVM_DIR",
-        "Path to a UVM source tree auto-added for UVM designs",
+        "UVM source tree (src dir, release root or multi-release checkout) added to UVM designs",
+    ),
+    (
+        "XEZIM_UVM_VERSION",
+        "Release subdirectory of a multi-release XEZIM_UVM_DIR checkout (default: newest present)",
     ),
     (
         "XEZIM_VALUE_TRACE",

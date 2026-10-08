@@ -28,6 +28,11 @@ pub(crate) struct CompatArgs {
     pub cover: Option<String>,
     /// `-coverage`.
     pub coverage: bool,
+    /// `-uvm` / `--uvm`: add the UVM library named by `XEZIM_UVM_DIR`
+    /// (see src/uvm_dir.rs).
+    pub uvm: bool,
+    /// `--fst-scope-file` files named inside args files (src/cli_files.rs).
+    pub fst_scope_files: Vec<String>,
 }
 
 /// The code coverage `+cover[=<letters>]` and `-coverage` ask for, as
@@ -116,6 +121,10 @@ pub(crate) fn handle_flag(
         }
         "-coverage" => {
             cx.coverage = true;
+            Ok(1)
+        }
+        "-uvm" | "--uvm" => {
+            cx.uvm = true;
             Ok(1)
         }
         "-wlf" => {

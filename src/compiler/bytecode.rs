@@ -3201,6 +3201,10 @@ impl<'a> BytecodeCompiler<'a> {
         self.allow_ast_fallback = false;
         let saved_ret = self.inline_ret;
         let saved_ret_jumps = std::mem::take(&mut self.inline_ret_jumps);
+        // §12.8: break/continue belong to loops in this subroutine, never
+        // the caller. A failed body can leave unfinished loop frames behind.
+        let saved_break_patches = std::mem::take(&mut self.loop_break_patches);
+        let saved_continue_patches = std::mem::take(&mut self.loop_continue_patches);
         self.inline_ret = Some((Some(ret_slot), ret_w));
         let mut ok = self.compile_pure_body(&items, ret_slot, ret_w, ctx_width);
         // Early returns land HERE — after the body, before the output-formal
@@ -3211,6 +3215,8 @@ impl<'a> BytecodeCompiler<'a> {
         }
         self.inline_ret = saved_ret;
         self.inline_ret_jumps = saved_ret_jumps;
+        self.loop_break_patches = saved_break_patches;
+        self.loop_continue_patches = saved_continue_patches;
         if ok {
             for (target, value, width) in &ref_writes {
                 if !self.compile_blocking_target(target, *value, *width) {
@@ -3571,6 +3577,10 @@ impl<'a> BytecodeCompiler<'a> {
             self.inlining_stack.push(task_name.to_string());
             let saved_ret = self.inline_ret;
             let saved_ret_jumps = std::mem::take(&mut self.inline_ret_jumps);
+            // Keep the caller's loop fixups out of the task's body, including
+            // when a failed lowering leaves unfinished loop frames behind.
+            let saved_break_patches = std::mem::take(&mut self.loop_break_patches);
+            let saved_continue_patches = std::mem::take(&mut self.loop_continue_patches);
             self.inline_ret = Some((None, 0));
             for st in &body {
                 if !self.compile_stmt(st) {
@@ -3585,6 +3595,8 @@ impl<'a> BytecodeCompiler<'a> {
             }
             self.inline_ret = saved_ret;
             self.inline_ret_jumps = saved_ret_jumps;
+            self.loop_break_patches = saved_break_patches;
+            self.loop_continue_patches = saved_continue_patches;
             self.inlining_stack.pop();
             self.inline_foreign -= foreign as u32;
             self.m_labels = saved_labels;
@@ -3621,7 +3633,7 @@ impl<'a> BytecodeCompiler<'a> {
                 );
             }
             // A half-emitted body writes REAL signals — roll everything back.
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         }
@@ -6472,7 +6484,7 @@ impl<'a> BytecodeCompiler<'a> {
             match self.compile_expr(a, 0) {
                 Some(r) => regs.push(r),
                 None => {
-                    self.insns.truncate(start);
+                    self.truncate_insns(start);
                     self.next_reg = start_reg;
                     return None;
                 }
@@ -6708,6 +6720,21 @@ impl<'a> BytecodeCompiler<'a> {
 
     fn emit(&mut self, insn: Insn) {
         self.insns.push(insn);
+    }
+
+    /// Discard speculative instructions together with their pending jump
+    /// fixups. A return, break or continue emitted by a failed lowering must
+    /// not patch discarded code when an enclosing function or loop finishes.
+    fn truncate_insns(&mut self, len: usize) {
+        self.insns.truncate(len);
+        self.inline_ret_jumps.retain(|&pc| pc < len);
+        self.method_ret_jumps.retain(|&pc| pc < len);
+        for patches in &mut self.loop_break_patches {
+            patches.retain(|&pc| pc < len);
+        }
+        for patches in &mut self.loop_continue_patches {
+            patches.retain(|&pc| pc < len);
+        }
     }
 
     /// `hier_raw_name`, borrowed when the path has a single segment.
@@ -7020,12 +7047,12 @@ impl<'a> BytecodeCompiler<'a> {
                 if Self::hier_raw_name(lh) != vname {
                     return false;
                 }
-                let Some(c) = self.fold_const(right).and_then(|v| v.to_u64()) else {
+                let Some(c) = self.fold_const(right).and_then(|v| v.to_i64()) else {
                     return false;
                 };
                 match op {
-                    BinaryOp::Add => c as i64,
-                    BinaryOp::Sub => -(c as i64),
+                    BinaryOp::Add => c,
+                    BinaryOp::Sub => c.wrapping_neg(),
                     _ => return false,
                 }
             }
@@ -7034,10 +7061,33 @@ impl<'a> BytecodeCompiler<'a> {
         if step_delta == 0 {
             return false;
         }
+        // The loop variable is bound with its declared width and signedness
+        // (§6.11, §6.8): the condition compares it as signed when both
+        // operands are signed (§11.8.1), so `for (int i = 1; i > -1; i--)`
+        // needs `i` signed, and the step wraps at the declared width.
+        let kind = self.local_kind_of(data_type, None);
+        let Some(LocalKind::Int { width, signed, .. }) = kind else {
+            return false;
+        };
+        if width == 0 || width > 64 {
+            return false;
+        }
+        let fit = |x: i64| -> i64 {
+            if width == 64 {
+                return x;
+            }
+            let mask = (1u64 << width) - 1;
+            let u = (x as u64) & mask;
+            if signed && (u >> (width - 1)) & 1 == 1 {
+                (u | !mask) as i64
+            } else {
+                u as i64
+            }
+        };
         let Some(mut cur) = self
             .fold_const(init)
-            .and_then(|v| v.to_u64())
-            .map(|v| v as i64)
+            .and_then(|v| if v.has_xz() { None } else { v.to_i64() })
+            .map(fit)
         else {
             return false;
         };
@@ -7046,16 +7096,26 @@ impl<'a> BytecodeCompiler<'a> {
         let start_reg = self.next_reg;
         let outer_const = self.local_const_vars.remove(&vname);
         // How a fallback in the body hands the constant to the interpreter.
-        let kind = self.local_kind_of(data_type, None);
-        let outer_kind = match kind {
-            Some(k) => self.local_const_kinds.insert(vname.clone(), k),
-            None => self.local_const_kinds.remove(&vname),
-        };
+        let outer_kind = self.local_const_kinds.insert(
+            vname.clone(),
+            LocalKind::Int {
+                width,
+                signed,
+                two_state: matches!(
+                    kind,
+                    Some(LocalKind::Int {
+                        two_state: true,
+                        ..
+                    })
+                ),
+            },
+        );
         let mut ok = true;
         let mut trips = 0usize;
         loop {
-            self.local_const_vars
-                .insert(vname.clone(), Value::from_u64(cur as u64, 32));
+            let mut bound = Value::from_u64(cur as u64, width);
+            bound.is_signed = signed;
+            self.local_const_vars.insert(vname.clone(), bound);
             let c = match self.fold_const(cond) {
                 Some(v) => v.is_true(),
                 None => {
@@ -7080,7 +7140,7 @@ impl<'a> BytecodeCompiler<'a> {
                 ok = false;
                 break;
             }
-            cur += step_delta;
+            cur = fit(cur.wrapping_add(step_delta));
         }
         self.local_const_vars.remove(&vname);
         if let Some(v) = outer_const {
@@ -7095,7 +7155,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         if !ok {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         }
@@ -7424,7 +7484,7 @@ impl<'a> BytecodeCompiler<'a> {
             lvalue, acc_expr, e, &op, acc_id, k_sig, k_init, k_w, &vals, cur, &names, &kval,
         );
         if !ok {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
         }
         ok
@@ -7719,7 +7779,14 @@ impl<'a> BytecodeCompiler<'a> {
                 let v = self.fold_const(operand)?;
                 match op {
                     UnaryOp::Plus => v,
-                    UnaryOp::Minus => Value::zero(v.width.max(32)).sub(&v),
+                    // §11.4.3/§11.8.1: negation keeps its operand's
+                    // signedness — `-1` is a signed constant, so `i > -1`
+                    // on a signed `i` compares signed.
+                    UnaryOp::Minus => {
+                        let mut r = Value::zero(v.width.max(32)).sub(&v);
+                        r.is_signed = v.is_signed;
+                        r
+                    }
                     UnaryOp::BitNot => v.bitwise_not(),
                     UnaryOp::LogNot => v.logic_not(),
                     _ => return None,
@@ -7911,7 +7978,7 @@ impl<'a> BytecodeCompiler<'a> {
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let Some(sel) = self.compile_expr(expr, 0) else {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         };
@@ -7953,7 +8020,7 @@ impl<'a> BytecodeCompiler<'a> {
             self.next_reg = arm_reg_start;
         }
         if !ok {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         }
@@ -7969,7 +8036,7 @@ impl<'a> BytecodeCompiler<'a> {
         if let Ok(lim) = std::env::var("XEZIM_CASEJUMP_LIMIT") {
             if let Ok(lim) = lim.parse::<usize>() {
                 if n >= lim {
-                    self.insns.truncate(start);
+                    self.truncate_insns(start);
                     self.next_reg = start_reg;
                     return false;
                 }
@@ -8111,7 +8178,7 @@ impl<'a> BytecodeCompiler<'a> {
         let start = self.insns.len();
         let start_reg = self.next_reg;
         let Some(sel) = self.compile_expr(expr, 0) else {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         };
@@ -8233,7 +8300,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
         }
         if !ok {
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             return false;
         }
@@ -9570,6 +9637,10 @@ impl<'a> BytecodeCompiler<'a> {
         let start_reg = self.next_reg;
         let saved_reason = self.bail_reason;
         let saved_overflow = self.register_overflow;
+        let loop_depth = (
+            self.loop_break_patches.len(),
+            self.loop_continue_patches.len(),
+        );
         self.bail_reason = None;
         self.register_overflow = false;
         let strict_ok = self.compile_stmt_strict(stmt);
@@ -9578,6 +9649,9 @@ impl<'a> BytecodeCompiler<'a> {
             self.register_overflow = saved_overflow;
             return true;
         }
+        // A loop that bailed part-way may leave its own patch frames pushed.
+        self.loop_break_patches.truncate(loop_depth.0);
+        self.loop_continue_patches.truncate(loop_depth.1);
         if self.register_overflow {
             self.bail("bytecode_register_limit");
         }
@@ -9592,7 +9666,7 @@ impl<'a> BytecodeCompiler<'a> {
             let reason = self
                 .bail_reason
                 .unwrap_or_else(|| Self::stmt_kind_label(stmt));
-            self.insns.truncate(start);
+            self.truncate_insns(start);
             self.next_reg = start_reg;
             let locals = if self.fb_live() {
                 self.fb_stmt_locals(stmt)
@@ -10086,7 +10160,7 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("nba_rvalue");
                 }
                 // Roll back partial work and emit fallback if allowed.
-                self.insns.truncate(start);
+                self.truncate_insns(start);
                 self.next_reg = start_reg;
                 self.emit_fallback(stmt)
             }
@@ -10137,7 +10211,7 @@ impl<'a> BytecodeCompiler<'a> {
                     {
                         return true;
                     }
-                    self.insns.truncate(start);
+                    self.truncate_insns(start);
                     self.next_reg = start_reg;
                     // Fall through to the AST fallback below.
                     self.bail("coll_elem_store");
@@ -10188,7 +10262,7 @@ impl<'a> BytecodeCompiler<'a> {
                 } else {
                     self.bail("blocking_rvalue");
                 }
-                self.insns.truncate(start);
+                self.truncate_insns(start);
                 self.next_reg = start_reg;
                 self.emit_fallback(stmt)
             }
@@ -10496,7 +10570,7 @@ impl<'a> BytecodeCompiler<'a> {
                             if lowered == Some(()) {
                                 return true;
                             }
-                            self.insns.truncate(start);
+                            self.truncate_insns(start);
                             self.next_reg = start_reg;
                         }
                         self.bail("Expr_PreIncr");
@@ -10554,7 +10628,7 @@ impl<'a> BytecodeCompiler<'a> {
                             if lowered == Some(()) {
                                 return true;
                             }
-                            self.insns.truncate(start);
+                            self.truncate_insns(start);
                             self.next_reg = start_reg;
                         }
                         self.bail("Expr_PreDecr");
@@ -10609,7 +10683,7 @@ impl<'a> BytecodeCompiler<'a> {
                                         return true;
                                     }
                                 }
-                                self.insns.truncate(start);
+                                self.truncate_insns(start);
                                 self.next_reg = start_reg;
                                 // fall through to the task/AST paths
                             }
@@ -11405,7 +11479,7 @@ impl<'a> BytecodeCompiler<'a> {
             match self.compile_expr(a, 0) {
                 Some(r) => arg_values.push(r),
                 None => {
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_New_args");
                     return None;
@@ -11730,7 +11804,7 @@ impl<'a> BytecodeCompiler<'a> {
                     if let Some(out) = lowered {
                         return Some(out);
                     }
-                    self.insns.truncate(start);
+                    self.truncate_insns(start);
                     self.next_reg = start_reg;
                     self.bail("Expr_IncrExpr");
                     return None;
@@ -12245,7 +12319,7 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(dest) = self.compile_packed_member_index(expr, index) {
                     return Some(dest);
                 }
-                self.insns.truncate(member_start);
+                self.truncate_insns(member_start);
                 self.next_reg = member_reg;
                 // §7.4.1 CHAINED packed element select — `v[i][j][k]` on
                 // `logic [0:0][1:0][1:0]`. Only the innermost `Index` has an
@@ -12497,7 +12571,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // right when it really is a scalar, so hand the interpreter
                 // the whole select instead.
                 if self.sel_base_is_interpreted(base_start, expr) {
-                    self.insns.truncate(base_start);
+                    self.truncate_insns(base_start);
                     self.next_reg = base_reg;
                     if let Some(r) =
                         self.emit_expr_fallback(whole, ctx_width, "sel_base_interpreted")
@@ -12560,7 +12634,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // right when it really is a scalar, so hand the interpreter
                     // the whole select instead.
                     if self.sel_base_is_interpreted(base_start, expr) {
-                        self.insns.truncate(base_start);
+                        self.truncate_insns(base_start);
                         self.next_reg = base_reg;
                         if let Some(r) =
                             self.emit_expr_fallback(whole, ctx_width, "sel_base_interpreted")
@@ -12657,7 +12731,7 @@ impl<'a> BytecodeCompiler<'a> {
                     // is only right when it really is a scalar, so hand the
                     // interpreter the whole select instead.
                     if self.sel_base_is_interpreted(base_start, expr) {
-                        self.insns.truncate(base_start);
+                        self.truncate_insns(base_start);
                         self.next_reg = base_reg;
                         if let Some(r) =
                             self.emit_expr_fallback(whole, ctx_width, "sel_base_interpreted")
@@ -12798,7 +12872,7 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit(Insn::StrOp(dst, StrOpKind::Concat, Box::new(regs)));
                             return Some(dst);
                         }
-                        self.insns.truncate(start);
+                        self.truncate_insns(start);
                         self.next_reg = start_reg;
                     }
                     self.bail("Concat_string");
@@ -12971,7 +13045,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 if ok {
                                     native = Some((segs, arg_regs));
                                 } else {
-                                    self.insns.truncate(start);
+                                    self.truncate_insns(start);
                                     self.next_reg = start_reg;
                                 }
                             }
@@ -13325,7 +13399,7 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(dest) = self.compile_indexed_packed_member(base, &member.name) {
                     return Some(dest);
                 }
-                self.insns.truncate(member_start);
+                self.truncate_insns(member_start);
                 self.next_reg = member_reg;
                 // `b.descriptors[0].region` parses with the element select on
                 // the LAST path segment (`b.descriptors[0]` is one identifier):
@@ -13348,7 +13422,7 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(dest);
                     }
                 }
-                self.insns.truncate(member_start);
+                self.truncate_insns(member_start);
                 self.next_reg = member_reg;
 
                 // Direct packed member (`container.field`). Nested field paths
@@ -13363,7 +13437,7 @@ impl<'a> BytecodeCompiler<'a> {
                     self.emit(Insn::RangeSelectConst(dest, root, *off + *width - 1, *off));
                     return Some(dest);
                 }
-                self.insns.truncate(direct_start);
+                self.truncate_insns(direct_start);
                 self.next_reg = direct_reg;
                 // class-perf P2: a PACKAGE-scope enum constant parsed as
                 // MemberAccess (`pk::LOW` in an argument). Same fold as the
@@ -13577,7 +13651,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_Call_super");
                     return None;
@@ -13654,7 +13728,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_Call_class_method");
                     return None;
@@ -13757,7 +13831,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit_arg_slot_writeback(args, arg_start, Some(&h.path[0].name.name))?;
                         return Some(dest);
                     }
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_Call_bare_method");
                     return None;
@@ -13823,7 +13897,7 @@ impl<'a> BytecodeCompiler<'a> {
                         ));
                         return Some(dest);
                     }
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                 }
                 // class-perf Step 9h: a CLASS-SCOPE static call —
@@ -13942,7 +14016,7 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }
-                    self.insns.truncate(call_start);
+                    self.truncate_insns(call_start);
                     self.next_reg = call_next;
                     self.bail("Expr_Call_static_scope");
                     return None;
@@ -13959,7 +14033,7 @@ impl<'a> BytecodeCompiler<'a> {
                 if let Some(r) = self.compile_pure_call(func, args, ctx_width) {
                     return Some(r);
                 }
-                self.insns.truncate(start);
+                self.truncate_insns(start);
                 self.next_reg = first_reg;
                 self.emit_expr_fallback(expr, ctx_width, "Expr_Call_impure")
             }
@@ -14328,7 +14402,7 @@ impl<'a> BytecodeCompiler<'a> {
             });
             return true;
         }
-        self.insns.truncate(start);
+        self.truncate_insns(start);
         self.next_reg = start_reg;
         self.bail_reason = saved_reason;
         false
@@ -17341,7 +17415,7 @@ impl<'a> BytecodeCompiler<'a> {
                 );
             }
             // Roll back everything; leave the compiler in non-method mode.
-            self.insns.truncate(start_len);
+            self.truncate_insns(start_len);
             self.next_reg = start_reg;
             self.method_mode = false;
             self.method_this_reg = None;
@@ -21150,6 +21224,16 @@ pub enum TsInsn {
     Jmp {
         t: u32,
     },
+    /// A backward `Jmp` (a loop back-edge; rewritten once the stream is
+    /// final): Ctrl-C bails the block to the four-state VM, whose back-edge
+    /// poll stops the run. A long loop inside one time slot never reaches the
+    /// event loop's own poll. A separate instruction rather than a test in
+    /// `Jmp`, so forward jumps pay nothing.
+    JmpPoll {
+        t: u32,
+    },
+    /// Ahead of a do-while back-edge (`BrNz`), same purpose as `JmpPoll`.
+    LoopPoll,
     /// Jump-table dispatch (§12.5 `case`). Two-state registers are X-free by
     /// the eval-site prefilter, so the 4-state arm's "any x/z bit matches no
     /// pattern -> default" branch cannot arise and this reduces to a bounds-
@@ -21843,6 +21927,8 @@ pub fn ts_read_masks(insns: &[TsInsn], widths: &[u32]) -> Option<(Vec<(u32, u64)
             | TsInsn::BrFalse { .. }
             | TsInsn::BrNz { .. }
             | TsInsn::Jmp { .. }
+            | TsInsn::JmpPoll { .. }
+            | TsInsn::LoopPoll
             | TsInsn::CaseJmp { .. }
             | TsInsn::CaseMaskJmp { .. }
             | TsInsn::RedOr { .. }
@@ -23924,6 +24010,10 @@ pub fn lower_two_state(
             }
             Insn::BranchUnlessZero(s, t) => {
                 narrow_reg!(rw, *s, "wide branch condition");
+                // do-while back-edge: see `TsInsn::LoopPoll`.
+                if (*t as usize) <= ins_i {
+                    out.push(TsInsn::LoopPoll);
+                }
                 out.push(TsInsn::BrNz {
                     s: *s as u16,
                     t: *t,
@@ -25081,6 +25171,15 @@ pub fn lower_two_state(
         // Fusion re-indexes the stream; a wait-bearing stream keeps its
         // four-state index map exact instead.
         fuse_ts_pairs(&mut out);
+    }
+    // Loop back-edges poll Ctrl-C (see `TsInsn::JmpPoll`). In place, so no
+    // index moves; nothing after this point re-reads branch targets.
+    for (i, insn) in out.iter_mut().enumerate() {
+        if let TsInsn::Jmp { t } = *insn {
+            if (t as usize) <= i {
+                *insn = TsInsn::JmpPoll { t };
+            }
+        }
     }
     if track && std::env::var_os("XEZIM_TS_DUMP").is_some() {
         eprintln!("[TS-DUMP] {} insns:", out.len());

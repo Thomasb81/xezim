@@ -6,6 +6,119 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 # What's new in 0.11
 
+### Unreleased
+
+**Correctness**
+
+* `randomize()` with a soft constraint and an array sized by the constraints
+  no longer fails when a constraint reads a member path through `this`
+  (`this.lo`, `this.lim.lo`) that names state rather than a random variable.
+  (#256, from PR #257 by Taichi Ishitani)
+* A member read through a class handle (`item.item.len`) no longer picks up
+  an unrelated struct variable of the same name in another scope or another
+  process, and a class handle sent through a mailbox from a parameterized
+  class reaches the receiver while another specialization's struct receiver
+  is waiting. A `ref` or `const ref` class-handle formal keeps following the
+  caller's variable after the caller reassigns it. (#258, #260, from PR #259
+  by Taichi Ishitani)
+* A base class specialized with named parameter assignments inside an
+  `extends` argument (`extends wrap #(.BASE(base #(.REQ(REQ))))`) binds its
+  parameters by name; it used to bind them by position, which could end in a
+  null dereference.
+* A parameter declared with a type or range takes its value as an assignment
+  to that type, for its default, a `#(...)` override and a `defparam`: the
+  value is evaluated in the declared width, wrapped to it and given the
+  declared signedness. `parameter [3:0] P = -1` is 15, `signed [3:0]` turns 15
+  into -1, and `#(.P(4'hF + 4'h1))` on `[7:0]` is 16. Real values round
+  (`parameter int P = 2.6` is 3), 2-state types drop x and z, and
+  unpacked-array elements and pattern overrides wrap per element. A value
+  parameter typed by a type parameter keeps that type's full width, and a
+  range that uses another parameter of the same instance uses the instance's
+  own value. (#237, from xezim-core PR #52 and PR #264 by Ganesh T S)
+* A function or task with an early `return` inside a loop that cannot be
+  unrolled no longer crashes the bytecode compiler ("index out of bounds")
+  or leaves a caller's `break`/`continue` unpatched, which hung the
+  simulation; a `for` loop whose header falls back to the interpreter no
+  longer does either. (#268, from PR #267 by AaronKel)
+* A static call on a class specialization that nests another one or uses
+  named parameter assignments (`uvm_config_db#(cfg#(AW,DW))::get`,
+  `db#(cfg#(.AW(AW),.DW(DW)))`, `db#(.T(...))`) resolves the enclosing
+  class's parameters at every level, so the getter reaches the specialization
+  the setter wrote. (#269, from PR #270 by AaronKel)
+* `foreach` over an associative array keyed by class handles binds the loop
+  variable to the key's class, so property writes through it land; an
+  associative array returned through a class method's `output` formal is
+  copied back; and processes parked on NBA-region completion (as in
+  `uvm_wait_for_nba_region`) resume only after the time slot's queued
+  processes, their `#0` continuations and their nonblocking assignments have
+  run (IEEE 1800 §4.5). (#277, from PR #275 by Thomas Burg)
+* `Alias::type_id::create(...)` through a chain of class typedefs, including
+  package-qualified aliases and a parameterized specialization in the middle
+  of the chain, reaches the class's factory registry, so factory overrides
+  apply and the object is not null. (#274, from PR #276 by AaronKel)
+* An unrolled `for` loop over a signed variable runs the right number of
+  times when its bounds are negative (`for (int i = 1; i > -1; i--)`); it
+  used to run zero times. (#278)
+* A class member read or compared through a handle, through `this` or by its
+  bare name in a method (`t.irq != x`) is no longer mistaken for an interface
+  instance of the same name. (#271, reported by AaronKel)
+* A covergroup in a parameterized class builds its bins from that
+  specialization's parameters (`bins b[] = {[0:N-1]}`), so
+  `get_inst_coverage()` counts samples correctly. (#273, reported by AaronKel)
+* `pop_front()`/`pop_back()` on a queue of unpacked structs returns every
+  member, whether it goes to a local, a class property, a return value, an
+  argument or a declaration initializer, and the initializer form pops only
+  once. A scalar `bit` argument of a class method has the formal's one-bit
+  width. (#272, reported by AaronKel)
+* `randomize()` with a soft constraint and an array sized by the
+  constraints no longer returns 0 when the joint solver gives up: once its
+  runs are used up, an assignment that satisfies every constraint is
+  accepted. (#256, reported by Taichi Ishitani)
+* The constraint solver handles more shapes: packed-struct fields set from
+  other random variables, bit and part selects of random array elements,
+  elements or bits at positions chosen by random variables, equalities whose
+  sides wrap at their width, `$countones`, and `foreach` over a state vector.
+  (#255, reported by rharikrishna25)
+* Assertion control (§20.11, §20.12) is implemented: `$asserton`,
+  `$assertoff`, `$assertkill`, `$assertpasson`/`$assertpassoff`,
+  `$assertfailon`/`$assertfailoff`, `$assertnonvacuouson`/`$assertvacuousoff`
+  and `$assertcontrol` (Lock/Unlock, assertion-type and directive-type masks,
+  `levels` and a list of scopes or assertion names). They apply to
+  concurrent, immediate and deferred assertions and to covers; they used to
+  print "assertion control is not modeled" and be ignored, so assertions kept
+  firing after `$assertoff`.
+
+**Usability**
+
+* `-fst_scope_file <file>` reads FST dump scopes from a file (one or more per
+  line, `#`/`//` comments), and `-xezim_env <file>` sets `XEZIM_*` variables
+  from a file (`NAME=value`, `export`, `setenv`, `unsetenv` lines) before xezim
+  reads any of them, so a run's settings can live next to its file list
+  whatever shell starts it.
+
+* `-uvm` (or `--uvm`) adds the UVM library that `XEZIM_UVM_DIR` names, for
+  compile and simulation alike: its `src` directory joins the include path and
+  its `uvm_pkg.sv` the file list, so a UVM testbench needs only its own files.
+  `XEZIM_UVM_DIR` may name the `src` directory, a release root, or a checkout
+  of several releases, where `XEZIM_UVM_VERSION` picks one (default: the
+  newest). Without `-uvm` nothing is added.
+
+* `-override_timescale <unit>/<precision>` (also `--override-timescale`)
+  gives every design element, package and compilation unit one timescale,
+  replacing every `` `timescale `` directive, `timeunit`/`timeprecision`
+  declaration and `--module-timescale`: with `1ns/1ns` a bare `#10` is 10 ns
+  everywhere, with `1ps/1ps` 10 ps. Literals with a unit (`#3ns`) keep their
+  absolute value. It works on the command line and in `-f`/`-F` files.
+
+**Waveforms**
+
+* Ctrl-C and SIGTERM also stop a long loop inside one time slot, and close
+  the waveform dumps normally. When the run cannot stop (a DPI call that does
+  not return), the FST dump is closed at the current time before the process
+  ends. FST dumps reach the disk at least every 2 seconds
+  (`XEZIM_FST_FLUSH_SECS`), so a run killed with `kill -9` or by running out
+  of memory leaves a readable file up to its last write.
+
 ### 0.11.1 — complete VPI, faster memory models, IEEE 1800 conformance fixes (October 2026)
 
 **Correctness**

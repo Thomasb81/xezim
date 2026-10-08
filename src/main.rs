@@ -7,6 +7,8 @@ mod report;
 
 // Other simulators' command-line spellings (`-do`, `-g`, `-sv_seed`, ...).
 mod cli_compat;
+mod cli_files;
+mod uvm_dir;
 
 /// The library's `chatter!` for the CLI: internal lines (run banner, `[PHASE]`
 /// timings) print only under `--verbose`/`--profile`/`--sim-debug`.
@@ -145,6 +147,46 @@ fn spawn_memory_watchdog() {
     });
 }
 
+/// `-xezim_env <file>`: set (or with `unsetenv`, remove) the `XEZIM_*`
+/// variables a file lists, overriding the shell environment. Files apply in
+/// command-line order; a later setting wins.
+fn apply_xezim_env_files() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let files = match cli_files::env_files_in_args(&args) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    for f in files {
+        let text = match std::fs::read_to_string(&f) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Error: cannot read -xezim_env file '{}': {}", f, e);
+                std::process::exit(1);
+            }
+        };
+        let settings = match cli_files::parse_env_file(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error: -xezim_env file '{}': {}", f, e);
+                std::process::exit(1);
+            }
+        };
+        for (name, value) in settings {
+            // SAFETY: called first thing in `main`, before any other thread
+            // exists, so nothing reads the environment concurrently.
+            unsafe {
+                match value {
+                    Some(v) => env::set_var(&name, v),
+                    None => env::remove_var(&name),
+                }
+            }
+        }
+    }
+}
+
 fn print_usage() {
     eprintln!("Usage: xezim [mode] [options] <source_files> [plusargs]");
     eprintln!("Modes (pick one; default is 'simulate'):");
@@ -155,6 +197,8 @@ fn print_usage() {
     eprintln!("  -V               Print version and exit");
     eprintln!("  -I <dir>         Add directory to include search path");
     eprintln!("  -D <name>[=val]  Define a macro");
+    eprintln!("  -uvm, --uvm      Add the UVM library named by XEZIM_UVM_DIR (its src include");
+    eprintln!("                   dir and uvm_pkg.sv); XEZIM_UVM_VERSION picks a release");
     eprintln!("  -s <topmodule>   Specify the top-level module to elaborate");
     eprintln!("  --no-sim         Alias for --compile (deprecated)");
     eprintln!("  --preprocess     Run the preprocessor only; emit expanded text");
@@ -243,6 +287,11 @@ fn print_usage() {
     eprintln!("  -timescale <unit>/<prec>     spelled as other simulators spell it. Same rule:");
     eprintln!("                     it is a DEFAULT for design elements with no timescale");
     eprintln!("                     directive, and never overrides an explicit one.");
+    eprintln!("  -override_timescale <unit>/<prec>  One timescale for EVERY design element,");
+    eprintln!("                     package and compilation unit: every `timescale directive,");
+    eprintln!("                     `timeunit`/`timeprecision` decl and --module-timescale is");
+    eprintln!("                     ignored (e.g. 1ns/1ns, 1ps/1ps). Unit-suffixed literals");
+    eprintln!("                     such as #3ns keep their absolute value.");
     eprintln!("  --report-stats[=json]  Print an end-of-run statistics footer on stderr");
     eprintln!("                   (human text; '=json' emits one JSON line instead). Off by");
     eprintln!("                   default. XEZIM_REPORT_STATS=1|json enables it too; the");
@@ -299,6 +348,11 @@ fn print_usage() {
     eprintln!("  --fst <file>     Emit an FST (GTKWave binary) waveform dump to <file>.");
     eprintln!("  --fst-scope <hier>  Restrict the FST dump to signals under <hier>");
     eprintln!("                   (exact name or '<hier>.' prefix). Repeatable.");
+    eprintln!("  -fst_scope_file <file>  (--fst-scope-file) FST scopes from a file: one or");
+    eprintln!("                   more per line, '#' or '//' comments. Adds to --fst-scope.");
+    eprintln!("  -xezim_env <file>  (--xezim-env) Set XEZIM_* variables from a file before");
+    eprintln!("                   anything reads them: NAME=value, export NAME=value,");
+    eprintln!("                   setenv NAME value, unsetenv NAME. Overrides the shell.");
     eprintln!("  --sv2017         Parse as IEEE 1800-2017 (default is 1800-2023)");
     eprintln!("  --sv2023         Parse as IEEE 1800-2023 (default; kept for back-compat)");
     eprintln!("  --no-strict      Disable strict negative-test diagnostics (accept LRM-illegal");
@@ -469,9 +523,35 @@ fn parse_max_time(raw: &str) -> Result<u64, String> {
     Ok(rounded as u64)
 }
 
+/// Marks an `-override_timescale` value inside the `--module-timescale`
+/// argument list (a module name cannot start with `+`).
+const OVERRIDE_TIMESCALE_TAG: &str = "+force+";
+
+/// The `<unit>/<prec>` value of an `-override_timescale` spelling at `t`
+/// (`-override_timescale`, `--override_timescale`, `-override-timescale`,
+/// `--override-timescale`, each with a following value or `=value`), as
+/// `Some(Some(value))`; `Some(None)` when the value is the next token; `None`
+/// when `t` is not one of these spellings.
+fn override_timescale_flag(t: &str) -> Option<Option<&str>> {
+    let body = t.strip_prefix("--").or_else(|| t.strip_prefix('-'))?;
+    let (name, value) = match body.split_once('=') {
+        Some((n, v)) => (n, Some(v)),
+        None => (body, None),
+    };
+    matches!(name, "override_timescale" | "override-timescale").then_some(value)
+}
+
 fn build_module_timescale_cli(raw: &[String]) -> Result<xezim::ModuleTimescaleCli, String> {
     let mut cli = xezim::ModuleTimescaleCli::default();
     for spec in raw {
+        // `-override_timescale`: the last one given wins.
+        if let Some(v) = spec.strip_prefix(OVERRIDE_TIMESCALE_TAG) {
+            cli.force = Some(
+                parse_timescale_value(v)
+                    .map_err(|e| e.replace("--module-timescale", "-override_timescale"))?,
+            );
+            continue;
+        }
         let (modules, value) = match spec.split_once('=') {
             Some((m, v)) => (Some(m), v),
             None => (None, spec.as_str()),
@@ -850,6 +930,31 @@ fn process_command_file(
                 // `-F` differs from `-f` only in resolving `+incdir+` paths
                 // against the args file's own directory, else as given (see
                 // resolve_rel_file_first). `-file` is a long spelling of `-f`.
+                // `--fst-scope-file <file>` (path relative to this args
+                // file); ahead of the `-f<file>` prefix form below.
+                _ if cli_files::option_value(t, cli_files::FST_SCOPE_FILE_NAMES).is_some() => {
+                    let v = match cli_files::option_value(t, cli_files::FST_SCOPE_FILE_NAMES) {
+                        Some(Some(v)) => Some(v.to_string()),
+                        _ => {
+                            i += 1;
+                            toks.get(i).map(|s| s.to_string())
+                        }
+                    };
+                    if let Some(v) = v {
+                        compat.fst_scope_files.push(resolve_rel(base, &v));
+                    }
+                }
+                // `-xezim_env` must be on the command line: the environment
+                // is set before any args file is read.
+                _ if cli_files::option_value(t, cli_files::XEZIM_ENV_NAMES).is_some() => {
+                    if cli_files::option_value(t, cli_files::XEZIM_ENV_NAMES) == Some(None) {
+                        i += 1;
+                    }
+                    eprintln!(
+                        "Warning: -xezim_env in args file '{}' is ignored; give it on the command line",
+                        path
+                    );
+                }
                 "-f" | "-c" | "-F" | "-file" => {
                     let nested_rel = t == "-F";
                     i += 1;
@@ -957,6 +1062,20 @@ fn process_command_file(
                 _ if t.starts_with("--timescale=") => {
                     module_timescale_args.push(t["--timescale=".len()..].to_string());
                 }
+                // `-override_timescale <unit>/<prec>`: one timescale for every
+                // design element, replacing all source-level timescales.
+                _ if override_timescale_flag(t).is_some() => match override_timescale_flag(t) {
+                    Some(Some(v)) => {
+                        module_timescale_args.push(format!("{}{}", OVERRIDE_TIMESCALE_TAG, v))
+                    }
+                    _ => {
+                        if i + 1 < toks.len() {
+                            i += 1;
+                            module_timescale_args
+                                .push(format!("{}{}", OVERRIDE_TIMESCALE_TAG, toks[i]));
+                        }
+                    }
+                },
                 // commercial-simulator-compatible seed aliases: `-svseed <n>` / `-svseed=<n>`
                 // (and `-seed` likewise) lower onto the `+seed=` plusarg the
                 // simulator already consumes.
@@ -1600,6 +1719,10 @@ fn append_adopted_libs_to_merged(
 }
 
 fn main() {
+    // `-xezim_env <file>` before anything reads an `XEZIM_*` variable (this
+    // very function reads XEZIM_HUGEPAGE and XEZIM_STACK_MB). The process is
+    // still single-threaded here, so setting the environment is sound.
+    apply_xezim_env_files();
     // FIRST thing, before any large allocation: a parent can disable transparent
     // huge pages for its whole descendant tree with prctl(PR_SET_THP_DISABLE, 1),
     // and the flag is inherited across fork+exec. While set, madvise(MADV_HUGEPAGE)
@@ -1811,6 +1934,25 @@ fn run_main() -> i32 {
             _ if arg.starts_with("-D") && arg.len() > 2 => {
                 push_define_token(&arg[2..], &mut defines);
             }
+            // `-override_timescale <unit>/<prec>` (ahead of the `-o<file>` prefix
+            // form, which would take it): one timescale for every
+            // design element, replacing every `timescale directive and
+            // `timeunit`/`timeprecision` declaration.
+            _ if override_timescale_flag(arg).is_some() => match override_timescale_flag(arg) {
+                Some(Some(v)) => {
+                    module_timescale_args.push(format!("{}{}", OVERRIDE_TIMESCALE_TAG, v))
+                }
+                _ => {
+                    i += 1;
+                    if i < args.len() {
+                        module_timescale_args
+                            .push(format!("{}{}", OVERRIDE_TIMESCALE_TAG, args[i]));
+                    } else {
+                        eprintln!("Error: -override_timescale requires <unit>/<precision>");
+                        std::process::exit(1);
+                    }
+                }
+            },
             "-o" => {
                 i += 1;
                 if i < args.len() {
@@ -1848,6 +1990,37 @@ fn run_main() -> i32 {
             ) => {}
             // `-F` also resolves `+incdir+` paths against the args file's
             // directory first (resolve_rel_file_first); `-file` is `-f`.
+            // `--fst-scope-file <file>`: one `--fst-scope` per listed scope.
+            // Ahead of the `-f<file>` args-file prefix form, which would
+            // otherwise take `-fst_scope_file`.
+            _ if cli_files::option_value(arg, cli_files::FST_SCOPE_FILE_NAMES).is_some() => {
+                let path = match cli_files::option_value(arg, cli_files::FST_SCOPE_FILE_NAMES) {
+                    Some(Some(v)) => v.to_string(),
+                    _ => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(v) => v.clone(),
+                            None => {
+                                eprintln!("Error: -fst_scope_file requires a file");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => fst_scopes.extend(cli_files::parse_scope_file(&text)),
+                    Err(e) => {
+                        eprintln!("Error: cannot read -fst_scope_file '{}': {}", path, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // `-xezim_env <file>` was applied at start-up (apply_xezim_env_files).
+            _ if cli_files::option_value(arg, cli_files::XEZIM_ENV_NAMES).is_some() => {
+                if cli_files::option_value(arg, cli_files::XEZIM_ENV_NAMES) == Some(None) {
+                    i += 1;
+                }
+            }
             "-c" | "-f" | "-F" | "-file" => {
                 let incdir_rel = arg == "-F";
                 i += 1;
@@ -2699,6 +2872,40 @@ fn run_main() -> i32 {
     xezim::set_verbose(
         verbose || sim_debug || env_on("XEZIM_PROFILE_REPORT") || env_on("XEZIM_PROFILE_TIMING"),
     );
+
+    // `--fst-scope-file` given inside an args file.
+    for f in std::mem::take(&mut compat.fst_scope_files) {
+        match std::fs::read_to_string(&f) {
+            Ok(text) => fst_scopes.extend(cli_files::parse_scope_file(&text)),
+            Err(e) => {
+                eprintln!("Error: cannot read -fst_scope_file '{}': {}", f, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // `-uvm`: add the UVM library that `XEZIM_UVM_DIR` names (its `src`
+    // include directory and `uvm_pkg.sv`; src/uvm_dir.rs). Before
+    // `--dump-files-list`, so the list shows what was added.
+    match uvm_dir::apply_uvm_dir(
+        compat.uvm,
+        env::var("XEZIM_UVM_DIR").ok().as_deref(),
+        env::var("XEZIM_UVM_VERSION").ok().as_deref(),
+        &mut source_files,
+        &mut include_dirs,
+    ) {
+        uvm_dir::UvmDirAction::Added(src) if verbose => {
+            eprintln!(
+                "[xezim] -uvm: added {}/uvm_pkg.sv and its include directory",
+                src.display()
+            );
+        }
+        uvm_dir::UvmDirAction::Error(why) => {
+            eprintln!("Error: {}", why);
+            std::process::exit(1);
+        }
+        _ => {}
+    }
 
     // `--dump-files-list`: the fully resolved compilation file set, after every
     // `-f` args file has been expanded. Printed BEFORE the files are read so

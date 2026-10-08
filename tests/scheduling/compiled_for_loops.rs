@@ -350,3 +350,39 @@ endmodule
     assert_eq!(u(&sim, "state"), u64::from(state));
     assert_eq!(u(&sim, "bundle"), expected);
 }
+
+#[test]
+fn unrolled_loop_var_keeps_declared_signedness() {
+    // #278: an unrolled `for` bound its loop variable as a 32-bit unsigned
+    // constant, so `for (int i = 1; i > -1; i--)` and `for (int i = -2; i <
+    // 2; i++)` ran zero times. §6.11/§11.8.1: `int` is signed and the compare
+    // is signed; narrow loop variables wrap at their declared width.
+    // Expected values are the reference simulator's.
+    let sim =
+        simulate(include_str!("unrolled_for_signed_bounds.sv"), 100).expect("simulate failed");
+    let got: Vec<&str> = sim
+        .output
+        .iter()
+        .filter_map(|l| l.message.strip_prefix("T|"))
+        .collect();
+    let want = [
+        "desc acc=3 cnt=2",
+        "neg_start acc=2 cnt=4",
+        "ge0 acc=10 cnt=4",
+        "minus_eq acc=6 cnt=6",
+        "plus_neg acc=6 cnt=4",
+        "assign_sub acc=12 cnt=8",
+        "uint_vs_neg acc=0 cnt=0",
+        "ge0_from1 acc=3 cnt=2",
+        "byte_wrap acc=381 cnt=3",
+        "shortint acc=3 cnt=6",
+        "longint acc=3 cnt=6",
+        "integer acc=5 cnt=5",
+        "bit3_wrap acc=24 cnt=5",
+        "lsigned4 acc=0 cnt=7",
+        "neg_val acc=-734",
+        "lt0_body acc=203",
+        "fdesc 23 222 6",
+    ];
+    assert_eq!(got, want);
+}

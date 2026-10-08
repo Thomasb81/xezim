@@ -11,6 +11,10 @@
 //! plain `mod x;` beside itself, not into `tests/<group>/`. To add a test,
 //! drop the file in this group's directory and add one entry here.
 
+#[path = "scheduling/loop_frame_bail_rollback.rs"]
+mod loop_frame_bail_rollback;
+#[path = "scheduling/nba_region_waiter_order.rs"]
+mod nba_region_waiter_order;
 #[path = "scheduling/property_wait_shapes.rs"]
 mod property_wait_shapes;
 
@@ -68,6 +72,8 @@ mod condition_waiter_name_gate;
 mod dead_clock_watchdog;
 #[path = "scheduling/decl_init_time_literal_scaling.rs"]
 mod decl_init_time_literal_scaling;
+#[path = "scheduling/assertion_control.rs"]
+mod assertion_control;
 #[path = "scheduling/deferred_immediate_assertions.rs"]
 mod deferred_immediate_assertions;
 #[path = "scheduling/delay_lands_on_clock_edge.rs"]
@@ -154,6 +160,8 @@ mod nba_index_freeze_and_elem_selects;
 mod nba_intra_event_control;
 #[path = "scheduling/nba_leak_waiter_active_region.rs"]
 mod nba_leak_waiter_active_region;
+#[path = "scheduling/nba_region_join_none_order.rs"]
+mod nba_region_join_none_order;
 #[path = "scheduling/nba_region_not_flushed_mid_edge.rs"]
 mod nba_region_not_flushed_mid_edge;
 #[path = "scheduling/null_mailbox_and_stall_location.rs"]
@@ -266,6 +274,8 @@ mod lrm_audit_disable_from_fork;
 mod lrm_audit_sva;
 #[path = "scheduling/nba_array_elem_last_write_wins.rs"]
 mod nba_array_elem_last_write_wins;
+#[path = "scheduling/seq_grant_nba_region_order.rs"]
+mod seq_grant_nba_region_order;
 #[path = "scheduling/nba_wait_for_region_yield.rs"]
 mod nba_wait_for_region_yield;
 #[path = "scheduling/nested_delay_slot_servicing.rs"]

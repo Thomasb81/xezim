@@ -23,14 +23,13 @@ fn c14_10_clocking_block_events() {
 // §14.14, §6.24.2: global clocking, $cast on enums
 #[test]
 fn c14_14_global_clocking_and_6_24_2_cast() {
-    // Known gap (§20.11): `20.11` reference `fails=1`, xezim `fails=2`
     check(
         "c_left",
         include_str!("sv/c_left.sv"),
         "cleft",
         Order::Exact,
-        &["T|6.24.2d|e=B", "T|14.14|gcnt=3"],
-        &["T|20.11|"],
+        &["T|20.11|fails=1", "T|6.24.2d|e=B", "T|14.14|gcnt=3"],
+        &[],
     );
 }
 

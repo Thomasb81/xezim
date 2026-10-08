@@ -26,23 +26,27 @@ fn c20_10_severity_tasks() {
 // §20.12: Assertion control: $assertoff/$asserton/$assertkill/$assertpassoff/$assertfailoff/$assertcontrol
 #[test]
 fn c20_12_assertion_control() {
-    // Known gap (§20.12): `b` reference `after $assertoff fails=3 (unchanged expected)`, xezim `after $assertoff fails=6 (unchanged expected)`
-    // Known gap (§20.12): `c` reference `after $asserton fails=5`, xezim `after $asserton fails=8`
-    // Known gap (§20.12): `d` reference `after $assertcontrol(off) fails=5`, xezim `after $assertcontrol(off) fails=10`
     check(
         "20.12_assertion_control",
         include_str!("sv/20.12_assertion_control.sv"),
         "t20_12",
         Order::Exact,
-        &["T|a|base fails=3"],
-        &["T|b|", "T|c|", "T|d|"],
+        &[
+            "T|a|base fails=3",
+            "T|b|after $assertoff fails=3 (unchanged expected)",
+            "T|c|after $asserton fails=5",
+            "T|d|after $assertcontrol(off) fails=5",
+        ],
+        &[],
     );
 }
 
 // §20.12: assertion control: $assertoff/$asserton/$assertpassoff/$assertfailoff
 #[test]
 fn c20_12_assertion_control_tasks() {
-    // Known gap (§20.12): `20.12`: 9 reference lines differ from xezim's 9, e.g. reference `after off passes=0 fails=3`, xezim `after off passes=0 fails=6`
+    // Not compared: after `$assertpasson(0, ap)` the reference runs the PASS
+    // action of every later failure of `ap` (with `a` held at 0 it counts
+    // passes); xezim runs the fail action, as §20.12 specifies.
     check(
         "c16_ctl",
         include_str!("sv/c16_ctl.sv"),
@@ -50,15 +54,15 @@ fn c20_12_assertion_control_tasks() {
         Order::Exact,
         &[
             "T|20.12|base passes=0 fails=3",
+            "T|20.12|after off passes=0 fails=3",
+            "T|20.12|after on passes=0 fails=5",
+            "T|20.12|passoff passes=0 fails=5",
             "T|16|ap2 F t=115",
+            "T|20.12|passon passes=2 fails=5",
             "T|20.12|after kill",
         ],
         &[
-            "T|20.12|after off passes=0 fails=",
-            "T|20.12|after on passes=0 fails=",
-            "T|20.12|passoff passes=",
-            "T|20.12|passon passes=",
-            "T|20.12|failoff passes=4 fails=",
+            "T|20.12|failoff passes=",
             "T|20.12|failon passes=",
             "T|20.12|ctl off passes=",
             "T|20.12|ctl on passes=",

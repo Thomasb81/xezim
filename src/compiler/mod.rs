@@ -11,6 +11,7 @@ pub mod bytecode;
 pub mod dispatch;
 mod fb_scan;
 pub mod fst_sink;
+mod interrupt;
 pub mod jit;
 pub mod prof_sampler;
 pub mod simulator;

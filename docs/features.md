@@ -20,6 +20,12 @@ per release are in the [release notes](../NOTES.md).
   matures at the end of the time slot; a report is dropped if its process
   resumes first, and one still pending at `$finish` prints a note instead of
   running its action.
+* **Assertion control** (§20.11, §20.12) — `$asserton`, `$assertoff`,
+  `$assertkill`, the pass/fail/vacuous action-control tasks and
+  `$assertcontrol` with Lock/Unlock, the assertion-type and directive-type
+  masks, and `levels` plus a list of scopes or assertion names. They apply to
+  concurrent, immediate and deferred assertions and covers; `expect`
+  statements ignore them, as in the reference simulator.
 * **User-defined nettypes with resolution functions** (§6.6.7) —
   `nettype T wire_t with resolver;` including Z-skip and built-in resolution.
 * **Per-module timescales** (§3.14, §20.3, §21.3.5) — `$time`/`$realtime`
