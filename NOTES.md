@@ -35,6 +35,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   parameter typed by a type parameter keeps that type's full width, and a
   range that uses another parameter of the same instance uses the instance's
   own value. (#237, from xezim-core PR #52 and PR #264 by Ganesh T S)
+* A function or task with an early `return` inside a loop that cannot be
+  unrolled no longer crashes the bytecode compiler ("index out of bounds")
+  or leaves a caller's `break`/`continue` unpatched, which hung the
+  simulation; a `for` loop whose header falls back to the interpreter no
+  longer does either. (#268, from PR #267 by AaronKel)
+* A static call on a class specialization that nests another one or uses
+  named parameter assignments (`uvm_config_db#(cfg#(AW,DW))::get`,
+  `db#(cfg#(.AW(AW),.DW(DW)))`, `db#(.T(...))`) resolves the enclosing
+  class's parameters at every level, so the getter reaches the specialization
+  the setter wrote. (#269, from PR #270 by AaronKel)
 
 **Usability**
 
@@ -51,6 +61,15 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   declaration and `--module-timescale`: with `1ns/1ns` a bare `#10` is 10 ns
   everywhere, with `1ps/1ps` 10 ps. Literals with a unit (`#3ns`) keep their
   absolute value. It works on the command line and in `-f`/`-F` files.
+
+**Waveforms**
+
+* Ctrl-C and SIGTERM also stop a long loop inside one time slot, and close
+  the waveform dumps normally. When the run cannot stop (a DPI call that does
+  not return), the FST dump is closed at the current time before the process
+  ends. FST dumps reach the disk at least every 2 seconds
+  (`XEZIM_FST_FLUSH_SECS`), so a run killed with `kill -9` or by running out
+  of memory leaves a readable file up to its last write.
 
 ### 0.11.1 — complete VPI, faster memory models, IEEE 1800 conformance fixes (October 2026)
 
