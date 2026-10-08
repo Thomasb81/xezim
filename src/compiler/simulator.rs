@@ -4058,6 +4058,9 @@ struct TaskCleanup {
     saved_continue: bool,
     saved_return: bool,
     prev_static: Option<String>,
+    /// The caller's `current_auto_task` to restore on unwind (paired with
+    /// `prev_static`).
+    prev_auto: Option<String>,
     /// Set when a blocking-method inline (run_process_stmts) pushed a receiver
     /// `this`/class-context for an `obj.method()` call; pop them on unwind.
     /// Default false (free-task/same-`this` inlines don't touch those stacks).
@@ -8430,6 +8433,14 @@ pub struct Simulator {
     queues: HashMap<i64, StochasticQueue>,
     static_task_init: HashSet<String>,
     current_static_task: Option<String>,
+    /// Name of the enclosing subroutine when it is declared `automatic`
+    /// (or a class method — automatic by default, §8.6). Mirrors
+    /// `current_static_task`, but records the AUTOMATIC half of a
+    /// subroutine's lifetime so per-invocation local-array isolation can
+    /// be applied to module-scope automatic tasks/functions too, not just
+    /// class methods. `None` at top level, and for class methods (whose
+    /// locals already get isolated via the `in_method` path).
+    current_auto_task: Option<String>,
     /// Best-effort hierarchical context for resolving ambiguous leaf identifiers.
     name_resolve_hint: RefCell<Option<String>>,
     /// The scope of the code CURRENTLY executing as a process/block
@@ -12476,6 +12487,7 @@ impl Simulator {
             queues: HashMap::default(),
             static_task_init: HashSet::default(),
             current_static_task: None,
+            current_auto_task: None,
             name_resolve_hint: RefCell::new(None),
             activation_scope: RefCell::new(None),
             assoc_static_keys_cache: RefCell::new(HashMap::default()),
@@ -81087,7 +81099,7 @@ impl Simulator {
                         // other's.
                         let bare = d.name.name.clone();
                         let in_method = matches!(self.class_context_stack.last(), Some(Some(_)));
-                        let name = if in_method
+                        let name = if (in_method || self.current_auto_task.is_some())
                             && self.current_static_task.is_none()
                             && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
                         {
@@ -81395,7 +81407,7 @@ impl Simulator {
                 // key the associative locals already use.
                 let bare = d.name.name.clone();
                 let in_method = matches!(self.class_context_stack.last(), Some(Some(_)));
-                let name = if in_method
+                let name = if (in_method || self.current_auto_task.is_some())
                     && self.current_static_task.is_none()
                     && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
                 {
@@ -132856,6 +132868,7 @@ impl Simulator {
         // §21.2.1.7 `%m`: restore the caller's lexical scope.
         self.m_scope_stack = c.saved_m_scope;
         self.current_static_task = c.prev_static;
+        self.current_auto_task = c.prev_auto;
         if c.pushed_method_this {
             self.this_stack.pop();
             self.class_context_stack.pop();
@@ -133946,6 +133959,15 @@ impl Simulator {
         if matches!(td.lifetime, Some(crate::ast::types::Lifetime::Static)) {
             self.current_static_task = Some(td.name.name.name.clone());
         }
+        // §6.21: an `automatic` task's locals are per-invocation — they need
+        // the same per-call array isolation class methods get (see the
+        // enumerator-lifetime in `exec_stmt_var_decl`). A default (unmarked)
+        // module task is static and shares its locals, so only an explicit
+        // `automatic` lifetime sets this.
+        let prev_auto = self.current_auto_task.take();
+        if matches!(td.lifetime, Some(crate::ast::types::Lifetime::Automatic)) {
+            self.current_auto_task = Some(td.name.name.name.clone());
+        }
         // §9.6.2 bookkeeping: this pid is now executing an invocation of
         // the named task, so a cross-process `disable <task>` can find it.
         let tname = td.name.name.name.clone();
@@ -133972,6 +133994,7 @@ impl Simulator {
             saved_continue,
             saved_return,
             prev_static,
+            prev_auto,
             pushed_method_this: false,
             saved_spec: None,
             formal_metadata,
