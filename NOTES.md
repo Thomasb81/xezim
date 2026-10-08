@@ -56,6 +56,20 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   package-qualified aliases and a parameterized specialization in the middle
   of the chain, reaches the class's factory registry, so factory overrides
   apply and the object is not null. (#274, from PR #276 by AaronKel)
+* An unrolled `for` loop over a signed variable runs the right number of
+  times when its bounds are negative (`for (int i = 1; i > -1; i--)`); it
+  used to run zero times. (#278)
+* A class member read or compared through a handle, through `this` or by its
+  bare name in a method (`t.irq != x`) is no longer mistaken for an interface
+  instance of the same name. (#271, reported by AaronKel)
+* A covergroup in a parameterized class builds its bins from that
+  specialization's parameters (`bins b[] = {[0:N-1]}`), so
+  `get_inst_coverage()` counts samples correctly. (#273, reported by AaronKel)
+* `pop_front()`/`pop_back()` on a queue of unpacked structs returns every
+  member, whether it goes to a local, a class property, a return value, an
+  argument or a declaration initializer, and the initializer form pops only
+  once. A scalar `bit` argument of a class method has the formal's one-bit
+  width. (#272, reported by AaronKel)
 
 **Usability**
 
