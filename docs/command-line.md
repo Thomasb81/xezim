@@ -46,8 +46,8 @@ how to use them together, see the [user guide](user-guide.md).
 | `+delay_mode_zero` / `+delay_mode_unit`, `+mindelays` / `+typdelays` / `+maxdelays` | Gate-level delay modes and min/typ/max selection |
 | `--wave` | Compile the model with waveform support, enabling `$dumpfile`/`$dumpvars` (off by default; `--fst`/`--xtrace` imply it) |
 | `--fst <file>` | Emit an FST (GTKWave binary) waveform dump |
-| `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable) |
-| `-fst_scope_file <file>` (also `--fst-scope-file`, `=` form) | FST scopes from a file: one or more per line, separated by spaces or commas, with `#` or `//` comments. Each adds a `--fst-scope`. Works in `-f`/`-F` files, where a relative path resolves as given, else next to the args file |
+| `--fst-scope <hier>` | Restrict the FST dump to signals under `<hier>` (repeatable). `LEVEL:<hier>` limits the depth: `1:top.u1` dumps only `top.u1`'s own signals, `2:top.u1` one level of children too, and `0:` or no prefix every level (§21.7.1.4) |
+| `-fst_scope_file <file>` (also `--fst-scope-file`, `=` form) | FST scopes from a file, each optionally `LEVEL:SCOPE`: one or more per line, separated by spaces or commas, with `#` or `//` comments. Each adds a `--fst-scope`. Works in `-f`/`-F` files, where a relative path resolves as given, else next to the args file |
 | `-xezim_env <file>` (also `--xezim-env`, `=` form) | Set `XEZIM_*` variables from a file before xezim reads any of them: `NAME=value`, `export NAME=value`, `setenv NAME value`, `NAME value`, `unsetenv NAME`; `#`/`//` comments, quoted values. Values override the shell; several files apply in order. Command line only (an args file is read too late) |
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
@@ -80,6 +80,7 @@ unless noted.
 | `XEZIM_NO_NATIVE_CACHE=1` | Disable the persistent native-library cache (`~/.cache/xezim/native`) |
 | `XEZIM_REGIONS=1` | Fuse dependency-connected compiled combinational entries into region blocks (experimental; currently net-negative on the benchmark set) |
 | `XEZIM_STUCK_CLOCK=1` | Flag a process parked on a clock/reset that never changes while the design keeps churning edges (`abort` variant for CI) |
+| `XEZIM_INIT_REG=0\|random` | Give registers (the flops of compiled clocked blocks) a defined value at time 0 instead of x: `0`, or `random`, a per-register pattern that changes with the run's seed (`+seed=<n>`, `-sv_seed <n>`; no seed and seed 1 give the same pattern), for reset-bug hunting |
 | `XEZIM_INIT_ZERO=1` | Coerce X-initialized signals/arrays to 0 (required for some C910/C906 workloads, e.g. CoreMark) |
 | `XEZIM_FST_FLUSH_SECS=N` | `--fst`: write the in-memory value-change block to the file at least every N wall seconds (default 2; fractions allowed; `0` flushes only when the block reaches 64 MB). A run that is killed (`kill -9`, out of memory) keeps everything up to the last flush, and the file stays readable |
 | `XEZIM_PROGRESS=N` | Emit a `[PROGRESS]` line every N wall-seconds (sim_time, iters, edges_fired, nba_q) |

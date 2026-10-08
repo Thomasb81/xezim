@@ -336,6 +336,8 @@ mod randomize_dist_weights;
 mod randomize_inside_range;
 #[path = "classes/randomize_issue_255_shapes.rs"]
 mod randomize_issue_255_shapes;
+#[path = "classes/randomize_issue_261_wide.rs"]
+mod randomize_issue_261_wide;
 #[path = "classes/randomize_member_subset.rs"]
 mod randomize_member_subset;
 #[path = "classes/randomize_nonrand_members.rs"]

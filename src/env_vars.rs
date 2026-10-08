@@ -464,7 +464,7 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     (
         "XEZIM_INIT_REG",
-        "Init: initial value policy for registers (x/0/rand)",
+        "Init: initial value of registers: 0, or random (varies with +seed=/-sv_seed)",
     ),
     ("XEZIM_INIT_ZERO", "Init: start all state at 0 instead of x"),
     (

@@ -135,6 +135,8 @@ mod ifu_precode_c910_pc710;
 mod implicit_static_diagnostic;
 #[path = "misc/include_path_from_function_macro.rs"]
 mod include_path_from_function_macro;
+#[path = "misc/init_reg_seed.rs"]
+mod init_reg_seed;
 #[path = "misc/inspect_types.rs"]
 mod inspect_types;
 #[path = "misc/interconnect_and_var_ports.rs"]

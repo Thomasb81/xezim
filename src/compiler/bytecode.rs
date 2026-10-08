@@ -13140,8 +13140,12 @@ impl<'a> BytecodeCompiler<'a> {
                         _ => None,
                     });
                     if let Some(w) = w.filter(|&w| w > 0) {
+                        // §20.6.2: `$bits` returns an `integer` — signed,
+                        // so `$bits(a) - 200` is negative, not 2**32 - 72.
+                        let mut c = Value::from_u64(w as u64, 32);
+                        c.is_signed = true;
                         let r = self.alloc_reg();
-                        self.emit(Insn::LoadConst(r, Box::new(Value::from_u64(w as u64, 32))));
+                        self.emit(Insn::LoadConst(r, Box::new(c)));
                         Some(r)
                     } else {
                         if let Some(r) = self.emit_expr_fallback(expr, ctx_width, "SystemCall_bits")
