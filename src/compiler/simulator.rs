@@ -8347,6 +8347,10 @@ pub struct Simulator {
     trace_always: Option<String>,
     /// Runtime plusargs passed from CLI/filelists (e.g. +FOO, +BAR=1).
     plusargs: Vec<String>,
+    /// The seed the run chose with `+seed=<n>` / `+seed=random` / `-sv_seed`
+    /// (None: the default stream). `XEZIM_INIT_REG=random` mixes it in, so
+    /// register X-init values change with the seed.
+    run_seed: Option<u64>,
 
     /// Owned copies of every CLI arg as `CString`s. Required so that
     /// `vpi_argv` (raw `*mut c_char` pointers into these buffers) stays
@@ -12445,6 +12449,7 @@ impl Simulator {
                 .ok()
                 .map(|v| if v == "1" { String::new() } else { v }),
             plusargs: Vec::new(),
+            run_seed: None,
 
             // Default to a single-element argv so vpi_get_vlog_info
             // always returns at least argc=1 / argv[0]="xezim" even
@@ -12704,8 +12709,10 @@ impl Simulator {
                     let seed = rand::rngs::StdRng::from_entropy().r#gen::<u64>();
                     eprintln!("[xezim] random seed: {} (replay with +seed={})", seed, seed);
                     self.rng = SvRng::from_seed(seed);
+                    self.run_seed = Some(seed);
                 } else if let Ok(seed) = v.parse::<u64>() {
                     self.rng = SvRng::from_seed(seed);
+                    self.run_seed = Some(seed);
                 } else {
                     eprintln!(
                         "[xezim][warning] ignoring malformed +seed={} (want an integer or 'random')",
@@ -18903,8 +18910,9 @@ impl Simulator {
     /// blocks are not scanned (rare; their flops stay X). Writes go through
     /// `write_sig!` + dirty marking, so the time-0 settle derives all comb
     /// values and edge detection sees a legitimate X->0 (negedge, not
-    /// posedge). `random` fills inline-width flops from a per-id LCG
-    /// (reset-bug hunting); wide flops get 0 in both modes.
+    /// posedge). `random` fills inline-width flops from a per-id hash mixed
+    /// with the run's seed (`+seed=`/`-sv_seed`), so different seeds give
+    /// different patterns (reset-bug hunting); wide flops get 0 in both modes.
     ///
     /// `XEZIM_INIT_ZERO=1` is kept as a deprecated alias for `=0` (its array
     /// zeroing lives on separately as `XEZIM_INIT_MEM`).
@@ -18949,8 +18957,17 @@ impl Simulator {
             }
             let w = self.signal_widths[id];
             let mut val = if mode == 1 && w <= 64 {
-                // SplitMix64 over the signal id: stable, seedless, per-flop.
-                let mut z = (id as u64).wrapping_add(0x9e3779b97f4a7c15);
+                // SplitMix64 over the signal id, offset by the run's seed
+                // (`+seed=` / `-sv_seed`) so the X-init pattern changes with
+                // the seed. No seed, or the default seed 1, gives the
+                // historical values.
+                let salt = self
+                    .run_seed
+                    .filter(|&s| s != SvRng::DEFAULT_SEED)
+                    .map_or(0, |s| s.wrapping_add(1).wrapping_mul(0xd1b5_4a32_d192_ed03));
+                let mut z = (id as u64)
+                    .wrapping_add(0x9e3779b97f4a7c15)
+                    .wrapping_add(salt);
                 z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
                 z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
                 let bits = (z ^ (z >> 31)) & if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
@@ -96782,6 +96799,20 @@ impl Simulator {
     /// list and the `$dumpvars` depth (§21.7.1.4: 0 = all levels below the
     /// scope, N = N levels starting at the scope; a filter that names a SIGNAL
     /// rather than a scope always matches exactly).
+    /// Split an FST scope entry `LEVEL:SCOPE` (e.g. `1:top.u1`) into its depth
+    /// and scope; an entry without a numeric prefix has depth 0 (all levels).
+    /// A hierarchical name cannot start with `<digits>:`, so this is unambiguous.
+    fn fst_scope_depth(entry: &str) -> (u32, &str) {
+        if let Some((lvl, scope)) = entry.split_once(':') {
+            if !lvl.is_empty() && lvl.bytes().all(|b| b.is_ascii_digit()) {
+                if let Ok(d) = lvl.parse::<u32>() {
+                    return (d, scope);
+                }
+            }
+        }
+        (0, entry)
+    }
+
     fn dump_name_selected(name: &str, filters: Option<&[String]>, depth: u32) -> bool {
         // `rest` is the name relative to the selected scope: no dot = level 1.
         let level_ok = |rest: &str| depth == 0 || (rest.matches('.').count() as u32) < depth;
@@ -99243,7 +99274,31 @@ impl Simulator {
         // Same enumeration + top-relative scope normalization as `$dumpvars`
         // (see `dump_signal_names`): the old copy read the empty `self.signals`
         // mirror and compared absolute filter paths against relative names.
-        let sig_names: Vec<String> = self.dump_signal_names(&self.fst_scopes, 0);
+        // A scope may carry a depth, `LEVEL:SCOPE` (§21.7.1.4: 0 = every
+        // level below the scope, N = N levels starting at it). Scopes with the
+        // same depth are selected together; the union keeps first-seen order.
+        let sig_names: Vec<String> = if self.fst_scopes.is_empty() {
+            self.dump_signal_names(&self.fst_scopes, 0)
+        } else {
+            let mut groups: Vec<(u32, Vec<String>)> = Vec::new();
+            for sc in &self.fst_scopes {
+                let (depth, scope) = Self::fst_scope_depth(sc);
+                match groups.iter_mut().find(|(d, _)| *d == depth) {
+                    Some((_, g)) => g.push(scope.to_string()),
+                    None => groups.push((depth, vec![scope.to_string()])),
+                }
+            }
+            let mut seen: HashSet<String> = HashSet::default();
+            let mut out = Vec::new();
+            for (depth, scopes) in &groups {
+                for n in self.dump_signal_names(scopes, *depth) {
+                    if seen.insert(n.clone()) {
+                        out.push(n);
+                    }
+                }
+            }
+            out
+        };
         eprintln!(
             "[FST] dumping {} signals (scopes={})",
             sig_names.len(),
@@ -99255,7 +99310,11 @@ impl Simulator {
         // `--fst-scope top.gen` matches no signal — silently, since the count
         // line above only reports the total.
         if !self.fst_scopes.is_empty() {
-            let scopes = self.fst_scopes.clone();
+            let scopes: Vec<String> = self
+                .fst_scopes
+                .iter()
+                .map(|sc| Self::fst_scope_depth(sc).1.to_string())
+                .collect();
             for sc in &scopes {
                 if !self
                     .dump_signal_names(std::slice::from_ref(sc), 0)

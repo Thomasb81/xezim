@@ -90,6 +90,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Usability**
 
+* `XEZIM_INIT_REG=random` now varies with the run's seed (`+seed=<n>`,
+  `-sv_seed <n>`), so a reset bug that depends on the power-up value can be
+  found by changing the seed; the same seed reproduces the same values, and
+  no seed (or seed 1) gives the pattern earlier releases used.
+
 * `-fst_scope_file <file>` reads FST dump scopes from a file (one or more per
   line, `#`/`//` comments), and `-xezim_env <file>` sets `XEZIM_*` variables
   from a file (`NAME=value`, `export`, `setenv`, `unsetenv` lines) before xezim
@@ -111,6 +116,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   absolute value. It works on the command line and in `-f`/`-F` files.
 
 **Waveforms**
+
+* An FST scope can carry a depth, `LEVEL:SCOPE`, both in `--fst-scope` and in
+  a `-fst_scope_file`: `1:top.u_cpu` dumps only that scope's own signals,
+  `2:top.u_cpu` one level of children too, and no prefix (or `0:`) every
+  level, as `$dumpvars` does (§21.7.1.4).
 
 * Ctrl-C and SIGTERM also stop a long loop inside one time slot, and close
   the waveform dumps normally. When the run cannot stop (a DPI call that does
