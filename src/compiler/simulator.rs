@@ -3623,6 +3623,10 @@ struct CovergroupInstance {
     /// §19.3 `ref` constructor formals and their actual expressions: read
     /// again at every sample rather than captured at `new`.
     ctor_refs: Vec<(String, Expression)>,
+    /// §8.25/§19.5: the value parameters of the owning object's class
+    /// specialization (`N` of `group_n #(2)`), for bins and options of a
+    /// class-body covergroup. A constructor formal of the same name hides one.
+    class_params: Vec<(String, Value)>,
     /// Hits: coverpoint_name -> observed value -> times sampled
     point_hits: HashMap<String, HashMap<Value, u64>>,
     /// Cross hits: cross_name -> observed value tuple -> times sampled
@@ -111323,8 +111327,18 @@ impl Simulator {
     /// an inline-struct property of `box #(W)`.
     fn instance_param_scope(&self, handle: usize) -> HashMap<String, Value> {
         let mut params = self.module.parameters.clone();
+        for (n, v) in self.instance_value_params(handle) {
+            params.entry(n).or_insert(v);
+        }
+        params
+    }
+
+    /// The class value parameters bound on object `handle`, leaf class first
+    /// (§8.25): each specialization's own values, as its methods see them.
+    fn instance_value_params(&self, handle: usize) -> Vec<(String, Value)> {
+        let mut out: Vec<(String, Value)> = Vec::new();
         let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) else {
-            return params;
+            return out;
         };
         let mut cur = Some(inst.class_name.clone());
         let mut seen: HashSet<String> = HashSet::default();
@@ -111336,13 +111350,16 @@ impl Simulator {
                 break;
             };
             for (pname, _) in &cd.param_defaults {
+                if out.iter().any(|(n, _)| n == pname) {
+                    continue;
+                }
                 if let Some(v) = inst.properties.get(pname) {
-                    params.entry(pname.clone()).or_insert_with(|| v.clone());
+                    out.push((pname.clone(), v.clone()));
                 }
             }
             cur = cd.extends.clone();
         }
-        params
+        out
     }
 
     /// `(handle, prop, elem_struct)` when `lvalue` — with any trailing element
@@ -133799,6 +133816,13 @@ impl Simulator {
                 .filter(|(_, p)| matches!(p.direction, crate::ast::types::PortDirection::Ref))
                 .filter_map(|(i, p)| _args.get(i).map(|a| (p.name.name.clone(), a.clone())))
                 .collect(),
+            class_params: owner
+                .map(|h| {
+                    let mut ps = self.instance_value_params(h);
+                    ps.retain(|(n, _)| !cg_def.ports.iter().any(|p| &p.name.name == n));
+                    ps
+                })
+                .unwrap_or_default(),
             point_hits: HashMap::default(),
             bin_hits: HashMap::default(),
             trans_pos: HashMap::default(),
@@ -134329,16 +134353,37 @@ impl Simulator {
         }
     }
 
-    /// Constant value of a bin bound or option: constructor formals first,
-    /// then the design's parameters.
+    /// Constant value of a bin bound or option: constructor formals and the
+    /// owning class's value parameters first, then the design's parameters,
+    /// then both together (`[K:N+M]` mixing the two scopes).
     fn cg_const_i64(&self, e: &Expression, ctor: &[(String, Value)]) -> Option<i64> {
-        if !ctor.is_empty() {
-            let params: HashMap<String, Value> = ctor.iter().cloned().collect();
-            if let Some(v) = super::elaborate::const_eval_i64_with_params(e, Some(&params)) {
-                return Some(v);
-            }
+        if ctor.is_empty() {
+            return super::elaborate::const_eval_i64_with_params(e, Some(&self.module.parameters));
         }
-        super::elaborate::const_eval_i64_with_params(e, Some(&self.module.parameters))
+        let params: HashMap<String, Value> = ctor.iter().cloned().collect();
+        if let Some(v) = super::elaborate::const_eval_i64_with_params(e, Some(&params)) {
+            return Some(v);
+        }
+        if let Some(v) =
+            super::elaborate::const_eval_i64_with_params(e, Some(&self.module.parameters))
+        {
+            return Some(v);
+        }
+        let mut all = self.module.parameters.clone();
+        all.extend(params);
+        super::elaborate::const_eval_i64_with_params(e, Some(&all))
+    }
+
+    /// The names a bin bound or option of covergroup instance `inst` sees
+    /// besides the design's parameters: its constructor formals, then the
+    /// owning specialization's value parameters (§19.5, §8.25).
+    fn cg_bin_scope(inst: &CovergroupInstance) -> std::borrow::Cow<'_, [(String, Value)]> {
+        if inst.class_params.is_empty() {
+            return std::borrow::Cow::Borrowed(inst.ctor_args.as_slice());
+        }
+        let mut v = inst.class_params.clone();
+        v.extend(inst.ctor_args.iter().cloned());
+        std::borrow::Cow::Owned(v)
     }
 
     /// §19.7 option `name` of a coverpoint or cross (`item_opts`), else
@@ -134370,7 +134415,11 @@ impl Simulator {
         item_opts: &[(String, Expression)],
         insts: &[&CovergroupInstance],
     ) -> u64 {
-        let ctor: &[(String, Value)] = insts.first().map(|i| i.ctor_args.as_slice()).unwrap_or(&[]);
+        let scope = insts
+            .first()
+            .map(|i| Self::cg_bin_scope(i))
+            .unwrap_or_default();
+        let ctor: &[(String, Value)] = &scope;
         self.cg_option_i64(def, item_opts, "at_least", ctor)
             .unwrap_or(1)
             .max(1) as u64
@@ -134445,7 +134494,11 @@ impl Simulator {
         insts: &[&CovergroupInstance],
         width_hint: Option<u32>,
     ) -> CpShape {
-        let ctor: &[(String, Value)] = insts.first().map(|i| i.ctor_args.as_slice()).unwrap_or(&[]);
+        let scope = insts
+            .first()
+            .map(|i| Self::cg_bin_scope(i))
+            .unwrap_or_default();
+        let ctor: &[(String, Value)] = &scope;
         let excl = self.cg_excluded_ranges(cp, ctor);
         let cp_name = Self::cg_point_name(cp);
         let explicit: Vec<&crate::ast::decl::CoverBin> = cp
@@ -134713,7 +134766,11 @@ impl Simulator {
         item: &CovergroupItem,
         insts: &[&CovergroupInstance],
     ) -> Option<(u64, u64, f64)> {
-        let ctor: &[(String, Value)] = insts.first().map(|i| i.ctor_args.as_slice()).unwrap_or(&[]);
+        let scope = insts
+            .first()
+            .map(|i| Self::cg_bin_scope(i))
+            .unwrap_or_default();
+        let ctor: &[(String, Value)] = &scope;
         match item {
             CovergroupItem::Coverpoint(cp) => {
                 let at_least = self.cg_at_least(def, &cp.options, insts);
@@ -135404,7 +135461,7 @@ impl Simulator {
                         .cg_heap
                         .get(handle)
                         .and_then(|x| x.as_ref())
-                        .map(|i| i.ctor_args.clone())
+                        .map(|i| Self::cg_bin_scope(i).into_owned())
                         .unwrap_or_default();
                     // §19.5.6/§19.5.7: an ignored or illegal value is in no
                     // other bin.
@@ -135560,7 +135617,8 @@ impl Simulator {
                             .collect();
                         if let Some(Some(inst)) = self.cg_heap.get(handle) {
                             let insts = [inst];
-                            let ctor = inst.ctor_args.as_slice();
+                            let scope = Self::cg_bin_scope(inst);
+                            let ctor: &[(String, Value)] = &scope;
                             let axes: Vec<CpShape> = cr
                                 .items
                                 .iter()
