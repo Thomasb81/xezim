@@ -8,8 +8,9 @@ Thank you to everyone who has improved xezim through pull requests:
   hardening, per-process bookkeeping for methods that park mid-body, the
   condition-waiter drain de-duplication, the NBA-region lane in the
   `--max-time` hang report, class-method performance (fast accessor inlining,
-  peephole branch fusion), packed-struct rand-array constraints, and queue and
-  associative-array returns.
+  peephole branch fusion), packed-struct rand-array constraints, queue and
+  associative-array returns, handle-keyed `foreach` binding, and the resume
+  order of NBA-region waiters.
 - **Vrajesh Prakhya** — real-number modelling: Verilog-AMS `wreal` nets
   resolved by summing, user-defined nettypes across the hierarchy and in
   packages (§6.6.7, §6.6.8), real-ness of members projected from call results,
@@ -44,6 +45,7 @@ Thank you to everyone who has improved xezim through pull requests:
   (an early `return` inside a loop that cannot be unrolled used to crash the
   compiler or hang the caller's loop), and nested type arguments kept in
   static-call specializations, so `uvm_config_db#(cfg#(AW,DW))::get` reaches
-  the configuration that was set.
+  the configuration that was set, and factory `type_id::create` through chains
+  of class typedefs.
 
 New contributors are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).

@@ -45,6 +45,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   `db#(cfg#(.AW(AW),.DW(DW)))`, `db#(.T(...))`) resolves the enclosing
   class's parameters at every level, so the getter reaches the specialization
   the setter wrote. (#269, from PR #270 by AaronKel)
+* `foreach` over an associative array keyed by class handles binds the loop
+  variable to the key's class, so property writes through it land; an
+  associative array returned through a class method's `output` formal is
+  copied back; and processes parked on NBA-region completion (as in
+  `uvm_wait_for_nba_region`) resume only after the time slot's queued
+  processes, their `#0` continuations and their nonblocking assignments have
+  run (IEEE 1800 §4.5). (#277, from PR #275 by Thomas Burg)
+* `Alias::type_id::create(...)` through a chain of class typedefs, including
+  package-qualified aliases and a parameterized specialization in the middle
+  of the chain, reaches the class's factory registry, so factory overrides
+  apply and the object is not null. (#274, from PR #276 by AaronKel)
 
 **Usability**
 
