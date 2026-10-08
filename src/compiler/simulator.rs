@@ -131187,6 +131187,66 @@ impl Simulator {
     /// local even when the actual has the formal's own name; `output` starts
     /// empty. §13.5.2: a `ref` formal ALIASES the actual's storage, so
     /// concurrent callers' writes all land in it.
+    /// §13.5.2: resolve the ACTUAL of an unpacked-array formal (associative,
+    /// fixed-size, or queue) to its storage key, whatever the spelling:
+    /// a bare name (a caller-local, or an implicit-`this` class member under
+    /// its per-process/per-instance key), an explicit member access
+    /// (`c.member` / `this.member`), or a member chain (`a.b.member`).
+    /// `queue_actual_storage` covers queues; this is the variant fixed_, array_
+    /// and assoc_ binders share, so an `output`/`inout`/`ref` FORMAL whose
+    /// actual is a CLASS PROPERTY writes back to the property, not to a stray
+    /// bare-named signal (PR #275 follow-up: `fill(prop)`).
+    fn array_actual_storage(&mut self, arg: &Expression) -> Option<String> {
+        use crate::ast::expr::ExprKind;
+        let cname = match &arg.kind {
+            // A bare name: a caller-local collection (under its per-process
+            // rename), or an implicit-`this` unpacked-array property stored at
+            // `<handle>#member` (an assoc / fixed-array formal actual
+            // `fill(A)` inside the method — PR #275 follow-up).
+            ExprKind::Ident(h) if h.path.len() == 1 => {
+                let mut n = self.resolve_hier_name(h);
+                if let Some(r) = self.dyn_name_lookup(&n) {
+                    n = std::borrow::Cow::Owned(r.to_string());
+                } else if let Some(s) = self.instance_assoc_member(&n) {
+                    n = std::borrow::Cow::Owned(s);
+                }
+                n.into_owned()
+            }
+            // A flattened member chain `a.b.member` naming an unpacked-array
+            // property. HEAD is the base object; middle segments are
+            // handle-valued properties; the LAST names the collection, stored
+            // per instance at `<handle>#member`.
+            ExprKind::Ident(h)
+                if h.path.len() >= 2 && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let head = &h.path[0].name.name;
+                let leaf = h.path.last().unwrap().name.name.clone();
+                let mut handle = self.eval_ident_handle(head)?;
+                for seg in h.path.iter().take(h.path.len() - 1).skip(1) {
+                    handle = self.member_handle(handle, &seg.name.name)?;
+                }
+                self.handle_collection_name(handle, &leaf)?
+            }
+            // An explicit member access `c.member` / `this.member` naming an
+            // unpacked-array property: evaluate the receiver to its object
+            // handle and resolve `<handle>#member`.
+            ExprKind::MemberAccess { expr, member } => {
+                let handle = self.eval_handle_expr(expr)?;
+                self.handle_collection_name(handle, &member.name)?
+            }
+            _ => return None,
+        };
+        if !self.module.arrays.contains_key(&*cname)
+            && !self.module.dynamic_arrays.contains(&*cname)
+            && !self.module.associative_arrays.contains_key(&*cname)
+            && !self.module.arrays_2d.contains_key(&*cname)
+            && !self.module.arrays_nd.contains_key(&*cname)
+        {
+            return None;
+        }
+        Some(cname)
+    }
+
     fn bind_assoc_param(
         &mut self,
         port: &crate::ast::decl::FunctionPort,
@@ -131195,10 +131255,7 @@ impl Simulator {
         if !self.port_is_assoc_array(port) {
             return None;
         }
-        let ExprKind::Ident(hier) = &arg.kind else {
-            return None;
-        };
-        let caller = self.resolve_hier_name(hier).into_owned();
+        let caller = self.array_actual_storage(arg)?;
         let param = port.name.name.clone();
         if matches!(port.direction, PortDirection::Ref) {
             self.map_formal_dyn(&param, &caller);
@@ -131334,18 +131391,13 @@ impl Simulator {
             }
             _ => return None,
         };
-        let ExprKind::Ident(h) = &arg.kind else {
-            return None;
-        };
-        let mut caller = self.resolve_hier_name(h);
-        // §18.5.12 / §13.5.2: the actual may be a fixed-array CLASS member
-        // (`calculate_array_parity(payload_bytes)` inside a constraint), whose
-        // storage lives at `<handle>#<member>`, not under the bare name.
-        if !self.module.arrays.contains_key(&*caller) {
-            if let Some(scoped) = self.instance_assoc_member(&caller) {
-                caller = std::borrow::Cow::Owned(scoped);
-            }
-        }
+        // §18.5.12 / §13.5.2: resolve the actual's storage key across every
+        // spelling — a bare name (a caller-local, or an implicit-`this` member
+        // under `<handle>#<member>`), or an explicit member access `c.member` /
+        // `this.member` / `a.b.member` (handled by `array_actual_storage`;
+        // a fixed-array property actual `parity_bytes` previously returned
+        // None here, dropping the writeback).
+        let caller = self.array_actual_storage(arg)?;
         // §13.5.2 multi-dimensional formal (`int a[R][C]`, `a[X][Y][Z]`): copy
         // every element of the caller's array in under the formal's name and
         // register the same shape, so element, `foreach`, `%p`, `$size` and
