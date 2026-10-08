@@ -107,6 +107,8 @@ mod assoc_of_struct;
 mod builtin_class_construction_forms;
 #[path = "collections/class_member_semaphore_keys.rs"]
 mod class_member_semaphore_keys;
+#[path = "collections/count_methods_return_signed_int.rs"]
+mod count_methods_return_signed_int;
 #[path = "collections/foreach_live_size_bounds.rs"]
 mod foreach_live_size_bounds;
 #[path = "collections/foreach_packed_multidim.rs"]

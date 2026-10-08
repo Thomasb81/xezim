@@ -87,8 +87,33 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   concurrent, immediate and deferred assertions and to covers; they used to
   print "assertion control is not modeled" and be ignored, so assertions kept
   firing after `$assertoff`.
+* `size()` on queues and dynamic arrays, `num()`/`size()` on associative
+  arrays, `len()` on strings, `num()` on enums and mailboxes, and the array
+  query functions (`$size`, `$bits`, `$unpacked_dimensions`, ...) return a
+  signed `int`, so `q.size() - 2` on an empty queue is -2 and a loop such as
+  `for (i = 0; i < q.size() - 1; i++)` no longer runs about 4 billion times.
+  `$size` of an associative array is its number of entries, and `$bits` of a
+  queue is its current size in bits. (#280)
+* A `wait (...)` inside a DPI-exported task called from C blocks until its
+  condition holds even when a timed event (a clock) is pending; it used to
+  hang until the run ended. This covers event `.triggered`, nets and the
+  task's own automatic variables, other processes' `wait`s keep resuming
+  meanwhile, and a wait that can never be satisfied ends the run with the
+  task still waiting. (#279, reported by Dragon-Git)
+* `randomize()` solves classes with rand variables wider than 64 bits: a wide
+  member that no constraint reads no longer blocks the rest of the class, and
+  shifts by a constant, masks, part and bit selects, struct fields,
+  `==`/`!=`, `inside` and comparisons on wide scalars, wide array elements
+  and wide packed structs are solved over 64-bit segments. Arithmetic on a
+  wide variable is still left to the trial loop. (#261, reported by Taichi
+  Ishitani)
 
 **Usability**
+
+* `XEZIM_INIT_REG=random` now varies with the run's seed (`+seed=<n>`,
+  `-sv_seed <n>`), so a reset bug that depends on the power-up value can be
+  found by changing the seed; the same seed reproduces the same values, and
+  no seed (or seed 1) gives the pattern earlier releases used.
 
 * `-fst_scope_file <file>` reads FST dump scopes from a file (one or more per
   line, `#`/`//` comments), and `-xezim_env <file>` sets `XEZIM_*` variables
@@ -111,6 +136,11 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   absolute value. It works on the command line and in `-f`/`-F` files.
 
 **Waveforms**
+
+* An FST scope can carry a depth, `LEVEL:SCOPE`, both in `--fst-scope` and in
+  a `-fst_scope_file`: `1:top.u_cpu` dumps only that scope's own signals,
+  `2:top.u_cpu` one level of children too, and no prefix (or `0:`) every
+  level, as `$dumpvars` does (§21.7.1.4).
 
 * Ctrl-C and SIGTERM also stop a long loop inside one time slot, and close
   the waveform dumps normally. When the run cannot stop (a DPI call that does

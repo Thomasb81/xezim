@@ -332,6 +332,8 @@ mod randomize_inside_range;
 mod randomize_issue_255_shapes;
 #[path = "classes/randomize_with_receiver_qualified_element.rs"]
 mod randomize_with_receiver_qualified_element;
+#[path = "classes/randomize_issue_261_wide.rs"]
+mod randomize_issue_261_wide;
 #[path = "classes/randomize_member_subset.rs"]
 mod randomize_member_subset;
 #[path = "classes/randomize_nonrand_members.rs"]

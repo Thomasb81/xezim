@@ -218,3 +218,57 @@ fn fst_scope_file_adds_scopes() {
     assert!(fst_line(&out).contains("scopes=2"), "{}", out);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Three levels, one register each: `top.a`, `top.m1.b`, `top.m1.l1.c`.
+const NESTED: &str = "module top;\n  mid m1();\n  reg a = 0;\n  initial #10 $finish;\nendmodule\nmodule mid;\n  leaf l1();\n  reg b = 0;\nendmodule\nmodule leaf;\n  reg c = 0;\nendmodule\n";
+
+/// The number of signals the `[FST] dumping N signals` line reports.
+fn fst_count(out: &str) -> usize {
+    let l = fst_line(out);
+    l.split_whitespace()
+        .nth(2)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no [FST] line:\n{}", out))
+}
+
+#[test]
+fn fst_scope_depth_limits_levels() {
+    // IEEE 1800-2023 §21.7.1.4: 0 = every level below the scope, N = N
+    // levels starting at the scope.
+    let d = scratch("depth");
+    std::fs::write(d.join("tb.sv"), NESTED).unwrap();
+    let count = |scopes: &[&str]| {
+        let mut args = vec!["--fst", "d.fst"];
+        for s in scopes {
+            args.extend(["--fst-scope", s]);
+        }
+        args.extend(["-s", "top", "tb.sv"]);
+        let (rc, out) = run(&d, &[], &args);
+        assert_eq!(rc, 0, "{:?}: {}", scopes, out);
+        fst_count(&out)
+    };
+    let all = count(&["top.m1"]);
+    assert_eq!(count(&["0:top.m1"]), all, "0: means every level");
+    assert_eq!(count(&["1:top.m1"]), 1, "1: is the scope's own signals (b)");
+    assert_eq!(count(&["2:top.m1"]), 2, "2: adds one level of children (c)");
+    assert_eq!(all, 2);
+    // Mixed depths in one list, and from a scope file.
+    assert_eq!(count(&["1:top.m1", "top.m1.l1"]), 2);
+    std::fs::write(d.join("depth.txt"), "1:top.m1   # only b\n").unwrap();
+    let (rc, out) = run(
+        &d,
+        &[],
+        &[
+            "--fst",
+            "e.fst",
+            "-fst_scope_file",
+            "depth.txt",
+            "-s",
+            "top",
+            "tb.sv",
+        ],
+    );
+    assert_eq!(rc, 0, "{}", out);
+    assert_eq!(fst_count(&out), 1, "{}", out);
+    let _ = std::fs::remove_dir_all(&d);
+}
