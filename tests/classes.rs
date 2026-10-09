@@ -338,6 +338,8 @@ mod randomize_issue_255_shapes;
 mod randomize_issue_261_wide;
 #[path = "classes/randomize_with_receiver_qualified_element.rs"]
 mod randomize_with_receiver_qualified_element;
+#[path = "classes/randomize_with_receiver_scope.rs"]
+mod randomize_with_receiver_scope;
 #[path = "classes/randomize_member_subset.rs"]
 mod randomize_member_subset;
 #[path = "classes/randomize_nonrand_members.rs"]

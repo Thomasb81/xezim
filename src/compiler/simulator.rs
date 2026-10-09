@@ -6752,6 +6752,9 @@ pub struct Simulator {
     /// solver recognises `recv.member` as the object's own `member` when
     /// `recv` is this receiver AND `member` is a rand property.
     rand_receiver: Option<String>,
+    /// `method_local_base` entry of the solve frame `rand_receiver` belongs
+    /// to; see `active_rand_receiver`.
+    rand_receiver_base: usize,
     /// §8.10: property names declared by MORE than one class of some object's
     /// inheritance chain. Non-leaf declarers' copies are stored under
     /// `"<Class>::<name>"`; the set is the cheap gate that keeps every
@@ -11950,6 +11953,7 @@ impl Simulator {
             obj_rng: HashMap::default(),
             obj_rng_stack: Vec::new(),
             rand_receiver: None,
+            rand_receiver_base: 0,
             randomize_subset: None,
             shadowed_prop_names: HashSet::default(),
             shadowed_prop_mask: 0,
@@ -69958,7 +69962,7 @@ impl Simulator {
         // `prefixed_self_member`). Pure read — no scope mutation.
         if self.rand_receiver.is_some() {
             if let Some(rn) = Self::plain_ident_name(expr) {
-                if self.rand_receiver.as_deref() == Some(&rn) {
+                if self.active_rand_receiver() == Some(&rn) {
                     if let Some(&obj) = self.obj_rng_stack.last() {
                         let v = self
                             .heap
@@ -103752,12 +103756,16 @@ impl Simulator {
         self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
         let prev_receiver = std::mem::replace(&mut self.rand_receiver, receiver);
+        // `exec_randomize_inner` pushes the solve frame next, so its
+        // `method_local_base` entry is the current frame count.
+        let prev_base = std::mem::replace(&mut self.rand_receiver_base, self.local_stack.len());
         let prev_subset = std::mem::replace(&mut self.randomize_subset, subset);
         let inline_src_file = (!items.is_empty())
             .then(|| self.current_src_file())
             .flatten();
         let r = self.exec_randomize_inner(handle, items, inline_src_file);
         self.randomize_subset = prev_subset;
+        self.rand_receiver_base = prev_base;
         self.rand_receiver = prev_receiver;
         self.obj_rng_stack.pop();
         self.end_randomize_budget();
@@ -109977,7 +109985,7 @@ impl Simulator {
             None => {
                 let (recv, prop) = Self::split_trailing_member(base)?;
                 let rn = Self::plain_ident_name(&recv)?;
-                if self.rand_receiver.as_deref() != Some(rn.as_str()) {
+                if self.active_rand_receiver() != Some(rn.as_str()) {
                     return None;
                 }
                 (self.this_stack.last().copied().flatten()?, prop)
@@ -144994,6 +145002,28 @@ impl Simulator {
         None
     }
 
+    /// §18.7 — the receiver name of the in-flight `obj.randomize() with
+    /// {…}`, while it may stand for the randomized object. Two limits:
+    /// - only in the solve's own frame, where the inline items are
+    ///   evaluated. `pre_randomize`/`post_randomize` and any method they
+    ///   call run in their own frames, where `obj` is an ordinary name;
+    /// - names in the inline block resolve in the object's scope first, so
+    ///   when the object has a property called `obj`, `obj.member` is that
+    ///   property's member, not the receiver's.
+    fn active_rand_receiver(&self) -> Option<&str> {
+        let recv = self.rand_receiver.as_deref()?;
+        if self.method_local_base.last() != Some(&self.rand_receiver_base) {
+            return None;
+        }
+        let obj = *self.obj_rng_stack.last()?;
+        let shadowed = self
+            .heap
+            .get(obj)
+            .and_then(|o| o.as_ref())
+            .is_some_and(|i| i.properties.contains_key(recv));
+        (!shadowed).then_some(recv)
+    }
+
     /// §18.7 — inside `obj.randomize() with { … }`, a receiver-prefixed
     /// reference (`obj.member`, then indexed as `obj.member[i]`) names the
     /// randomized object's OWN property. The element and whole-element
@@ -145004,7 +145034,7 @@ impl Simulator {
     /// not such a reference (either parse shape: `MemberAccess` or a
     /// two-segment dotted `Ident`).
     fn strip_rand_receiver_prefix(&self, expr: &Expression) -> Option<Expression> {
-        let recv = self.rand_receiver.as_deref()?;
+        let recv = self.active_rand_receiver()?;
         let member: crate::ast::Identifier = match &expr.kind {
             ExprKind::MemberAccess { expr: base, member } => {
                 if Self::plain_ident_name(base).as_deref() != Some(recv) {
@@ -145060,7 +145090,7 @@ impl Simulator {
         // (eval returns 0), so recognise it by name when it matches the
         // `obj.randomize() with { obj.member … }` receiver.
         if let Some(rn) = Self::plain_ident_name(recv) {
-            if self.rand_receiver.as_deref() == Some(&rn) {
+            if self.active_rand_receiver() == Some(&rn) {
                 return Some(prop);
             }
         }
