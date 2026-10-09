@@ -71669,7 +71669,10 @@ impl Simulator {
         if self.rand_receiver.is_some()
             && matches!(
                 expr.kind,
-                ExprKind::Index { .. } | ExprKind::RangeSelect { .. }
+                ExprKind::Index { .. }
+                    | ExprKind::RangeSelect { .. }
+                    | ExprKind::MemberAccess { .. }
+                    | ExprKind::Call { .. }
             )
         {
             let rebuilt = match &expr.kind {
@@ -71700,6 +71703,40 @@ impl Simulator {
                         expr.span,
                     )
                 }),
+                // `obj.m.size` / `obj.m.size()` and other members or methods
+                // of a receiver-prefixed property: the sizing pass resizes
+                // the object's own `m`, so the acceptance check must read it.
+                ExprKind::MemberAccess { expr: base, member } => {
+                    self.strip_rand_receiver_prefix(base).map(|b| {
+                        Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(b),
+                                member: member.clone(),
+                            },
+                            expr.span,
+                        )
+                    })
+                }
+                ExprKind::Call { func, args } => match &func.kind {
+                    ExprKind::MemberAccess { expr: base, member } => {
+                        self.strip_rand_receiver_prefix(base).map(|b| {
+                            Expression::new(
+                                ExprKind::Call {
+                                    func: Box::new(Expression::new(
+                                        ExprKind::MemberAccess {
+                                            expr: Box::new(b),
+                                            member: member.clone(),
+                                        },
+                                        func.span,
+                                    )),
+                                    args: args.clone(),
+                                },
+                                expr.span,
+                            )
+                        })
+                    }
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(stripped) = rebuilt {
@@ -140515,6 +140552,8 @@ impl Simulator {
     /// (`m[i].size()`).
     fn size_cons_in_item(&mut self, item: &ConstraintItem, prop: &str, row: bool) -> Vec<SizeCon> {
         let mut out: Vec<SizeCon> = Vec::new();
+        let recv = self.active_rand_receiver().map(str::to_owned);
+        let recv = recv.as_deref();
         match item {
             ConstraintItem::Block(items) => {
                 for i in items {
@@ -140555,7 +140594,7 @@ impl Simulator {
                 range,
                 is_dist,
                 ..
-            } if !*is_dist && Self::is_size_call(expr, prop, row) => {
+            } if !*is_dist && Self::is_size_call(expr, prop, row, recv) => {
                 let rs = range.clone();
                 out.push(SizeCon::In(self.eval_range_list(&rs)));
             }
@@ -140577,9 +140616,9 @@ impl Simulator {
                     }
                 }
                 ExprKind::Binary { op, left, right } => {
-                    let (sz_side, other, flip) = if Self::is_size_call(left, prop, row) {
+                    let (sz_side, other, flip) = if Self::is_size_call(left, prop, row, recv) {
                         (true, right, false)
-                    } else if Self::is_size_call(right, prop, row) {
+                    } else if Self::is_size_call(right, prop, row, recv) {
                         (true, left, true)
                     } else {
                         (false, right, false)
@@ -140614,7 +140653,7 @@ impl Simulator {
                 ExprKind::Inside {
                     expr: inner,
                     ranges,
-                } if Self::is_size_call(inner, prop, row) => {
+                } if Self::is_size_call(inner, prop, row, recv) => {
                     let cr: Vec<ConstraintRange> = ranges
                         .iter()
                         .map(|r| match &r.kind {
@@ -140655,13 +140694,16 @@ impl Simulator {
     }
 
     /// `m.size()` (row=false) / `m[i].size()` (row=true) receiver test.
-    fn is_size_call(e: &Expression, prop: &str, row: bool) -> bool {
+    /// `recv` is the active `obj.randomize() with {…}` receiver
+    /// (`active_rand_receiver`): §18.7, `obj.m.size()` in the inline block
+    /// sizes the object's own `m`.
+    fn is_size_call(e: &Expression, prop: &str, row: bool, recv: Option<&str>) -> bool {
         // The built-in array `size` method (§7.4.2) may be written either as a
         // no-argument call (`q.size()`) or as a bare member access (`q.size`).
         // Both denote the same method; a constraint like `q.size inside
         // {[1:11]}` parses to the member-access form, so the matcher must
         // accept both shapes.
-        let recv = match &e.kind {
+        let arr = match &e.kind {
             ExprKind::Call { func, args } if args.is_empty() => match &func.kind {
                 ExprKind::MemberAccess { expr, member } if member.name == "size" => expr,
                 _ => return false,
@@ -140669,12 +140711,18 @@ impl Simulator {
             ExprKind::MemberAccess { expr, member } if member.name == "size" => expr,
             _ => return false,
         };
-        match (&recv.kind, row) {
-            (ExprKind::Ident(h), false) => h.path.last().is_some_and(|s| s.name.name == prop),
-            (ExprKind::Index { expr: b, .. }, true) => match &b.kind {
-                ExprKind::Ident(h) => h.path.last().is_some_and(|s| s.name.name == prop),
-                _ => false,
-            },
+        let names_prop = |b: &Expression| match &b.kind {
+            ExprKind::Ident(h) => h.path.last().is_some_and(|s| s.name.name == prop),
+            ExprKind::MemberAccess { expr, member } => {
+                member.name == prop
+                    && recv.is_some()
+                    && Self::plain_ident_name(expr).as_deref() == recv
+            }
+            _ => false,
+        };
+        match (&arr.kind, row) {
+            (ExprKind::Index { expr: b, .. }, true) => names_prop(b),
+            (_, false) => names_prop(arr),
             _ => false,
         }
     }
@@ -141738,7 +141786,10 @@ impl Simulator {
                     .filter(|c| c.kind == CollKind::Dyn)
                     .map(|c| c.prop.clone())
                     .collect();
-                let touches = names.iter().any(|n| Self::item_has_size_call(item, n));
+                let recv = self.active_rand_receiver();
+                let touches = names
+                    .iter()
+                    .any(|n| Self::item_has_size_call(item, n, recv));
                 if !touches {
                     return None;
                 }
@@ -141749,24 +141800,28 @@ impl Simulator {
     }
 
     /// Does the item contain a `<prop>.size()` / `<prop>[i].size()` call?
-    fn item_has_size_call(item: &ConstraintItem, prop: &str) -> bool {
-        fn in_expr(e: &Expression, prop: &str) -> bool {
-            if Simulator::is_size_call(e, prop, false) || Simulator::is_size_call(e, prop, true) {
+    fn item_has_size_call(item: &ConstraintItem, prop: &str, recv: Option<&str>) -> bool {
+        fn in_expr(e: &Expression, prop: &str, recv: Option<&str>) -> bool {
+            if Simulator::is_size_call(e, prop, false, recv)
+                || Simulator::is_size_call(e, prop, true, recv)
+            {
                 return true;
             }
             match &e.kind {
-                ExprKind::Binary { left, right, .. } => in_expr(left, prop) || in_expr(right, prop),
-                ExprKind::Unary { operand, .. } => in_expr(operand, prop),
-                ExprKind::Paren(i) => in_expr(i, prop),
+                ExprKind::Binary { left, right, .. } => {
+                    in_expr(left, prop, recv) || in_expr(right, prop, recv)
+                }
+                ExprKind::Unary { operand, .. } => in_expr(operand, prop, recv),
+                ExprKind::Paren(i) => in_expr(i, prop, recv),
                 ExprKind::Inside { expr, ranges } => {
-                    in_expr(expr, prop) || ranges.iter().any(|r| in_expr(r, prop))
+                    in_expr(expr, prop, recv) || ranges.iter().any(|r| in_expr(r, prop, recv))
                 }
                 _ => false,
             }
         }
         match item {
-            ConstraintItem::Expr(e) => in_expr(e, prop),
-            ConstraintItem::Inside { expr, .. } => in_expr(expr, prop),
+            ConstraintItem::Expr(e) => in_expr(e, prop, recv),
+            ConstraintItem::Inside { expr, .. } => in_expr(expr, prop, recv),
             _ => false,
         }
     }
@@ -143800,10 +143855,10 @@ impl Simulator {
                     // §18.5.8.1: `arr.size() == n` sizes the rand array FROM
                     // n; reading the current size back into n pinned n to
                     // the previous call's length forever.
-                    if rand_colls
-                        .iter()
-                        .any(|c| c.kind == CollKind::Dyn && Self::item_has_size_call(item, &c.prop))
-                    {
+                    if rand_colls.iter().any(|c| {
+                        c.kind == CollKind::Dyn
+                            && Self::item_has_size_call(item, &c.prop, self.active_rand_receiver())
+                    }) {
                         continue;
                     }
                     if let ConstraintItem::Expr(expr) = item {
@@ -147213,13 +147268,17 @@ impl Simulator {
             ExprKind::MemberAccess { expr, member } if member.name == "size" => expr,
             _ => return false,
         };
-        let ExprKind::Ident(h) = &arr.kind else {
-            return false;
+        let name = match &arr.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 => &h.path[0].name.name,
+            // §18.7: `obj.m.size()` in `obj.randomize() with {…}`.
+            ExprKind::MemberAccess { expr, member }
+                if self.active_rand_receiver().is_some()
+                    && Self::plain_ident_name(expr).as_deref() == self.active_rand_receiver() =>
+            {
+                &member.name
+            }
+            _ => return false,
         };
-        if h.path.len() != 1 {
-            return false;
-        }
-        let name = &h.path[0].name.name;
         let cn = match self.heap.get(handle).and_then(|o| o.as_ref()) {
             Some(inst) => inst.class_name.clone(),
             None => return false,
