@@ -48,10 +48,7 @@ endmodule
         .iter()
         .map(|o| o.message.clone())
         .collect();
-    let want = [
-        "RES assoc=1 fixed=42",
-        "TAG_PASS",
-    ];
+    let want = ["RES assoc=1 fixed=42", "TAG_PASS"];
     assert_eq!(out, want, "{out:?}");
 }
 
@@ -100,7 +97,10 @@ endmodule
         .iter()
         .map(|o| o.message.clone())
         .collect();
-    assert!(out.contains(&"TAG_PASS all=42,43,44 42,43".to_string()), "{out:?}");
+    assert!(
+        out.contains(&"TAG_PASS all=42,43,44 42,43".to_string()),
+        "{out:?}"
+    );
 }
 
 /// The #277 caller-local shape must keep working (regression guard), and the
@@ -135,9 +135,6 @@ endmodule
         .iter()
         .map(|o| o.message.clone())
         .collect();
-    let want = [
-        "LOCAL=42 MEMBER=42",
-        "TAG_PASS",
-    ];
+    let want = ["LOCAL=42 MEMBER=42", "TAG_PASS"];
     assert_eq!(out, want, "{out:?}");
 }

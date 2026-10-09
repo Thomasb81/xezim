@@ -132267,6 +132267,38 @@ impl Simulator {
         tmp
     }
 
+    /// Stage every `output`/`inout`/`ref` associative formal of a returning
+    /// call (`(formal, caller actual, is_out)`; an identity binding, formal
+    /// named like its actual, has nothing to copy) before
+    /// `pop_and_restore_queue_frame` tears the formal's per-call key down.
+    /// Returns `(temp key, caller)` pairs for `apply_assoc_writebacks`.
+    fn stage_assoc_writebacks<'a>(
+        &mut self,
+        formals: impl Iterator<Item = (&'a str, &'a str, bool)>,
+    ) -> Vec<(String, String)> {
+        let mut staged = Vec::new();
+        for (param, caller, is_out) in formals {
+            if is_out && param != caller {
+                staged.push((self.stage_assoc_formal(param), caller.to_string()));
+            }
+        }
+        staged
+    }
+
+    /// §13.5.2: after the caller's shadowed storage (and its associative
+    /// registration) is restored, copy each staged formal onto the caller's
+    /// array and drop the staged keys.
+    fn apply_assoc_writebacks(&mut self, staged: Vec<(String, String)>) {
+        for (tmp, caller) in staged {
+            self.writeback_assoc_param(&tmp, &caller);
+            let tprefix = format!("{}[", tmp);
+            for k in self.signals.keys_with_elem_prefix(&tprefix) {
+                self.signals.remove(&k);
+            }
+            self.signals.remove(&format!("{}.size", tmp));
+        }
+    }
+
     /// Copy a `ref`/`output`/`inout` associative formal back onto the caller's
     /// array, replacing its contents.
     fn writeback_assoc_param(&mut self, param: &str, caller: &str) {
@@ -133767,17 +133799,11 @@ impl Simulator {
         // the storage is still live (mirroring ``stage_queue_param``); fixed-
         // array formals keep bare keys that survive, so their writeback reads
         // ``param`` directly after the restore.
-        let mut assoc_wb: Vec<(String, String, Option<bool>)> = Vec::new();
-        for (param, caller, is_out, prior) in &assoc_params {
-            if param == caller {
-                continue;
-            }
-            if !is_out {
-                continue;
-            }
-            let tmp = self.stage_assoc_formal(param);
-            assoc_wb.push((tmp, caller.clone(), *prior));
-        }
+        let assoc_wb = self.stage_assoc_writebacks(
+            assoc_params
+                .iter()
+                .map(|(p, c, out, _)| (p.as_str(), c.as_str(), *out)),
+        );
         // Copy `output`/`inout`/`ref` formals back to the caller's actuals
         // before popping this frame's locals.
         let writebacks: Vec<(String, Value, Expression)> = output_bindings
@@ -133830,23 +133856,7 @@ impl Simulator {
         // write back assoc formals (from the staged temp key) and fixed-array
         // formals (from the surviving bare keys), then purge each formal
         // registration. See the deferred-capture block before the pop.
-        for (tmp, caller, _prior) in assoc_wb {
-            self.writeback_assoc_param(&tmp, &caller);
-            // A callee local shadowing the caller's actual removed the
-            // caller's flat `module.associative_arrays` registration at its
-            // declaration; the queue-frame restore does not put it back.
-            // Re-register so a later `A["x"]` read resolves the writeback.
-            if !self.module.associative_arrays.contains_key(&caller) {
-                self.module.associative_arrays.insert(caller.clone(), true);
-            }
-            // Drop the staged temp-plus elements.
-            let tprefix = format!("{}[", tmp);
-            let keys: Vec<String> = self.signals.keys_with_elem_prefix(&tprefix);
-            for k in keys {
-                self.signals.remove(&k);
-            }
-            self.signals.remove(&format!("{}.size", tmp));
-        }
+        self.apply_assoc_writebacks(assoc_wb);
         for (param, caller, _is_out, prior) in assoc_params {
             if param == caller {
                 // Formal aliases the caller's namespace; the body's writes
@@ -133985,13 +133995,11 @@ impl Simulator {
         let assoc_params = std::mem::take(&mut c.assoc_params);
         let wb = c.array_writebacks.clone();
         let array_params = std::mem::take(&mut c.array_params);
-        let mut assoc_wb: Vec<(String, String)> = Vec::new();
-        for (param_name, caller_name, is_out) in &assoc_params {
-            if *is_out && param_name != caller_name {
-                let tmp = self.stage_assoc_formal(param_name);
-                assoc_wb.push((tmp, caller_name.clone()));
-            }
-        }
+        let assoc_wb = self.stage_assoc_writebacks(
+            assoc_params
+                .iter()
+                .map(|(p, c, out)| (p.as_str(), c.as_str(), *out)),
+        );
         let identity_params: std::collections::HashSet<&String> = wb
             .iter()
             .filter(|(p, c2, ..)| p == c2)
@@ -134003,18 +134011,7 @@ impl Simulator {
         // The caller's shadowed storage is restored above — now apply the
         // deferred assoc (from staged temp keys) and fixed-array writebacks,
         // then purge each formal.
-        for (tmp, caller_name) in assoc_wb {
-            self.writeback_assoc_param(&tmp, &caller_name);
-            if !self.module.associative_arrays.contains_key(&caller_name) {
-                self.module.associative_arrays.insert(caller_name.clone(), true);
-            }
-            let tprefix = format!("{}[", tmp);
-            let tkeys: Vec<String> = self.signals.keys_with_elem_prefix(&tprefix);
-            for k in tkeys {
-                self.signals.remove(&k);
-            }
-            self.signals.remove(&format!("{}.size", tmp));
-        }
+        self.apply_assoc_writebacks(assoc_wb);
         for (param_name, caller_name, _is_out) in assoc_params {
             // `is_out` element copy already applied from the staged temp key
             // above — the formal's per-call key is gone by now, so calling
@@ -152340,13 +152337,11 @@ impl Simulator {
                 // shadowed storage is then put back — doing the copy now
                 // would let a same-name callee local wipe it).
                 let assoc_params = std::mem::take(&mut assoc_params);
-                let mut assoc_wb: Vec<(String, String, Option<bool>)> = Vec::new();
-                for (param, caller, is_out, prior) in &assoc_params {
-                    if *is_out && param != caller {
-                        let tmp = self.stage_assoc_formal(param);
-                        assoc_wb.push((tmp, caller.clone(), *prior));
-                    }
-                }
+                let assoc_wb = self.stage_assoc_writebacks(
+                    assoc_params
+                        .iter()
+                        .map(|(p, c, out, _)| (p.as_str(), c.as_str(), *out)),
+                );
                 self.pop_and_restore_queue_frame();
                 for (tmp, caller) in staged_wb {
                     self.writeback_queue_param(&tmp, &caller);
@@ -152354,18 +152349,7 @@ impl Simulator {
                 }
                 // The caller's shadowed storage is now restored — apply the
                 // deferred assoc writebacks (from staged temp keys).
-                for (tmp, caller, _prior) in assoc_wb {
-                    self.writeback_assoc_param(&tmp, &caller);
-                    if !self.module.associative_arrays.contains_key(&caller) {
-                        self.module.associative_arrays.insert(caller.clone(), true);
-                    }
-                    let tprefix = format!("{}[", tmp);
-                    let tkeys: Vec<String> = self.signals.keys_with_elem_prefix(&tprefix);
-                    for k in tkeys {
-                        self.signals.remove(&k);
-                    }
-                    self.signals.remove(&format!("{}.size", tmp));
-                }
+                self.apply_assoc_writebacks(assoc_wb);
                 for (param, caller, _is_out, prior) in assoc_params {
                     if param == caller {
                         // Identity binding — the body's writes landed directly
