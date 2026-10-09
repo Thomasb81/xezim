@@ -10,6 +10,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* An `@(posedge clk iff g)` wait in a class task evaluates its guard in the
+  waiting process: the guard reads that object's fields and the task's
+  locals (`@(posedge vif.clk iff vif.gnt[master_id] === 1)`), so several
+  objects parked on one clock no longer see each other's state. Inside
+  `req.randomize() with {...}`, a receiver-qualified element constraint
+  (`req.data[0] == d`) and a receiver-qualified size (`req.data.size() == 3`)
+  apply to the randomized object; the size used to be ignored. A size that
+  conflicts with the class constraints makes `randomize()` return 0. In
+  `pre_randomize`, `post_randomize` and when the class has a property named
+  like the receiver, `req` keeps its ordinary meaning. (from PR #287 by
+  Thomas Burg)
 * `randomize()` with a soft constraint and an array sized by the constraints
   no longer fails when a constraint reads a member path through `this`
   (`this.lo`, `this.lim.lo`) that names state rather than a random variable.
