@@ -119,6 +119,8 @@ mod forward_typedef_class_handle_width;
 mod function_return_width;
 #[path = "types/generate_scope_struct_metadata.rs"]
 mod generate_scope_struct_metadata;
+#[path = "types/generate_with_array_queries.rs"]
+mod generate_with_array_queries;
 #[path = "types/header_parameter_declared_signedness.rs"]
 mod header_parameter_declared_signedness;
 #[path = "types/hierarchy_and_type_overrides.rs"]

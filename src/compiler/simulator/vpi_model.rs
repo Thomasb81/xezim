@@ -3525,7 +3525,7 @@ impl<'a> Builder<'a> {
         };
         // The iteration values, as the elaborator computed them.
         let mut values: Vec<i64> = Vec::new();
-        let mut i = gf.init_val;
+        let mut i = xezim_core::elaborate::generate_for_start(gf, &ctx.params);
         let mut p = (*ctx.params).clone();
         let mut ok = true;
         for _ in 0..10000 {
