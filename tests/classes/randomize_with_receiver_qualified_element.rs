@@ -71,7 +71,8 @@ endmodule
 fn randomize_with_qualifies_element_constraint() {
     let msgs = messages(SRC);
     assert!(
-        msgs.iter().any(|m| m.starts_with("RAND_OK addr=c4bc rw=WRITE size=1 d0=b0")),
+        msgs.iter()
+            .any(|m| m.starts_with("RAND_OK addr=c4bc rw=WRITE size=1 d0=b0")),
         "expected RAND_OK with pinned fields, got {msgs:?}"
     );
     assert!(
