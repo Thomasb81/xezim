@@ -293,6 +293,28 @@ fn method_tier_threshold() -> u32 {
 /// the suite-level ON == OFF parity run against a warm cache.
 const METHOD_CACHE_COMPILER_SALT: u64 = 0x6370_6666_3033;
 
+/// The subroutine shape `try_run_compiled_method` plans for. Borrowed, so
+/// the per-call hooks (class methods, wait-free tasks, free functions) never
+/// clone a declaration.
+#[derive(Clone, Copy)]
+enum CompiledBodyKind<'a> {
+    Function(&'a crate::ast::decl::FunctionDeclaration),
+    Task(&'a TaskDeclaration),
+    /// Extern / pure prototypes: never compiled.
+    Other,
+}
+
+impl<'a> CompiledBodyKind<'a> {
+    fn of(kind: &'a crate::ast::decl::ClassMethodKind) -> Self {
+        use crate::ast::decl::ClassMethodKind as K;
+        match kind {
+            K::Function(f) => Self::Function(f),
+            K::Task(t) => Self::Task(t),
+            K::Extern(_) | K::PureVirtual(_) => Self::Other,
+        }
+    }
+}
+
 /// class-perf P3: direct-call eligibility for a compiled (cid, mid).
 #[derive(Clone)]
 enum FastCallState {
@@ -7656,6 +7678,8 @@ pub struct Simulator {
     /// DPI import function prototypes by SV name, built once on the first
     /// method compile (see `dpi_import_fd_table`).
     dpi_import_fds: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,
+    /// Package name ("" for none) -> interned `__free_fn__<pkg>` class name.
+    free_fn_class_names: HashMap<String, std::rc::Rc<str>>,
     /// The same for `module.tasks`: every interpreted task call cloned the
     /// whole `TaskDeclaration`, and the clone plus its drop was about a
     /// quarter of a behavioural memory model's run (a device calling a
@@ -12233,6 +12257,7 @@ impl Simulator {
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
             dpi_import_fds: None,
+            free_fn_class_names: HashMap::default(),
             task_decl_cache: HashMap::default(),
 
             fn_pure_cache: HashMap::default(),
@@ -51527,9 +51552,9 @@ impl Simulator {
                                         // twin site below): a compiling task
                                         // body runs synchronously; skip the
                                         // process-frame machinery.
-                                        if let Some(_v) = self.try_compiled_task_body(
-                                            rh, &mclass, &mn, td, &tm,
-                                        ) {
+                                        if let Some(_v) =
+                                            self.try_compiled_task_body(rh, &mclass, &mn, td)
+                                        {
                                             if let Some(c) = self.task_cleanup.pop() {
                                                 self.unwind_task_frame(c);
                                             }
@@ -152589,11 +152614,10 @@ impl Simulator {
                 // (the compiled block reads `this` members and locals from
                 // the same heap / register file the AST path uses). Gated off
                 // by default.
-                // Tasks bypass the call-count tier: a task's body is where
-                // the loop work usually lives (phase tasks), so its invocation
-                // count says nothing about the cost inside. A failed compile
-                // lands in compiled_method_skip and is never retried.
-                let tier_bypass = matches!(method.kind, ClassMethodKind::Task(_));
+                // Wait-free tasks compile like functions, after the same
+                // call-count tier: compiling every task on its first call
+                // paid a whole plan + compile for each of the many tasks a
+                // UVM run calls only a few times.
                 if let Some(cval) = compiled_methods_enabled()
                     .then(|| {
                         self.try_run_compiled_method(
@@ -152604,8 +152628,7 @@ impl Simulator {
                             body,
                             fn_ret_name,
                             ret_is_string,
-                            &method.kind,
-                            tier_bypass,
+                            CompiledBodyKind::of(&method.kind),
                         )
                     })
                     .flatten()
@@ -153813,15 +153836,6 @@ impl Simulator {
         }
     }
 
-    /// class-perf free-function tier: run a package/module-scope FUNCTION
-    /// body as bytecode, reusing `try_run_compiled_method`'s entire plan +
-    /// admission + block-cache machinery under a SYNTHETIC class name. The
-    /// interpreter's frame for this call already holds the bound formals and
-    /// the implicit return cell; the callee runs with `this == 0` (pushed
-    /// null above), so any member access degrades exactly as the interpreter
-    /// would — and a body that touches `this`-relative names was never
-    /// compilable anyway (the compiler's handle-chain gates require a
-    /// class-typed root, which no free-function frame provides).
     /// Wait-free compiled execution of a task-method body dispatched from a
     /// process statement runner. The caller has already bound the task frame
     /// (`bind_task_frame` + method-this context) exactly as the scheduled
@@ -153830,19 +153844,22 @@ impl Simulator {
     /// scheduling machinery is skipped entirely and the caller continues as
     /// if the scheduled frame had finished. Returns `None` when the body does
     /// not (yet) compile; the caller falls back to the scheduled path.
-    /// `tier_bypass` is set: this dispatch point already pays the scheduling
-    /// prologue, so warming up on the interpreter would cost more than the
-    /// single one-shot compile.
-    #[allow(clippy::too_many_arguments)]
     fn try_compiled_task_body(
         &mut self,
         handle: usize,
         mclass: &str,
         mname: &str,
         td: &TaskDeclaration,
-        tm: &std::sync::Arc<crate::ast::decl::ClassMethod>,
     ) -> Option<Value> {
         if !compiled_methods_enabled() || handle == 0 {
+            return None;
+        }
+        // A task already known never to compile (it can suspend, or its body
+        // does not lower) returns before any frame bookkeeping.
+        let ids = &self.compiled_class_method_ids;
+        if let (Some(&cid), Some(&mid)) = (ids.get(mclass), ids.get(mname))
+            && self.compiled_method_skip.contains(&(cid, mid))
+        {
             return None;
         }
         let sync_name = self.sync_frame_name(mname);
@@ -153866,8 +153883,7 @@ impl Simulator {
             &td.items,
             None,
             false,
-            &tm.kind,
-            true,
+            CompiledBodyKind::Task(td),
         );
         if let Some(prev) = saved_meth {
             CUR_METHOD_HASH.store(prev, std::sync::atomic::Ordering::Relaxed);
@@ -153879,21 +153895,43 @@ impl Simulator {
             // Persist static locals seeded by the block (mirrors the
             // interpreter epilogue's sync pass).
             self.sync_static_locals();
-        } else {
-            self.static_local_syncs.pop();
+        } else if let Some((name, _)) = self.static_local_syncs.pop()
+            && self.sync_name_pool.len() < 64
+        {
+            self.sync_name_pool.push(name);
         }
         r
     }
 
+    /// The synthetic class name a free function compiles under:
+    /// `__free_fn__<pkg>`, or `__free_fn__` for a `$unit`/module-scope
+    /// function. Interned once per package, so the per-call hook below
+    /// allocates nothing.
+    fn free_fn_class_name(&mut self, pkg: Option<&str>) -> std::rc::Rc<str> {
+        let pkg = pkg.unwrap_or("");
+        if let Some(c) = self.free_fn_class_names.get(pkg) {
+            return c.clone();
+        }
+        let c: std::rc::Rc<str> = std::rc::Rc::from(format!("__free_fn__{pkg}"));
+        self.free_fn_class_names.insert(pkg.to_string(), c.clone());
+        c
+    }
+
+    /// class-perf free-function tier: run a package/module-scope FUNCTION
+    /// body as bytecode, reusing `try_run_compiled_method`'s entire plan +
+    /// admission + block-cache machinery under a SYNTHETIC class name. The
+    /// interpreter's frame for this call already holds the bound formals and
+    /// the implicit return cell; the callee runs with `this == 0` (pushed
+    /// null by the caller), so any member access degrades exactly as the interpreter
+    /// would — and a body that touches `this`-relative names was never
+    /// compilable anyway (the compiler's handle-chain gates require a
+    /// class-typed root, which no free-function frame provides).
     fn try_run_compiled_free_function(
         &mut self,
         fd: &crate::ast::decl::FunctionDeclaration,
         pkg_scope: Option<&str>,
     ) -> Option<Value> {
-        let cname = format!(
-            "__free_fn__{}",
-            pkg_scope.unwrap_or("-")
-        );
+        let cname = self.free_fn_class_name(pkg_scope);
         let ret_is_string = Self::is_string_data_type(&fd.return_type);
         self.try_run_compiled_method(
             0,
@@ -153903,8 +153941,7 @@ impl Simulator {
             &fd.items,
             Some(&fd.name.name.name),
             ret_is_string,
-            &crate::ast::decl::ClassMethodKind::Function(fd.clone()),
-            false,
+            CompiledBodyKind::Function(fd),
         )
     }
 
@@ -153917,11 +153954,9 @@ impl Simulator {
         body: &[crate::ast::stmt::Statement],
         fn_ret_name: Option<&str>,
         ret_is_string: bool,
-        kind: &crate::ast::decl::ClassMethodKind,
-        tier_bypass: bool,
+        kind: CompiledBodyKind<'_>,
     ) -> Option<Value> {
         use super::bytecode::BytecodeCompiler;
-        use crate::ast::decl::ClassMethodKind;
         use crate::ast::types::PortDirection;
         // COLD-PATH FIRST (class-perf P0 + adaptive tiering): the tier
         // counter used to run before the skip cache — every class-function
@@ -153974,7 +154009,7 @@ impl Simulator {
         // the counter only while below the threshold, and the count is
         // keyed by u32 ids (the same key the block cache uses).
         let tier = method_tier_threshold();
-        if tier > 0 && !tier_bypass {
+        if tier > 0 {
             let calls = self
                 .compiled_method_call_counts
                 .entry((cid, mid))
@@ -154013,8 +154048,8 @@ impl Simulator {
             // sees the ordinary function shape.
             let task_fd_storage;
             let _f = match kind {
-                ClassMethodKind::Function(f) => f,
-                ClassMethodKind::Task(t) => {
+                CompiledBodyKind::Function(f) => f,
+                CompiledBodyKind::Task(t) => {
                     // A compiled task runs synchronously inside `exec_insns`;
                     // if its body (or any transitively reached callee) can
                     // park the process, the suspension can never resume into
@@ -154039,7 +154074,7 @@ impl Simulator {
                     };
                     &task_fd_storage
                 }
-                _ => {
+                CompiledBodyKind::Other => {
                     trace_decline("kind");
                     self.compiled_method_skip.insert((cid, mid));
                     return None;
@@ -155337,6 +155372,10 @@ impl Simulator {
             sim.compiled_fast_calls
                 .insert((cid, mid), FastCallState::Never);
         };
+        if self.compiled_method_skip.contains(&(cid, mid)) {
+            never(self);
+            return None;
+        }
         let Some(pre) = self.compiled_method_plans.get(&(cid, mid)).cloned() else {
             return None; // no plan yet: this call goes the interpreter route
         };

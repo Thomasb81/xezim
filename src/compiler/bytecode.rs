@@ -18,6 +18,21 @@ const MAX_INLINE_DEPTH: usize = 8;
 pub(crate) struct MethodAdmission {
     pub writeback_positions: HashMap<String, HashSet<usize>>,
     pub instance_fields: HashMap<String, HashSet<String>>,
+    /// Free-function facts the method compiles keep asking for; the function
+    /// table they come from is the same for every method compile.
+    pub fn_facts: FnFacts,
+}
+
+/// Memoized free-function facts (see `MethodAdmission::fn_facts`).
+#[derive(Default)]
+pub(crate) struct FnFacts {
+    /// (declaration name and source span, instance prefix, external reads
+    /// allowed) -> `fn_is_pure_in_ext`. Only verdicts that do not depend on
+    /// the recursion-depth cutoff are kept.
+    #[allow(clippy::type_complexity)]
+    pure: std::cell::RefCell<HashMap<(String, usize, usize, Option<String>, bool), bool>>,
+    /// Callee name -> no instance-qualified twin exists (`compile_pure_call`).
+    ext_reads_ok: std::cell::RefCell<HashMap<String, bool>>,
 }
 
 /// A register in the bytecode VM. Registers hold Values. The compact u16
@@ -1819,6 +1834,9 @@ pub struct BytecodeCompiler<'a> {
     /// purity). Past the cap the answer is "not pure", which merely keeps the
     /// call on the AST interpreter — where recursion already works.
     purity_depth: std::cell::Cell<u32>,
+    /// Set when a purity check hit `MAX_PURITY_DEPTH` (its `false` is then
+    /// depth-dependent and not memoized).
+    purity_cut: std::cell::Cell<bool>,
     /// Local/formal names (in the current inline scope) bound to STRING
     /// values — drives `%s` semantics and resize suppression. Name-based on
     /// purpose: register ids are recycled across arms, names are not.
@@ -1973,6 +1991,7 @@ impl<'a> BytecodeCompiler<'a> {
             local_var_array: HashMap::default(),
             const_var_binds: HashMap::default(),
             purity_depth: std::cell::Cell::new(0),
+            purity_cut: std::cell::Cell::new(false),
             inline_ret: None,
             inline_ret_jumps: Vec::new(),
             multi_dim_arrays: None,
@@ -2809,6 +2828,15 @@ impl<'a> BytecodeCompiler<'a> {
         } else {
             args
         };
+        // Whether the callee may be inlined: decided at most once, for the
+        // delegation shape below or the inline path after it.
+        let mut fn_pure_memo: Option<bool> = None;
+        let mut fn_pure = |me: &Self| -> bool {
+            *fn_pure_memo.get_or_insert_with(|| {
+                let ext = me.callee_ext_reads_ok(&name);
+                me.fn_is_pure_in_ext(&fd, name.rsplit_once('.').map(|(p, _)| p), ext)
+            })
+        };
         // class-perf delegation: a callee that cannot be INLINED (impure, or
         // a `string` formal the inline shape rejects) but whose ports are
         // all scalar inputs with a matching arity is still callable from
@@ -2834,15 +2862,11 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                 )
             });
-            let allow_ext_reads = name.contains('.')
-                || self.functions.is_some_and(|f| {
-                    let suffix = format!(".{}", name);
-                    !f.keys().any(|k| k.ends_with(suffix.as_str()))
-                });
-            let callee_pure =
-                self.fn_is_pure_in_ext(&fd, name.rsplit_once('.').map(|(p, _)| p), allow_ext_reads)
-                    && !has_string_port;
-            if self.method_mode && input_only_scalar && arity_le && !callee_pure {
+            if self.method_mode
+                && input_only_scalar
+                && arity_le
+                && (has_string_port || !fn_pure(self))
+            {
                 let call_start = self.insns.len();
                 let call_next = self.next_reg;
                 let mut ok = true;
@@ -2964,12 +2988,7 @@ impl<'a> BytecodeCompiler<'a> {
         // the value may then depend on module state, and the CA dependency
         // machinery follows callee reads, so re-evaluation still triggers).
         // Writes to module state stay disqualifying either way.
-        let allow_ext_reads = name.contains('.')
-            || self.functions.is_some_and(|f| {
-                let suffix = format!(".{}", name);
-                !f.keys().any(|k| k.ends_with(suffix.as_str()))
-            });
-        if !self.fn_is_pure_in_ext(&fd, name.rsplit_once('.').map(|(p, _)| p), allow_ext_reads) {
+        if !fn_pure(self) {
             if std::env::var_os("XEZIM_PROBE_INLINE").is_some() {
                 eprintln!("[INLINE-FAIL] fn {} reason=impure", name);
             }
@@ -5788,11 +5807,53 @@ impl<'a> BytecodeCompiler<'a> {
     ) -> bool {
         const MAX_PURITY_DEPTH: u32 = 8;
         if self.purity_depth.get() >= MAX_PURITY_DEPTH {
+            self.purity_cut.set(true);
             return false;
         }
+        let facts = self.method_admission.as_ref().map(|a| &a.fn_facts);
+        let key = (
+            fd.name.name.name.clone(),
+            fd.span.start,
+            fd.span.end,
+            prefix.map(str::to_string),
+            allow_ext_reads,
+        );
+        if let Some(hit) = facts.and_then(|f| f.pure.borrow().get(&key).copied()) {
+            return hit;
+        }
+        let outer_cut = self.purity_cut.replace(false);
         self.purity_depth.set(self.purity_depth.get() + 1);
         let ok = self.fn_is_pure_in_inner(fd, prefix, allow_ext_reads);
         self.purity_depth.set(self.purity_depth.get() - 1);
+        let cut = self.purity_cut.get();
+        // `true` holds at any depth; `false` only when no nested check was
+        // cut off by the depth limit (asked again higher up, it could pass).
+        if (ok || !cut)
+            && let Some(f) = facts
+        {
+            f.pure.borrow_mut().insert(key, ok);
+        }
+        self.purity_cut.set(outer_cut || cut);
+        ok
+    }
+
+    /// `compile_pure_call`'s external-read admission: a callee with no
+    /// instance-qualified (`<inst>.name`) twin in the function table.
+    fn callee_ext_reads_ok(&self, name: &str) -> bool {
+        if name.contains('.') {
+            return true;
+        }
+        let facts = self.method_admission.as_ref().map(|a| &a.fn_facts);
+        if let Some(hit) = facts.and_then(|f| f.ext_reads_ok.borrow().get(name).copied()) {
+            return hit;
+        }
+        let ok = self.functions.is_some_and(|f| {
+            let suffix = format!(".{}", name);
+            !f.keys().any(|k| k.ends_with(suffix.as_str()))
+        });
+        if let Some(f) = facts {
+            f.ext_reads_ok.borrow_mut().insert(name.to_string(), ok);
+        }
         ok
     }
 
@@ -5970,7 +6031,10 @@ impl<'a> BytecodeCompiler<'a> {
                         let args_ok = args.iter().all(|a| expr_ok(a, bound, me, ext));
                         return input_only
                             && args_ok
-                            && (me.fn_is_pure(fd2) || (scalar_ports && arity_le));
+                            // Delegation (CallFreeFunction) exists in method
+                            // mode only; module code keeps inlining pure
+                            // callees alone.
+                            && ((me.method_mode && scalar_ports && arity_le) || me.fn_is_pure(fd2));
                     }
                     // Not a declared function — a DPI IMPORT is still a
                     // legitimate callee: the interpreter executes it through
@@ -6058,7 +6122,8 @@ impl<'a> BytecodeCompiler<'a> {
                 // A void call in statement position (`uvm_report_error(...)`)
                 // is as pure as the expression walker says: an inlinable,
                 // delegatable (scalar-input) or DPI-import callee is a leaf.
-                StatementKind::Expr(e) => {
+                // Method bodies only: module code inlines as before.
+                StatementKind::Expr(e) if me.method_mode => {
                     let mut e = e;
                     while let ExprKind::Paren(inner) = &e.kind {
                         e = inner;
@@ -10992,10 +11057,12 @@ impl<'a> BytecodeCompiler<'a> {
                 // Void diagnostic system tasks ($display family, $finish,
                 // $stop): they never produce a value, so route them through
                 // the AST-fallback insn — the runtime interpreter prints
-                // byte-identical output. This arm also applies in method
-                // mode (allow_ast_fallback is deliberately not consulted):
-                // these are leaf statements with no control-flow effect.
-                if let ExprKind::SystemCall { name, .. } = &e.kind
+                // byte-identical output. Method bodies only (their
+                // allow_ast_fallback is off, deliberately not consulted here:
+                // these are leaf statements with no control-flow effect);
+                // module code keeps `emit_fallback` below.
+                if self.method_mode
+                    && let ExprKind::SystemCall { name, .. } = &e.kind
                     && matches!(
                         name.as_str(),
                         "$display" | "$write" | "$strobe" | "$monitor" | "$finish" | "$stop"
