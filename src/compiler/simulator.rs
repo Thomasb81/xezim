@@ -71658,88 +71658,10 @@ impl Simulator {
     /// Evaluate expression with a context width hint (for proper shift sizing).
     /// When ctx_width > 0, shift operators widen their left operand to ctx_width.
     pub fn eval_expr_ctx(&mut self, expr: &Expression, ctx_width: u32) -> Value {
-        // §18.7 — inside `obj.randomize() with { … }`, an ELEMENT read of a
-        // receiver-prefixed member (`obj.member[i]`, `obj.member[i:j]`) must
-        // resolve against the randomized object's per-element stores, exactly
-        // like the bare spelling `member[i]` does inside the solve. The
-        // whole-property member read below serves the object's SNAPSHOT
-        // value, and for a dynamic array / queue the elements live in the
-        // `<handle>#member[i]` cells the solver writes — so index the
-        // receiver-stripped chain instead.
-        if self.rand_receiver.is_some()
-            && matches!(
-                expr.kind,
-                ExprKind::Index { .. }
-                    | ExprKind::RangeSelect { .. }
-                    | ExprKind::MemberAccess { .. }
-                    | ExprKind::Call { .. }
-            )
-        {
-            let rebuilt = match &expr.kind {
-                ExprKind::Index { expr: base, index } => {
-                    self.strip_rand_receiver_prefix(base).map(|b| {
-                        Expression::new(
-                            ExprKind::Index {
-                                expr: Box::new(b),
-                                index: index.clone(),
-                            },
-                            expr.span,
-                        )
-                    })
-                }
-                ExprKind::RangeSelect {
-                    expr: base,
-                    kind,
-                    left,
-                    right,
-                } => self.strip_rand_receiver_prefix(base).map(|b| {
-                    Expression::new(
-                        ExprKind::RangeSelect {
-                            expr: Box::new(b),
-                            kind: *kind,
-                            left: left.clone(),
-                            right: right.clone(),
-                        },
-                        expr.span,
-                    )
-                }),
-                // `obj.m.size` / `obj.m.size()` and other members or methods
-                // of a receiver-prefixed property: the sizing pass resizes
-                // the object's own `m`, so the acceptance check must read it.
-                ExprKind::MemberAccess { expr: base, member } => {
-                    self.strip_rand_receiver_prefix(base).map(|b| {
-                        Expression::new(
-                            ExprKind::MemberAccess {
-                                expr: Box::new(b),
-                                member: member.clone(),
-                            },
-                            expr.span,
-                        )
-                    })
-                }
-                ExprKind::Call { func, args } => match &func.kind {
-                    ExprKind::MemberAccess { expr: base, member } => {
-                        self.strip_rand_receiver_prefix(base).map(|b| {
-                            Expression::new(
-                                ExprKind::Call {
-                                    func: Box::new(Expression::new(
-                                        ExprKind::MemberAccess {
-                                            expr: Box::new(b),
-                                            member: member.clone(),
-                                        },
-                                        func.span,
-                                    )),
-                                    args: args.clone(),
-                                },
-                                expr.span,
-                            )
-                        })
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some(stripped) = rebuilt {
+        // §18.7 receiver-prefixed reads inside `obj.randomize() with {…}`
+        // (see `strip_rand_receiver_expr`).
+        if self.rand_receiver.is_some() {
+            if let Some(stripped) = self.strip_rand_receiver_expr(expr) {
                 return self.eval_expr_ctx(&stripped, ctx_width);
             }
         }
@@ -145055,6 +144977,83 @@ impl Simulator {
             }
         }
         None
+    }
+
+    /// §18.7 — inside `obj.randomize() with { … }`, an ELEMENT read of a
+    /// receiver-prefixed member (`obj.member[i]`, `obj.member[i:j]`) must
+    /// resolve against the randomized object's per-element stores, exactly
+    /// like the bare spelling `member[i]` does inside the solve. The
+    /// whole-property member read (`eval_expr_member_access`) serves the
+    /// object's SNAPSHOT value, and for a dynamic array / queue the
+    /// elements live in the `<handle>#member[i]` cells the solver writes —
+    /// so `eval_expr_ctx` evaluates the receiver-stripped chain instead.
+    /// Kept out of line so the expression dispatcher stays small.
+    #[inline(never)]
+    fn strip_rand_receiver_expr(&self, expr: &Expression) -> Option<Expression> {
+        match &expr.kind {
+            ExprKind::Index { expr: base, index } => {
+                self.strip_rand_receiver_prefix(base).map(|b| {
+                    Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(b),
+                            index: index.clone(),
+                        },
+                        expr.span,
+                    )
+                })
+            }
+            ExprKind::RangeSelect {
+                expr: base,
+                kind,
+                left,
+                right,
+            } => self.strip_rand_receiver_prefix(base).map(|b| {
+                Expression::new(
+                    ExprKind::RangeSelect {
+                        expr: Box::new(b),
+                        kind: *kind,
+                        left: left.clone(),
+                        right: right.clone(),
+                    },
+                    expr.span,
+                )
+            }),
+            // `obj.m.size` / `obj.m.size()` and other members or methods
+            // of a receiver-prefixed property: the sizing pass resizes
+            // the object's own `m`, so the acceptance check must read it.
+            ExprKind::MemberAccess { expr: base, member } => {
+                self.strip_rand_receiver_prefix(base).map(|b| {
+                    Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(b),
+                            member: member.clone(),
+                        },
+                        expr.span,
+                    )
+                })
+            }
+            ExprKind::Call { func, args } => match &func.kind {
+                ExprKind::MemberAccess { expr: base, member } => {
+                    self.strip_rand_receiver_prefix(base).map(|b| {
+                        Expression::new(
+                            ExprKind::Call {
+                                func: Box::new(Expression::new(
+                                    ExprKind::MemberAccess {
+                                        expr: Box::new(b),
+                                        member: member.clone(),
+                                    },
+                                    func.span,
+                                )),
+                                args: args.clone(),
+                            },
+                            expr.span,
+                        )
+                    })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// §18.7 — the receiver name of the in-flight `obj.randomize() with
