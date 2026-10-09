@@ -692,6 +692,34 @@ fn open_dpi_library(path: &str) -> Result<Library, libloading::Error> {
     }
 }
 
+/// The command that builds the DPI export trampoline (§35.5.4): the host C
+/// compiler (`$CC` when set, else `cc`) producing a position-independent
+/// shared object. Only portable flags: the compiler's default target is
+/// already the host, and an x86-only flag such as `-m64` makes a non-x86
+/// compiler reject the command (#282). `$CC` may carry its own leading
+/// arguments (`ccache gcc`). On macOS the linker must be told that the
+/// dispatch symbol is resolved at load time from the xezim executable.
+fn dpi_trampoline_cc_command(
+    cc_env: Option<&str>,
+    so: &std::path::Path,
+    c: &std::path::Path,
+) -> Vec<std::ffi::OsString> {
+    let mut cmd: Vec<std::ffi::OsString> = cc_env
+        .map(|v| v.split_whitespace().map(Into::into).collect::<Vec<_>>())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec!["cc".into()]);
+    for a in ["-fPIC", "-shared", "-O1"] {
+        cmd.push(a.into());
+    }
+    if cfg!(target_os = "macos") {
+        cmd.push("-Wl,-U,___xezim_dpi_export_dispatch".into());
+    }
+    cmd.push("-o".into());
+    cmd.push(so.into());
+    cmd.push(c.into());
+    cmd
+}
+
 fn configured_dpi_libs() -> Vec<String> {
     dpi_lib_paths()
         .lock()
@@ -14853,7 +14881,7 @@ impl Simulator {
         // forwards into `__xezim_dpi_export_dispatch`, which runs the SV
         // subroutine. Loaded RTLD_GLOBAL so the user libs' RTLD_NOW resolution
         // of the exported names finds them.
-        self.load_dpi_export_trampoline();
+        let trampoline_failed = !self.load_dpi_export_trampoline();
         // Each library is opened RTLD_NOW | RTLD_GLOBAL, so its symbols join
         // the global scope and a later --dpi-lib can link against it (#202).
         // A library that needs one listed after it fails its first attempt;
@@ -14886,8 +14914,19 @@ impl Simulator {
         // in the reference simulator (#201): continuing would turn every call
         // into it into a silent no-op.
         for (_, path, e) in pending {
-            self.compile_errors
-                .push(format!("--dpi-lib '{}' could not be loaded: {}", path, e));
+            // A library that calls an exported SV subroutine needs the
+            // trampoline; when that failed to build, say so — the loader's
+            // own message only names the missing symbol.
+            let hint = if trampoline_failed {
+                " (the DPI export trampoline could not be built, so exported SV \
+                 subroutines are unresolved; see the [DPI] message above)"
+            } else {
+                ""
+            };
+            self.compile_errors.push(format!(
+                "--dpi-lib '{}' could not be loaded: {}{}",
+                path, e, hint
+            ));
         }
     }
 
@@ -14975,15 +15014,17 @@ impl Simulator {
         }
     }
 
-    fn load_dpi_export_trampoline(&mut self) {
+    /// Build and load the export trampoline; false when it was needed but
+    /// could not be built.
+    fn load_dpi_export_trampoline(&mut self) -> bool {
         let exports = self.module.dpi_exports.clone();
         if exports.is_empty() {
-            return;
+            return true;
         }
         // Exported functions are only reachable from a loaded DPI library; with
         // none configured, nothing can call them from C — skip the compile.
         if configured_dpi_libs().is_empty() {
-            return;
+            return true;
         }
         let c_ty = |k: DpiExpKind| match k {
             DpiExpKind::Void => "void",
@@ -15099,7 +15140,7 @@ impl Simulator {
             emitted += 1;
         }
         if emitted == 0 {
-            return;
+            return true;
         }
         let dir = std::env::temp_dir();
         let stem = format!("xezim_dpi_exports_{}", std::process::id());
@@ -15107,13 +15148,10 @@ impl Simulator {
         let sopath = dir.join(format!("{}.so", stem));
         if let Err(e) = std::fs::write(&cpath, &body) {
             eprintln!("[DPI] could not write export trampoline source: {}", e);
-            return;
+            return false;
         }
-        let status = std::process::Command::new("cc")
-            .args(["-m64", "-fPIC", "-shared", "-O1", "-o"])
-            .arg(&sopath)
-            .arg(&cpath)
-            .status();
+        let cmd = dpi_trampoline_cc_command(std::env::var("CC").ok().as_deref(), &sopath, &cpath);
+        let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).status();
         match status {
             Ok(st) if st.success() => {}
             Ok(st) => {
@@ -15122,24 +15160,32 @@ impl Simulator {
                      exported SV functions will be unresolved",
                     st.code()
                 );
-                return;
+                return false;
             }
             Err(e) => {
                 eprintln!(
-                    "[DPI] could not run the C compiler for the export trampoline ({}); \
-                     is `cc`/`gcc` on PATH?",
+                    "[DPI] could not run the C compiler `{}` for the export trampoline ({}); \
+                     set $CC or put `cc` on PATH",
+                    cmd[0].to_string_lossy(),
                     e
                 );
-                return;
+                return false;
             }
         }
         use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
-        match unsafe { UnixLibrary::open(Some(&sopath), RTLD_NOW | RTLD_GLOBAL) } {
-            Ok(l) => self.dpi_libraries.push(Library::from(l)),
-            Err(e) => eprintln!("[DPI] failed to load export trampoline: {}", e),
-        }
+        let loaded = match unsafe { UnixLibrary::open(Some(&sopath), RTLD_NOW | RTLD_GLOBAL) } {
+            Ok(l) => {
+                self.dpi_libraries.push(Library::from(l));
+                true
+            }
+            Err(e) => {
+                eprintln!("[DPI] failed to load export trampoline: {}", e);
+                false
+            }
+        };
         let _ = std::fs::remove_file(&cpath);
         let _ = std::fs::remove_file(&sopath);
+        loaded
     }
 
     /// §35.5.4: run an exported SV subroutine identified by its declaration-order
@@ -159145,5 +159191,38 @@ mod name_table_helper_tests {
         assert!(f.may_contain(&"y".repeat(1500).replace('y', "x")));
         assert!(!f.may_contain("b"));
         assert!(!f.may_contain("top.sig2"));
+    }
+}
+
+#[cfg(test)]
+mod dpi_trampoline_cc_tests {
+    use super::dpi_trampoline_cc_command;
+    use std::path::Path;
+
+    fn args(cc: Option<&str>) -> Vec<String> {
+        dpi_trampoline_cc_command(cc, Path::new("/t/x.so"), Path::new("/t/x.c"))
+            .into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// #282: the trampoline build passes no target-specific flag (`-m64` is
+    /// rejected by a non-x86 compiler) and takes the compiler from `$CC`.
+    #[test]
+    fn trampoline_command_is_portable() {
+        let a = args(None);
+        assert_eq!(a[0], "cc");
+        assert!(
+            !a.iter()
+                .any(|x| x == "-m64" || x == "-m32" || x.starts_with("-march"))
+        );
+        for f in ["-fPIC", "-shared", "-o", "/t/x.so", "/t/x.c"] {
+            assert!(a.iter().any(|x| x == f), "missing {f} in {a:?}");
+        }
+        assert_eq!(a.last().map(String::as_str), Some("/t/x.c"));
+        let b = args(Some("ccache  aarch64-linux-gnu-gcc"));
+        assert_eq!(&b[..2], ["ccache", "aarch64-linux-gnu-gcc"]);
+        assert!(!b.iter().any(|x| x == "-m64"));
+        assert_eq!(args(Some("  "))[0], "cc");
     }
 }
