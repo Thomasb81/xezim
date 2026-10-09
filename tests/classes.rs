@@ -208,6 +208,8 @@ mod class_width_copy_fork;
 mod compiled_method_accessors;
 #[path = "classes/compiled_method_output_formals.rs"]
 mod compiled_method_output_formals;
+#[path = "classes/compiled_pkg_fn_scope.rs"]
+mod compiled_pkg_fn_scope;
 #[path = "classes/compiled_method_type_param_members.rs"]
 mod compiled_method_type_param_members;
 #[path = "classes/compiled_method_free_fn_caller_locals.rs"]

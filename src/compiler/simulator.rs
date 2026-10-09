@@ -7680,6 +7680,8 @@ pub struct Simulator {
     dpi_import_fds: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,
     /// Package name ("" for none) -> interned `__free_fn__<pkg>` class name.
     free_fn_class_names: HashMap<String, std::rc::Rc<str>>,
+    /// Call name -> package its callee runs in (see `free_call_pkg`).
+    free_call_pkgs: HashMap<String, Option<std::rc::Rc<str>>>,
     /// The same for `module.tasks`: every interpreted task call cloned the
     /// whole `TaskDeclaration`, and the clone plus its drop was about a
     /// quarter of a behavioural memory model's run (a device calling a
@@ -12258,6 +12260,7 @@ impl Simulator {
             free_fn_table: None,
             dpi_import_fds: None,
             free_fn_class_names: HashMap::default(),
+            free_call_pkgs: HashMap::default(),
             task_decl_cache: HashMap::default(),
 
             fn_pure_cache: HashMap::default(),
@@ -32833,13 +32836,30 @@ impl Simulator {
                 self.vm_regs[*dest as usize] = result;
                 local_count += 1;
             }
-            Insn::CallFreeFunction(dest, fname, arg_start, n_args) => {
+            Insn::CallFreeFunction(dest, fname, arg_start, n_args) => 'call: {
                 let base = *arg_start as usize;
                 let n = *n_args as usize;
                 // The callee resolves from the SAME table the compiler
                 // admitted it from; a vanishing entry (module swap)
                 // yields a benign zero like every other missing fn.
                 let fd = self.fn_decl_rc(&fname.0);
+                // §26.3: the package the callee's body runs in. A call the
+                // compiler bound to `P::name` names it outright; any other
+                // callee runs in its declaring scope.
+                let pkg = match &fd {
+                    Some(fd) => self.free_call_pkg(&fname.0, &fd.name.name.name),
+                    None => None,
+                };
+                // Fast dispatch when this callee has a compiled block
+                // (compiled→compiled chain): it reads the argument registers
+                // directly, so no AST actuals are synthesized on this route.
+                if let Some(fd) = &fd
+                    && let Some(v) = self.vm_try_direct_free_fn_call(fd, pkg.as_deref(), base, n)
+                {
+                    self.vm_regs[*dest as usize] = v;
+                    local_count += 1;
+                    break 'call;
+                }
                 // DPI imports are NOT in the function table. When the callee
                 // resolves to an import, `output` formals must be written
                 // back into the argument registers: the DPI bridge assigns
@@ -32915,21 +32935,8 @@ impl Simulator {
                 }
                 let result = match fd {
                     Some(fd) => {
-                        // Fast dispatch when this callee has a compiled block
-                        // (compiled→compiled chain, no AST arg synthesis on
-                        // the fast route).
-                        let fname = fd.name.name.name.clone();
-                        let pkg = self
-                            .module
-                            .func_decl_scope
-                            .get(&fname)
-                            .cloned()
-                            .unwrap_or_else(|| "-".to_string());
-                        let cname = format!("__free_fn__{pkg}");
-                        match self.vm_try_direct_free_fn_call(&fd, &cname, &pkg, base, n) {
-                            Some(v) => v,
-                            None => self.exec_function_call(&fd, &args),
-                        }
+                        self.pending_pkg_scope = pkg.map(|p| p.to_string());
+                        self.exec_function_call(&fd, &args)
                     }
                     None => self
                         .exec_dpi_import_call(&fname.0, &args)
@@ -153921,6 +153928,26 @@ impl Simulator {
         c
     }
 
+    /// §26.3: the package a compiled `CallFreeFunction` callee runs in. The
+    /// compiler names a contested callee `P::name` (the calling package's
+    /// own subroutine); any other callee runs in its declaring scope, as
+    /// `exec_function_call` derives it. Memoized per call name.
+    fn free_call_pkg(&mut self, call_name: &str, decl_name: &str) -> Option<std::rc::Rc<str>> {
+        if let Some(p) = self.free_call_pkgs.get(call_name) {
+            return p.clone();
+        }
+        let p: Option<std::rc::Rc<str>> = match call_name.rsplit_once("::") {
+            Some((pkg, _)) => Some(std::rc::Rc::from(pkg)),
+            None => self
+                .module
+                .func_decl_scope
+                .get(decl_name)
+                .map(|p| std::rc::Rc::from(p.as_str())),
+        };
+        self.free_call_pkgs.insert(call_name.to_string(), p.clone());
+        p
+    }
+
     /// class-perf free-function tier: run a package/module-scope FUNCTION
     /// body as bytecode, reusing `try_run_compiled_method`'s entire plan +
     /// admission + block-cache machinery under a SYNTHETIC class name. The
@@ -155518,8 +155545,7 @@ impl Simulator {
     fn vm_try_direct_free_fn_call(
         &mut self,
         fd: &FunctionDeclaration,
-        cname: &str,
-        pkg: &str,
+        pkg: Option<&str>,
         arg_base: usize,
         n: usize,
     ) -> Option<Value> {
@@ -155527,33 +155553,12 @@ impl Simulator {
             return None;
         }
         let fname = fd.name.name.name.as_str();
-        let tier = method_tier_threshold();
-        if tier > 0 {
-            let ids = &mut self.compiled_class_method_ids;
-            let cid = match ids.get(cname) {
-                Some(&id) => id,
-                None => {
-                    let next = ids.len() as u32;
-                    *ids.entry(cname.to_string()).or_insert(next)
-                }
-            };
-            let mid = match ids.get(fname) {
-                Some(&id) => id,
-                None => {
-                    let next = ids.len() as u32;
-                    *ids.entry(fname.to_string()).or_insert(next)
-                }
-            };
-            let calls = self
-                .compiled_method_call_counts
-                .entry((cid, mid))
-                .or_insert(0);
-            if *calls < tier {
-                *calls += 1;
-                return None;
-            }
-        }
-        let Some(entry) = self.vm_fast_free_fn_entry_for(cname, fname, fd) else {
+        let cname = self.free_fn_class_name(pkg);
+        // Only a callee that already compiled through the interpreter route
+        // (`try_run_compiled_free_function`, which owns the tier counter and
+        // the skip cache) has an entry; everything else declines here
+        // without touching any counter.
+        let Some(entry) = self.vm_fast_free_fn_entry_for(&cname, fname, fd) else {
             return None;
         };
         if n != entry.coerce.len() {
@@ -155584,7 +155589,7 @@ impl Simulator {
             locals.insert(name.to_string(), v.clone());
         }
         self.push_local_frame(locals);
-        self.pkg_scope_stack.push(Some(pkg.to_string()));
+        self.pkg_scope_stack.push(pkg.map(str::to_string));
         self.func_call_stack.push(fd.name.name.name.clone());
         let _prev_compiled = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
             Some(CUR_METHOD_COMPILED.swap(true, std::sync::atomic::Ordering::Relaxed))

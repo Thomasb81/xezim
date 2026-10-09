@@ -2693,6 +2693,41 @@ impl<'a> BytecodeCompiler<'a> {
         }
     }
 
+    /// §26.3: the function-table key a BARE call names from the body being
+    /// compiled. Inside a package function (free-function mode under
+    /// `__free_fn__<pkg>`) a name declared in several scopes resolves in the
+    /// enclosing package first, which the table keeps as `pkg::name` (the
+    /// bare key holds whichever declaration registered last). A contested
+    /// name the package does not declare itself, or one met inside an
+    /// inlined callee (whose own package may differ), returns `None` so the
+    /// body stays on the interpreter, which resolves it at run time.
+    /// Uncontested names and every other compile mode keep the bare key.
+    fn scoped_callee_name(&self, bare: String) -> Option<String> {
+        if !self.free_function_mode || bare.contains("::") {
+            return Some(bare);
+        }
+        let Some(pkg) = self
+            .method_class
+            .as_deref()
+            .and_then(|c| c.strip_prefix("__free_fn__"))
+            .filter(|p| !p.is_empty())
+        else {
+            return Some(bare);
+        };
+        let Some(f) = self.functions else {
+            return Some(bare);
+        };
+        let suffix = format!("::{bare}");
+        if !f.keys().any(|k| k.ends_with(suffix.as_str())) {
+            return Some(bare);
+        }
+        if !self.inlining_stack.is_empty() {
+            return None;
+        }
+        let qualified = format!("{pkg}{suffix}");
+        f.contains_key(&qualified).then_some(qualified)
+    }
+
     /// Try to inline a zero-arg, non-blocking user task's body at this
     /// call site. Returns true if successfully inlined.
     /// Inline a call to a pure combinational function, yielding the register
@@ -2712,6 +2747,10 @@ impl<'a> BytecodeCompiler<'a> {
                 self.bail("Expr_Call");
                 return None;
             }
+        };
+        let Some(name) = self.scoped_callee_name(name) else {
+            self.bail("Expr_Call_pkg_scope");
+            return None;
         };
         if self.inlining_stack.len() >= MAX_INLINE_DEPTH
             || self.inlining_stack.iter().any(|n| *n == name)
@@ -14193,9 +14232,8 @@ impl<'a> BytecodeCompiler<'a> {
                     && h.root.is_none()
                     && h.path.len() == 1
                     && h.path[0].selects.is_empty()
-                    && let Some(fd) = self
-                        .functions
-                        .and_then(|f| f.get(h.path[0].name.name.as_str()))
+                    && let Some(name) = self.scoped_callee_name(h.path[0].name.name.clone())
+                    && let Some(fd) = self.functions.and_then(|f| f.get(name.as_str()))
                     && fd.ports.len() == args.len()
                     && fd
                         .ports
@@ -14205,7 +14243,6 @@ impl<'a> BytecodeCompiler<'a> {
                         .iter()
                         .any(|a| matches!(a.kind, ExprKind::NamedArg { .. }))
                 {
-                    let name = h.path[0].name.name.clone();
                     let call_start = self.insns.len();
                     let call_next = self.next_reg;
                     let mut ok = true;
