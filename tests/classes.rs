@@ -472,6 +472,8 @@ mod concurrent_method_local_arrays;
 mod concurrent_method_local_queues;
 #[path = "classes/module_auto_task_local_array.rs"]
 mod module_auto_task_local_array;
+#[path = "classes/default_automatic_task_locals.rs"]
+mod default_automatic_task_locals;
 #[path = "classes/instance_class_handles_start_null.rs"]
 mod instance_class_handles_start_null;
 #[path = "classes/interface_array_handle_new.rs"]

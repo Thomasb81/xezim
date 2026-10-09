@@ -3922,6 +3922,12 @@ struct ProcessContext {
     /// a method-local shadowing a module-scope net then resolved to the net
     /// and `local = new()` constructed the wrong class.
     method_local_base: Vec<usize>,
+    /// §6.21: the lifetime of the subroutine this process is running (see
+    /// `Simulator::current_static_task` / `current_auto_task`). A task that
+    /// parks mid-body must not leave its lifetime to the process that runs
+    /// next, nor lose it when it resumes.
+    current_static_task: Option<String>,
+    current_auto_task: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -48164,6 +48170,8 @@ impl Simulator {
             formal_dyn: self.formal_dyn.clone(),
             static_local_syncs: self.static_local_syncs.clone(),
             method_local_base: self.method_local_base.clone(),
+            current_static_task: self.current_static_task.clone(),
+            current_auto_task: self.current_auto_task.clone(),
         }
     }
 
@@ -48219,6 +48227,8 @@ impl Simulator {
             && self.formal_dyn.is_empty()
             && self.static_local_syncs.is_empty()
             && self.method_local_base.is_empty()
+            && self.current_static_task.is_none()
+            && self.current_auto_task.is_none()
             && !self.ref_redirect_hot
     }
 
@@ -48247,6 +48257,8 @@ impl Simulator {
             formal_dyn: std::mem::take(&mut self.formal_dyn),
             static_local_syncs: std::mem::take(&mut self.static_local_syncs),
             method_local_base: std::mem::take(&mut self.method_local_base),
+            current_static_task: self.current_static_task.take(),
+            current_auto_task: self.current_auto_task.take(),
         }
     }
 
@@ -48272,6 +48284,8 @@ impl Simulator {
         self.formal_dyn = ctx.formal_dyn;
         self.static_local_syncs = ctx.static_local_syncs;
         self.method_local_base = ctx.method_local_base;
+        self.current_static_task = ctx.current_static_task;
+        self.current_auto_task = ctx.current_auto_task;
     }
 
     fn inherit_current_process_context(&mut self, pid: usize) {
@@ -81124,7 +81138,18 @@ impl Simulator {
                         .product::<i64>()
                         <= (1 << 20)
                 }) {
-                    let name = d.name.name.clone();
+                    // §6.21: automatic like the 1-D fixed local below — a
+                    // per-invocation key in a class method or automatic task.
+                    let bare = d.name.name.clone();
+                    let in_method = matches!(self.class_context_stack.last(), Some(Some(_)));
+                    let name = if (in_method || self.current_auto_task.is_some())
+                        && self.current_static_task.is_none()
+                        && !matches!(lifetime, Some(crate::ast::types::Lifetime::Static))
+                    {
+                        self.declare_local_dyn(&bare)
+                    } else {
+                        bare
+                    };
                     match shape.len() {
                         2 => {
                             self.module
@@ -102984,6 +103009,8 @@ impl Simulator {
         }
         self.module.dynamic_arrays.remove(key);
         self.module.arrays.remove(key);
+        self.module.arrays_2d.remove(key);
+        self.module.arrays_nd.remove(key);
         self.module.associative_arrays.remove(key);
         self.module.assoc_index_widths.remove(key);
         self.module.queue_max_sizes.remove(key);
@@ -133133,6 +133160,22 @@ impl Simulator {
     }
 
     fn exec_function_call(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
+        // §6.21 / §13.4.2: a function's locals take ITS lifetime, not the
+        // calling task's. A static function called from an automatic task
+        // shares its locals across calls, so the caller's per-invocation
+        // renaming (`current_auto_task`) is suspended for the call.
+        if self.current_auto_task.is_none()
+            || matches!(fd.lifetime, Some(crate::ast::types::Lifetime::Automatic))
+        {
+            return self.exec_function_call_body(fd, args);
+        }
+        let prev_auto = self.current_auto_task.take();
+        let v = self.exec_function_call_body(fd, args);
+        self.current_auto_task = prev_auto;
+        v
+    }
+
+    fn exec_function_call_body(&mut self, fd: &FunctionDeclaration, args: &[Expression]) -> Value {
         self.signals.remove("__vif_return__");
         self.vif_return_pending = false;
         // §26.3: the package this body belongs to. Taken before anything else
@@ -140048,6 +140091,8 @@ impl Simulator {
                                 formal_dyn: Vec::new(),
                                 static_local_syncs: Vec::new(),
                                 method_local_base: Vec::new(),
+                                current_static_task: None,
+                                current_auto_task: None,
                             },
                         );
                         self.event_queue
