@@ -148065,6 +148065,97 @@ impl Simulator {
     /// member. None = not such a foreach (or one this checker cannot judge:
     /// fewer loop vars than dimensions, or an unmodeled body) — the caller's
     /// other checkers/skips then apply unchanged. Some(ok) is authoritative.
+    /// A `foreach` array that names a member of the object itself (`m`,
+    /// `this.m`), not one reached through another handle.
+    fn foreach_plain_member(array: &Expression) -> bool {
+        match &array.kind {
+            ExprKind::Ident(h) => {
+                h.root.is_none()
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && (h.path.len() == 1 || (h.path.len() == 2 && h.path[0].name.name == "this"))
+            }
+            ExprKind::MemberAccess { expr, .. } => matches!(expr.kind, ExprKind::This),
+            _ => false,
+        }
+    }
+
+    /// §18.5.8.1: the index ranges of `foreach (name[i…])` over a plain
+    /// member that is not an unpacked fixed array: a packed vector (`bit
+    /// [3:0] it;`, one range per loop variable, leftmost dimension first,
+    /// §12.7.3) or a queue / dynamic array whose current size bounds the
+    /// loop. Such a loop is as much a constraint as one over a rand array,
+    /// so the trial judge must check it rather than skip it. None for any
+    /// other shape (a path through another object, an associative array).
+    pub(super) fn state_foreach_dims(
+        &self,
+        handle: usize,
+        array: &Expression,
+        name: &str,
+        nvars: usize,
+    ) -> Option<Vec<(i64, i64)>> {
+        if !Self::foreach_plain_member(array) || nvars == 0 {
+            return None;
+        }
+        let mut cur = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(&cn)?;
+            if cd.assoc_properties.contains_key(name)
+                || cd.array_properties.contains_key(name)
+                || cd.array_nd_properties.contains_key(name)
+            {
+                return None;
+            }
+            if cd.queue_properties.contains_key(name) {
+                if nvars != 1 {
+                    return None;
+                }
+                let n = self.get_queue_size(&format!("{}#{}", handle, name)) as i64;
+                return Some(vec![(0, n - 1)]);
+            }
+            if let Some(dt) = self.class_prop_decl_type(cd, name) {
+                let p = &self.module.parameters;
+                let dims = match super::elaborate::packed_full_dims_chained(
+                    dt,
+                    p,
+                    &self.module.typedef_types,
+                ) {
+                    Some(d) => d,
+                    // A single dimension: an ordinary vector.
+                    None => {
+                        let dt =
+                            super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+                        let DataType::IntegerVector { dimensions, .. } = dt else {
+                            return None;
+                        };
+                        let [crate::ast::types::PackedDimension::Range { left, right, .. }] =
+                            dimensions.as_slice()
+                        else {
+                            return None;
+                        };
+                        let l = super::elaborate::const_eval_i64_with_params(left, Some(p))?;
+                        let r = super::elaborate::const_eval_i64_with_params(right, Some(p))?;
+                        vec![(l, r)]
+                    }
+                };
+                if dims.len() < nvars {
+                    return None;
+                }
+                return Some(
+                    dims[..nvars]
+                        .iter()
+                        .map(|&(l, r)| (l.min(r), l.max(r)))
+                        .collect(),
+                );
+            }
+            cur = cd.extends.clone();
+        }
+        None
+    }
+
     fn check_fixed_foreach_item(&mut self, handle: usize, item: &ConstraintItem) -> Option<bool> {
         let ConstraintItem::Foreach {
             array,
@@ -148082,7 +148173,7 @@ impl Simulator {
         // An array MEMBER of a struct property (`foreach (u.arr[i])`).
         if Self::foreach_member_chain(array).is_some() {
             if let Some(dims) = self.member_foreach_dims(handle, array) {
-                if idx_names.len() != dims.len() || Self::constraint_unmodeled(body) {
+                if idx_names.len() != dims.len() || Self::foreach_body_unmodeled(body) {
                     return None;
                 }
                 let body = (**body).clone();
@@ -148093,11 +148184,14 @@ impl Simulator {
             }
         }
         let arr_name = Self::foreach_base_name(array)?;
-        let (dims, _w) = self.fixed_foreach_dims(handle, &arr_name)?;
+        let dims = match self.fixed_foreach_dims(handle, &arr_name) {
+            Some((dims, _)) => dims,
+            None => self.state_foreach_dims(handle, array, &arr_name, idx_names.len())?,
+        };
         if idx_names.len() != dims.len() {
             return None;
         }
-        if Self::constraint_unmodeled(body) {
+        if Self::foreach_body_unmodeled(body) {
             return None;
         }
         if dims.iter().any(|&(lo, hi)| hi < lo) {
@@ -148579,6 +148673,36 @@ impl Simulator {
         }
     }
 
+    /// `constraint_unmodeled` for the body of a `foreach` the trial judge
+    /// checks element by element: a nested `foreach` is judged too (see the
+    /// `Foreach` arm of `check_constraint_item_impl`), so it is unmodeled
+    /// only when its own body is.
+    fn foreach_body_unmodeled(item: &ConstraintItem) -> bool {
+        match item {
+            ConstraintItem::Foreach { item, .. } => Self::foreach_body_unmodeled(item),
+            ConstraintItem::Block(items) => items.iter().any(Self::foreach_body_unmodeled),
+            ConstraintItem::Soft(inner) => Self::foreach_body_unmodeled(inner),
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => Self::expr_unmodeled(condition) || Self::foreach_body_unmodeled(constraint),
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                Self::expr_unmodeled(condition)
+                    || Self::foreach_body_unmodeled(then_item)
+                    || else_item
+                        .as_ref()
+                        .is_some_and(|e| Self::foreach_body_unmodeled(e))
+            }
+            other => Self::constraint_unmodeled(other),
+        }
+    }
+
     fn constraint_unmodeled(item: &ConstraintItem) -> bool {
         match item {
             ConstraintItem::Foreach { .. }
@@ -148886,7 +149010,80 @@ impl Simulator {
                 }
                 true
             }
+            ConstraintItem::Foreach {
+                array,
+                vars,
+                item: body,
+                ..
+            } => self.check_member_foreach(array, vars, body),
             _ => true,
+        }
+    }
+
+    /// §18.5.8.1: `foreach (m[i…]) body` over a plain member of the object
+    /// being checked (`this_stack`), judged element by element: an unpacked
+    /// fixed array, a packed vector, a queue or a dynamic array. A loop
+    /// nested in another loop's body (`foreach (a[i]) foreach (b[j]) …`)
+    /// reaches the checker only here, and used to pass unseen. A shape the
+    /// checker cannot enumerate still passes, as before.
+    fn check_member_foreach(
+        &mut self,
+        array: &Expression,
+        vars: &[Option<crate::ast::Identifier>],
+        body: &ConstraintItem,
+    ) -> bool {
+        let Some(Some(handle)) = self.this_stack.last().copied() else {
+            return true;
+        };
+        let Some(name) = Self::foreach_base_name(array) else {
+            return true;
+        };
+        // Only a plain member (`m`, `this.m`): `state_foreach_dims` checks
+        // that, and a fixed array must pass the same test.
+        let Some(dims) = (match self.state_foreach_dims(handle, array, &name, vars.len()) {
+            Some(d) => Some(d),
+            None if Self::foreach_plain_member(array) => {
+                self.fixed_foreach_dims(handle, &name).map(|d| d.0)
+            }
+            None => None,
+        }) else {
+            return true;
+        };
+        if dims.len() != vars.len() || Self::foreach_body_unmodeled(body) {
+            return true;
+        }
+        if dims.iter().any(|&(lo, hi)| hi < lo) {
+            return true;
+        }
+        let mut idx: Vec<i64> = dims.iter().map(|d| d.0).collect();
+        // The enclosing loop's indices stay visible (`a[i][j*2+1]` in a loop
+        // nested in `foreach (a[i])`): the frame extends the current one.
+        let outer = self.local_stack.last().cloned().unwrap_or_default();
+        loop {
+            let mut frame = outer.clone();
+            for (k, v) in vars.iter().enumerate() {
+                if let Some(v) = v {
+                    frame.insert(v.name.clone(), Self::signed_loop_val(idx[k]));
+                }
+            }
+            self.push_local_frame(frame);
+            let ok = self.check_constraint_item_impl(body);
+            self.pop_local_frame();
+            if !ok {
+                return false;
+            }
+            let mut k = dims.len();
+            loop {
+                if k == 0 {
+                    return true;
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] <= dims[k].1 {
+                    break;
+                }
+                idx[k] = dims[k].0;
+            }
         }
     }
 

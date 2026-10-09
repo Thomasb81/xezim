@@ -49,6 +49,10 @@ thread_local! {
     /// one index at a time (classes with wide variables).
     static CSP_SCAN_BINDS: std::cell::RefCell<Vec<(String, Value)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The variables whose whole value `$countones` reads, found while
+    /// `csp_split_slices` scans the constraints (see `Csp::pop`).
+    static CSP_SCAN_POPS: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The scan's evaluation scope: the bound `foreach` indices, if any.
@@ -297,6 +301,13 @@ enum Node {
         src: usize,
     },
     AllDiff(Vec<usize>),
+    /// §20.9: `c == $countones(x)` for a variable `x` of `w` bits and its
+    /// count variable `c` (see `Csp::pop`): a fixed `x` fixes `c`.
+    Pop {
+        x: usize,
+        c: usize,
+        w: u32,
+    },
     /// Judged by the evaluator once every variable of `src` is fixed.
     Eval {
         src: usize,
@@ -343,8 +354,19 @@ struct Aux {
     /// `solve p before v`: the variables decided before each one.
     preds: Vec<Vec<usize>>,
     succs: Vec<Vec<usize>>,
-    /// Read by some `if`/`->` condition.
+    /// Weighed by its solutions (`csp_weigh`): read by some `if`/`->`
+    /// condition, or by the other side of a relation on a `$countones`
+    /// count (`$countones(strb) == 2**size`: each size leaves C(w, 2**size)
+    /// strobe values).
     guard_var: Vec<bool>,
+    /// `succs` from `solve … before` alone, without the orderings the
+    /// solver adds itself (`Fun` and `$countones` variables after their
+    /// inputs).
+    user_succs: Vec<Vec<usize>>,
+    /// `$countones` links (`Csp::pop`): the count variable of each counted
+    /// variable, and the counted variable and its width of each count.
+    pop_c: Vec<Option<usize>>,
+    pop_x: Vec<Option<(usize, u32)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -443,6 +465,17 @@ struct Csp {
     /// A wide variable could not be split (too many segments, a dynamic
     /// select): the problem is not modelled.
     wide_fail: bool,
+    /// §20.9: `$countones(x)` of a whole variable of at most 64 bits is an
+    /// int-valued count variable in [0, width] (x -> count), tied to `x` by
+    /// a `Pop` node. A relation on the count is then an ordinary one —
+    /// linear, or a `Fun` node when its other side is not linear
+    /// (`$countones(strb) == 2**size`) — and `x` is decided after its count
+    /// and drawn with exactly that many ones, instead of being guessed
+    /// against a test the bits rarely pass.
+    pop: HashMap<usize, usize>,
+    /// The reverse of `pop` (count -> x): the evaluator reads `x` itself, so
+    /// a source that depends on the count depends on `x` too.
+    pop_rev: HashMap<usize, usize>,
 }
 
 /// Translation scope: bound `foreach` indices and the `with` iterator.
@@ -618,6 +651,7 @@ impl Node {
                 out.extend(srcs[*src].deps.iter().copied());
             }
             Node::AllDiff(vs) => out.extend(vs.iter().copied()),
+            Node::Pop { x, c, .. } => out.extend([*x, *c]),
             Node::Eval { src, .. } => out.extend(srcs[*src].deps.iter().copied()),
             Node::Fun {
                 var, other, whole, ..
@@ -818,6 +852,8 @@ impl Simulator {
             wide_free: Vec::new(),
             draw_free: false,
             wide_fail: false,
+            pop: HashMap::default(),
+            pop_rev: HashMap::default(),
         };
         let dom_of = |w: u32, s: bool, members: &Option<Vec<u64>>| -> Dom {
             match members {
@@ -934,6 +970,8 @@ impl Simulator {
             wide_free: Vec::new(),
             draw_free: false,
             wide_fail: false,
+            pop: HashMap::default(),
+            pop_rev: HashMap::default(),
         };
         let enum_dom = |me: &Self, tn: &str| -> Option<Dom> {
             let members = me.module.enum_members.get(tn)?;
@@ -1347,6 +1385,41 @@ impl Simulator {
                 }
             }
         }
+        // §18.5.10 / §20.9: a `$countones` count is drawn in proportion to
+        // the values of its variable that have that many ones (C(w, n)), as
+        // a uniform draw of the variable would; the variable then draws
+        // exactly that many ones.
+        if let Some((_, w)) = aux.pop_x[v] {
+            if let Some(n) = self.csp_pop_count(&st.d[v], w) {
+                return n;
+            }
+        }
+        if let Some(c) = aux.pop_c[v] {
+            let w = csp.vars[v].width;
+            for _ in 0..64 {
+                let n = match st.fixed(c) {
+                    Some(n) => n,
+                    None => match self.csp_pop_count(&st.d[c], w) {
+                        Some(n) => n,
+                        None => break,
+                    },
+                };
+                // The ones go below the top of a non-negative range.
+                let (lo, hi) = st.bounds(v);
+                let span = if lo >= 0 {
+                    (128 - (hi as u128).leading_zeros()).min(w)
+                } else {
+                    w
+                };
+                if n < 0 || n > span as i128 {
+                    break;
+                }
+                let x = self.csp_pop_draw(w, span, n as u32, csp.vars[v].signed);
+                if dom_has(&st.d[v], x) {
+                    return x;
+                }
+            }
+        }
         let size = dom_size(&st.d[v]);
         if aux.guard_var[v] && size <= EST_MAX_DOM && st.est_work < EST_BUDGET {
             if let Some(x) = self.csp_weigh(csp, aux, watch, st, v) {
@@ -1355,6 +1428,74 @@ impl Simulator {
         }
         let k = self.cur_rng().gen_range(0..size);
         dom_nth(&st.d[v], k)
+    }
+
+    /// A count of ones for a `w`-bit variable from `dom`, weighed by the
+    /// number of `w`-bit values with that count, C(w, n). None when `dom`
+    /// holds no count in [0, w].
+    fn csp_pop_count(&mut self, dom: &Dom, w: u32) -> Option<i128> {
+        let w = w.min(64);
+        let mut binom = vec![1f64; w as usize + 1];
+        for n in 1..=w as usize {
+            binom[n] = binom[n - 1] * (w as usize + 1 - n) as f64 / n as f64;
+        }
+        let cand: Vec<(i128, f64)> = dom_clip(dom, 0, w as i128)
+            .iter()
+            .flat_map(|&(l, h)| l..=h)
+            .map(|n| (n, binom[n as usize]))
+            .collect();
+        let total: f64 = cand.iter().map(|c| c.1).sum();
+        if cand.is_empty() || total <= 0.0 {
+            return None;
+        }
+        let mut r = self.cur_rng().gen_range(0.0..total);
+        for &(n, wt) in &cand {
+            if r < wt {
+                return Some(n);
+            }
+            r -= wt;
+        }
+        cand.last().map(|c| c.0)
+    }
+
+    /// log2 of the solutions a domain stands for: its size, or for a
+    /// `$countones` count the values of its variable with one of its
+    /// counts, Σ C(w, n).
+    fn csp_log_size(aux: &Aux, u: usize, d: &Dom) -> f64 {
+        let Some((_, w)) = aux.pop_x[u] else {
+            return (dom_size(d) as f64).log2();
+        };
+        let w = w.min(64) as usize;
+        let mut binom = 1f64;
+        let mut total = 0f64;
+        for n in 0..=w {
+            if n > 0 {
+                binom = binom * (w + 1 - n) as f64 / n as f64;
+            }
+            if dom_has(d, n as i128) {
+                total += binom;
+            }
+        }
+        total.log2()
+    }
+
+    /// A `w`-bit value with exactly `n` ones at random positions among its
+    /// low `span` bits, read as the variable's value (sign-extended when it
+    /// is signed).
+    fn csp_pop_draw(&mut self, w: u32, span: u32, n: u32, signed: bool) -> i128 {
+        let w = w.min(64);
+        let mut pos: Vec<u32> = (0..span.min(w)).collect();
+        let mut bits: u64 = 0;
+        for k in 0..(n as usize).min(pos.len()) {
+            let j = self.cur_rng().gen_range(k..pos.len());
+            pos.swap(k, j);
+            bits |= 1u64 << pos[k];
+        }
+        if signed && w > 0 && (bits >> (w - 1)) & 1 == 1 {
+            bits as i128 - (1i128 << w)
+        } else {
+            bits as i128
+        }
     }
 
     /// §18.5.10: without an ordering every solution is equally likely, so a
@@ -1372,11 +1513,11 @@ impl Simulator {
         v: usize,
     ) -> Option<i128> {
         let mut after = vec![false; csp.vars.len()];
-        let mut todo: Vec<usize> = aux.succs[v].clone();
+        let mut todo: Vec<usize> = aux.user_succs[v].clone();
         while let Some(u) = todo.pop() {
             if !after[u] {
                 after[u] = true;
-                todo.extend(aux.succs[u].iter().copied());
+                todo.extend(aux.user_succs[u].iter().copied());
             }
         }
         let vals: Vec<i128> = st.d[v].iter().flat_map(|&(l, h)| l..=h).collect();
@@ -1400,7 +1541,7 @@ impl Simulator {
                     }
                     seen[u] = true;
                     touched.push(u);
-                    lg += (dom_size(&st.d[u]) as f64).log2() - (dom_size(old) as f64).log2();
+                    lg += Self::csp_log_size(aux, u, &st.d[u]) - Self::csp_log_size(aux, u, old);
                 }
                 for u in touched.drain(..) {
                     seen[u] = false;
@@ -1435,9 +1576,27 @@ impl Simulator {
             preds: vec![Vec::new(); n],
             succs: vec![Vec::new(); n],
             guard_var: vec![false; n],
+            user_succs: vec![Vec::new(); n],
+            pop_c: vec![None; n],
+            pop_x: vec![None; n],
         };
         for (i, d) in csp.dists.iter().enumerate() {
             aux.dists[d.var].push(i);
+        }
+        // A counted variable is decided after its count, so it is drawn
+        // with the count's number of ones (`csp_pick_val`).
+        for (&x, &c) in &csp.pop {
+            // A variable under a dist draws by its weights first (§18.5.4);
+            // its count then follows it.
+            if !aux.dists[x].is_empty() {
+                continue;
+            }
+            aux.pop_c[x] = Some(c);
+            aux.pop_x[c] = Some((x, csp.vars[x].width));
+            if !aux.preds[x].contains(&c) {
+                aux.preds[x].push(c);
+                aux.succs[c].push(x);
+            }
         }
         for (before, after) in &csp.order {
             for &a in after {
@@ -1445,6 +1604,7 @@ impl Simulator {
                     if a != b {
                         aux.preds[a].push(b);
                         aux.succs[b].push(a);
+                        aux.user_succs[b].push(a);
                     }
                 }
             }
@@ -1488,6 +1648,25 @@ impl Simulator {
         let mut gv = Vec::new();
         for nd in &csp.nodes {
             conds(nd, &csp.srcs, &mut gv);
+        }
+        // The inputs of a `Fun` relation on a counted `$countones` count.
+        fn pop_inputs(n: &Node, csp: &Csp, aux: &Aux, out: &mut Vec<usize>) {
+            match n {
+                Node::And(ns) | Node::Or(ns) => {
+                    ns.iter().for_each(|m| pop_inputs(m, csp, aux, out))
+                }
+                Node::If { then, els, .. } => {
+                    pop_inputs(then, csp, aux, out);
+                    pop_inputs(els, csp, aux, out);
+                }
+                Node::Fun { var, other, .. } if aux.pop_x[*var].is_some() => {
+                    out.extend(csp.srcs[*other].deps.iter().copied());
+                }
+                _ => {}
+            }
+        }
+        for nd in &csp.nodes {
+            pop_inputs(nd, csp, &aux, &mut gv);
         }
         for v in gv {
             aux.guard_var[v] = true;
@@ -1667,6 +1846,41 @@ impl Simulator {
                 // pigeonhole: the free variables need that many values
                 free == 0 || dom_size(&dom_norm(pool)) >= free
             }
+            Node::Pop { x, c, w } => {
+                if let Some(v) = st.fixed(*x) {
+                    let n = Self::bits_at(v, *w).count_ones() as i128;
+                    let nd = dom_meet(&st.d[*c], &vec![(n, n)]);
+                    return st.set(*c, nd);
+                }
+                // A small domain of x: keep the values whose count is still
+                // possible, and the counts some value still has.
+                if dom_size(&st.d[*x]) <= 64 {
+                    let mut xs = Vec::new();
+                    let mut ns = Vec::new();
+                    for &(l, h) in &st.d[*x] {
+                        for v in l..=h {
+                            let n = Self::bits_at(v, *w).count_ones() as i128;
+                            if dom_has(&st.d[*c], n) {
+                                xs.push((v, v));
+                                ns.push((n, n));
+                            }
+                        }
+                    }
+                    return st.set(*x, dom_norm(xs)) && st.set(*c, dom_norm(ns));
+                }
+                // Otherwise bound the count by x's range: a value in [lo, hi]
+                // with 0 <= lo has at most max(ones(hi), bits(hi) - 1) ones,
+                // and at least one when lo > 0.
+                let (lo, hi) = st.bounds(*x);
+                if lo >= 0 {
+                    let h = hi as u128;
+                    let bl = 128 - h.leading_zeros();
+                    let cmax = h.count_ones().max(bl.saturating_sub(1)) as i128;
+                    let nd = dom_clip(&st.d[*c], (lo > 0) as i128, cmax);
+                    return st.set(*c, nd);
+                }
+                true
+            }
             Node::Eval { src, neg } => {
                 !self.csp_src_fixed(csp, st, *src) || self.csp_eval_src(csp, st, *src) != *neg
             }
@@ -1699,6 +1913,16 @@ impl Simulator {
                         let sh = 64 - c.width.max(1);
                         (((x << sh) as i64) >> sh) as i128
                     }
+                    // §11.8.1/§11.8.2: with an unsigned side the relation is
+                    // unsigned, at the wider width, and each operand is
+                    // zero-extended. A signed variable that cannot be
+                    // negative (a `$countones` count against `2**size`)
+                    // keeps its value; the other side, at least as wide,
+                    // is its own self-determined value.
+                    (true, false) if st.bounds(*var).0 >= 0 && c.width >= vw => match c.to_u64() {
+                        Some(x) => x as i128,
+                        None => return true,
+                    },
                     // Mixed signedness: leave it to the final judgement.
                     _ => return true,
                 };
@@ -1856,6 +2080,13 @@ impl Simulator {
                     return Some(!*neg);
                 }
                 None
+            }
+            Node::Pop { x, c, w } => {
+                let n = Self::bits_at(st.fixed(*x)?, *w).count_ones() as i128;
+                if !dom_has(&st.d[*c], n) {
+                    return Some(false);
+                }
+                st.fixed(*c).map(|_| true)
             }
             Node::AllDiff(vs) => {
                 if !st.all_fixed(vs) {
@@ -2288,7 +2519,19 @@ impl Simulator {
     // Translation
     // ---------------------------------------------------------------------
 
-    fn csp_src(&self, csp: &mut Csp, item: SrcItem, env: &Env, deps: Vec<usize>) -> usize {
+    fn csp_src(&self, csp: &mut Csp, item: SrcItem, env: &Env, mut deps: Vec<usize>) -> usize {
+        // The evaluator reads a counted variable itself, not its count.
+        if !csp.pop_rev.is_empty() {
+            let xs: Vec<usize> = deps
+                .iter()
+                .filter_map(|d| csp.pop_rev.get(d).copied())
+                .collect();
+            if !xs.is_empty() {
+                deps.extend(xs);
+                deps.sort_unstable();
+                deps.dedup();
+            }
+        }
         csp.srcs.push(Src {
             item,
             binds: env.binds.clone(),
@@ -2579,9 +2822,16 @@ impl Simulator {
             .or_else(|| self.packed_prop_foreach_dims(csp.handle, name))
         {
             Some((dims, _)) => *dims.first()?,
-            None => self.csp_vector_range(csp.handle, name)?,
+            // A state queue or dynamic array: its current size bounds the
+            // loop for this solve (an empty one constrains nothing).
+            None => match self.csp_vector_range(csp.handle, name) {
+                Some(r) => r,
+                None => *self
+                    .state_foreach_dims(csp.handle, array, name, 1)?
+                    .first()?,
+            },
         };
-        (hi >= lo && hi - lo < 4096).then(|| (lo..=hi).collect())
+        (hi - lo < 4096).then(|| (lo..=hi).collect())
     }
 
     /// The declared index range (low, high) of a one-dimensional packed
@@ -3965,16 +4215,23 @@ impl Simulator {
             }
             me.csp_const(e, env)?.to_i64()
         };
-        let (v, lo, w, _) = self.csp_slice_base_k(csp, x, &mut konst)?;
-        let segs = csp.segs.get(&v)?;
-        let bits: Vec<usize> = segs
-            .iter()
-            .filter(|s| s.0 >= lo && s.0 < lo + w)
-            .map(|s| (s.1 == 1).then_some(s.2))
-            .collect::<Option<_>>()?;
-        if bits.len() != w as usize {
-            return None;
-        }
+        let (v, lo, w, whole) = self.csp_slice_base_k(csp, x, &mut konst)?;
+        // A variable split into single bits anyway (a select at a variable
+        // position) counts them; a whole variable otherwise has its count.
+        let bits: Option<Vec<usize>> = csp.segs.get(&v).and_then(|segs| {
+            segs.iter()
+                .filter(|s| s.0 >= lo && s.0 < lo + w)
+                .map(|s| (s.1 == 1).then_some(s.2))
+                .collect::<Option<Vec<_>>>()
+        });
+        let bits = match bits {
+            Some(b) if b.len() == w as usize => b,
+            _ => {
+                let &c = csp.pop.get(&v)?;
+                return (whole && lo == 0 && w == csp.vars[v].width)
+                    .then(|| Self::csp_var_ae(csp, c));
+            }
+        };
         let terms = bits
             .into_iter()
             .map(|b| Ae::Cast {
@@ -4255,12 +4512,20 @@ impl Simulator {
         let mut uses: HashMap<usize, (Vec<(u32, u32)>, bool)> = HashMap::default();
         let mut bound: Vec<String> = Vec::new();
         let prev_any = CSP_SCAN_ANY.with(|c| c.replace(true));
+        let prev_pops = CSP_SCAN_POPS.with(|p| std::mem::take(&mut *p.borrow_mut()));
         for c in constraints {
             for it in &c.items {
                 self.csp_scan_item(csp, it, &mut bound, &mut uses);
             }
         }
         CSP_SCAN_ANY.with(|c| c.set(prev_any));
+        let mut pops = CSP_SCAN_POPS.with(|p| std::mem::replace(&mut *p.borrow_mut(), prev_pops));
+        // As for the cuts below: a loop over an array counts every element.
+        for a in csp.arrays.values() {
+            if a.elems.iter().any(|e| pops.contains(&e.1)) {
+                pops.extend(a.elems.iter().map(|e| e.1));
+            }
+        }
         // An element select seen through a `foreach` index was recorded on
         // one element: give every element of that array the same cuts.
         for a in csp.arrays.values() {
@@ -4325,6 +4590,35 @@ impl Simulator {
                 }
             }
             csp.segs.insert(v, segs);
+        }
+        pops.sort_unstable();
+        pops.dedup();
+        csp.pop.clear();
+        csp.pop_rev.clear();
+        for x in pops {
+            let w = csp.vars[x].width;
+            if w == 0 || w > 64 || csp.wide.contains(&x) || csp.vars.len() >= MAX_VARS {
+                continue;
+            }
+            // Split into single bits anyway (a select at a variable
+            // position): `csp_countones` sums them instead.
+            if csp
+                .segs
+                .get(&x)
+                .is_some_and(|segs| segs.iter().all(|s| s.1 == 1))
+            {
+                continue;
+            }
+            // §20.9: `$countones` returns an int.
+            csp.vars.push(CspVar {
+                key: VarKey::Aux,
+                width: 32,
+                signed: true,
+            });
+            csp.dom0.push(vec![(0, w as i128)]);
+            let c = csp.vars.len() - 1;
+            csp.pop.insert(x, c);
+            csp.pop_rev.insert(c, x);
         }
     }
 
@@ -4533,15 +4827,21 @@ impl Simulator {
                 None => u.1 = true,
             }
         }
-        // `$countones(x)` counts single bits (see `csp_countones`).
+        // `$countones(x)` of a whole variable is a count variable (see
+        // `Csp::pop`); of a select or a field it counts single bits (see
+        // `csp_countones`).
         if let ExprKind::SystemCall { name, args } = &Self::unparen(e).kind
             && name == "$countones"
             && let [x] = args.as_slice()
-            && let Some((v, lo, w, _)) = self.csp_slice_base_k(csp, x, &mut konst)
+            && let Some((v, lo, w, whole)) = self.csp_slice_base_k(csp, x, &mut konst)
             && w <= 64
         {
-            let u = uses.entry(v).or_default();
-            u.0.extend((lo..lo + w).map(|b| (b, 1)));
+            if whole && lo == 0 && w == csp.vars[v].width && !csp.wide.contains(&v) {
+                CSP_SCAN_POPS.with(|p| p.borrow_mut().push(v));
+            } else {
+                let u = uses.entry(v).or_default();
+                u.0.extend((lo..lo + w).map(|b| (b, 1)));
+            }
         }
         // `x & MASK`: the runs of ones in the mask are selects of x.
         if let ExprKind::Binary {
@@ -4863,6 +5163,12 @@ impl Simulator {
                 }
             }
             links.push(Lin { t, k: 0 });
+        }
+        let mut pops: Vec<(usize, usize)> = csp.pop.iter().map(|(&x, &c)| (x, c)).collect();
+        pops.sort_unstable();
+        for (x, c) in pops {
+            let w = csp.vars[x].width;
+            csp.nodes.push(Node::Pop { x, c, w });
         }
         for mut lin in links {
             lin.t.sort_unstable_by_key(|x| x.0);
