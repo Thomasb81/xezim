@@ -16000,16 +16000,6 @@ impl Simulator {
         if self.dpi_bindings.contains_key(sv_name) || self.dpi_unsupported.contains(sv_name) {
             return;
         }
-        // Built-in implementations of the UVM distribution's DPI-C helpers
-        // (a faithful port of src/dpi/*.cc) take precedence over a loaded
-        // shared library: no FFI marshalling, and their caches (compiled
-        // regexes behind `uvm_re_compexecfree`, whose chandle never escapes
-        // to SV) keep hot loops from recompiling patterns per call. Leave
-        // these unbound so exec_dpi_import_call serves them from the
-        // built-in table; anything else binds to the library as before.
-        if Self::uvm_dpi_builtin_implements(&spec.c_name) {
-            return;
-        }
         // LRM §35.5.3: a DPI import declared `pure` must (a) return non-void
         // and (b) have ONLY `input` ports — no output/inout/ref. A `pure`
         // task is illegal. Catch the violations at bind time so a misdeclared
@@ -16403,24 +16393,23 @@ impl Simulator {
         let prev_active = ACTIVE_SIMULATOR.with(|cell| cell.get());
         if !self.dpi_bindings.contains_key(sv_name) {
             let c_name = self.module.dpi_imports.get(sv_name)?.c_name.clone();
-            // Built-in implementations of the UVM distribution's DPI-C
-            // helpers (src/compiler/simulator/uvm_dpi.rs) take precedence
-            // over a user-loaded shared library for the symbols they
-            // implement: they are a faithful port of the same src/dpi/*.cc
-            // sources, without FFI marshalling, and can cache (compiled
-            // regexes behind `uvm_re_compexecfree`, whose chandle never
-            // escapes to SV). Symbols outside the built-in table still
-            // bind to the library as before.
-            if let Some(v) = self.exec_uvm_dpi_builtin(&c_name, sv_name, args) {
-                ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
-                return Some(v);
-            }
             // Binding is attempted once per import; UVM's regex helpers are
             // called often enough that re-cloning the prototype showed.
             if !self.dpi_unsupported.contains(sv_name) && self.dpi_bind_tried.insert(sv_name.into())
             {
                 let spec = self.module.dpi_imports.get(sv_name)?.clone();
                 self.try_bind_dpi(sv_name, &spec);
+            }
+            // Built-in implementations of the UVM distribution's DPI-C
+            // helpers (src/compiler/simulator/uvm_dpi.rs), so UVM runs
+            // without +define+UVM_NO_DPI. A user-loaded shared library that
+            // defines one of these symbols wins — the builtin only serves
+            // symbols no library resolved.
+            if !self.dpi_bindings.contains_key(sv_name) {
+                if let Some(v) = self.exec_uvm_dpi_builtin(&c_name, sv_name, args) {
+                    ACTIVE_SIMULATOR.with(|cell| cell.set(prev_active));
+                    return Some(v);
+                }
             }
         }
         let spec = self.module.dpi_imports.get(sv_name)?.clone();

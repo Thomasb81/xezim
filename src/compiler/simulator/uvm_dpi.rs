@@ -248,42 +248,6 @@ fn chandle_val(h: u64) -> Value {
 impl Simulator {
     /// Serve UVM's DPI-C helper `c_name` (imported as `sv_name`). `None`
     /// when `c_name` is not one of them.
-    /// The `c_name`s `exec_uvm_dpi_builtin` implements — mirror of its
-    /// match arms. Imports in this set skip `try_bind_dpi` so the built-in
-    /// serves them at call time (see `exec_dpi_import_call`).
-    pub(super) fn uvm_dpi_builtin_implements(c_name: &str) -> bool {
-        matches!(
-            c_name,
-            "uvm_re_match"
-                | "uvm_dpi_get_next_arg_c"
-                | "uvm_dpi_get_tool_name_c"
-                | "uvm_dpi_get_tool_version_c"
-                | "uvm_dpi_regcomp"
-                | "uvm_dpi_regexec"
-                | "uvm_dpi_regfree"
-                | "uvm_dump_re_cache"
-                | "uvm_glob_to_re"
-                | "uvm_hdl_check_path"
-                | "uvm_hdl_deposit"
-                | "uvm_hdl_force"
-                | "uvm_hdl_read"
-                | "uvm_hdl_release"
-                | "uvm_hdl_release_and_read"
-                | "uvm_hdl_signal_size"
-                | "uvm_polling_create"
-                | "uvm_polling_get_callback_enable"
-                | "uvm_polling_process_changelist"
-                | "uvm_polling_set_enable_callback"
-                | "uvm_polling_setup_notifier"
-                | "uvm_re_buffer"
-                | "uvm_re_comp"
-                | "uvm_re_compexec"
-                | "uvm_re_compexecfree"
-                | "uvm_re_deglobbed"
-                | "uvm_re_exec"
-                | "uvm_re_free"
-        )
-    }
     pub(super) fn exec_uvm_dpi_builtin(
         &mut self,
         c_name: &str,

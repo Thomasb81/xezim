@@ -99,6 +99,8 @@ mod struct_elem_string_member_format;
 mod system_task_gaps;
 #[path = "strings/uvm_dpi_driver_linkage.rs"]
 mod uvm_dpi_driver_linkage;
+#[path = "strings/uvm_dpi_user_library_wins.rs"]
+mod uvm_dpi_user_library_wins;
 #[path = "strings/vpi_callbacks.rs"]
 mod vpi_callbacks;
 #[path = "strings/vpi_mcd_and_time_queries.rs"]
