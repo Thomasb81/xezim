@@ -51,7 +51,6 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "XEZIM_ARRAY_SOA_SHADOW",
         "Arrays: shadow-verify structure-of-arrays storage against per-element Values",
     ),
-    ("XEZIM_AW_DBG", "Debug: trace assignment-width inference"),
     (
         "XEZIM_BC_DUMP",
         "Dump compiled bytecode blocks after compilation",

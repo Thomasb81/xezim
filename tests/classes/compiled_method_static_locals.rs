@@ -73,8 +73,16 @@ fn compiled_static_local_singleton_persists() {
 endmodule
 ";
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "mismatches"), 0, "every call returns the SAME singleton");
-    assert_eq!(u(&sim, "first_id"), 0, "the initializer ran once (first construction)");
+    assert_eq!(
+        u(&sim, "mismatches"),
+        0,
+        "every call returns the SAME singleton"
+    );
+    assert_eq!(
+        u(&sim, "first_id"),
+        0,
+        "the initializer ran once (first construction)"
+    );
 }
 
 /// A scalar static local must also persist across compiled calls
@@ -98,7 +106,11 @@ endmodule
 ";
     let sim = simulate(SRC, 100).expect("simulate failed");
     // sum of 1..=6000 = 6000*6001/2 = 18_003_000
-    assert_eq!(u(&sim, "sum"), 18_003_000, "static counter persisted across every call");
+    assert_eq!(
+        u(&sim, "sum"),
+        18_003_000,
+        "static counter persisted across every call"
+    );
 }
 
 /// The AST path (compiled methods disabled) must keep the same

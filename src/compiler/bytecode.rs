@@ -2723,10 +2723,7 @@ impl<'a> BytecodeCompiler<'a> {
                     .ports
                     .iter()
                     .all(|p| matches!(p.direction, PortDirection::Input | PortDirection::Output))
-                || idf
-                    .ports
-                    .iter()
-                    .any(|p| !p.dimensions.is_empty())
+                || idf.ports.iter().any(|p| !p.dimensions.is_empty())
             {
                 self.bail("Expr_Call_ports");
                 return None;
@@ -2799,9 +2796,15 @@ impl<'a> BytecodeCompiler<'a> {
             .iter()
             .any(|a| matches!(a.kind, ExprKind::NamedArg { .. } | ExprKind::Empty))
         {
-            owned_args =
+            // A failed normalization (nothing bindable) keeps the call on
+            // the interpreter instead of compiling a zero-argument call.
+            let Some(v) =
                 crate::compiler::simulator::Simulator::normalize_call_args(&fd.ports, args)
-                    .unwrap_or_default();
+            else {
+                self.bail("Expr_Call_named_args");
+                return None;
+            };
+            owned_args = v;
             &owned_args
         } else {
             args
@@ -5807,7 +5810,11 @@ impl<'a> BytecodeCompiler<'a> {
         // the +UVM_TESTNAME cmdline scan read an empty string and run_test
         // never saw the test name). Treat a body-less function as impure —
         // the call stays on the interpreter, which performs the DPI call.
-        if fd.items.is_empty() {
+        if self
+            .dpi_import_fds
+            .as_deref()
+            .is_some_and(|m| m.contains_key(&fd.name.name.name))
+        {
             return false;
         }
         let mut bound: HashSet<String> = HashSet::default();
@@ -5942,10 +5949,14 @@ impl<'a> BytecodeCompiler<'a> {
                             .iter()
                             .any(|a| matches!(a.kind, ExprKind::NamedArg { .. } | ExprKind::Empty))
                         {
-                            owned = crate::compiler::simulator::Simulator::normalize_call_args(
-                                &fd2.ports, args,
-                            )
-                            .unwrap_or_default();
+                            let Some(v) =
+                                crate::compiler::simulator::Simulator::normalize_call_args(
+                                    &fd2.ports, args,
+                                )
+                            else {
+                                return false;
+                            };
+                            owned = v;
                             owned.as_slice()
                         } else {
                             args
@@ -10271,7 +10282,11 @@ impl<'a> BytecodeCompiler<'a> {
                         } else if is_real {
                             (0, Value::from_f64(0.0))
                         } else {
-                            let w = if is_string { 0 } else { self.decl_width(data_type) };
+                            let w = if is_string {
+                                0
+                            } else {
+                                self.decl_width(data_type)
+                            };
                             (w, self.type_default_value(data_type, w))
                         };
                         if is_class_handle {
@@ -10287,7 +10302,8 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.local_kinds.insert(slot, k);
                             }
                         }
-                        self.local_var_regs.insert(decl.name.name.clone(), (slot, w));
+                        self.local_var_regs
+                            .insert(decl.name.name.clone(), (slot, w));
                         self.decl_local_regs.insert(decl.name.name.clone());
                         self.method_static_locals
                             .push((decl.name.name.clone(), slot, default));
@@ -17751,8 +17767,11 @@ impl<'a> BytecodeCompiler<'a> {
         // dispatch shell reads their registers after `exec_insns` (to
         // persist them into `static_local_vars` via the exit sync), so a
         // body-final store must not be NOP'd by copy-forwarding either.
-        let static_local_slots: Vec<RegId> =
-            self.method_static_locals.iter().map(|(_, s, _)| *s).collect();
+        let static_local_slots: Vec<RegId> = self
+            .method_static_locals
+            .iter()
+            .map(|(_, s, _)| *s)
+            .collect();
         for slot in static_local_slots {
             self.emit(Insn::Move(slot, slot));
         }
@@ -17859,7 +17878,7 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // class-perf collection-return: a contiguous arg range read.
             Insn::RetCollection(a, n) => {
-                for x in (*a as usize..*a as usize + *n as usize) {
+                for x in *a as usize..*a as usize + *n as usize {
                     f(x as RegId);
                 }
             }

@@ -7653,6 +7653,9 @@ pub struct Simulator {
     /// method compiler (free-function calls). Built lazily on the first
     /// class-method compile; cloned per call site by Rc only.
     free_fn_table: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,
+    /// DPI import function prototypes by SV name, built once on the first
+    /// method compile (see `dpi_import_fd_table`).
+    dpi_import_fds: Option<std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>>>,
     /// The same for `module.tasks`: every interpreted task call cloned the
     /// whole `TaskDeclaration`, and the clone plus its drop was about a
     /// quarter of a behavioural memory model's run (a device calling a
@@ -12229,6 +12232,7 @@ impl Simulator {
             cast_widths,
             fn_decl_cache: HashMap::default(),
             free_fn_table: None,
+            dpi_import_fds: None,
             task_decl_cache: HashMap::default(),
 
             fn_pure_cache: HashMap::default(),
@@ -32816,22 +32820,19 @@ impl Simulator {
                 // call. The compiled caller then moves the register into its
                 // own lvalue (compile-time copyback).
                 let import_ports: Option<Vec<crate::ast::decl::FunctionPort>> = if fd.is_none() {
-                    self.module.dpi_imports.get(fname.0.as_ref()).and_then(|s| {
-                        match &s.proto {
-                            crate::ast::decl::DPIProto::Function(f) => {
-                                Some(f.ports.clone())
-                            }
+                    self.module
+                        .dpi_imports
+                        .get(fname.0.as_ref())
+                        .and_then(|s| match &s.proto {
+                            crate::ast::decl::DPIProto::Function(f) => Some(f.ports.clone()),
                             _ => None,
-                        }
-                    })
+                        })
                 } else {
                     None
                 };
                 let mut out_slots: Vec<(usize, String)> = Vec::new();
-                let port_types: Option<&Vec<crate::ast::decl::FunctionPort>> = fd
-                    .as_ref()
-                    .map(|f| &f.ports)
-                    .or(import_ports.as_ref());
+                let port_types: Option<&Vec<crate::ast::decl::FunctionPort>> =
+                    fd.as_ref().map(|f| &f.ports).or(import_ports.as_ref());
                 let mut args = Vec::with_capacity(n);
                 for i in 0..n {
                     let v = self
@@ -32839,17 +32840,15 @@ impl Simulator {
                         .get(base + i)
                         .cloned()
                         .unwrap_or_else(|| Value::zero(32));
-                    let port_is_string = port_types
-                        .and_then(|p| p.get(i))
-                        .is_some_and(|p| {
-                            matches!(
-                                &p.data_type,
-                                crate::ast::types::DataType::Simple {
-                                    kind: crate::ast::types::SimpleType::String,
-                                    ..
-                                }
-                            )
-                        });
+                    let port_is_string = port_types.and_then(|p| p.get(i)).is_some_and(|p| {
+                        matches!(
+                            &p.data_type,
+                            crate::ast::types::DataType::Simple {
+                                kind: crate::ast::types::SimpleType::String,
+                                ..
+                            }
+                        )
+                    });
                     let is_output = import_ports
                         .as_ref()
                         .and_then(|p| p.get(i))
@@ -51518,7 +51517,11 @@ impl Simulator {
                                         // Even a same-object bare call changes
                                         // the defining-class context used by
                                         // `super`; push both stacks uniformly.
-                                        self.push_task_method_this(Some(rh), mclass.clone(), &mut cleanup);
+                                        self.push_task_method_this(
+                                            Some(rh),
+                                            mclass.clone(),
+                                            &mut cleanup,
+                                        );
                                         self.task_cleanup.push(cleanup);
                                         // Wait-free compiled fast path (see the
                                         // twin site below): a compiling task
@@ -51719,7 +51722,7 @@ impl Simulator {
                                 // member/static resolution, with a null `this`.
                                 self.m_scope_stack.clear();
                                 self.this_stack.push(None);
-                                self.class_context_stack.push(Some(mclass.clone()));
+                                self.class_context_stack.push(Some(mclass));
                                 self.method_local_base
                                     .push(self.local_stack.len().saturating_sub(1));
                                 cleanup.pushed_method_this = true;
@@ -51729,36 +51732,6 @@ impl Simulator {
                                     self.current_spec = Some((sb, ss));
                                 }
                                 self.task_cleanup.push(cleanup);
-                                // Wait-free compiled fast path: a task body
-                                // that compiles (the compiler declines every
-                                // timing control) can only run to completion
-                                // synchronously, so the scheduling machinery
-                                // is bypassed entirely — semantics identical
-                                // to the scheduled run below, minus the
-                                // process-frame overhead. A bare implicit-this
-                                // call resolves the receiver here.
-                                let rh_this = self
-                                    .this_stack
-                                    .last()
-                                    .copied()
-                                    .flatten()
-                                    .unwrap_or(0);
-                                if rh_this != 0
-                                    && let Some(_v) = self.try_compiled_task_body(
-                                        rh_this, &mclass, &mn, td, &tm,
-                                    )
-                                {
-                                    if let Some(c) = self.task_cleanup.pop() {
-                                        self.unwind_task_frame(c);
-                                    }
-                                    self.current_spec = saved_spec;
-                                    // Body ran synchronously — continue the
-                                    // caller's slice (see the twin site above:
-                                    // `return` would strand the process's
-                                    // remaining statements).
-                                    i += 1;
-                                    continue;
-                                }
                                 let frame = self.class_task_body_frame(&tm, stmt.span);
                                 // Chain the caller's tail instead of copying it onto the end of
                                 // the spliced body (ProcCont::pushed_frame).
@@ -133651,17 +133624,21 @@ impl Simulator {
     /// table is immutable after elaboration, so build it once. Task imports
     /// are not callable as expressions and are excluded.
     fn dpi_import_fd_table(
-        &self,
+        &mut self,
     ) -> std::rc::Rc<HashMap<String, crate::ast::decl::FunctionDeclaration>> {
+        if let Some(rc) = &self.dpi_import_fds {
+            return rc.clone();
+        }
         let mut m: HashMap<String, crate::ast::decl::FunctionDeclaration> = HashMap::default();
         for (name, spec) in &self.module.dpi_imports {
             if let crate::ast::decl::DPIProto::Function(fd) = &spec.proto {
                 m.insert(name.clone(), fd.clone());
             }
         }
-        std::rc::Rc::new(m)
+        let rc = std::rc::Rc::new(m);
+        self.dpi_import_fds = Some(rc.clone());
+        rc
     }
-
 
     /// `fn_decl_rc` for tasks: the task table is never modified after
     /// elaboration, so one shared copy per name serves every call.
@@ -134230,144 +134207,23 @@ impl Simulator {
         // keyed by a synthetic class name derived from the declaring scope,
         // so class-dependent plan inputs (member admission sets, extends
         // walks) all see an empty class and every admission decision
-        // degrades to the free-function rules.
-        if let Some(cval) = compiled_methods_enabled()
-            .then(|| self.try_run_compiled_free_function(fd, pkg_scope.as_deref()))
-            .flatten()
-        {
-            self.close_decl_shadow_frame();
-            for n in &frame_string_signals {
-                self.string_signals.remove(n);
-            }
-            if let Some(removed) = self.string_signals_removed.pop() {
-                for n in removed {
-                    self.string_signals.insert(n);
+        // degrades to the free-function rules. A compiled body hands its
+        // result over as `return_value` and the epilogue below runs
+        // unchanged, exactly as after an interpreted `return`.
+        let compiled = if compiled_methods_enabled() {
+            self.try_run_compiled_free_function(fd, pkg_scope.as_deref())
+        } else {
+            None
+        };
+        if let Some(cval) = compiled {
+            self.return_value = Some(cval);
+        } else {
+            // Execute function body
+            for stmt in &fd.items {
+                self.exec_statement(stmt);
+                if self.return_value.is_some() || self.return_flag {
+                    break;
                 }
-            }
-            self.sync_static_locals();
-            self.local_iface_aliases.pop();
-            self.func_call_stack.pop();
-            self.fn_ret_collection_stack.pop();
-            self.pkg_scope_stack.pop();
-            self.m_scope_stack = saved_m_scope_fn;
-            self.this_stack.pop();
-            self.class_context_stack.pop();
-            // (sync_static_locals already popped this frame's
-            // static_local_syncs entry — same contract as the interpreter
-            // epilogue below.)
-            let mut result = cval;
-            if let Some(k) = &static_ret_key {
-                self.static_fn_ret.insert(k.clone(), result.clone());
-            }
-            let unpacked_struct_ret = self.unpacked_struct_of(&fd.return_type).is_some();
-            if !result.is_real
-                && !unpacked_struct_ret
-                && !Self::is_string_data_type(&fd.return_type)
-                && !matches!(
-                    fd.return_type,
-                    crate::ast::types::DataType::Void { .. } | crate::ast::types::DataType::Real { .. }
-                )
-            {
-                let w = super::elaborate::resolve_type_width(
-                    &fd.return_type,
-                    Some(&self.module.parameters),
-                    Some(&self.module.typedefs),
-                );
-                if w > 0 && w != result.width {
-                    result = result.resize(w);
-                }
-                result.is_signed = super::elaborate::is_type_signed(&fd.return_type);
-            }
-            for (param, caller, is_out, prior) in std::mem::take(&mut assoc_params) {
-                if param == caller {
-                    match prior {
-                        Some(v) => {
-                            self.module.associative_arrays.insert(param.clone(), v);
-                        }
-                        None => {
-                            self.module.associative_arrays.remove(&param);
-                        }
-                    }
-                    continue;
-                }
-                if is_out {
-                    self.writeback_assoc_param(&param, &caller);
-                }
-                self.purge_assoc_param(&param, prior);
-            }
-            let mut staged_wb: Vec<(String, String)> = Vec::new();
-            for (param, caller) in &queue_writebacks {
-                if caller.is_empty() || param == caller {
-                    continue;
-                }
-                let tmp = self.stage_queue_param(param);
-                staged_wb.push((tmp, caller.clone()));
-            }
-            self.writeback_array_args(&array_writebacks);
-            for (param, caller, ..) in &array_writebacks {
-                if param == caller {
-                    continue;
-                }
-                let prefix = format!("{}[", param);
-                let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
-                for k in keys {
-                    self.signals.remove(&k);
-                }
-                self.purge_array_formal(param);
-            }
-            let writebacks: Vec<(String, Value, Expression)> = output_bindings
-                .iter()
-                .filter_map(|(pn, caller)| {
-                    self.local_stack
-                        .last()
-                        .and_then(|l| l.get(pn).cloned())
-                        .map(|v| (pn.clone(), v, caller.clone()))
-                })
-                .collect();
-            let struct_wb: Vec<(Expression, Value)> = struct_output_writebacks
-                .iter()
-                .filter_map(|(local_key, caller_lval)| {
-                    self.local_stack
-                        .last()
-                        .and_then(|l| l.get(local_key).cloned())
-                        .map(|v| (caller_lval.clone(), v))
-                })
-                .collect();
-            self.pop_local_frame();
-            let vif_ended = if vif_saved.is_empty() {
-                HashMap::default()
-            } else {
-                let outs: Vec<&str> = writebacks.iter().map(|(pn, _, _)| pn.as_str()).collect();
-                self.vif_formals_exit(vif_saved, &vif_formals, &outs)
-            };
-            for (pn, v, caller) in writebacks {
-                if let Some(nm) = vif_ended.get(&pn) {
-                    self.vif_bind_actual(&caller, nm);
-                }
-                self.assign_value(&caller, &v);
-            }
-            for (caller_lval, v) in struct_wb {
-                self.assign_value(&caller_lval, &v);
-            }
-            self.break_flag = saved_break;
-            self.continue_flag = saved_continue;
-            self.return_flag = saved_return;
-            self.pop_and_restore_queue_frame();
-            for (tmp, caller) in staged_wb {
-                self.writeback_queue_param(&tmp, &caller);
-                self.drop_staged_queue(&tmp);
-            }
-            for saved in formal_metadata.into_iter().rev() {
-                self.restore_formal_metadata(saved);
-            }
-            self.return_value = None;
-            return result;
-        }
-        // Execute function body
-        for stmt in &fd.items {
-            self.exec_statement(stmt);
-            if self.return_value.is_some() || self.return_flag {
-                break;
             }
         }
         // §23.8: stop leaking this frame's string formal names into the
@@ -154173,9 +154029,7 @@ impl Simulator {
                     task_fd_storage = crate::ast::decl::FunctionDeclaration {
                         lifetime: t.lifetime.clone(),
                         specifier: t.specifier.clone(),
-                        return_type: crate::ast::types::DataType::Void(
-                            crate::ast::Span::dummy(),
-                        ),
+                        return_type: crate::ast::types::DataType::Void(crate::ast::Span::dummy()),
                         name: t.name.clone(),
                         ports: t.ports.clone(),
                         items: Vec::new(),
@@ -154202,9 +154056,7 @@ impl Simulator {
             // Tasks and plain `function void` bodies have no implicit result
             // cell; the empty name gives the plan/compiler a void shape
             // (never a live local name).
-            let rname = fn_ret_name
-                .map(str::to_string)
-                .unwrap_or_default(); // class-perf row 2: NON-INPUT formals (output / inout / ref) are
+            let rname = fn_ret_name.map(str::to_string).unwrap_or_default(); // class-perf row 2: NON-INPUT formals (output / inout / ref) are
             // admitted as plain scalars (integral / string / enum / class
             // handle, `dimensions.is_empty()`): the interpreter implements
             // exactly these as copy-in/copy-out through `output_bindings`
@@ -154837,6 +154689,7 @@ impl Simulator {
                     self.compiled_method_admission = Some(facts.clone());
                     facts
                 });
+                let dpi_fds = self.dpi_import_fd_table();
                 let compiled = {
                     let mut compiler = BytecodeCompiler::new(
                         &self.signal_name_to_id,
@@ -154846,8 +154699,7 @@ impl Simulator {
                         &self.widths,
                     );
                     compiler.method_admission = Some(admission);
-                    compiler
-                        .set_dpi_import_fds(self.dpi_import_fd_table());
+                    compiler.set_dpi_import_fds(dpi_fds);
                     if method_trace_enabled() {
                         compiler.scope_hint = Some(format!("{}.{}", cname, method_name));
                     }
@@ -155507,11 +155359,7 @@ impl Simulator {
                 Some(&scope),
                 Some(&self.module.typedefs),
             );
-            if w > 0 {
-                w
-            } else {
-                pre.static_result_width
-            }
+            if w > 0 { w } else { pre.static_result_width }
         } else {
             pre.static_result_width
         };

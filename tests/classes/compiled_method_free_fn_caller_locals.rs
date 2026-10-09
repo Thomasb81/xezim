@@ -12,7 +12,7 @@
 use xezim::simulate;
 
 fn gate_on() -> bool {
-    std::env::var("XEZIM_COMPILE_METHODS").is_ok()
+    super::compiled_method_test_env::eager()
 }
 
 fn out(src: &str) -> String {

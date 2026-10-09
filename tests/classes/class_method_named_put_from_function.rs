@@ -61,8 +61,16 @@ endmodule
 ";
     let sim = simulate(SRC, 100).expect("simulate failed");
     assert_eq!(u(&sim, "direct_"), 5, "direct put still works");
-    assert_eq!(u(&sim, "wrapped"), 1, "put inside a function must execute the class method");
-    assert_eq!(u(&sim, "mark"), 1, "the nested put's body must run in order (m_mark=1)");
+    assert_eq!(
+        u(&sim, "wrapped"),
+        1,
+        "put inside a function must execute the class method"
+    );
+    assert_eq!(
+        u(&sim, "mark"),
+        1,
+        "the nested put's body must run in order (m_mark=1)"
+    );
 }
 
 /// The interception must still serve real containers: a mailbox `put`
@@ -84,7 +92,11 @@ fn real_mailbox_put_from_function_still_delivers() {
 endmodule
 ";
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "got"), 42, "mailbox put from a function still delivers");
+    assert_eq!(
+        u(&sim, "got"),
+        42,
+        "mailbox put from a function still delivers"
+    );
 }
 
 /// Same for a semaphore `put` from a function context.
@@ -104,5 +116,9 @@ fn real_semaphore_put_from_function_still_counts() {
 endmodule
 ";
     let sim = simulate(SRC, 100).expect("simulate failed");
-    assert_eq!(u(&sim, "taken"), 1, "semaphore put from a function still increments");
+    assert_eq!(
+        u(&sim, "taken"),
+        1,
+        "semaphore put from a function still increments"
+    );
 }

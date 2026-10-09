@@ -75,9 +75,15 @@ endmodule
 "#;
     let o = out(src);
     assert!(o.contains("HITS=5"), "loop-scoped vardecl task body:\n{o}");
-    assert!(o.contains("SEEN=23"), "break/continue in for-vardecl loop:\n{o}");
+    assert!(
+        o.contains("SEEN=23"),
+        "break/continue in for-vardecl loop:\n{o}"
+    );
     assert!(o.contains("ACC=10"), "count-down for-vardecl loop:\n{o}");
-    assert!(o.contains("SLOW"), "wait task must still run (interpreted):\n{o}");
+    assert!(
+        o.contains("SLOW"),
+        "wait task must still run (interpreted):\n{o}"
+    );
     assert!(o.contains("DONE"), "tail display after tasks:\n{o}");
 }
 
@@ -124,7 +130,10 @@ module top;
 endmodule
 "#;
     let o = out(src);
-    assert!(o.contains("A=103 B=18 C=1 D=1"), "free-fn chain results:\n{o}");
+    assert!(
+        o.contains("A=103 B=18 C=1 D=1"),
+        "free-fn chain results:\n{o}"
+    );
     assert!(o.contains("TAG_PASS"), "chain verdict:\n{o}");
 }
 
