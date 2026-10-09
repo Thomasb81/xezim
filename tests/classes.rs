@@ -637,3 +637,9 @@ mod covergroup_class_param_bins;
 mod class_method_scalar_formal_width;
 #[path = "classes/typedef_packed_return_prototype.rs"]
 mod typedef_packed_return_prototype;
+#[path = "classes/inherited_type_param_create.rs"]
+mod inherited_type_param_create;
+#[path = "classes/dynamic_array_property_new_init.rs"]
+mod dynamic_array_property_new_init;
+#[path = "classes/type_param_handle_not_struct.rs"]
+mod type_param_handle_not_struct;

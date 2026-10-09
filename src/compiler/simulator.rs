@@ -69371,6 +69371,17 @@ impl Simulator {
                         let n = super::elaborate::type_query_bound(name, &q, 1).unwrap_or(0);
                         return Value::from_u64(n as u64, 32);
                     }
+                    // A class property or a struct member path (`m`,
+                    // `this.m`, `a.w`): its declared type, unpacked and
+                    // packed dimensions alike. A multi-dimensional packed
+                    // one is stored flattened and counted as one dimension.
+                    if let Some(q) = self
+                        .query_operand_decl_dims(arg)
+                        .filter(|q| !q.dims.is_empty())
+                    {
+                        let n = super::elaborate::type_query_bound(name, &q, 1).unwrap_or(0);
+                        return Value::from_u64(n as u64, 32);
+                    }
                     if let ExprKind::Ident(hier) = &arg.kind {
                         let aname = self.resolve_hier_name(hier);
                         // §20.7: EVERY unpacked dimension counts, not just
@@ -69424,14 +69435,7 @@ impl Simulator {
                         .unwrap_or(1) as usize;
                     // §20.7: an out-of-range dimension has no bounds to
                     // report — the result is x, not 0.
-                    let Some(r) = super::elaborate::type_query_bound(&sn, &q, dim) else {
-                        let mut xv = Value::new(32);
-                        xv.is_signed = true;
-                        return xv;
-                    };
-                    let mut rv = Value::from_u64((r as u64) & 0xFFFF_FFFF, 32);
-                    rv.is_signed = true;
-                    return rv;
+                    return Self::type_query_value(&sn, &q, dim);
                 }
                 let dim = args
                     .get(1)
@@ -69602,6 +69606,11 @@ impl Simulator {
                             // this the query collapsed to the FLATTENED vector,
                             // so `$left([3:0][7:0])` returned 31, not 3.
                             (l.min(r), l.max(r), l > r)
+                        } else if let Some(q) = self
+                            .query_operand_decl_dims(arg)
+                            .filter(|q| q.unpacked >= n_unpacked && !q.dims.is_empty())
+                        {
+                            return Self::type_query_value(&sn, &q, dim);
                         } else {
                             (0i64, packed_w as i64 - 1, true)
                         };
@@ -69629,6 +69638,12 @@ impl Simulator {
                         let mut rv = Value::from_u64(result & 0xFFFF_FFFF, 32);
                         rv.is_signed = true;
                         return rv;
+                    }
+                    if let Some(q) = self
+                        .query_operand_decl_dims(arg)
+                        .filter(|q| !q.dims.is_empty())
+                    {
+                        return Self::type_query_value(&sn, &q, dim);
                     }
                     let v = self.eval_expr(arg);
                     match sn.as_str() {
@@ -76354,8 +76369,18 @@ impl Simulator {
         let Some(Some(inst)) = self.heap.get(h) else {
             return false;
         };
-        self.class_prop_type_named(&inst.class_name, name)
-            .is_some_and(|t| self.module.classes.contains_key(&t))
+        // §8.25: a property typed by a TYPE PARAMETER (`REQ req;` of a
+        // `uvm_sequence #(item)` base) is a class handle when the parameter
+        // is bound to a class. Only the parameter's name came back, so the
+        // property was taken for a same-named struct variable elsewhere —
+        // a monitor task's `output pkt_s req` formal while it waits — and
+        // `req = item::type_id::create()` spread the handle over struct
+        // members, leaving `req` unchanged.
+        match self.class_prop_type_named(&inst.class_name, name) {
+            Some(t) if self.module.classes.contains_key(&t) => true,
+            Some(t) => self.bound_prop_class(inst, name, &t).is_some(),
+            None => false,
+        }
     }
 
     /// §8.11 / §13.3: a member path through a class-handle variable of the
@@ -76965,245 +76990,65 @@ impl Simulator {
         // min(n, src.size()) elements and default-initialises the rest.
         // A `d[i] = new[n]` lvalue sizes the ELEMENT of an array of
         // dynamic arrays.
-        {
-            let is_new = |e: &Expression| {
-                matches!(&e.kind,
-                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new")
+        if let Some((n_expr, src_expr)) = Self::sized_new_parts(rvalue) {
+            let target = match &lvalue.kind {
+                ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
+                // `dq[1] = new[n]` on an array-of-dynamic-arrays
+                // class property: the element collection's key.
+                _ => self
+                    .class_array_of_coll_key(lvalue)
+                    .or_else(|| self.flat_member_name(lvalue))
+                    .map(std::borrow::Cow::Owned),
             };
-            let sized_new: Option<(&Expression, Option<&Expression>)> = match &rvalue.kind {
-                ExprKind::Call { func, args } if is_new(func) && !args.is_empty() => {
-                    Some((&args[0], None))
-                }
-                ExprKind::Call { func, args } => match &func.kind {
-                    ExprKind::Call {
-                        func: inner,
-                        args: iargs,
-                    } if is_new(inner) && !iargs.is_empty() => Some((&iargs[0], args.first())),
-                    _ => None,
-                },
-                _ => None,
-            };
-            if let Some((n_expr, src_expr)) = sized_new {
-                let target = match &lvalue.kind {
-                    ExprKind::Ident(lh) => Some(self.resolve_hier_name(lh)),
-                    // `dq[1] = new[n]` on an array-of-dynamic-arrays
-                    // class property: the element collection's key.
-                    _ => self
-                        .class_array_of_coll_key(lvalue)
-                        .or_else(|| self.flat_member_name(lvalue))
-                        .map(std::borrow::Cow::Owned),
-                };
-                // A class-property dynamic array (`c.p = new[n]`)
-                // lives under the instance-scoped `<handle>#p`, which
-                // is never in the module-scope `dynamic_arrays` set —
-                // fall back to the collection resolver so the size and
-                // element cells are written. Restricted to
-                // non-associative collections (dynamic arrays /
-                // queues); `new[n]` is invalid for assoc arrays.
-                //
-                // §8.9/§10 scope: an unqualified single-segment name in a
-                // class METHOD/constructor resolves to a class member of
-                // `this` BEFORE an ENCLOSING (inlined) frame's same-named
-                // dynamic-array local or `ref` formal. The current frame's
-                // OWN local/formal shadows the member (§8.10). Without
-                // this, a constructor's `value = new[1]` with `value` both
-                // a member of the new object and a live `ref` formal of
-                // the caller's task resolved the LHS to the caller's
-                // formal and sized the CALLER's array instead of the
-                // object's member (UVM 4251: burst_read's 64-element
-                // `value` collapsed to 1). Prefer the `this`-scoped member
-                // store over the enclosing-frame/renamed resolution below.
-                let member_store: Option<std::borrow::Cow<str>> = if let ExprKind::Ident(lh) =
-                    &lvalue.kind
-                    && lh.path.len() == 1
-                    && lh.path[0].selects.is_empty()
-                {
-                    let bare = &lh.path[0].name.name;
-                    let current_frame_local = self.dyn_name_lookup_innermost(bare).is_some();
-                    if !current_frame_local {
-                        self.instance_assoc_member(bare)
-                            .map(std::borrow::Cow::Owned)
-                    } else {
-                        None
-                    }
+            // A class-property dynamic array (`c.p = new[n]`)
+            // lives under the instance-scoped `<handle>#p`, which
+            // is never in the module-scope `dynamic_arrays` set —
+            // fall back to the collection resolver so the size and
+            // element cells are written. Restricted to
+            // non-associative collections (dynamic arrays /
+            // queues); `new[n]` is invalid for assoc arrays.
+            //
+            // §8.9/§10 scope: an unqualified single-segment name in a
+            // class METHOD/constructor resolves to a class member of
+            // `this` BEFORE an ENCLOSING (inlined) frame's same-named
+            // dynamic-array local or `ref` formal. The current frame's
+            // OWN local/formal shadows the member (§8.10). Without
+            // this, a constructor's `value = new[1]` with `value` both
+            // a member of the new object and a live `ref` formal of
+            // the caller's task resolved the LHS to the caller's
+            // formal and sized the CALLER's array instead of the
+            // object's member (UVM 4251: burst_read's 64-element
+            // `value` collapsed to 1). Prefer the `this`-scoped member
+            // store over the enclosing-frame/renamed resolution below.
+            let member_store: Option<std::borrow::Cow<str>> = if let ExprKind::Ident(lh) =
+                &lvalue.kind
+                && lh.path.len() == 1
+                && lh.path[0].selects.is_empty()
+            {
+                let bare = &lh.path[0].name.name;
+                let current_frame_local = self.dyn_name_lookup_innermost(bare).is_some();
+                if !current_frame_local {
+                    self.instance_assoc_member(bare)
+                        .map(std::borrow::Cow::Owned)
                 } else {
                     None
-                };
-                let name = member_store.or_else(|| {
-                    target
-                        .filter(|n| self.module.dynamic_arrays.contains(n.as_ref()))
-                        .or_else(|| {
-                            self.expr_assoc_name(lvalue)
-                                .filter(|an| !self.is_associative_array(an))
-                                .map(std::borrow::Cow::Owned)
-                        })
-                });
-                if let Some(name) = name {
-                    let n = self.eval_expr(n_expr).to_u64().unwrap_or(0);
-                    // The source may be any array or queue. A self-copy
-                    // (`d = new[n](d)`) is index-preserving, so no
-                    // snapshot is needed.
-                    let src = src_expr.and_then(|e| match &e.kind {
-                        ExprKind::Ident(h) => {
-                            // Resolve flattened object members before the
-                            // hierarchy resolver adds a module/local prefix.
-                            if h.path.len() > 1
-                                && let Some(storage) = self.expr_assoc_name(e)
-                            {
-                                return Some(storage);
-                            }
-                            let n = self.resolve_hier_name(h);
-                            // A class-member source (`new[t+1](slices)`
-                            // in a method) lives at `<h>#slices` — the
-                            // bare name read size 0, so the copy-init
-                            // silently dropped every existing element.
-                            Some(self.resolve_locator_storage(&n))
-                        }
-                        // `obj.member` and indexed/call-bearing owners are
-                        // collection operands, not scalar broadcast values.
-                        ExprKind::MemberAccess { .. } => self.expr_assoc_name(e),
-                        _ => None,
-                    });
-                    let keep = match &src {
-                        Some(sn) => self.get_queue_size(sn).min(n),
-                        None => 0,
-                    };
-                    if let Some(sn) = &src {
-                        for i in 0..keep {
-                            self.queue_copy_elem(sn, i, &name, i);
-                        }
-                    }
-                    // `T a[][16]`: each slot is itself a fixed array
-                    // whose elements live at `a[i][j]` — default-init
-                    // those, not a phantom scalar `a[i]`.
-                    let inner: Option<(Vec<(i64, i64)>, u32)> = self
-                        .module
-                        .arrays_2d
-                        .get(&*name)
-                        .map(|&(_, d2, w)| (vec![d2], w))
-                        .or_else(|| {
-                            self.module
-                                .arrays_nd
-                                .get(&*name)
-                                .map(|(sh, w)| (sh[1..].to_vec(), *w))
-                        });
-                    if let Some((shape, w)) = inner {
-                        let mut suffixes: Vec<String> = vec![String::new()];
-                        for &(lo, hi) in &shape {
-                            let mut next = Vec::new();
-                            for s in &suffixes {
-                                for k in lo..=hi {
-                                    next.push(format!("{}[{}]", s, k));
-                                }
-                            }
-                            suffixes = next;
-                        }
-                        for i in keep..n {
-                            for s in &suffixes {
-                                self.set_signal_value_by_name(
-                                    &format!("{}[{}]{}", name, i, s),
-                                    Value::zero(w),
-                                );
-                            }
-                        }
-                    } else {
-                        // §7.5.1: new elements take the element
-                        // type's DEFAULT — x for a 4-state type
-                        // (logic/reg/integer/time), 0 otherwise.
-                        // Everything x-init'd as 0 before.
-                        let w = self
-                            .module
-                            .arrays
-                            .get(&*name)
-                            .map(|&(_, _, w)| w)
-                            .unwrap_or(32);
-                        let four_state = self.p_elem_type_ref(&name).is_some_and(|dt| {
-                            use crate::ast::types::{
-                                DataType as DT, IntegerAtomType as IAT, IntegerVectorType as IVT,
-                            };
-                            match self.resolve_dt_ref(&dt) {
-                                DT::IntegerVector {
-                                    kind: IVT::Logic | IVT::Reg,
-                                    ..
-                                } => true,
-                                DT::IntegerAtom {
-                                    kind: IAT::Integer | IAT::Time,
-                                    ..
-                                } => true,
-                                _ => false,
-                            }
-                        });
-                        let fill = if four_state {
-                            Value::new(w)
-                        } else {
-                            Value::zero(w)
-                        };
-                        // A STRUCT-element array keeps each member in
-                        // its own leaf (`arr[i].path`) — seeding a
-                        // packed container instead made later member
-                        // reads slice that zero container while
-                        // member writes went to the leaves, so
-                        // `slices[t].path` read back blank (UVM's
-                        // uvm_hdl_path_concat::add_path).
-                        let elem_su = self.queue_elem_struct(&name);
-                        for i in keep..n {
-                            let elem = format!("{}[{}]", name, i);
-                            match &elem_su {
-                                Some(su) => {
-                                    for (k, lw, is_real) in
-                                        self.unpacked_struct_leaf_keys(&elem, su)
-                                    {
-                                        let sv = if is_real {
-                                            Value::from_f64(0.0)
-                                        } else {
-                                            Value::zero(lw)
-                                        };
-                                        self.signals.insert(k, sv);
-                                    }
-                                }
-                                None => {
-                                    self.set_signal_value_by_name(&elem, fill.clone());
-                                }
-                            }
-                        }
-                    }
-                    // §7.5.1: `new[n]('{...})` — the argument may be an
-                    // assignment pattern (array literal), not just a
-                    // named source array. Populate elements from it,
-                    // mirroring a plain `arr = '{...}` pattern assign.
-                    if let Some(se) = src_expr
-                        && src.is_none()
-                    {
-                        match &se.kind {
-                            ExprKind::AssignmentPattern(items) => {
-                                for (i, item) in items.iter().enumerate() {
-                                    if (i as u64) >= n {
-                                        break;
-                                    }
-                                    let v = self.eval_expr(item.expr());
-                                    self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
-                                }
-                            }
-                            // A non-array scalar argument (`new[n](3.0)`,
-                            // `new[n]("A")`) broadcasts to every element
-                            // (matches a reference simulator). Ident sources were already
-                            // element-copied above.
-                            ExprKind::Ident(_) => {}
-                            _ => {
-                                let v = self.eval_expr(se);
-                                for i in 0..n {
-                                    self.set_signal_value_by_name(
-                                        &format!("{}[{}]", name, i),
-                                        v.clone(),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    self.set_queue_size(&name, n);
-                    self.settle_after_proc_write();
-                    return;
                 }
+            } else {
+                None
+            };
+            let name = member_store.or_else(|| {
+                target
+                    .filter(|n| self.module.dynamic_arrays.contains(n.as_ref()))
+                    .or_else(|| {
+                        self.expr_assoc_name(lvalue)
+                            .filter(|an| !self.is_associative_array(an))
+                            .map(std::borrow::Cow::Owned)
+                    })
+            });
+            if let Some(name) = name {
+                self.fill_sized_new(&name, n_expr, src_expr);
+                self.settle_after_proc_write();
+                return;
             }
         }
         // §7.2.1: `b = a` between unpacked-struct VARS whose type has
@@ -79710,6 +79555,190 @@ impl Simulator {
         }
         self.assign_value(lvalue, &val);
         self.settle_after_proc_write();
+    }
+
+    /// The size and optional source of a §7.5.1 dynamic-array constructor:
+    /// `new[n]` parses as `Call{Ident(new), [n]}` and `new[n](src)` as
+    /// `Call{Call{Ident(new), [n]}, [src]}`. `None` for any other expression.
+    fn sized_new_parts(rvalue: &Expression) -> Option<(&Expression, Option<&Expression>)> {
+        let is_new = |e: &Expression| {
+            matches!(&e.kind,
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].name.name == "new")
+        };
+        match &rvalue.kind {
+            ExprKind::Call { func, args } if is_new(func) && !args.is_empty() => {
+                Some((&args[0], None))
+            }
+            ExprKind::Call { func, args } => match &func.kind {
+                ExprKind::Call {
+                    func: inner,
+                    args: iargs,
+                } if is_new(inner) && !iargs.is_empty() => Some((&iargs[0], args.first())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// §7.5.1: size the dynamic array stored at `name` to `new[n_expr]`,
+    /// copying min(n, src.size()) elements from `src_expr` (`new[n](src)`)
+    /// and giving the rest the element type's default.
+    #[inline(never)]
+    fn fill_sized_new(&mut self, name: &str, n_expr: &Expression, src_expr: Option<&Expression>) {
+        let n = self.eval_expr(n_expr).to_u64().unwrap_or(0);
+        // The source may be any array or queue. A self-copy
+        // (`d = new[n](d)`) is index-preserving, so no
+        // snapshot is needed.
+        let src = src_expr.and_then(|e| match &e.kind {
+            ExprKind::Ident(h) => {
+                // Resolve flattened object members before the
+                // hierarchy resolver adds a module/local prefix.
+                if h.path.len() > 1
+                    && let Some(storage) = self.expr_assoc_name(e)
+                {
+                    return Some(storage);
+                }
+                let n = self.resolve_hier_name(h);
+                // A class-member source (`new[t+1](slices)`
+                // in a method) lives at `<h>#slices` — the
+                // bare name read size 0, so the copy-init
+                // silently dropped every existing element.
+                Some(self.resolve_locator_storage(&n))
+            }
+            // `obj.member` and indexed/call-bearing owners are
+            // collection operands, not scalar broadcast values.
+            ExprKind::MemberAccess { .. } => self.expr_assoc_name(e),
+            _ => None,
+        });
+        let keep = match &src {
+            Some(sn) => self.get_queue_size(sn).min(n),
+            None => 0,
+        };
+        if let Some(sn) = &src {
+            for i in 0..keep {
+                self.queue_copy_elem(sn, i, &name, i);
+            }
+        }
+        // `T a[][16]`: each slot is itself a fixed array
+        // whose elements live at `a[i][j]` — default-init
+        // those, not a phantom scalar `a[i]`.
+        let inner: Option<(Vec<(i64, i64)>, u32)> = self
+            .module
+            .arrays_2d
+            .get(&*name)
+            .map(|&(_, d2, w)| (vec![d2], w))
+            .or_else(|| {
+                self.module
+                    .arrays_nd
+                    .get(&*name)
+                    .map(|(sh, w)| (sh[1..].to_vec(), *w))
+            });
+        if let Some((shape, w)) = inner {
+            let mut suffixes: Vec<String> = vec![String::new()];
+            for &(lo, hi) in &shape {
+                let mut next = Vec::new();
+                for s in &suffixes {
+                    for k in lo..=hi {
+                        next.push(format!("{}[{}]", s, k));
+                    }
+                }
+                suffixes = next;
+            }
+            for i in keep..n {
+                for s in &suffixes {
+                    self.set_signal_value_by_name(&format!("{}[{}]{}", name, i, s), Value::zero(w));
+                }
+            }
+        } else {
+            // §7.5.1: new elements take the element
+            // type's DEFAULT — x for a 4-state type
+            // (logic/reg/integer/time), 0 otherwise.
+            // Everything x-init'd as 0 before.
+            let w = self
+                .module
+                .arrays
+                .get(&*name)
+                .map(|&(_, _, w)| w)
+                .unwrap_or(32);
+            let four_state = self.p_elem_type_ref(&name).is_some_and(|dt| {
+                use crate::ast::types::{
+                    DataType as DT, IntegerAtomType as IAT, IntegerVectorType as IVT,
+                };
+                match self.resolve_dt_ref(&dt) {
+                    DT::IntegerVector {
+                        kind: IVT::Logic | IVT::Reg,
+                        ..
+                    } => true,
+                    DT::IntegerAtom {
+                        kind: IAT::Integer | IAT::Time,
+                        ..
+                    } => true,
+                    _ => false,
+                }
+            });
+            let fill = if four_state {
+                Value::new(w)
+            } else {
+                Value::zero(w)
+            };
+            // A STRUCT-element array keeps each member in
+            // its own leaf (`arr[i].path`) — seeding a
+            // packed container instead made later member
+            // reads slice that zero container while
+            // member writes went to the leaves, so
+            // `slices[t].path` read back blank (UVM's
+            // uvm_hdl_path_concat::add_path).
+            let elem_su = self.queue_elem_struct(&name);
+            for i in keep..n {
+                let elem = format!("{}[{}]", name, i);
+                match &elem_su {
+                    Some(su) => {
+                        for (k, lw, is_real) in self.unpacked_struct_leaf_keys(&elem, su) {
+                            let sv = if is_real {
+                                Value::from_f64(0.0)
+                            } else {
+                                Value::zero(lw)
+                            };
+                            self.signals.insert(k, sv);
+                        }
+                    }
+                    None => {
+                        self.set_signal_value_by_name(&elem, fill.clone());
+                    }
+                }
+            }
+        }
+        // §7.5.1: `new[n]('{...})` — the argument may be an
+        // assignment pattern (array literal), not just a
+        // named source array. Populate elements from it,
+        // mirroring a plain `arr = '{...}` pattern assign.
+        if let Some(se) = src_expr
+            && src.is_none()
+        {
+            match &se.kind {
+                ExprKind::AssignmentPattern(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        if (i as u64) >= n {
+                            break;
+                        }
+                        let v = self.eval_expr(item.expr());
+                        self.set_signal_value_by_name(&format!("{}[{}]", name, i), v);
+                    }
+                }
+                // A non-array scalar argument (`new[n](3.0)`,
+                // `new[n]("A")`) broadcasts to every element
+                // (matches a reference simulator). Ident sources were already
+                // element-copied above.
+                ExprKind::Ident(_) => {}
+                _ => {
+                    let v = self.eval_expr(se);
+                    for i in 0..n {
+                        self.set_signal_value_by_name(&format!("{}[{}]", name, i), v.clone());
+                    }
+                }
+            }
+        }
+        self.set_queue_size(&name, n);
     }
 
     /// Outlined from `exec_statement` so the dispatcher's stack frame
@@ -109531,6 +109560,218 @@ impl Simulator {
     /// a sub-array (`$size(s.mm[1])`) — answered from the member's declared
     /// dimensions. `None` for anything else, including a member whose shape
     /// is registered (the general path answers it).
+    /// §20.7: an array query answered from a type's dimensions — a signed
+    /// `int`, or x for a dimension the type does not have.
+    fn type_query_value(sn: &str, q: &super::elaborate::TypeQueryDims, dim: usize) -> Value {
+        let Some(r) = super::elaborate::type_query_bound(sn, q, dim) else {
+            let mut xv = Value::new(32);
+            xv.is_signed = true;
+            return xv;
+        };
+        let mut rv = Value::from_u64((r as u64) & 0xFFFF_FFFF, 32);
+        rv.is_signed = true;
+        rv
+    }
+
+    /// §20.7, §7.4.5: the dimensions of an array-query operand read from its
+    /// DECLARED type — unpacked first, then packed — for an operand whose
+    /// storage registers no packed shape: a class property (`m`, `this.m`,
+    /// `o.m`) or a member of a subroutine formal or local struct (`a.w`). A
+    /// multi-dimensional packed variable there is stored as one flattened
+    /// vector, so the queries reported the flattened width (`$size(a.wdata)`
+    /// 131584 for `bit [256:0][511:0]`, not 257). A bare design variable is
+    /// left to its registered shape. `None` when a step of the path is
+    /// unknown or carries a select, or an inner step has an unpacked
+    /// dimension.
+    #[cold]
+    #[inline(never)]
+    fn query_operand_decl_dims(&self, arg: &Expression) -> Option<super::elaborate::TypeQueryDims> {
+        fn path<'e>(e: &'e Expression, out: &mut Vec<&'e str>) -> Option<()> {
+            match &e.kind {
+                ExprKind::Ident(h) => {
+                    for s in &h.path {
+                        if !s.selects.is_empty() {
+                            return None;
+                        }
+                        out.push(s.name.name.as_str());
+                    }
+                    Some(())
+                }
+                ExprKind::This => {
+                    out.push("this");
+                    Some(())
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    path(expr, out)?;
+                    out.push(member.name.as_str());
+                    Some(())
+                }
+                _ => None,
+            }
+        }
+        let mut segs: Vec<&str> = Vec::new();
+        path(arg, &mut segs)?;
+        let (first, rest) = segs.split_first()?;
+        let (mut dt, mut udims) = if *first == "this" {
+            let ctx = self.class_context_stack.last()?.as_deref()?;
+            (Self::class_type_ref(ctx), Vec::new())
+        } else {
+            let (dt, udims, is_prop) = self.query_root_decl_type(first)?;
+            if rest.is_empty() && !is_prop {
+                return None;
+            }
+            (dt, udims)
+        };
+        for seg in rest {
+            if !udims.is_empty() {
+                return None;
+            }
+            (dt, udims) = self.member_decl_type(&dt, seg)?;
+        }
+        if let DataType::TypeReference { name, .. } = &dt
+            && self.module.classes.contains_key(&name.name.name)
+        {
+            return None;
+        }
+        let inner = super::elaborate::type_query_dims_of(
+            &dt,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+            Some(&self.module.typedef_types),
+        );
+        let unpacked = udims.len();
+        udims.extend(inner.dims);
+        Some(super::elaborate::TypeQueryDims {
+            dims: udims,
+            unpacked,
+            whole: inner.whole,
+        })
+    }
+
+    /// A `TypeReference` naming class `cn`.
+    fn class_type_ref(cn: &str) -> DataType {
+        let span = crate::ast::Span::dummy();
+        DataType::TypeReference {
+            name: crate::ast::types::TypeName {
+                scopes: Vec::new(),
+                name: crate::ast::Identifier {
+                    name: cn.to_string(),
+                    span,
+                },
+                span,
+            },
+            dimensions: Vec::new(),
+            type_args: Vec::new(),
+            span,
+        }
+    }
+
+    /// The declared type and unpacked dimensions of the variable `name`
+    /// heading an array-query operand (see `query_operand_decl_dims`): a
+    /// formal or local of the running subroutine, else a property of the
+    /// method's class (flagged `true`), else a design variable.
+    fn query_root_decl_type(&self, name: &str) -> Option<(DataType, Vec<(i64, i64)>, bool)> {
+        let frames = match self.method_local_base.last() {
+            Some(&base) => self.local_stack.get(base..).unwrap_or(&[]),
+            None => &self.local_stack[..],
+        };
+        let marker = format!("{}.", name);
+        let in_frame = frames
+            .iter()
+            .rev()
+            .any(|m| m.contains_key(name) || m.contains_key(marker.as_str()));
+        if in_frame {
+            if let Some(t) = self.local_typedef_type_of(name) {
+                return Some((
+                    self.module.typedef_types.get(&t)?.clone(),
+                    Vec::new(),
+                    false,
+                ));
+            }
+            if let Some(c) = self.local_class_type_of(name) {
+                return Some((Self::class_type_ref(&c), Vec::new(), false));
+            }
+        } else if let Some(Some(ctx)) = self.class_context_stack.last()
+            && let Some((dt, udims)) = self.class_property_decl_type(ctx, name)
+        {
+            return Some((dt, udims, true));
+        }
+        if let Some(dt) = self.module.var_decl_types.get(name) {
+            return Some((dt.clone(), Vec::new(), false));
+        }
+        self.var_class_types
+            .get(name)
+            .map(|c| (Self::class_type_ref(c), Vec::new(), false))
+    }
+
+    /// The declared type and unpacked dimensions of member `seg` of a value
+    /// of type `dt`: a property of a class, or a member of a struct.
+    fn member_decl_type(&self, dt: &DataType, seg: &str) -> Option<(DataType, Vec<(i64, i64)>)> {
+        if let DataType::TypeReference { name, .. } = dt {
+            let cn = name.name.name.as_str();
+            let base = cn.split('#').next().unwrap_or(cn);
+            if self.module.classes.contains_key(base) {
+                return self.class_property_decl_type(base, seg);
+            }
+        }
+        let DataType::Struct(su) = self.resolve_dt(dt) else {
+            return None;
+        };
+        let (mdt, dims) = su.members.iter().find_map(|m| {
+            m.declarators
+                .iter()
+                .find(|md| md.name.name == seg)
+                .map(|md| (m.data_type.clone(), md.dimensions.clone()))
+        })?;
+        let udims = if dims.is_empty() {
+            Vec::new()
+        } else {
+            self.member_dim_indices(&dims)?
+                .iter()
+                .map(|l| Some((*l.first()?, *l.last()?)))
+                .collect::<Option<Vec<_>>>()?
+        };
+        Some((mdt, udims))
+    }
+
+    /// The declared type and fixed unpacked dimensions of property `prop` of
+    /// class `cn` or an ancestor; `None` for a queue, dynamic, associative or
+    /// parameter-sized property.
+    fn class_property_decl_type(
+        &self,
+        cn: &str,
+        prop: &str,
+    ) -> Option<(DataType, Vec<(i64, i64)>)> {
+        let mut cur = Some(cn);
+        let mut guard = 0;
+        while let Some(c) = cur {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            let cd = self.module.classes.get(c)?;
+            if cd.properties.contains_key(prop) {
+                if cd.queue_properties.contains_key(prop)
+                    || cd.assoc_properties.contains_key(prop)
+                    || cd.array_of_coll_properties.contains_key(prop)
+                    || cd.param_sized_props.contains_key(prop)
+                {
+                    return None;
+                }
+                let udims = if let Some((shape, _)) = cd.array_nd_properties.get(prop) {
+                    shape.clone()
+                } else if let Some(&(lo, hi, _)) = cd.array_properties.get(prop) {
+                    vec![(lo, hi)]
+                } else {
+                    Vec::new()
+                };
+                return Some((cd.property_types.get(prop)?.clone(), udims));
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
     fn member_array_query(&mut self, sn: &str, arg: &Expression, dim: usize) -> Option<Value> {
         match &arg.kind {
             ExprKind::Index { .. } | ExprKind::MemberAccess { .. } => {}
@@ -116567,7 +116808,27 @@ impl Simulator {
         filter: Option<&Expression>,
         iter_name: Option<&str>,
     ) -> Vec<usize> {
-        let size = self.get_queue_size(arr) as usize;
+        // §7.12.1, §7.8.2: an associative array is searched in index order,
+        // its elements living at `arr[key]`; the `_index` forms yield keys.
+        // With integral non-negative keys the key doubles as the position
+        // every caller names an element by. The positional walk below saw an
+        // associative array as empty, so every locator on one (the axi4
+        // AVIP scoreboard's `find_first_index` over its address tables)
+        // found nothing. String or negative keys keep the old answer.
+        let order: Vec<usize> = if self.is_associative_array(arr) {
+            match self
+                .assoc_top_level_keys(arr)
+                .iter()
+                .map(|k| k.parse::<usize>().ok())
+                .collect::<Option<Vec<_>>>()
+            {
+                Some(ks) => ks,
+                None => return Vec::new(),
+            }
+        } else {
+            (0..self.get_queue_size(arr) as usize).collect()
+        };
+        let size = order.len();
         if size == 0 {
             return Vec::new();
         }
@@ -116592,7 +116853,7 @@ impl Simulator {
 
         let mut keys: Vec<i64> = Vec::with_capacity(size);
         let mut truth: Vec<bool> = Vec::with_capacity(size);
-        for i in 0..size {
+        for &i in &order {
             let elem = format!("{}[{}]", arr, i);
             if elem_su.is_some() {
                 self.item_alias = Some(elem.clone());
@@ -116657,7 +116918,7 @@ impl Simulator {
             self.pop_local_frame();
         }
 
-        match method {
+        let picked: Vec<usize> = match method {
             "find" | "find_index" => (0..size).filter(|&i| truth[i]).collect(),
             "find_first" | "find_first_index" => {
                 (0..size).find(|&i| truth[i]).into_iter().collect()
@@ -116672,7 +116933,8 @@ impl Simulator {
                 (0..size).filter(|&i| seen.insert(keys[i])).collect()
             }
             _ => Vec::new(),
-        }
+        };
+        picked.into_iter().map(|p| order[p]).collect()
     }
 
     /// Write a locator result into the destination queue `dst`. The `_index`
@@ -137793,7 +138055,60 @@ impl Simulator {
                 }
             }
         }
-        None
+        self.inherited_type_param(tn, spec)
+    }
+
+    /// §8.25, §6.20.2: `tn` is a type parameter of an ANCESTOR of the
+    /// executing method's class, bound by the `extends` clauses between them
+    /// (`class d extends drv #(item)` naming `REQ`, or the defaulted
+    /// `RSP = REQ`). A class that is not itself parameterized has no
+    /// specialization and its objects carry no bindings, so `RSP::type_id::
+    /// create()`, `REQ x = new` and `r = new` in such a class resolved `tn`
+    /// to nothing and built nothing. The ancestor's specialization as the
+    /// method's class binds it answers; an argument that is one of the
+    /// method's class's own type parameters resolves through `spec` / `this`.
+    #[cold]
+    #[inline(never)]
+    fn inherited_type_param(&self, tn: &str, spec: &Option<(String, String)>) -> Option<String> {
+        let ctx = self.class_context_stack.last()?.as_deref()?;
+        let ctx_cd = self.module.classes.get(ctx)?;
+        if ctx_cd.type_param_names.iter().any(|t| t == tn) {
+            return None;
+        }
+        let mut decl: Option<&str> = None;
+        let mut cur: Option<&str> = ctx_cd.extends.as_deref();
+        let mut guard = 0;
+        while let Some(cn) = cur {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            let cd = self.module.classes.get(cn)?;
+            if cd.type_param_names.iter().any(|t| t == tn) {
+                decl = Some(cn);
+                break;
+            }
+            if cd.typedef_names.iter().any(|t| t == tn) {
+                return None;
+            }
+            cur = cd.extends.as_deref();
+        }
+        let (base, sig) = self.static_receiver_spec(ctx, decl?)?;
+        let cd = self.module.classes.get(&base)?;
+        let order: &[String] = if cd.param_order.is_empty() {
+            &cd.type_param_names
+        } else {
+            &cd.param_order
+        };
+        let idx = order.iter().position(|p| p == tn)?;
+        let v = Self::spec_arg_at(&sig, idx)?.trim();
+        if v.is_empty() {
+            return None;
+        }
+        if ctx_cd.type_param_names.iter().any(|t| t == v) {
+            return self.resolve_type_param_with(v, spec);
+        }
+        Some(v.to_string())
     }
 
     /// Resolve any type-parameter names inside an extracted call spec's sig
@@ -139069,6 +139384,18 @@ impl Simulator {
                                 continue;
                             }
                         }
+                    }
+                }
+                // §8.7, §7.5.1: a dynamic-array property initialized with its
+                // constructor (`int da[] = new[4];`) is sized here, like the
+                // same assignment as the first statement of `new()`. The
+                // call-bearing deferral below evaluated it as a scalar and
+                // left the array empty.
+                if let Some((n_expr, src_expr)) = Self::sized_new_parts(init) {
+                    let scoped = format!("{}#{}", handle, pname);
+                    if self.module.dynamic_arrays.contains(scoped.as_str()) {
+                        self.fill_sized_new(&scoped, n_expr, src_expr);
+                        continue;
                     }
                 }
                 // Only re-evaluate side-effect-free initializers. Ones that call

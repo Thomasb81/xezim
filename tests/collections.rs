@@ -123,3 +123,5 @@ mod queue_concat_index_prefilled_prefix;
 mod std_randomize_multidim;
 #[path = "collections/queue_struct_pop.rs"]
 mod queue_struct_pop;
+#[path = "collections/assoc_locator_methods.rs"]
+mod assoc_locator_methods;
