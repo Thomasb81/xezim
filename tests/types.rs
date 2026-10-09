@@ -19,6 +19,8 @@ mod array_element_declared_signedness;
 mod array_parameter;
 #[path = "types/array_query_multidim_packed.rs"]
 mod array_query_multidim_packed;
+#[path = "types/array_query_of_declared_variable.rs"]
+mod array_query_of_declared_variable;
 #[path = "types/array_read_unknown_index_is_x.rs"]
 mod array_read_unknown_index_is_x;
 #[path = "types/ascending_indexed_part_select.rs"]
