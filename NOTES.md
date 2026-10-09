@@ -141,6 +141,17 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * `--dpi-lib` works on non-x86 hosts: the DPI export trampoline is built with
   `$CC` (default `cc`) and no x86-only flags, and a trampoline build failure
   is named in the library-load error. (#282, reported by Dragon-Git)
+* A variable whose type is a typedef of a virtual interface
+  (`typedef virtual bus_if vif_t; vif_t v;`) starts as `null` at module,
+  `$unit`, subroutine and block scope and in arrays, and `$typename` names
+  virtual interfaces as declared (`virtual bus_if.mp`,
+  `virtual pbus_if #(16)`) instead of `logic`. (#285, reported by Dragon-Git)
+* `$readmemh`, `$readmemb`, `$writememh` and `$writememb` reach another
+  instance's memory through a hierarchical name from tasks, functions and
+  class methods, and through instance-array elements (`ra[1].mem`). A target
+  that names no memory is reported as an error, and a file that cannot be
+  opened as a warning, instead of being skipped silently. (#281, reported by
+  jjts)
 
 **Usability**
 
