@@ -179,6 +179,10 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   arrays with integral keys, in key order (§7.12).
 * With these, the axi4 AVIP's write, read and write-read tests run to
   completion.
+* Writing one character of a string that lives in a function or task frame
+  (`s[i] = "x"` on a local, a static local, a `ref`/`inout`/`output`
+  function formal or an automatic local in a forked child) replaces that
+  byte instead of setting a bit. (from PR #289 by Thomas Burg)
 
 **Usability**
 
