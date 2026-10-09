@@ -8671,6 +8671,10 @@ struct QueueLocalSave {
     was_descending: bool,
     queue_max: Option<u32>,
     width: Option<u32>,
+    /// The caller's `module.associative_arrays` entry (`true` = string
+    /// keys): a same-named callee local drops it at its declaration, and an
+    /// int-keyed array re-registered as string-keyed reads its keys as text.
+    assoc_entry: Option<bool>,
 }
 
 /// §6.16.9 string→number conversion: scan LEADING digit/underscore
@@ -81410,6 +81414,26 @@ impl Simulator {
                             .associative_arrays
                             .insert(name.clone(), is_string_key);
                         self.widths.insert(name.clone(), w);
+                        // §7.8.2 / §7.9: the key's width and signedness, as
+                        // elaboration records them for a module-scope array.
+                        // Without them a `foreach` over a local `int a[int]`
+                        // bound the negative key -5 as 4294967291, and the
+                        // element read through it missed.
+                        match super::elaborate::assoc_key_type_info(
+                            key_dt.as_deref(),
+                            &self.module.parameters,
+                            &self.module.typedefs,
+                            &self.module.typedef_types,
+                        )
+                        .0
+                        {
+                            Some(iw) => {
+                                self.module.assoc_index_widths.insert(name.clone(), iw);
+                            }
+                            None => {
+                                self.module.assoc_index_widths.remove(&name);
+                            }
+                        }
                         // §6.19.6/§7.8: a NAMED key type (`int aa[e_t];`)
                         // gives a `foreach (aa[k])` index variable that type,
                         // so `k.last`/`k.next`/`k.name` resolve against the
@@ -102961,6 +102985,7 @@ impl Simulator {
         self.module.dynamic_arrays.remove(key);
         self.module.arrays.remove(key);
         self.module.associative_arrays.remove(key);
+        self.module.assoc_index_widths.remove(key);
         self.module.queue_max_sizes.remove(key);
         self.module.descending_arrays.remove(key);
         self.module.var_decl_types.remove(key);
@@ -103033,6 +103058,7 @@ impl Simulator {
                 was_descending: self.module.descending_arrays.remove(name),
                 queue_max: self.module.queue_max_sizes.remove(name),
                 width: self.widths.get(name).copied(),
+                assoc_entry: self.module.associative_arrays.remove(name),
             }
         } else {
             QueueLocalSave {
@@ -103042,6 +103068,7 @@ impl Simulator {
                 was_descending: self.module.descending_arrays.contains(name),
                 queue_max: self.module.queue_max_sizes.get(name).copied(),
                 width: self.widths.get(name).copied(),
+                assoc_entry: self.module.associative_arrays.get(name).copied(),
             }
         };
         let mut key = self.queue_name_pool.pop().unwrap_or_default();
@@ -103086,6 +103113,7 @@ impl Simulator {
                 was_descending,
                 queue_max,
                 width,
+                assoc_entry,
             } = save;
             for (k, v) in signals {
                 self.signals.insert(k, v);
@@ -103125,6 +103153,14 @@ impl Simulator {
                 },
                 None => {
                     self.widths.remove(&name);
+                }
+            }
+            match assoc_entry {
+                Some(k) => {
+                    self.module.associative_arrays.insert(name.clone(), k);
+                }
+                None => {
+                    self.module.associative_arrays.remove(&name);
                 }
             }
             if self.queue_name_pool.len() < 64 {

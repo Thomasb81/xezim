@@ -109,6 +109,8 @@ mod builtin_class_construction_forms;
 mod callee_local_shadow_assoc_output;
 #[path = "collections/array_actual_hier_pkg_writeback.rs"]
 mod array_actual_hier_pkg_writeback;
+#[path = "collections/callee_local_shadow_int_assoc.rs"]
+mod callee_local_shadow_int_assoc;
 #[path = "collections/class_member_semaphore_keys.rs"]
 mod class_member_semaphore_keys;
 #[path = "collections/count_methods_return_signed_int.rs"]
