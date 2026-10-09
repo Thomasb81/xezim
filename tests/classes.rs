@@ -625,3 +625,5 @@ mod class_member_named_like_instance;
 mod covergroup_class_param_bins;
 #[path = "classes/class_method_scalar_formal_width.rs"]
 mod class_method_scalar_formal_width;
+#[path = "classes/typedef_packed_return_prototype.rs"]
+mod typedef_packed_return_prototype;

@@ -15743,10 +15743,35 @@ impl Simulator {
         }
     }
 
+    /// A typedef-named DPI return type (`typedef int I; import "DPI-C"
+    /// function I f();`), resolved to the type it names so it maps to the
+    /// same C type. A typedef name with packed dimensions (`M [1:0]`) is a
+    /// packed array, which §35.5.5 does not allow as a result; it stays
+    /// unresolved and the prototype is reported unsupported.
+    fn dpi_resolve_typedef(&self, dt: &DataType) -> DataType {
+        let mut cur = dt.clone();
+        for _ in 0..16 {
+            let DataType::TypeReference {
+                name, dimensions, ..
+            } = &cur
+            else {
+                break;
+            };
+            if !name.scopes.is_empty() || !dimensions.is_empty() {
+                break;
+            }
+            match self.module.typedef_types.get(&name.name.name) {
+                Some(t) => cur = t.clone(),
+                None => break,
+            }
+        }
+        cur
+    }
+
     fn dpi_signature(&self, spec: &DpiImportSpec) -> Option<(DpiRetKind, Vec<DpiArgKind>)> {
         match &spec.proto {
             crate::ast::decl::DPIProto::Function(fd) => {
-                let ret = Self::dpi_return_kind(&fd.return_type)?;
+                let ret = Self::dpi_return_kind(&self.dpi_resolve_typedef(&fd.return_type))?;
                 let mut args = Vec::with_capacity(fd.ports.len());
                 for p in &fd.ports {
                     args.push(self.dpi_atom_kind(&p.data_type, &p.dimensions, p.direction)?);

@@ -111,3 +111,5 @@ mod vpi_routines;
 mod vpi_typed_port_kinds;
 #[path = "strings/wide_string2num.rs"]
 mod wide_string2num;
+#[path = "strings/dpi_typedef_return.rs"]
+mod dpi_typedef_return;
