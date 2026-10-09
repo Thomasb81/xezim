@@ -202,6 +202,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   directly. A class-heavy benchmark (400,000 calls of a wait-free task that
   makes a virtual call and two package-function calls) runs 16% fewer
   instructions; the axi4 AVIP runs 0.4% more. (from PR #265 by Thomas Burg)
+* Imported DPI tasks run on their own stack on x86_64 and aarch64, for Linux
+  (glibc and musl) and macOS, so a `wait` in an exported task behaves the
+  same everywhere. `XEZIM_DPI_FIBERS=0` selects the nested-scheduler
+  fallback, which no longer loses concurrent callers or ignores a `$finish`.
+  (#290, reported by Dragon-Git)
+* Exported subroutines accept every formal type DPI can carry (§35.5.6,
+  Annex H): `chandle` as `void*`, a `string` result or output, packed vectors
+  wider than 64 bits through `svLogicVecVal*`/`svBitVecVal*`, the exact
+  scalar C types, and unpacked structs and arrays by pointer. A formal DPI
+  cannot carry is reported as an error at each call instead of silently
+  returning 0, and a wide or aggregate result is rejected (§35.5.5). (#291,
+  reported by Dragon-Git)
 
 **Usability**
 
