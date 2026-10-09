@@ -14635,6 +14635,27 @@ impl Simulator {
                 return Some(name);
             }
         }
+        // §23.6 / §21.4: a hierarchical memory name inside a subroutine body
+        // (`r.mem`), or through an instance-array element anywhere
+        // (`ra[1].mem`), arrives as a MemberAccess chain rather than a flat
+        // Ident. Resolve it as the hierarchical name it spells; without this
+        // `$readmemh("f", r.mem)` in a task loaded nothing.
+        if matches!(expr.kind, ExprKind::MemberAccess { .. }) {
+            if let Some(mut flat) = Self::member_chain_as_hier_ident(expr) {
+                // An instance-array select names one element instance, whose
+                // scope is `ra[1]`: fold the (constant) index into the
+                // segment name, the spelling the element's storage uses.
+                if let ExprKind::Ident(h) = &mut flat.kind {
+                    for seg in h.path.iter_mut() {
+                        for sel in std::mem::take(&mut seg.selects) {
+                            let i = self.eval_scalar_self(&sel)?;
+                            seg.name.name = format!("{}[{}]", seg.name.name, i);
+                        }
+                    }
+                }
+                return self.resolve_array_name_from_expr(&flat);
+            }
+        }
         let (resolved, raw) = match &expr.kind {
             ExprKind::Ident(hier) => {
                 let resolved = self.resolve_hier_name(hier);
@@ -14668,6 +14689,118 @@ impl Simulator {
             return Some(found.clone());
         }
         None
+    }
+
+    /// The memory a `$readmem*` / `$writemem*` call names, with its
+    /// `(lo, hi, width)`. A target that names no unpacked memory is an error
+    /// (the reference simulator rejects the design); report it rather than
+    /// skip the call silently.
+    fn memory_task_target(
+        &mut self,
+        task: &str,
+        arg: &Expression,
+    ) -> Option<(String, (i64, i64, u32))> {
+        if let Some(name) = self.resolve_array_name_from_expr(arg) {
+            if let Some(&dims) = self.module.arrays.get(&name) {
+                return Some((name, dims));
+            }
+        }
+        let flat = Self::member_chain_as_hier_ident(arg);
+        let shown = match &flat.as_ref().unwrap_or(arg).kind {
+            ExprKind::Ident(h) => h
+                .path
+                .iter()
+                .map(|s| {
+                    let mut t = s.name.name.clone();
+                    for sel in &s.selects {
+                        match self.eval_expr(sel).to_i64() {
+                            Some(i) => t.push_str(&format!("[{}]", i)),
+                            None => t.push_str("[?]"),
+                        }
+                    }
+                    t
+                })
+                .collect::<Vec<_>>()
+                .join("."),
+            _ => "<expression>".to_string(),
+        };
+        let m = format!(
+            "[xezim][error] {}: '{}' does not name an unpacked memory (t={})",
+            task, shown, self.time
+        );
+        self.error_count = self.error_count.saturating_add(1);
+        self.record_output(m.clone());
+        self.stdout_writeln(&m);
+        None
+    }
+
+    /// A dotted chain of names and constant-indexed instance-array elements
+    /// (`r.mem`, `ra[1].s.mem`, `top.r.mem`) as one hierarchical Ident, the
+    /// index expressions kept as segment selects. `None` for other shapes.
+    fn member_chain_as_hier_ident(e: &Expression) -> Option<Expression> {
+        fn collect(e: &Expression, out: &mut Vec<crate::ast::expr::HierPathSegment>) -> bool {
+            match &e.kind {
+                ExprKind::Ident(h) => {
+                    out.extend(h.path.iter().cloned());
+                    true
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    if !collect(expr, out) {
+                        return false;
+                    }
+                    out.push(crate::ast::expr::HierPathSegment {
+                        name: member.clone(),
+                        selects: Vec::new(),
+                    });
+                    true
+                }
+                ExprKind::Index { expr, index } => {
+                    if !collect(expr, out) {
+                        return false;
+                    }
+                    match out.last_mut() {
+                        Some(seg) => {
+                            seg.selects.push((**index).clone());
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            }
+        }
+        let mut path = Vec::new();
+        if !collect(e, &mut path) || path.len() < 2 {
+            return None;
+        }
+        let root = match &e.kind {
+            ExprKind::MemberAccess { .. } => {
+                let mut head = e;
+                loop {
+                    match &head.kind {
+                        ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => {
+                            head = expr
+                        }
+                        _ => break,
+                    }
+                }
+                match &head.kind {
+                    ExprKind::Ident(h) => h.root.clone(),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        Some(Expression::new(
+            ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
+                root,
+                path,
+                span: e.span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            e.span,
+        ))
     }
 
     fn parse_mem_token(token: &str, default_radix: u32) -> Option<(u32, String)> {
@@ -14706,15 +14839,12 @@ impl Simulator {
             sim_dbg_eprintln!("[DEBUG] $readmem*: empty path");
             return Value::zero(32);
         }
-        let Some(mem_name) = self.resolve_array_name_from_expr(&args[1]) else {
-            sim_dbg_eprintln!(
-                "[DEBUG] $readmem*: array resolution failed for arg {:?}",
-                args[1]
-            );
-            return Value::zero(32);
+        let task = match default_radix {
+            2 => "$readmemb",
+            10 => "$readmemd",
+            _ => "$readmemh",
         };
-        let Some((lo, hi, width)) = self.module.arrays.get(&mem_name).copied() else {
-            sim_dbg_eprintln!("[DEBUG] $readmem*: array '{}' not found", mem_name);
+        let Some((mem_name, (lo, hi, width))) = self.memory_task_target(task, &args[1]) else {
             return Value::zero(32);
         };
         let mut addr = if args.len() >= 3 {
@@ -14733,7 +14863,15 @@ impl Simulator {
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                sim_dbg_eprintln!("[DEBUG] $readmem*: failed to read '{}': {}", path, e);
+                // §21.4: the memory is left unchanged; say why, as the
+                // reference simulator does, instead of loading nothing
+                // silently.
+                let m = format!(
+                    "[xezim][warning] {}: cannot open file \"{}\": {}",
+                    task, path, e
+                );
+                self.record_output(m.clone());
+                self.stdout_writeln(&m);
                 return Value::zero(32);
             }
         };
@@ -14822,10 +14960,7 @@ impl Simulator {
         if path.is_empty() {
             return Value::zero(32);
         }
-        let Some(mem_name) = self.resolve_array_name_from_expr(&args[1]) else {
-            return Value::zero(32);
-        };
-        let Some((lo, hi, width)) = self.module.arrays.get(&mem_name).copied() else {
+        let Some((mem_name, (lo, hi, width))) = self.memory_task_target(tn, &args[1]) else {
             return Value::zero(32);
         };
         let start = if args.len() >= 3 {
