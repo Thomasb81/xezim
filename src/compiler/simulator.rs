@@ -76153,7 +76153,15 @@ impl Simulator {
         let struct_decl = self.module.var_decl_types.get(&dst).is_some_and(|dt| {
             matches!(self.resolve_dt_ref(dt), DataType::Struct(su) if Self::spreads_member_wise(su))
         });
-        !struct_decl && self.struct_copy_target(dst).1.is_none()
+        // §8.10 / §13.3: a bare name that is an INTEGRAL property of the
+        // running object (`this.s`) is a scalar, not the module/package-scope
+        // variable that a same-named STRUCT type may declare (`var_decl_types`
+        // is keyed by the bare name and shared by every scope). UVM's
+        // field-automation macros assign `s = __rdone__` for an `int s` while
+        // some unrelated global `s` is a struct: without this, the whole-struct
+        // copy path diverts the write and `s` silently stays 0.
+        let this_scalar = self.this_integral_prop(n);
+        (!struct_decl || this_scalar) && (self.struct_copy_target(dst).1.is_none() || this_scalar)
     }
 
     /// Does `flat_member_name(e)` evaluate nothing but plain reads? Its only
@@ -76191,6 +76199,61 @@ impl Simulator {
         let v = self.local_stack[depth].get(name)?;
         let cls = self.local_type_stack.get(depth)?.0.get(name)?;
         Some((v.to_u64()? as usize, cls.as_str()))
+    }
+
+    /// Whether `name` is a scalar INTEGRAL property of the running method's
+    /// object (`this`), regardless of any same-named variable or struct type
+    /// in module/package scope. Returns false when `name` is currently a
+    /// frame local (the innermost frame shadows the property) or when no
+    /// `this` is bound. Used to keep the whole-struct copy branch from
+    /// diverting `s = v` when a global `s` is an unrelated struct.
+    fn this_integral_prop(&self, name: &str) -> bool {
+        if self
+            .local_stack
+            .last()
+            .is_some_and(|f| f.contains_key(name))
+        {
+            return false;
+        }
+        let Some(Some(h)) = self.this_stack.last().copied() else {
+            return false;
+        };
+        let Some(Some(inst)) = self.heap.get(h) else {
+            return false;
+        };
+        let owners = self.prop_owners(&inst.class_name);
+        let Some((_, cd)) = owners.get(name) else {
+            return false;
+        };
+        let Some(prop) = cd.properties.get(name) else {
+            return false;
+        };
+        // Collections and structs: not an integral scalar target.
+        if cd.array_properties.contains_key(name)
+            || cd.assoc_properties.contains_key(name)
+            || cd.queue_properties.contains_key(name)
+            || cd.array_nd_properties.contains_key(name)
+        {
+            return false;
+        }
+        // A class-handle / enum / covergroup-typed property is routed via
+        // `class_prop_type_named`; leave it to the other guards.
+        if self.class_prop_type_named(&inst.class_name, name).is_some() {
+            return false;
+        }
+        // A struct-typed property (declared via typedef) is a real struct
+        // copy target, not an integral scalar.
+        if let Some(tn) = prop.type_name.as_ref() {
+            if self.module.typedef_types.get(tn).is_some_and(|dt| {
+                matches!(
+                    Self::resolve_type_ref(dt, &self.module.typedef_types),
+                    crate::ast::types::DataType::Struct(_)
+                )
+            }) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether `name`, not a variable of the innermost frame, is a
