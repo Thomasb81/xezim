@@ -6143,6 +6143,12 @@ impl<'a> BytecodeCompiler<'a> {
         ) -> bool {
             match &st.kind {
                 StatementKind::Null => true,
+                // §6.21: a `static` local keeps its value from one call to
+                // the next; an inlined copy would start from scratch.
+                StatementKind::VarDecl {
+                    lifetime: Some(crate::ast::types::Lifetime::Static),
+                    ..
+                } => false,
                 StatementKind::VarDecl { declarators, .. } => {
                     for d in declarators {
                         if let Some(e) = &d.init {

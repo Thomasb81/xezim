@@ -154584,7 +154584,27 @@ impl Simulator {
                         _ => false,
                     }
                 };
-                if is_static && block.instructions.iter().any(uses_this) {
+                // §6.21: a `static` local lives in a register for the whole
+                // block and reaches the persistent store only at exit. A call
+                // out of the block could re-enter this same subroutine
+                // (recursion) and see the stale stored value, which the
+                // interpreter's write-through cell never shows; keep such
+                // bodies on the interpreter.
+                let calls_out = |i: &super::bytecode::Insn| {
+                    use super::bytecode::Insn as I;
+                    matches!(
+                        i,
+                        I::CallMethod(..)
+                            | I::CallScopedMethod(..)
+                            | I::CallFreeFunction(..)
+                            | I::CallStaticScoped(..)
+                            | I::StmtFallback(..)
+                            | I::EvalExprFallback(..)
+                    )
+                };
+                let reentrant_static =
+                    !block.static_locals.is_empty() && block.instructions.iter().any(calls_out);
+                if (is_static && block.instructions.iter().any(uses_this)) || reentrant_static {
                     self.compiled_method_block_cache
                         .insert(key, super::bytecode::CompiledMethodOutcome::Nil);
                     if let Some(k) = disk_key {
@@ -154829,22 +154849,40 @@ impl Simulator {
                 }
             }
         }
-        // §6.21: copy final STATIC-local registers into the locals frame
-        // so the exit `sync_static_locals` persists them to
-        // `static_local_vars` (same contract as the formal writeback
-        // above).
+        // §6.21: persist the final STATIC-local registers. The store is
+        // written directly: for a scalar static the interpreter keeps
+        // `static_local_vars` authoritative (write-through), so the exit
+        // `sync_static_locals` deliberately skips it and a frame copy alone
+        // would be dropped. The frame copy keeps the other statics' sync.
         if !block.static_locals.is_empty() {
-            let mut outs: Vec<(String, Value)> = Vec::new();
-            for (nm, reg, _) in &block.static_locals {
-                if let Some(v) = self.vm_regs.get(*reg as usize).cloned() {
-                    outs.push((nm.clone(), v));
+            let keys: Vec<String> = self
+                .static_local_syncs
+                .last()
+                .map(|(_, syncs)| {
+                    block
+                        .static_locals
+                        .iter()
+                        .map(|(nm, _, _)| {
+                            syncs
+                                .iter()
+                                .find(|(n, _)| n == nm)
+                                .map(|(_, k)| k.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (i, (nm, reg, _)) in block.static_locals.iter().enumerate() {
+                let Some(v) = self.vm_regs.get(*reg as usize).cloned() else {
+                    continue;
+                };
+                if let Some(k) = keys.get(i)
+                    && !k.is_empty()
+                {
+                    self.static_local_vars.insert(k.clone(), v.clone());
                 }
-            }
-            if !outs.is_empty()
-                && let Some(fr) = self.local_stack.last_mut()
-            {
-                for (n, v) in outs {
-                    fr.insert(n, v);
+                if let Some(fr) = self.local_stack.last_mut() {
+                    fr.insert(nm.clone(), v);
                 }
             }
         }

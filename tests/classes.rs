@@ -208,6 +208,8 @@ mod class_width_copy_fork;
 mod compiled_method_accessors;
 #[path = "classes/compiled_method_output_formals.rs"]
 mod compiled_method_output_formals;
+#[path = "classes/compiled_method_static_local_vars.rs"]
+mod compiled_method_static_local_vars;
 #[path = "classes/compiled_nonvirtual_dispatch.rs"]
 mod compiled_nonvirtual_dispatch;
 #[path = "classes/compiled_pkg_fn_scope.rs"]
