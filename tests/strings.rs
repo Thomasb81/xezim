@@ -25,6 +25,8 @@ mod display_only_always;
 mod dpi_child_module_import;
 #[path = "strings/dpi_export_task_waits.rs"]
 mod dpi_export_task_waits;
+#[path = "strings/dpi_export_types.rs"]
+mod dpi_export_types;
 #[path = "strings/dpi_integration_tests.rs"]
 mod dpi_integration_tests;
 #[path = "strings/dpi_library_loading.rs"]

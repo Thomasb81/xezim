@@ -59,3 +59,39 @@ jobs:
       - name: cargo test --features jit
         if: always()
         run: cargo test --features jit --no-fail-fast
+
+      # Imported DPI tasks on the nested-scheduler fallback, the path a
+      # platform without fibers takes (#290).
+      - name: DPI tests on the nested-scheduler fallback
+        if: always()
+        env:
+          XEZIM_DPI_FIBERS: "0"
+        run: cargo test --test strings --no-fail-fast -- dpi_export_task_waits dpi_semantics dpi_export_types
+
+  # The DPI groups on macOS arm64: the fibers there are aarch64 and the
+  # trampoline links for Mach-O (#290). Only the DPI tests, not the suite.
+  dpi-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargoreg-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargoreg-
+
+      - name: DPI tests
+        run: cargo test --test strings --no-fail-fast -- dpi_export_task_waits dpi_semantics dpi_export_types
+
+      - name: DPI tests on the nested-scheduler fallback
+        if: always()
+        env:
+          XEZIM_DPI_FIBERS: "0"
+        run: cargo test --test strings --no-fail-fast -- dpi_export_task_waits dpi_semantics dpi_export_types

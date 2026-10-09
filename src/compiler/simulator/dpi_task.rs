@@ -2,8 +2,8 @@
 //!
 //! An imported task may call an exported task that waits, so the C frames of
 //! the import have to survive while the simulation runs on. Each call of an
-//! imported task from a process runs on its own stack (a fiber: a `ucontext`
-//! over an `mmap`ed stack). When SystemVerilog code reached from it waits,
+//! imported task from a process runs on its own stack (a fiber: a stackful
+//! coroutine over an `mmap`ed stack). When SystemVerilog code reached from it waits,
 //! the calling process parks like any other process — its continuation
 //! starts with a resume marker — and the fiber switches back to the
 //! scheduler. When the process wakes, the marker switches into the fiber,
@@ -28,7 +28,10 @@
 //! without calling another export (both checked, as the clause requires).
 //!
 //! Only armed when an imported task is declared and a library is loaded
-//! (`dpi_task_names` non-empty); otherwise nothing here runs.
+//! (`dpi_task_names` non-empty); otherwise nothing here runs. Where there
+//! are no fibers (an architecture other than x86_64 or aarch64), or with
+//! `XEZIM_DPI_FIBERS=0`, a wait inside an imported task runs the scheduler
+//! nested in the C call instead (`run_nested_until`).
 
 use super::*;
 
@@ -85,6 +88,16 @@ struct DpiAmbient {
     active_scope: *mut libc::c_void,
 }
 
+/// Whether imported tasks run on their own stacks: where the platform has
+/// fibers, unless `XEZIM_DPI_FIBERS=0` selects the nested-scheduler fallback
+/// (the path other platforms take, so it can be tested anywhere).
+pub(super) fn fibers_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        fiber::SUPPORTED && std::env::var("XEZIM_DPI_FIBERS").ok().as_deref() != Some("0")
+    })
+}
+
 fn marker(name: &str, id: u64) -> Statement {
     let span = crate::ast::Span::dummy();
     let arg = Expression::new(
@@ -134,7 +147,7 @@ impl Simulator {
     /// After the libraries are loaded: arm the mechanism when an imported
     /// task could be called.
     pub(super) fn dpi_tasks_setup(&mut self) {
-        if !fiber::SUPPORTED || self.dpi_libraries.is_empty() {
+        if !fibers_enabled() || self.dpi_libraries.is_empty() {
             return;
         }
         for (sv, spec) in &self.module.dpi_imports {
@@ -669,14 +682,17 @@ pub extern "C" fn svIsDisabledState() -> libc::c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn svAckDisabledState() {}
 
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod fiber {
-    //! A stackful coroutine on `ucontext`: `resume` runs it until it
-    //! `suspend`s or its entry returns. The context records point into
-    //! themselves, so a `Fiber` must not move once resumed (it lives boxed in
-    //! a `DpiTask`).
+    //! A stackful coroutine (`corosensei`, which switches stacks with a few
+    //! instructions of its own per architecture): `resume` runs it until it
+    //! `suspend`s or its entry returns. The same code serves x86_64 and
+    //! aarch64 on Linux (glibc or musl) and macOS (#290). A `Fiber` must not
+    //! move once resumed (it lives boxed in a `DpiTask`).
+    use corosensei::stack::{Stack, StackPointer};
+    use corosensei::{Coroutine, CoroutineResult, Yielder};
     use std::any::Any;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
 
     pub(in super::super) const SUPPORTED: bool = true;
 
@@ -702,18 +718,36 @@ mod fiber {
     }
 
     thread_local! {
-        static STARTING: Cell<*mut Fiber> = const { Cell::new(std::ptr::null_mut()) };
         /// Stacks of finished fibers, kept for reuse.
         static POOL: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     }
     const POOL_MAX: usize = 16;
 
+    /// One `mmap`ed stack: `stack_len()` bytes from `map`, the lowest
+    /// `GUARD` of them inaccessible.
+    struct MappedStack {
+        map: usize,
+    }
+
+    // SAFETY: the mapping is `stack_len()` bytes with a guard region at the
+    // bottom; both ends are page-aligned, so 16-byte aligned.
+    unsafe impl Stack for MappedStack {
+        fn base(&self) -> StackPointer {
+            StackPointer::new(self.map + stack_len()).expect("stack mapping")
+        }
+        fn limit(&self) -> StackPointer {
+            StackPointer::new(self.map).expect("stack mapping")
+        }
+    }
+
+    type Co = Coroutine<(), (), (), MappedStack>;
+
     pub(in super::super) struct Fiber {
-        ctx: libc::ucontext_t,
-        back: libc::ucontext_t,
-        stack: *mut u8,
+        co: Option<Co>,
+        /// Set by the coroutine when it starts; valid while it lives.
+        yielder: *const Yielder<(), ()>,
         entry: Option<Box<dyn FnOnce()>>,
-        started: bool,
+        floor: usize,
         done: bool,
         panic: Option<Box<dyn Any + Send>>,
     }
@@ -721,12 +755,10 @@ mod fiber {
     impl Fiber {
         pub(in super::super) fn new() -> Self {
             Fiber {
-                // SAFETY: plain C records, filled in by getcontext.
-                ctx: unsafe { std::mem::zeroed() },
-                back: unsafe { std::mem::zeroed() },
-                stack: std::ptr::null_mut(),
+                co: None,
+                yielder: std::ptr::null(),
                 entry: None,
-                started: false,
+                floor: 0,
                 done: false,
                 panic: None,
             }
@@ -746,7 +778,7 @@ mod fiber {
 
         /// The lowest usable address of the stack (it grows down to here).
         pub(in super::super) fn stack_floor(&self) -> usize {
-            self.stack as usize + GUARD
+            self.floor
         }
 
         /// Run the fiber until it suspends or finishes.
@@ -759,22 +791,32 @@ mod fiber {
                 if (*this).done {
                     return;
                 }
-                if !(*this).started {
-                    (*this).started = true;
-                    let len = stack_len();
-                    let stack = alloc_stack(len);
-                    (*this).stack = stack;
-                    if libc::getcontext(&raw mut (*this).ctx) != 0 {
-                        panic!("getcontext failed");
-                    }
-                    (*this).ctx.uc_stack.ss_sp = stack.add(GUARD).cast();
-                    (*this).ctx.uc_stack.ss_size = len - GUARD;
-                    // Returning from the entry resumes whoever resumed last.
-                    (*this).ctx.uc_link = &raw mut (*this).back;
-                    libc::makecontext(&raw mut (*this).ctx, fiber_main, 0);
-                    STARTING.with(|c| c.set(this));
+                if (*this).co.is_none() {
+                    let stack = alloc_stack();
+                    (*this).floor = stack.map + GUARD;
+                    let entry = (*this).entry.take();
+                    (*this).co = Some(Coroutine::with_stack(
+                        stack,
+                        move |y: &Yielder<(), ()>, ()| {
+                            (*this).yielder = y;
+                            // A panic is carried back to the resumer, which
+                            // re-raises it on its own stack.
+                            let r =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                                    if let Some(f) = entry {
+                                        f();
+                                    }
+                                }));
+                            if let Err(p) = r {
+                                (*this).panic = Some(p);
+                            }
+                        },
+                    ));
                 }
-                libc::swapcontext(&raw mut (*this).back, &raw const (*this).ctx);
+                let co: *mut Co = (*this).co.as_mut().expect("fiber");
+                if let CoroutineResult::Return(()) = (*co).resume(()) {
+                    (*this).done = true;
+                }
             }
         }
 
@@ -784,39 +826,30 @@ mod fiber {
         /// Called on `this` fiber's own stack.
         pub(in super::super) unsafe fn suspend(this: *mut Fiber) {
             unsafe {
-                libc::swapcontext(&raw mut (*this).ctx, &raw const (*this).back);
+                let y = (*this).yielder;
+                if !y.is_null() {
+                    (*y).suspend(());
+                }
             }
         }
     }
 
-    extern "C" fn fiber_main() {
-        let this = STARTING.with(|c| c.get());
-        // SAFETY: set by `resume` just before switching here.
-        let entry = unsafe { (*this).entry.take() };
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            if let Some(f) = entry {
-                f();
-            }
-        }));
-        unsafe {
-            if let Err(p) = r {
-                (*this).panic = Some(p);
-            }
-            (*this).done = true;
-        }
-    }
-
-    fn alloc_stack(len: usize) -> *mut u8 {
+    fn alloc_stack() -> MappedStack {
         if let Some(p) = POOL.with(|p| p.borrow_mut().pop()) {
-            return p as *mut u8;
+            return MappedStack { map: p };
         }
+        let len = stack_len();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_STACK;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
         // SAFETY: a fresh anonymous mapping.
         unsafe {
             let p = libc::mmap(
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE | libc::MAP_STACK,
+                flags,
                 -1,
                 0,
             );
@@ -827,20 +860,26 @@ mod fiber {
                 );
             }
             libc::mprotect(p, GUARD, libc::PROT_NONE);
-            p.cast()
+            MappedStack { map: p as usize }
         }
     }
 
     impl Drop for Fiber {
         fn drop(&mut self) {
-            if self.stack.is_null() {
+            let Some(mut co) = self.co.take() else {
                 return;
-            }
-            let len = stack_len();
+            };
             // A fiber dropped while suspended (the run ended inside an
-            // imported task) leaves its frames unrun; the stack is only
-            // memory. Reuse it, or hand it back.
-            let kept = self.done
+            // imported task) leaves its frames unrun, C frames among them:
+            // nothing on it is unwound, and the stack is only memory.
+            let suspended = !self.done;
+            if suspended {
+                // SAFETY: nothing on the abandoned stack is ever resumed.
+                unsafe { co.force_reset() };
+            }
+            let stack = co.into_stack();
+            let len = stack_len();
+            let kept = !suspended
                 && POOL.with(|p| {
                     let mut p = p.borrow_mut();
                     if p.len() >= POOL_MAX {
@@ -850,24 +889,24 @@ mod fiber {
                     let top = 256 * 1024;
                     unsafe {
                         libc::madvise(
-                            self.stack.add(GUARD).cast(),
+                            (stack.map + GUARD) as *mut libc::c_void,
                             len - GUARD - top,
                             libc::MADV_DONTNEED,
                         );
                     }
-                    p.push(self.stack as usize);
+                    p.push(stack.map);
                     true
                 });
             if !kept {
                 unsafe {
-                    libc::munmap(self.stack.cast(), len);
+                    libc::munmap(stack.map as *mut libc::c_void, len);
                 }
             }
         }
     }
 }
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+#[cfg(not(all(unix, any(target_arch = "x86_64", target_arch = "aarch64"))))]
 mod fiber {
     //! No fibers here: imported tasks keep the nested-scheduler fallback
     //! (`dpi_tasks_setup` never arms the mechanism).

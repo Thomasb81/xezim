@@ -2306,6 +2306,7 @@ impl NbaFastIndex {
 
 mod assert_ctl;
 mod code_cov;
+mod dpi_export;
 mod dpi_task;
 mod event_bits;
 mod module_paths;
@@ -2611,6 +2612,25 @@ impl TimingWheel {
                 .entry(time)
                 .or_default()
                 .push_front((pid, stmts));
+        }
+    }
+
+    /// Put back `rest`, in order and ahead of anything queued at `time`
+    /// since: events a batch took for `time` but has not run yet.
+    fn requeue_front(&mut self, time: u64, rest: EventList) {
+        self.narrow_next_cache(time);
+        for (pid, stmts) in rest.into_iter().rev() {
+            *self.pid_counts.entry(pid).or_insert(0) += 1;
+            if time < self.current_time + WHEEL_SIZE as u64 {
+                let s = Self::slot(time);
+                self.wheel[s].push_front((pid, stmts));
+                self.bitmap_set(s);
+            } else {
+                self.overflow
+                    .entry(time)
+                    .or_default()
+                    .push_front((pid, stmts));
+            }
         }
     }
 
@@ -4115,27 +4135,6 @@ struct TaskCleanup {
     pushed_method_this: bool,
     saved_spec: Option<(String, String)>,
     formal_metadata: Vec<FormalMetadataSnapshot>,
-}
-
-/// Scalar kind of a DPI-EXPORT subroutine's port or return, for the generated
-/// C trampoline (§35.5.4). `Bad` = a type not modeled for C callback (string,
-/// chandle, aggregate, or a packed vector wider than 64 bits).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DpiExpKind {
-    Void,
-    I32,
-    I64,
-    Real,
-    /// `string` — modeled only as an INPUT argument (`const char*`); a string
-    /// RETURN is not modeled (mapped to Bad).
-    StrIn,
-    /// §35.5.6 / H.8.2: an `output`/`inout` formal of an exported subroutine
-    /// arrives as a POINTER (`int*`, `long long*`, `double*`); the formal's
-    /// final value is stored through it on return.
-    I32Out,
-    I64Out,
-    RealOut,
-    Bad,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7117,6 +7116,14 @@ pub struct Simulator {
     /// after a disable.
     dpi_task_names: HashSet<String>,
     dpi_tasks: HashMap<u64, Box<dpi_task::DpiTask>>,
+    /// Strings an exported subroutine handed to C (a `string` result or
+    /// output), kept until its next call (§35.5.6).
+    dpi_export_cstrings: HashMap<usize, Vec<std::ffi::CString>>,
+    /// Numbers the hidden variables of each call from C (`dpi_export.rs`).
+    dpi_export_seq: u64,
+    /// The time slot batches `run_events_until` is running, outermost first:
+    /// their unrun processes (`requeue_slot_batches`).
+    slot_batches: Vec<(u64, EventList)>,
     dpi_cur_task: Option<u64>,
     dpi_unwinding: bool,
     next_dpi_task: u64,
@@ -12086,6 +12093,9 @@ impl Simulator {
             dpi_export_depth: 0,
             dpi_task_names: HashSet::default(),
             dpi_tasks: HashMap::default(),
+            dpi_export_cstrings: HashMap::default(),
+            dpi_export_seq: 0,
+            slot_batches: Vec::new(),
             dpi_cur_task: None,
             dpi_unwinding: false,
             next_dpi_task: 1,
@@ -15129,463 +15139,6 @@ impl Simulator {
                 path, e, hint
             ));
         }
-    }
-
-    /// Scalar DPI-export kind of a type. `real`/`shortreal` -> Real; integer
-    /// vectors/atoms up to 64 bits -> I32/I64; everything else -> Bad.
-    fn dpi_export_kind(&self, dt: &crate::ast::types::DataType) -> DpiExpKind {
-        use crate::ast::types::{DataType, SimpleType};
-        if super::elaborate::is_type_real(dt) {
-            return DpiExpKind::Real;
-        }
-        if let DataType::Simple { kind, .. } = dt {
-            match kind {
-                SimpleType::String => return DpiExpKind::StrIn,
-                SimpleType::Chandle | SimpleType::Event => return DpiExpKind::Bad,
-            }
-        }
-        let w = super::elaborate::resolve_type_width(
-            dt,
-            Some(&self.module.parameters),
-            Some(&self.module.typedefs),
-        )
-        .max(1);
-        match w {
-            1..=32 => DpiExpKind::I32,
-            33..=64 => DpiExpKind::I64,
-            _ => DpiExpKind::Bad,
-        }
-    }
-
-    /// An exported subroutine's formal: its scalar kind, as a pointer kind
-    /// for an `output`/`inout` (§35.5.6: C passes those by reference).
-    fn dpi_export_port_kind(
-        &self,
-        dt: &crate::ast::types::DataType,
-        dir: PortDirection,
-    ) -> DpiExpKind {
-        let k = self.dpi_export_kind(dt);
-        if !matches!(
-            dir,
-            PortDirection::Output | PortDirection::Inout | PortDirection::Ref
-        ) {
-            return k;
-        }
-        match k {
-            DpiExpKind::I32 => DpiExpKind::I32Out,
-            DpiExpKind::I64 => DpiExpKind::I64Out,
-            DpiExpKind::Real => DpiExpKind::RealOut,
-            _ => DpiExpKind::Bad,
-        }
-    }
-
-    /// `(return_kind, arg_kinds)` for an exported subroutine. `void`-returning
-    /// functions and tasks report `Void`. None if the name is neither a
-    /// function nor a task. Any `Bad` kind means the C signature can't be
-    /// modeled and the trampoline must be a stub.
-    fn dpi_export_signature(&self, name: &str) -> Option<(DpiExpKind, Vec<DpiExpKind>)> {
-        if let Some(fd) = self.module.functions.get(name) {
-            let ret = if matches!(fd.return_type, crate::ast::types::DataType::Void(_)) {
-                DpiExpKind::Void
-            } else {
-                match self.dpi_export_kind(&fd.return_type) {
-                    // A `string`-returning export isn't modeled (the returned
-                    // char* would need a lifetime past the call).
-                    DpiExpKind::StrIn => DpiExpKind::Bad,
-                    k => k,
-                }
-            };
-            let args = fd
-                .ports
-                .iter()
-                .map(|p| self.dpi_export_port_kind(&p.data_type, p.direction))
-                .collect();
-            Some((ret, args))
-        } else if let Some(td) = self.module.tasks.get(name) {
-            let args = td
-                .ports
-                .iter()
-                .map(|p| self.dpi_export_port_kind(&p.data_type, p.direction))
-                .collect();
-            // §35.9: the C function for an exported task returns int — 1
-            // when it returned because of a disable, else 0.
-            Some((DpiExpKind::I32, args))
-        } else {
-            None
-        }
-    }
-
-    /// Build and load the export trampoline; false when it was needed but
-    /// could not be built.
-    fn load_dpi_export_trampoline(&mut self) -> bool {
-        let exports = self.module.dpi_exports.clone();
-        if exports.is_empty() {
-            return true;
-        }
-        // Exported functions are only reachable from a loaded DPI library; with
-        // none configured, nothing can call them from C — skip the compile.
-        if configured_dpi_libs().is_empty() {
-            return true;
-        }
-        let c_ty = |k: DpiExpKind| match k {
-            DpiExpKind::Void => "void",
-            DpiExpKind::I32 => "int",
-            DpiExpKind::I64 => "long long",
-            DpiExpKind::Real => "double",
-            DpiExpKind::StrIn => "const char*",
-            DpiExpKind::I32Out => "int*",
-            DpiExpKind::I64Out => "long long*",
-            DpiExpKind::RealOut => "double*",
-            DpiExpKind::Bad => "long long",
-        };
-        let mut body = String::new();
-        body.push_str("#include <string.h>\n");
-        body.push_str(
-            "extern long long __xezim_dpi_export_dispatch(long long id, long long n, const long long* a);\n",
-        );
-        let mut emitted = 0usize;
-        let c_names = self.module.dpi_export_c_names.clone();
-        // §35.5.3: every instance of a module that exports a subroutine
-        // shares its C symbol; one entry point serves them all and the
-        // dispatch picks the instance by scope (`dpi_export_for_scope`).
-        let mut seen_c: HashSet<&str> = HashSet::default();
-        for (id, name) in exports.iter().enumerate() {
-            // The symbol the C side links against: the export's alias when
-            // one was declared, else the SV name.
-            let c_name: &str = c_names.get(id).map(|s| s.as_str()).unwrap_or(name);
-            if !seen_c.insert(c_name) {
-                continue;
-            }
-            let Some((ret, args)) = self.dpi_export_signature(name) else {
-                continue;
-            };
-            let supported = ret != DpiExpKind::Bad && !args.contains(&DpiExpKind::Bad);
-            let params: Vec<String> = if supported {
-                args.iter()
-                    .enumerate()
-                    .map(|(i, k)| format!("{} a{}", c_ty(*k), i))
-                    .collect()
-            } else {
-                // Stub keeps the right arity so the symbol resolves (the user
-                // library loads) but the call is a warned no-op.
-                (0..args.len())
-                    .map(|i| format!("long long a{}", i))
-                    .collect()
-            };
-            let param_list = if params.is_empty() {
-                "void".to_string()
-            } else {
-                params.join(", ")
-            };
-            if !supported {
-                eprintln!(
-                    "[DPI] exported subroutine '{}' has a type not modeled for C callback \
-                     (real/string/chandle/aggregate or a vector wider than 64 bits handled only \
-                     partially) — calls from C return 0",
-                    name
-                );
-                let ret_c = if ret == DpiExpKind::Void {
-                    "void"
-                } else {
-                    "long long"
-                };
-                if ret == DpiExpKind::Void {
-                    body.push_str(&format!("void {}({}) {{ }}\n", c_name, param_list));
-                } else {
-                    body.push_str(&format!(
-                        "{} {}({}) {{ return 0; }}\n",
-                        ret_c, c_name, param_list
-                    ));
-                }
-                emitted += 1;
-                continue;
-            }
-            // Pack each argument into a 64-bit slot: integers by value, reals by
-            // their IEEE-754 bit pattern (so the single integer dispatch carries
-            // both). The dispatch reconstructs the correct Value per port type.
-            let mut pack = String::new();
-            if args.is_empty() {
-                pack.push_str("    long long __a[1]; (void)__a;\n");
-            } else {
-                pack.push_str(&format!("    long long __a[{}];\n", args.len()));
-                for (i, k) in args.iter().enumerate() {
-                    match k {
-                        DpiExpKind::Real => pack.push_str(&format!(
-                            "    {{ double __t = a{}; memcpy(&__a[{}], &__t, 8); }}\n",
-                            i, i
-                        )),
-                        DpiExpKind::I32Out | DpiExpKind::I64Out | DpiExpKind::RealOut => pack
-                            .push_str(&format!(
-                                "    __a[{}] = (long long)(unsigned long)a{};\n",
-                                i, i
-                            )),
-                        _ => pack.push_str(&format!("    __a[{}] = (long long)a{};\n", i, i)),
-                    }
-                }
-            }
-            let call = format!("__xezim_dpi_export_dispatch({}, {}, __a)", id, args.len());
-            match ret {
-                DpiExpKind::Void => body.push_str(&format!(
-                    "void {}({}) {{\n{}    (void){};\n}}\n",
-                    c_name, param_list, pack, call
-                )),
-                DpiExpKind::Real => body.push_str(&format!(
-                    "double {}({}) {{\n{}    long long __r = {};\n    double __d; memcpy(&__d, &__r, 8); return __d;\n}}\n",
-                    c_name, param_list, pack, call
-                )),
-                _ => body.push_str(&format!(
-                    "{} {}({}) {{\n{}    return ({}){};\n}}\n",
-                    c_ty(ret), c_name, param_list, pack, c_ty(ret), call
-                )),
-            }
-            emitted += 1;
-        }
-        if emitted == 0 {
-            return true;
-        }
-        let dir = std::env::temp_dir();
-        let stem = format!("xezim_dpi_exports_{}", std::process::id());
-        let cpath = dir.join(format!("{}.c", stem));
-        let sopath = dir.join(format!("{}.so", stem));
-        if let Err(e) = std::fs::write(&cpath, &body) {
-            eprintln!("[DPI] could not write export trampoline source: {}", e);
-            return false;
-        }
-        let cmd = dpi_trampoline_cc_command(std::env::var("CC").ok().as_deref(), &sopath, &cpath);
-        let status = std::process::Command::new(&cmd[0]).args(&cmd[1..]).status();
-        match status {
-            Ok(st) if st.success() => {}
-            Ok(st) => {
-                eprintln!(
-                    "[DPI] export trampoline compile failed (exit {:?}); C callbacks into \
-                     exported SV functions will be unresolved",
-                    st.code()
-                );
-                return false;
-            }
-            Err(e) => {
-                eprintln!(
-                    "[DPI] could not run the C compiler `{}` for the export trampoline ({}); \
-                     set $CC or put `cc` on PATH",
-                    cmd[0].to_string_lossy(),
-                    e
-                );
-                return false;
-            }
-        }
-        use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
-        let loaded = match unsafe { UnixLibrary::open(Some(&sopath), RTLD_NOW | RTLD_GLOBAL) } {
-            Ok(l) => {
-                self.dpi_libraries.push(Library::from(l));
-                true
-            }
-            Err(e) => {
-                eprintln!("[DPI] failed to load export trampoline: {}", e);
-                false
-            }
-        };
-        let _ = std::fs::remove_file(&cpath);
-        let _ = std::fs::remove_file(&sopath);
-        loaded
-    }
-
-    /// §35.5.4: run an exported SV subroutine identified by its declaration-order
-    /// id, called from C through the generated trampoline. `args` points at
-    /// `nargs` 64-bit slots (integers by value, reals as IEEE-754 bits). The
-    /// return is a 64-bit slot: an integer value, or a real's bit pattern.
-    fn run_dpi_export(&mut self, id: usize, nargs: usize, args: *const i64) -> i64 {
-        // §35.9 d): an imported subroutine in the disabled state may not call
-        // an export any more.
-        if self.dpi_unwinding {
-            self.dpi_protocol_fatal(
-                "an exported subroutine was called after its imported caller was disabled",
-            );
-            return 1;
-        }
-        if self.dpi_cur_task.is_some() && self.dpi_stack_exhausted() {
-            return 0;
-        }
-        let Some(id) = self.dpi_export_for_scope(id) else {
-            let (c, scope) = (
-                self.module
-                    .dpi_export_c_names
-                    .get(id)
-                    .cloned()
-                    .unwrap_or_default(),
-                dpi_task::dpi_scope_name(ACTIVE_SCOPE.with(|cell| cell.get())),
-            );
-            self.emit_severity_text(
-                "Fatal",
-                &format!(
-                    "DPI export '{}' is not declared in the calling scope '{}' or a scope above it (IEEE 1800 clause 35.5.3)",
-                    c, scope
-                ),
-            );
-            self.fatal_finish_number = Some(1);
-            self.finished = true;
-            return 0;
-        };
-        let Some(name) = self.module.dpi_exports.get(id).cloned() else {
-            return 0;
-        };
-        let Some((ret_kind, arg_kinds)) = self.dpi_export_signature(&name) else {
-            return 0;
-        };
-        let raw: Vec<i64> = (0..nargs).map(|i| unsafe { *args.add(i) }).collect();
-        // §35.5.6: an `output`/`inout` formal binds to a frame local of this
-        // dispatch holding the pointee; its final value is stored back
-        // through the C pointer after the call.
-        let out_name = |i: usize| format!("__dpi_export_out{}", i);
-        let mut out_frame: HashMap<String, Value> = HashMap::default();
-        let mut outs: Vec<(usize, DpiExpKind, i64)> = Vec::new();
-        for (i, &slot) in raw.iter().enumerate() {
-            let k = arg_kinds.get(i).copied().unwrap_or(DpiExpKind::Bad);
-            if slot == 0
-                || !matches!(
-                    k,
-                    DpiExpKind::I32Out | DpiExpKind::I64Out | DpiExpKind::RealOut
-                )
-            {
-                continue;
-            }
-            let v = unsafe {
-                match k {
-                    DpiExpKind::I32Out => {
-                        let mut v = Value::from_u64(*(slot as *const i32) as u32 as u64, 32);
-                        v.is_signed = true;
-                        v
-                    }
-                    DpiExpKind::I64Out => {
-                        let mut v = Value::from_u64(*(slot as *const i64) as u64, 64);
-                        v.is_signed = true;
-                        v
-                    }
-                    _ => Value::from_f64(*(slot as *const f64)),
-                }
-            };
-            out_frame.insert(out_name(i), v);
-            outs.push((i, k, slot));
-        }
-        let arg_exprs: Vec<Expression> = raw
-            .iter()
-            .enumerate()
-            .map(|(i, &slot)| {
-                if outs.iter().any(|&(j, ..)| j == i) {
-                    return Expression::new(
-                        ExprKind::Ident(crate::ast::expr::HierarchicalIdentifier {
-                            root: None,
-                            path: vec![crate::ast::expr::HierPathSegment {
-                                name: crate::ast::Identifier {
-                                    name: out_name(i),
-                                    span: crate::ast::Span::dummy(),
-                                },
-                                selects: Vec::new(),
-                            }],
-                            span: crate::ast::Span::dummy(),
-                            cached_signal_id: std::cell::Cell::new(None),
-                            cached_resolved_name: std::cell::OnceCell::new(),
-                        }),
-                        crate::ast::Span::dummy(),
-                    );
-                }
-                match arg_kinds.get(i) {
-                    Some(DpiExpKind::Real) => {
-                        return Expression::new(
-                            ExprKind::Number(NumberLiteral::Real(f64::from_bits(slot as u64))),
-                            crate::ast::Span::dummy(),
-                        );
-                    }
-                    Some(DpiExpKind::StrIn) => {
-                        let sval = if slot == 0 {
-                            String::new()
-                        } else {
-                            unsafe { std::ffi::CStr::from_ptr(slot as *const libc::c_char) }
-                                .to_string_lossy()
-                                .into_owned()
-                        };
-                        return Expression::new(
-                            ExprKind::StringLiteral(sval),
-                            crate::ast::Span::dummy(),
-                        );
-                    }
-                    _ => {}
-                }
-                {
-                    Expression::new(
-                        ExprKind::Number(NumberLiteral::Integer {
-                            size: Some(64),
-                            signed: true,
-                            base: NumberBase::Decimal,
-                            value: slot.to_string(),
-                            cached_val: Cell::new(Some((slot as u64, 0u64, 64u32))),
-                        }),
-                        crate::ast::Span::dummy(),
-                    )
-                }
-            })
-            .collect();
-        let has_outs = !outs.is_empty();
-        if has_outs {
-            self.push_local_frame(out_frame);
-        }
-        let mut ret = 0i64;
-        // An instance's export runs in that instance, as a call through its
-        // hierarchical name does (`$time`, `%m` and bare names included).
-        let inst: Option<String> = name
-            .rsplit_once('.')
-            .filter(|_| !name.contains("::"))
-            .map(|(p, _)| p.to_string());
-        let saved_scope = inst.as_ref().map(|sc| {
-            let hint = self.name_resolve_hint.replace(Some(sc.clone()));
-            let ts = self.timescale_scope_override.replace(sc.clone());
-            (hint, ts)
-        });
-        let on_fiber = self.dpi_note_export(&name, true);
-        if let Some(fd) = self.fn_decl_rc(&name) {
-            self.dpi_export_depth += 1;
-            let r = self.exec_function_call(&fd, &arg_exprs);
-            self.dpi_export_depth -= 1;
-            ret = match ret_kind {
-                DpiExpKind::Real => r.to_f64().to_bits() as i64,
-                DpiExpKind::Void => 0,
-                _ => r.to_i64().unwrap_or(0),
-            };
-        } else if let Some(td) = self.task_decl_rc(&name) {
-            self.dpi_export_depth += 1;
-            if inst.is_some() {
-                self.task_clears_this = true;
-            }
-            self.exec_task_call(&td, &arg_exprs);
-            self.dpi_export_depth -= 1;
-            // §35.9 a): an exported task returns 1 when it returns because
-            // its imported caller was disabled, else 0.
-            ret = self.dpi_unwinding as i64;
-        }
-        if on_fiber {
-            self.dpi_note_export(&name, false);
-        }
-        if let Some((hint, ts)) = saved_scope {
-            *self.name_resolve_hint.borrow_mut() = hint;
-            self.timescale_scope_override = ts;
-        }
-        if has_outs {
-            let frame = self.pop_local_frame_take().unwrap_or_default();
-            for (i, k, slot) in outs {
-                let Some(v) = frame.get(&out_name(i)) else {
-                    continue;
-                };
-                unsafe {
-                    match k {
-                        DpiExpKind::I32Out => {
-                            *(slot as *mut i32) = v.to_u64().unwrap_or(0) as u32 as i32
-                        }
-                        DpiExpKind::I64Out => *(slot as *mut i64) = v.to_u64().unwrap_or(0) as i64,
-                        _ => *(slot as *mut f64) = v.to_f64(),
-                    }
-                }
-            }
-        }
-        ret
     }
 
     fn bind_all_dpi_imports(&mut self) {
@@ -19310,7 +18863,9 @@ impl Simulator {
                 d
             );
         }
-        #[cfg(target_os = "linux")]
+        // MADV_COLLAPSE is in `libc` for glibc targets only, so a musl build
+        // (also `target_os = "linux"`) keeps the stub below (#290).
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
         fn advise<T>(s: &[T], name: &str, stats: bool) {
             let bytes = std::mem::size_of_val(s);
             if bytes < HP {
@@ -19379,7 +18934,7 @@ impl Simulator {
                 }
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
         fn advise<T>(_s: &[T], _n: &str, _st: bool) {}
 
         advise(&self.signal_table, "signal_table", stats);
@@ -48838,6 +48393,7 @@ impl Simulator {
     /// and resume like a process (#204). The synchronous `#delay` arm waits
     /// the same way, through `run_events_until`.
     fn run_nested_until(&mut self, mut done: impl FnMut(&mut Self) -> bool) {
+        self.requeue_slot_batches();
         let saved_hint = self.name_resolve_hint.borrow().clone();
         if !self.in_edge_block {
             self.apply_nba();
@@ -48913,6 +48469,26 @@ impl Simulator {
         *self.name_resolve_hint.borrow_mut() = saved_hint;
     }
 
+    /// A scheduler is starting nested inside a process that an enclosing
+    /// `run_events_until` took from its time slot's batch: hand the batch's
+    /// unrun processes back to the queue, so they run in their own time slot
+    /// in the nested scheduler. Left in the batch they ran only once the
+    /// nested scheduler returned — at a later time, or never when it waited
+    /// on one of them. Several processes calling imported tasks in one slot
+    /// on the nested-scheduler fallback lost all but the first (#290).
+    fn requeue_slot_batches(&mut self) {
+        if self.slot_batches.iter().all(|(_, b)| b.is_empty()) {
+            return;
+        }
+        // Innermost first, so the outermost batch's processes end up first.
+        for (t, b) in self.slot_batches.iter_mut().rev() {
+            let rest = std::mem::take(b);
+            if !rest.is_empty() {
+                self.event_queue.requeue_front(*t, rest);
+            }
+        }
+    }
+
     /// `run_nested_until` gave up: the run ends with the task entered from C
     /// still waiting. §35.8: the call returns only when the task has
     /// finished, so neither the rest of the task nor its caller may run —
@@ -48949,6 +48525,7 @@ impl Simulator {
     }
 
     fn run_events_until(&mut self, target: u64) {
+        self.requeue_slot_batches();
         self.nested_run_epoch += 1;
         let saved_pid = self.current_pid;
         let saved_break = self.break_flag;
@@ -49055,14 +48632,25 @@ impl Simulator {
             }
             let processes = self.event_queue.remove(self.time);
             let ran_process = !processes.is_empty();
-            for (pid, stmts) in processes {
-                if self.finished {
-                    break;
+            if ran_process {
+                // The batch stays where a nested scheduler started by one of
+                // its processes finds it (`requeue_slot_batches`).
+                self.slot_batches.push((self.time, processes));
+                let depth = self.slot_batches.len();
+                while !self.finished {
+                    let Some((pid, stmts)) = self
+                        .slot_batches
+                        .get_mut(depth - 1)
+                        .and_then(|(_, b)| b.pop_front())
+                    else {
+                        break;
+                    };
+                    self.run_scheduled_process(pid, &stmts);
+                    if !self.is_pid_suspended(pid) {
+                        self.child_finished(pid);
+                    }
                 }
-                self.run_scheduled_process(pid, &stmts);
-                if !self.is_pid_suspended(pid) {
-                    self.child_finished(pid);
-                }
+                self.slot_batches.truncate(depth - 1);
             }
             // §4.5: `#0` continuations parked by the processes above activate
             // and run BEFORE this slot's NBA region — loop again at the same
@@ -49121,6 +48709,15 @@ impl Simulator {
             // state stayed parked until the C call returned (#279).
             if self.dpi_export_depth > 0 && !self.condition_waiters.is_empty() {
                 self.nested_drain_condition_waiters();
+            }
+            // §20.2: a `$finish` the edge delivery above deferred to the end
+            // of this slot (`finish_deferred`, as `run_one_tick` honours it)
+            // stops the run here too. This loop never took it: the slot
+            // ended, the flag stayed set, and a nested scheduler kept
+            // advancing time to `--max-time` (#290).
+            if self.finish_deferred {
+                self.finish_deferred = false;
+                self.finished = true;
             }
             // §4.4.2.3: a process resumed above may have parked a `#0`
             // continuation in the Inactive queue. apply_nba for this pass
@@ -158351,7 +157948,11 @@ pub extern "C" fn __xezim_dpi_export_dispatch(
     a: *const libc::c_longlong,
 ) -> libc::c_longlong {
     try_active_sim("__xezim_dpi_export_dispatch", |sim| {
-        sim.run_dpi_export(id as usize, n.max(0) as usize, a as *const i64) as libc::c_longlong
+        if n < 0 {
+            // An export C cannot call (`load_dpi_export_trampoline`).
+            return sim.run_dpi_export_unmodelled(id as usize) as libc::c_longlong;
+        }
+        sim.run_dpi_export(id as usize, n as usize, a as *const i64) as libc::c_longlong
     })
     .unwrap_or(0)
 }

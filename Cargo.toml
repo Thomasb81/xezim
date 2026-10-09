@@ -50,6 +50,13 @@ miniz_oxide = "0.8"
 [target.'cfg(target_os = "macos")'.dependencies]
 libffi = { version = "3", features = ["system"] }
 
+# IEEE 1800 §35.5.2: each call of an imported DPI task runs on its own
+# stack (src/compiler/simulator/dpi_task.rs). Stackful coroutines for
+# x86_64 and aarch64 on Linux (glibc and musl) and macOS alike; elsewhere the
+# nested-scheduler fallback runs (#290).
+[target.'cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+corosensei = { version = "0.3", default-features = false }
+
 [dev-dependencies]
 # `tests/gates/fst_roundtrip.rs` DECODES the FST dumps this crate writes, to
 # check var types, widths, aliases, values and the trailer's end_time. An FST

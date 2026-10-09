@@ -281,6 +281,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Edge engine: shadow-compare dirty-driven scan vs full scan",
     ),
     (
+        "XEZIM_DPI_FIBERS",
+        "DPI: 0 runs waits inside imported tasks on the nested scheduler instead of per-call stacks",
+    ),
+    (
         "XEZIM_DPI_STACK_MB",
         "Stack size in MB reserved for each running DPI imported-task call (default 256)",
     ),

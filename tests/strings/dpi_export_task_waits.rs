@@ -15,6 +15,10 @@
 //! stack, `dpi_task.rs`; the expected values are the reference simulator's)
 //! and through an imported function, which xezim accepts and runs on the
 //! nested scheduler with the same results.
+//!
+//! Where there are no fibers (an architecture other than x86_64 or aarch64)
+//! an imported task takes that nested scheduler too; `XEZIM_DPI_FIBERS=0`
+//! selects it here, and every design runs both ways (#290).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,8 +35,14 @@ fn shared_lib(dir: &Path, stem: &str, src: &str) -> PathBuf {
     let so = dir.join(format!("{stem}.so"));
     std::fs::write(&c, src).unwrap();
     let include = Path::new(env!("CARGO_MANIFEST_DIR")).join("include");
-    let ok = Command::new("cc")
-        .args(["-shared", "-fPIC", "-I"])
+    let mut cc = Command::new("cc");
+    cc.args(["-shared", "-fPIC"]);
+    if cfg!(target_os = "macos") {
+        // The exported subroutines resolve when xezim loads the library.
+        cc.arg("-Wl,-undefined,dynamic_lookup");
+    }
+    let ok = cc
+        .arg("-I")
         .arg(&include)
         .arg(&c)
         .arg("-o")
@@ -44,9 +54,17 @@ fn shared_lib(dir: &Path, stem: &str, src: &str) -> PathBuf {
     so
 }
 
-fn run(dir: &Path, lib: &Path, sv: &str) -> String {
+fn run(dir: &Path, lib: &Path, sv: &str, stack: Stack) -> String {
     std::fs::write(dir.join("top.sv"), sv).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_xezim"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_xezim"));
+    cmd.env(
+        "XEZIM_DPI_FIBERS",
+        match stack {
+            Stack::Fibers => "1",
+            Stack::Nested => "0",
+        },
+    );
+    let out = cmd
         .arg("--dpi-lib")
         .arg(lib)
         // A hang runs into this instead of the default limit.
@@ -63,6 +81,18 @@ fn run(dir: &Path, lib: &Path, sv: &str) -> String {
     text
 }
 
+/// Where an imported task's waits run.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stack {
+    /// Each call on its own stack (`dpi_task.rs`).
+    Fibers,
+    /// The scheduler nested in the C call (`XEZIM_DPI_FIBERS=0`, and every
+    /// platform without fibers).
+    Nested,
+}
+
+const STACKS: [Stack; 2] = [Stack::Fibers, Stack::Nested];
+
 /// How the C entry points are declared.
 #[derive(Clone, Copy, Debug)]
 enum Import {
@@ -77,7 +107,7 @@ enum Import {
 /// Run `sv` with `c` for one import form. `sv` declares its imports as
 /// `IMPORT name(args);` and `c` its entry points as `ENTRY name(args) {`,
 /// ending each with `DONE`.
-fn run_as(tag: &str, form: Import, sv: &str, c: &str) -> String {
+fn run_as(tag: &str, form: Import, stack: Stack, sv: &str, c: &str) -> String {
     let (imp, entry, done) = match form {
         Import::Task => ("import \"DPI-C\" context task", "int", "return 0;"),
         Import::Function => ("import \"DPI-C\" function void", "void", "return;"),
@@ -85,16 +115,33 @@ fn run_as(tag: &str, form: Import, sv: &str, c: &str) -> String {
     };
     let sv = sv.replace("IMPORT", imp);
     let c = c.replace("ENTRY", entry).replace("DONE", done);
-    let d = scratch(&format!("{tag}_{form:?}"));
+    let d = scratch(&format!("{tag}_{form:?}_{stack:?}"));
     let lib = shared_lib(&d, "from_c", &c);
-    let text = run(&d, &lib, &sv);
+    let text = run(&d, &lib, &sv, stack);
     let _ = std::fs::remove_dir_all(&d);
     text
 }
 
-fn expect_all(text: &str, form: Import, lines: &[&str]) {
+/// Each import form on each stack. An imported function always runs on the
+/// nested scheduler, so it needs no second run.
+fn forms_and_stacks(forms: &[Import]) -> Vec<(Import, Stack)> {
+    let mut out = Vec::new();
+    for &form in forms {
+        for stack in STACKS {
+            if stack == Stack::Fibers || matches!(form, Import::Task) {
+                out.push((form, stack));
+            }
+        }
+    }
+    out
+}
+
+fn expect_all(text: &str, form: Import, stack: Stack, lines: &[&str]) {
     for line in lines {
-        assert!(text.contains(line), "{form:?}: missing `{line}`:\n{text}");
+        assert!(
+            text.contains(line),
+            "{form:?} {stack:?}: missing `{line}`:\n{text}"
+        );
     }
 }
 
@@ -153,11 +200,12 @@ ENTRY from_c(int which) {
 
 #[test]
 fn exported_tasks_called_from_c_block_until_they_finish() {
-    for form in [Import::Task, Import::Function] {
-        let text = run_as("dpi_export_waits", form, SV, C);
+    for (form, stack) in forms_and_stacks(&[Import::Task, Import::Function]) {
+        let text = run_as("dpi_export_waits", form, stack, SV, C);
         expect_all(
             &text,
             form,
+            stack,
             &[
                 "R|mode 0 t=1000000 sink=1", // #1000
                 "R|mode 1 t=1100000 sink=1", // wait(ev): +100
@@ -205,11 +253,14 @@ endmodule
         ("", "fork #500; join_none"),
     ] {
         let sv = SV279.replace("PENDING", pending).replace("OWN", own);
-        for form in [Import::Task, Import::Function, Import::ContextFunction] {
-            let text = run_as("dpi_export_wait279", form, &sv, C279);
+        for (form, stack) in
+            forms_and_stacks(&[Import::Task, Import::Function, Import::ContextFunction])
+        {
+            let text = run_as("dpi_export_wait279", form, stack, &sv, C279);
             expect_all(
                 &text,
                 form,
+                stack,
                 &[
                     "[SV] resumed t=10 counter=1\n[SV] back in SV at t=10\n",
                     "Simulation finished at time 10 ($finish called)",
@@ -284,11 +335,14 @@ ENTRY from_c(int which) {
     DONE
 }
 "#;
-    for form in [Import::Task, Import::Function, Import::ContextFunction] {
-        let text = run_as("dpi_export_wait_shapes", form, SVW, CW);
+    for (form, stack) in
+        forms_and_stacks(&[Import::Task, Import::Function, Import::ContextFunction])
+    {
+        let text = run_as("dpi_export_wait_shapes", form, stack, SVW, CW);
         expect_all(
             &text,
             form,
+            stack,
             &[
                 "T|mode 0 t=13000 sink=1",  // child's #10
                 "T|mode 1 t=13000 sink=1",  // already true
@@ -351,10 +405,11 @@ ENTRY call_we(int id) { we(id); DONE }
 ENTRY sub_call(void) { sw(); DONE }
 "#;
     // Each caller resumes on its own (the reference simulator's order).
-    // Only the standard form: through imported functions the calls nest on
-    // one stack, so an outer caller resumes only after the ones above it
-    // have returned.
-    let text = run_as("dpi_export_wait_conc", Import::Task, SVC, CC);
+    // Only on fibers: on one stack (imported functions, or the nested
+    // fallback) an outer caller resumes only after the ones above it have
+    // returned, and a wait on `.triggered` that held meanwhile is missed —
+    // `concurrent_c_callers_on_one_stack` checks that order.
+    let text = run_as("dpi_export_wait_conc", Import::Task, Stack::Fibers, SVC, CC);
     let got: Vec<&str> = text.lines().filter(|l| l.starts_with("T|")).collect();
     assert_eq!(
         got,
@@ -390,8 +445,8 @@ module top;
 endmodule
 "#;
     const CP: &str = "extern int slow(void);\nENTRY call_slow(void) { slow(); DONE }\n";
-    for form in [Import::Task, Import::Function] {
-        let text = run_as("dpi_export_wait_peer", form, SVP, CP);
+    for (form, stack) in forms_and_stacks(&[Import::Task, Import::Function]) {
+        let text = run_as("dpi_export_wait_peer", form, stack, SVP, CP);
         let got: Vec<&str> = text.lines().filter(|l| l.starts_with("T|")).collect();
         assert_eq!(
             got,
@@ -401,7 +456,83 @@ endmodule
                 "T|slow done t=101",
                 "T|back t=101",
             ],
-            "{form:?}:\n{text}"
+            "{form:?} {stack:?}:\n{text}"
+        );
+    }
+}
+
+/// Several processes enter imported tasks in one time slot, each waiting in
+/// an exported task on a level. On fibers each resumes when its own wait
+/// holds. On one stack (the nested-scheduler fallback, #290) the calls nest
+/// last-in, first-out: an outer caller resumes once the ones above it have
+/// returned. The callers after the first one in the slot used to be lost —
+/// the slot's batch kept them where the nested scheduler could not see
+/// them — and a `$finish` deferred to the end of a slot did not stop the
+/// nested scheduler, which ran on to `--max-time`.
+#[test]
+fn concurrent_c_callers_on_one_stack() {
+    const SVL: &str = r#"
+`timescale 1ns/1ns
+module top;
+  logic clk = 0;
+  always #5 clk = ~clk;
+  int cnt = 0;
+  always @(posedge clk) cnt <= cnt + 1;
+  int never = 0;
+  task automatic wa(input int id, input int lim);
+    wait (cnt >= lim);
+    $display("T|wa %0d woke t=%0t cnt=%0d", id, $time, cnt);
+  endtask
+  task automatic wn(); wait (never == 1); $display("T|wn woke t=%0t", $time); endtask
+  export "DPI-C" task wa;
+  export "DPI-C" task wn;
+  IMPORT call_wa(int id, int lim);
+  IMPORT call_wn();
+  initial begin #2; call_wa(1, 3); $display("T|back 1 t=%0t", $time); end
+  initial begin #3; call_wa(2, 1); $display("T|back 2 t=%0t", $time); end
+  initial begin #3; call_wa(3, 2); $display("T|back 3 t=%0t", $time); end
+  initial begin #3; call_wa(4, 0); $display("T|back 4 t=%0t", $time); end
+  initial begin #26; call_wa(5, 50); $display("T|back 5 t=%0t", $time); end
+  initial begin #30; call_wn(); $display("T|back n t=%0t", $time); end
+  initial begin #100; $display("T|fin t=%0t", $time); $finish; end
+endmodule
+"#;
+    const CL: &str = r#"
+extern int wa(int id, int lim), wn(void);
+ENTRY call_wa(int id, int lim) { wa(id, lim); DONE }
+ENTRY call_wn(void) { wn(); DONE }
+"#;
+    for stack in STACKS {
+        let text = run_as("dpi_export_wait_lifo", Import::Task, stack, SVL, CL);
+        let got: Vec<&str> = text.lines().filter(|l| l.starts_with("T|")).collect();
+        let want: &[&str] = match stack {
+            Stack::Fibers => &[
+                "T|wa 4 woke t=3 cnt=0",
+                "T|back 4 t=3",
+                "T|wa 2 woke t=5 cnt=1",
+                "T|back 2 t=5",
+                "T|wa 3 woke t=15 cnt=2",
+                "T|back 3 t=15",
+                "T|wa 1 woke t=25 cnt=3",
+                "T|back 1 t=25",
+                "T|fin t=100",
+            ],
+            Stack::Nested => &[
+                "T|wa 4 woke t=3 cnt=0",
+                "T|back 4 t=3",
+                "T|wa 3 woke t=15 cnt=2",
+                "T|back 3 t=15",
+                "T|wa 2 woke t=15 cnt=2",
+                "T|back 2 t=15",
+                "T|wa 1 woke t=25 cnt=3",
+                "T|back 1 t=25",
+                "T|fin t=100",
+            ],
+        };
+        assert_eq!(got, want, "{stack:?}:\n{text}");
+        assert!(
+            text.contains("Simulation finished at time 100 ($finish called)"),
+            "{stack:?}:\n{text}"
         );
     }
 }
@@ -427,13 +558,17 @@ endmodule
     const CN: &str = "extern int m(void);\nENTRY c_call(void) { m(); DONE }\n";
     for (clock, end) in [("", 3), ("logic clk = 0; always #5 clk = ~clk;", 100_000)] {
         let sv = SVN.replace("CLOCK", clock);
-        for form in [Import::Task, Import::Function] {
-            let text = run_as("dpi_export_wait_never", form, &sv, CN);
+        for (form, stack) in forms_and_stacks(&[Import::Task, Import::Function]) {
+            let text = run_as("dpi_export_wait_never", form, stack, &sv, CN);
             let got: Vec<&str> = text.lines().filter(|l| l.starts_with("T|")).collect();
-            assert_eq!(got, [format!("T|final t={end}")], "{form:?}:\n{text}");
+            assert_eq!(
+                got,
+                [format!("T|final t={end}")],
+                "{form:?} {stack:?}:\n{text}"
+            );
             assert!(
                 text.contains(&format!("Simulation finished at time {end}\n")),
-                "{form:?}:\n{text}"
+                "{form:?} {stack:?}:\n{text}"
             );
         }
     }

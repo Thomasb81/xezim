@@ -299,9 +299,11 @@ xezim --dpi-lib /abs/path/to/libfoo.so [more --dpi-lib paths …] <sv files>
   resumes when its own wait is over (IEEE 1800 §35.5.2, §35.9). The C
   function returns `int`, and so does the C side of an exported task. The
   stacks are reserved, not committed, 256 MiB each by default;
-  `XEZIM_DPI_STACK_MB` changes the size. This needs Linux with glibc;
-  elsewhere a wait inside an imported task runs the scheduler nested in the
-  C call, so concurrent calls return in last-in, first-out order.
+  `XEZIM_DPI_STACK_MB` changes the size. This works on x86_64 and aarch64,
+  on Linux (glibc or musl) and macOS. On other architectures, or with
+  `XEZIM_DPI_FIBERS=0`, a wait inside an imported task runs the scheduler
+  nested in the C call instead: concurrent calls then return in last-in,
+  first-out order, and the §35.9 disable protocol is not available.
 * Disabling a process while it waits inside an imported task (`disable` of a
   block around the call, `disable fork`, `process::kill()`) follows the
   §35.9 protocol. The waiting exported task returns 1, and
@@ -322,6 +324,47 @@ xezim --dpi-lib /abs/path/to/libfoo.so [more --dpi-lib paths …] <sv files>
 
 ---
 
+## Types of exported subroutines
+
+A C library calls an exported subroutine (`export "DPI-C" function f;`)
+through a C function xezim generates. Its arguments must have the C types of
+IEEE 1800 §35.5.6 and Annex H, the same prototype the reference simulator
+writes into its generated DPI header:
+
+| SV formal | C argument (input) | C argument (`output` / `inout`) |
+|---|---|---|
+| `byte`, `shortint`, `int`, `longint` | `char`, `short`, `int`, `long long` | pointer to it |
+| `real`, `shortreal` | `double`, `float` | pointer to it |
+| scalar `bit`, `logic` | `svBit`, `svLogic` | `svBit*`, `svLogic*` |
+| `chandle` | `void*` | `void**` |
+| `string` | `const char*` | `const char**` |
+| packed vector (`bit`/`logic [N-1:0]`, packed struct), N > 64 | `const svBitVecVal*` / `const svLogicVecVal*` | `svBitVecVal*` / `svLogicVecVal*` |
+| packed vector, N <= 64, `integer`, `time` | `int` (N <= 32) or `long long`, by value | pointer to it |
+| unpacked struct | `const T*`, `T` the C struct of its members | `T*` |
+| fixed-size unpacked array | `const E*`, its elements in a row | `E*` |
+
+* In an unpacked struct or array, a packed vector of any width is an inline
+  `svLogicVecVal[]` / `svBitVecVal[]` and a `string` is a `const char*`. Array
+  elements run from the lowest index up in every dimension (`int a[5:2]`:
+  `a[2]` is C element 0), the first dimension outermost.
+* A packed vector of up to 64 bits passes by value as `int` or `long long`.
+  The standard passes it by pointer at every width; xezim keeps the value
+  form there, which earlier releases used.
+* A function result (§35.5.5) is one of `void`, `char`, `short`, `int`,
+  `long long`, `float`, `double`, `svBit`, `svLogic`, `void*` (`chandle`) or
+  `const char*` (`string`). A returned string stays valid until the next call
+  of the same export; so do strings stored through `const char**` outputs.
+  A function returning a packed vector wider than 64 bits, or an unpacked
+  aggregate, is not a legal DPI export: xezim stops with an error before the
+  run, as the reference simulator does. Return it through an `output`.
+* A formal of any other type (an `event`, a class handle, a dynamic array,
+  a queue, an associative array, an unpacked union) cannot be passed. xezim
+  prints at startup that the subroutine is NOT callable from C and why, and
+  each call from C reports `[xezim][error] DPI export 'f' cannot be called
+  from C: ...`, counted as an error, and returns 0.
+
+---
+
 ## Cross-platform notes
 
 | Platform | Shared-object ext. | Compiler | One-file recipe |
@@ -336,6 +379,12 @@ Windows, MSVC-produced DLLs need the corresponding `.lib` import library
 available at link time of any consumer binary (xezim itself doesn't, because
 it only `dlopen`s).
 
+On macOS, a library that calls exported SV subroutines must leave those
+symbols for the loader to resolve: add `-Wl,-undefined,dynamic_lookup` to the
+link (`cc -shared -fPIC -Wl,-undefined,dynamic_lookup ...`). On Linux with
+musl, build xezim with `RUSTFLAGS="-C target-feature=-crt-static"`: a static
+musl executable cannot load shared libraries at all.
+
 ---
 
 ## Troubleshooting
@@ -347,6 +396,8 @@ it only `dlopen`s).
 | `** Fatal: DPI import 'my_dpi_fn' has no implementation` | Imported name doesn't match exported name (C++ mangling, missing `extern "C"`, missing `SV_PUBLIC`), or the library was not passed | Wrap in `extern "C"`, mark `SV_PUBLIC`, ensure the `.c`/`.cc` actually compiles the symbol in |
 | `ImportError: …failed to run xezim: No such file or directory` from `cargo test` | The test harness uses `env!("CARGO_BIN_EXE_xezim")` — make sure the bin was built first | `cargo build --tests` then run; the env var is set at compile time |
 | Symbol resolves but the call returns garbage | ABI mismatch (e.g. `int` vs `int64_t`, `char*` lifetime) | DPI imports must match the C signature exactly; for `string` returns, the buffer must outlive the call site |
+| `[DPI] exported subroutine 'f' is NOT callable from C: formal 'x' has type ...` at startup, then `[xezim][error] DPI export 'f' cannot be called from C` | One formal of the export has a type DPI cannot pass (an `event`, a class handle, a dynamic array, ...); the call does not run the subroutine | Pass that data another way (a `chandle`, an index into an SV-side table); see "Types of exported subroutines" |
+| An exported subroutine called from C reads wrong argument values | The C prototype does not match the export's (a packed vector wider than 64 bits, an unpacked struct or an array is passed by pointer, `byte` is `char`, `shortreal` is `float`) | Declare the C prototype as "Types of exported subroutines" lists |
 | `failed to resolve path` from a VPI call | `vpi_handle_by_name` found no object of that name | Use the full name from the top (`top.u_sub.gen[1].sig`), `pkg::name` for a package member, or pass a scope handle for a relative name; see "VPI object model" |
 
 Run xezim with `--sim_debug` for `[DEBUG]` lines that show symbol resolution,

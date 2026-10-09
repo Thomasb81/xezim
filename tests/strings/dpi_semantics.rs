@@ -46,6 +46,18 @@ fn dpi_header_width_helpers_have_defined_c_shifts() {
     );
 }
 
+/// True on the nested-scheduler fallback (`XEZIM_DPI_FIBERS=0`, #290),
+/// where imported tasks share one stack: concurrent calls return last-in,
+/// first-out and the §35.9 disable protocol needs a stack per call, so the
+/// benches that check those skip there (the rest run in both modes).
+fn on_one_stack() -> bool {
+    let one = std::env::var("XEZIM_DPI_FIBERS").as_deref() == Ok("0");
+    if one {
+        eprintln!("skipped on the nested-scheduler fallback: needs a stack per call");
+    }
+    one
+}
+
 /// Build `c_file` into a fresh shared library.
 fn compile(c_file: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -54,8 +66,14 @@ fn compile(c_file: &str) -> PathBuf {
         .as_nanos();
     let stem = Path::new(c_file).file_stem().unwrap().to_string_lossy();
     let so = std::env::temp_dir().join(format!("{}_{}_{}.so", stem, std::process::id(), nanos));
-    let status = Command::new("cc")
-        .args(["-shared", "-fPIC", "-I"])
+    let mut cc = Command::new("cc");
+    cc.args(["-shared", "-fPIC"]);
+    if cfg!(target_os = "macos") {
+        // The exported subroutines resolve when xezim loads the library.
+        cc.arg("-Wl,-undefined,dynamic_lookup");
+    }
+    let status = cc
+        .arg("-I")
         .arg(manifest_path("include"))
         .arg(manifest_path(c_file))
         .arg("-o")
@@ -138,6 +156,9 @@ fn dpi_imported_task_consumes_time() {
 /// land at 9 and 16).
 #[test]
 fn dpi_concurrent_imported_tasks_interleave() {
+    if on_one_stack() {
+        return;
+    }
     let so = compile("tests/dpi/dpi_tasks.c");
     let mut out = tagged(&so, "tests/dpi/dpi_tasks_concurrent_test.sv");
     // Steps at the same time come from different processes; compare them
@@ -199,6 +220,9 @@ fn dpi_export_from_instantiated_module() {
 /// from an instance's scope (the lookup goes upward).
 #[test]
 fn dpi_instance_exports_follow_the_scope() {
+    if on_one_stack() {
+        return;
+    }
     let so = compile("tests/dpi/dpi_instance_scopes.c");
     assert_eq!(
         tagged(&so, "tests/dpi/dpi_instance_scopes_test.sv"),
@@ -255,6 +279,9 @@ fn dpi_instance_export_outside_its_scope_is_fatal() {
 /// that waits at every level, 41 and 26 levels deep at once.
 #[test]
 fn dpi_imported_task_wait_kinds_and_recursion() {
+    if on_one_stack() {
+        return;
+    }
     let so = compile("tests/dpi/dpi_task_shapes.c");
     assert_eq!(
         tagged_sorted(&so, "tests/dpi/dpi_task_waits_test.sv"),
@@ -289,6 +316,9 @@ fn dpi_imported_task_wait_kinds_and_recursion() {
 /// its own period.
 #[test]
 fn dpi_many_concurrent_imported_tasks() {
+    if on_one_stack() {
+        return;
+    }
     let so = compile("tests/dpi/dpi_task_shapes.c");
     assert_eq!(
         tagged(&so, "tests/dpi/dpi_task_many_test.sv"),
@@ -303,6 +333,9 @@ fn dpi_many_concurrent_imported_tasks() {
 /// killing process carries on.
 #[test]
 fn dpi_imported_task_disable_protocol() {
+    if on_one_stack() {
+        return;
+    }
     let so = compile("tests/dpi/dpi_task_shapes.c");
     assert_eq!(
         tagged(&so, "tests/dpi/dpi_task_disable_test.sv"),
@@ -329,6 +362,9 @@ fn dpi_imported_task_disable_protocol() {
 /// skipped and the process carries on after it.
 #[test]
 fn dpi_imported_task_disabled_block_unwinds() {
+    if on_one_stack() {
+        return;
+    }
     let so = compile("tests/dpi/dpi_task_shapes.c");
     assert_eq!(
         tagged(&so, "tests/dpi/dpi_task_disable_block_test.sv"),
@@ -347,6 +383,9 @@ fn dpi_imported_task_disabled_block_unwinds() {
 /// and returns 1, and the process does not carry on.
 #[test]
 fn dpi_imported_task_process_killed_from_its_export() {
+    if on_one_stack() {
+        return;
+    }
     let so = compile("tests/dpi/dpi_task_shapes.c");
     assert_eq!(
         tagged(&so, "tests/dpi/dpi_task_self_kill_test.sv"),
@@ -363,6 +402,9 @@ fn dpi_imported_task_process_killed_from_its_export() {
 /// export with 0; the imported task is not disabled and carries on.
 #[test]
 fn dpi_disabled_export_returns_zero() {
+    if on_one_stack() {
+        return;
+    }
     let so = compile("tests/dpi/dpi_task_shapes.c");
     assert_eq!(
         tagged(&so, "tests/dpi/dpi_task_disable_export_test.sv"),
@@ -380,6 +422,9 @@ fn dpi_disabled_export_returns_zero() {
 /// another export, is a fatal error, as in the reference simulator.
 #[test]
 fn dpi_disable_protocol_violations_are_fatal() {
+    if on_one_stack() {
+        return;
+    }
     for (bench, what) in [
         (
             "tests/dpi/dpi_task_bad_return_test.sv",
@@ -403,6 +448,9 @@ fn dpi_disable_protocol_violations_are_fatal() {
 /// run at once and cleanly; the suspended calls are left.
 #[test]
 fn dpi_finish_while_imported_tasks_wait() {
+    if on_one_stack() {
+        return;
+    }
     let so = compile("tests/dpi/dpi_task_shapes.c");
     assert_eq!(
         tagged(&so, "tests/dpi/dpi_task_finish_test.sv"),
