@@ -71497,6 +71497,11 @@ impl Simulator {
                 {
                     return v;
                 }
+                if !self.module.lets.is_empty()
+                    && let Some(v) = self.let_call_ctx(func, args, ctx_width)
+                {
+                    return v;
+                }
             }
             ExprKind::Index { expr: base, .. } | ExprKind::RangeSelect { expr: base, .. }
                 if matches!(
@@ -130094,6 +130099,16 @@ impl Simulator {
                     self.exec_task_call(&td, args);
                     return Value::zero(32);
                 }
+                // §11.13: `pkg::my_let(...)`.
+                let ld = self
+                    .module
+                    .lets
+                    .get(&qual)
+                    .or_else(|| self.module.lets.get(name))
+                    .cloned();
+                if let Some(ld) = ld {
+                    return self.exec_let_call(&ld, args);
+                }
             }
             // §26.3: a BARE call inside a package subroutine binds to the
             // enclosing package's own subroutine first — `p2::twice` calling
@@ -130155,39 +130170,65 @@ impl Simulator {
         Value::zero(32)
     }
 
-    fn exec_let_call(&mut self, ld: &LetDeclaration, args: &[Expression]) -> Value {
-        use crate::ast::module::PortList;
-        let mut locals = self.take_pooled_frame();
-        let mut arg_idx = 0usize;
-        match &ld.ports {
-            PortList::Ansi(ports) => {
-                for p in ports {
-                    let v = if arg_idx < args.len() {
-                        self.eval_expr(&args[arg_idx])
-                    } else {
-                        Value::zero(32)
-                    };
-                    locals.insert(p.name.name.clone(), v);
-                    arg_idx += 1;
-                }
-            }
-            PortList::NonAnsi(names) => {
-                for n in names {
-                    let v = if arg_idx < args.len() {
-                        self.eval_expr(&args[arg_idx])
-                    } else {
-                        Value::zero(32)
-                    };
-                    locals.insert(n.name.clone(), v);
-                    arg_idx += 1;
-                }
-            }
-            PortList::Empty => {}
+    /// `exec_let_call` in an expression with a context width: a let instance
+    /// is its parenthesized body, so it takes part in the width of the
+    /// expression around it (`r8 = p::sum(a4, b4)` keeps the carry). None
+    /// when `func` does not name a let (or a subroutine of that name wins).
+    #[cold]
+    #[inline(never)]
+    fn let_call_ctx(
+        &mut self,
+        func: &Expression,
+        args: &[Expression],
+        ctx_width: u32,
+    ) -> Option<Value> {
+        // A bare name (imported or compilation-unit let) or `pkg::name` (the
+        // parser flattens the scope into a two-segment identifier).
+        let ExprKind::Ident(h) = &func.kind else {
+            return None;
+        };
+        if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
         }
-        self.push_local_frame(locals);
-        let out = self.eval_expr(&ld.expr);
-        self.pop_local_frame();
-        out
+        let name = h.path.last()?.name.name.as_str();
+        let ld = match h.path.len() {
+            1 => self.module.lets.get(name)?.clone(),
+            2 if self.module.packages.contains(&h.path[0].name.name) => {
+                let qual = format!("{}::{}", h.path[0].name.name, name);
+                self.module
+                    .lets
+                    .get(&qual)
+                    .or_else(|| self.module.lets.get(name))?
+                    .clone()
+            }
+            _ => return None,
+        };
+        if self.module.functions.contains_key(name) || self.module.classes.contains_key(name) {
+            return None;
+        }
+        if let Some(Some(ctx)) = self.class_context_stack.last().cloned()
+            && self.class_has_method(&ctx, name)
+        {
+            return None;
+        }
+        let e = ld.expand(args, func.span).ok()?;
+        Some(self.eval_expr_ctx(&e, ctx_width))
+    }
+
+    /// IEEE 1800-2023 §11.13: a let the parser could not expand where it was
+    /// written (a compilation-unit let, or a package let reached through an
+    /// import or `pkg::`). The instance is the let body with the actuals
+    /// substituted for the formals (typed formals cast, omitted ones taking
+    /// their defaults), evaluated self-determined.
+    fn exec_let_call(&mut self, ld: &LetDeclaration, args: &[Expression]) -> Value {
+        let span = args.first().map(|a| a.span).unwrap_or(ld.span);
+        match ld.expand(args, span) {
+            Ok(e) => self.eval_expr(&e),
+            Err(msg) => {
+                eprintln!("Error: {} (IEEE 1800-2023 §11.13)", msg);
+                Value::zero(32)
+            }
+        }
     }
 
     /// Is a method's DECLARED return type a `string` AFTER resolving a TYPE

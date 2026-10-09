@@ -493,3 +493,5 @@ mod virtual_array_names;
 mod while_continue_final_iter;
 #[path = "misc/zero_width_select_unselected_generate.rs"]
 mod zero_width_select_unselected_generate;
+#[path = "misc/let_declaration_scopes.rs"]
+mod let_declaration_scopes;
