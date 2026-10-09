@@ -163,6 +163,22 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   that names no memory is reported as an error, and a file that cannot be
   opened as a warning, instead of being skipped silently. (#281, reported by
   jjts)
+* A class that extends a parameterized class resolves the base's type
+  parameters, including defaulted ones such as `RSP = REQ`, in its own
+  methods: `RSP::type_id::create()` in a `uvm_driver #(item)` subclass no
+  longer returns null (§8.25).
+* A class property typed by a type parameter, such as a sequence's `req`, is
+  no longer mistaken for a same-named struct variable elsewhere, so each
+  `req = ...::type_id::create()` takes effect.
+* `$size`, `$left`, `$dimensions` and the other array queries report
+  per-dimension bounds for multi-dimensional packed class properties and for
+  members of struct formals (§20.7).
+* A dynamic-array class property initialized with `new[n]` is sized when the
+  object is constructed (§8.7).
+* `find*`, `min`, `max` and `unique` locator methods work on associative
+  arrays with integral keys, in key order (§7.12).
+* With these, the axi4 AVIP's write, read and write-read tests run to
+  completion.
 
 **Usability**
 
