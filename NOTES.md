@@ -268,6 +268,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`XEZIM_FST_FLUSH_SECS`), so a run killed with `kill -9` or by running out
   of memory leaves a readable file up to its last write.
 
+* An FST dump killed while a value-change block was being written (`kill -9`,
+  an out-of-memory kill, a second Ctrl-C) is readable again. The block went
+  to the file in 8 KB pieces with its length patched last, so a kill in that
+  window left a block that made every reader reject the whole file (about 1
+  kill in 15 under load). Each block now reaches the file whole or not at
+  all, and the first block is written as soon as the run starts, so the file
+  always opens and holds everything up to the last block written.
+
 ### 0.11.1 — complete VPI, faster memory models, IEEE 1800 conformance fixes (October 2026)
 
 **Correctness**

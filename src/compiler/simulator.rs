@@ -99554,7 +99554,7 @@ impl Simulator {
             date: String::new(),
             file_type: fst_writer::FstFileType::Verilog,
         };
-        let mut header = match fst_writer::open_fst(&filename, &info) {
+        let (mut header, fst_target) = match super::fst_sink::open_fst(&filename, &info) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("Warning: cannot create FST file '{}': {:?}", filename, e);
@@ -99748,9 +99748,9 @@ impl Simulator {
         self.fst_event_last = vec![u64::MAX; events.len()];
         self.fst_events = events;
         self.fst_writer = Some(if self.dump_writer_threaded() {
-            super::fst_sink::FstSink::threaded(body, &filename, self.time)
+            super::fst_sink::FstSink::threaded(body, fst_target, self.time)
         } else {
-            super::fst_sink::FstSink::inline(body, &filename, self.time)
+            super::fst_sink::FstSink::inline(body, fst_target, self.time)
         });
     }
 
@@ -99845,8 +99845,9 @@ impl Simulator {
                 changes: Vec::new(),
             });
         }
-        // `finish()` joined the writer thread, so the trailer is on disk (and
-        // the time tables repaired, see `fst_sink::repair_time_tables`).
+        // `finish()` joined the writer thread, so the last block and the final
+        // header are in the dump (and the time tables repaired, see
+        // `fst_sink::repair_time_tables`).
         if let Some(sink) = self.fst_writer.take() {
             sink.finish();
         }

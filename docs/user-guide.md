@@ -75,8 +75,10 @@ dumps normally; this includes a long loop inside one time slot. If the run
 cannot stop (a DPI call that does not return), the FST dump is closed at the
 current time after half a second, and the process ends 5 seconds after the
 signal. A second Ctrl-C ends it at once. An FST dump is also written out every
-2 seconds (`XEZIM_FST_FLUSH_SECS`), so after a `kill -9` or an out-of-memory
-kill the file is still readable up to the last write.
+2 seconds (`XEZIM_FST_FLUSH_SECS`), and its first block as soon as the run
+starts. Each block reaches the file whole or not at all, so after a `kill -9`,
+an out-of-memory kill or a second Ctrl-C, at any moment, the file is readable
+and holds everything up to the last block written.
 
 ## Warm design cache
 

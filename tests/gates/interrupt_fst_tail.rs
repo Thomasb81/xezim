@@ -19,6 +19,13 @@
 //!
 //! Each test drives the release binary and waits for an output line before it
 //! signals, so machine load moves only the times, not the outcome.
+//!
+//! A kill can also land while a block is being written. fst-writer writes a
+//! block in 8 KB pieces and then patches its length, so a block cut short used
+//! to make the whole file unreadable (fst-reader asserted `compressed_length <=
+//! section_length`). xezim now moves each finished block into the dump with a
+//! two-step commit (`fst_sink`), and `XEZIM_FST_KILL_AT` kills the run at each
+//! step to check what it leaves.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -82,11 +89,15 @@ impl Scratch {
         Scratch { paths: Vec::new() }
     }
     fn path(&mut self, tag: &str, ext: &str) -> PathBuf {
+        // Tests run on parallel threads of one process: a process-wide
+        // counter keeps their files apart.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
             "xezim_fsttail_{}_{}_{}.{}",
             tag,
             std::process::id(),
-            self.paths.len(),
+            n,
             ext
         ));
         let _ = std::fs::remove_file(&p);
@@ -399,7 +410,10 @@ fn kill_9_leaves_a_readable_fst_with_data() {
             fst.to_str().unwrap(),
             sv.to_str().unwrap(),
         ],
-        &[("XEZIM_FST_FLUSH_SECS", "0.3")],
+        &[
+            ("XEZIM_FST_FLUSH_SECS", "0.3"),
+            ("XEZIM_FST_COMMIT_LOG", "1"),
+        ],
     );
     run.wait_for("TICK", Duration::from_secs(10));
     // The header, hierarchy and geometry are on disk from the start; wait for
@@ -413,15 +427,156 @@ fn kill_9_leaves_a_readable_fst_with_data() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    // Every block reported committed before the kill must be in the file.
+    let committed = last_commit(&run.seen.join("\n"));
     run.signal(libc::SIGKILL);
     let (status, _) = run.finish(Duration::from_secs(10));
     assert!(!status.success());
     let d = decode(&fst, "cnt");
     assert!(d.end_time > 0, "the killed run's FST has no time range");
     assert!(
+        d.end_time >= committed.unwrap_or(0),
+        "the FST ends at {} but a block up to {:?} was committed",
+        d.end_time,
+        committed
+    );
+    assert!(
         d.probe.len() > 10,
         "the killed run's FST holds only {} counter changes",
         d.probe.len()
     );
     assert_counter_reaches(&d, d.end_time, "killed run");
+}
+
+/// `[xezim] fst-commit N` (with `XEZIM_FST_COMMIT_LOG`) → the last N.
+fn last_commit(out: &str) -> Option<u64> {
+    out.lines()
+        .filter_map(|l| l.split("[xezim] fst-commit ").nth(1))
+        .filter_map(|r| r.trim().parse().ok())
+        .last()
+}
+
+/// Kill the run with `XEZIM_FST_KILL_AT=<point>` and check the file: it
+/// decodes, ends at the last committed block (`want_last`), or at the
+/// `$finish` time once the final header is in (`finished`).
+fn kill_at(point: &str, finished: bool) {
+    let mut s = Scratch::new();
+    // A short run with blocks every 50 ms of wall time: at least two blocks
+    // (the first is written as soon as it has data, the last at `$finish`).
+    let sv = s.write(
+        "killat",
+        "sv",
+        &design(r#"initial begin #200000; $display("FINISHING"); $finish; end"#),
+    );
+    let fst = s.path("killat", "fst");
+    let run = Run::start(
+        &[
+            "--no-cache",
+            "-s",
+            "top",
+            "--fst",
+            fst.to_str().unwrap(),
+            sv.to_str().unwrap(),
+        ],
+        &[
+            ("XEZIM_FST_FLUSH_SECS", "0.05"),
+            ("XEZIM_FST_COMMIT_LOG", "1"),
+            ("XEZIM_FST_KILL_AT", point),
+        ],
+    );
+    let (status, out) = run.finish(Duration::from_secs(60));
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL),
+        "{point}: the run was not killed at the hook:\n{out}"
+    );
+    let d = decode(&fst, "cnt");
+    match last_commit(&out) {
+        None => {
+            assert_eq!(point, "initial", "{point}: no block committed:\n{out}");
+            assert!(d.probe.is_empty(), "initial: no block, but value changes");
+        }
+        Some(t) => {
+            let want = if finished { 200000 } else { t };
+            assert_eq!(d.end_time, want, "{point}: the FST end time\n{out}");
+            assert_counter_reaches(&d, want, point);
+        }
+    }
+}
+
+#[test]
+fn kill_before_the_first_block_leaves_a_readable_fst() {
+    kill_at("initial", false);
+}
+
+#[test]
+fn kill_in_a_torn_block_keeps_the_blocks_before_it() {
+    kill_at("torn:2", false);
+}
+
+#[test]
+fn kill_before_a_block_commit_keeps_the_blocks_before_it() {
+    kill_at("body:2", false);
+}
+
+#[test]
+fn kill_after_a_block_commit_keeps_that_block() {
+    kill_at("committed:2", false);
+}
+
+#[test]
+fn kill_before_the_final_header_keeps_the_last_block() {
+    kill_at("last", false);
+}
+
+#[test]
+fn kill_before_the_terminator_is_dropped_keeps_the_whole_run() {
+    kill_at("header", true);
+}
+
+/// The finished file is exactly what fst-writer would write: no terminator,
+/// and the header carries the end time.
+#[test]
+fn finished_fst_has_no_terminator() {
+    let mut s = Scratch::new();
+    let sv = s.write(
+        "done",
+        "sv",
+        &design(r#"initial begin #200000; $finish; end"#),
+    );
+    let fst = s.path("done", "fst");
+    let run = Run::start(
+        &[
+            "--no-cache",
+            "-s",
+            "top",
+            "--fst",
+            fst.to_str().unwrap(),
+            sv.to_str().unwrap(),
+        ],
+        &[("XEZIM_FST_FLUSH_SECS", "0.01")],
+    );
+    let (status, out) = run.finish(Duration::from_secs(60));
+    assert!(status.success(), "{out}");
+    let bytes = std::fs::read(&fst).unwrap();
+    // Walk the block chain: it must end exactly at the end of the file.
+    let mut off = 0usize;
+    let mut last_type = 0u8;
+    while off < bytes.len() {
+        assert!(off + 9 <= bytes.len(), "a block head is cut at {off}");
+        last_type = bytes[off];
+        let len = u64::from_be_bytes(bytes[off + 1..off + 9].try_into().unwrap()) as usize;
+        assert!(len >= 8, "block at {off} has length {len}");
+        off += 1 + len;
+    }
+    assert_eq!(off, bytes.len(), "the block chain overruns the file");
+    assert_ne!(
+        last_type, 255,
+        "the finished FST still ends in a SKIP block"
+    );
+    let end = u64::from_be_bytes(bytes[17..25].try_into().unwrap());
+    assert_eq!(end, 200000, "header end time");
+    let d = decode(&fst, "cnt");
+    assert_eq!(d.end_time, 200000);
+    assert_counter_reaches(&d, 200000, "finished run");
 }

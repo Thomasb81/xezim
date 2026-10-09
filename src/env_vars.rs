@@ -402,8 +402,20 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Bytecode: max foreach unroll replay count",
     ),
     (
+        "XEZIM_FST_COMMIT_LOG",
+        "FST: print the end time of each value-change block as it reaches the dump (testing)",
+    ),
+    (
         "XEZIM_FST_FLUSH_SECS",
         "FST: write the in-memory value-change block to disk every N wall seconds (default 2; 0 = only at 64 MB)",
+    ),
+    (
+        "XEZIM_FST_KILL_AT",
+        "FST (testing): SIGKILL the run at a point of the n-th block commit: initial|torn|body|committed|last|header[:n]",
+    ),
+    (
+        "XEZIM_FST_STAGE",
+        "FST (testing): `file` stages value-change blocks in a temporary file beside the dump instead of memory",
     ),
     (
         "XEZIM_FUSE",

@@ -82,7 +82,7 @@ unless noted.
 | `XEZIM_STUCK_CLOCK=1` | Flag a process parked on a clock/reset that never changes while the design keeps churning edges (`abort` variant for CI) |
 | `XEZIM_INIT_REG=0\|random` | Give registers (the flops of compiled clocked blocks) a defined value at time 0 instead of x: `0`, or `random`, a per-register pattern that changes with the run's seed (`+seed=<n>`, `-sv_seed <n>`; no seed and seed 1 give the same pattern), for reset-bug hunting |
 | `XEZIM_INIT_ZERO=1` | Coerce X-initialized signals/arrays to 0 (required for some C910/C906 workloads, e.g. CoreMark) |
-| `XEZIM_FST_FLUSH_SECS=N` | `--fst`: write the in-memory value-change block to the file at least every N wall seconds (default 2; fractions allowed; `0` flushes only when the block reaches 64 MB). A run that is killed (`kill -9`, out of memory) keeps everything up to the last flush, and the file stays readable |
+| `XEZIM_FST_FLUSH_SECS=N` | `--fst`: write the in-memory value-change block to the file at least every N wall seconds (default 2; fractions allowed; `0` flushes only when the block reaches 64 MB). The first block is written as soon as the run starts. A run that is killed at any moment (`kill -9`, out of memory, a second Ctrl-C) keeps everything up to the last flush, and the file stays readable: each block reaches the file whole or not at all |
 | `XEZIM_PROGRESS=N` | Emit a `[PROGRESS]` line every N wall-seconds (sim_time, iters, edges_fired, nba_q) |
 | `XEZIM_CACHE_DIR=<dir>` | Override the elaborated-design cache directory |
 | `XEZIM_NO_CACHE=1` | Disable the automatic elaborated-design cache |
