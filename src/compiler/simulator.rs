@@ -132493,6 +132493,27 @@ impl Simulator {
         None
     }
 
+    /// After the copy-back, drop each written-back formal's elements and
+    /// registrations. A class method left them behind, so a later call's
+    /// same-named formal of another shape inherited them: a stale 1-D `p`
+    /// turned `p[1][0]` of an `output int p[2][2]` into a 1-D select.
+    fn purge_array_formals(&mut self, wb: &[(String, String, i64, i64)]) {
+        for (param, caller, ..) in wb {
+            // An IDENTITY binding (formal named like the caller's actual —
+            // `task bump(ref int arr[3]); ... bump(arr)`) shares the
+            // caller's storage: purging the formal's keys deleted the
+            // caller's whole array (audit46 a10 — post-call all-x).
+            if param == caller {
+                continue;
+            }
+            let prefix = format!("{}[", param);
+            for k in self.signals.keys_with_elem_prefix(&prefix) {
+                self.signals.remove(&k);
+            }
+            self.purge_array_formal(param);
+        }
+    }
+
     /// Drop the array registrations a formal received in `bind_array_arg`.
     fn purge_array_formal(&mut self, param: &str) {
         self.module.arrays.remove(param);
@@ -133919,21 +133940,7 @@ impl Simulator {
             self.purge_assoc_param(&param, prior);
         }
         self.writeback_array_args(&array_writebacks);
-        for (param, caller, ..) in &array_writebacks {
-            // An IDENTITY binding (formal named like the caller's actual —
-            // `task bump(ref int arr[3]); ... bump(arr)`) shares the
-            // caller's storage: purging the formal's keys deleted the
-            // caller's whole array (audit46 a10 — post-call all-x).
-            if param == caller {
-                continue;
-            }
-            let prefix = format!("{}[", param);
-            let keys: Vec<String> = self.signals.keys_with_elem_prefix(&prefix);
-            for k in keys {
-                self.signals.remove(&k);
-            }
-            self.purge_array_formal(param);
-        }
+        self.purge_array_formals(&array_writebacks);
         for (tmp, caller) in staged_wb {
             self.writeback_queue_param(&tmp, &caller);
             self.drop_staged_queue(&tmp);
@@ -152424,6 +152431,7 @@ impl Simulator {
                 // that for array args to constraint functions).
                 if !array_writebacks.is_empty() {
                     self.writeback_array_args(&array_writebacks);
+                    self.purge_array_formals(&array_writebacks);
                 }
                 let outs: Vec<&str> = writebacks.iter().map(|(pn, _, _)| pn.as_str()).collect();
                 let vif_ended = if !vif_fast {
