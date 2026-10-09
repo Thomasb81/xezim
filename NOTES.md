@@ -107,6 +107,14 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   and wide packed structs are solved over 64-bit segments. Arithmetic on a
   wide variable is still left to the trial loop. (#261, reported by Taichi
   Ishitani)
+* `randomize()` solves `$countones` constraints whose other side is not
+  linear, such as `$countones(strb[i]) == 2**size` in AXI write transactions,
+  with counts following the uniform distribution over solutions (§18.5.10).
+* `randomize()` no longer reports success with a violated `foreach`
+  constraint over a state vector, queue, dynamic array or packed array, or
+  one nested in another `foreach` (§18.6.1).
+* Copying an unpacked struct with a wide multi-dimensional packed member is
+  done 64 bits at a time instead of bit by bit.
 
 **Usability**
 
