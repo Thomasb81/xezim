@@ -183,6 +183,25 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   (`s[i] = "x"` on a local, a static local, a `ref`/`inout`/`output`
   function formal or an automatic local in a forked child) replaces that
   byte instead of setting a bit. (from PR #289 by Thomas Burg)
+* A class function that runs as bytecode (after 1000 calls) writes back every
+  `output` argument, not only the last, and at the declared width of a packed
+  typedef (`output M [1:0] o`). Its `static` variables keep counting across
+  that switch, and a non-virtual method it calls through a base-class handle
+  runs the base class's method (§8.20). A module or package function with a
+  `static` variable is no longer inlined into module code, which restarted
+  the variable on every call. A user class method named `put` called inside a
+  function now runs. A task that reaches a wait only through a call cycle
+  (`a` calls `b`, `b` calls `a`, and `a` waits) suspends its caller again.
+  (from PR #265 by Thomas Burg, with follow-ups)
+
+**Performance**
+
+* Wait-free class tasks and package and module functions run as bytecode once
+  they cross the same call threshold as class functions (`XEZIM_METHOD_TIER`,
+  default 1000 calls), and compiled code calls compiled package functions
+  directly. A class-heavy benchmark (400,000 calls of a wait-free task that
+  makes a virtual call and two package-function calls) runs 16% fewer
+  instructions; the axi4 AVIP runs 0.4% more. (from PR #265 by Thomas Burg)
 
 **Usability**
 
