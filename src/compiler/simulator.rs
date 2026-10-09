@@ -144991,114 +144991,6 @@ impl Simulator {
         None
     }
 
-    /// §18.5 — `(x >> k) == c` / `(x & m) == c` with a CONSTANT other side:
-    /// force the rand scalar directly. The constraint's solution set is a
-    /// 2^-24-style sliver of the domain, so generate-and-test essentially
-    /// never finds it, and the joint CSP refuses the whole class when it
-    /// carries a >64-bit rand member (or the target itself is wide), so
-    /// nothing else solves it (issue #261). Shift: pick uniformly in
-    /// `[c<<k, c<<k + 2^k)`. Mask: OR random bits into the holes of `m`
-    /// (unsatisfiable when `c` sets bits outside `m` — `None` leaves it to
-    /// the rejection backstop, so `randomize()` reports 0).
-    fn force_shift_mask_eq(
-        &mut self,
-        handle: usize,
-        shifted: &Expression,
-        other: &Expression,
-        rand_set: &HashSet<String>,
-    ) -> Option<(String, Value)> {
-        use rand::Rng;
-        let mut s = shifted;
-        while let ExprKind::Paren(inner) = &s.kind {
-            s = inner;
-        }
-        let ExprKind::Binary { op, left, right } = &s.kind else {
-            return None;
-        };
-        let (base, is_shift, arg) = match op {
-            BinaryOp::ShiftRight => (left, true, right),
-            BinaryOp::BitAnd => {
-                // The rand base and the constant mask may sit on either side.
-                if self.rand_lvalue_name(left, rand_set).is_some() {
-                    (left, false, right)
-                } else {
-                    (right, false, left)
-                }
-            }
-            _ => return None,
-        };
-        let name = self.rand_lvalue_name(base, rand_set)?;
-        let width = self
-            .class_prop_width_of(handle, &name)
-            .or_else(|| {
-                self.heap
-                    .get(handle)
-                    .and_then(|o| o.as_ref())
-                    .and_then(|i| i.properties.get(&name))
-                    .map(|v| v.width)
-            })?
-            .max(1);
-        // Everything else in the shape must be constant NOW.
-        let arg = self.eval_expr(arg).to_u128();
-        let c = self.eval_expr(other).to_u128();
-        let wmask: u128 = if width >= 128 {
-            u128::MAX
-        } else {
-            (1u128 << width) - 1
-        };
-        let v: u128 = if is_shift {
-            let k = arg;
-            if k == 0 || k >= 127 {
-                return None;
-            }
-            // `c` must still fit the unshifted width.
-            if c.checked_shl(k as u32).is_none_or(|x| x > wmask) {
-                return None;
-            }
-            let span: u128 = (1u128 << k) - 1;
-            let r = if span == 0 {
-                0
-            } else {
-                self.cur_rng().gen_range(0..=span)
-            };
-            (c << k) | r
-        } else {
-            let m = arg & wmask;
-            // Unsatisfiable: `c` sets bits the mask cannot reproduce.
-            if c & !m != 0 {
-                return None;
-            }
-            let holes = !m & wmask;
-            let r = if holes == 0 {
-                0
-            } else {
-                // Uniform over the holes, bit by bit (width can exceed 64).
-                let mut acc = 0u128;
-                for b in 0..128u32 {
-                    if holes & (1u128 << b) != 0 && self.cur_rng().gen_bool(0.5) {
-                        acc |= 1u128 << b;
-                    }
-                }
-                acc
-            };
-            c | r
-        };
-        // Assemble the value at the property's width (from_u64 caps at 64).
-        let mut val = if width <= 64 {
-            Value::from_u64((v & ((1u128 << width) - 1)) as u64, width)
-        } else {
-            let mut wide = Value::zero(width);
-            for b in 0..width {
-                if v & (1u128 << b) != 0 {
-                    wide.set_bit(b as usize, LogicBit::One);
-                }
-            }
-            wide
-        };
-        val.is_signed = self.class_prop_signed_of(handle, &name);
-        Some((name, val))
-    }
-
     /// §18.7 — inside `obj.randomize() with { … }`, a receiver-prefixed
     /// reference (`obj.member`, then indexed as `obj.member[i]`) names the
     /// randomized object's OWN property. The element and whole-element
@@ -147589,23 +147481,7 @@ impl Simulator {
                     // §18.5.12 — neither side is a bare rand target: the
                     // equality is ALGEBRAIC (`int_val + $signed({1'b0, l_val})
                     // == 32'd50`, `(r_val - 8'd10) * (l_val + 8'd5) == 16'd0`).
-                    // §18.5.12 — a shift/mask shape (`(x >> 8) == 0`,
-                    // `(x & 'hffff_ff00) == 0`) is NOT affine, and its
-                    // solution is a domain sliver generate-and-test cannot
-                    // reach when the joint CSP declined the class (e.g. a
-                    // >64-bit rand member or a wide target — issue #261).
-                    // Force the rand scalar directly, then let the affine
-                    // path handle everything else.
-                    if let Some((name, val)) =
-                        self.force_shift_mask_eq(handle, left, right, rand_set)
-                    {
-                        return self.set_prop_if_changed(handle, &name, val);
-                    }
-                    if let Some((name, val)) =
-                        self.force_shift_mask_eq(handle, right, left, rand_set)
-                    {
-                        return self.set_prop_if_changed(handle, &name, val);
-                    }
+                    // Solve it as an affine equation in one rand variable.
                     self.solve_affine_eq(handle, left, right, rand_set)
                 }
                 // `a != b` (the desugared form of `unique {…}`, §18.5.5, and
