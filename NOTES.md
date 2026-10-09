@@ -115,6 +115,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   one nested in another `foreach` (§18.6.1).
 * Copying an unpacked struct with a wide multi-dimensional packed member is
   done 64 bits at a time instead of bit by bit.
+* `$bits` and the array query functions (`$size`, `$dimensions`,
+  `$unpacked_dimensions`, `$left`, `$right`, `$low`, `$high`, `$increment`)
+  of a fixed-size unpacked-array variable fold to its declared shape wherever
+  a constant is needed: localparams, parameter values, packed widths and
+  generate conditions. `localparam P = $bits(fx)` on `int fx[4]` was 0 and
+  is now 128.
+* A `generate if`/`case` condition or a generate `for` bound may use these
+  queries; `if ($size(fx) - 5 < 0)` used to be rejected as not constant. A
+  generate `for` genvar that starts from a parameter, a negative number or an
+  expression no longer starts at 0.
+* An integral operand of a real operator is converted from its own value and
+  width: with `int unsigned u = 1`, `(u - 2) * 1.0` and `r = u - 2` give
+  4294967295.0, not 18446744073709551616.0 (§11.8.2).
 
 **Usability**
 
