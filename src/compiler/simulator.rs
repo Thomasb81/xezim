@@ -2317,6 +2317,7 @@ mod rand_diag;
 const MEMBER_DIST_MARK: &str = "\u{1}member:";
 mod rand_scope;
 mod sv_file;
+mod task_suspend;
 mod timing_checks;
 mod ts_x;
 mod uvm_dpi;
@@ -6174,16 +6175,10 @@ pub struct Simulator {
     /// blocks only via nested calls route through the suspend-aware runner
     /// instead of the name whitelist. Keyed by bare name (over-approx across a
     /// free task / same-named method). See `subroutine_name_blocks`.
-    tb_cache: std::cell::RefCell<HashMap<String, bool>>,
-    /// Memo for `subroutine_name_can_suspend` (the real-suspension analysis
-    /// that gates TASK compilation). Keyed by bare callee name; a tentative
-    /// `false` is cached before recursing so cyclic call graphs terminate.
-    ts_cache: std::cell::RefCell<HashMap<String, bool>>,
-    /// Receiver-type frames for the real-suspension analysis: one entry
-    /// per in-analysis method body — (owning class, ident → declared class)
-    /// collected from the method's formals, body VarDecls and the owning
-    /// chain's class-typed members.
-    ts_recv: std::cell::RefCell<Vec<(String, HashMap<String, String>)>>,
+    tb_cache: task_suspend::CycleMemo,
+    /// The wait-free analysis that gates compiling a class task (see
+    /// `task_suspend`).
+    ts: task_suspend::TsState,
     /// LRM §25.9: stack of per-call virtual-interface formal-arg
     /// aliases. When a task or function takes `virtual <iface> <name>`,
     /// the call hooks add a frame mapping `<name>` to the caller's
@@ -11829,9 +11824,8 @@ impl Simulator {
             virtual_iface_bindings: HashMap::default(),
             recv_call_memo: Vec::new(),
             vif_tokens_stored: false,
-            tb_cache: std::cell::RefCell::new(HashMap::default()),
-            ts_cache: std::cell::RefCell::new(HashMap::default()),
-            ts_recv: std::cell::RefCell::new(Vec::new()),
+            tb_cache: task_suspend::CycleMemo::default(),
+            ts: task_suspend::TsState::default(),
             local_iface_aliases: Vec::new(),
             viface_var_aliases: HashMap::default(),
             last_vif_return: None,
@@ -53825,324 +53819,6 @@ impl Simulator {
         }
     }
 
-    /// Real-suspension analysis for compiled TASKS. Unlike
-    /// `stmt_is_blocking` — which over-approximates (canonical blocking
-    /// names, join..join) so statements route through the suspend-aware
-    /// runner — this answers a narrower question with real waits only:
-    /// can executing this body ever PARK the running process?
-    ///
-    /// Why it exists: a compiled task runs synchronously inside
-    /// `exec_insns`; if a callee suspends there, the suspension unwinds
-    /// through the compiled frame and can never resume into it (the insn
-    /// pointer is not checkpointable). A `true` verdict must therefore
-    /// DECLINE compilation, whatever the call-count tier says. The direct
-    /// timing statements (TimingControl / Wait / WaitFork / WaitOrder,
-    /// fork..join / join_any, intra-assignment timing, `process::await`)
-    /// are the same set `stmt_is_blocking` uses; the difference is callee
-    /// resolution: real waits in the callee's body, by name, resolved
-    /// against the free tasks/functions, hierarchical tasks and EVERY
-    /// same-named class method (the receiver's dynamic type is unknown).
-    /// The canonical-name whitelist is NOT consulted for user-declared
-    /// callees — only for names with no user declaration at all, which may
-    /// still be builtin container methods (mailbox `get`/`put`/`peek`,
-    /// semaphore `get`, event `wait_on`).
-    fn stmts_can_suspend(&self, stmts: &[Statement]) -> bool {
-        stmts.iter().any(|s| self.stmt_can_suspend(s))
-    }
-    /// Analyze a class-method body with receiver context: the owning
-    /// class plus a ident→class map from the method's formals, its body
-    /// VarDecls and the owning chain's class-typed members. Callee names
-    /// are then resolved through the DECLARING chain instead of any
-    /// same-named class — `uvm_report_fatal` declared by
-    /// `uvm_report_object` must not be poisoned by a same-named method on
-    /// the unrelated `uvm_sequence_item` chain.
-    fn method_body_can_suspend(
-        &self,
-        cname: &str,
-        ports: &[crate::ast::decl::FunctionPort],
-        body: &[Statement],
-    ) -> bool {
-        let mut recv: HashMap<String, String> = HashMap::default();
-        for p in ports {
-            if let Some(c) = self.typeref_class_name(&p.data_type) {
-                recv.insert(p.name.name.clone(), c);
-            }
-        }
-        for (n, t) in self.class_typed_local_types(body) {
-            recv.entry(n).or_insert(t);
-        }
-        let mut cur = cname.to_string();
-        let mut seen = HashSet::default();
-        while let Some(cd) = self.module.classes.get(&cur) {
-            if !seen.insert(cur.clone()) {
-                break;
-            }
-            for (p, dt) in cd.property_types.iter() {
-                if let Some(c) = self.typeref_class_name(dt) {
-                    recv.entry(p.clone()).or_insert(c);
-                }
-            }
-            match &cd.extends {
-                Some(b) => cur = b.clone(),
-                None => break,
-            }
-        }
-        self.ts_recv
-            .borrow_mut()
-            .push((cname.to_string(), recv));
-        let r = self.stmts_can_suspend(body);
-        self.ts_recv.borrow_mut().pop();
-        r
-    }
-    fn stmt_can_suspend(&self, stmt: &Statement) -> bool {
-        match &stmt.kind {
-            StatementKind::TimingControl { .. }
-            | StatementKind::Wait { .. }
-            | StatementKind::WaitOrder { .. }
-            | StatementKind::WaitFork => true,
-            StatementKind::RandCase { items } => {
-                items.iter().any(|(_, s)| self.stmt_can_suspend(s))
-            }
-            StatementKind::BlockingAssign { rvalue, .. } => Self::intra_timing_suspends(rvalue),
-            StatementKind::SeqBlock { stmts, .. } => {
-                stmts.iter().any(|s| self.stmt_can_suspend(s))
-            }
-            StatementKind::If {
-                then_stmt,
-                else_stmt,
-                ..
-            } => {
-                self.stmt_can_suspend(then_stmt)
-                    || else_stmt.as_ref().is_some_and(|e| self.stmt_can_suspend(e))
-            }
-            StatementKind::Forever { body } => self.stmt_can_suspend(body),
-            StatementKind::For { body, .. }
-            | StatementKind::While { body, .. }
-            | StatementKind::DoWhile { body, .. }
-            | StatementKind::Foreach { body, .. } => self.stmt_can_suspend(body),
-            StatementKind::Case { items, .. } => {
-                items.iter().any(|it| self.stmt_can_suspend(&it.stmt))
-            }
-            // fork..join / join_any park the caller; a join_none's children
-            // run as separate processes that cannot park THIS frame.
-            StatementKind::ParBlock { join_type, .. } => {
-                !matches!(join_type, JoinType::JoinNone)
-            }
-            StatementKind::Repeat { body, .. } => self.stmt_can_suspend(body),
-            StatementKind::Expr(e) => {
-                Self::expr_is_proc_await(e) || self.callee_can_suspend(e)
-            }
-            _ => false,
-        }
-    }
-    /// Extract a statement-position callee (Call / bare Ident / dotted
-    /// MemberAccess enable) and resolve it. The resolution base comes
-    /// from the receiver frames: a declared class for `obj.m(...)` when
-    /// `obj` is a known class-typed ident, a class name for a static
-    /// `Class::m(...)` scope call, the owning class for a bare `m(...)`
-    /// (this-bounded) enable. Unresolvable receivers keep the any-class
-    /// name scan (sound, merely conservative).
-    fn callee_can_suspend(&self, expr: &Expression) -> bool {
-        let callee = match &expr.kind {
-            ExprKind::Call { func, .. } => &**func,
-            ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => expr,
-            _ => return false,
-        };
-        let name = match &callee.kind {
-            ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.as_str()),
-            ExprKind::MemberAccess { member, .. } => Some(member.name.as_str()),
-            _ => None,
-        };
-        let Some(name) = name else { return false };
-        let base = match &callee.kind {
-            ExprKind::MemberAccess { expr, .. } => {
-                let mut b: Option<String> = None;
-                if let ExprKind::Ident(h) = &expr.kind {
-                    if h.path.len() == 1 {
-                        let on = h.path[0].name.name.as_str();
-                        let frames = self.ts_recv.borrow();
-                        if let Some((_, map)) = frames.last() {
-                            if let Some(c) = map.get(on) {
-                                b = Some(c.clone());
-                            }
-                        }
-                        if b.is_none() && self.module.classes.contains_key(on) {
-                            b = Some(on.to_string()); // Class::static() call
-                        }
-                    }
-                }
-                b
-            }
-            ExprKind::Ident(_) => self.ts_recv.borrow().last().map(|(c, _)| c.clone()),
-            _ => None,
-        };
-        match base {
-            Some(b) => self.subroutine_name_can_suspend_in(&b, name),
-            None => self.subroutine_name_can_suspend(name),
-        }
-    }
-    /// Nearest ancestor of `base` (inclusive) that declares a method
-    /// named `name`; virtual dispatch on a `base`-typed handle can only
-    /// reach overrides of THAT declaration.
-    fn chain_declares(&self, base: &str, name: &str) -> Option<String> {
-        let mut cur = base.to_string();
-        let mut seen = HashSet::default();
-        while let Some(cd) = self.module.classes.get(&cur) {
-            if !seen.insert(cur.clone()) {
-                return None;
-            }
-            if cd.methods.contains_key(name) {
-                return Some(cur);
-            }
-            match &cd.extends {
-                Some(b) => cur = b.clone(),
-                None => return None,
-            }
-        }
-        None
-    }
-    /// Is `d` an ancestor of (or equal to) `c` in the extends chain?
-    fn class_chain_contains(&self, c: &str, d: &str) -> bool {
-        let mut cur = c.to_string();
-        let mut seen = HashSet::default();
-        while let Some(cd) = self.module.classes.get(&cur) {
-            if !seen.insert(cur.clone()) {
-                return false;
-            }
-            if cur == d {
-                return true;
-            }
-            match &cd.extends {
-                Some(b) => cur = b.clone(),
-                None => return false,
-            }
-        }
-        false
-    }
-    /// Real-suspension resolution of `name` as seen from a `base`-typed
-    /// receiver: free module tasks/functions first (bare names inside a
-    /// class body still resolve against the module tables), then the
-    /// nearest declaring chain class, then every override of that exact
-    /// declaration (a class whose own nearest declarer is the same).
-    fn subroutine_name_can_suspend_in(&self, base: &str, name: &str) -> bool {
-        let key = format!("{}::{}", base, name);
-        if let Some(&b) = self.ts_cache.borrow().get(&key) {
-            return b;
-        }
-        self.ts_cache.borrow_mut().insert(key.clone(), false);
-        let mut suspends = false;
-        'resolve: {
-            if let Some(t) = self.module.tasks.get(name) {
-                if self.stmts_can_suspend(&t.items) {
-                    suspends = true;
-                    break 'resolve;
-                }
-            }
-            if let Some(f) = self.module.functions.get(name) {
-                if self.stmts_can_suspend(&f.items) {
-                    suspends = true;
-                    break 'resolve;
-                }
-            }
-            let Some(d) = self.chain_declares(base, name) else {
-                break 'resolve; // unresolvable on this receiver: not reached
-            };
-            for cls in self.module.classes.values() {
-                if let Some(m) = cls.methods.get(name) {
-                    // Virtual dispatch on a `base`-typed handle reaches only
-                    // overrides of D's declaration: classes in D's subtree
-                    // (D is their ancestor) that redeclare `name` — plus D
-                    // itself. Same-named methods on unrelated chains never
-                    // dispatch here.
-                    if !self.class_chain_contains(cls.name.as_str(), d.as_str()) {
-                        continue;
-                    }
-                    let (items, ports) = match &m.kind {
-                        crate::ast::decl::ClassMethodKind::Function(f)
-                        | crate::ast::decl::ClassMethodKind::Extern(f)
-                        | crate::ast::decl::ClassMethodKind::PureVirtual(f) => {
-                            (&f.items, &f.ports)
-                        }
-                        crate::ast::decl::ClassMethodKind::Task(t) => (&t.items, &t.ports),
-                    };
-                    if self.method_body_can_suspend(cls.name.as_str(), ports, items) {
-                        suspends = true;
-                        break 'resolve;
-                    }
-                }
-            }
-        }
-        self.ts_cache.borrow_mut().insert(key, suspends);
-        suspends
-    }
-    /// Memoized any-receiver fallback: does the subroutine named `name`
-    /// (free task/function, hierarchical task, or ANY same-named class
-    /// method — the receiver's type is unknown) transitively reach a REAL
-    /// suspension point? Used when a receiver's declared class cannot be
-    /// resolved; sound, merely coarser.
-    fn subroutine_name_can_suspend(&self, name: &str) -> bool {
-        if let Some(&b) = self.ts_cache.borrow().get(name) {
-            return b;
-        }
-        self.ts_cache
-            .borrow_mut()
-            .insert(name.to_string(), false);
-        let mut suspends = false;
-        'resolve: {
-            if let Some(t) = self.module.tasks.get(name) {
-                if self.stmts_can_suspend(&t.items) {
-                    suspends = true;
-                    break 'resolve;
-                }
-            }
-            if let Some(f) = self.module.functions.get(name) {
-                if self.stmts_can_suspend(&f.items) {
-                    suspends = true;
-                    break 'resolve;
-                }
-            }
-            let dotted = format!(".{}", name);
-            for (k, t) in self.module.tasks.iter() {
-                if k.ends_with(dotted.as_str()) && self.stmts_can_suspend(&t.items) {
-                    suspends = true;
-                    break 'resolve;
-                }
-            }
-            let mut any_decl = false;
-            for cls in self.module.classes.values() {
-                if let Some(m) = cls.methods.get(name) {
-                    any_decl = true;
-                    let (items, ports) = match &m.kind {
-                        crate::ast::decl::ClassMethodKind::Function(f)
-                        | crate::ast::decl::ClassMethodKind::Extern(f)
-                        | crate::ast::decl::ClassMethodKind::PureVirtual(f) => {
-                            (&f.items, &f.ports)
-                        }
-                        crate::ast::decl::ClassMethodKind::Task(t) => (&t.items, &t.ports),
-                    };
-                    let hit = self.method_body_can_suspend(cls.name.as_str(), ports, items);
-                    if hit {
-                        suspends = true;
-                        break 'resolve;
-                    }
-                }
-            }
-            // No user declaration under this name anywhere: the call may
-            // still reach a builtin container method that parks the caller
-            // (mailbox get/put/peek, semaphore get, event wait_on). Those
-            // have no AST to scan, so the leaf name decides.
-            if !any_decl
-                && matches!(name, "get" | "put" | "peek" | "wait_on" | "wait_for")
-            {
-                suspends = true;
-            }
-        }
-        self.ts_cache
-            .borrow_mut()
-            .insert(name.to_string(), suspends);
-        suspends
-    }
-
     /// Does this statement need a real *process* context (the ability to
     /// suspend and resume) — as opposed to merely containing a `#delay`?
     ///
@@ -54283,10 +53959,14 @@ impl Simulator {
     /// cyclic/recursive calls terminate (a pure cycle with no real blocker is
     /// correctly non-blocking).
     fn subroutine_name_blocks(&self, name: &str) -> bool {
-        if let Some(&b) = self.tb_cache.borrow().get(name) {
-            return b;
-        }
-        self.tb_cache.borrow_mut().insert(name.to_string(), false);
+        // A call cycle (`a -> b -> a`) must not leave a member cached as
+        // non-blocking on the strength of the cycle's own assumption (see
+        // `CycleMemo`).
+        self.tb_cache
+            .get(name, || self.subroutine_name_blocks_uncached(name))
+    }
+
+    fn subroutine_name_blocks_uncached(&self, name: &str) -> bool {
         let mut blocks = false;
         if let Some(t) = self.module.tasks.get(name) {
             blocks = self.stmts_have_blocking(&t.items);
@@ -54333,7 +54013,6 @@ impl Simulator {
                 }
             }
         }
-        self.tb_cache.borrow_mut().insert(name.to_string(), blocks);
         blocks
     }
 
