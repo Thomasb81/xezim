@@ -111,6 +111,8 @@ mod callee_local_shadow_assoc_output;
 mod array_actual_hier_pkg_writeback;
 #[path = "collections/callee_local_shadow_int_assoc.rs"]
 mod callee_local_shadow_int_assoc;
+#[path = "collections/output_array_formal_starts_default.rs"]
+mod output_array_formal_starts_default;
 #[path = "collections/class_member_semaphore_keys.rs"]
 mod class_member_semaphore_keys;
 #[path = "collections/count_methods_return_signed_int.rs"]

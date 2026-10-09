@@ -132427,8 +132427,17 @@ impl Simulator {
                 };
             self.multi_dim_array_names.insert(param.clone());
             if param != caller {
+                let w = match self.module.arrays_2d.get(&param) {
+                    Some(&(_, _, w)) => w,
+                    None => self.module.arrays_nd.get(&param).map_or(32, |t| t.1),
+                };
+                let out_default = self.output_formal_elem_default(port, w);
                 for sfx in &suffixes {
-                    if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", caller, sfx)) {
+                    let v = match &out_default {
+                        Some(d) => Some(d.clone()),
+                        None => self.get_signal_value_by_name(&format!("{}{}", caller, sfx)),
+                    };
+                    if let Some(v) = v {
                         self.signals.insert(format!("{}{}", param, sfx), v);
                     }
                 }
@@ -132446,22 +132455,71 @@ impl Simulator {
             .p_elem_type(&caller)
             .or_else(|| self.p_elem_type(&param))
             .and_then(|dt| self.unpacked_struct_of(&dt));
+        let w = self.module.arrays.get(&*caller).map(|t| t.2).unwrap_or(32);
+        let out_default = if param == caller {
+            None
+        } else {
+            self.output_formal_elem_default(port, w)
+        };
         for idx in lo..=hi {
             if let Some(su) = &elem_su {
-                let (d, s) = (
-                    format!("{}[{}]", param, idx),
-                    format!("{}[{}]", caller, idx),
-                );
+                let d = format!("{}[{}]", param, idx);
+                if out_default.is_some() {
+                    let mut leaves = Vec::new();
+                    self.unpacked_struct_leaf_defaults(&d, su, 0, &mut leaves);
+                    for (k, dv, _) in leaves {
+                        self.signals.insert(k, dv);
+                    }
+                    continue;
+                }
+                let s = format!("{}[{}]", caller, idx);
                 self.copy_unpacked_struct(&d, &s, &su.clone());
                 continue;
             }
-            if let Some(v) = self.get_signal_value_by_name(&format!("{}[{}]", caller, idx)) {
+            let v = match &out_default {
+                Some(d) => Some(d.clone()),
+                None => self.get_signal_value_by_name(&format!("{}[{}]", caller, idx)),
+            };
+            if let Some(v) = v {
                 self.signals.insert(format!("{}[{}]", param, idx), v);
             }
         }
-        let w = self.module.arrays.get(&*caller).map(|t| t.2).unwrap_or(32);
         self.module.arrays.insert(param.clone(), (lo, hi, w));
         Some((param, caller.to_string(), lo, hi))
+    }
+
+    /// §13.5.1: an `output` formal is not copied in: it starts at its type's
+    /// default (0 for a 2-state element, x for a 4-state one, "" for a
+    /// string, 0.0 for a real) and the whole formal is copied out on return,
+    /// so an element the body leaves alone overwrites the caller's with
+    /// that default. `None` for any other direction.
+    fn output_formal_elem_default(
+        &self,
+        port: &crate::ast::decl::FunctionPort,
+        w: u32,
+    ) -> Option<Value> {
+        if !matches!(port.direction, PortDirection::Output) {
+            return None;
+        }
+        let dt = &port.data_type;
+        let resolved = super::elaborate::resolve_typedef_chain(dt, &self.module.typedef_types);
+        if matches!(
+            resolved,
+            crate::ast::types::DataType::Simple {
+                kind: crate::ast::types::SimpleType::String,
+                ..
+            }
+        ) {
+            return Some(Value::from_string(""));
+        }
+        if super::elaborate::is_type_real_resolved(dt, &self.module.typedef_types) {
+            return Some(Value::from_f64(0.0));
+        }
+        if super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types) {
+            Some(Value::zero(w))
+        } else {
+            Some(Value::new(w))
+        }
     }
 
     /// Copy an array formal's elements back onto the caller's array, then drop
