@@ -10250,25 +10250,23 @@ impl Simulator {
         // `if (vif == null) $fatal(...)` evaluated x, took the else branch,
         // and the "not connected" check silently passed. (Class properties
         // already default to 0, which is why only the module/block-scope
-        // variable form misbehaved.)
-        {
-            let vif_vars: Vec<String> = module
-                .var_decl_types
-                .iter()
-                .filter(|(_, dt)| match dt {
-                    crate::ast::types::DataType::Interface { .. } => true,
-                    crate::ast::types::DataType::TypeReference { name, .. } => {
-                        module.interfaces.contains(&name.name.name)
-                    }
-                    _ => false,
-                })
-                .map(|(n, _)| n.clone())
-                .collect();
-            for n in vif_vars {
-                if let Some(sig) = module.signals.get_mut(&n) {
-                    if sig.value.has_xz() {
-                        sig.value = Value::zero(sig.value.width.max(1));
-                    }
+        // variable form misbehaved.) The type may be a typedef alias of a
+        // virtual interface (`typedef virtual bus_if vif_t;`, from the module,
+        // a package or `$unit`, possibly a typedef of a typedef): IEEE
+        // 1800-2023 Table 6-7 gives it the same `null` default. Each element
+        // of an unpacked array of such handles starts null too.
+        // The element storage of an array is built further down; its bases
+        // are zeroed there (see `vif_vars` below).
+        let vif_vars: std::collections::HashSet<String> = module
+            .var_decl_types
+            .iter()
+            .filter(|(_, dt)| Self::dt_is_virtual_iface(dt, &module))
+            .map(|(n, _)| n.clone())
+            .collect();
+        for n in &vif_vars {
+            if let Some(sig) = module.signals.get_mut(n) {
+                if sig.value.has_xz() {
+                    sig.value = Value::zero(sig.value.width.max(1));
                 }
             }
         }
@@ -11024,6 +11022,21 @@ impl Simulator {
                 }
             }
         }
+        // §25.9 / Table 6-7: every element of an unpacked array of virtual
+        // interfaces (`vif_t va[2][3];`, each dimension registered under a
+        // compound base `va[0]`) starts as the null handle.
+        if !vif_vars.is_empty() {
+            for (base, &(first_id, lo, hi)) in array_first_id.iter() {
+                let decl = base.split('[').next().unwrap_or(base);
+                if is_packed_id(first_id) || !vif_vars.contains(decl) {
+                    continue;
+                }
+                let n = (hi - lo + 1).max(0) as usize;
+                for id in first_id..first_id + n {
+                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                }
+            }
+        }
         for base in module.z_init_signals.iter() {
             if let Some(&(first_id, lo, hi)) = array_first_id.get(base.as_str()) {
                 if is_packed_id(first_id) {
@@ -11147,6 +11160,13 @@ impl Simulator {
                     );
                 }
             }
+            // §25.9: a virtual-interface element starts null (see the 1-D
+            // loop).
+            if vif_vars.contains(base.as_str()) {
+                for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                }
+            }
             // §6.11.1: same element-signedness inheritance the 1-D loop
             // applies — without it `int a2[2][2]; a2[0][0] = -1` read back
             // unsigned (4294967295, and `a2[0][0] < 0` was FALSE).
@@ -11194,6 +11214,11 @@ impl Simulator {
                     &mut signal_name_to_id,
                     &mut id_to_name,
                 );
+            }
+            if vif_vars.contains(base.as_str()) {
+                for id in first_id..signal_table.len() {
+                    signal_table[id] = Value::zero(signal_widths_vec[id]);
+                }
             }
             // §6.11.1: element-signedness inheritance (see the 1-D / 2-D
             // loops above).
@@ -69501,6 +69526,12 @@ impl Simulator {
                             }
                         }
                     }
+                    // §20.6.1 / §25.9: a virtual-interface variable or class
+                    // property (spelled out or through a typedef) names
+                    // its interface type, `virtual bus_if[.mp] [#(...)]`.
+                    if let Some(t) = self.vif_operand_typename(arg) {
+                        return Value::from_string(&t);
+                    }
                     // A Specialization expression given directly, e.g.
                     // $typename(foo#(bar#(xyz),88)) — IEEE 1800-2017 §21.7.
                     if let ExprKind::Specialization {
@@ -80714,9 +80745,17 @@ impl Simulator {
         // §6.11.3: the declared signedness every declarator's value and
         // later reads carry.
         let decl_signed = !plain_class && self.type_is_signed_concrete(data_type);
+        // §25.9 / IEEE 1800-2023 Table 6-7: a virtual-interface handle
+        // defaults to `null`, also when its type is a typedef alias
+        // (`vif_t v;`). The spelled-out `virtual bus_if v;` has no data
+        // width (w0 == 0) and was already zeroed below.
+        let is_vif_handle = !is_class_handle
+            && matches!(data_type, crate::ast::types::DataType::TypeReference { .. })
+            && Self::dt_is_virtual_iface(data_type, &self.module);
         let default_v = if is_real_type {
             Value::from_f64(0.0)
-        } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle {
+        } else if two_state || is_class_handle || w0 == 0 || unknown_typeref_handle || is_vif_handle
+        {
             Value::zero(w)
         } else {
             Value::new(w)
@@ -109073,9 +109112,134 @@ impl Simulator {
                 SimpleType::Event => "event".to_string(),
             },
             DataType::Implicit { .. } => "logic".to_string(),
+            // §25.9: a virtual interface renders as it is declared, the
+            // modport before the parameter values (`virtual pbus_if.m
+            // #(16)`), as the reference simulator prints it. Positional
+            // values are evaluated; a named one keeps its `.NAME(...)`.
+            DataType::Interface {
+                name,
+                modport,
+                type_args,
+                ..
+            } => {
+                let mut s = format!("virtual {}", name.name);
+                if let Some(mp) = modport {
+                    s.push('.');
+                    s.push_str(&mp.name);
+                }
+                if !type_args.is_empty() {
+                    let params = &self.module.parameters;
+                    let render = |e: &Expression| {
+                        crate::elaborate::const_eval_i64_with_params(e, Some(params))
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    };
+                    let parts: Vec<String> = type_args
+                        .iter()
+                        .map(|a| match &a.kind {
+                            ExprKind::NamedArg { name, expr } => format!(
+                                ".{}({})",
+                                name.name,
+                                expr.as_deref().map(render).unwrap_or_default()
+                            ),
+                            _ => render(a),
+                        })
+                        .collect();
+                    s.push_str(&format!(" #({})", parts.join(", ")));
+                }
+                s
+            }
+            DataType::TypeReference { name, .. }
+                if self.module.interfaces.contains(&name.name.name) =>
+            {
+                format!("virtual {}", name.name.name)
+            }
             // Aggregates / classes are out of the scalar path's scope.
             _ => "logic".to_string(),
         }
+    }
+
+    /// §20.6.1 `$typename` of a virtual-interface operand: a variable (module
+    /// scope or local) or a class property `h.p` whose declared type is
+    /// `virtual <iface>` or a typedef chain ending there. None otherwise.
+    fn vif_operand_typename(&mut self, arg: &Expression) -> Option<String> {
+        let ExprKind::Ident(hier) = &arg.kind else {
+            return None;
+        };
+        if hier.path.iter().any(|s| !s.selects.is_empty()) {
+            return None;
+        }
+        let dt = match hier.path.len() {
+            1 => self
+                .module
+                .var_decl_types
+                .get(hier.path[0].name.name.as_str())
+                .cloned(),
+            2 => {
+                let h = self.eval_ident_handle(hier.path[0].name.name.as_str())?;
+                let cn = self
+                    .heap
+                    .get(h)
+                    .and_then(|o| o.as_ref())
+                    .map(|i| i.class_name.clone())?;
+                let prop = hier.path[1].name.name.as_str();
+                let mut cur = Some(cn);
+                let mut found = None;
+                while let Some(c) = cur {
+                    let cd = self.module.classes.get(&c)?;
+                    if let Some(dt) = cd.property_types.get(prop) {
+                        found = Some(dt.clone());
+                        break;
+                    }
+                    cur = cd.extends.clone();
+                }
+                found
+            }
+            _ => None,
+        }?;
+        if !Self::dt_is_virtual_iface(&dt, &self.module) {
+            return None;
+        }
+        // Parameter values evaluate in the calling scope, which also sees a
+        // `localparam` of a top wrapped for elaboration (`top.P`).
+        let resolved =
+            super::elaborate::resolve_typedef_chain(&dt, &self.module.typedef_types).clone();
+        if let DataType::Interface {
+            name,
+            modport,
+            type_args,
+            ..
+        } = &resolved
+        {
+            if !type_args.is_empty() {
+                let mut s = format!("virtual {}", name.name);
+                if let Some(mp) = modport {
+                    s.push('.');
+                    s.push_str(&mp.name);
+                }
+                let mut parts = Vec::with_capacity(type_args.len());
+                for a in type_args {
+                    let (named, e) = match &a.kind {
+                        ExprKind::NamedArg { name, expr } => (Some(&name.name), expr.as_deref()),
+                        _ => (None, Some(a)),
+                    };
+                    let v = match e {
+                        Some(e) => match self.eval_expr(e).to_i64() {
+                            Some(v) => v.to_string(),
+                            None => "?".to_string(),
+                        },
+                        None => String::new(),
+                    };
+                    parts.push(match named {
+                        Some(n) => format!(".{}({})", n, v),
+                        None => v,
+                    });
+                }
+                s.push_str(&format!(" #({})", parts.join(", ")));
+                return Some(s);
+            }
+        }
+        Some(self.typename_of_dt(&resolved))
     }
 
     /// `$typename` of a resolved CONCRETE type string (a type parameter's
@@ -123137,6 +123301,17 @@ impl Simulator {
                 .var_decl_types
                 .get(coll)
                 .is_some_and(|dt| self.is_virtual_iface_type(dt)),
+        }
+    }
+
+    /// §25.9: does `dt` denote a virtual-interface handle type — `virtual
+    /// <iface>[.modport]` spelled out, a bare interface type name, or a
+    /// typedef chain (package-scoped, `$unit` or local) ending at either?
+    fn dt_is_virtual_iface(dt: &DataType, module: &ElaboratedModule) -> bool {
+        match super::elaborate::resolve_typedef_chain(dt, &module.typedef_types) {
+            DataType::Interface { .. } => true,
+            DataType::TypeReference { name, .. } => module.interfaces.contains(&name.name.name),
+            _ => false,
         }
     }
 

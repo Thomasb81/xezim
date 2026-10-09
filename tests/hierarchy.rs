@@ -185,6 +185,8 @@ mod vif_clocking_in_methods;
 mod vif_hierarchical_instance_path;
 #[path = "hierarchy/vif_in_subroutines.rs"]
 mod vif_in_subroutines;
+#[path = "hierarchy/vif_typedef_null_default.rs"]
+mod vif_typedef_null_default;
 #[path = "hierarchy/wildcard_import_shadow.rs"]
 mod wildcard_import_shadow;
 
