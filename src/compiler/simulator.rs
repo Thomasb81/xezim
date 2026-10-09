@@ -15658,8 +15658,12 @@ impl Simulator {
         if !is_resolved_int {
             return None;
         }
+        // §7.4.1: packed dimensions on the reference itself (`M [1:0]` with
+        // `typedef bit [31:0] M`) multiply the typedef's width; the chain
+        // above resolves to the element type alone.
+        let own_dims = matches!(dt, DT::TypeReference { dimensions, .. } if !dimensions.is_empty());
         let pw = super::elaborate::resolve_type_width(
-            &resolved,
+            if own_dims { dt } else { resolved },
             Some(&self.module.parameters),
             Some(&self.module.typedefs),
         );
@@ -155940,11 +155944,16 @@ impl Simulator {
         let Some(md) = self.method_defining_class(class_name, method) else {
             return Vec::new();
         };
-        let crate::ast::decl::ClassMethodKind::Function(f) = &md.method.kind else {
-            return Vec::new();
+        // §13.5: task and function formals bind the same way; a task callee
+        // reached from compiled code (now that wait-free tasks compile) must
+        // write its outputs back exactly like a function's.
+        use crate::ast::decl::ClassMethodKind as K;
+        let ports = match &md.method.kind {
+            K::Function(f) | K::Extern(f) | K::PureVirtual(f) => &f.ports,
+            K::Task(t) => &t.ports,
         };
         let mut pos = Vec::new();
-        for (i, port) in f.ports.iter().enumerate() {
+        for (i, port) in ports.iter().enumerate() {
             if port.direction == PortDirection::Input || !port.dimensions.is_empty() {
                 continue;
             }

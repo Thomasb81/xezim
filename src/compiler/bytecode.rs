@@ -18615,6 +18615,14 @@ impl<'a> BytecodeCompiler<'a> {
                 if ip == Some(md) || ip == Some(ms) {
                     break;
                 }
+                // A self-move `Move(r, r)` is an observable-export marker
+                // (method result, output formal, static local: the runtime
+                // reads `r` after the block). Rewriting its read would turn
+                // it into a real copy that this pass then drops as dead, and
+                // the export would be lost; it keeps `md` live instead.
+                if matches!(ins, Insn::Move(a, b) if a == b && *a == md) {
+                    break;
+                }
                 if Self::insn_reads_reg(ins, md) && !Self::replace_read_reg(&mut insns[j], md, ms) {
                     break;
                 }
