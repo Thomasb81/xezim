@@ -63310,6 +63310,7 @@ impl Simulator {
                             .last()
                             .and_then(|f| f.get(base.as_ref()))
                             .cloned()
+                        && !self.string_signals.contains(&*base)
                     {
                         let bit = i as usize;
                         if bit < cur.width as usize {
