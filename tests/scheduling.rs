@@ -124,6 +124,8 @@ mod forked_package_task_suspends;
 mod gap_fixes_scoping_and_nba;
 #[path = "scheduling/gate_rise_fall_delay.rs"]
 mod gate_rise_fall_delay;
+#[path = "scheduling/iff_guard_module_scope.rs"]
+mod iff_guard_module_scope;
 #[path = "scheduling/intra_assignment_delay.rs"]
 mod intra_assignment_delay;
 #[path = "scheduling/intra_assignment_event_identifier.rs"]

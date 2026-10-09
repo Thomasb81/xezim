@@ -56193,6 +56193,14 @@ impl Simulator {
                 // module-scope eval cannot resolve either name and reads X,
                 // so the waiter would never fire (ubus arbitration).
                 let guard_ok = match sid.iff.as_deref() {
+                    // Fast path: a waiter with no parked context, drained
+                    // from the top level, sees the module scope directly.
+                    Some(g)
+                        if !self.process_contexts.contains_key(&waiter.pid)
+                            && self.process_context_is_default() =>
+                    {
+                        self.eval_expr(g).is_true()
+                    }
                     Some(g) => self.eval_waiter_condition(waiter.pid, g),
                     None => true,
                 };
