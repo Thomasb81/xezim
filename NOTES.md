@@ -10,6 +10,18 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* Unpacked-array locals of an automatic task, including multi-dimensional
+  ones, are per invocation, so concurrent calls no longer share them. Tasks
+  and functions in a `module automatic`, `interface automatic`, `program
+  automatic` or `package automatic` are automatic unless declared `static`.
+  An `output`, `inout` or `ref` array formal writes back when its actual is
+  a class property (`fill(prop)`, `this.prop`, `c.prop`, `o.i.prop`, a
+  `[2][2]` property), and when the callee declares a local with the actual's
+  name; an integer-keyed array stays integer-keyed. Hierarchical and
+  package-qualified actuals (`u.A`, `i.IA`, `pk::PA`) keep writing back. An
+  `output` array formal starts at its type's default instead of a copy of
+  the actual, and `foreach` over a local `int a[int]` binds negative keys.
+  (from PR #288 by Thomas Burg)
 * An `@(posedge clk iff g)` wait in a class task evaluates its guard in the
   waiting process: the guard reads that object's fields and the task's
   locals (`@(posedge vif.clk iff vif.gnt[master_id] === 1)`), so several
