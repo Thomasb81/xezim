@@ -128,6 +128,19 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * An integral operand of a real operator is converted from its own value and
   width: with `int unsigned u = 1`, `(u - 2) * 1.0` and `r = u - 2` give
   4294967295.0, not 18446744073709551616.0 (§11.8.2).
+* A `let` may be declared in a function, task, class method, `begin`/`fork`
+  block, generate block, checker, program or clocking block (§11.13).
+  Instances follow the standard's substitution rules, including defaults,
+  typed formals and the width of the surrounding expression, and
+  `import pkg::name` and `pkg::name` reach package lets. (#283, reported by
+  Dragon-Git)
+* Subroutine prototypes (`extern`, `pure virtual`, interface class, DPI)
+  accept a typedef return type with packed dimensions, such as
+  `extern function M [1:0] f();`. DPI imports may return a typedef of an
+  integer, real or other small C type. (#284, reported by Dragon-Git)
+* `--dpi-lib` works on non-x86 hosts: the DPI export trampoline is built with
+  `$CC` (default `cc`) and no x86-only flags, and a trampoline build failure
+  is named in the library-load error. (#282, reported by Dragon-Git)
 
 **Usability**
 
