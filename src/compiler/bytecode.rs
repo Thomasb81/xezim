@@ -8058,6 +8058,247 @@ impl<'a> BytecodeCompiler<'a> {
         Some(v)
     }
 
+    /// §11.8.2: true when `e` is REAL-typed by declaration — a real literal, a
+    /// real variable, a real-valued system function, a cast to a real type,
+    /// or an arithmetic/conditional operator over such an operand. Exact,
+    /// unlike `expr_may_be_real`: it decides how the OTHER operand of a real
+    /// operator is evaluated, so a shape it cannot type answers false and
+    /// keeps the integral rules.
+    fn expr_is_real_static(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(n) => matches!(n, NumberLiteral::Real(_) | NumberLiteral::Time(_)),
+            ExprKind::Ident(h) => {
+                self.local_var_is_real.contains(&Self::hier_raw_name(h))
+                    || self.lookup_signal_id(h).is_some_and(|id| {
+                        self.signal_real
+                            .is_some_and(|r| r.get(id).copied().unwrap_or(false))
+                    })
+            }
+            ExprKind::Paren(x) => self.expr_is_real_static(x),
+            ExprKind::Unary {
+                op: UnaryOp::Plus | UnaryOp::Minus,
+                operand,
+            } => self.expr_is_real_static(operand),
+            ExprKind::Binary {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Power,
+                left,
+                right,
+            } => self.expr_is_real_static(left) || self.expr_is_real_static(right),
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => self.expr_is_real_static(then_expr) || self.expr_is_real_static(else_expr),
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$__xz_type_cast" => matches!(
+                    args.first().map(|a| &a.kind),
+                    Some(ExprKind::TypeLiteral(dt))
+                        if crate::compiler::elaborate::is_type_real(dt)
+                ),
+                n => system_function_is_real(n),
+            },
+            _ => false,
+        }
+    }
+
+    /// §10.7/§11.8.2: the context width an assignment gives its right-hand
+    /// side. A REAL target has no bit width to lend: an integral RHS is
+    /// evaluated self-determined and then converted (`r = u - 2` with
+    /// `int unsigned u = 1` is 4294967295.0, `r = x + 1` wraps at 32 bits).
+    fn assign_rhs_ctx(&self, lvalue: &Expression, width: u32) -> u32 {
+        if matches!(lvalue.kind, ExprKind::Ident(_)) && self.expr_is_real_static(lvalue) {
+            0
+        } else {
+            width
+        }
+    }
+
+    /// A constant expression by its shape — literals, parameters, and
+    /// operators, casts and real conversions over them.
+    fn expr_is_constant(&self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) => true,
+            ExprKind::Ident(h) => self.lookup_param_value(h).is_some(),
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => self.expr_is_constant(x),
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_is_constant(left) && self.expr_is_constant(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_is_constant(condition)
+                    && self.expr_is_constant(then_expr)
+                    && self.expr_is_constant(else_expr)
+            }
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$__xz_type_cast" => args.get(1).is_some_and(|a| self.expr_is_constant(a)),
+                n if n != "$realtime" && system_function_is_real(n) => {
+                    args.iter().all(|a| self.expr_is_constant(a))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// §11.8.2 operators with a REAL operand. Neither operand real: None, and
+    /// the integral rules apply. Otherwise:
+    /// - an arithmetic operator's result is real, so each integral operand is
+    ///   evaluated SELF-determined and then converted. The surrounding context
+    ///   width never reaches it — `(u - 2) * 1.0` with `int unsigned u = 1`
+    ///   converts the 32-bit 4294967295, not a 64-bit all-ones;
+    /// - a relational or equality operator's operands take real type from
+    ///   each other, so the real type propagates ONE operator into the
+    ///   integral side, whose own operands are then self-determined (see
+    ///   `compile_in_real_context`): `3.5 == 7/2` compares 3.5 with 3.5. As
+    ///   in the reference simulator, this happens only for a constant
+    ///   integral side; a run-time one is converted whole.
+    fn compile_real_operator(
+        &mut self,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+    ) -> Option<Option<RegId>> {
+        let arith = matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Power
+        );
+        let cmp = matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+        );
+        if !arith && !cmp {
+            return None;
+        }
+        let lr = self.expr_is_real_static(left);
+        let rr = self.expr_is_real_static(right);
+        if !lr && !rr {
+            return None;
+        }
+        // The reference simulator propagates into a comparison only when the
+        // integral side is itself CONSTANT (`3.5 == 7/2` divides as reals);
+        // a run-time integral side is converted from its self-determined
+        // value (`x == a/b` divides as integers).
+        let lp = cmp && !lr && self.expr_is_constant(left);
+        let rp = cmp && !rr && self.expr_is_constant(right);
+        let l = if lp {
+            self.compile_in_real_context(left)
+        } else {
+            self.compile_real_operand(left, lr)
+        };
+        let Some(l) = l else {
+            return Some(None);
+        };
+        let r = if rp {
+            self.compile_in_real_context(right)
+        } else {
+            self.compile_real_operand(right, rr)
+        };
+        let Some(r) = r else {
+            return Some(None);
+        };
+        Some(Some(self.emit_real_binop(op, l, r)))
+    }
+
+    /// An arm of a `?:` whose result is real: a real arm as itself, a
+    /// constant integral arm in real context, any other integral arm
+    /// converted from its self-determined value (as the reference simulator
+    /// does at run time).
+    fn compile_real_arm(&mut self, e: &Expression) -> Option<RegId> {
+        if self.expr_is_real_static(e) {
+            self.compile_expr(e, 0)
+        } else if self.expr_is_constant(e) {
+            self.compile_in_real_context(e)
+        } else {
+            self.compile_real_operand(e, false)
+        }
+    }
+
+    /// One real-operator instruction over two real registers.
+    fn emit_real_binop(&mut self, op: BinaryOp, l: RegId, r: RegId) -> RegId {
+        let dest = self.alloc_reg();
+        self.emit(match op {
+            BinaryOp::Add => Insn::Add(dest, l, r),
+            BinaryOp::Sub => Insn::Sub(dest, l, r),
+            BinaryOp::Mul => Insn::Mul(dest, l, r),
+            BinaryOp::Div => Insn::Div(dest, l, r),
+            BinaryOp::Power => Insn::Pow(dest, l, r),
+            BinaryOp::Eq => Insn::Eq(dest, l, r),
+            BinaryOp::Neq => Insn::Neq(dest, l, r),
+            BinaryOp::Lt => Insn::Lt(dest, l, r),
+            BinaryOp::Leq => Insn::Leq(dest, l, r),
+            BinaryOp::Gt => Insn::Gt(dest, l, r),
+            _ => Insn::Geq(dest, l, r),
+        });
+        dest
+    }
+
+    /// An operand of a real operator: a real operand as itself, an integral
+    /// one SELF-determined (§11.8.2) and converted to real (§6.12.2: x and z
+    /// bits read as 0). Converted in a fresh register — the operand's own
+    /// may be a local variable's.
+    fn compile_real_operand(&mut self, e: &Expression, is_real: bool) -> Option<RegId> {
+        let v = self.compile_expr(e, 0)?;
+        if is_real {
+            return Some(v);
+        }
+        let t = self.alloc_reg();
+        self.emit(Insn::Move(t, v));
+        self.emit_to_real(t);
+        Some(t)
+    }
+
+    /// §11.8.2: an integral operand that takes REAL type from its context (the
+    /// other side of a relational operator, the other arm of `?:`). The real
+    /// type reaches the operator at its top — an arithmetic one computes in
+    /// real — whose own integral operands are then self-determined and
+    /// converted. Anything else is self-determined and converted whole.
+    fn compile_in_real_context(&mut self, e: &Expression) -> Option<RegId> {
+        match &e.kind {
+            ExprKind::Paren(x) => self.compile_in_real_context(x),
+            ExprKind::Binary {
+                op:
+                    op @ (BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Power),
+                left,
+                right,
+            } => {
+                let lr = self.expr_is_real_static(left);
+                let l = self.compile_real_operand(left, lr)?;
+                let rr = self.expr_is_real_static(right);
+                let r = self.compile_real_operand(right, rr)?;
+                Some(self.emit_real_binop(*op, l, r))
+            }
+            ExprKind::Unary {
+                op: op @ (UnaryOp::Plus | UnaryOp::Minus),
+                operand,
+            } => {
+                let real = self.expr_is_real_static(operand);
+                let o = self.compile_real_operand(operand, real)?;
+                if matches!(op, UnaryOp::Plus) {
+                    return Some(o);
+                }
+                let dest = self.alloc_reg();
+                self.emit(Insn::Negate(dest, o));
+                Some(dest)
+            }
+            _ => {
+                let real = self.expr_is_real_static(e);
+                self.compile_real_operand(e, real)
+            }
+        }
+    }
+
     /// Conservative: true when `e` may evaluate to a real — a real literal,
     /// a real signal or local, or a real-valued system function.
     fn expr_may_be_real(&self, e: &Expression) -> bool {
@@ -9731,7 +9972,8 @@ impl<'a> BytecodeCompiler<'a> {
                 let start = self.insns.len();
                 let start_reg = self.next_reg;
                 self.pattern_layout = self.lvalue_struct_layout(lvalue);
-                let compiled = self.compile_expr(rvalue, width);
+                let rctx = self.assign_rhs_ctx(lvalue, width);
+                let compiled = self.compile_expr(rvalue, rctx);
                 self.pattern_layout = None;
                 if let Some(val_reg) = compiled {
                     // Note: NbaAssign itself performs §10.7 assignment-padding resize,
@@ -9818,7 +10060,8 @@ impl<'a> BytecodeCompiler<'a> {
                 let compiled = if let Some(cls) = new_cls {
                     self.compile_new_construct(rvalue, &cls)
                 } else {
-                    self.compile_expr(rvalue, width)
+                    let rctx = self.assign_rhs_ctx(lvalue, width);
+                    self.compile_expr(rvalue, rctx)
                 };
                 self.pattern_layout = None;
                 if let Some(val_reg) = compiled {
@@ -11388,6 +11631,11 @@ impl<'a> BytecodeCompiler<'a> {
                     self.bail("string_formal_non_eq_binary");
                     return None;
                 }
+                // §11.8.2: an operator with a REAL operand follows the real
+                // rules, not the integral width/sign propagation below.
+                if let Some(r) = self.compile_real_operator(*op, left, right) {
+                    return r;
+                }
                 // Verilog operand-width rules: comparison and logical ops
                 // (==, !=, <, <=, >, >=, &&, ||, ===, !==, case-eq) are
                 // self-determined — their operands' widths are max(L,R) of
@@ -11694,6 +11942,16 @@ impl<'a> BytecodeCompiler<'a> {
                 then_expr,
                 else_expr,
             } => {
+                // §11.4.11/§11.8.2: with a REAL arm the result is real and no
+                // context width applies; see `compile_real_arm`.
+                if self.expr_is_real_static(then_expr) || self.expr_is_real_static(else_expr) {
+                    let cond = self.compile_expr(condition, 0)?;
+                    let then_reg = self.compile_real_arm(then_expr)?;
+                    let else_reg = self.compile_real_arm(else_expr)?;
+                    let dest = self.alloc_reg();
+                    self.emit(Insn::Select(dest, cond, then_reg, else_reg));
+                    return Some(dest);
+                }
                 // Evaluate both branches unconditionally so Select can do a
                 // per-bit merge when the condition has X/Z (IEEE 1800 §11.4.11).
                 let cond = self.compile_expr(condition, 0)?;
@@ -24665,6 +24923,39 @@ pub fn lower_two_state(
         writes: writes.into_boxed_slice(),
         writes_span: writes_span.into_boxed_slice(),
     })
+}
+
+/// §20.5 / §20.8: the system functions whose result is REAL — the
+/// conversions to real, `$realtime`, and the real math functions.
+pub(crate) fn system_function_is_real(name: &str) -> bool {
+    matches!(
+        name,
+        "$itor"
+            | "$bitstoreal"
+            | "$bitstoshortreal"
+            | "$realtime"
+            | "$ln"
+            | "$log10"
+            | "$exp"
+            | "$sqrt"
+            | "$pow"
+            | "$floor"
+            | "$ceil"
+            | "$sin"
+            | "$cos"
+            | "$tan"
+            | "$asin"
+            | "$acos"
+            | "$atan"
+            | "$atan2"
+            | "$hypot"
+            | "$sinh"
+            | "$cosh"
+            | "$tanh"
+            | "$asinh"
+            | "$acosh"
+            | "$atanh"
+    )
 }
 
 /// IEEE 1800-2017 §20/§21 result type of a system FUNCTION as (width,

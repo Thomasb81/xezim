@@ -219,6 +219,8 @@ mod preprocessor_include_fatal;
 mod property_value_param_binding;
 #[path = "types/range_select_param_arith.rs"]
 mod range_select_param_arith;
+#[path = "types/real_conversion_of_integral_operands.rs"]
+mod real_conversion_of_integral_operands;
 #[path = "types/real_literal_comb_eval.rs"]
 mod real_literal_comb_eval;
 #[path = "types/real_valued_delay.rs"]

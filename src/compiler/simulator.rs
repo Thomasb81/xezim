@@ -71283,17 +71283,11 @@ impl Simulator {
             (Some(lw), Some(rw)) => lw.max(rw),
             _ => ctx_width,
         };
-        let mut l = self.eval_expr_ctx(left, sw);
-        let mut r = self.eval_expr_ctx(right, sw);
-        if l.is_real != r.is_real {
-            if l.is_real {
-                if let Some(f) = self.eval_subtree_as_real(right) {
-                    r = Value::from_f64(f);
-                }
-            } else if let Some(f) = self.eval_subtree_as_real(left) {
-                l = Value::from_f64(f);
-            }
-        }
+        // §11.8.2: against a real operand the plain name or literal on the
+        // other side is converted from its own value — the comparison
+        // operators below convert it.
+        let l = self.eval_expr_ctx(left, sw);
+        let r = self.eval_expr_ctx(right, sw);
         Some(match op {
             BinaryOp::Eq => l.is_equal(&r),
             BinaryOp::Neq => l.is_not_equal(&r),
@@ -73185,6 +73179,17 @@ impl Simulator {
                 let self_det_w = if is_arith_or_bitwise {
                     let (lw, lv) = self.width_probe(left);
                     let (rw, rv) = self.width_probe(right);
+                    // §11.8.2: a real operand is 64 bits wide, so only then
+                    // can `+ - *` have a real operand; each integral operand
+                    // is then converted from its self-determined value (the
+                    // probes above already evaluated some operands that way).
+                    let (mut lv, mut rv) = (lv, rv);
+                    if (lw == 64 || rw == 64)
+                        && matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+                        && let Some(v) = self.real_arith_probed(*op, left, right, &mut lv, &mut rv)
+                    {
+                        return v;
+                    }
                     pre_l = lv;
                     pre_r = rv;
                     let w = lw.max(rw).max(ctx_width);
@@ -73208,15 +73213,27 @@ impl Simulator {
                     // `(a<<4)>>2` in an 8-bit context otherwise evaluates the
                     // inner shift at 12 bits and the dropped carry returns.
                     // (Unknown shapes keep the historical infer_width.)
-                    let lw = self
-                        .lrm_self_width(left)
-                        .unwrap_or_else(|| self.infer_width(left));
+                    let llw = self.lrm_self_width(left);
                     // §11.6.1: `/` and `%` size from BOTH operands (only a
                     // shift amount or an exponent is self-determined), so
                     // `(a + b) / 3` over 8-bit a, b divides at the literal's
                     // 32 bits, as the compiled path already does.
+                    let rlw = if matches!(op, BinaryOp::Div | BinaryOp::Mod | BinaryOp::Power) {
+                        self.lrm_self_width(right)
+                    } else {
+                        Some(0)
+                    };
+                    // §11.8.2: `/` and `**` with a REAL operand (64 bits, or a
+                    // literal the LRM width cannot size).
+                    if matches!(op, BinaryOp::Div | BinaryOp::Power)
+                        && (llw.is_none_or(|w| w == 64) || rlw.is_none_or(|w| w == 64))
+                        && let Some(v) = self.eval_real_operator(*op, left, right)
+                    {
+                        return v;
+                    }
+                    let lw = llw.unwrap_or_else(|| self.infer_width(left));
                     let rw = if matches!(op, BinaryOp::Div | BinaryOp::Mod) {
-                        self.lrm_self_width(right).unwrap_or(0)
+                        rlw.unwrap_or(0)
                     } else {
                         0
                     };
@@ -73233,7 +73250,15 @@ impl Simulator {
                     // Any operand this cannot size without evaluating keeps
                     // the historical behavior (the outer context) — sizing
                     // through infer_width would EXECUTE method calls.
-                    match (self.lrm_self_width(left), self.lrm_self_width(right)) {
+                    let (llw, rlw) = (self.lrm_self_width(left), self.lrm_self_width(right));
+                    // §11.8.2: a REAL operand (64 bits, or a literal the LRM
+                    // width cannot size) makes the comparison real.
+                    if (llw.is_none_or(|w| w == 64) || rlw.is_none_or(|w| w == 64))
+                        && let Some(v) = self.eval_real_operator(*op, left, right)
+                    {
+                        return v;
+                    }
+                    match (llw, rlw) {
                         (Some(lw), Some(rw)) => lw.max(rw),
                         _ => ctx_width,
                     }
@@ -73321,20 +73346,6 @@ impl Simulator {
                 } else {
                     self.eval_expr_ctx(right, self_det_w)
                 };
-                // §11.8.3: when ONE operand of an arithmetic/relational op is
-                // real, the other's INTEGER SUBTREE evaluates in real context
-                // — `3.5 == 7/2` divides as reals (3.5), it does not compare
-                // 3.5 to the integer quotient 3 (reference-verified,
-                // audit46 c3). Shifts and 4-state-only ops are excluded.
-                if !is_shift_op && l.is_real != r.is_real {
-                    if l.is_real {
-                        if let Some(f) = self.eval_subtree_as_real(right) {
-                            r = Value::from_f64(f);
-                        }
-                    } else if let Some(f) = self.eval_subtree_as_real(left) {
-                        l = Value::from_f64(f);
-                    }
-                }
                 // IEEE 1800-2023 §6.16 / Table 6-9: the `==`/`!=` operators
                 // are 2-STATE when applied to the `string` data type — they
                 // compare the textual content and always yield a definite
@@ -73540,6 +73551,17 @@ impl Simulator {
                 then_expr,
                 else_expr,
             } => {
+                // §11.4.11/§11.8.2: with a REAL arm the result is real; the
+                // integral arm converts from its self-determined value
+                // (`c ? (u - 2) : 1.5` is 4294967295.0 for `int unsigned u =
+                // 1`). An x condition yields the else arm, as below.
+                // (A node with a known non-64 static width is integral.)
+                let maybe_real = |e: &Expression| !e.cached_width.get().is_some_and(|w| w != 64);
+                if (maybe_real(then_expr) || maybe_real(else_expr))
+                    && let Some(v) = self.eval_real_conditional(condition, then_expr, else_expr)
+                {
+                    return v;
+                }
                 let c = self.eval_expr(condition);
                 if c.has_unknown() {
                     // IEEE 1800 §11.4.11 Table 11-21: per-bit merge — bit is known
@@ -76280,6 +76302,11 @@ impl Simulator {
             let iw = self.infer_lhs_width(lvalue);
             if iw == 0 { 32 } else { iw }
         };
+        let w = if Self::rhs_takes_context(rvalue) {
+            self.assign_rhs_ctx(lvalue, w)
+        } else {
+            w
+        };
         let val = self.eval_expr_ctx(rvalue, w);
         if rhs_call && self.assign_pending_ret_collection(lvalue) {
             return true;
@@ -78901,13 +78928,13 @@ impl Simulator {
                         }
                     }
                 } else {
-                    self.eval_expr_ctx(rvalue, w)
+                    self.eval_assign_rhs(lvalue, rvalue, w)
                 }
             } else {
-                self.eval_expr_ctx(rvalue, w)
+                self.eval_assign_rhs(lvalue, rvalue, w)
             }
         } else {
-            self.eval_expr_ctx(rvalue, w)
+            self.eval_assign_rhs(lvalue, rvalue, w)
         };
         // A collection RETURNED by the call in `rvalue` (recorded at
         // its `return` statement): copy it into a collection lvalue.
@@ -113212,40 +113239,328 @@ impl Simulator {
     }
 
     /// Copy every element of `src` onto `dst` and set its size (`r = q`).
-    /// §11.8.3: evaluate an integer subtree in REAL context — arithmetic
-    /// (notably division) computes on reals. Returns None when the subtree
-    /// is not a plain arithmetic shape (then the caller keeps the ordinary
-    /// integral evaluation and converts only the result).
-    fn eval_subtree_as_real(&mut self, e: &Expression) -> Option<f64> {
+    /// §10.7/§11.8.2: the context width an assignment gives its right-hand
+    /// side. A REAL target has no bit width to lend: an integral RHS is
+    /// evaluated self-determined and then converted (`r = u - 2` with
+    /// `int unsigned u = 1` is 4294967295.0).
+    /// The right-hand side of an assignment to `lvalue` (width `w`); see
+    /// `assign_rhs_ctx`.
+    #[inline]
+    fn eval_assign_rhs(&mut self, lvalue: &Expression, rvalue: &Expression, w: u32) -> Value {
+        let w = if Self::rhs_takes_context(rvalue) {
+            self.assign_rhs_ctx(lvalue, w)
+        } else {
+            w
+        };
+        self.eval_expr_ctx(rvalue, w)
+    }
+
+    /// Only an operator takes a width from its context; a plain operand
+    /// converts to the same real either way, so only then does an
+    /// assignment need `assign_rhs_ctx`.
+    #[inline]
+    fn rhs_takes_context(e: &Expression) -> bool {
         match &e.kind {
-            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { .. }) => {
-                self.eval_expr(e).to_i64().map(|v| v as f64)
-            }
-            ExprKind::Number(crate::ast::expr::NumberLiteral::Real(f)) => Some(*f),
-            ExprKind::Paren(inner) => self.eval_subtree_as_real(inner),
-            ExprKind::Unary {
-                op: crate::ast::expr::UnaryOp::Minus,
-                operand,
-            } => self.eval_subtree_as_real(operand).map(|f| -f),
-            ExprKind::Unary {
-                op: crate::ast::expr::UnaryOp::Plus,
-                operand,
-            } => self.eval_subtree_as_real(operand),
-            ExprKind::Binary { op, left, right } => {
-                let l = self.eval_subtree_as_real(left)?;
-                let r = self.eval_subtree_as_real(right)?;
-                match op {
-                    BinaryOp::Add => Some(l + r),
-                    BinaryOp::Sub => Some(l - r),
-                    BinaryOp::Mul => Some(l * r),
-                    BinaryOp::Div => Some(l / r),
-                    _ => None,
+            ExprKind::Paren(x) => Self::rhs_takes_context(x),
+            ExprKind::Binary { .. } | ExprKind::Conditional { .. } => true,
+            ExprKind::Unary { op, .. } => matches!(op, UnaryOp::Minus | UnaryOp::BitNot),
+            _ => false,
+        }
+    }
+
+    #[inline(never)]
+    fn assign_rhs_ctx(&mut self, lvalue: &Expression, w: u32) -> u32 {
+        // A real variable is 64 bits wide; any other width is integral.
+        if w == 64 && matches!(lvalue.kind, ExprKind::Ident(_)) && self.expr_is_real_static(lvalue)
+        {
+            0
+        } else {
+            w
+        }
+    }
+
+    /// §11.8.2: true when `e` is REAL-typed by declaration — a real literal,
+    /// a real variable, a real-valued system function, a cast to a real type,
+    /// or an arithmetic/conditional operator over such an operand. Mirrors
+    /// the bytecode compiler's `expr_is_real_static`; a shape it cannot type
+    /// answers false and keeps the integral rules.
+    fn expr_is_real_static(&mut self, e: &Expression) -> bool {
+        // Every real-typed expression is 64 bits wide, so a node whose STATIC
+        // width is already known to be anything else is integral — the
+        // common case, answered without a walk or a name lookup.
+        if e.cached_width.get().is_some_and(|w| w != 64) {
+            return false;
+        }
+        match &e.kind {
+            ExprKind::Number(n) => matches!(
+                n,
+                crate::ast::expr::NumberLiteral::Real(_) | crate::ast::expr::NumberLiteral::Time(_)
+            ),
+            ExprKind::Ident(h) => {
+                if h.path.len() == 1
+                    && h.root.is_none()
+                    && let Some(v) = self
+                        .local_stack
+                        .last()
+                        .and_then(|m| m.get(&h.path[0].name.name))
+                {
+                    return v.is_real;
                 }
+                let n = self.resolve_hier_name(h);
+                self.lookup_signal_real(&n)
             }
-            _ => {
-                let v = self.eval_expr(e);
-                if v.is_real { Some(v.to_f64()) } else { None }
+            ExprKind::Paren(x) => self.expr_is_real_static(x),
+            ExprKind::Unary {
+                op: UnaryOp::Plus | UnaryOp::Minus,
+                operand,
+            } => self.expr_is_real_static(operand),
+            ExprKind::Binary {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Power,
+                left,
+                right,
+            } => self.expr_is_real_static(left) || self.expr_is_real_static(right),
+            ExprKind::Conditional {
+                then_expr,
+                else_expr,
+                ..
+            } => self.expr_is_real_static(then_expr) || self.expr_is_real_static(else_expr),
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$__xz_type_cast" => matches!(
+                    args.first().map(|a| &a.kind),
+                    Some(ExprKind::TypeLiteral(dt))
+                        if crate::compiler::elaborate::is_type_real(dt)
+                ),
+                n => super::bytecode::system_function_is_real(n),
+            },
+            _ => false,
+        }
+    }
+
+    /// A constant expression by its shape — literals, parameters, and
+    /// operators, casts and real conversions over them.
+    fn expr_is_constant(&mut self, e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Number(_) => true,
+            ExprKind::Ident(h) => {
+                if h.path.len() == 1
+                    && h.root.is_none()
+                    && self
+                        .local_stack
+                        .last()
+                        .is_some_and(|m| m.contains_key(&h.path[0].name.name))
+                {
+                    return false;
+                }
+                let n = self.resolve_hier_name(h);
+                self.module.parameters.contains_key(&*n)
             }
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => self.expr_is_constant(x),
+            ExprKind::Binary { left, right, .. } => {
+                self.expr_is_constant(left) && self.expr_is_constant(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                self.expr_is_constant(condition)
+                    && self.expr_is_constant(then_expr)
+                    && self.expr_is_constant(else_expr)
+            }
+            ExprKind::SystemCall { name, args } => match name.as_str() {
+                "$__xz_type_cast" => args.get(1).is_some_and(|a| self.expr_is_constant(a)),
+                n if n != "$realtime" && super::bytecode::system_function_is_real(n) => {
+                    args.iter().all(|a| self.expr_is_constant(a))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// §11.8.2 operators with a REAL operand (see the bytecode compiler's
+    /// `compile_real_operator`): an arithmetic operator converts each integral
+    /// operand from its SELF-determined value; a relational or equality
+    /// operator propagates the real type one operator into a CONSTANT integral
+    /// side. None when neither operand is real.
+    #[inline(never)]
+    fn eval_real_operator(
+        &mut self,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+    ) -> Option<Value> {
+        if !matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Power
+                | BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+        ) {
+            return None;
+        }
+        let cmp = matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Neq
+                | BinaryOp::Lt
+                | BinaryOp::Leq
+                | BinaryOp::Gt
+                | BinaryOp::Geq
+        );
+        let lr = self.expr_is_real_static(left);
+        let rr = self.expr_is_real_static(right);
+        if !lr && !rr {
+            return None;
+        }
+        // Only a CONSTANT integral side takes the real type in a comparison,
+        // as in the reference simulator (see the bytecode compiler).
+        let l = if cmp && !lr && self.expr_is_constant(left) {
+            self.eval_in_real_context(left)
+        } else {
+            self.real_operand(left)
+        };
+        let r = if cmp && !rr && self.expr_is_constant(right) {
+            self.eval_in_real_context(right)
+        } else {
+            self.real_operand(right)
+        };
+        Some(Self::real_binop(op, &l, &r))
+    }
+
+    /// `+ - *` with a REAL operand (§11.8.2), once the width probes have
+    /// sized — and for some shapes evaluated — the operands: each integral
+    /// operand is converted from its self-determined value. None (and the
+    /// probed values left in place) when neither operand is real.
+    #[inline(never)]
+    fn real_arith_probed(
+        &mut self,
+        op: BinaryOp,
+        left: &Expression,
+        right: &Expression,
+        lv: &mut Option<Value>,
+        rv: &mut Option<Value>,
+    ) -> Option<Value> {
+        let lr = match lv {
+            Some(v) => v.is_real,
+            None => self.expr_is_real_static(left),
+        };
+        let rr = match rv {
+            Some(v) => v.is_real,
+            None => self.expr_is_real_static(right),
+        };
+        if !lr && !rr {
+            return None;
+        }
+        let l = match lv.take() {
+            Some(v) => v,
+            None => self.eval_expr_ctx(left, 0),
+        };
+        let r = match rv.take() {
+            Some(v) => v,
+            None => self.eval_expr_ctx(right, 0),
+        };
+        let real = |v: Value| {
+            if v.is_real {
+                v
+            } else {
+                Value::from_f64(v.to_f64())
+            }
+        };
+        Some(Self::real_binop(op, &real(l), &real(r)))
+    }
+
+    /// `?:` with a REAL arm (§11.4.11/§11.8.2): the taken arm as a real — a
+    /// constant integral arm in real context, a run-time one converted from
+    /// its self-determined value. None when neither arm is real.
+    #[inline(never)]
+    fn eval_real_conditional(
+        &mut self,
+        condition: &Expression,
+        then_expr: &Expression,
+        else_expr: &Expression,
+    ) -> Option<Value> {
+        if !self.expr_is_real_static(then_expr) && !self.expr_is_real_static(else_expr) {
+            return None;
+        }
+        let c = self.eval_expr(condition);
+        let taken = if !c.has_unknown() && c.is_true() {
+            then_expr
+        } else {
+            else_expr
+        };
+        Some(if self.expr_is_constant(taken) {
+            self.eval_in_real_context(taken)
+        } else {
+            self.real_operand(taken)
+        })
+    }
+
+    fn real_binop(op: BinaryOp, l: &Value, r: &Value) -> Value {
+        match op {
+            BinaryOp::Add => l.add(r),
+            BinaryOp::Sub => l.sub(r),
+            BinaryOp::Mul => l.mul(r),
+            BinaryOp::Div => l.div(r),
+            BinaryOp::Power => l.power(r),
+            BinaryOp::Eq => l.is_equal(r),
+            BinaryOp::Neq => l.is_not_equal(r),
+            BinaryOp::Lt => l.less_than(r),
+            BinaryOp::Leq => l.less_equal(r),
+            BinaryOp::Gt => l.greater_than(r),
+            _ => l.greater_equal(r),
+        }
+    }
+
+    /// An operand of a real operator, SELF-determined and converted to real
+    /// (§6.12.2: x and z bits read as 0).
+    fn real_operand(&mut self, e: &Expression) -> Value {
+        let v = self.eval_expr_ctx(e, 0);
+        if v.is_real {
+            v
+        } else {
+            Value::from_f64(v.to_f64())
+        }
+    }
+
+    /// §11.8.2: an integral operand that takes REAL type from its context (the
+    /// other side of a relational operator, the other arm of `?:`): the real
+    /// type reaches its top operator, whose own operands are self-determined
+    /// and converted — `(u - 2) > 1.0` compares -1.0, `a / b < 3.2` divides
+    /// as reals. Anything else is self-determined and converted whole.
+    fn eval_in_real_context(&mut self, e: &Expression) -> Value {
+        match &e.kind {
+            ExprKind::Paren(x) => self.eval_in_real_context(x),
+            ExprKind::Binary {
+                op:
+                    op @ (BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Power),
+                left,
+                right,
+            } => {
+                let l = self.real_operand(left);
+                let r = self.real_operand(right);
+                Self::real_binop(*op, &l, &r)
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Minus,
+                operand,
+            } => self.real_operand(operand).negate(),
+            ExprKind::Unary {
+                op: UnaryOp::Plus,
+                operand,
+            } => self.real_operand(operand),
+            _ => self.real_operand(e),
         }
     }
 
