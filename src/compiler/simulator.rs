@@ -130561,11 +130561,27 @@ impl Simulator {
                 continue;
             };
             any = true;
-            for i in 0..w {
-                out.set_bit((off + i) as usize, v.get_bit(i as usize));
-            }
+            Self::copy_leaf_bits(&mut out, off, &v, 0, w);
         }
         any.then_some(out)
+    }
+
+    /// `dst[dst_off +: w] = src[src_off +: w]`, a bit past `src` reading 0
+    /// (or the fill bit), as a per-bit copy would — but word by word: a
+    /// struct with a 2-D packed member (`bit [256:0][511:0] wdata`) is about
+    /// 150k bits, packed and spread on every call that passes it by value.
+    fn copy_leaf_bits(dst: &mut Value, dst_off: u32, src: &Value, src_off: u32, w: u32) {
+        let n = if src.is_fill {
+            0
+        } else {
+            w.min(src.width.saturating_sub(src_off))
+        };
+        if n > 0 {
+            dst.copy_bits_from(dst_off as usize, src, src_off as usize, n as usize);
+        }
+        for i in n..w {
+            dst.set_bit((dst_off + i) as usize, src.get_bit((src_off + i) as usize));
+        }
     }
 
     /// Bit layout over an unpacked struct's LEAVES, as `(key, offset, width,
@@ -130616,9 +130632,7 @@ impl Simulator {
                 continue;
             };
             any = true;
-            for i in 0..w {
-                out.set_bit((off + i) as usize, v.get_bit(i as usize));
-            }
+            Self::copy_leaf_bits(&mut out, off, &v, 0, w);
         }
         any.then_some(out)
     }
@@ -130636,9 +130650,7 @@ impl Simulator {
         }
         for (leaf, off, w, is_real) in fields {
             let mut mv = Value::new(w);
-            for i in 0..w {
-                mv.set_bit(i as usize, v.get_bit((off + i) as usize));
-            }
+            Self::copy_leaf_bits(&mut mv, 0, v, off, w);
             if is_real {
                 // `Value::from_f64` stores `f.to_bits()`, and packing copied
                 // those raw IEEE-754 bits into the aggregate — so recovering
@@ -130668,9 +130680,7 @@ impl Simulator {
         let mut out = Vec::with_capacity(fields.len());
         for (leaf, off, w, is_real) in fields {
             let mut mv = Value::new(w);
-            for i in 0..w {
-                mv.set_bit(i as usize, v.get_bit((off + i) as usize));
-            }
+            Self::copy_leaf_bits(&mut mv, 0, v, off, w);
             if is_real {
                 mv = Value::from_f64(f64::from_bits(mv.to_u64().unwrap_or(0)));
             }
