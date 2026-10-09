@@ -103714,6 +103714,15 @@ impl Simulator {
         // (sizing, element solving, acceptance).
         self.begin_randomize_budget();
         self.obj_rng_stack.push(handle);
+        // §18.7: names in the inline block resolve in the object's scope
+        // first, so a property named like the receiver hides it there.
+        let receiver = receiver.filter(|r| {
+            !self
+                .heap
+                .get(handle)
+                .and_then(|o| o.as_ref())
+                .is_some_and(|i| i.properties.contains_key(r))
+        });
         let prev_receiver = std::mem::replace(&mut self.rand_receiver, receiver);
         // `exec_randomize_inner` pushes the solve frame next, so its
         // `method_local_base` entry is the current frame count.
@@ -145063,19 +145072,14 @@ impl Simulator {
     ///   call run in their own frames, where `obj` is an ordinary name;
     /// - names in the inline block resolve in the object's scope first, so
     ///   when the object has a property called `obj`, `obj.member` is that
-    ///   property's member, not the receiver's.
+    ///   property's member, not the receiver's (`randomize_object_with`
+    ///   then records no receiver).
     fn active_rand_receiver(&self) -> Option<&str> {
         let recv = self.rand_receiver.as_deref()?;
         if self.method_local_base.last() != Some(&self.rand_receiver_base) {
             return None;
         }
-        let obj = *self.obj_rng_stack.last()?;
-        let shadowed = self
-            .heap
-            .get(obj)
-            .and_then(|o| o.as_ref())
-            .is_some_and(|i| i.properties.contains_key(recv));
-        (!shadowed).then_some(recv)
+        Some(recv)
     }
 
     /// §18.7 — inside `obj.randomize() with { … }`, a receiver-prefixed
