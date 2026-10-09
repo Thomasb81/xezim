@@ -18,6 +18,11 @@ const MAX_INLINE_DEPTH: usize = 8;
 pub(crate) struct MethodAdmission {
     pub writeback_positions: HashMap<String, HashSet<usize>>,
     pub instance_fields: HashMap<String, HashSet<String>>,
+    /// §8.20: declared class -> method -> the class whose body a call
+    /// through a handle of that declared type binds to, for every
+    /// NON-virtual method that some subclass redeclares (the only case where
+    /// the object's dynamic class would pick a different body).
+    pub nonvirtual_targets: HashMap<String, HashMap<String, String>>,
     /// Free-function facts the method compiles keep asking for; the function
     /// table they come from is the same for every method compile.
     pub fn_facts: FnFacts,
@@ -14102,13 +14107,39 @@ impl<'a> BytecodeCompiler<'a> {
                                 self.emit(Insn::Move(slot, v));
                             }
                         }
-                        self.emit(Insn::CallMethod(
-                            dest,
-                            handle_reg,
-                            Box::new(Name(member.name.clone().into_boxed_str())),
-                            arg_start,
-                            n,
-                        ));
+                        // §8.20: a non-virtual method binds to the
+                        // receiver's DECLARED class; CallMethod dispatches on
+                        // the object's dynamic class, which differs only when
+                        // a subclass redeclares the method. Those calls start
+                        // the hierarchy walk at the statically bound class.
+                        let static_target = self.method_handle_chain_class(base).and_then(|rc| {
+                            self.method_admission.as_ref().and_then(|a| {
+                                a.nonvirtual_targets
+                                    .get(rc.split('#').next().unwrap_or(&rc))
+                                    .and_then(|m| m.get(member.name.as_str()))
+                                    .cloned()
+                            })
+                        });
+                        if let Some(target) = static_target {
+                            self.emit(Insn::CallScopedMethod(
+                                dest,
+                                handle_reg,
+                                Box::new(NamePair(
+                                    target.into_boxed_str(),
+                                    member.name.clone().into_boxed_str(),
+                                )),
+                                arg_start,
+                                n,
+                            ));
+                        } else {
+                            self.emit(Insn::CallMethod(
+                                dest,
+                                handle_reg,
+                                Box::new(Name(member.name.clone().into_boxed_str())),
+                                arg_start,
+                                n,
+                            ));
+                        }
                         self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }

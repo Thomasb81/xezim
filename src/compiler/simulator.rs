@@ -154430,6 +154430,66 @@ impl Simulator {
                             }
                         }
                     }
+                    // §8.20: non-virtual methods some subclass redeclares —
+                    // the only calls whose static binding differs from the
+                    // dynamic dispatch CallMethod performs.
+                    let mut hidden: HashSet<&str> = HashSet::default();
+                    for cd in self.module.classes.values() {
+                        if cd.extends.is_none() {
+                            continue;
+                        }
+                        for m in cd.methods.keys() {
+                            if m == "new" || hidden.contains(m.as_str()) {
+                                continue;
+                            }
+                            // Redeclared below an ancestor whose topmost
+                            // declaration is not `virtual`: a handle of that
+                            // ancestor's type binds statically (a `virtual`
+                            // added lower down only affects handles below it).
+                            let mut top_virtual = false;
+                            let mut redeclares = false;
+                            let mut cur = cd.extends.as_deref();
+                            let mut guard = 0;
+                            while let Some(b) = cur
+                                && guard < 64
+                            {
+                                guard += 1;
+                                let Some(bd) =
+                                    self.module.classes.get(b.split('#').next().unwrap_or(b))
+                                else {
+                                    break;
+                                };
+                                if let Some(bm) = bd.methods.get(m) {
+                                    redeclares = true;
+                                    use crate::ast::decl::ClassQualifier as Q;
+                                    top_virtual = bm.qualifiers.contains(&Q::Virtual)
+                                        || bm.qualifiers.contains(&Q::Pure);
+                                }
+                                cur = bd.extends.as_deref();
+                            }
+                            if redeclares && !top_virtual {
+                                hidden.insert(m.as_str());
+                            }
+                        }
+                    }
+                    let hidden: Vec<String> = hidden.into_iter().map(str::to_string).collect();
+                    if !hidden.is_empty() {
+                        let classes: Vec<String> = self.module.classes.keys().cloned().collect();
+                        for class in classes {
+                            for m in hidden.iter() {
+                                if self.is_static_method(&class, m) {
+                                    continue;
+                                }
+                                if let Some(t) = self.nonvirtual_target_class(&class, m) {
+                                    facts
+                                        .nonvirtual_targets
+                                        .entry(class.clone())
+                                        .or_default()
+                                        .insert(m.clone(), t);
+                                }
+                            }
+                        }
+                    }
                     let facts = std::rc::Rc::new(facts);
                     self.compiled_method_admission = Some(facts.clone());
                     facts
@@ -155377,6 +155437,10 @@ impl Simulator {
         let Some(Some(inst)) = self.heap.get(handle) else {
             return None;
         };
+        // Dispatch on the object's class is the virtual binding (§8.20). A
+        // non-virtual method that a subclass redeclares never reaches here:
+        // the compiler lowers such a call to `CallScopedMethod` starting at
+        // the receiver's declared class (`MethodAdmission::nonvirtual_targets`).
         let leaf = inst.class_name.clone();
         if Self::proc_handle_to_pid(handle as u64).is_some() {
             return None;
