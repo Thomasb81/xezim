@@ -226,6 +226,12 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   cannot carry is reported as an error at each call instead of silently
   returning 0, and a wide or aggregate result is rejected (§35.5.5). (#291,
   reported by Dragon-Git)
+* `randomize()` solves rand sub-objects held in fixed, dynamic and queue
+  arrays of handles, rand sub-object members wider than 64 bits (packed
+  structs, nested fields, packed-array elements) and `solve ... before` on
+  sub-object members together with the enclosing object (§18.5.9). Reading a
+  nested packed-struct field or packed-array element through a class handle
+  no longer returns 0. (#255, reported by rharikrishna25)
 
 **Usability**
 
