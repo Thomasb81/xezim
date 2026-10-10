@@ -3875,6 +3875,16 @@ type FormalDynSetup = (usize, Vec<(String, String)>, Vec<(String, String)>);
 struct ProcessContext {
     this_stack: Vec<Option<usize>>,
     local_stack: Vec<HashMap<String, Value>>,
+    /// Per blocking-loop shadow saves (§6.21): for each active suspend-aware
+    /// `foreach` whose body declares a block-local that shadows an enclosing
+    /// local, the outer value of each shadowed name, captured at loop entry
+    /// and restored on loop exit (return/break/exhausted). Stored here so it
+    /// rides process suspension like `local_stack`. Empty inner Vec means no
+    /// scope was isolated for that loop. Mirrors `saved_shadows` in the
+    /// synchronous SeqBlock path, but across the flattened blocking body (no
+    /// throwaway frame is pushed, so `local_stack.last()` keeps pointing at
+    /// the method frame and handle resolution / phasing is undisturbed).
+    loop_shadow_restores: Vec<Vec<(String, Option<Value>)>>,
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with. Two different method activations never share a generation even
     /// when they occupy the same slot index, so a fork child can tell whether
@@ -6461,6 +6471,8 @@ pub struct Simulator {
     /// are bound in the caller's context.
     task_clears_this: bool,
     local_stack: Vec<HashMap<String, Value>>,
+    /// Per blocking-loop shadow saves; see `ProcessContext::loop_shadow_restores`.
+    loop_shadow_restores: Vec<Vec<(String, Option<Value>)>>,
     /// Parallel to `local_stack`: the frame generation each slot was pushed
     /// with (see `ProcessContext::local_gen_stack`). Kept on the active
     /// `Simulator` exactly like `local_stack`, and moved into/out of a
@@ -11952,6 +11964,7 @@ impl Simulator {
             this_stack: vec![],
             task_clears_this: false,
             local_stack: vec![],
+            loop_shadow_restores: vec![],
             local_gen_stack: Vec::new(),
             class_context_stack: vec![],
             method_local_base: vec![],
@@ -48152,6 +48165,7 @@ impl Simulator {
         ProcessContext {
             this_stack: self.this_stack.clone(),
             local_stack: self.local_stack.clone(),
+            loop_shadow_restores: self.loop_shadow_restores.clone(),
             local_gen_stack: self.local_gen_stack.clone(),
             local_type_stack: self.local_type_stack.clone(),
             class_context_stack: self.class_context_stack.clone(),
@@ -48239,6 +48253,7 @@ impl Simulator {
         ProcessContext {
             this_stack: std::mem::take(&mut self.this_stack),
             local_stack: std::mem::take(&mut self.local_stack),
+            loop_shadow_restores: std::mem::take(&mut self.loop_shadow_restores),
             local_gen_stack: std::mem::take(&mut self.local_gen_stack),
             local_type_stack: std::mem::take(&mut self.local_type_stack),
             class_context_stack: std::mem::take(&mut self.class_context_stack),
@@ -48265,6 +48280,7 @@ impl Simulator {
     fn restore_process_context(&mut self, ctx: ProcessContext) {
         self.this_stack = ctx.this_stack;
         self.local_stack = ctx.local_stack;
+        self.loop_shadow_restores = ctx.loop_shadow_restores;
         self.local_gen_stack = ctx.local_gen_stack;
         self.local_type_stack = ctx.local_type_stack;
         self.class_context_stack = ctx.class_context_stack;
@@ -52740,6 +52756,7 @@ impl Simulator {
                     // task's ScopePop (handled by the top-of-loop return_flag
                     // skip). Just exit this foreach without consuming flags.
                     if self.return_flag {
+                        self.exit_loop_shadow_scope();
                         self.auto_loop_vars.truncate(*fe_auto_len);
                         i += 1;
                         continue;
@@ -52747,6 +52764,7 @@ impl Simulator {
                     // A `break` (set WITHOUT return_flag) exits this loop —
                     // consume it, mirroring the synchronous `while` at L30181.
                     if self.break_flag {
+                        self.exit_loop_shadow_scope();
                         self.break_flag = false;
                         self.continue_flag = false;
                         self.auto_loop_vars.truncate(*fe_auto_len);
@@ -52774,6 +52792,7 @@ impl Simulator {
                     };
                     if exhausted {
                         // loop exhausted — restore automatic-loop-var scope
+                        self.exit_loop_shadow_scope();
                         self.auto_loop_vars.truncate(*fe_auto_len);
                         i += 1;
                         continue;
@@ -52915,6 +52934,19 @@ impl Simulator {
                                 self.set_loop_var_aliased(var_scope.as_deref(), vn, kv);
                             }
                             self.continue_flag = false;
+                            // §6.21: isolate a body-local that shadows an
+                            // enclosing local (see `enter_loop_shadow_scope`).
+                            // Rather than push a throwaway frame (which would
+                            // re-point `local_stack.last()` for EVERY lookup in
+                            // the loop and disturb handle resolution / phasing),
+                            // SAVE the overwritten outer binding in the current
+                            // frame and restore it at loop exit. The saved values
+                            // ride process suspension on `loop_shadow_restores`, so
+                            // they survive the loop's blocking body. Evaluating the
+                            // predicate at exit against a live `local_stack` would
+                            // be asymmetric (the method frame lands during the
+                            // body), so the restore set is captured HERE once.
+                            self.enter_loop_shadow_scope(body);
                             let body_stmts = match &body.kind {
                                 StatementKind::SeqBlock { stmts, .. } => stmts.clone(),
                                 _ => vec![(**body).clone()],
@@ -53403,6 +53435,68 @@ impl Simulator {
             }
         }
         false
+    }
+
+    /// §6.21: for a suspend-aware `foreach` body that declares a block-local
+    /// shadowing an enclosing local, capture the outer value of each shadowed
+    /// name so it can be restored on loop exit. See the push-site comment on
+    /// why this prefers save/restore over pushing a throwaway frame. The record
+    /// rides `loop_shadow_restores` across the loop's suspensions. The body's
+    /// VarDecl exec writes the shadow into `local_stack.last()` (the method
+    /// frame), overwriting the outer binding; `exit_loop_shadow_scope` undoes
+    /// it after the loop.
+    fn enter_loop_shadow_scope(&mut self, body: &Statement) {
+        if let StatementKind::SeqBlock { stmts, .. } = &body.kind {
+            let mut saves: Vec<(String, Option<Value>)> = Vec::new();
+            for s in stmts {
+                if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                    for d in declarators {
+                        let nm = d.name.name.as_str();
+                        // Isolate ANY name the loop body is about to clobber in
+                        // the current frame (the body reprograms it): an
+                        // enclosing local or a module signal (which, with a
+                        // frame present, lands in the frame too).
+                        let shadows = self.local_stack.iter().any(|f| f.contains_key(nm))
+                            || self.signal_name_to_id.contains_key(nm);
+                        if shadows && !saves.iter().any(|(n, _)| n == nm) {
+                            let outer = self
+                                .local_stack
+                                .last()
+                                .and_then(|f| f.get(nm).cloned());
+                            saves.push((nm.to_string(), outer));
+                        }
+                    }
+                }
+            }
+            self.loop_shadow_restores.push(saves);
+        } else {
+            self.loop_shadow_restores.push(Vec::new());
+        }
+    }
+
+    /// Restore the outer bindings a blocking `foreach` body's shadowing locals
+    /// overwrote, and pop the restore record — symmetric with
+    /// `enter_loop_shadow_scope` (called once at each of the three ForeachTail
+    /// loop exits: return, break, exhausted). No frame is popped; the restore
+    /// writes the saved values back into the method frame, so
+    /// `local_stack.last()` semantics and handle resolution stay intact.
+    fn exit_loop_shadow_scope(&mut self) {
+        if let Some(saves) = self.loop_shadow_restores.pop() {
+            if !saves.is_empty() {
+                if let Some(f) = self.local_stack.last_mut() {
+                    for (nm, prev) in saves {
+                        match prev {
+                            Some(v) => {
+                                f.insert(nm, v);
+                            }
+                            None => {
+                                f.remove(&nm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Check if any statements contain blocking constructs (timing, events, wait).
@@ -83394,14 +83488,51 @@ impl Simulator {
                 // exactly like the for-loop shadow frame. Only when a direct
                 // child declaration actually collides, so the common case pays
                 // one scan and no allocation.
-                let shadow_frame = self.local_stack.last().is_none()
-                    && stmts.iter().any(|s| match &s.kind {
-                        StatementKind::VarDecl { declarators, .. } => declarators
-                            .iter()
-                            .any(|d| self.signal_name_to_id.contains_key(d.name.name.as_str())),
-                        _ => false,
-                    });
+                //
+                // A block-local may also shadow an ENCLOSING LOCAL (a call
+                // frame is on the stack): the VarDecl exec writes into
+                // `local_stack.last_mut()` (the one shared frame), overwriting
+                // the outer same-named binding, and nothing restores it when
+                // the inner block ends — reads after the block see the
+                // shadow's stale value (UVM's `do_write` owns `uvm_reg_cb_iter
+                // cbs` at task scope and its field-body re-declares `cbs`).
+                // Rather than push a throwaway frame (which would re-point
+                // `local_stack.last()` for EVERY lookup in the block and
+                // disturb handle resolution / `this`-scoped reads), SAVE the
+                // overwritten outer bindings and restore them on exit — the
+                // shadowing writes land in the existing frame and are undone
+                // afterward (same pattern as `push_pattern_bindings`).
+                let mut saved_shadows: Vec<(String, Option<Value>)> = Vec::new();
+                let mut module_signal_shadow = false;
+                {
+                    let frameless = self.local_stack.last().is_none();
+                    for s in stmts {
+                        if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+                            for d in declarators {
+                                let nm = d.name.name.as_str();
+                                if frameless && self.signal_name_to_id.contains_key(nm) {
+                                    // Frameless block-local shadowing a module
+                                    // signal: needs the throwaway frame (there
+                                    // is no enclosing local frame to restore
+                                    // into).
+                                    module_signal_shadow = true;
+                                }
+                                if !frameless
+                                    && self.local_stack.iter().any(|f| f.contains_key(nm))
+                                    && !saved_shadows.iter().any(|(n, _)| n == nm)
+                                {
+                                    let f = self.local_stack.last().unwrap();
+                                    saved_shadows.push((nm.to_string(), f.get(nm).cloned()));
+                                }
+                            }
+                        }
+                    }
+                }
+                let shadow_frame = module_signal_shadow;
                 if shadow_frame {
+                    // The frameless module-signal shadow has no enclosing local
+                    // frame to save/restore into, so isolate it with a
+                    // throwaway frame (as originally).
                     self.push_local_frame(HashMap::default());
                 }
                 // `automatic` locals declared in this block (see the VarDecl
@@ -83427,6 +83558,23 @@ impl Simulator {
                 }
                 if shadow_frame {
                     self.pop_local_frame();
+                }
+                // Restore outer bindings the block's shadowing locals
+                // overwrote, so reads after the block see the enclosing value
+                // again (frame-model block-local scoping; see above).
+                if !saved_shadows.is_empty() {
+                    if let Some(f) = self.local_stack.last_mut() {
+                        for (nm, prev) in saved_shadows {
+                            match prev {
+                                Some(v) => {
+                                    f.insert(nm, v);
+                                }
+                                None => {
+                                    f.remove(&nm);
+                                }
+                            }
+                        }
+                    }
                 }
                 self.auto_loop_vars.truncate(seq_auto_len);
                 // A `disable` naming THIS block ends here; execution resumes
@@ -140322,6 +140470,7 @@ impl Simulator {
                             ProcessContext {
                                 this_stack: vec![Some(handle)],
                                 local_stack: vec![locals],
+                                loop_shadow_restores: Vec::new(),
                                 local_gen_stack: vec![fgen],
                                 local_type_stack: vec![(HashMap::default(), HashMap::default())],
                                 class_context_stack: vec![Some(cname.clone())],
