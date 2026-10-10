@@ -155000,6 +155000,7 @@ impl Simulator {
             let param_able_result = !is_class_result
                 && !is_string_result
                 && !is_void_result
+                && !is_collection_result
                 && !matches!(
                     &_f.return_type,
                     crate::ast::types::DataType::IntegerAtom { .. }
