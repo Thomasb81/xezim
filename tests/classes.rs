@@ -352,6 +352,10 @@ mod randomize_foreach_accept;
 mod randomize_shift_mask_wide_peer;
 #[path = "classes/randomize_inside_range.rs"]
 mod randomize_inside_range;
+#[path = "classes/randomize_object_arrays.rs"]
+mod randomize_object_arrays;
+#[path = "classes/randomize_issue_255_full.rs"]
+mod randomize_issue_255_full;
 #[path = "classes/randomize_issue_255_shapes.rs"]
 mod randomize_issue_255_shapes;
 #[path = "classes/randomize_issue_261_wide.rs"]
