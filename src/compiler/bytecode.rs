@@ -4977,6 +4977,67 @@ impl<'a> BytecodeCompiler<'a> {
         })
     }
 
+    /// class-perf method-mode: a member read rooted at an ELEMENT of a
+    /// class-handle member collection — `m[k].data`, `this.aa[k].field`,
+    /// `obj.q[i].m`. The base is an Index whose indexed name is a class
+    /// member collection storing HANDLE elements. It lowers in two steps that
+    /// mirror the interpreter exactly: `compile_member_coll_elem_read` emits a
+    /// `LoadCollElem` whose value IS the element's heap handle, then
+    /// `LoadClassMember` reads `member` off that handle. Returns None for any
+    /// non-method, non-class-element, or un-admitted shape (the enclosing
+    /// statement keeps the AST path).
+    fn compile_member_handle_elem_member(
+        &mut self,
+        base: &crate::ast::expr::Expression,
+        member: &str,
+    ) -> Option<RegId> {
+        use crate::ast::expr::ExprKind;
+        if !self.method_mode {
+            return None;
+        }
+        let ExprKind::Index {
+            expr: coll_base,
+            index,
+        } = &base.kind
+        else {
+            return None;
+        };
+        // Resolve the indexed base to a class-member collection and its
+        // element class (`handle_member_types[method_class][coll]` is the
+        // STORED element type — Some iff the collection holds handles).
+        let (coll, _bare, _) = self.member_coll_elem_target(coll_base)?;
+        let elem_class = self
+            .method_class
+            .as_deref()
+            .and_then(|cls| self.handle_member_types?.get(cls)?.get(coll.as_str()).cloned())?;
+        // The leaf must be an admitted instance field of the ELEMENT class
+        // (statics / non-loadable / unadmitted members stay on the AST).
+        if !self
+            .method_admission
+            .as_ref()
+            .is_some_and(|admission| {
+                admission
+                    .instance_fields
+                    .get(&elem_class)
+                    .is_some_and(|fields| fields.contains(member))
+            })
+        {
+            return None;
+        }
+        // Lower `m[k]` to the element's heap-handle register, then read
+        // `member` off it. `compile_member_coll_elem_read` takes the indexed
+        // BASE (`Ident(m)`, not the whole Index expr) + index and yields the
+        // element value (a class handle here).
+        let handle_reg = self.compile_member_coll_elem_read(coll_base, index, 0)?;
+        let dest = self.alloc_reg();
+        self.emit(Insn::LoadClassMember(
+            dest,
+            handle_reg,
+            member.to_string().into_boxed_str(),
+        ));
+        Some(dest)
+    }
+
     /// class-perf method-mode: when `base` denotes the receiving object
     /// (`this`) or a method-local CLASS HANDLE, return the VM register whose
     /// value is that object's heap handle — the base register for
@@ -13741,6 +13802,16 @@ impl<'a> BytecodeCompiler<'a> {
                 // bound as a CLASS HANDLE qualifies; anything else keeps the
                 // pre-existing (signal/struct) paths below.
                 if self.method_mode {
+                    // class-perf: a member read rooted at an ELEMENT of a
+                    // class-handle member collection (`m[k].data`,
+                    // `this.aa[k].field`). Checked before the handle-chain
+                    // path and the signal/struct arms below, which cannot
+                    // resolve an indexed collection receiver.
+                    if let Some(dest) =
+                        self.compile_member_handle_elem_member(base, &member.name)
+                    {
+                        return Some(dest);
+                    }
                     // Step 6: the base may be a whole chain (`a.b`,
                     // `this.m_parent`, a bare member) — lower it to its
                     // handle register first, then read `member` off that
