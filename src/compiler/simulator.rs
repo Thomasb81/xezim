@@ -49150,6 +49150,51 @@ impl Simulator {
             Self::recycle_string(&mut self.hint_string_pool, mine);
             return;
         }
+        // A schedule entry for a pid that is NOT a fork child created by
+        // `inherit_fork_child_context` (so absent from `process_contexts`)
+        // but whose working context is LIVE on the stack is a resumed PARENT
+        // — a continuation trampolined through the event queue by
+        // `continue_stmts_or_trampoline` when the `run_process_stmts`
+        // recursion crossed `RPS_TRAMPOLINE_DEPTH`. Its `this`/frames must
+        // stay in place for the body (e.g. a `foreach (m_fields[i])` on a
+        // UVM register that resolves `this`). The fork-child dance below
+        // would `take_process_context()` the live frames, restore an EMPTY
+        // table entry (`unwrap_or_default()` — this pid was never parked
+        // there), run the body context-less, and only put `this` back at
+        // the end — too late, the reads already saw null → null-deref. Run
+        // the payload directly so the live context is preserved, parking a
+        // snapshot into the table only if the body suspends. Requires
+        // `saved_ctx_needed` (there IS a live context worth keeping),
+        // `method_local_base` non-empty (the continuation is inside an
+        // inlined task-method, so the live `this` is genuinely the method's
+        // receiver and must stay — NOT a frame leaked onto a module-scope
+        // process after a fork/join), and `process_parents.get(&pid).is_none()`
+        // (a genuine fork child — which does have a parent entry — still
+        // takes the fork-dance below and gets its `this`/locals isolated
+        // from the parent's live stack).
+        if saved_ctx_needed
+            && !has_pid_ctx
+            && !self.method_local_base.is_empty()
+            && self.process_parents.get(&pid).is_none()
+        {
+            self.run_process_payload(pid, stmts);
+            let susp = self.is_pid_suspended(pid);
+            if susp
+                && (!self.this_stack.is_empty()
+                    || !self.local_stack.is_empty()
+                    || !self.class_context_stack.is_empty()
+                    || !self.method_local_base.is_empty())
+            {
+                self.process_contexts
+                    .insert(pid, self.snapshot_process_context());
+            } else {
+                self.process_contexts.remove(&pid);
+            }
+            self.auto_loop_vars.truncate(saved_auto_len);
+            let mine = self.name_resolve_hint.replace(saved_hint);
+            Self::recycle_string(&mut self.hint_string_pool, mine);
+            return;
+        }
         // The caller's context is MOVED aside (the restore below overwrites
         // every field, so a clone bought nothing) and moved back at the end.
         let mut saved = self.take_process_context();
