@@ -30155,6 +30155,10 @@ impl Simulator {
                     debug_assert!(false, "ret-collection insn in isolated comb exec");
                     break;
                 }
+                Insn::AssignPendingColl(_) => {
+                    debug_assert!(false, "collect-store insn in isolated comb exec");
+                    break;
+                }
                 Insn::LoadConst(dest, val) => {
                     vm_regs[*dest as usize] = (**val).clone();
                 }
@@ -30950,6 +30954,10 @@ impl Simulator {
                 }
                 Insn::RetCollection(..) => {
                     debug_assert!(false, "ret-collection insn in isolated comb exec");
+                    break;
+                }
+                Insn::AssignPendingColl(_) => {
+                    debug_assert!(false, "collect-store insn in isolated comb exec");
                     break;
                 }
                 Insn::LoadConst(dest, val) => {
@@ -32424,14 +32432,12 @@ impl Simulator {
                         self.vm_drain_arg_temps(base, n);
                     }
                     self.vm_regs[*dest as usize] = result;
-                    // class-perf collection-return: a compiled CALLER can't
-                    // consume a collection result (its lowering of a
-                    // collection-typed assignment declines the whole method,
-                    // so a surviving `pending_ret_collection` could only leak
-                    // into an outer, unrelated assign). The AST fast path's
-                    // `assign_pending_ret_collection` TAKES the pending (and
-                    // drops it on failure); mirror that consumption here.
-                    self.pending_ret_collection = None;
+                    // class-perf collection-return: now the COMPILED CALLER can
+                    // consume a collection result via the immediately-following
+                    // `AssignPendingColl` insn (which this VM loop's call
+                    // delegation look-ahead keeps alive). A collection-returning
+                    // call in any other position cannot be read by the caller,
+                    // so the delegation site drops the pending there.
                     local_count += 1;
                 }
             }
@@ -32746,11 +32752,10 @@ impl Simulator {
                     self.vm_drain_arg_temps(base, n);
                 }
                 self.vm_regs[*dest as usize] = result;
-                // class-perf collection-return leak guard (see CallMethod):
-                // a callee routed through `exec_method_call` may leave a
-                // `pending_ret_collection`; a compiled caller can never
-                // consume one, so drop it here.
-                self.pending_ret_collection = None;
+                // class-perf collection-return: the compiled CALLER consumes a
+                // pending collection store via `AssignPendingColl`; if this
+                // call's result isn't immediately stored, the exec_insns call
+                // delegation look-ahead drops the pending.
                 local_count += 1;
             }
             // Step 9b-ii: element READ of a class member collection
@@ -33259,6 +33264,37 @@ impl Simulator {
                 | Insn::ForeachKeys(..)
                 | Insn::RetCollection(..) => {
                     local_count += self.exec_class_opcode(&insns[pc]);
+                    // class-perf collection-return store: a callee whose
+                    // body returned a queue leaves `pending_ret_collection`
+                    // set for the COMPILED CALLER to consume. The callee can
+                    // only be meaningfully stored by the immediately-following
+                    // `AssignPendingColl` (`q_local = coll_fn(...)`); any other
+                    // consumer cannot read a collection value, so drop the
+                    // pending here unless that insn follows. This is the
+                    // compiled-mirror of the AST's assign_pending_ret_collection
+                    // (which takes/drops pending on every blocking assign).
+                    if !matches!(insns.get(pc + 1), Some(Insn::AssignPendingColl(_))) {
+                        self.pending_ret_collection = None;
+                    }
+                }
+                // class-perf collection-return store: copy the callee's
+                // `pending_ret_collection` snapshot whole into the named
+                // local collection (bare queue / unsized dynamic array), then
+                // drop it. Mirrors the AST `assign_pending_ret_collection`
+                // byname path; a strain surviving here is a no-op.
+                Insn::AssignPendingColl(key) => {
+                    let Some(src) = self.pending_ret_collection.take() else {
+                        break;
+                    };
+                    let bare = key.strip_prefix('\u{1}').unwrap_or(key);
+                    let dst = self
+                        .dyn_name_lookup(bare)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| bare.to_string());
+                    if dst != src {
+                        self.copy_whole_queue(&dst, &src);
+                    }
+                    self.settle_after_proc_write();
                 }
                 // Advance a compiled foreach: pop the slot's next key into
                 // the var register; `ok` = 0 at exhaustion (loop exit).
@@ -47755,6 +47791,7 @@ impl Simulator {
             Insn::ForeachKeys(..) => "ForeachKeys",
             Insn::ForeachNext(..) => "ForeachNext",
             Insn::RetCollection(..) => "RetCollection",
+            Insn::AssignPendingColl(..) => "AssignPendingColl",
             Insn::LoadConst(..) => "LoadConst",
             Insn::LoadSignal(..) => "LoadSignal",
             Insn::LoadSignalSigned(..) => "LoadSignalSigned",
@@ -155424,6 +155461,13 @@ impl Simulator {
                     scope_static_receivers.remove(nm);
                 }
                 scope_static_receivers.retain(|n| !self.signal_name_to_id.contains_key(n.as_str()));
+                // 9h free-fn gate: only ELABORATED concrete class names are
+                // safe to compile as class-scope static receivers from a
+                // free function body (the defining class is baked; the
+                // runtime resolves it without the stale caller spec). Type
+                // params and typedef aliases are deliberately excluded.
+                let concrete_class_names: HashSet<String> =
+                    self.module.classes.keys().cloned().collect();
                 let admission = self.compiled_method_admission.clone().unwrap_or_else(|| {
                     let mut facts = super::bytecode::MethodAdmission::default();
                     for (class, declaration) in &self.module.classes {
@@ -155540,6 +155584,7 @@ impl Simulator {
                         &const_names,
                         &new_type_map,
                         &scope_static_receivers,
+                        &concrete_class_names,
                         &handle_local_types,
                         &string_method_names,
                         &free_fn_table,

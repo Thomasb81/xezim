@@ -226,6 +226,7 @@ impl Opcode {
             Insn::ForeachKeys(..) => Self::ForeachKeys,
             Insn::ForeachNext(..) => Self::ForeachNext,
             Insn::RetCollection(..) => Self::Nop, // census: no register ops
+            Insn::AssignPendingColl(..) => Self::Nop, // census only; exec via generic match
         }
     }
 

@@ -655,6 +655,16 @@ pub enum Insn {
     /// (width 0), exactly like a class-handle return.
     RetCollection(u32, u32),
 
+    /// class-perf collection-return store: a compiled CALLER consumes a
+    /// callee's `pending_ret_collection` (a queue / unsized-dynamic-array
+    /// result) by copying it whole into the named LOCAL collection.
+    /// `key` is the `local_coll_key` (`\x01`-prefixed) of the destination
+    /// local. The compiler emits this IMMEDIATELY after the collection-
+    /// returning CallMethod / CallFreeFunction etc.; the VM loop keeps
+    /// `pending_ret_collection` alive for exactly this insn (see
+    /// `exec_insns`'s call delegation look-ahead) and drops it otherwise.
+    AssignPendingColl(Box<str>),
+
     Nop,
 
     /// Fused `LoadSignal` + `RangeSelectConst`: dest = signal_table[sig][left:right].
@@ -1165,6 +1175,7 @@ impl Insn {
             // (no rebasing needed beyond the range itself — the base is an
             // absolute slot like CallFreeFunction's).
             RetCollection(_, _) => {}
+            AssignPendingColl(_) => {}
             RangeSelectW(a, b, c, _, _) => {
                 *a += rb;
                 *b += rb;
@@ -1299,6 +1310,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::ForeachKeys(..) => "FeKeys",
         Insn::ForeachNext(..) => "FeNext",
         Insn::RetCollection(..) => "RetColl",
+        Insn::AssignPendingColl(..) => "AssignPC",
         Insn::Nop => "Nop",
         Insn::Jump(..) => "Jump",
         Insn::BranchIfFalse(..) => "Br",
@@ -1589,6 +1601,14 @@ pub struct BytecodeCompiler<'a> {
     /// targets are admitted (compile-site filtered).
     new_type_map: HashMap<String, String>,
     scope_static_receivers: HashSet<String>,
+    /// Covers 9h free-fn gate: the set of ELABORATED concrete class names
+    /// (keys of `module.classes`). A class-scope static call from a FREE
+    /// function is only compiled when the receiver is one of these — a
+    /// plain class whose defining class is baked, so `exec_class_scope_
+    /// static_call` resolves it without consulting the (stale) caller
+    /// `current_spec`. Type-param receivers stay on the AST interpreter,
+    /// where the per-specialization binding is resolved by the frame.
+    concrete_class_names: HashSet<String>,
     /// class-perf Step 9e: the static CLASS of the method being compiled —
     /// the `this` root's type for TYPED handle-chain admission.
     method_class: Option<String>,
@@ -1943,6 +1963,7 @@ impl<'a> BytecodeCompiler<'a> {
             class_const_names: HashSet::default(),
             new_type_map: HashMap::default(),
             scope_static_receivers: HashSet::default(),
+            concrete_class_names: HashSet::default(),
             method_class: None,
             handle_member_types: None,
             method_admission: None,
@@ -5421,6 +5442,37 @@ impl<'a> BytecodeCompiler<'a> {
     /// interpreter's per-call `@name#id` storage key (`dyn_name_lookup`).
     fn local_coll_key(name: &str) -> String {
         format!("\u{1}{}", name)
+    }
+
+    /// class-perf collection-return store: the `local_coll_key` of a BARE
+    /// local collection (`q`, a queue / unsized dynamic array declared in
+    /// this method body). Used at a blocking-assign site whose RHS is a
+    /// collection-returning call — the pending snapshot is copied to this
+    /// key. Non-bare or non-local targets yield None (those keep the AST
+    /// fallback path).
+    fn local_coll_lhs_key(&self, lvalue: &Expression) -> Option<String> {
+        if !self.local_coll_names.contains(&self.ident_bare(lvalue)?) {
+            return None;
+        }
+        // Restrict to a bare one-segment Ident (no selects, no dotted base,
+        // no explicit class scope): the runtime per-call `@name#id` store.
+        match &lvalue.kind {
+            ExprKind::Ident(h)
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                Some(Self::local_coll_key(h.path[0].name.name.as_str()))
+            }
+            _ => None,
+        }
+    }
+
+    fn ident_bare(&self, e: &Expression) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                Some(h.path[0].name.name.to_string())
+            }
+            _ => None,
+        }
     }
 
     /// Split a marked local-collection key back to the bare name.
@@ -10672,6 +10724,26 @@ impl<'a> BytecodeCompiler<'a> {
                 };
                 self.pattern_layout = None;
                 if let Some(val_reg) = compiled {
+                    // class-perf collection-return store: `q_local = coll_fn(..)`.
+                    // The callee's body hands its queue/array result through the
+                    // `pending_ret_collection` side channel (RetCollection); a
+                    // COMPILED caller previously declined the whole method on
+                    // this shape (`blocking_target`). Emit AssignPendingColl to
+                    // copy that snapshot whole into the named local collection.
+                    // It must be the instruction IMMEDIATELY following the call:
+                    // the VM loop's call-delegation look-ahead keeps the pending
+                    // alive across exactly this insn, then drops it. A
+                    // collection-returning call in any REQUIRED position is only
+                    // meaningfully stored by a collection local, so this shape
+                    // (bare local lhs + call rhs) selects the store gate.
+                    if self.method_mode
+                        && matches!(rvalue.kind, ExprKind::Call { .. })
+                        && self.local_coll_lhs_key(lvalue).is_some()
+                    {
+                        let key = self.local_coll_lhs_key(lvalue).unwrap();
+                        self.emit(Insn::AssignPendingColl(key.into_boxed_str()));
+                        return true;
+                    }
                     if width > 0 && !via_new {
                         self.emit(Insn::Resize(val_reg, width));
                     }
@@ -14460,7 +14532,25 @@ impl<'a> BytecodeCompiler<'a> {
                     // pipeline corrupted strings. Free fns decline static
                     // scoped calls; they stay on the AST interpreter which
                     // resolves the scope correctly.
-                    && !self.free_function_mode
+                    // free-function bodies have no `this` and no defining
+                    // class context: a class-scope static call
+                    // (`Cls.m(..)` / `pkg.Cls.m(..)`) re-enters the
+                    // dispatcher with the CALLER's class context — for a
+                    // free fn that is whatever frame ran last. Compiling a
+                    // CONCRETE-class receiver is safe: `CallStaticScoped`
+                    // bakes the class name, and
+                    // `exec_class_scope_static_call` resolves it through
+                    // `module.classes` without consulting the stale
+                    // `current_spec` (it saves/restores spec around the
+                    // dispatch). A TYPE-PARAM receiver (`T::m()`) instead
+                    // resolves via `resolve_type_param_binding(name)`
+                    // against the stale spec, which is exactly the
+                    // `uvm_report_info`/`get_server` string corruption the
+                    // gate guards; those stay on the AST interpreter.
+                    && (!self.free_function_mode
+                        || self
+                            .concrete_class_names
+                            .contains(h.path[0].name.name.as_str()))
                     && self
                         .scope_static_receivers
                         .contains(h.path[0].name.name.as_str())
@@ -17719,6 +17809,7 @@ impl<'a> BytecodeCompiler<'a> {
         class_const_names: &HashSet<String>,
         new_type_map: &HashMap<String, String>,
         scope_static_receivers: &HashSet<String>,
+        concrete_class_names: &HashSet<String>,
         handle_local_types: &HashMap<String, String>,
         string_method_names: &HashSet<String>,
         functions: &'a HashMap<String, FunctionDeclaration>,
@@ -17836,6 +17927,7 @@ impl<'a> BytecodeCompiler<'a> {
         self.class_const_names = class_const_names.clone();
         self.new_type_map = new_type_map.clone();
         self.scope_static_receivers = scope_static_receivers.clone();
+        self.concrete_class_names = concrete_class_names.clone();
         self.method_class = Some(method_class.to_string());
         self.handle_member_types = Some(handle_member_types);
 
@@ -18104,6 +18196,8 @@ impl<'a> BytecodeCompiler<'a> {
                     f(x as RegId);
                 }
             }
+            // class-perf collection-return store: no register inputs.
+            Insn::AssignPendingColl(_) => {}
             // Step 9g: a static-property READ has no register inputs.
             Insn::LoadClassStatic(..) => {}
             Insn::StoreClassStatic(_, src) => f(*src),
@@ -19927,6 +20021,9 @@ impl<'a> BytecodeCompiler<'a> {
                 // Collection-return hand-off defines no SSA value (the
                 // result leaves via the side-channel snapshot store).
                 Insn::RetCollection(..) => {}
+                // class-perf collection-return store writes the side-channel
+                // snapshot into a collection (no SSA register defined).
+                Insn::AssignPendingColl(_) => {}
                 // `$cast`: the 1/0 result's width is statically 32, but the
                 // register route also re-defines the dest slot at a runtime
                 // width (the frame arm's fit) — drop both from tracking.
