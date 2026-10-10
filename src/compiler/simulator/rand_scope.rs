@@ -112,7 +112,11 @@ impl Simulator {
 
     /// Storage keys of a class collection, or None for a scalar property.
     /// Fixed arrays use their declared labels, including inherited ranges.
-    fn rand_child_collection_keys(&self, handle: usize, prop: &str) -> Option<Vec<String>> {
+    pub(super) fn rand_child_collection_keys(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<Vec<String>> {
         let scoped = format!("{}#{}", handle, prop);
         let mut cls = self
             .heap
@@ -1238,7 +1242,7 @@ impl Simulator {
 impl Simulator {
     /// The names of a plain operand path: an identifier (no selects, no
     /// root) or a member-access chain over one. None for anything else.
-    fn member_chain(e: &Expression) -> Option<Vec<String>> {
+    pub(super) fn member_chain(e: &Expression) -> Option<Vec<String>> {
         match &e.kind {
             ExprKind::Ident(h) => {
                 if h.root.is_some() || h.path.iter().any(|s| !s.selects.is_empty()) {
@@ -1414,7 +1418,7 @@ impl Simulator {
 
     /// Replace the plain identifier `name` with `lit` throughout `it`
     /// (stopping at a nested `foreach` that rebinds it).
-    fn subst_ident_item(it: &mut ConstraintItem, name: &str, lit: &Expression) {
+    pub(super) fn subst_ident_item(it: &mut ConstraintItem, name: &str, lit: &Expression) {
         let se = |e: &mut Expression| Self::subst_ident_expr(e, name, lit);
         match it {
             ConstraintItem::Expr(e) => Self::subst_ident_expr(e, name, lit),
@@ -1471,7 +1475,15 @@ impl Simulator {
                 }
             }
             ConstraintItem::Unique { exprs, .. } => exprs.iter_mut().for_each(se),
-            ConstraintItem::Solve { .. } => {}
+            // §18.5.10: an operand path may pick an element by the index.
+            ConstraintItem::Solve {
+                before_paths,
+                after_paths,
+                ..
+            } => before_paths
+                .iter_mut()
+                .chain(after_paths.iter_mut())
+                .for_each(se),
         }
     }
 

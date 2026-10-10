@@ -73948,6 +73948,16 @@ impl Simulator {
                         }
                     }
                 }
+                // §7.4.5: an element of a packed-array field of a packed
+                // struct reached through a member chain (`h.r.t[k]`,
+                // `a[0].r.t[k]`): the field's first dimension picks an
+                // element, not a bit.
+                if let ExprKind::MemberAccess { expr: sb, member } = &expr.kind
+                    && matches!(sb.kind, ExprKind::MemberAccess { .. })
+                    && let Some(v) = self.struct_field_elem_read(sb, member, index)
+                {
+                    return v;
+                }
                 // Every shape probe below used to re-resolve this same base
                 // identifier from scratch — up to ten resolutions, each with
                 // its own allocation, per indexed read. On an axi4Lite UVM run
@@ -110681,6 +110691,62 @@ impl Simulator {
         None
     }
 
+    /// `sb.member[index]` with `member` a packed-array field (two or more
+    /// packed dimensions) of the packed struct `sb` names: the element.
+    #[inline(never)]
+    fn struct_field_elem_read(
+        &mut self,
+        sb: &Expression,
+        member: &crate::ast::Identifier,
+        index: &Expression,
+    ) -> Option<Value> {
+        let su = self.chain_base_packed_struct(sb)?;
+        let m = su
+            .members
+            .iter()
+            .find(|m| m.declarators.iter().any(|d| d.name.name == member.name))?;
+        let dims = crate::compiler::elaborate::packed_full_dims_chained(
+            &m.data_type,
+            &self.module.parameters,
+            &self.module.typedef_types,
+        )?;
+        if dims.len() < 2 {
+            return None;
+        }
+        let (l, r) = dims[0];
+        let n = (l - r).unsigned_abs() + 1;
+        let field = Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(sb.clone()),
+                member: member.clone(),
+            },
+            sb.span,
+        );
+        let fv = self.eval_expr(&field);
+        let fw = u64::from(fv.width);
+        if n == 0 || fw % n != 0 {
+            return None;
+        }
+        let ew = (fw / n) as u32;
+        let iv = self.eval_expr(index);
+        if iv.has_xz() {
+            return Some(Value::new(ew));
+        }
+        let k = iv.to_i64()?;
+        let off = if l >= r {
+            (r..=l).contains(&k).then(|| k - r)
+        } else {
+            (l..=r).contains(&k).then(|| r - k)
+        };
+        Some(match off {
+            Some(o) => {
+                let lo = o as u32 * ew;
+                fv.range_select((lo + ew - 1) as usize, lo as usize)
+            }
+            None => Value::new(ew),
+        })
+    }
+
     fn chain_base_packed_struct(
         &mut self,
         e: &Expression,
@@ -110691,7 +110757,16 @@ impl Simulator {
                 Self::resolve_type_ref(&ret, &self.module.typedef_types)
             }
             ExprKind::MemberAccess { expr, member } => {
-                let su = self.chain_base_packed_struct(expr)?;
+                let Some(su) = self.chain_base_packed_struct(expr) else {
+                    // §8.4/§7.2.1: a packed-struct property of a class
+                    // object (`h.r` in `h.r.hdr.a`, `a[0].r.f`).
+                    let h = self.eval_expr(expr).to_u64().unwrap_or(0) as usize;
+                    if h == 0 || self.heap.get(h).and_then(|o| o.as_ref()).is_none() {
+                        return None;
+                    }
+                    let su = self.class_prop_struct(h, &member.name)?;
+                    return (su.packed && !Self::spreads_member_wise(&su)).then_some(su);
+                };
                 let m_dt = su
                     .members
                     .iter()
@@ -143867,25 +143942,14 @@ impl Simulator {
         // The joint solver (`rand_csp`) models integral scalars and 1-D
         // arrays; randc cycles, real values, object handles and unpacked
         // aggregates stay with the trial loop.
-        // §18.5.9: rand sub-objects held in plain handle members join the
-        // fallback joint solve (`csp_add_sub`); a collection of objects, a
-        // null handle or a member-subset call keeps them out.
+        // §18.5.9: rand sub-objects held in handle members, and in fixed,
+        // dynamic and queue arrays of handles, join the fallback joint solve
+        // (`csp_add_sub`); an associative array of objects, a shared or null
+        // plain handle or a member-subset call keeps them out.
         let sub_objs: Option<Vec<(String, usize)>> = if self.randomize_subset.is_some() {
             None
         } else {
-            let cd = self.module.classes.get(&class_name).cloned();
-            rand_obj_props
-                .iter()
-                .map(|p| {
-                    let coll = cd.as_ref().is_some_and(|cd| {
-                        cd.queue_properties.contains_key(p)
-                            || cd.array_properties.contains_key(p)
-                            || cd.assoc_properties.contains_key(p)
-                    }) || self.is_associative_array(&format!("{}#{}", handle, p));
-                    let sub = self.member_handle(handle, p).unwrap_or(0);
-                    (!coll && sub != 0 && sub != handle).then(|| (p.clone(), sub))
-                })
-                .collect()
+            self.rand_csp_subs(handle, &class_name, &rand_obj_props, &constraints)
         };
         let mut csp_ok = randc_set.is_empty()
             && real_rand_props.is_empty()
