@@ -44306,6 +44306,30 @@ impl Simulator {
             return;
         }
 
+        self.promote_condition_waiters_for_names(&target_names);
+    }
+
+    /// Re-check parked condition waiters whose condition names one of
+    /// `target_names`, promoting those now true to `ready_condition_waiters`.
+    /// Shared by `check_condition_waiters_for_write` (a blocking procedural
+    /// write) and the fork-child merge path (a child's write propagating back
+    /// into a parked parent's activation). The promotion is what unblocks the
+    /// waiter inside a long-running edge cascade, which drains only READY
+    /// waiters (`ready_condition_waiters`) and would otherwise starve a parked
+    /// (§9.4.2) condition-maintained handshake.
+    fn promote_condition_waiters_for_names(&mut self, target_names: &[String]) {
+        if self.condition_waiters.is_empty() {
+            return;
+        }
+        let any_match = self.condition_waiters.iter().any(|(pid, _)| {
+            self.cond_waiter_reads
+                .get(pid)
+                .is_some_and(|reads| target_names.iter().any(|tn| reads.contains(tn)))
+        });
+        if !any_match {
+            return;
+        }
+
         let mut i = 0;
         while i < self.condition_waiters.len() {
             let (pid, _) = self.condition_waiters[i];
@@ -49240,28 +49264,39 @@ impl Simulator {
         //       into `self.signals`, which is what the parent reads from.
         let child_frames: &[HashMap<String, Value>] = &child_ctx.local_stack;
         let child_frames_gen: &[u64] = &child_ctx.local_gen_stack;
-        let baseline = self.fork_baselines.get(&pid);
-        let signal_caps = self.fork_signal_captures.get(&pid);
+        let baseline = self.fork_baselines.get(&pid).cloned();
+        let signal_caps = self.fork_signal_captures.get(&pid).cloned();
         if !child_frames.is_empty() {
             if let Some(parent_pid) = self.process_parents.get(&pid).copied() {
                 // (a) subroutine-frame merge
-                if let Some(parent_ctx) = self.process_contexts.get_mut(&parent_pid) {
-                    Self::merge_fork_writes(
+                let (written, _parent_in_pctx) = if let Some(parent_ctx) =
+                    self.process_contexts.get_mut(&parent_pid)
+                {
+                    let w = Self::merge_fork_writes(
                         &mut parent_ctx.local_stack,
                         &parent_ctx.local_gen_stack,
                         child_frames,
                         child_frames_gen,
-                        baseline,
+                        baseline.as_ref(),
                     );
+                    (w, true)
                 } else {
                     // Parent is the active process — its context is `saved`.
-                    Self::merge_fork_writes(
+                    let w = Self::merge_fork_writes(
                         &mut saved.local_stack,
                         &saved.local_gen_stack,
                         child_frames,
                         child_frames_gen,
-                        baseline,
+                        baseline.as_ref(),
                     );
+                    (w, false)
+                };
+                if !written.is_empty() {
+                    // A child wrote a key a parked `wait` of the parent reads —
+                    // promote it to ready so a long-running edge cascade (which
+                    // drains only READY waiters) unblocks the handshake instead
+                    // of starving it.
+                    self.promote_condition_waiters_for_names(&written);
                 }
             }
         }
@@ -49271,11 +49306,12 @@ impl Simulator {
         // clobber a sibling's or the parent's concurrent write.
         if let Some(caps) = signal_caps {
             let top = child_frames.last();
-            for nm in caps {
+            for nm in &caps {
                 let Some(v) = top.and_then(|f| f.get(nm)) else {
                     continue;
                 };
                 let inherited_unchanged = baseline
+                    .as_ref()
                     .and_then(|b| b.last())
                     .and_then(|f| f.get(nm))
                     .is_some_and(|old| old == v);
@@ -49963,13 +49999,17 @@ impl Simulator {
     /// clobber the unrelated activation that now occupies the same slot
     /// (regression 3627: an alpha reader orphaned by `join_any` kept overwriting
     /// beta's `count` with its own stale value).
+    /// Returns the names of keys actually propagated (child value differs
+    /// from both baseline and parent, so a real write landed). The caller
+    /// uses this to promote parked condition waiters that read those names.
     fn merge_fork_writes(
         parent_frames: &mut [HashMap<String, Value>],
         parent_gens: &[u64],
         child_frames: &[HashMap<String, Value>],
         child_gens: &[u64],
         baseline: Option<&Vec<HashMap<String, Value>>>,
-    ) {
+    ) -> Vec<String> {
+        let mut written = Vec::new();
         let n = parent_frames.len().min(child_frames.len());
         for i in 0..n {
             let same_activation = parent_gens.get(i).copied() == child_gens.get(i).copied();
@@ -50001,6 +50041,7 @@ impl Simulator {
                             *slot = v.clone();
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
+                            written.push(k.clone());
                         }
                     }
                 }
@@ -50021,12 +50062,14 @@ impl Simulator {
                             *slot = v.clone();
                             // A parked `wait` of the parent may read it.
                             note_store_write(name_bit(k));
+                            written.push(k.clone());
                         }
                     }
                     None => continue,
                 }
             }
         }
+        written
     }
 
     /// Evaluate a `#delay` expression to an integer number of simulator ticks.
@@ -51018,7 +51061,18 @@ impl Simulator {
                                 .flatten()
                             {
                                 if self.stmts_have_blocking(&td.items) {
-                                    let cleanup = self.bind_task_frame(&td, args, None);
+                                    let mut cleanup = self.bind_task_frame(&td, args, None);
+                                    // §13.4/§13.3.2: a free task body must NOT
+                                    // see the caller's class context — task-scope
+                                    // `static` locals key off
+                                    // `class_context_stack` at their declaration,
+                                    // so an unshielded body silently gave every
+                                    // CALLING CLASS its own copy of the static
+                                    // cell (uvm_wait_for_nba_region's shared
+                                    // nba/next_nba barrier split per caller
+                                    // class). Self-guarded: only shields when
+                                    // the caller actually has a `this`.
+                                    self.push_instance_task_context(&mut cleanup);
                                     self.task_cleanup.push(cleanup);
                                     let mut cont: Vec<Statement> = td.items.clone();
                                     cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -51043,7 +51097,10 @@ impl Simulator {
                 if let ExprKind::Call { func, args } = &expr.kind {
                     if let Some(td) = self.package_task_target(func) {
                         if self.stmts_have_blocking(&td.items) {
-                            let cleanup = self.bind_task_frame(&td, args, None);
+                            let mut cleanup = self.bind_task_frame(&td, args, None);
+                            // §13.4/§13.3.2 class-context shield — see the
+                            // bare free-task arm above (Stage 1).
+                            self.push_instance_task_context(&mut cleanup);
                             self.task_cleanup.push(cleanup);
                             let mut cont: Vec<Statement> = td.items.clone();
                             cont.push(Statement::new(StatementKind::ScopePop, stmt.span));
@@ -134352,9 +134409,19 @@ impl Simulator {
             .or_else(|| self.module.func_decl_scope.get(&td.name.name.name).cloned());
         let mut cleanup = self.bind_task_frame(td, args, None);
         self.open_decl_shadow_frame();
-        if std::mem::take(&mut self.task_clears_this) {
-            self.push_instance_task_context(&mut cleanup);
-        }
+        // Consume the flag so a stale set at a call site cannot leak into a
+        // later invocation (it is subsumed by the unconditional shield
+        // below).
+        let _ = std::mem::take(&mut self.task_clears_this);
+        // §13.4/§13.3.2: shield the SYNCHRONOUS free-task path too — a free
+        // task body must not see a class-method caller's `this`/class
+        // context, or its task-scope `static` locals get keyed per calling
+        // class (one shared cell per class instead of one per declaration;
+        // IEEE 1800-2023 §13.3.2 requires a single variable "in a module
+        // instance, regardless of the number of concurrent activations").
+        // `push_instance_task_context` self-guards on the caller having a
+        // `this`, so module/package callers are unaffected.
+        self.push_instance_task_context(&mut cleanup);
         self.pkg_scope_stack.push(pkg_scope);
         // Execute task body
         for stmt in &td.items {
