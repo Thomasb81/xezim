@@ -32691,11 +32691,7 @@ impl Simulator {
                         }
                     }
                 }
-                let result = if handle == 0 {
-                    // Null receiver: the AST funnel falls through to
-                    // `Value::zero(32)` (no storage, no fault).
-                    Value::zero(32)
-                } else if let Some(bare_name) = Self::split_local_coll_marker(member) {
+                let result = if let Some(bare_name) = Self::split_local_coll_marker(member) {
                     // Row 3: a LOCAL collection declared in this body
                     // (the decl ran as a StmtFallback, registering the
                     // per-call `@name#id` key in the current frame).
@@ -32708,8 +32704,13 @@ impl Simulator {
                     let store = self.local_coll_store(bare_name);
                     match self.eval_builtin_method(&store, m, &args) {
                         Some(v) => v,
+                        None if handle == 0 => Value::zero(32),
                         None => self.exec_method_call(handle, m, &args),
                     }
+                } else if handle == 0 {
+                    // Null receiver: the AST funnel falls through to
+                    // `Value::zero(32)` (no storage, no fault).
+                    Value::zero(32)
                 } else if *bare != 0 {
                     // Bare receiver (`q.size()`): the receiver IS
                     // `this`. Resolve the member's instance store FIRST
