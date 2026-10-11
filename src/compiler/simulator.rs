@@ -156243,24 +156243,27 @@ impl Simulator {
         };
         // Shape guards (permanent): non-input formals need the interpreter's
         // write-back epilogue; a param-bounded return needs the instance's
-        // param scope; parameterized defining classes need spec-static
-        // seeding; static methods dispatch through exec_static_method.
+        // param scope; static methods dispatch through exec_static_method.
+        // NOTE: a class whose methods carry a header `#(...)` list is NOT
+        // excluded here: by the time this function runs, `pre` is a compiled
+        // PLAN for this concrete method (the interpreter path `try_run_compiled_method`
+        // already compiled and runs it), so the block is specialization-correct.
+        // The body/instruction guards below (static locals, fallback insns)
+        // are what genuinely forbid a frame-free run.
         if !pre.writeback_formals.is_empty()
             || pre.param_able_result
-            || self.class_is_parameterized(dclass)
             || self.is_static_method(dclass, method)
         {
             never(self);
             return None;
         }
         // class-perf collection-return: the callee returns via the
-        // `pending_ret_collection` side channel, which needs the
-        // interpreter's queue-frame / epilogue machinery — VM->VM direct
-        // calls are scalar-only.
-        if pre.is_collection_result {
-            never(self);
-            return None;
-        }
+        // `pending_ret_collection` / `vm_ret_vals` side channel. A VM->VM
+        // direct call CAN carry this when `vm_try_direct_call` re-stashes the
+        // block's `RetCollection` flat values into `vm_ret_vals` for the
+        // caller's `AssignPendingColl`; we no longer blacklist it here. The
+        // instruction guards below (static locals, fallback insns) and the
+        // transport in `vm_try_direct_call` keep such a call correct.
         let key = (cid, mid, pre.formal_widths.clone(), pre.static_result_width);
         let Some(super::bytecode::CompiledMethodOutcome::Block(rc_entry)) =
             self.compiled_method_block_cache.get(&key).cloned()
