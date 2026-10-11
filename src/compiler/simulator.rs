@@ -6606,6 +6606,14 @@ pub struct Simulator {
     /// `pending_ret_collection` (None for a plain value return). Only the
     /// `AssignPendingColl` that may follow the call reads it.
     vm_ret_coll: Option<String>,
+    /// Flat element values a compiled collection-returning call produced
+    /// (`Insn::RetCollection`), stashed straight out of the callee's register
+    /// file. `Insn::AssignPendingColl` prefers these over the string-keyed
+    /// `vm_ret_coll`/`__xz_ret_coll__` snapshot+copy round trip, which
+    /// allocates a formatted key, a HashMap insert, a class-legacy scan and
+    /// per-element lookups per returned element. `None` = the AST/string path
+    /// produced the return and the historic signal-snapshot copy applies.
+    vm_ret_vals: Option<Vec<Value>>,
     /// Innermost-first stack of whether each currently-active function returns
     /// a collECTION (queue / unsized dynamic array). The `Return` statement
     /// reads the top to decide whether a LITERAL return value (`return '{...}`,
@@ -12062,6 +12070,7 @@ impl Simulator {
             timescale_scope_override: None,
             pending_ret_collection: None,
             vm_ret_coll: None,
+            vm_ret_vals: None,
             fn_ret_collection_stack: Vec::new(),
             current_scope: String::new(),
             m_block_scope: String::new(),
@@ -33044,18 +33053,32 @@ impl Simulator {
                 const RET_SNAP: &str = "__xz_ret_coll__";
                 let base = *arg_start as usize;
                 let n = *n as usize;
-                for (i, r) in (base..base + n).enumerate() {
-                    let v = self
-                        .vm_regs
-                        .get(r)
-                        .cloned()
-                        .unwrap_or_else(|| Value::zero(32));
-                    let name = format!("{RET_SNAP}[{i}]");
-                    self.set_signal_value_by_name(&name, v);
-                    // Mirror populate_queue_from_init's width registration
-                    // (unregistered names read fine, but a registered width
-                    // keeps downstream element-width fits exact).
-                    self.widths.entry(name).or_insert(32);
+                // Fast channel: capture the flat element values straight out
+                // of the callee registers so AssignPendingColl can copy them
+                // into a local queue without the signal-snapshot round trip.
+                let mut vals = Vec::with_capacity(n);
+                for r in base..base + n {
+                    vals.push(
+                        self.vm_regs
+                            .get(r)
+                            .cloned()
+                            .unwrap_or_else(|| Value::zero(32)),
+                    );
+                }
+                self.vm_ret_vals = Some(vals);
+                // Keep the string-keyed snapshot too: the AST/name-resolved
+                // destination path (and any non-local consumer) still reads
+                // the historical `__xz_ret_coll__[i]` cells.
+                if let Some(vals) = self.vm_ret_vals.take() {
+                    for (i, v) in vals.iter().enumerate() {
+                        let name = format!("{RET_SNAP}[{i}]");
+                        self.set_signal_value_by_name(&name, v.clone());
+                        // Mirror populate_queue_from_init's width registration
+                        // (unregistered names read fine, but a registered width
+                        // keeps downstream element-width fits exact).
+                        self.widths.entry(name).or_insert(32);
+                    }
+                    self.vm_ret_vals = Some(vals);
                 }
                 self.set_queue_size(RET_SNAP, n as u64);
                 self.pending_ret_collection = Some(RET_SNAP.to_string());
@@ -33069,13 +33092,49 @@ impl Simulator {
                 let bare = Self::split_local_coll_marker(key).unwrap_or(key);
                 let span = crate::ast::Span::dummy();
                 let lv = Self::hier_ident_expr(Self::iface_path_segs(bare, span), span);
-                self.pending_ret_collection = self.vm_ret_coll.take();
-                if !self.assign_pending_ret_collection(&lv) {
-                    let v = self.vm_regs[*val as usize].clone();
-                    self.assign_value(&lv, &v);
-                    self.settle_after_proc_write();
+                // Fast path: a compiled `RetCollection` stashed the flat
+                // element values. Write them straight onto the resolved
+                // destination (element cells + size) without materializing the
+                // `__xz_ret_coll__` signal snapshot or the per-element reads
+                // in `copy_whole_queue` (which scans the class table and
+                // rebuilds formatted keys per element). The destination is
+                // resolved by the exact helper `assign_pending_ret_collection`
+                // uses, so when it cannot resolve a writable base we fall back
+                // to the historic path, byte-identical.
+                let resolved_dst = self.pending_coll_dst(&lv);
+                if let Some(vals) = self.vm_ret_vals.take() {
+                    self.pending_ret_collection = self.vm_ret_coll.take();
+                    match resolved_dst {
+                        Some(dst) => {
+                            for (i, v) in vals.iter().enumerate() {
+                                self.set_signal_value_by_name(&format!("{dst}[{i}]"), v.clone());
+                            }
+                            self.set_queue_size(&dst, vals.len() as u64);
+                            self.settle_after_proc_write();
+                        }
+                        None => {
+                            // Destination not resolvable to a writable base:
+                            // put the values back on the fast channel and take
+                            // the historic snapshot path (which also settles
+                            // internally when it copies).
+                            self.vm_ret_vals = Some(vals);
+                            if !self.assign_pending_ret_collection(&lv) {
+                                let v = self.vm_regs[*val as usize].clone();
+                                self.assign_value(&lv, &v);
+                                self.settle_after_proc_write();
+                            }
+                        }
+                    }
+                    local_count += 1;
+                } else {
+                    self.pending_ret_collection = self.vm_ret_coll.take();
+                    if !self.assign_pending_ret_collection(&lv) {
+                        let v = self.vm_regs[*val as usize].clone();
+                        self.assign_value(&lv, &v);
+                        self.settle_after_proc_write();
+                    }
+                    local_count += 1;
                 }
-                local_count += 1;
             }
             _ => unreachable!("unexpected opcode in class executor"),
         }
@@ -76692,23 +76751,7 @@ impl Simulator {
         let Some(src) = self.pending_ret_collection.take() else {
             return false;
         };
-        let dst: Option<std::borrow::Cow<str>> = {
-            let byname = if let ExprKind::Ident(h) = &lvalue.kind {
-                let bare = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                let n = self
-                    .dyn_name_lookup(bare)
-                    .map(|s| std::borrow::Cow::Owned(s.to_string()))
-                    .unwrap_or_else(|| self.resolve_hier_name(h));
-                self.module.dynamic_arrays.contains(&*n).then_some(n)
-            } else {
-                None
-            };
-            byname.or_else(|| {
-                self.expr_assoc_name(lvalue)
-                    .filter(|an| !self.is_associative_array(an))
-                    .map(std::borrow::Cow::Owned)
-            })
-        };
+        let dst: Option<String> = self.pending_coll_dst(lvalue);
         let Some(dst) = dst else {
             return false;
         };
@@ -76719,6 +76762,29 @@ impl Simulator {
         true
     }
 
+    /// Resolve the whole-collection storage name that a collection-return
+    /// assignment `q = f(..)` writes into, for the destination expression
+    /// `lvalue`. This is the exact resolution shared by the historic
+    /// `assign_pending_ret_collection` copy and the compiled flat-value fast
+    /// path: a rename-frame local / dynamic-array name (via [`dyn_name_lookup`])
+    /// or an [`expr_assoc_name`] instance-scoped collection; the associative
+    /// case is excluded (an assoc assign keeps the AST copy path).
+    fn pending_coll_dst(&mut self, lvalue: &Expression) -> Option<String> {
+        let byname = if let ExprKind::Ident(h) = &lvalue.kind {
+            let bare = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            let n = self
+                .dyn_name_lookup(bare)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| self.resolve_hier_name(h).into_owned());
+            self.module.dynamic_arrays.contains(&n).then_some(n)
+        } else {
+            None
+        };
+        byname.or_else(|| {
+            self.expr_assoc_name(lvalue)
+                .filter(|an| !self.is_associative_array(an))
+        })
+    }
     /// The extra conditions for `n = r` (both bare names) to reduce to a
     /// plain evaluate + assign: no `new`, no vif binding to carry, no
     /// struct copy or spread, and no collection / array / associative copy
