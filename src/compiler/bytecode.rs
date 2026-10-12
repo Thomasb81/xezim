@@ -13,10 +13,24 @@ use xezim_core::hasher::{HashMap, HashSet};
 
 const MAX_INLINE_DEPTH: usize = 8;
 
+/// Sentinel for a method receiver whose declared class could not be resolved
+/// (a handle local/formal with no carried declared type). `emit_arg_slot_writeback`
+/// treats UNTYPED receivers with the conservative name-global writeback rule.
+const UNTYPED: &str = "\u{0}";
+
 /// Immutable admission facts shared by all method compiles in one design.
 #[derive(Default)]
 pub(crate) struct MethodAdmission {
-    pub writeback_positions: HashMap<String, HashSet<usize>>,
+    /// class-perf writeback: non-input (output/inout/ref) formal positions,
+    /// keyed by the class that DECLARES the method. Keying by class (not by
+    /// bare method name) stops names that un-related classes share (one
+    /// class's `get(output ...)` vs another's input-only `get`) from
+    /// spuriously declining the other call's compile.
+    pub writeback_positions: HashMap<(String, String), HashSet<usize>>,
+    /// Direct supervclass (extends target, spec args stripped) per declared
+    /// class. `emit_arg_slot_writeback` walks this chain to gather the
+    /// non-input formal positions inherited by a receiver's class.
+    pub class_parents: HashMap<String, String>,
     pub instance_fields: HashMap<String, HashSet<String>>,
     /// §8.20: declared class -> method -> the class whose body a call
     /// through a handle of that declared type binds to, for every
@@ -4949,24 +4963,55 @@ impl<'a> BytecodeCompiler<'a> {
         &mut self,
         args: &[Expression],
         arg_start: RegId,
-        method: Option<&str>,
+        class_method: Option<(&str, &str)>,
     ) -> Option<()> {
         // The VM only returns argument slots to bare register-backed locals.
         // Keep other writable actuals on the AST path, which retains their
         // lvalue expression for the interpreter's argument binding.
-        if let Some(method) = method {
+        if let Some((rc, method)) = class_method {
             let Some(admission) = self.method_admission.as_ref() else {
                 self.bail("method_writeback_metadata");
                 return None;
             };
-            if admission
-                .writeback_positions
-                .get(method)
-                .is_some_and(|positions| {
-                    positions.iter().any(|&i| {
-                        args.get(i).is_some_and(|arg| {
-                    !matches!(&arg.kind, ExprKind::Ident(h) if self.local_var_reg_of(h).is_some())
-                })
+            // Non-input formal positions (output/inout/ref) that apply to
+            // THIS call. Keyed by declaring class so one class's `get(output`
+            // can't spuriously decline an un-related input-only `get`.
+            let affected: Option<HashSet<usize>> = if rc == UNTYPED {
+                // Unresolvable receiver: fall back to the conservative
+                // name-global rule (union over every class that declares a
+                // non-input formal for this method name).
+                let any: HashSet<usize> = admission
+                    .writeback_positions
+                    .iter()
+                    .filter(|((_, m), _)| m.as_str() == method)
+                    .flat_map(|(_, pos)| pos.iter().copied())
+                    .collect();
+                if any.is_empty() { None } else { Some(any) }
+            } else {
+                // Resolved receiver: walk its superclass chain and union the
+                // non-input positions of every class-or-ancestor that
+                // declares `method`. A non-input formal an ancestor declares
+                // is inherited, so this is conservative-safe.
+                let mut acc: HashSet<usize> = HashSet::default();
+                let mut cur = Some(rc.split('#').next().unwrap_or(rc));
+                let mut guard = 0;
+                while let Some(c) = cur
+                    && guard < 128
+                {
+                    if let Some(pos) =
+                        admission.writeback_positions.get(&(c.to_string(), method.to_string()))
+                    {
+                        acc.extend(pos.iter().copied());
+                    }
+                    cur = admission.class_parents.get(c).map(|s| s.as_str());
+                    guard += 1;
+                }
+                if acc.is_empty() { None } else { Some(acc) }
+            };
+            if let Some(positions) = affected
+                && positions.iter().any(|&i| {
+                    args.get(i).is_some_and(|arg| {
+                        !matches!(&arg.kind, ExprKind::Ident(h) if self.local_var_reg_of(h).is_some())
                     })
                 })
             {
@@ -5166,7 +5211,6 @@ impl<'a> BytecodeCompiler<'a> {
     /// wrong dispatch. The bare-member ROOT additionally keeps the
     /// bare-key-stability requirement (`bare_member_names`).
     fn method_handle_chain_class(&self, expr: &crate::ast::expr::Expression) -> Option<String> {
-        const UNTYPED: &str = "\u{0}";
         if !self.method_mode {
             return None;
         }
@@ -14181,13 +14225,13 @@ impl<'a> BytecodeCompiler<'a> {
                             dest,
                             this_reg,
                             Box::new(NamePair(
-                                parent.into_boxed_str(),
+                                parent.clone().into_boxed_str(),
                                 member.name.clone().into_boxed_str(),
                             )),
                             arg_start,
                             n,
                         ));
-                        self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
+                        self.emit_arg_slot_writeback(args, arg_start, Some((parent.as_str(), member.name.as_str())))?;
                         return Some(dest);
                     }
                     self.truncate_insns(call_start);
@@ -14262,10 +14306,11 @@ impl<'a> BytecodeCompiler<'a> {
                         // the object's dynamic class, which differs only when
                         // a subclass redeclares the method. Those calls start
                         // the hierarchy walk at the statically bound class.
-                        let static_target = self.method_handle_chain_class(base).and_then(|rc| {
+                        let rc_decl = self.method_handle_chain_class(base);
+                        let static_target = rc_decl.as_deref().and_then(|rc| {
                             self.method_admission.as_ref().and_then(|a| {
                                 a.nonvirtual_targets
-                                    .get(rc.split('#').next().unwrap_or(&rc))
+                                    .get(rc.split('#').next().unwrap_or(rc))
                                     .and_then(|m| m.get(member.name.as_str()))
                                     .cloned()
                             })
@@ -14275,12 +14320,17 @@ impl<'a> BytecodeCompiler<'a> {
                                 dest,
                                 handle_reg,
                                 Box::new(NamePair(
-                                    target.into_boxed_str(),
+                                    target.clone().into_boxed_str(),
                                     member.name.clone().into_boxed_str(),
                                 )),
                                 arg_start,
                                 n,
                             ));
+                            self.emit_arg_slot_writeback(
+                                args,
+                                arg_start,
+                                Some((target.as_str(), member.name.as_str())),
+                            )?;
                         } else {
                             self.emit(Insn::CallMethod(
                                 dest,
@@ -14289,8 +14339,12 @@ impl<'a> BytecodeCompiler<'a> {
                                 arg_start,
                                 n,
                             ));
+                            self.emit_arg_slot_writeback(
+                                args,
+                                arg_start,
+                                rc_decl.as_deref().map(|rc| (rc, member.name.as_str())),
+                            )?;
                         }
-                        self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
                         return Some(dest);
                     }
                     self.truncate_insns(call_start);
@@ -14373,7 +14427,7 @@ impl<'a> BytecodeCompiler<'a> {
                                 dest,
                                 this_reg,
                                 Box::new(NamePair(
-                                    target.into_boxed_str(),
+                                    target.clone().into_boxed_str(),
                                     h.path[0].name.name.clone().into_boxed_str(),
                                 )),
                                 arg_start,
@@ -14382,10 +14436,11 @@ impl<'a> BytecodeCompiler<'a> {
                             self.emit_arg_slot_writeback(
                                 args,
                                 arg_start,
-                                Some(&h.path[0].name.name),
+                                Some((target.as_str(), h.path[0].name.name.as_str())),
                             )?;
                             return Some(dest);
                         }
+                        let this_cls = self.method_class.clone();
                         self.emit(Insn::CallMethod(
                             dest,
                             this_reg,
@@ -14393,7 +14448,11 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
-                        self.emit_arg_slot_writeback(args, arg_start, Some(&h.path[0].name.name))?;
+                        self.emit_arg_slot_writeback(
+                            args,
+                            arg_start,
+                            this_cls.as_deref().map(|c| (c, h.path[0].name.name.as_str())),
+                        )?;
                         return Some(dest);
                     }
                     self.truncate_insns(call_start);
@@ -14576,7 +14635,11 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
-                        self.emit_arg_slot_writeback(args, arg_start, Some(&member.name))?;
+                        self.emit_arg_slot_writeback(
+                            args,
+                            arg_start,
+                            Some((h.path[0].name.name.as_str(), member.name.as_str())),
+                        )?;
                         return Some(dest);
                     }
                     self.truncate_insns(call_start);

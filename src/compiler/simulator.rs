@@ -155717,6 +155717,17 @@ impl Simulator {
                         let mut fields = self.class_member_access_safe_names(class);
                         fields.extend(self.class_string_member_names(class));
                         facts.instance_fields.insert(class.clone(), fields);
+                        // Direct superclass (spec args stripped): the
+                        // writeback-hierarchy walk in
+                        // `emit_arg_slot_writeback` climbs this chain.
+                        if let Some(parent) = self
+                            .get_class_def(class)
+                            .and_then(|cd| cd.extends.as_deref())
+                        {
+                            let parent =
+                                parent.split('#').next().unwrap_or(parent).to_string();
+                            facts.class_parents.insert(class.clone(), parent);
+                        }
                         for method in declaration.methods.values() {
                             use crate::ast::decl::ClassMethodKind as Kind;
                             let (name, ports) = match &method.kind {
@@ -155729,7 +155740,7 @@ impl Simulator {
                                 if port.direction != PortDirection::Input {
                                     facts
                                         .writeback_positions
-                                        .entry(name.clone())
+                                        .entry((class.clone(), name.clone()))
                                         .or_default()
                                         .insert(index);
                                 }
