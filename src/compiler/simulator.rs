@@ -33066,21 +33066,13 @@ impl Simulator {
                     );
                 }
                 self.vm_ret_vals = Some(vals);
-                // Keep the string-keyed snapshot too: the AST/name-resolved
-                // destination path (and any non-local consumer) still reads
-                // the historical `__xz_ret_coll__[i]` cells.
-                if let Some(vals) = self.vm_ret_vals.take() {
-                    for (i, v) in vals.iter().enumerate() {
-                        let name = format!("{RET_SNAP}[{i}]");
-                        self.set_signal_value_by_name(&name, v.clone());
-                        // Mirror populate_queue_from_init's width registration
-                        // (unregistered names read fine, but a registered width
-                        // keeps downstream element-width fits exact).
-                        self.widths.entry(name).or_insert(32);
-                    }
-                    self.vm_ret_vals = Some(vals);
-                }
-                self.set_queue_size(RET_SNAP, n as u64);
+                // Defer the string-keyed `__xz_ret_coll__[i]` snapshot: it is
+                // only ever materialized on the destination path that cannot
+                // consume the flat `vm_ret_vals` fast channel (see
+                // `assign_pending_ret_collection`), so writing the signal cells
+                // + width rows + `.size` here, before we know the destination
+                // resolves to a writable base, is wasted on every hot
+                // collection-return call.
                 self.pending_ret_collection = Some(RET_SNAP.to_string());
                 local_count += 1;
             }
@@ -76751,6 +76743,23 @@ impl Simulator {
         let Some(src) = self.pending_ret_collection.take() else {
             return false;
         };
+        // Deferred snapshot: the flat fast channel (`vm_ret_vals`) held the
+        // returned elements; the destination does not resolve to a writable
+        // base, so materialize the historical `__xz_ret_coll__[i]` cells (the
+        // signal writes + width rows + `.size`) from those values before the
+        // whole-queue copy reads them. Byte-identical to what RetCollection
+        // used to write eagerly.
+        const RET_SNAP: &str = "__xz_ret_coll__";
+        if src == RET_SNAP {
+            if let Some(vals) = self.vm_ret_vals.take() {
+                for (i, v) in vals.iter().enumerate() {
+                    let name = format!("{RET_SNAP}[{i}]");
+                    self.set_signal_value_by_name(&name, v.clone());
+                    self.widths.entry(name).or_insert(32);
+                }
+                self.set_queue_size(RET_SNAP, vals.len() as u64);
+            }
+        }
         let dst: Option<String> = self.pending_coll_dst(lvalue);
         let Some(dst) = dst else {
             return false;
