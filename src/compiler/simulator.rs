@@ -7442,7 +7442,7 @@ pub struct Simulator {
     /// type-resolution work (return kind, formal seed widths) runs once at
     /// plan creation instead of per call.
     compiled_method_plans:
-        HashMap<(u32, u32), std::rc::Rc<super::bytecode::PreboundCompiledMethod>>,
+        HashMap<(u32, u32, u32), std::rc::Rc<super::bytecode::PreboundCompiledMethod>>,
     /// class-perf decision cache: interned (class, method) id pairs whose
     /// method can NEVER run as bytecode (task-form, string return, void, a
     /// ref/output formal, or a non-scalar return). These decisions are
@@ -7450,21 +7450,29 @@ pub struct Simulator {
     /// resolves widths from module scope), so once decided they never flip;
     /// memoizing them skips the gate + type-resolution re-validation on every
     /// one of the (mostly negative-cached) UVM calls.
-    compiled_method_skip: HashSet<(u32, u32)>,
+    compiled_method_skip: HashSet<(u32, u32, u32)>,
     /// class-perf adaptive tiering: per-interned-(cid, mid) call counters.
     /// Bumped ONLY by methods that passed the skip cache (plausibly
     /// compilable) and only while below the tier threshold; once a method
     /// crosses, it compiles and the counter is never touched again (the
     /// compiled path above the threshold is counter-free). Keyed by the
     /// (cid, mid) ids the block cache uses, so interning is done once.
-    compiled_method_call_counts: HashMap<(u32, u32), u32>,
+    compiled_method_call_counts: HashMap<(u32, u32, u32), u32>,
     /// class-perf P3: direct VM->VM dispatch entries for `CallMethod`,
     /// keyed (cid, mid) of the DEFINING class. `Pending` re-probes after
     /// the plan / block caches fill; `Never` is a permanent decline
     /// (param-dependent shape, writeback formals, fallback-heavy body);
     /// `Entry` runs the callee's block in-place with a fresh register
     /// file, skipping arg materialization + interpreter binding.
-    compiled_fast_calls: HashMap<(u32, u32), FastCallState>,
+    compiled_fast_calls: HashMap<(u32, u32, u32), FastCallState>,
+    /// Phase 2 (class-perf): intern a `(base_class, spec_sig)` specialization to a
+    /// u32 id (0 = non-specialized / no spec), so the plan / skip / fast-call caches
+    /// can be keyed by `(spec_id, cid, mid)` instead of `(cid, mid)`. Without this, a
+    /// parameterized class's method (e.g. `Cache#(string)::getv`) shared one plan
+    /// across ALL specializations, forcing it to the AST interpreter whenever a
+    /// type-param formal/return wasn't module-scope-resolvable. Interned lazily from
+    /// `inst.spec` at the plan-lookup point.
+    compiled_spec_intern: HashMap<(String, String), u32>,
     /// `resolve_typeref_class_name` memo: name -> scope -> class ctx -> (class-table size, answer).
     #[allow(clippy::type_complexity)]
     typeref_class_memo: std::cell::RefCell<
@@ -12288,6 +12296,7 @@ impl Simulator {
             compiled_method_skip: HashSet::default(),
             compiled_method_call_counts: HashMap::default(),
             compiled_fast_calls: HashMap::default(),
+            compiled_spec_intern: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
             condition_waiters: Vec::new(),
@@ -121995,6 +122004,29 @@ impl Simulator {
     /// A method's type parameters belong to its declaring specialization,
     /// even when a parameterized receiver reuses the same parameter names.
     #[inline(never)]
+    /// Phase 2: the interned specialization id for a concrete instance's spec
+    /// `(base, sig)` (0 when unspecialized / unparameterized). Called at every
+    /// plan / skip / fast-call lookup so a parameterized class's caches are keyed
+    /// per specialization — two specializations of the same method never share a
+    /// compiled plan. The common (non-parameterized) path always returns 0 and is
+    /// untouched.
+    fn instance_spec_id(&mut self, handle: usize) -> u32 {
+        let Some(spec) = self
+            .heap
+            .get(handle)
+            .and_then(|o| o.as_ref())
+            .and_then(|inst| inst.spec.clone())
+        else {
+            return 0;
+        };
+        if let Some(&id) = self.compiled_spec_intern.get(&spec) {
+            return id;
+        }
+        let next = self.compiled_spec_intern.len() as u32 + 1; // 0 reserved
+        self.compiled_spec_intern.insert(spec, next);
+        next
+    }
+
     fn inherited_method_spec(&self, handle: usize, declaring: &str) -> Option<(String, String)> {
         let origin = self.class_origin(declaring);
         if !self.class_is_parameterized(origin) {
@@ -141393,7 +141425,8 @@ impl Simulator {
         }
         if compiled_methods_enabled() {
             if let Some(md) = self.method_defining_class(&class_name, method_name) {
-                if let Some(entry) = self.vm_fast_entry_for(&md.class, method_name, &md.method) {
+                let spec_id = self.instance_spec_id(handle);
+                if let Some(entry) = self.vm_fast_entry_for(&md.class, method_name, &md.method, spec_id) {
                     match &entry.accessor {
                         FastAccessor::Getter(field) if args.is_empty() => {
                             let value = self
@@ -154806,9 +154839,10 @@ impl Simulator {
         }
         // A task already known never to compile (it can suspend, or its body
         // does not lower) returns before any frame bookkeeping.
+        let spec_id = self.instance_spec_id(handle);
         let ids = &self.compiled_class_method_ids;
         if let (Some(&cid), Some(&mid)) = (ids.get(mclass), ids.get(mname))
-            && self.compiled_method_skip.contains(&(cid, mid))
+            && self.compiled_method_skip.contains(&(cid, mid, spec_id))
         {
             return None;
         }
@@ -154960,6 +154994,11 @@ impl Simulator {
                 *ids.entry(method_name.to_string()).or_insert(next)
             }
         };
+        // Phase 2: specialization id. A parameterized class's methods get a
+        // per-spec plan/skip/fast key so `Cache#(string)::getv` is never
+        // confused with `Cache#(int)::getv`. Non-parameterized methods always
+        // yield 0 (untouched behavior).
+        let spec_id = self.instance_spec_id(handle);
         // Fast decision cache: a (class, method) already decided it can never
         // run as bytecode is looked up BEFORE re-running the whole gate +
         // type-resolution (and, with adaptive tiering, before the tier
@@ -154969,7 +155008,7 @@ impl Simulator {
         // cached UVM calls re-paid the full re-validation per call (the
         // dominant cost on the hier-gen perf workload even though the block
         // cache hits).
-        if self.compiled_method_skip.contains(&(cid, mid)) {
+        if self.compiled_method_skip.contains(&(cid, mid, spec_id)) {
             return None;
         }
         // Adaptive tier counter: only reached by methods that passed the skip
@@ -154982,7 +155021,7 @@ impl Simulator {
         if tier > 0 {
             let calls = self
                 .compiled_method_call_counts
-                .entry((cid, mid))
+                .entry((cid, mid, spec_id))
                 .or_insert(0);
             if *calls < tier {
                 *calls += 1;
@@ -154994,7 +155033,7 @@ impl Simulator {
         // scope, so it runs once per (cid, mid) at plan creation. The only
         // per-instance input — the result width of a param-bounded packed
         // return — is flagged in the plan and re-resolved below.
-        let pre = if let Some(p) = self.compiled_method_plans.get(&(cid, mid)) {
+        let pre = if let Some(p) = self.compiled_method_plans.get(&(cid, mid, spec_id)) {
             p.clone()
         } else {
             // Census aid: XEZIM_FALLBACK_SITES=1 also prints PLAN-phase
@@ -155028,7 +155067,7 @@ impl Simulator {
                     // frequency and says nothing about this.
                     if self.method_body_can_suspend(cname, &t.ports, &t.items) {
                         trace_decline("task-suspends");
-                        self.compiled_method_skip.insert((cid, mid));
+                        self.compiled_method_skip.insert((cid, mid, spec_id));
                         return None;
                     }
                     task_fd_storage = crate::ast::decl::FunctionDeclaration {
@@ -155046,7 +155085,7 @@ impl Simulator {
                 }
                 CompiledBodyKind::Other => {
                     trace_decline("kind");
-                    self.compiled_method_skip.insert((cid, mid));
+                    self.compiled_method_skip.insert((cid, mid, spec_id));
                     return None;
                 }
             };
@@ -155084,7 +155123,7 @@ impl Simulator {
                         || self.scalar_formal_integral(&port.data_type).is_some());
                 if !shape_ok {
                     trace_decline("noninput_formal_shape");
-                    self.compiled_method_skip.insert((cid, mid));
+                    self.compiled_method_skip.insert((cid, mid, spec_id));
                     return None;
                 }
                 writeback_formals.push(port.name.name.clone());
@@ -155143,7 +155182,7 @@ impl Simulator {
                 pair
             } else {
                 trace_decline("ret_type");
-                self.compiled_method_skip.insert((cid, mid));
+                self.compiled_method_skip.insert((cid, mid, spec_id));
                 return None;
             };
             // Build the formal list: (name, width) plus a class-handle set. A
@@ -155210,7 +155249,7 @@ impl Simulator {
                         // (the decision is instance-independent: the declared
                         // formal type cannot change per instance).
                         trace_decline("formal_type");
-                        self.compiled_method_skip.insert((cid, mid));
+                        self.compiled_method_skip.insert((cid, mid, spec_id));
                         return None;
                     };
                     // Seed width MIRRORS the interpreter's formal-binding branch
@@ -155267,7 +155306,7 @@ impl Simulator {
                 param_able_result,
                 formals,
             });
-            self.compiled_method_plans.insert((cid, mid), pre.clone());
+            self.compiled_method_plans.insert((cid, mid, spec_id), pre.clone());
             pre
         };
         // Effective result width: instance-resolved for param-bounded packed
@@ -156222,6 +156261,7 @@ impl Simulator {
         dclass: &str,
         method: &str,
         mdef: &std::sync::Arc<crate::ast::decl::ClassMethod>,
+        spec_id: u32,
     ) -> Option<std::rc::Rc<FastCallEntry>> {
         use super::bytecode::Insn;
         let crate::ast::decl::ClassMethodKind::Function(f) = &mdef.kind else {
@@ -156236,7 +156276,7 @@ impl Simulator {
             (Some(&c), Some(&m)) => (c, m),
             _ => return None, // never interned: never compiled
         };
-        if let Some(state) = self.compiled_fast_calls.get(&(cid, mid)) {
+        if let Some(state) = self.compiled_fast_calls.get(&(cid, mid, spec_id)) {
             return match state {
                 FastCallState::Entry(rc) => Some(rc.clone()),
                 FastCallState::Never => None,
@@ -156245,9 +156285,9 @@ impl Simulator {
         }
         let never = |sim: &mut Self| {
             sim.compiled_fast_calls
-                .insert((cid, mid), FastCallState::Never);
+                .insert((cid, mid, spec_id), FastCallState::Never);
         };
-        let Some(pre) = self.compiled_method_plans.get(&(cid, mid)).cloned() else {
+        let Some(pre) = self.compiled_method_plans.get(&(cid, mid, spec_id)).cloned() else {
             return None; // no plan yet: this call goes the interpreter route
         };
         // Shape guards (permanent): non-input formals need the interpreter's
@@ -156452,7 +156492,7 @@ impl Simulator {
             accessor,
         });
         self.compiled_fast_calls
-            .insert((cid, mid), FastCallState::Entry(entry.clone()));
+            .insert((cid, mid, spec_id), FastCallState::Entry(entry.clone()));
         Some(entry)
     }
     /// Fast-call twin of `vm_fast_entry_for` for free (package-scope)
@@ -156471,7 +156511,7 @@ impl Simulator {
             (Some(&c), Some(&m)) => (c, m),
             _ => return None, // never interned: never compiled
         };
-        if let Some(state) = self.compiled_fast_calls.get(&(cid, mid)) {
+        if let Some(state) = self.compiled_fast_calls.get(&(cid, mid, 0)) {
             return match state {
                 FastCallState::Entry(rc) => Some(rc.clone()),
                 FastCallState::Never => None,
@@ -156480,13 +156520,13 @@ impl Simulator {
         }
         let never = |sim: &mut Self| {
             sim.compiled_fast_calls
-                .insert((cid, mid), FastCallState::Never);
+                .insert((cid, mid, 0), FastCallState::Never);
         };
-        if self.compiled_method_skip.contains(&(cid, mid)) {
+        if self.compiled_method_skip.contains(&(cid, mid, 0)) {
             never(self);
             return None;
         }
-        let Some(pre) = self.compiled_method_plans.get(&(cid, mid)).cloned() else {
+        let Some(pre) = self.compiled_method_plans.get(&(cid, mid, 0)).cloned() else {
             return None; // no plan yet: this call goes the interpreter route
         };
         if !pre.writeback_formals.is_empty() {
@@ -156613,7 +156653,7 @@ impl Simulator {
             accessor: FastAccessor::None,
         });
         self.compiled_fast_calls
-            .insert((cid, mid), FastCallState::Entry(entry.clone()));
+            .insert((cid, mid, 0), FastCallState::Entry(entry.clone()));
         Some(entry)
     }
     /// Register-machine fast dispatch for a compiled free function invoked
@@ -156788,13 +156828,15 @@ impl Simulator {
         let Some(md) = self.method_defining_class(&leaf, method) else {
             return None;
         };
+        // Phase 2: specialization id for the receiver's plan/fast caches.
+        let spec_id = self.instance_spec_id(handle);
         if self.is_static_method(&leaf, method) {
             return None;
         }
         // Fast-path accessor check: if the method is already compiled as a
         // pure 1-statement getter or setter, execute it with zero allocations
         // or frame setup, even before the tier threshold.
-        if let Some(entry) = self.vm_fast_entry_for(&md.class, method, &md.method) {
+        if let Some(entry) = self.vm_fast_entry_for(&md.class, method, &md.method, spec_id) {
             match &entry.accessor {
                 FastAccessor::Getter(field) if n == 0 => {
                     let value = self
@@ -156857,14 +156899,14 @@ impl Simulator {
             };
             let calls = self
                 .compiled_method_call_counts
-                .entry((cid, mid))
+                .entry((cid, mid, spec_id))
                 .or_insert(0);
             if *calls < tier {
                 *calls += 1;
                 return None;
             }
         }
-        let Some(entry) = self.vm_fast_entry_for(&md.class, method, &md.method) else {
+        let Some(entry) = self.vm_fast_entry_for(&md.class, method, &md.method, spec_id) else {
             return None;
         };
         // Arity must match exactly — fewer actuals mean default-formal
