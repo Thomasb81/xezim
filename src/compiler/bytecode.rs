@@ -493,6 +493,17 @@ pub enum Insn {
     /// The third field lists the register-backed locals the statement
     /// names (see `FbLocal`); empty when none are live.
     StmtFallback(Box<(Arc<Statement>, Arc<str>, FbLocals)>),
+    /// class-perf: a function-local QUEUE / unsized dynamic-array declaration
+    /// with NO initializer (`chandle cached[$];`). The old emission routed
+    /// this through `StmtFallback("VarDecl_local_coll")`, which tripped the
+    /// fast-call admission gate (`has_forbidden`) and forced the WHOLE
+    /// enclosing body onto the AST interpreter — e.g. `uvm_re_match` was
+    /// never fast-called. This dedicated opcode declares the empty collection
+    /// through `exec_stmt_var_decl` (the exact interpreter registration,
+    /// guaranteed byte-identical) WITHOUT being classified as a fallback, so
+    /// the enclosing block stays frame-free-eligible. The payload mirrors the
+    /// StmtFallback shape: (synthetic VarDecl statement, reason, local regs).
+    InitLocalColl(Box<(Arc<Statement>, Arc<str>)>),
     /// Expression-level AST escape hatch: interpret ONE sub-expression the
     /// compiler can't handle (unresolvable ident, member access, impure
     /// call, ...) into a register, keeping the REST of the statement
@@ -1244,6 +1255,7 @@ impl Insn {
             | CaseJump(..)
             | CaseMaskJump(..)
             | StmtFallback(..)
+            | InitLocalColl(..)
             | EvalExprFallback(..)
             | WaitDelayReg(..)
             | WaitEdge(..)
@@ -1375,6 +1387,7 @@ pub fn insn_opcode_name(i: &Insn) -> &'static str {
         Insn::BinOpConst(_, _, _, BinOpConstKind::Mul) => "MulC",
         Insn::BinOpConst(_, _, _, BinOpConstKind::Sub) => "SubC",
         Insn::StmtFallback(..) => "Fallback",
+        Insn::InitLocalColl(..) => "InitColl",
         Insn::EvalExprFallback(..) => "EvalExpr",
     }
 }
@@ -4277,7 +4290,8 @@ impl<'a> BytecodeCompiler<'a> {
                     i if Self::dest_reg(i) == Some(r)
                         || Self::in_place_reg(i) == Some(r)
                         || matches!(i, Insn::EvalExprFallback(_, d, _) if *d == r)
-                        || matches!(i, Insn::StmtFallback(..)) =>
+                        || matches!(i, Insn::StmtFallback(..))
+                        || matches!(i, Insn::InitLocalColl(..)) =>
                     {
                         Some(false)
                     }
@@ -10450,11 +10464,15 @@ impl<'a> BytecodeCompiler<'a> {
                             // reads no registers (init is None), so neither
                             // the decl_local_regs nor the loop-var hazard
                             // applies; it must survive even where plain
-                            // fallbacks are barred.
-                            self.emit(Insn::StmtFallback(Box::new((
+                            // fallbacks are barred. class-perf: emitted as the
+                            // dedicated `InitLocalColl` opcode (not a
+                            // `StmtFallback`) so the enclosing block stays
+                            // eligible for the fast-call admission gate — a
+                            // `VarDecl_local_coll` StmtFallback pessimized
+                            // otherwise-blink functions like `uvm_re_match`.
+                            self.emit(Insn::InitLocalColl(Box::new((
                                 Arc::new(synth),
                                 Arc::from("VarDecl_local_coll"),
-                                Box::new([]),
                             ))));
                             self.local_coll_names.insert(decl.name.name.clone());
                             continue;
@@ -18367,6 +18385,8 @@ impl<'a> BytecodeCompiler<'a> {
             }
             // AST fallback can read anything through the interpreter.
             Insn::StmtFallback(..) => return false,
+            // A local-collection declaration has storage side effects.
+            Insn::InitLocalColl(..) => return false,
             Insn::EvalExprFallback(..) => return false,
         }
         true
@@ -18748,6 +18768,7 @@ impl<'a> BytecodeCompiler<'a> {
         matches!(
             insn,
             Insn::StmtFallback(..)
+                | Insn::InitLocalColl(..)
                 | Insn::EvalExprFallback(..)
                 | Insn::Format(..)
                 | Insn::StrOp(..)
@@ -19577,6 +19598,7 @@ impl<'a> BytecodeCompiler<'a> {
                 | Insn::BlockingAssignArrayRange(..)
                 | Insn::BlockingAssignString(..)
                 | Insn::StmtFallback(..)
+                | Insn::InitLocalColl(..)
                 | Insn::WaitDelayReg(..)
                 | Insn::WaitEdge(..)
                 | Insn::Nop => Some(None),
@@ -20353,6 +20375,7 @@ impl<'a> BytecodeCompiler<'a> {
 
                 // The AST interpreter runs with the whole machine in reach.
                 Insn::StmtFallback(..) => rw.iter_mut().for_each(|f| *f = None),
+                Insn::InitLocalColl(..) => rw.iter_mut().for_each(|f| *f = None),
                 Insn::EvalExprFallback(..) => rw.iter_mut().for_each(|f| *f = None),
             }
         }
@@ -25618,6 +25641,12 @@ pub fn lower_two_state(
                 if !payload.2.is_empty() {
                     gate!("fallback carries locals");
                 }
+                side_effects = true;
+                out.push(TsInsn::Fallback(payload.0.clone()));
+            }
+            Insn::InitLocalColl(payload) => {
+                // Declares empty local collection storage; its writes go
+                // through the interpreter's signal paths.
                 side_effects = true;
                 out.push(TsInsn::Fallback(payload.0.clone()));
             }

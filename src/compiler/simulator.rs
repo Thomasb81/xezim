@@ -30177,6 +30177,10 @@ impl Simulator {
                     debug_assert!(false, "collection-elem insn in isolated comb exec");
                     break;
                 }
+                Insn::InitLocalColl(..) => {
+                    debug_assert!(false, "InitLocalColl in isolated comb exec");
+                    break;
+                }
                 Insn::Cast(..) => {
                     debug_assert!(false, "cast insn in isolated comb exec");
                     break;
@@ -30968,6 +30972,10 @@ impl Simulator {
                 }
                 Insn::CallCollMethod(..) => {
                     debug_assert!(false, "CallCollMethod insn in isolated comb exec");
+                    break;
+                }
+                Insn::InitLocalColl(..) => {
+                    debug_assert!(false, "InitLocalColl in isolated comb exec");
                     break;
                 }
                 Insn::LoadCollElem(..) | Insn::StoreCollElem(..) => {
@@ -34334,6 +34342,16 @@ impl Simulator {
                         .or_insert((0u64, 0u64));
                     e.0 += 1;
                     e.1 += elapsed;
+                }
+                Insn::InitLocalColl(payload) => {
+                    // class-perf: a function-local QUEUE/unsized-dynarray decl
+                    // with no init. Register empty storage through the exact
+                    // interpreter path (`exec_statement`→`exec_stmt_var_decl`),
+                    // byte-identical to the old `VarDecl_local_coll` fallback,
+                    // but under a DEDICATED opcode so the enclosing block is
+                    // NOT pessimized by `has_forbidden`.
+                    let s = payload.0.clone();
+                    self.exec_statement(&s);
                 }
                 Insn::BlockingAssign(sig_id, val_reg, width) => {
                     let sig_id = &(*sig_id as usize);
@@ -47912,6 +47930,7 @@ impl Simulator {
             Insn::BlockingAssignArrayRange(..) => "BlockingAssignArrayRange",
             Insn::Move(..) => "Move",
             Insn::StmtFallback(..) => "StmtFallback",
+            Insn::InitLocalColl(..) => "InitLocalColl",
             Insn::EvalExprFallback(..) => "EvalExprFallback",
             Insn::ClearSigned(..) => "ClearSigned",
             Insn::Pow(..) => "Pow",
@@ -156411,7 +156430,11 @@ impl Simulator {
         // the fast path never records into `var_class_types`/
         // `class_of_var`-style metadata), no process-local loads, and no
         // `$cast` (its runtime type check reads the binding loop's
-        // per-formal class/enum recordings).
+        // per-formal class/enum recordings). Note `InitLocalColl` is NOT
+        // forbidden: it declares empty local-collection storage with no
+        // formal reads, and the fast paths already open a `local_dyn` frame
+        // (via `push_queue_frame`) so the per-call `@key` registration is
+        // correct and cleaned up on exit.
         let block = rc_entry.block.clone();
         let has_forbidden = block.instructions.iter().any(|i| {
             matches!(
