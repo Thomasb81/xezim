@@ -156204,6 +156204,42 @@ impl Simulator {
         out
     }
 
+    /// issue-301: element packed dims for members whose ELEMENT type is a
+    /// MULTI-dimensional packed array (`bit [8:0][7:0] arr[3]`, and the
+    /// same element shape behind queues/dynamic/associative members). A
+    /// further select on a loaded element (`arr[j][2]`) is a packed
+    /// ELEMENT select — the compiled lowering needs the dims to slice the
+    /// right ew bits instead of taking one bit. `packed_full_dims_chained`
+    /// reports None for single-vector/scalar elements (and struct
+    /// elements), which keep the old lowering.
+    fn class_coll_elem_packed_dims(&self, cname: &str) -> HashMap<String, Vec<(i64, i64)>> {
+        let mut out = HashMap::default();
+        if cname.starts_with("__free_fn__") {
+            return out;
+        }
+        let mut seen = HashSet::default();
+        let mut cur = cname.to_string();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                break;
+            }
+            for (p, dt) in cd.property_types.iter() {
+                if let Some(dims) = super::elaborate::packed_full_dims_chained(
+                    dt,
+                    &self.module.parameters,
+                    &self.module.typedef_types,
+                ) {
+                    out.insert(p.clone(), dims);
+                }
+            }
+            match &cd.extends {
+                Some(b) => cur = b.clone(),
+                None => break,
+            }
+        }
+        out
+    }
+
     /// Persistent method keys include the complete elaborated design context,
     /// the compiler version salt, and the method's resolved width signature.
     /// The shared context digest is lazy: disk caching pays once per simulator,
@@ -156776,6 +156812,7 @@ impl Simulator {
                 coll_members: std::rc::Rc::new(self.class_coll_member_names(cname)),
                 static_coll_members: std::rc::Rc::new(self.class_static_coll_member_names(cname)),
                 coll_elem_members: std::rc::Rc::new(self.class_coll_elem_member_names(cname)),
+                coll_elem_packed_dims: std::rc::Rc::new(self.class_coll_elem_packed_dims(cname)),
                 writeback_formals: std::rc::Rc::new(writeback_formals),
                 static_result_width,
                 result_signed,
@@ -157329,6 +157366,8 @@ impl Simulator {
                         &self.widths,
                     );
                     compiler.method_admission = Some(admission);
+                    // issue-301 plan fact: multi-dim packed coll elements.
+                    compiler.coll_elem_packed_dims = (*pre.coll_elem_packed_dims).clone();
                     compiler.set_dpi_import_fds(dpi_fds);
                     if method_trace_enabled() {
                         compiler.scope_hint = Some(format!("{}.{}", cname, method_name));

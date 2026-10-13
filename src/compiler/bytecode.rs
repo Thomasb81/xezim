@@ -984,6 +984,15 @@ pub(super) struct PreboundCompiledMethod {
     /// behavior.) Element reads/writes only — CALLS stay admitted for the
     /// name (the AST call funnel is class-first too).
     pub coll_elem_members: std::rc::Rc<HashSet<String>>,
+    /// issue-301 shape: for admitted coll-element members whose ELEMENT
+    /// type is a MULTI-dimensional packed array (`bit [8:0][7:0] arr[3]`,
+    /// queues/dynamic/associative alike), the element's full packed dims.
+    /// A further select on the loaded element (`arr[j][2]`) is a packed
+    /// ELEMENT select (an ew-bit slice), but the generic Index tail lowers
+    /// it to a 1-bit bit-select of the loaded element — the compiler needs
+    /// the dims to slice instead. Absent ⇒ single-vector elements, where
+    /// the old bit-select lowering is correct.
+    pub coll_elem_packed_dims: std::rc::Rc<HashMap<String, Vec<(i64, i64)>>>,
     /// class-perf row 2: names of NON-INPUT formals (output / inout / ref —
     /// the interpreter's `output_bindings` copy-out set) admitted to the
     /// compiled path as plain scalars (integral / string / enum / class
@@ -1716,6 +1725,11 @@ pub struct BytecodeCompiler<'a> {
     /// keeps using `coll_member_names` (a MemberAccess base cannot collide
     /// with a module table name).
     coll_elem_member_names: HashSet<String>,
+    /// Mirrored plan fact (`PreboundCompiledMethod::coll_elem_packed_dims`):
+    /// coll-element members whose ELEMENT is a multi-dimensional packed
+    /// array — `arr[j][2]` must select the packed ELEMENT (ew-bit slice),
+    /// not one bit of the loaded element.
+    pub coll_elem_packed_dims: HashMap<String, Vec<(i64, i64)>>,
     /// class-perf Step 9c: names whose `$cast` destination may take the
     /// register route — formals, the result cell, and TOP-LEVEL body
     /// locals. A nested-block local is register-backed too, but its
@@ -2009,6 +2023,7 @@ impl<'a> BytecodeCompiler<'a> {
             coll_member_names: HashSet::default(),
             static_coll_member_names: HashSet::default(),
             coll_elem_member_names: HashSet::default(),
+            coll_elem_packed_dims: HashMap::default(),
             cast_reg_ok_locals: HashSet::default(),
             method_ret_jumps: Vec::new(),
             decl_local_regs: std::collections::HashSet::default(),
@@ -5540,6 +5555,40 @@ impl<'a> BytecodeCompiler<'a> {
         key.strip_prefix('\u{1}')
     }
 
+    /// issue-301: the select width of `arr[i][k]` — the first packed dim's
+    /// ELEMENT width, when `root` admits to the member element read and the
+    /// plan carries multi-dim packed dims for the member. Feeds
+    /// `expr_max_width` (self-determined compare/shift contexts).
+    fn member_coll_elem_index_width(
+        &self,
+        root: &crate::ast::expr::Expression,
+    ) -> Option<u32> {
+        let (coll, ..) = self.member_coll_elem_target(root)?;
+        let dims = self.coll_elem_packed_dims.get(&coll)?;
+        if dims.len() != 2 {
+            return None;
+        }
+        Some((dims[1].0 - dims[1].1).abs() as u32 + 1)
+    }
+
+    /// issue-301: the FULL element width of a member-collection element
+    /// read (`arr[i]`) when the element is a multi-dim packed array — the
+    /// product of the plan's packed dims.
+    fn member_coll_elem_decl_width(
+        &self,
+        hier: &crate::ast::expr::HierarchicalIdentifier,
+    ) -> Option<u32> {
+        if hier.root.is_some() || hier.path.len() != 1 || !hier.path[0].selects.is_empty() {
+            return None;
+        }
+        let name = hier.path[0].name.name.as_str();
+        if !self.coll_elem_member_names.contains(name) {
+            return None;
+        }
+        let dims = self.coll_elem_packed_dims.get(name)?;
+        Some(dims.iter().map(|(l, r)| (l - r).abs() as u32 + 1).product())
+    }
+
     /// Pure admission probe for member-collection ELEMENT access (Step
     /// 9b-ii): `expr` is the indexed base expression (`q`, `this.aa`,
     /// `obj.aa` — no trailing index). Returns `(collection_name, bare,
@@ -5669,6 +5718,110 @@ impl<'a> BytecodeCompiler<'a> {
         // zeroed the handle, killing uvm_packer's cycle detection and
         // recursing forever on cyclic object graphs (6693).
         if ctx_width > 0 && !elem_is_class {
+            self.emit(Insn::Resize(dest, ctx_width));
+        }
+        Some(dest)
+    }
+
+    /// issue-301: `arr[j][k]` / `obj.aa[i][k]` — a further select on a member
+    /// collection ELEMENT read whose element type is a multi-dimensional
+    /// packed array (`bit [8:0][7:0] arr[3]`). Per §7.4.1, `k` selects an
+    /// element of the first packed dim — an ew-bit slice of the loaded
+    /// element — while the generic Index tail lowers it to a 1-bit
+    /// bit-select of the loaded element (LoadCollElem + BitSelectConst),
+    /// silently misreading the value. Lowers LoadCollElem (whole element,
+    /// no ctx resize) then RangeSelectConst for constant `k` and
+    /// Mul-offset + RangeSelectW for dynamic `k`. Deeper packed chains
+    /// (dims.len() != 2), part-select `k` and OOB constants bail to the
+    /// AST path (all-or-nothing), matching the interpreter's x semantics.
+    fn compile_member_coll_elem_packed_select(
+        &mut self,
+        expr: &crate::ast::expr::Expression,
+        index: &crate::ast::expr::Expression,
+        ctx_width: u32,
+    ) -> Option<RegId> {
+        let ExprKind::Index {
+            expr: root,
+            index: base_idx,
+        } = &expr.kind
+        else {
+            return None;
+        };
+        // Same admission as the element read itself (bare member in the
+        // plan's collision-excluded set, or a dotted `this.aa`/`obj.aa`).
+        let (coll, ..) = self.member_coll_elem_target(root)?;
+        let dims = self.coll_elem_packed_dims.get(&coll)?.clone();
+        if dims.len() != 2 {
+            // Deeper packed chains: the remaining selects compound — bail
+            // to the AST path rather than approximate.
+            return None;
+        }
+        let (l, r) = dims[0];
+        let (lo_b, hi_b) = (l.min(r), l.max(r));
+        let ew: i64 = (dims[1].0 - dims[1].1).abs() + 1; // element width of dim 0
+        // Load the whole element (ctx 0: the slice below carries the width).
+        let elem_reg = match self.compile_member_coll_elem_read(root, base_idx, 0) {
+            Some(reg) => reg,
+            None => {
+                // The shape matched but the element read declined ($ index,
+                // string formal): keep the whole select on the AST path.
+                self.bail("member_coll_elem_packed_select");
+                return None;
+            }
+        };
+        // Constant index: a fixed slice [slot*ew +: ew].
+        if let Some(iv) = self.fold_const(index).and_then(|v| v.to_u64()) {
+            let d = i64::try_from(iv).ok()?;
+            if d < lo_b || d > hi_b {
+                self.bail("member_coll_elem_packed_select");
+                return None;
+            }
+            // §7.4.1: a descending range labels the LEFT bound as the most
+            // significant element; an ascending one reverses the slot order.
+            let slot = if l >= r { d - lo_b } else { hi_b - d };
+            let off = u32::try_from(slot.checked_mul(ew)?).ok()?;
+            let dest = self.alloc_reg();
+            self.emit(Insn::RangeSelectConst(
+                dest,
+                elem_reg,
+                off + ew as u32 - 1,
+                off,
+            ));
+            if ctx_width > 0 {
+                self.emit(Insn::Resize(dest, ctx_width));
+            }
+            return Some(dest);
+        }
+        // Dynamic index: slot = k-lo_b (descending) / hi_b-k (ascending),
+        // offset = slot*ew, then `offset +: ew` (RangeSelectW keeps ew on
+        // an x/z index, matching the interpreter).
+        let k_reg = self.compile_expr(index, 0)?;
+        let bound = self.alloc_reg();
+        self.emit(Insn::LoadConst(
+            bound,
+            Box::new(Value::from_u64(
+                (if l >= r { lo_b } else { hi_b }) as u64,
+                32,
+            )),
+        ));
+        let slot_reg = self.alloc_reg();
+        if l >= r {
+            self.emit(Insn::Sub(slot_reg, k_reg, bound));
+        } else {
+            self.emit(Insn::Sub(slot_reg, bound, k_reg));
+        }
+        self.emit(Insn::Resize(slot_reg, 32));
+        let ew_reg = self.alloc_reg();
+        self.emit(Insn::LoadConst(
+            ew_reg,
+            Box::new(Value::from_u64(ew as u64, 32)),
+        ));
+        let off_reg = self.alloc_reg();
+        self.emit(Insn::Mul(off_reg, slot_reg, ew_reg));
+        self.emit(Insn::Resize(off_reg, 32));
+        let dest = self.alloc_reg();
+        self.emit(Insn::RangeSelectW(dest, elem_reg, off_reg, ew as u32, true));
+        if ctx_width > 0 {
             self.emit(Insn::Resize(dest, ctx_width));
         }
         Some(dest)
@@ -12859,6 +13012,18 @@ impl<'a> BytecodeCompiler<'a> {
                 {
                     return Some(dest);
                 }
+                // issue-301: a select INTO a member-collection element
+                // (`arr[j][2]` on `bit [8:0][7:0] arr[3]`). The base is an
+                // Index node, so the element-read arm above declined and
+                // the generic tail below would BIT-select one bit of the
+                // loaded element; for a multi-dimensional packed element
+                // the select names a packed DIMENSION — an ew-bit slice.
+                if self.method_mode
+                    && let Some(dest) =
+                        self.compile_member_coll_elem_packed_select(expr, index, ctx_width)
+                {
+                    return Some(dest);
+                }
                 if relaxed_formal_index {
                     // The relaxed index only ever flows here when the
                     // member-element read declined — nothing else may lower
@@ -17705,7 +17870,18 @@ impl<'a> BytecodeCompiler<'a> {
                         self.lookup_array_name(hier)
                             .and_then(|n| self.assoc_elem_widths.and_then(|m| m.get(&n).copied()))
                     })
+                    .or_else(|| self.member_coll_elem_decl_width(hier))
                     .unwrap_or(1),
+                // issue-301: a select INTO a member-collection element
+                // (`arr[i][2]` on `bit [8:0][7:0] arr[3]`) — the width is
+                // the first packed dim's ELEMENT width (ew bits), not 1.
+                // Reporting 1 here narrowed the SELF-DETERMINED compare
+                // context (`arr[i][2] != i` resized the 8-bit slice down
+                // to one bit and misjudged the equality), so only the
+                // store-backed shapes above were safe.
+                ExprKind::Index { expr: root, .. } => {
+                    self.member_coll_elem_index_width(root).unwrap_or(1)
+                }
                 _ => 1,
             },
             ExprKind::Replication { count, exprs } => {
