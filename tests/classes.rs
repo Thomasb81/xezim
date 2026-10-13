@@ -39,6 +39,8 @@ mod class_method_named_put_from_function;
 mod compiled_method_static_locals;
 #[path = "classes/class_param_default_scope.rs"]
 mod class_param_default_scope;
+#[path = "classes/class_property_x_default.rs"]
+mod class_property_x_default;
 #[path = "classes/class_queue_struct_member_arrays.rs"]
 mod class_queue_struct_member_arrays;
 #[path = "classes/class_struct_collection_elements.rs"]
@@ -358,6 +360,10 @@ mod randomize_dist_weights;
 mod randomize_foreach_accept;
 #[path = "classes/randomize_issues_295_297.rs"]
 mod randomize_issues_295_297;
+#[path = "classes/randomize_issues_298_299.rs"]
+mod randomize_issues_298_299;
+#[path = "classes/randomize_issue_301_wide2d.rs"]
+mod randomize_issue_301_wide2d;
 #[path = "classes/randomize_shift_mask_wide_peer.rs"]
 mod randomize_shift_mask_wide_peer;
 #[path = "classes/randomize_inside_range.rs"]

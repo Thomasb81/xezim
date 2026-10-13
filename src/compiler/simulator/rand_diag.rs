@@ -10,6 +10,17 @@ pub(super) fn rand_diag_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("XEZIM_RAND_DIAG").is_some())
 }
 
+/// How many failures of one class (or one `std::randomize` call site) are
+/// reported before the warning goes quiet, so a retry loop does not flood.
+const RAND_FAIL_REPORTS: u32 = 3;
+
+/// Whether failed randomize() calls are reported (`XEZIM_RAND_WARN=0`
+/// silences them; read once).
+fn rand_warn_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XEZIM_RAND_WARN").map_or(true, |v| v != "0"))
+}
+
 /// Per-call tally of the constraint items each rejected trial left
 /// unsatisfied, keyed by (constraint block, item) index.
 #[derive(Default)]
@@ -38,6 +49,124 @@ fn item_span(item: &ConstraintItem) -> Option<crate::ast::Span> {
 }
 
 impl Simulator {
+    /// §18.6.3/§18.11: a randomize() that finds no solution returns 0 and
+    /// leaves its random variables unchanged. Like the reference
+    /// simulator's report of an unsolvable constraint set, say so on stderr:
+    /// the class, its active constraint blocks with their locations, and
+    /// whether the solver proved that no solution exists (`proven`) or only
+    /// found none. Called for the outermost failing call only.
+    pub(super) fn rand_fail_warn(
+        &mut self,
+        class_name: &str,
+        constraints: &[ClassConstraint],
+        constraint_src_files: &[Option<u32>],
+        proven: bool,
+    ) {
+        if !rand_warn_enabled() {
+            return;
+        }
+        let mut blocks: Vec<String> = Vec::new();
+        for (ci, con) in constraints.iter().enumerate() {
+            let name = match con.name.name.as_str() {
+                "__inline__" => "with {...}",
+                n => n,
+            };
+            let src = constraint_src_files.get(ci).copied().flatten();
+            // An inline block's own span is synthetic: use its first item's.
+            let span = match con.name.name.as_str() {
+                "__inline__" => con.items.first().and_then(item_span).unwrap_or(con.span),
+                _ => con.span,
+            };
+            let loc = self
+                .span_file_and_line(span, src)
+                .map(|(f, l)| {
+                    let f = std::path::Path::new(&f)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or(f);
+                    format!(" ({}:{})", f, l)
+                })
+                .unwrap_or_default();
+            let b = format!("{}{}", name, loc);
+            if !blocks.contains(&b) {
+                blocks.push(b);
+            }
+        }
+        let what = if proven {
+            "its constraints have no solution"
+        } else {
+            "no solution found for its constraints"
+        };
+        self.rand_fail_report(
+            format!("{}|{}", class_name, blocks.join("|")),
+            format!("randomize() failed for class '{}': {}", class_name, what),
+            &blocks,
+            "class",
+        );
+    }
+
+    /// The same for `std::randomize() with {...}` (§18.12): the call
+    /// site's `with` block.
+    pub(super) fn rand_fail_warn_std(&mut self, items: &[ConstraintItem]) {
+        if !rand_warn_enabled() {
+            return;
+        }
+        let src = self.current_src_file();
+        let span = match (
+            items.first().and_then(item_span),
+            items.last().and_then(item_span),
+        ) {
+            (Some(a), Some(b)) => Some(crate::ast::Span::new(a.start, b.end)),
+            _ => None,
+        };
+        let loc = span
+            .and_then(|sp| self.span_file_and_line(sp, src))
+            .map(|(f, l)| {
+                let f = std::path::Path::new(&f)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or(f);
+                format!("{}:{}", f, l)
+            })
+            .unwrap_or_else(|| "?".to_string());
+        self.rand_fail_report(
+            format!("std::randomize@{}", loc),
+            "std::randomize() failed: no solution found for its constraints".to_string(),
+            &[format!("with {{...}} ({})", loc)],
+            "call",
+        );
+    }
+
+    fn rand_fail_report(&mut self, key: String, head: String, blocks: &[String], kind: &str) {
+        let n = self.rand_fail_reports.entry(key).or_insert(0);
+        *n += 1;
+        let n = *n;
+        if n > RAND_FAIL_REPORTS {
+            return;
+        }
+        const SHOWN: usize = 6;
+        let mut list = if blocks.is_empty() {
+            "no constraint blocks".to_string()
+        } else {
+            blocks[..blocks.len().min(SHOWN)].join(", ")
+        };
+        if blocks.len() > SHOWN {
+            list.push_str(&format!(", and {} more", blocks.len() - SHOWN));
+        }
+        let mut tail = String::new();
+        if n == RAND_FAIL_REPORTS {
+            tail.push_str(&format!(
+                "; further failures of this {} are not reported",
+                kind
+            ));
+        }
+        if !rand_diag_enabled() && !self.rand_fail_hinted {
+            self.rand_fail_hinted = true;
+            tail.push_str("; XEZIM_RAND_DIAG=1 lists the unsatisfied constraint items");
+        }
+        eprintln!("[xezim][warning] {} ({}); returned 0{}", head, list, tail);
+    }
+
     /// Record which items of `constraints` the current (rejected) trial
     /// leaves unsatisfied.
     pub(super) fn rand_diag_tally(

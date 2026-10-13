@@ -273,6 +273,8 @@ mod subroutine_range_identifiers;
 mod svtb_suite;
 #[path = "misc/system_task_value.rs"]
 mod system_task_value;
+#[path = "misc/time0_x_defaults.rs"]
+mod time0_x_defaults;
 #[path = "misc/unnamed_block_end_label.rs"]
 mod unnamed_block_end_label;
 #[path = "misc/unsized_decimal_wrap_warning.rs"]

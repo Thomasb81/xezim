@@ -55,6 +55,15 @@ thread_local! {
     /// `csp_split_slices` scans the constraints (see `Csp::pop`).
     static CSP_SCAN_POPS: std::cell::RefCell<Vec<usize>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Bit ranges of two wide variables a relation compares, found while
+    /// `csp_split_slices` scans the constraints: (v1, lsb1, v2, lsb2,
+    /// width). `csp_wide_split` cuts both alike over that range.
+    /// Set while `csp_dyn_cases` builds its guard on the whole relation:
+    /// a select of a wide variable at a position not known yet then
+    /// depends on all of its segments (`csp_wide_deps`).
+    static CSP_DYN_WHOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CSP_SCAN_LINKS: std::cell::RefCell<Vec<(usize, u32, usize, u32, u32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The scan's evaluation scope: the bound `foreach` indices, if any.
@@ -85,6 +94,10 @@ const EST_BUDGET: u64 = 200_000;
 const EST_MAX_DOM: u128 = 64;
 /// Largest variable count the solver takes on.
 const MAX_VARS: usize = 8192;
+/// Largest size the size phase gives a dynamic array (§18.5.8.1).
+const SIZE_TOP: i128 = 1 << 20;
+/// Sizes drawn above the lower bound of a size left open above.
+const SIZE_OPEN: i128 = 64;
 
 fn dom_size(d: &Dom) -> u128 {
     d.iter()
@@ -369,6 +382,12 @@ struct Aux {
     /// variable, and the counted variable and its width of each count.
     pop_c: Vec<Option<usize>>,
     pop_x: Vec<Option<(usize, u32)>>,
+    /// The more significant segments decided before each segment of a
+    /// variable that is used as a number (`csp_aux`).
+    seg_hi: Vec<Vec<usize>>,
+    /// A variable held as segments, or a select spanning several of them,
+    /// without a dist of its own: fixed by its segments, never decided.
+    composite: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -401,6 +420,10 @@ struct Src {
     item: SrcItem,
     binds: Vec<(String, Value)>,
     deps: Vec<usize>,
+    /// Reads an array whose size the size phase decides (`Csp::sizes`):
+    /// its current contents are not the ones being solved, so it is never
+    /// judged by the evaluator.
+    stale: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -452,6 +475,10 @@ struct Csp {
     /// f`), keyed by (base, lsb, width): the declared (left, right) of its
     /// first dimension and its element width, so `f[k]` names an element.
     field_elems: HashMap<(usize, u32, u32), (i64, i64, u32)>,
+    /// §7.4.1: the declared (left, right) of every packed dimension of a
+    /// multi-dimensional packed scalar or array element (`bit [8:0][7:0]
+    /// w`), outermost first; its selects go through them (`csp_pdim_ref`).
+    pdims: HashMap<usize, Vec<(i64, i64)>>,
     /// Declared lsb of a base variable's packed range (`[31:8]` -> 8).
     lsb: HashMap<usize, i64>,
     /// Variables whose packed labels increase from most to least significant.
@@ -491,10 +518,29 @@ struct Csp {
     /// Variable count before translation: the carry variables live above
     /// it and are made afresh by every translation.
     carry_base: Option<usize>,
+    /// §18.5.8.1 size phase (`csp_size_phase`): the dynamic arrays whose
+    /// size is a variable of this solve, and that variable. Such an array
+    /// has no element variables.
+    sizes: HashMap<String, usize>,
+    /// The problem is the size phase's relaxation: an item it cannot model
+    /// is dropped rather than making the solve inapplicable.
+    size_phase: bool,
 }
 
 /// One modular reduction of a relation being translated (see
 /// `Csp::carries`): its variables are created only when the relation is.
+/// A select of a multi-dimensional packed variable (`csp_pdim_ref`): the
+/// bit ranges (lsb, width) it may name, how many dimensions its selects
+/// consumed (0: the whole variable; past the last: a part-select, which
+/// takes no further select), and whether every index was constant (then
+/// `pos` holds exactly one range).
+struct PdimRef {
+    v: usize,
+    pos: Vec<(u32, u32)>,
+    depth: usize,
+    known: bool,
+}
+
 struct Carry {
     acc: Lin,
     w: u32,
@@ -800,26 +846,251 @@ impl Simulator {
         strict: bool,
         subs: &[(String, usize)],
     ) -> CspOutcome {
+        // §18.5.8.1: the size of a dynamic array is solved before its
+        // elements, jointly with the variables its size constraints tie it
+        // to (`beats.size() == cmd.count + 1`). The sizes are a solve of
+        // their own (`csp_size_phase`); the elements are then solved with
+        // the arrays at those sizes. A size that leaves the elements without
+        // a solution is drawn again a few times.
+        let sized: HashSet<String> = if subs.is_empty() {
+            colls
+                .iter()
+                .filter(|c| Self::csp_size_solved(c, constraints))
+                .map(|c| c.prop.clone())
+                .collect()
+        } else {
+            HashSet::default()
+        };
+        let solve = |me: &mut Self| {
+            me.rand_csp_solve_sized(
+                handle,
+                constraints,
+                constraint_depth,
+                rand_props,
+                signed_props,
+                enum_props,
+                colls,
+                array_enums,
+                strict,
+                subs,
+            )
+        };
+        if sized.is_empty() {
+            return solve(self);
+        }
+        for _ in 0..4 {
+            match self.csp_size_phase(
+                handle,
+                constraints,
+                constraint_depth,
+                rand_props,
+                signed_props,
+                enum_props,
+                colls,
+                array_enums,
+                &sized,
+            ) {
+                Ok(sizes) => {
+                    for (c, n) in sizes {
+                        self.resize_coll(&c.scoped, n);
+                        self.module.dynamic_arrays.insert(c.scoped.clone());
+                        let signed = self.class_prop_signed_of(handle, &c.prop);
+                        for i in 0..n {
+                            let key = format!("{}[{}]", c.scoped, i);
+                            if self.read_coll_elem(&key).is_none() {
+                                let mut v = if c.width > 64 {
+                                    self.random_value_of_width(c.width)
+                                } else {
+                                    self.draw_elem(c.width, None)
+                                };
+                                v.is_signed = signed;
+                                self.write_coll_elem(&key, v);
+                            }
+                        }
+                    }
+                }
+                // A relaxation of the problem has no solution: neither has
+                // the problem.
+                Err(CspOutcome::Unsat) => return CspOutcome::Unsat,
+                // Not modelled: the sizes the caller drew stay, and the
+                // outcome proves nothing about other sizes.
+                Err(_) => {
+                    return match solve(self) {
+                        CspOutcome::Unsat => CspOutcome::GaveUp,
+                        o => o,
+                    };
+                }
+            }
+            match solve(self) {
+                CspOutcome::Unsat | CspOutcome::GaveUp => {}
+                o => return o,
+            }
+        }
+        CspOutcome::GaveUp
+    }
+
+    /// Whether the size phase decides the size of `c`: a dynamic array of
+    /// values whose `size()` some constraint reads.
+    pub(super) fn csp_size_solved(c: &RandColl, constraints: &[ClassConstraint]) -> bool {
+        if c.kind != CollKind::Dyn || c.nested || c.is_object_elem {
+            return false;
+        }
+        let names = |e: &Expression| match &Self::unparen(e).kind {
+            ExprKind::Ident(h) => {
+                h.root.is_none()
+                    && h.path.last().is_some_and(|s| s.name.name == c.prop)
+                    && h.path.iter().all(|s| s.selects.is_empty())
+                    && h.path.len() <= 2
+            }
+            ExprKind::MemberAccess { member, .. } => member.name == c.prop,
+            _ => false,
+        };
+        let mut hit = false;
+        let mut look = |e: &Expression| {
+            Self::walk_operands(e, &mut |x| {
+                let recv = match &x.kind {
+                    ExprKind::Call { func, args } if args.is_empty() => match &func.kind {
+                        ExprKind::MemberAccess { expr, member } if member.name == "size" => {
+                            Some(expr)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if recv.is_some_and(|r| names(r)) {
+                    hit = true;
+                }
+            })
+        };
+        for con in constraints {
+            for it in &con.items {
+                Self::csp_item_walk(it, &mut |i| match i {
+                    ConstraintItem::Expr(e) => look(e),
+                    ConstraintItem::Inside { expr, range, .. } => {
+                        look(expr);
+                        for r in range {
+                            match r {
+                                ConstraintRange::Value(v) => look(v),
+                                ConstraintRange::Range { lo, hi } => {
+                                    look(lo);
+                                    look(hi);
+                                }
+                            }
+                        }
+                    }
+                    ConstraintItem::Implication { condition, .. }
+                    | ConstraintItem::IfElse { condition, .. } => look(condition),
+                    _ => {}
+                });
+            }
+        }
+        hit
+    }
+
+    /// §18.5.8.1: the sizes of the arrays in `sized`, solved with the other
+    /// variables, every array of them a size variable without elements.
+    /// What reads the elements of such an array is left out (a
+    /// relaxation), so Unsat here is final.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn csp_size_phase<'c>(
+        &mut self,
+        handle: usize,
+        constraints: &[ClassConstraint],
+        constraint_depth: &[usize],
+        rand_props: &[(String, u32)],
+        signed_props: &HashSet<String>,
+        enum_props: &HashMap<String, String>,
+        colls: &'c [RandColl],
+        array_enums: &HashMap<String, String>,
+        sized: &HashSet<String>,
+    ) -> Result<Vec<(&'c RandColl, u64)>, CspOutcome> {
+        let unread = Self::csp_unread(constraints, rand_props, colls);
+        let mut csp = self
+            .csp_vars(
+                handle,
+                rand_props,
+                signed_props,
+                enum_props,
+                colls,
+                array_enums,
+                &unread,
+                false,
+                sized,
+            )
+            .ok_or(CspOutcome::NotApplicable)?;
+        csp.size_phase = true;
+        self.csp_split_slices(&mut csp, constraints);
+        if csp.wide_fail {
+            return Err(CspOutcome::NotApplicable);
+        }
+        self.csp_translate(&mut csp, constraints, constraint_depth)
+            .ok_or(CspOutcome::NotApplicable)?;
+        let st = match self.csp_find(&csp) {
+            Ok(st) => st,
+            // §18.5.14: a preference that conflicts with the hard
+            // constraints is dropped; the sizes then follow the hard ones.
+            Err(CspOutcome::Unsat) if !csp.soft_priority.is_empty() => {
+                csp.soft_enabled = Some(HashSet::default());
+                self.csp_translate(&mut csp, constraints, constraint_depth)
+                    .ok_or(CspOutcome::NotApplicable)?;
+                self.csp_find(&csp)?
+            }
+            Err(o) => return Err(o),
+        };
+        let mut out = Vec::new();
+        for c in colls {
+            if let Some(&sv) = csp.sizes.get(&c.prop) {
+                let n = st.fixed(sv).ok_or(CspOutcome::GaveUp)?;
+                out.push((c, n.max(0) as u64));
+            }
+        }
+        Ok(out)
+    }
+
+    /// §18.4: the rand variables wider than 64 bits that no constraint
+    /// reads (or reads only through `size()`).
+    fn csp_unread(
+        constraints: &[ClassConstraint],
+        rand_props: &[(String, u32)],
+        colls: &[RandColl],
+    ) -> HashSet<String> {
+        if rand_props.iter().any(|(_, w)| *w > 64) || colls.iter().any(|c| c.width > 64) {
+            let names: Vec<&str> = rand_props
+                .iter()
+                .filter(|(_, w)| *w > 64)
+                .map(|(n, _)| n.as_str())
+                .chain(
+                    colls
+                        .iter()
+                        .filter(|c| c.width > 64)
+                        .map(|c| c.prop.as_str()),
+                )
+                .collect();
+            Self::csp_wide_unread(constraints, &names)
+        } else {
+            HashSet::default()
+        }
+    }
+
+    /// The joint solve with every dynamic array at its current size.
+    #[allow(clippy::too_many_arguments)]
+    fn rand_csp_solve_sized(
+        &mut self,
+        handle: usize,
+        constraints: &[ClassConstraint],
+        constraint_depth: &[usize],
+        rand_props: &[(String, u32)],
+        signed_props: &HashSet<String>,
+        enum_props: &HashMap<String, String>,
+        colls: &[RandColl],
+        array_enums: &HashMap<String, String>,
+        strict: bool,
+        subs: &[(String, usize)],
+    ) -> CspOutcome {
         // §18.4: a rand variable wider than 64 bits that no constraint reads
         // (or reads only through `size()`) takes any value of its width; it
         // stays out of the solve instead of keeping the whole class out.
-        let unread =
-            if rand_props.iter().any(|(_, w)| *w > 64) || colls.iter().any(|c| c.width > 64) {
-                let names: Vec<&str> = rand_props
-                    .iter()
-                    .filter(|(_, w)| *w > 64)
-                    .map(|(n, _)| n.as_str())
-                    .chain(
-                        colls
-                            .iter()
-                            .filter(|c| c.width > 64)
-                            .map(|c| c.prop.as_str()),
-                    )
-                    .collect();
-                Self::csp_wide_unread(constraints, &names)
-            } else {
-                HashSet::default()
-            };
+        let unread = Self::csp_unread(constraints, rand_props, colls);
         let Some(mut csp) = self.csp_vars(
             handle,
             rand_props,
@@ -829,6 +1100,7 @@ impl Simulator {
             array_enums,
             &unread,
             !subs.is_empty(),
+            &HashSet::default(),
         ) else {
             return CspOutcome::NotApplicable;
         };
@@ -954,6 +1226,36 @@ impl Simulator {
         scalars: &[(String, Expression, u32, bool, Option<Vec<u64>>)],
         arrays: &[(String, String, Vec<i64>, u32, bool, Option<Vec<u64>>)],
     ) -> CspOutcome {
+        match self.csp_scope(items, scalars, arrays, &HashSet::default()) {
+            Ok(_) => CspOutcome::Sat,
+            Err(o) => o,
+        }
+    }
+
+    /// §18.5.8.1: the sizes of the arrays in `sized` (named as the
+    /// constraints write them) for `std::randomize`, solved before their
+    /// elements (see `csp_size_phase`).
+    #[allow(clippy::type_complexity)]
+    pub(super) fn csp_scope_sizes(
+        &mut self,
+        items: &[ConstraintItem],
+        scalars: &[(String, Expression, u32, bool, Option<Vec<u64>>)],
+        arrays: &[(String, String, Vec<i64>, u32, bool, Option<Vec<u64>>)],
+        sized: &HashSet<String>,
+    ) -> Result<Vec<(String, u64)>, CspOutcome> {
+        self.csp_scope(items, scalars, arrays, sized)
+    }
+
+    /// The scope solve: with `sized` empty a full solve, written to the
+    /// caller's variables (Ok with no sizes); otherwise the size phase.
+    #[allow(clippy::type_complexity)]
+    fn csp_scope(
+        &mut self,
+        items: &[ConstraintItem],
+        scalars: &[(String, Expression, u32, bool, Option<Vec<u64>>)],
+        arrays: &[(String, String, Vec<i64>, u32, bool, Option<Vec<u64>>)],
+        sized: &HashSet<String>,
+    ) -> Result<Vec<(String, u64)>, CspOutcome> {
         let mut csp = Csp {
             handle: usize::MAX,
             vars: Vec::new(),
@@ -975,6 +1277,7 @@ impl Simulator {
             aux_base: HashMap::default(),
             fields: HashMap::default(),
             field_elems: HashMap::default(),
+            pdims: HashMap::default(),
             lsb: HashMap::default(),
             ascending: HashSet::default(),
             wide: HashSet::default(),
@@ -986,6 +1289,8 @@ impl Simulator {
             pop_rev: HashMap::default(),
             carries: Vec::new(),
             carry_base: None,
+            sizes: HashMap::default(),
+            size_phase: false,
         };
         let dom_of = |w: u32, s: bool, members: &Option<Vec<u64>>| -> Dom {
             match members {
@@ -999,8 +1304,31 @@ impl Simulator {
             }
         };
         for (name, key, idx, w, s, members) in arrays {
+            if sized.contains(name) {
+                let sv = csp.vars.len();
+                csp.vars.push(CspVar {
+                    key: VarKey::Aux,
+                    width: 32,
+                    signed: true,
+                });
+                csp.dom0.push(vec![(0, SIZE_TOP)]);
+                csp.sizes.insert(name.clone(), sv);
+                csp.arrays.insert(
+                    name.clone(),
+                    CspArr {
+                        elems: Vec::new(),
+                        width: *w,
+                        signed: *s,
+                    },
+                );
+                continue;
+            }
+            if *w > 64 && !sized.is_empty() {
+                // Not a variable of the size phase.
+                continue;
+            }
             if *w == 0 || *w > 64 {
-                return CspOutcome::NotApplicable;
+                return Err(CspOutcome::NotApplicable);
             }
             let dom = dom_of(*w, *s, members);
             let mut elems = Vec::with_capacity(idx.len());
@@ -1024,7 +1352,7 @@ impl Simulator {
         }
         for (name, lv, w, s, members) in scalars {
             if *w == 0 || *w > 64 || csp.arrays.contains_key(name) {
-                return CspOutcome::NotApplicable;
+                return Err(CspOutcome::NotApplicable);
             }
             csp.scalars.insert(name.clone(), csp.vars.len());
             csp.vars.push(CspVar {
@@ -1038,8 +1366,9 @@ impl Simulator {
             }
         }
         if csp.vars.is_empty() || csp.vars.len() > MAX_VARS {
-            return CspOutcome::NotApplicable;
+            return Err(CspOutcome::NotApplicable);
         }
+        csp.size_phase = !sized.is_empty();
         if std::env::var_os("XEZIM_RAND_DBG").is_some() {
             eprintln!(
                 "[rand-dbg] scope solve: arrays {:?}",
@@ -1064,9 +1393,31 @@ impl Simulator {
         let prev_receiver = self.rand_receiver.take();
         self.csp_split_slices(&mut csp, &constraints);
         let out = if self.csp_translate(&mut csp, &constraints, &[]).is_none() {
-            CspOutcome::NotApplicable
+            Err(CspOutcome::NotApplicable)
+        } else if sized.is_empty() {
+            match self.csp_run(&csp, &constraints, &[]) {
+                CspOutcome::Sat => Ok(Vec::new()),
+                o => Err(o),
+            }
         } else {
-            self.csp_run(&csp, &constraints, &[])
+            let mut found = self.csp_find(&csp);
+            if matches!(found, Err(CspOutcome::Unsat)) && !csp.soft_priority.is_empty() {
+                // §18.5.14: sizes that follow the hard constraints alone.
+                csp.soft_enabled = Some(HashSet::default());
+                found = match self.csp_translate(&mut csp, &constraints, &[]) {
+                    Some(()) => self.csp_find(&csp),
+                    None => Err(CspOutcome::NotApplicable),
+                };
+            }
+            found.and_then(|st| {
+                csp.sizes
+                    .iter()
+                    .map(|(n, &sv)| {
+                        let k = st.fixed(sv).ok_or(CspOutcome::GaveUp)?;
+                        Ok((n.clone(), k.max(0) as u64))
+                    })
+                    .collect()
+            })
         };
         self.rand_receiver = prev_receiver;
         CSP_SCOPE.with(|c| c.set(prev));
@@ -1086,6 +1437,8 @@ impl Simulator {
         // Rand sub-objects join later (`csp_add_sub`): the object needs no
         // scalar of its own.
         obj_elems: bool,
+        // The dynamic arrays whose size is a variable (`csp_size_phase`).
+        sized: &HashSet<String>,
     ) -> Option<Csp> {
         let mut csp = Csp {
             handle,
@@ -1108,6 +1461,7 @@ impl Simulator {
             aux_base: HashMap::default(),
             fields: HashMap::default(),
             field_elems: HashMap::default(),
+            pdims: HashMap::default(),
             lsb: HashMap::default(),
             ascending: HashSet::default(),
             wide: HashSet::default(),
@@ -1119,6 +1473,8 @@ impl Simulator {
             pop_rev: HashMap::default(),
             carries: Vec::new(),
             carry_base: None,
+            sizes: HashMap::default(),
+            size_phase: false,
         };
         let enum_dom = |me: &Self, tn: &str| -> Option<Dom> {
             let members = me.module.enum_members.get(tn)?;
@@ -1137,6 +1493,26 @@ impl Simulator {
             }
             if c.is_object_elem || c.nested || c.kind == CollKind::Assoc {
                 return None;
+            }
+            if sized.contains(&c.prop) {
+                // §18.5.8.1: the size is solved before any element exists.
+                let sv = csp.vars.len();
+                csp.vars.push(CspVar {
+                    key: VarKey::Aux,
+                    width: 32,
+                    signed: true,
+                });
+                csp.dom0.push(vec![(0, SIZE_TOP)]);
+                csp.sizes.insert(c.prop.clone(), sv);
+                csp.arrays.insert(
+                    c.prop.clone(),
+                    CspArr {
+                        elems: Vec::new(),
+                        width: c.width,
+                        signed: false,
+                    },
+                );
+                continue;
             }
             let idx: Vec<i64> = match c.kind {
                 CollKind::Fixed => (c.lo..=c.hi).collect(),
@@ -1223,7 +1599,10 @@ impl Simulator {
             });
             csp.dom0.push(dom);
         }
-        if (csp.vars.is_empty() && !obj_elems) || csp.vars.len() > MAX_VARS {
+        // An array sized 0 (by the size phase or by the caller) is a
+        // problem without variables, still one to judge.
+        if (csp.vars.is_empty() && !obj_elems && csp.arrays.is_empty()) || csp.vars.len() > MAX_VARS
+        {
             return None;
         }
         Some(csp)
@@ -1286,6 +1665,43 @@ impl Simulator {
         constraints: &[ClassConstraint],
         colls: &[RandColl],
     ) -> CspOutcome {
+        let st = match self.csp_find(csp) {
+            Ok(st) => st,
+            Err(o) => return o,
+        };
+        let nvars = csp.vars.len();
+        for v in 0..nvars {
+            if csp.wide.contains(&v) {
+                // Written through its segments.
+                continue;
+            }
+            let x = st.fixed(v).unwrap_or(0);
+            self.csp_write(csp, v, x);
+        }
+        let accepted = if csp.scope.is_some() {
+            let items: Vec<ConstraintItem> = constraints
+                .iter()
+                .flat_map(|c| c.items.iter().cloned())
+                .collect();
+            self.inline_constraints_satisfied(&items)
+        } else {
+            self.rand_items_accept(csp.handle, constraints, colls, &mut false)
+        };
+        if accepted {
+            if csp.draw_free {
+                self.csp_draw_free(csp);
+            }
+            CspOutcome::Sat
+        } else {
+            if std::env::var_os("XEZIM_RAND_DBG").is_some() {
+                eprintln!("[rand-dbg] joint solve found a solution the checker rejects");
+            }
+            CspOutcome::GaveUp
+        }
+    }
+
+    /// Search with restarts: the final state, every variable fixed.
+    fn csp_find(&mut self, csp: &Csp) -> Result<St, CspOutcome> {
         let nvars = csp.vars.len();
         let mut watch: Vec<Vec<usize>> = vec![Vec::new(); nvars];
         for (i, n) in csp.nodes.iter().enumerate() {
@@ -1328,8 +1744,8 @@ impl Simulator {
                     level_tries = level_tries.saturating_mul(2);
                     run_budget *= 2;
                 }
-                Some(false) if st.cut => return CspOutcome::GaveUp,
-                Some(false) => return CspOutcome::Unsat,
+                Some(false) if st.cut => return Err(CspOutcome::GaveUp),
+                Some(false) => return Err(CspOutcome::Unsat),
                 None if budget == 0 || st.work >= WORK_BUDGET => {
                     if std::env::var_os("XEZIM_RAND_DBG").is_some() {
                         eprintln!(
@@ -1338,39 +1754,12 @@ impl Simulator {
                             st.work
                         );
                     }
-                    return CspOutcome::GaveUp;
+                    return Err(CspOutcome::GaveUp);
                 }
                 None => run_budget *= 2,
             }
         }
-        for v in 0..nvars {
-            if csp.wide.contains(&v) {
-                // Written through its segments.
-                continue;
-            }
-            let x = st.fixed(v).unwrap_or(0);
-            self.csp_write(csp, v, x);
-        }
-        let accepted = if csp.scope.is_some() {
-            let items: Vec<ConstraintItem> = constraints
-                .iter()
-                .flat_map(|c| c.items.iter().cloned())
-                .collect();
-            self.inline_constraints_satisfied(&items)
-        } else {
-            self.rand_items_accept(csp.handle, constraints, colls, &mut false)
-        };
-        if accepted {
-            if csp.draw_free {
-                self.csp_draw_free(csp);
-            }
-            CspOutcome::Sat
-        } else {
-            if std::env::var_os("XEZIM_RAND_DBG").is_some() {
-                eprintln!("[rand-dbg] joint solve found a solution the checker rejects");
-            }
-            CspOutcome::GaveUp
-        }
+        Ok(st)
     }
 
     /// Depth-first search: `Some(true)` solved (every domain fixed),
@@ -1475,11 +1864,18 @@ impl Simulator {
     fn csp_pick_var(&mut self, csp: &Csp, aux: &Aux, st: &St) -> Option<usize> {
         let mut best: Option<(u8, u128, usize)> = None;
         let mut ties = 0u32;
+        let mut composite = None;
         for (v, d) in st.d.iter().enumerate() {
             if dom_fixed(d).is_some() {
                 continue;
             }
-            let blocked = aux.preds[v].iter().any(|&p| st.fixed(p).is_none());
+            // Decided through its segments (see `Aux::composite`).
+            if aux.composite[v] {
+                composite.get_or_insert(v);
+                continue;
+            }
+            let blocked = aux.preds[v].iter().any(|&p| st.fixed(p).is_none())
+                || aux.seg_hi[v].iter().any(|&p| st.fixed(p).is_none());
             let tier = if aux.dists[v].is_empty() {
                 1
             } else {
@@ -1505,7 +1901,7 @@ impl Simulator {
                 }
             }
         }
-        best.map(|b| b.2)
+        best.map(|b| b.2).or(composite)
     }
 
     /// The dist in force on `v` (every guard entailed), and whether some
@@ -1608,6 +2004,13 @@ impl Simulator {
                 }
             }
         }
+        // A size bounded only below stays near that bound (see `SIZE_OPEN`).
+        if st.bounds(v).1 == SIZE_TOP && csp.sizes.values().any(|&sv| sv == v) {
+            let lo = st.bounds(v).0;
+            let part = dom_clip(&st.d[v], lo, lo + SIZE_OPEN - 1);
+            let k = self.cur_rng().gen_range(0..dom_size(&part));
+            return dom_nth(&part, k);
+        }
         let size = dom_size(&st.d[v]);
         if aux.guard_var[v] && size <= EST_MAX_DOM && st.est_work < EST_BUDGET {
             if let Some(x) = self.csp_weigh(csp, aux, watch, st, v) {
@@ -1708,6 +2111,15 @@ impl Simulator {
                 todo.extend(aux.user_succs[u].iter().copied());
             }
         }
+        // A variable drawn by a dist in force counts no values; one whose
+        // dist still waits on its guard does (`if (!cfg) total dist {…}`:
+        // `cfg == 0` leaves `total` five values, `cfg == 1` all of them).
+        let mut drawn = vec![false; csp.vars.len()];
+        for (u, ds) in aux.dists.iter().enumerate() {
+            if !ds.is_empty() {
+                drawn[u] = self.csp_dist_state(csp, aux, st, u).0.is_some();
+            }
+        }
         let vals: Vec<i128> = st.d[v].iter().flat_map(|&(l, h)| l..=h).collect();
         let mut logs: Vec<f64> = Vec::with_capacity(vals.len());
         let mut seen = vec![false; csp.vars.len()];
@@ -1724,7 +2136,7 @@ impl Simulator {
                 lg = 0.0;
                 for (u, old) in &st.trail[mark..] {
                     let u = *u;
-                    if u == v || after[u] || !aux.dists[u].is_empty() || seen[u] {
+                    if u == v || after[u] || drawn[u] || seen[u] {
                         continue;
                     }
                     seen[u] = true;
@@ -1767,9 +2179,62 @@ impl Simulator {
             user_succs: vec![Vec::new(); n],
             pop_c: vec![None; n],
             pop_x: vec![None; n],
+            seg_hi: vec![Vec::new(); n],
+            composite: vec![false; n],
         };
         for (i, d) in csp.dists.iter().enumerate() {
             aux.dists[d.var].push(i);
+        }
+        for &b in csp.segs.keys() {
+            aux.composite[b] = aux.dists[b].is_empty();
+        }
+        for &x in csp.slice_vars.values() {
+            aux.composite[x] = aux.dists[x].is_empty();
+        }
+        // A variable split into segments (`csp_split_slices`) that some
+        // relation reads as a number (`last == base + n`), itself or through
+        // a select spanning several segments, is decided from its most
+        // significant segment down. Deciding the low bits first leaves a
+        // conflict that only they cause (`base[15:0] + n` crossing a 64 KiB
+        // page) to be refuted one value of the high bits at a time.
+        let mut reads = vec![0u32; n];
+        for node in &csp.nodes {
+            let mut ds = Vec::new();
+            node.deps(&csp.srcs, &mut ds);
+            ds.sort_unstable();
+            ds.dedup();
+            for v in ds {
+                reads[v] += 1;
+            }
+        }
+        for (&b, segs) in &csp.segs {
+            if csp.wide.contains(&b) || segs.len() < 2 {
+                continue;
+            }
+            // Each is also read by its own definition (`csp_slice_links`).
+            let mut ranges: Vec<(u32, u32)> = Vec::new();
+            if reads[b] >= 2 {
+                ranges.push((0, csp.vars[b].width));
+            }
+            for (&(sb, lo, w), &x) in &csp.slice_vars {
+                if sb == b && reads[x] >= 2 {
+                    ranges.push((lo, w));
+                }
+            }
+            for (lo, w) in ranges {
+                let inside: Vec<(u32, usize)> = segs
+                    .iter()
+                    .filter(|s| s.0 >= lo && s.0 + s.1 <= lo + w)
+                    .map(|s| (s.0, s.2))
+                    .collect();
+                for &(slo, sv) in &inside {
+                    for &(tlo, tv) in &inside {
+                        if tlo > slo && !aux.seg_hi[sv].contains(&tv) {
+                            aux.seg_hi[sv].push(tv);
+                        }
+                    }
+                }
+            }
         }
         // A counted variable is decided after its count, so it is drawn
         // with the count's number of ones (`csp_pick_val`).
@@ -1786,9 +2251,34 @@ impl Simulator {
                 aux.succs[c].push(x);
             }
         }
+        // §18.5.10: a variable split into segments (`csp_split_slices`) is
+        // decided through them, so an ordering on the variable, or on a
+        // select of it, orders the segments it spans as well: otherwise a
+        // low segment of `last_addr` is guessed before `base` and the value
+        // of `last == base + n` only ever meets it by chance.
+        let spread = |vs: &[usize]| -> Vec<usize> {
+            let mut out = vs.to_vec();
+            for &v in vs {
+                let (b, lo, w) = match csp.aux_base.get(&v) {
+                    Some(&x) => x,
+                    None => (v, 0, csp.vars[v].width),
+                };
+                if let Some(segs) = csp.segs.get(&b) {
+                    out.extend(
+                        segs.iter()
+                            .filter(|s| s.0 < lo + w && s.0 + s.1 > lo)
+                            .map(|s| s.2),
+                    );
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
         for (before, after) in &csp.order {
-            for &a in after {
-                for &b in before {
+            let (before, after) = (spread(before), spread(after));
+            for &a in &after {
+                for &b in &before {
                     if a != b {
                         aux.preds[a].push(b);
                         aux.succs[b].push(a);
@@ -2206,7 +2696,10 @@ impl Simulator {
                 true
             }
             Node::Eval { src, neg } => {
-                !self.csp_src_fixed(csp, st, *src) || self.csp_eval_src(csp, st, *src) != *neg
+                if self.csp_src_fixed(csp, st, *src) {
+                    return self.csp_eval_src(csp, st, *src) != *neg;
+                }
+                self.csp_eval_forward(csp, st, *src, *neg)
             }
             Node::Fun {
                 var,
@@ -2216,6 +2709,9 @@ impl Simulator {
                 neg,
             } => {
                 if !self.csp_src_fixed(csp, st, *other) {
+                    if csp.srcs[*other].stale {
+                        return true;
+                    }
                     return !csp.has_subs || self.csp_fun_range(csp, st, *var, *op, *other);
                 }
                 if self.csp_src_fixed(csp, st, *whole) {
@@ -2474,8 +2970,97 @@ impl Simulator {
         }
     }
 
+    /// A constraint left to the evaluator with one variable still open, of
+    /// a few values: keep the values for which it holds (`(base &
+    /// ((1 << sz) - 1)) == 0` leaves the aligned low bits of `base` once
+    /// `sz` and its high bits are fixed). Without this the search guessed
+    /// the last variable and judged the guess, and a conflict caused by an
+    /// earlier decision was refuted one value of a later one at a time.
+    fn csp_eval_forward(&mut self, csp: &Csp, st: &mut St, src: usize, neg: bool) -> bool {
+        if csp.srcs[src].stale {
+            return true;
+        }
+        let mut open = None;
+        for &v in &csp.srcs[src].deps {
+            if st.fixed(v).is_none() {
+                if open.is_some() {
+                    return true;
+                }
+                open = Some(v);
+            }
+        }
+        let Some(v) = open else {
+            return true;
+        };
+        let n = dom_size(&st.d[v]);
+        if n > EST_MAX_DOM || csp.wide.contains(&v) || csp.segs.contains_key(&v) {
+            return true;
+        }
+        // Writing the fixed variable it is part of would overwrite it.
+        if let Some(&(b, ..)) = csp.aux_base.get(&v)
+            && csp.srcs[src].deps.contains(&b)
+        {
+            return true;
+        }
+        st.work += n as u64;
+        let vals: Vec<i128> = (0..n).map(|k| dom_nth(&st.d[v], k)).collect();
+        let mut keep = Vec::with_capacity(vals.len());
+        for x in vals {
+            self.csp_write(csp, v, x);
+            if self.csp_eval_src(csp, st, src) != neg {
+                keep.push((x, x));
+            }
+        }
+        st.set(v, dom_norm(keep))
+    }
+
     fn csp_src_fixed(&self, csp: &Csp, st: &St, src: usize) -> bool {
-        st.all_fixed(&csp.srcs[src].deps)
+        !csp.srcs[src].stale && st.all_fixed(&csp.srcs[src].deps)
+    }
+
+    /// Whether `item` names an array of the size phase (`Csp::sizes`).
+    fn csp_src_sized(csp: &Csp, item: &SrcItem) -> bool {
+        fn names(csp: &Csp, e: &Expression) -> bool {
+            let mut hit = false;
+            Simulator::walk_operands(e, &mut |x| match &x.kind {
+                ExprKind::Ident(h)
+                    if h.path.iter().any(|s| csp.sizes.contains_key(&s.name.name)) =>
+                {
+                    hit = true;
+                }
+                ExprKind::WithClause { expr, filter } => {
+                    hit |= names(csp, expr) || names(csp, filter);
+                }
+                _ => {}
+            });
+            hit
+        }
+        let mut hit = false;
+        let mut look = |e: &Expression| hit |= names(csp, e);
+        match item {
+            SrcItem::Expr(e) => look(e),
+            SrcItem::Item(it) => Self::csp_item_walk(it, &mut |i| match i {
+                ConstraintItem::Expr(e) => look(e),
+                ConstraintItem::Inside { expr, range, .. } => {
+                    look(expr);
+                    for r in range {
+                        match r {
+                            ConstraintRange::Value(v) => look(v),
+                            ConstraintRange::Range { lo, hi } => {
+                                look(lo);
+                                look(hi);
+                            }
+                        }
+                    }
+                }
+                ConstraintItem::Implication { condition, .. }
+                | ConstraintItem::IfElse { condition, .. } => look(condition),
+                ConstraintItem::Foreach { array, .. } => look(array),
+                ConstraintItem::Unique { exprs, .. } => exprs.iter().for_each(&mut look),
+                _ => {}
+            }),
+        }
+        hit
     }
 
     /// The local frame to evaluate under with `binds` (foreach indices)
@@ -3060,10 +3645,12 @@ impl Simulator {
             SrcItem::Expr(e) => SrcItem::Expr(Self::csp_obj_real(&e).unwrap_or(e)),
             SrcItem::Item(it) => SrcItem::Item(Self::csp_obj_real_item(&it)),
         };
+        let stale = csp.size_phase && Self::csp_src_sized(csp, &item);
         csp.srcs.push(Src {
             item,
             binds: env.binds.clone(),
             deps,
+            stale,
         });
         csp.srcs.len() - 1
     }
@@ -3113,6 +3700,15 @@ impl Simulator {
     }
 
     fn csp_item(&mut self, csp: &mut Csp, item: &ConstraintItem, env: &Env) -> Option<Node> {
+        let r = self.csp_item_inner(csp, item, env);
+        // The size phase solves a relaxation: what it cannot model (an
+        // element of an array not sized yet) constrains nothing there.
+        if r.is_none() && csp.size_phase {
+            return Some(Node::True);
+        }
+        r
+    }
+    fn csp_item_inner(&mut self, csp: &mut Csp, item: &ConstraintItem, env: &Env) -> Option<Node> {
         match item {
             ConstraintItem::Expr(e) => self.csp_bool(csp, e, env, false),
             ConstraintItem::Inside {
@@ -3188,6 +3784,72 @@ impl Simulator {
                 item: body,
                 ..
             } => {
+                // §7.4.1/§12.7.3: a loop over a multi-dimensional packed
+                // variable (`foreach (a.w[i, j])`) walks the labels of its
+                // dimensions, one loop variable per dimension.
+                if let Some(p) = self.csp_pdim_ref(csp, array, &mut |_, _| None) {
+                    let dims = match p {
+                        Some(p) if p.depth == 0 => csp.pdims.get(&p.v)?.clone(),
+                        _ => return None,
+                    };
+                    if vars.len() > dims.len() {
+                        return None;
+                    }
+                    let loops: Vec<(String, i64, i64)> = vars
+                        .iter()
+                        .zip(&dims)
+                        .filter_map(|(v, &(l, r))| {
+                            v.as_ref().map(|v| (v.name.clone(), l.min(r), l.max(r)))
+                        })
+                        .collect();
+                    let count = loops
+                        .iter()
+                        .try_fold(1u64, |n, l| n.checked_mul((l.2 - l.1 + 1) as u64))?;
+                    if count > 4096 {
+                        return None;
+                    }
+                    let mut idx: Vec<i64> = loops.iter().map(|l| l.1).collect();
+                    let mut out = Vec::new();
+                    loop {
+                        let mut e2 = env.clone();
+                        for (l, &i) in loops.iter().zip(&idx) {
+                            e2.binds.push((l.0.clone(), Self::signed_loop_val(i)));
+                        }
+                        match self.csp_item(csp, body, &e2)? {
+                            Node::True => {}
+                            n => out.push(n),
+                        }
+                        let mut k = loops.len();
+                        loop {
+                            if k == 0 {
+                                return Some(Self::csp_and(out));
+                            }
+                            k -= 1;
+                            idx[k] += 1;
+                            if idx[k] <= loops[k].2 {
+                                break;
+                            }
+                            idx[k] = loops[k].1;
+                        }
+                    }
+                }
+                // §7.4.5: a loop over a packed-array field (`foreach
+                // (a.s.f[i])`) walks the labels of its first dimension.
+                if let [Some(iv)] = vars.as_slice()
+                    && !csp.field_elems.is_empty()
+                    && let Some((_, all)) = self.csp_field_elem_all(csp, array, &mut |_, _| None)
+                {
+                    let mut out = Vec::with_capacity(all.len());
+                    for (i, ..) in all {
+                        let mut e2 = env.clone();
+                        e2.binds.push((iv.name.clone(), Self::signed_loop_val(i)));
+                        match self.csp_item(csp, body, &e2)? {
+                            Node::True => {}
+                            n => out.push(n),
+                        }
+                    }
+                    return Some(Self::csp_and(out));
+                }
                 let name = Self::foreach_base_name(array);
                 let arr = name.as_ref().and_then(|n| csp.arrays.get(n)).cloned();
                 let idx_var = match vars.as_slice() {
@@ -3756,7 +4418,13 @@ impl Simulator {
                 els: Box::new(Node::True),
             });
         }
-        out.push(self.csp_eval_node(csp, SrcItem::Expr(whole.clone()), env, neg)?);
+        // The relation as a whole, for an index outside every case. The
+        // cases already decide every position, so a select of a wide
+        // variable here may wait for all of its segments.
+        let prev = CSP_DYN_WHOLE.with(|c| c.replace(true));
+        let guard = self.csp_eval_node(csp, SrcItem::Expr(whole.clone()), env, neg);
+        CSP_DYN_WHOLE.with(|c| c.set(prev));
+        out.push(guard?);
         Some(Self::csp_and(out))
     }
 
@@ -3900,6 +4568,13 @@ impl Simulator {
             }
             me.csp_const(x, env)?.to_i64()
         };
+        // §7.4.1: the labels of the dimension a select of a
+        // multi-dimensional packed variable indexes.
+        if let Some(p) = self.csp_pdim_ref(csp, base, &mut konst) {
+            let p = p?;
+            let &(l, r) = csp.pdims.get(&p.v)?.get(p.depth)?;
+            return Some((l.min(r)..=l.max(r)).collect());
+        }
         if let Some((_, all)) = self.csp_field_elem_all(csp, base, &mut konst) {
             return Some(all.iter().map(|x| x.0).collect());
         }
@@ -4399,6 +5074,33 @@ impl Simulator {
     }
 
     /// The names of a plain member path (`a.b`, `this.a.b`), `this` kept.
+    /// The segments of a non-wide variable split by `csp_split_slices` that
+    /// a field path (`cmd.base`, `this.cmd.base`) spans. None for anything
+    /// else, including nested fields.
+    fn csp_field_segs(&self, csp: &Csp, e: &Expression) -> Option<Vec<usize>> {
+        let mut path = Self::csp_member_path(e)?;
+        if path.len() > 2
+            && (path[0] == "this" || self.rand_receiver.as_deref() == Some(path[0].as_str()))
+        {
+            path.remove(0);
+        }
+        let [var, field] = path.as_slice() else {
+            return None;
+        };
+        let &v = csp.scalars.get(var)?;
+        if csp.wide.contains(&v) {
+            return None;
+        }
+        let segs = csp.segs.get(&v)?;
+        let &(_, lo, w) = csp.fields.get(&v)?.iter().find(|f| &f.0 == field)?;
+        Some(
+            segs.iter()
+                .filter(|s| s.0 < lo + w && s.0 + s.1 > lo)
+                .map(|s| s.2)
+                .collect(),
+        )
+    }
+
     fn csp_member_path(e: &Expression) -> Option<Vec<String>> {
         match &e.kind {
             ExprKind::This => Some(vec!["this".to_string()]),
@@ -4420,6 +5122,15 @@ impl Simulator {
     /// Variables `e` reads. False when it calls something whose reads are
     /// unknown (a user function).
     fn csp_refs(&self, csp: &Csp, e: &Expression, env: &Env, out: &mut Vec<usize>) -> bool {
+        // A field of a variable split into segments reads the segments it
+        // spans, so a relation on `cmd.base` and `cmd.sz` is judged once
+        // those are fixed rather than once all of `cmd` is.
+        if matches!(e.kind, ExprKind::Ident(_) | ExprKind::MemberAccess { .. })
+            && let Some(segs) = self.csp_field_segs(csp, e)
+        {
+            out.extend(segs);
+            return true;
+        }
         // A wide variable is read through its segments.
         let push_var = |v: usize, out: &mut Vec<usize>| match csp.segs.get(&v) {
             Some(segs) if csp.wide.contains(&v) => out.extend(segs.iter().map(|x| x.2)),
@@ -4428,6 +5139,9 @@ impl Simulator {
         let push_name = |n: &str, out: &mut Vec<usize>| {
             if let Some(&v) = csp.scalars.get(n) {
                 push_var(v, out);
+            } else if let Some(&sv) = csp.sizes.get(n) {
+                // Its size is a variable of the size phase.
+                out.push(sv);
             } else if let Some(a) = csp.arrays.get(n) {
                 for x in &a.elems {
                     push_var(x.1, out);
@@ -4764,6 +5478,15 @@ impl Simulator {
                 }
             }
             ExprKind::Binary {
+                op: BinaryOp::ShiftRight,
+                left,
+                right,
+            } if self.csp_free(csp, right, env) => {
+                if let Some(a) = self.csp_shr_slice(csp, left, right, env) {
+                    return Some(a);
+                }
+            }
+            ExprKind::Binary {
                 op: op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul),
                 left,
                 right,
@@ -4843,6 +5566,16 @@ impl Simulator {
             },
             _ => {}
         }
+        // §18.5.8.1: in the size phase an array's size is a variable.
+        if !csp.sizes.is_empty()
+            && let ExprKind::Call { func, args } = &e.kind
+            && args.is_empty()
+            && let ExprKind::MemberAccess { expr, member } = &func.kind
+            && member.name == "size"
+            && let Some(&sv) = self.csp_member(csp, expr).and_then(|n| csp.sizes.get(&n))
+        {
+            return Some(Self::csp_var_ae(csp, sv));
+        }
         // The size of a wide solver array is fixed while it is solved.
         if !csp.wide.is_empty()
             && let ExprKind::Call { func, args } = &e.kind
@@ -4875,6 +5608,48 @@ impl Simulator {
             return self.csp_const(e, env).map(Ae::Const);
         }
         None
+    }
+
+    /// §11.4.10: `x >> k` with a constant `k` fills with zeros, so it is
+    /// the select `x[w-1:k]` zero-extended to `x`'s width. `csp_scan_expr`
+    /// cut `x` there, so the select is a variable of its own and a relation
+    /// like `(base >> 16) == (last >> 16)` is linear in two selects instead
+    /// of judged only once both sides are fixed.
+    fn csp_shr_slice(
+        &mut self,
+        csp: &Csp,
+        x: &Expression,
+        k: &Expression,
+        env: &Env,
+    ) -> Option<Ae> {
+        let k = self.csp_const(k, env)?.to_u64()?;
+        let mut konst = |me: &mut Self, y: &Expression| -> Option<i64> {
+            if !me.csp_free(csp, y, env) {
+                return None;
+            }
+            me.csp_const(y, env)?.to_i64()
+        };
+        let (v, lo, w, _) = self.csp_slice_base_k(csp, x, &mut konst)?;
+        if k == 0 || k >= u64::from(w) {
+            return None;
+        }
+        let (slo, sw) = (lo + k as u32, w - k as u32);
+        let sel = csp
+            .segs
+            .get(&v)
+            .and_then(|segs| segs.iter().find(|s| s.0 == slo && s.1 == sw).map(|s| s.2))
+            .or_else(|| csp.slice_vars.get(&(v, slo, sw)).copied())?;
+        let (xw, xs) = Self::csp_ws(&self.csp_ae(csp, x, env)?);
+        if xw != w || xw > 64 {
+            return None;
+        }
+        Some(Ae::Cast {
+            inner: Box::new(Ae::Var(sel, sw, false)),
+            iw: sw,
+            is: false,
+            w: xw,
+            s: xs,
+        })
     }
 
     fn csp_countones(&mut self, csp: &Csp, x: &Expression, env: &Env) -> Option<Ae> {
@@ -4962,8 +5737,9 @@ impl Simulator {
         if method == "size" {
             return None;
         }
-        let arr = csp.arrays.get(&self.csp_member(csp, recv)?)?.clone();
-        if method != "sum" {
+        let name = self.csp_member(csp, recv)?;
+        let arr = csp.arrays.get(&name)?.clone();
+        if method != "sum" || csp.sizes.contains_key(&name) {
             return Some(None);
         }
         let it = match args {
@@ -5132,6 +5908,7 @@ impl Simulator {
         csp.aux_base.clear();
         csp.fields.clear();
         csp.field_elems.clear();
+        csp.pdims.clear();
         csp.lsb.clear();
         csp.ascending.clear();
         let scalars: Vec<(String, usize)> =
@@ -5159,8 +5936,12 @@ impl Simulator {
                         csp.ascending.insert(*v);
                     }
                 }
+            } else if let Some(dims) = self.csp_packed_dims(csp, name, csp.vars[*v].width) {
+                // §7.4.1: selects of a multi-dimensional packed variable
+                // name elements of its dimensions (`csp_pdim_ref`).
+                csp.pdims.insert(*v, dims);
             } else {
-                // Multi-dimensional packed ranges are not split here.
+                // Other shapes are not split here.
                 csp.lsb.insert(*v, i64::MIN);
             }
         }
@@ -5182,6 +5963,10 @@ impl Simulator {
             } else {
                 self.csp_scalar_shape(csp, &name)
             };
+            let dims = match (&shape, elems.first()) {
+                (None, Some(&e)) if !skip => self.csp_packed_dims(csp, &name, csp.vars[e].width),
+                _ => None,
+            };
             for v in elems {
                 match &shape {
                     Some((fields, lsb)) => {
@@ -5195,9 +5980,14 @@ impl Simulator {
                             }
                         }
                     }
-                    None => {
-                        csp.lsb.insert(v, i64::MIN);
-                    }
+                    None => match &dims {
+                        Some(d) => {
+                            csp.pdims.insert(v, d.clone());
+                        }
+                        None => {
+                            csp.lsb.insert(v, i64::MIN);
+                        }
+                    },
                 }
             }
         }
@@ -5206,6 +5996,7 @@ impl Simulator {
         let mut bound: Vec<String> = Vec::new();
         let prev_any = CSP_SCAN_ANY.with(|c| c.replace(true));
         let prev_pops = CSP_SCAN_POPS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        let prev_links = CSP_SCAN_LINKS.with(|p| std::mem::take(&mut *p.borrow_mut()));
         for c in constraints {
             for it in &c.items {
                 self.csp_scan_item(csp, it, &mut bound, &mut uses);
@@ -5213,6 +6004,7 @@ impl Simulator {
         }
         CSP_SCAN_ANY.with(|c| c.set(prev_any));
         let mut pops = CSP_SCAN_POPS.with(|p| std::mem::replace(&mut *p.borrow_mut(), prev_pops));
+        let links = CSP_SCAN_LINKS.with(|p| std::mem::replace(&mut *p.borrow_mut(), prev_links));
         // As for the cuts below: a loop over an array counts every element.
         for a in csp.arrays.values() {
             if a.elems.iter().any(|e| pops.contains(&e.1)) {
@@ -5239,7 +6031,7 @@ impl Simulator {
             }
         }
         if !csp.wide.is_empty() {
-            self.csp_wide_split(csp, &uses);
+            self.csp_wide_split(csp, &uses, &links);
         }
         for (v, (ranges, dynamic)) in uses {
             let w = csp.vars[v].width;
@@ -5372,6 +6164,74 @@ impl Simulator {
 
     /// Packed-struct fields and declared (left, right) of scalar `name`.
     /// Struct fields use zero-based storage; unsupported shapes return None.
+    /// The declared type of member `name` of the object `owner`, searched
+    /// up its class chain; a class type parameter stands for the type this
+    /// object bound to it.
+    fn csp_prop_decl_type(&self, owner: usize, name: &str) -> Option<DataType> {
+        let class = self
+            .heap
+            .get(owner)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        let mut cur = class;
+        let mut found = None;
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(&cn) else {
+                break;
+            };
+            if let Some(t) = self.class_prop_decl_type(cd, name) {
+                found = Some(t.clone());
+                // §8.25: an element typed by a class type parameter
+                // (`rand T beats[];`) has the shape of the type this
+                // object bound to it.
+                if let DataType::TypeReference {
+                    name: tn,
+                    dimensions,
+                    ..
+                } = t
+                    && dimensions.is_empty()
+                    && !tn.has_scope()
+                    && cd.type_param_names.contains(&tn.name.name)
+                    && let Some(b) = self.class_prop_type_name(owner, name)
+                    && let Some(bt) = self.module.typedef_types.get(b.as_str())
+                {
+                    found = Some(bt.clone());
+                }
+                break;
+            }
+            cur = cd.extends.clone();
+        }
+        found
+    }
+
+    /// §7.4.1: the packed dimensions (left, right), outermost first, of a
+    /// solver scalar or array `name` declared as a multi-dimensional packed
+    /// vector (`bit [8:0][7:0] w`) whose dimensions make up `width` bits.
+    fn csp_packed_dims(&self, csp: &Csp, name: &str, width: u32) -> Option<Vec<(i64, i64)>> {
+        let (dt, params) = if csp.scope.is_some() {
+            let name = self.dyn_name_lookup(name).unwrap_or(name);
+            (
+                self.module.var_decl_types.get(name)?.clone(),
+                self.module.parameters.clone(),
+            )
+        } else {
+            let (owner, name) = Self::csp_owner(csp, name);
+            (
+                self.csp_prop_decl_type(owner, name)?,
+                self.instance_param_scope(owner),
+            )
+        };
+        let dims = crate::compiler::elaborate::packed_full_dims_chained(
+            &dt,
+            &params,
+            &self.module.typedef_types,
+        )?;
+        let bits = dims.iter().try_fold(1u64, |acc, &(l, r)| {
+            acc.checked_mul((l - r).unsigned_abs().checked_add(1)?)
+        })?;
+        (dims.len() >= 2 && bits == u64::from(width)).then_some(dims)
+    }
+
     #[allow(clippy::type_complexity)]
     fn csp_scalar_shape(
         &mut self,
@@ -5397,24 +6257,7 @@ impl Simulator {
                 let (fields, _) = self.packed_agg_layout_with(&su, &params);
                 return Some((fields, None));
             }
-            let class = self
-                .heap
-                .get(owner)
-                .and_then(|o| o.as_ref())
-                .map(|i| i.class_name.clone());
-            let mut cur = class;
-            let mut found = None;
-            while let Some(cn) = cur {
-                let Some(cd) = self.module.classes.get(&cn) else {
-                    break;
-                };
-                if let Some(t) = self.class_prop_decl_type(cd, name) {
-                    found = Some(t.clone());
-                    break;
-                }
-                cur = cd.extends.clone();
-            }
-            found
+            self.csp_prop_decl_type(owner, name)
         };
         let Some(dt) = dt else {
             return Some((Vec::new(), Some((0, 0))));
@@ -5586,7 +6429,18 @@ impl Simulator {
         // §7.4.5: an element of a packed-array field at a position not
         // known yet may be any element: cut at every element.
         let mut elem_dyn = false;
-        if let Some((b, idx)) = Self::csp_split_last_select(Self::unparen(e))
+        // §7.4.1: every range a select of a multi-dimensional packed
+        // variable may name is a select of it.
+        if let Some(p) = self.csp_pdim_ref(csp, e, &mut konst) {
+            elem_dyn = true;
+            if let Some(p) = p
+                && p.depth > 0
+            {
+                uses.entry(p.v).or_default().0.extend(p.pos);
+            }
+        }
+        if !elem_dyn
+            && let Some((b, idx)) = Self::csp_split_last_select(Self::unparen(e))
             && konst(self, &idx).is_none()
             && let Some((v, all)) = self.csp_field_elem_all(csp, &b, &mut konst)
         {
@@ -5635,6 +6489,22 @@ impl Simulator {
                     }
                 }
             }
+        }
+        // §11.4.10: `x >> K` is the select `x[w-1:K]` (see `csp_shr_slice`).
+        if let ExprKind::Binary {
+            op: BinaryOp::ShiftRight,
+            left,
+            right,
+        } = &Self::unparen(e).kind
+            && let Some(k) = konst(self, right)
+            && let Some((v, lo, w, _)) = self.csp_slice_base_k(csp, left, &mut konst)
+            && k > 0
+            && k < i64::from(w)
+        {
+            uses.entry(v)
+                .or_default()
+                .0
+                .push((lo + k as u32, w - k as u32));
         }
         if !csp.wide.is_empty() {
             self.csp_wide_scan(csp, e, &bound_now, uses);
@@ -5732,6 +6602,13 @@ impl Simulator {
             }
             Some((v, Some((blo + lo as u32, w as u32))))
         };
+        if let Some(p) = self.csp_pdim_ref(csp, e, konst) {
+            let p = p?;
+            if p.depth == 0 {
+                return None;
+            }
+            return Some((p.v, p.known.then(|| p.pos[0])));
+        }
         if let Some(r) = self.csp_field_elem(csp, e, konst) {
             return Some(r);
         }
@@ -5791,6 +6668,178 @@ impl Simulator {
         }
     }
 
+    /// §7.4.1/§11.5.1: `e` as a select of a multi-dimensional packed
+    /// variable (`csp.pdims`): `w`, `w[i]`, `w[i][j]`, `w[i][3:0]`,
+    /// `w[5:2]`, `w[i+:2]`. Each index or part-select applies to the next
+    /// unpacked-from-the-left dimension, in that dimension's declared
+    /// labels; an index not constant here (a `foreach` index while the
+    /// constraints are scanned) yields every element it could name. None
+    /// when `e` is not rooted at such a variable; Some(None) when it is but
+    /// the select is not modelled (out of range, a select after a
+    /// part-select, a non-constant part-select width).
+    fn csp_pdim_ref(
+        &mut self,
+        csp: &Csp,
+        e: &Expression,
+        konst: &mut dyn FnMut(&mut Self, &Expression) -> Option<i64>,
+    ) -> Option<Option<PdimRef>> {
+        use crate::ast::expr::RangeKind;
+        if csp.pdims.is_empty() {
+            return None;
+        }
+        let e = Self::unparen(e);
+        let whole = |v: usize| {
+            csp.pdims.contains_key(&v).then(|| PdimRef {
+                v,
+                pos: vec![(0, csp.vars[v].width)],
+                depth: 0,
+                known: true,
+            })
+        };
+        if let Some(n) = self.csp_member(csp, e)
+            && let Some(&v) = csp.scalars.get(&n)
+        {
+            return whole(v).map(Some);
+        }
+        if let Some(v) = self.csp_elem_ref(csp, e, konst) {
+            return whole(v).map(Some);
+        }
+        enum Sel<'a> {
+            Index(&'a Expression),
+            Part(RangeKind, &'a Expression, &'a Expression),
+        }
+        let peeled;
+        let (base, sel): (&Expression, Sel) = match &e.kind {
+            ExprKind::Index { expr, index } => (expr, Sel::Index(index)),
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => (expr, Sel::Part(*kind, left, right)),
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.last().is_some_and(|s| !s.selects.is_empty())
+                    && h.path[..h.path.len() - 1]
+                        .iter()
+                        .all(|s| s.selects.is_empty()) =>
+            {
+                let mut bh = h.clone();
+                let idx = bh.path.last_mut().unwrap().selects.pop().unwrap();
+                if matches!(idx.kind, ExprKind::Range(..)) {
+                    return None;
+                }
+                bh.cached_signal_id = Cell::new(None);
+                bh.cached_resolved_name = std::cell::OnceCell::new();
+                peeled = (Expression::new(ExprKind::Ident(bh), e.span), idx);
+                (&peeled.0, Sel::Index(&peeled.1))
+            }
+            _ => return None,
+        };
+        let Some(b) = self.csp_pdim_ref(csp, base, konst)? else {
+            return Some(None);
+        };
+        let Some(&(l, r)) = csp.pdims.get(&b.v).and_then(|d| d.get(b.depth)) else {
+            return Some(None);
+        };
+        let n = (l - r).unsigned_abs() + 1;
+        let cw = u64::from(b.pos[0].1);
+        if n > cw || cw % n != 0 {
+            return Some(None);
+        }
+        let ew = (cw / n) as u32;
+        // The offset of label `k` from the least significant element.
+        let off = |k: i64| -> Option<u32> {
+            let o = if l >= r { k - r } else { r - k };
+            (0..n as i64).contains(&o).then_some(o as u32)
+        };
+        let (lab_lo, lab_hi) = (l.min(r), l.max(r));
+        // The element offset ranges (first, count) the select may name.
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        let mut known = b.known;
+        let depth;
+        match sel {
+            Sel::Index(ix) => {
+                depth = b.depth + 1;
+                match konst(self, ix) {
+                    Some(k) => match off(k) {
+                        Some(o) => runs.push((o, 1)),
+                        None => return Some(None),
+                    },
+                    None => {
+                        known = false;
+                        runs.extend((0..n as u32).map(|o| (o, 1)));
+                    }
+                }
+            }
+            Sel::Part(kind, a, c) => {
+                depth = usize::MAX;
+                // The labels [first, last] the part-select covers.
+                let span = |s: i64, cnt: i64, up: bool| -> (i64, i64) {
+                    if up {
+                        (s, s + cnt - 1)
+                    } else {
+                        (s - cnt + 1, s)
+                    }
+                };
+                let mut labels: Vec<(i64, i64)> = Vec::new();
+                match kind {
+                    RangeKind::Constant => {
+                        let (Some(x), Some(y)) = (konst(self, a), konst(self, c)) else {
+                            return Some(None);
+                        };
+                        // §11.5.1: a part-select keeps the declared direction.
+                        if x != y && (x > y) != (l > r) {
+                            return Some(None);
+                        }
+                        labels.push((x.min(y), x.max(y)));
+                    }
+                    RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                        let up = kind == RangeKind::IndexedUp;
+                        let Some(cnt) = konst(self, c).filter(|&c| c >= 1) else {
+                            return Some(None);
+                        };
+                        match konst(self, a) {
+                            Some(s0) => labels.push(span(s0, cnt, up)),
+                            None => {
+                                known = false;
+                                for s0 in lab_lo..=lab_hi {
+                                    let (x, y) = span(s0, cnt, up);
+                                    if x >= lab_lo && y <= lab_hi {
+                                        labels.push((x, y));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for (x, y) in labels {
+                    let (Some(ox), Some(oy)) = (off(x), off(y)) else {
+                        return Some(None);
+                    };
+                    runs.push((ox.min(oy), ox.max(oy) - ox.min(oy) + 1));
+                }
+                if runs.is_empty() {
+                    return Some(None);
+                }
+            }
+        }
+        if b.pos.len() * runs.len() > 4096 {
+            return Some(None);
+        }
+        let pos = b
+            .pos
+            .iter()
+            .flat_map(|&(lo, _)| runs.iter().map(move |&(o, k)| (lo + o * ew, k * ew)))
+            .collect();
+        Some(Some(PdimRef {
+            v: b.v,
+            pos,
+            depth,
+            known,
+        }))
+    }
+
     /// `e` as (base, lsb, width, whole): a whole scalar, a field, or a select
     /// of either.
     fn csp_slice_base_k(
@@ -5811,6 +6860,11 @@ impl Simulator {
                 .find(|(n, ..)| n == f)
                 .map(|&(_, lo, w)| (lo, w))
         };
+        if let Some(p) = self.csp_pdim_ref(csp, e, konst) {
+            let p = p.filter(|p| p.known)?;
+            let (lo, w) = p.pos[0];
+            return Some((p.v, lo, w, p.depth == 0));
+        }
         // `x`, `this.x`, `recv.x`: the scalar itself.
         if let Some(n) = self.csp_member(csp, e) {
             if let Some(v) = var_of(self, &n) {
@@ -6561,36 +7615,84 @@ impl Simulator {
 
     /// Split every wide variable into segments: at each multiple of 64,
     /// the sign bit, and the boundaries its constraints use (`uses`).
-    fn csp_wide_split(&mut self, csp: &mut Csp, uses: &HashMap<usize, (Vec<(u32, u32)>, bool)>) {
+    fn csp_wide_split(
+        &mut self,
+        csp: &mut Csp,
+        uses: &HashMap<usize, (Vec<(u32, u32)>, bool)>,
+        links: &[(usize, u32, usize, u32, u32)],
+    ) {
         let mut wides: Vec<usize> = csp.wide.iter().copied().collect();
         wides.sort_unstable();
-        let mut plan: Vec<(usize, Vec<u32>)> = Vec::with_capacity(wides.len());
-        let mut total = csp.vars.len();
-        for v in wides {
+        let mut cuts_of: HashMap<usize, std::collections::BTreeSet<u32>> = HashMap::default();
+        for &v in &wides {
             let w = csp.vars[v].width;
-            let mut cuts: Vec<u32> = vec![0, w];
+            let mut cuts: std::collections::BTreeSet<u32> = [0, w].into_iter().collect();
             if csp.vars[v].signed {
-                cuts.push(w - 1);
+                cuts.insert(w - 1);
             }
             if let Some((ranges, _)) = uses.get(&v) {
                 for &(lo, rw) in ranges {
-                    cuts.push(lo);
-                    cuts.push(lo + rw);
+                    cuts.extend([lo, lo + rw].into_iter().filter(|&c| c <= w));
                 }
             }
-            cuts.retain(|&c| c <= w);
-            cuts.sort_unstable();
-            cuts.dedup();
-            // A stretch no constraint divides is cut at the multiples of 64
-            // inside it, so a field or select stays one segment.
-            let mut fill = Vec::new();
-            for p in cuts.windows(2) {
+            cuts_of.insert(v, cuts);
+        }
+        // Two wide ranges a relation compares (`b.w == a.w`), and the
+        // elements of one wide array, are cut alike: the relation is then a
+        // relation per segment (`csp_wide_chunks`).
+        let mut pairs: Vec<(usize, u32, usize, u32, u32)> = links
+            .iter()
+            .copied()
+            .filter(|l| cuts_of.contains_key(&l.0) && cuts_of.contains_key(&l.2))
+            .collect();
+        for a in csp.arrays.values() {
+            if let Some(&(_, e0)) = a.elems.first()
+                && cuts_of.contains_key(&e0)
+            {
+                let w = csp.vars[e0].width;
+                pairs.extend(a.elems.iter().skip(1).map(|e| (e0, 0, e.1, 0, w)));
+            }
+        }
+        let align = |cuts_of: &mut HashMap<usize, std::collections::BTreeSet<u32>>| {
+            for _ in 0..8 {
+                let mut changed = false;
+                for &(a, la, b, lb, w) in &pairs {
+                    for (x, lx, y, ly) in [(a, la, b, lb), (b, lb, a, la)] {
+                        let add: Vec<u32> = cuts_of[&x]
+                            .range(lx + 1..lx + w)
+                            .map(|&c| c - lx + ly)
+                            .collect();
+                        let cy = cuts_of.get_mut(&y).unwrap();
+                        for c in add {
+                            changed |= cy.insert(c);
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        };
+        if !pairs.is_empty() {
+            align(&mut cuts_of);
+        }
+        // A stretch no constraint divides is cut at the multiples of 64
+        // inside it, so a field or select stays one segment.
+        for cuts in cuts_of.values_mut() {
+            let v: Vec<u32> = cuts.iter().copied().collect();
+            for p in v.windows(2) {
                 if p[1] - p[0] > 64 {
-                    fill.extend((p[0] / 64 + 1..).map(|k| k * 64).take_while(|&c| c < p[1]));
+                    cuts.extend((p[0] / 64 + 1..).map(|k| k * 64).take_while(|&c| c < p[1]));
                 }
             }
-            cuts.extend(fill);
-            cuts.sort_unstable();
+        }
+        if !pairs.is_empty() {
+            align(&mut cuts_of);
+        }
+        let mut plan: Vec<(usize, Vec<u32>)> = Vec::with_capacity(wides.len());
+        let mut total = csp.vars.len();
+        for v in wides {
+            let cuts: Vec<u32> = cuts_of[&v].iter().copied().collect();
             total += cuts.len() - 1;
             plan.push((v, cuts));
         }
@@ -6837,6 +7939,32 @@ impl Simulator {
                     }
                 }
             }
+            // §11.4.5/§11.4.4: a relation between two wide ranges is
+            // decided segment by segment once both are cut alike.
+            BinaryOp::Eq
+            | BinaryOp::Neq
+            | BinaryOp::CaseEq
+            | BinaryOp::CaseNeq
+            | BinaryOp::Lt
+            | BinaryOp::Leq
+            | BinaryOp::Gt
+            | BinaryOp::Geq => {
+                let mut bits = |me: &mut Self, x: &Expression| -> Option<(usize, u32, u32)> {
+                    let x = Self::unparen(x);
+                    if let Some((v, r)) = me.csp_select_ref(csp, x, &mut konst) {
+                        let (lo, w) = r?;
+                        return csp.wide.contains(&v).then_some((v, lo, w));
+                    }
+                    let (v, lo, w, _) = me.csp_slice_base_k(csp, x, &mut konst)?;
+                    csp.wide.contains(&v).then_some((v, lo, w))
+                };
+                if let (Some(a), Some(b)) = (bits(self, left), bits(self, right))
+                    && (a.0, a.1) != (b.0, b.1)
+                {
+                    CSP_SCAN_LINKS
+                        .with(|l| l.borrow_mut().push((a.0, a.1, b.0, b.1, a.2.min(b.2))));
+                }
+            }
             _ => {}
         }
     }
@@ -6913,16 +8041,36 @@ impl Simulator {
             ExprKind::Range(a, b) => all(self, &[a, b], out),
             // A select at a position not known yet (`f[id]`, `f[id][7:0]`)
             // reads the bits of what it selects from, and its index.
-            ExprKind::Index { expr, index } => all(self, &[expr, index], out),
+            ExprKind::Index { expr, index } => self.csp_wide_sel_deps(csp, expr, index, env, out),
             ExprKind::RangeSelect {
                 expr, left, right, ..
             } => all(self, &[expr, left, right], out),
             ExprKind::Ident(_) => match Self::csp_split_last_select(e) {
-                Some((b, i)) => all(self, &[&b, &i], out),
+                Some((b, i)) => self.csp_wide_sel_deps(csp, &b, &i, env, out),
                 None => false,
             },
             _ => false,
         }
+    }
+
+    /// `base[index]` for `csp_wide_deps`: the select's bits and index;
+    /// under `CSP_DYN_WHOLE`, every segment of a whole wide `base`.
+    fn csp_wide_sel_deps(
+        &mut self,
+        csp: &Csp,
+        base: &Expression,
+        index: &Expression,
+        env: &Env,
+        out: &mut Vec<usize>,
+    ) -> bool {
+        if CSP_DYN_WHOLE.with(|c| c.get())
+            && let Some((v, _, _, true)) = self.csp_wide_bits(csp, base, env)
+            && let Some(segs) = csp.segs.get(&v)
+        {
+            out.extend(segs.iter().map(|s| s.2));
+            return self.csp_wide_deps(csp, index, env, out);
+        }
+        self.csp_wide_deps(csp, base, env, out) && self.csp_wide_deps(csp, index, env, out)
     }
 
     /// `e` may read a wide variable (see `csp_may_read_wide`).

@@ -4008,11 +4008,15 @@ struct MethodDef {
 /// to re-derive on every `new` (see `Simulator::inst_template`). The class
 /// tables are fixed at run time; the template also records the chain it was
 /// built from and is only used for that same chain (compared by pointer).
+/// `InstTemplate::seed` flag: seed the property with x (`prop_seeds_x`).
+const SEED_X: u8 = 4;
+
 struct InstTemplate {
     chain: Vec<Arc<crate::compiler::elaborate::ElaboratedClass>>,
     /// Per chain entry, per property in `properties` order: 0 = static or
     /// associative (not seeded per instance), 1 = seeded under its bare
-    /// name, 2 = seeded under `Class::name` (redeclared nearer the leaf).
+    /// name, 2 = seeded under `Class::name` (redeclared nearer the leaf);
+    /// `SEED_X` set = seeded with x (see `prop_seeds_x`).
     seed: Vec<Vec<u8>>,
     /// The `(chain index, property)` pairs, in the registration loop's
     /// order, that the type-parameter-bound collection registration can
@@ -4024,6 +4028,10 @@ struct InstTemplate {
     /// key `<prop>.<member>`, the default expression and the member's type,
     /// root class first so a derived class's property wins.
     struct_defaults: Vec<(String, Expression, DataType)>,
+    /// §6.8 / §7.2: the initial member cells of the chain's UNPACKED-struct
+    /// properties (`st_t st;`), keyed `<prop>.<member>`: x for a 4-state
+    /// member, 0 for a 2-state one. `struct_defaults` applies on top.
+    struct_cells: Vec<(String, Value)>,
 }
 
 impl MethodCallPlan {
@@ -6460,6 +6468,11 @@ pub struct Simulator {
     /// for `rand` class-handle members (a cyclic object graph would otherwise
     /// recurse forever).
     randomize_depth: usize,
+    /// Failed randomize() calls reported so far, per class or
+    /// `std::randomize` call site (`rand_fail_warn`).
+    rand_fail_reports: HashMap<String, u32>,
+    /// Whether the `XEZIM_RAND_DIAG` hint has been printed.
+    rand_fail_hinted: bool,
     /// One work/time budget shared by an outer randomize call and every
     /// recursive rand-object solve it starts.
     randomize_budget_depth: usize,
@@ -12032,6 +12045,8 @@ impl Simulator {
             constraint_mode_disabled: HashMap::default(),
             static_constraint_disabled: HashSet::default(),
             randomize_depth: 0,
+            rand_fail_reports: HashMap::default(),
+            rand_fail_hinted: false,
             randomize_budget_depth: 0,
             randomize_budget_remaining: 0,
             randomize_budget_deadline: None,
@@ -32917,8 +32932,8 @@ impl Simulator {
                     let key = self.assoc_key_str(&an, &idx_val);
                     // class-perf: pre-sized manual renderer, as in `LoadCollElem`.
                     let elem_name = Self::name_with_key(&an, &key);
-                    // §7.10.2.3: `q[i] = v` with `i >= size` APPENDS to
-                    // a queue / dynamic array (auto-grows to `i+1`).
+                    // Keep the established queue-unpack growth behavior in
+                    // sync with the AST path.
                     if !self.is_associative_array(&an) {
                         let kval = idx_val.to_i64().unwrap_or(0);
                         if kval >= 0 && kval as u64 >= self.get_queue_size(&an) {
@@ -67148,6 +67163,29 @@ impl Simulator {
                 changed
             }
             ExprKind::MemberAccess { expr, member } => {
+                // §7.2.1/§7.4: a field of an element of a class array of
+                // packed structs (`beats[i].last = 1`, `o.beats[i].mask =
+                // m`) is a slice of the element: write the element with
+                // the field's bits replaced. The read side
+                // (`packed_struct_elem_type`) already slices it.
+                if let ExprKind::Index { .. } = &expr.kind
+                    && let Some(su) = self.packed_struct_elem_type(expr)
+                {
+                    let (fields, total) = self.packed_agg_layout(&su);
+                    if let Some(&(_, off, w)) = fields.iter().find(|f| f.0 == member.name)
+                        && total > 0
+                    {
+                        let mut elem = self.eval_expr(expr);
+                        if elem.width != total {
+                            elem = elem.resize(total);
+                        }
+                        let fv = val.resize(w);
+                        for i in 0..w {
+                            elem.set_bit((off + i) as usize, fv.get_bit(i as usize));
+                        }
+                        return self.assign_value(expr, &elem);
+                    }
+                }
                 // §13.4.2: a member of a subroutine-local / formal unpacked
                 // struct is owned by the call frame. Inside a subroutine body
                 // `s.a = v` parses as MemberAccess (at module level the same
@@ -67913,7 +67951,16 @@ impl Simulator {
         if rev.is_empty() {
             return None;
         }
-        let (handle, prop) = match &cur.kind {
+        let (handle, prop) = self.prop_chain_root(cur)?;
+        rev.reverse();
+        Some((handle, prop, rev))
+    }
+
+    /// The object and member a plain or handle-qualified member reference
+    /// names (`w`, `o.w`, `y.a.w`, `expr.w`), for the packed-property
+    /// select paths.
+    fn prop_chain_root(&mut self, cur: &Expression) -> Option<(usize, String)> {
+        Some(match &cur.kind {
             ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
                 let name = &h.path[0].name.name;
                 if self
@@ -67944,6 +67991,26 @@ impl Simulator {
                 }
                 (obj, h.path[1].name.name.clone())
             }
+            // `y.a.w[i][j]`: a member of an object reached through a chain
+            // of handle members.
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() > 2
+                    && h.path.iter().all(|s| s.selects.is_empty()) =>
+            {
+                let mut obj = self.eval_ident_handle(&h.path[0].name.name)?;
+                for seg in &h.path[1..h.path.len() - 1] {
+                    if obj == 0 || obj >= self.heap.len() {
+                        return None;
+                    }
+                    self.prop_class_type(obj, &seg.name.name)?;
+                    obj = self.member_handle(obj, &seg.name.name)?;
+                }
+                if obj == 0 || obj >= self.heap.len() {
+                    return None;
+                }
+                (obj, h.path.last()?.name.name.clone())
+            }
             ExprKind::MemberAccess { expr: base, member } => {
                 let obj = self.eval_handle_expr(base)?;
                 if obj == 0 || obj >= self.heap.len() {
@@ -67952,9 +68019,118 @@ impl Simulator {
                 (obj, member.name.clone())
             }
             _ => return None,
+        })
+    }
+
+    /// The packed value `prop` of `h` and its indices `idx_exprs` select
+    /// into: the property itself when it is a multi-dimensional packed
+    /// array, or (§7.4) an element of a fixed unpacked array property whose
+    /// element type is one (`bit [3:0][7:0] arr [3]`, `arr[i][2]`), the
+    /// unpacked indices consumed. Returns the value, its packed dimensions
+    /// and the packed indices.
+    fn class_packed_operand(
+        &mut self,
+        h: usize,
+        prop: &str,
+        idx_exprs: &[&Expression],
+    ) -> Option<(Value, Vec<(i64, i64)>, Vec<Value>)> {
+        if let Some(dims) = self.class_prop_packed_dims(h, prop) {
+            let base = self.read_member_value(h, prop)?;
+            let idx = idx_exprs.iter().map(|ie| self.eval_expr(ie)).collect();
+            return Some((base, dims, idx));
+        }
+        if idx_exprs.is_empty() {
+            return None;
+        }
+        let (udims, _) = self.fixed_foreach_dims(h, prop)?;
+        if idx_exprs.len() < udims.len() {
+            return None;
+        }
+        let mut cn = self
+            .heap
+            .get(h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone())?;
+        let dt = loop {
+            let cd = self.module.classes.get(&cn)?;
+            if let Some(dt) = cd.property_types.get(prop) {
+                break dt.clone();
+            }
+            cn = cd.extends.clone()?;
         };
-        rev.reverse();
-        Some((handle, prop, rev))
+        let pdims = super::elaborate::packed_full_dims_chained(
+            &dt,
+            &self.module.parameters,
+            &self.module.typedef_types,
+        )?;
+        if pdims.len() < 2 {
+            return None;
+        }
+        let idx: Vec<Value> = idx_exprs.iter().map(|ie| self.eval_expr(ie)).collect();
+        let mut sfx = String::new();
+        for v in &idx[..udims.len()] {
+            sfx.push_str(&format!("[{}]", v.to_i64()?));
+        }
+        let elem = self.class_elem_load(h, prop, &sfx)?;
+        Some((elem, pdims, idx[udims.len()..].to_vec()))
+    }
+
+    /// §7.4.1/§11.5.1: a part-select of a multi-dimensional packed class
+    /// property, after any element selects (`w[5][8:5]`, `w[6:5]`,
+    /// `y.a.w[i][4 +: 2]`): the labels of the next dimension, each
+    /// spanning one element of it. None when `base` is not such a
+    /// property.
+    fn class_packed_part_select(
+        &mut self,
+        base: &Expression,
+        kind: crate::ast::expr::RangeKind,
+        left: &Expression,
+        right: &Expression,
+    ) -> Option<Value> {
+        let mut idx_exprs: Vec<&Expression> = Vec::new();
+        let mut cur = base;
+        while let ExprKind::Index { expr: b, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = b;
+        }
+        idx_exprs.reverse();
+        let (h, prop) = self.prop_chain_root(cur)?;
+        let (base_v, dims, idx) = self.class_packed_operand(h, &prop, &idx_exprs)?;
+        let &(dl, dr) = dims.get(idx.len())?;
+        let l = self.eval_expr(left);
+        let r = self.eval_expr(right);
+        let count = (dl - dr).unsigned_abs() + 1;
+        let ew = Self::packed_chain_width(base_v.width as u64, &dims, idx.len() + 1);
+        let (first, last) = match (l.to_i64(), r.to_i64()) {
+            (Some(a), Some(b)) if !l.has_xz() && !r.has_xz() => match kind {
+                crate::ast::expr::RangeKind::Constant => (a, b),
+                crate::ast::expr::RangeKind::IndexedUp => (a, a + b - 1),
+                crate::ast::expr::RangeKind::IndexedDown => (a - b + 1, a),
+            },
+            _ => (i64::MIN, i64::MIN),
+        };
+        let n = (first - last).unsigned_abs() + 1;
+        let out_w = (n * ew) as u32;
+        let Some((blsb, _)) = Self::packed_chain_slice(base_v.width as u64, &dims, &idx) else {
+            return Some(Value::new(out_w));
+        };
+        let lo_b = dl.min(dr);
+        let slot = |k: i64| -> Option<u64> {
+            let off = k - lo_b;
+            if off < 0 || off as u64 >= count {
+                return None;
+            }
+            Some(if dl >= dr {
+                off as u64
+            } else {
+                count - 1 - off as u64
+            })
+        };
+        let (Some(a), Some(b)) = (slot(first), slot(last)) else {
+            return Some(Value::new(out_w));
+        };
+        let lsb = blsb + a.min(b) * ew;
+        Some(base_v.range_select((lsb + out_w as u64 - 1) as usize, lsb as usize))
     }
 
     /// Bit slice (lsb, width) addressed by an index chain into a packed
@@ -68212,6 +68388,110 @@ impl Simulator {
         items: &[crate::ast::decl::ConstraintItem],
         targets: &[(String, Expression)],
     ) -> rand_csp::CspOutcome {
+        let (scalars, arrays) = match self.std_randomize_vars(targets, false) {
+            Ok(v) => v,
+            Err(o) => return o,
+        };
+        let out = self.rand_csp_solve_scope(items, &scalars, &arrays);
+        if std::env::var_os("XEZIM_RAND_DBG").is_some() {
+            eprintln!(
+                "[rand-dbg] std::randomize joint: targets {:?} -> {:?}",
+                targets.iter().map(|t| &t.0).collect::<Vec<_>>(),
+                out
+            );
+        }
+        out
+    }
+
+    /// §18.5.8.1: `std::randomize(n, a) with {a.size() == n + 1; …}` solves
+    /// the sizes of the dynamic-array targets whose `size()` a constraint
+    /// reads first, jointly with the other targets, then the elements with
+    /// the arrays at those sizes. None when no size is read or the joint
+    /// solver does not model the call; otherwise whether it succeeded.
+    fn std_randomize_sized(
+        &mut self,
+        items: &[crate::ast::decl::ConstraintItem],
+        targets: &[(String, Expression)],
+    ) -> Option<bool> {
+        let (scalars, arrays) = self.std_randomize_vars(targets, true).ok()?;
+        let sized: HashSet<String> = arrays
+            .iter()
+            .filter(|a| {
+                (self.module.dynamic_arrays.contains(&a.1)
+                    || self
+                        .signals
+                        .contains_key(&Self::name_with_suffix(&a.1, ".size")))
+                    && Self::items_read_size(items, &a.0)
+            })
+            .map(|a| a.0.clone())
+            .collect();
+        if sized.is_empty() {
+            return None;
+        }
+        for _ in 0..4 {
+            let sizes = match self.csp_scope_sizes(items, &scalars, &arrays, &sized) {
+                Ok(s) => s,
+                // A relaxation of the problem has no solution.
+                Err(rand_csp::CspOutcome::Unsat) => return Some(false),
+                Err(_) => return None,
+            };
+            for (name, n) in sizes {
+                if let Some(a) = arrays.iter().find(|a| a.0 == name) {
+                    let key = a.1.clone();
+                    self.resize_random_dyn_target(&key, n);
+                }
+            }
+            if matches!(
+                self.std_randomize_joint(items, targets),
+                rand_csp::CspOutcome::Sat
+            ) {
+                return Some(true);
+            }
+        }
+        None
+    }
+
+    /// Whether some item reads `name.size()`.
+    fn items_read_size(items: &[crate::ast::decl::ConstraintItem], name: &str) -> bool {
+        let wrapper = [crate::ast::decl::ClassConstraint {
+            is_static: false,
+            is_extern: false,
+            has_body: true,
+            name: crate::ast::Identifier {
+                name: "__inline__".to_string(),
+                span: crate::ast::Span::dummy(),
+            },
+            items: items.to_vec(),
+            span: crate::ast::Span::dummy(),
+        }];
+        let c = RandColl {
+            prop: name.to_string(),
+            scoped: name.to_string(),
+            kind: CollKind::Dyn,
+            width: 1,
+            lo: 0,
+            hi: 0,
+            nested: false,
+            is_object_elem: false,
+        };
+        Self::csp_size_solved(&c, &wrapper)
+    }
+
+    /// The joint solver's variables for `std::randomize(targets)`: plain
+    /// integral scalars and 1-D arrays at their current size. An empty
+    /// array is listed only with `empty` (the size phase sizes it).
+    #[allow(clippy::type_complexity)]
+    fn std_randomize_vars(
+        &mut self,
+        targets: &[(String, Expression)],
+        empty: bool,
+    ) -> Result<
+        (
+            Vec<(String, Expression, u32, bool, Option<Vec<u64>>)>,
+            Vec<(String, String, Vec<i64>, u32, bool, Option<Vec<u64>>)>,
+        ),
+        rand_csp::CspOutcome,
+    > {
         let mut scalars = Vec::new();
         let mut arrays = Vec::new();
         for (name, lv) in targets {
@@ -68224,7 +68504,7 @@ impl Simulator {
                 if self.module.arrays_nd.contains_key(&nm)
                     || self.module.arrays_2d.contains_key(&nm)
                 {
-                    return rand_csp::CspOutcome::NotApplicable;
+                    return Err(rand_csp::CspOutcome::NotApplicable);
                 }
                 let dynamic = self.module.dynamic_arrays.contains(&nm)
                     || self
@@ -68235,40 +68515,8 @@ impl Simulator {
                 } else if let Some(&(lo, hi, _)) = self.module.arrays.get(&nm) {
                     (lo.min(hi)..=lo.max(hi)).collect()
                 } else {
-                    return rand_csp::CspOutcome::NotApplicable;
+                    return Err(rand_csp::CspOutcome::NotApplicable);
                 };
-                let Some(first) = idx.first() else {
-                    // An empty array has no element variables.
-                    continue;
-                };
-                let Some(v0) = self.get_signal_value_by_name(&format!("{}[{}]", nm, first)) else {
-                    return rand_csp::CspOutcome::NotApplicable;
-                };
-                if v0.is_real {
-                    return rand_csp::CspOutcome::NotApplicable;
-                }
-                let w = self
-                    .module
-                    .arrays
-                    .get(&nm)
-                    .map(|t| t.2 as u32)
-                    .unwrap_or(v0.width);
-                if w > 64 {
-                    // Left as drawn: a constraint reading it is judged by the
-                    // final check.
-                    continue;
-                }
-                // The declared element type decides the signedness: an
-                // element value written by the per-item repair above may
-                // carry a literal's (`bc[i] == 1` left a `bit` element
-                // signed, and the solve then had no value 1 for it).
-                let signed = match self.module.var_decl_types.get(&nm) {
-                    Some(dt) => {
-                        super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types)
-                    }
-                    None => v0.is_signed || self.signed_signals.contains(&nm),
-                };
-                let ev = enum_vals(self, &nm);
                 // §18.12: a dynamic array or queue local to an automatic
                 // task is stored under a per-call key (`declare_local_dyn`);
                 // the constraints name it as written, so the solver knows it
@@ -68284,6 +68532,48 @@ impl Simulator {
                     }
                     _ => nm.clone(),
                 };
+                let Some(first) = idx.first() else {
+                    // An empty array has no element variables.
+                    if empty && dynamic {
+                        let w = self
+                            .module
+                            .arrays
+                            .get(&nm)
+                            .map(|t| t.2 as u32)
+                            .unwrap_or(32);
+                        let ev = enum_vals(self, &nm);
+                        arrays.push((written, nm, idx, w.max(1), false, ev));
+                    }
+                    continue;
+                };
+                let Some(v0) = self.get_signal_value_by_name(&format!("{}[{}]", nm, first)) else {
+                    return Err(rand_csp::CspOutcome::NotApplicable);
+                };
+                if v0.is_real {
+                    return Err(rand_csp::CspOutcome::NotApplicable);
+                }
+                let w = self
+                    .module
+                    .arrays
+                    .get(&nm)
+                    .map(|t| t.2 as u32)
+                    .unwrap_or(v0.width);
+                if w > 64 && !(empty && dynamic) {
+                    // Left as drawn: a constraint reading it is judged by the
+                    // final check.
+                    continue;
+                }
+                // The declared element type decides the signedness: an
+                // element value written by the per-item repair above may
+                // carry a literal's (`bc[i] == 1` left a `bit` element
+                // signed, and the solve then had no value 1 for it).
+                let signed = match self.module.var_decl_types.get(&nm) {
+                    Some(dt) => {
+                        super::elaborate::is_type_signed_resolved(dt, &self.module.typedef_types)
+                    }
+                    None => v0.is_signed || self.signed_signals.contains(&nm),
+                };
+                let ev = enum_vals(self, &nm);
                 arrays.push((written, nm, idx, w.max(1), signed, ev));
                 continue;
             }
@@ -68293,14 +68583,14 @@ impl Simulator {
                 if targets.iter().any(|(n, _)| n == root) {
                     continue;
                 }
-                return rand_csp::CspOutcome::NotApplicable;
+                return Err(rand_csp::CspOutcome::NotApplicable);
             }
             if !matches!(lv.kind, ExprKind::Ident(_)) {
-                return rand_csp::CspOutcome::NotApplicable;
+                return Err(rand_csp::CspOutcome::NotApplicable);
             }
             let cur = self.eval_expr(lv);
             if cur.is_real {
-                return rand_csp::CspOutcome::NotApplicable;
+                return Err(rand_csp::CspOutcome::NotApplicable);
             }
             if cur.width > 64 {
                 continue;
@@ -68314,15 +68604,7 @@ impl Simulator {
                 ev,
             ));
         }
-        let out = self.rand_csp_solve_scope(items, &scalars, &arrays);
-        if std::env::var_os("XEZIM_RAND_DBG").is_some() {
-            eprintln!(
-                "[rand-dbg] std::randomize joint: targets {:?} -> {:?}",
-                targets.iter().map(|t| &t.0).collect::<Vec<_>>(),
-                out
-            );
-        }
-        out
+        Ok((scalars, arrays))
     }
 
     /// The root variable a `std::randomize` target names: `v`, `s.f`,
@@ -70751,7 +71033,15 @@ impl Simulator {
                 return v;
             }
             if let Some(w) = self.coll_field_width(&su, &member.name) {
-                return Value::zero(w);
+                // §7.8.6: a missing struct element has its member types'
+                // defaults; reading it must not insert an associative entry.
+                let mut defaults = Vec::new();
+                self.struct_leaf_plain_defaults("", &su, 0, &mut defaults);
+                return defaults
+                    .into_iter()
+                    .find(|(n, _)| *n == format!(".{}", member.name))
+                    .map(|(_, v)| v)
+                    .unwrap_or_else(|| Value::zero(w));
             }
         }
         // Whole unpacked-struct class-property read in MemberAccess
@@ -74128,6 +74418,16 @@ impl Simulator {
                     }
                     match (llw, rlw) {
                         (Some(lw), Some(rw)) => lw.max(rw),
+                        // §7.5.1/§7.10.2: `size()` and `num()` return an int,
+                        // so `a.size() == n + m` over 6-bit n, m adds at 32
+                        // bits. Asked only when the other side is narrower.
+                        (l, r)
+                            if l.max(r).is_none_or(|w| w < 32)
+                                && (self.count_method_call(left)
+                                    || self.count_method_call(right)) =>
+                        {
+                            ctx_width.max(32)
+                        }
                         _ => ctx_width,
                     }
                 } else {
@@ -74679,6 +74979,24 @@ impl Simulator {
             ExprKind::Index { expr, index } => {
                 // Element select on a packed multi-dimensional CLASS property.
                 if let Some((h, prop, idx_exprs)) = self.prop_index_chain_parts(expr, index) {
+                    // §7.4: an element of an unpacked array property of
+                    // multi-dimensional packed elements, then packed selects.
+                    if idx_exprs.len() >= 2
+                        && !self.class_prop_packed_dims(h, &prop).is_some()
+                        && let Some((ev, pd, pidx)) =
+                            self.class_packed_operand(h, &prop, &idx_exprs)
+                        && !pidx.is_empty()
+                        && pidx.len() <= pd.len()
+                    {
+                        return match Self::packed_chain_slice(ev.width as u64, &pd, &pidx) {
+                            Some((lsb, w)) => ev.range_select((lsb + w - 1) as usize, lsb as usize),
+                            None => Value::new(Self::packed_chain_width(
+                                ev.width as u64,
+                                &pd,
+                                pidx.len(),
+                            ) as u32),
+                        };
+                    }
                     if let Some(dims) = self.class_prop_packed_dims(h, &prop) {
                         if idx_exprs.len() <= dims.len() {
                             let idx: Vec<Value> =
@@ -74724,6 +75042,25 @@ impl Simulator {
                     ExprKind::Ident(h) => Some(self.resolve_hier_name(h)),
                     _ => None,
                 };
+                // §8.9: `Cls::S[i]` of a static fixed array — the resolver
+                // collapses the two-segment form to the bare leaf, which
+                // named no array and read a bit of a scalar cell instead.
+                if let ExprKind::Ident(h) = &expr.kind
+                    && h.path.len() == 2
+                    && base_nm
+                        .as_deref()
+                        .is_some_and(|n| !self.module.arrays.contains_key(n))
+                    && let Some(k) = self.static_fixed_key_from_hier(h)
+                {
+                    let ew = self.module.arrays.get(&k).map(|t| t.2).unwrap_or(1).max(1);
+                    let iv = self.eval_expr(index);
+                    return match iv.to_i64().filter(|_| !iv.has_xz()) {
+                        Some(i) => self
+                            .get_signal_value_by_name(&format!("{}[{}]", k, i))
+                            .unwrap_or_else(|| Value::new(ew)),
+                        None => Value::new(ew),
+                    };
+                }
                 // §7.4.6 / §11.5.1: an x/z index reads x at the ELEMENT width,
                 // NOT element 0. `to_u64`/`to_i64` mask x bits to zero and
                 // never fail, so every `unwrap_or` below silently addressed
@@ -75754,6 +76091,13 @@ impl Simulator {
                 kind,
                 ..
             } => {
+                // A module-level plain name is never a class property.
+                let plain = matches!(&expr.kind, ExprKind::Ident(h) if h.path.len() == 1);
+                if (!plain || !self.this_stack.is_empty())
+                    && let Some(v) = self.class_packed_part_select(expr, *kind, left, right)
+                {
+                    return v;
+                }
                 // Unpacked array slice: concatenate elements
                 if let ExprKind::Ident(hier) = &expr.kind {
                     let name = self.resolve_hier_name(hier);
@@ -80338,9 +80682,16 @@ impl Simulator {
                 }
                 suffixes = next;
             }
+            // §7.5.1: the element type's default (x when 4-state).
+            let four_state = self.coll_elem_starts_x(name);
             for i in keep..n {
                 for s in &suffixes {
-                    self.set_signal_value_by_name(&format!("{}[{}]{}", name, i, s), Value::zero(w));
+                    let v = if four_state {
+                        Value::new(w)
+                    } else {
+                        Value::zero(w)
+                    };
+                    self.set_signal_value_by_name(&format!("{}[{}]{}", name, i, s), v);
                 }
             }
         } else {
@@ -80354,22 +80705,8 @@ impl Simulator {
                 .get(&*name)
                 .map(|&(_, _, w)| w)
                 .unwrap_or(32);
-            let four_state = self.p_elem_type_ref(&name).is_some_and(|dt| {
-                use crate::ast::types::{
-                    DataType as DT, IntegerAtomType as IAT, IntegerVectorType as IVT,
-                };
-                match self.resolve_dt_ref(&dt) {
-                    DT::IntegerVector {
-                        kind: IVT::Logic | IVT::Reg,
-                        ..
-                    } => true,
-                    DT::IntegerAtom {
-                        kind: IAT::Integer | IAT::Time,
-                        ..
-                    } => true,
-                    _ => false,
-                }
-            });
+            // A class member (`<handle>#da`) has its type on the class.
+            let four_state = self.coll_elem_starts_x(name);
             let fill = if four_state {
                 Value::new(w)
             } else {
@@ -80395,6 +80732,8 @@ impl Simulator {
                             };
                             self.signals.insert(k, sv);
                         }
+                        // §6.8: a 4-state member leaf starts at x.
+                        self.seed_struct_elem_cells(&elem, su);
                     }
                     None => {
                         self.set_signal_value_by_name(&elem, fill.clone());
@@ -89149,6 +89488,32 @@ impl Simulator {
                                         continue;
                                     }
                                 }
+                                // §21.2.1.7: a fixed-array or unpacked-struct
+                                // CLASS property renders from its declared type.
+                                if !self.no_class_objects()
+                                    && let Some((handle, prop)) = self.class_prop_receiver(arg)
+                                    && let Some(s) = self.render_p_class_prop(handle, &prop)
+                                {
+                                    result.push_str(&s);
+                                    continue;
+                                }
+                                // §8.9: a static fixed array spelled `Cls::S`.
+                                if let ExprKind::Ident(h) = &arg.kind
+                                    && h.path.len() == 2
+                                    && let Some(k) = self.static_fixed_key_from_hier(h)
+                                    && let Some(s) = self.render_p_var(&k)
+                                {
+                                    result.push_str(&s);
+                                    continue;
+                                }
+                                // An unpacked-struct ELEMENT of one (`c.sta[1]`)
+                                // renders from the element's instance cells.
+                                if !self.no_class_objects()
+                                    && let Some(s) = self.render_p_class_struct_elem(arg)
+                                {
+                                    result.push_str(&s);
+                                    continue;
+                                }
                                 // §21.2.1.7: a class object prints its properties
                                 // named, in declaration order (base first); a
                                 // null handle prints `null`. Only a genuinely
@@ -89168,12 +89533,14 @@ impl Simulator {
                                         {
                                             let parts: Vec<String> = members
                                                 .iter()
-                                                .map(|(n, v, is_str)| {
-                                                    format!(
-                                                        "{}:{}",
+                                                .filter_map(|(n, v, is_str)| {
+                                                    let r = self.render_p_object_member(
+                                                        handle as usize,
                                                         n,
-                                                        Self::render_p_value(v, *is_str)
-                                                    )
+                                                        v.as_ref(),
+                                                        *is_str,
+                                                    )?;
+                                                    Some(format!("{}:{}", n, r))
                                                 })
                                                 .collect();
                                             result.push_str(&format!("'{{{}}}", parts.join(", ")));
@@ -92550,7 +92917,7 @@ impl Simulator {
     /// chain or declaring module instance, then the class name. A class of
     /// the compilation unit keeps the object's creation scope.
     fn class_m_root(&self, cname: &str) -> String {
-        let mut path = cname.to_string();
+        let mut path = self.class_source_name(cname).to_string();
         let mut outer = cname.to_string();
         for _ in 0..16 {
             match self
@@ -97474,6 +97841,36 @@ impl Simulator {
     /// `None` when the callee is not a plain module-scope function (a method,
     /// a class constructor, an array builtin), where the caller falls back to
     /// evaluation.
+    /// `e` is a call of a collection's `size()` / `num()` (an int).
+    fn count_method_call(&mut self, e: &Expression) -> bool {
+        let ExprKind::Call { func, args } = &e.kind else {
+            return false;
+        };
+        if !args.is_empty() || !self.callee_method_name_is(func, |m| matches!(m, "size" | "num")) {
+            return false;
+        }
+        if self.collection_method_of(func).is_some() {
+            return true;
+        }
+        // A class member (`s.size()` in a method, `obj.s.size()`): its
+        // storage is instance-scoped.
+        let recv = match &func.kind {
+            ExprKind::MemberAccess { expr, .. } => (**expr).clone(),
+            ExprKind::Ident(h) if h.path.len() >= 2 => {
+                let mut r = h.clone();
+                r.path.pop();
+                r.cached_signal_id = std::cell::Cell::new(None);
+                r.cached_resolved_name = std::cell::OnceCell::new();
+                Expression::new(ExprKind::Ident(r), func.span)
+            }
+            _ => return false,
+        };
+        self.array_operand_name(&recv).is_some()
+            || self
+                .expr_assoc_name(&recv)
+                .is_some_and(|n| self.is_associative_array(&n))
+    }
+
     fn call_return_width(&mut self, func: &Expression) -> Option<u32> {
         // A queue/dyn-array method reached here through the generic Call
         // fallback and EVALUATED — so `s - q.pop_back()` popped once for the
@@ -104588,6 +104985,15 @@ impl Simulator {
                                 .collect();
                             let folded = self.fold_state_guards(constraints, &rand_roots);
                             let constraints: &[crate::ast::decl::ConstraintItem] = &folded;
+                            // §18.5.8.1: sizes a constraint reads are solved
+                            // first, then the elements (see
+                            // `std_randomize_sized`).
+                            if let Some(ok) = self.std_randomize_sized(constraints, &targets) {
+                                if !ok {
+                                    self.rand_fail_warn_std(constraints);
+                                }
+                                return Value::from_u64(ok as u64, 32);
+                            }
                             let mut satisfied = false;
                             for attempt in 0..10 {
                                 if attempt > 0 {
@@ -104760,6 +105166,9 @@ impl Simulator {
                             // 1 unconditionally reported success for an
                             // unsatisfiable set (`v >= 100; v <= 5;`) and for a
                             // narrow band the i64 interval solver cannot reach.
+                            if !satisfied {
+                                self.rand_fail_warn_std(constraints);
+                            }
                             return Value::from_u64(if satisfied { 1 } else { 0 }, 32);
                         }
                     }
@@ -105589,14 +105998,21 @@ impl Simulator {
                     // the array left at its old size — the ubiquitous
                     // `std::randomize(list) with { list.size() == N; }` idiom
                     // silently produced an empty list.
+                    // A size from a not yet constrained variable can be
+                    // anything; one past the size phase's bound is left to
+                    // the retries rather than allocated.
                     if let Some(arr) = self.size_call_on_target(left, targets) {
                         let n = self.eval_expr(right).to_i64().unwrap_or(0).max(0) as u64;
-                        self.resize_random_dyn_target(&arr, n);
+                        if n <= 1 << 20 {
+                            self.resize_random_dyn_target(&arr, n);
+                        }
                         return;
                     }
                     if let Some(arr) = self.size_call_on_target(right, targets) {
                         let n = self.eval_expr(left).to_i64().unwrap_or(0).max(0) as u64;
-                        self.resize_random_dyn_target(&arr, n);
+                        if n <= 1 << 20 {
+                            self.resize_random_dyn_target(&arr, n);
+                        }
                         return;
                     }
                     if let Some(lv) = self.target_for(left, targets) {
@@ -111929,7 +112345,12 @@ impl Simulator {
                 || cd.queue_properties.contains_key(&member)
                 || cd.assoc_properties.contains_key(&member)
             {
-                let tn = cd.properties.get(&member)?.type_name.clone()?;
+                let mut tn = cd.properties.get(&member)?.type_name.clone()?;
+                // §8.25: an element typed by a class type parameter has the
+                // type this object bound to it.
+                if cd.type_param_names.contains(&tn) {
+                    tn = self.class_prop_type_name(handle, &member)?;
+                }
                 let dt = self.module.typedef_types.get(tn.as_str())?;
                 if let DataType::Struct(su) = Self::resolve_type_ref(dt, &self.module.typedef_types)
                 {
@@ -113672,33 +114093,69 @@ impl Simulator {
         rvalue: &Expression,
         su: &crate::ast::types::StructUnionType,
     ) {
-        let items: Option<Vec<&Expression>> = match &rvalue.kind {
-            ExprKind::AssignmentPattern(its) => {
-                let ord = self.pattern_ordered(its);
-                (!ord.is_empty()).then_some(ord)
-            }
+        let items = match &rvalue.kind {
+            ExprKind::AssignmentPattern(its) => Some(its.as_slice()),
             _ => None,
         };
+        let ordered: Vec<_> = items
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|it| match it {
+                AssignmentPatternItem::Ordered(e) => Some(e),
+                _ => None,
+            })
+            .collect();
         let mut k = 0usize;
         for m in &su.members {
             for md in &m.declarators {
                 let mn = md.name.name.as_str();
                 let lhs_f = Self::append_member_expr(lvalue, mn);
-                let v = match &items {
-                    // Ordered pattern: item k belongs to the k-th declared member.
-                    Some(its) => match its.get(k) {
-                        Some(e) => {
-                            let e = (*e).clone();
-                            self.eval_expr(&e)
-                        }
-                        None => continue,
-                    },
-                    None => {
-                        let rhs_f = Self::append_member_expr(rvalue, mn);
-                        self.eval_expr(&rhs_f)
-                    }
+                // §10.9.1: named and type keys take precedence over the
+                // positional/default items, including constructor initializers.
+                let rhs_f = if let Some(its) = items {
+                    let selected = its
+                        .iter()
+                        .find_map(|it| match it {
+                            AssignmentPatternItem::Named(id, e) if id.name == mn => Some(e),
+                            _ => None,
+                        })
+                        .or_else(|| {
+                            its.iter().find_map(|it| match it {
+                                AssignmentPatternItem::Typed(dt, e)
+                                    if self.pattern_type_matches(&m.data_type, dt) =>
+                                {
+                                    Some(e)
+                                }
+                                _ => None,
+                            })
+                        })
+                        .or_else(|| ordered.get(k).copied())
+                        .or_else(|| {
+                            its.iter().find_map(|it| match it {
+                                AssignmentPatternItem::Default(e) => Some(e),
+                                _ => None,
+                            })
+                        });
+                    let Some(e) = selected else {
+                        k += 1;
+                        continue;
+                    };
+                    e.clone()
+                } else {
+                    Self::append_member_expr(rvalue, mn)
                 };
-                self.assign_value(&lhs_f, &v);
+                if let Some(inner) = self.unpacked_struct_of(&m.data_type) {
+                    self.assign_class_unpacked_elem(&lhs_f, &rhs_f, &inner);
+                } else {
+                    let w = resolve_type_width(
+                        &m.data_type,
+                        Some(&self.module.parameters),
+                        Some(&self.module.typedefs),
+                    )
+                    .max(1);
+                    let v = self.eval_expr_ctx(&rhs_f, w);
+                    self.assign_value(&lhs_f, &v);
+                }
                 k += 1;
             }
         }
@@ -114984,6 +115441,12 @@ impl Simulator {
 
     /// The unpacked-struct element type of queue `obj_name`, if it has one.
     fn queue_elem_struct(&self, obj_name: &str) -> Option<crate::ast::types::StructUnionType> {
+        if let Some(dt) = self.class_member_coll_type(obj_name) {
+            return match self.resolve_dt_ref(dt) {
+                DataType::Struct(su) if Self::spreads_member_wise(su) => Some(su.clone()),
+                _ => None,
+            };
+        }
         if let Some(dt) = self.p_elem_type_ref(obj_name) {
             if let DataType::Struct(su) = self.resolve_dt_ref(&dt) {
                 if Self::spreads_member_wise(su) {
@@ -116561,7 +117024,16 @@ impl Simulator {
             // A LOCAL queue has no entry in `var_decl_types`, so `p_elem_type`
             // returns None; fall back to rendering each element from its stored
             // value (string elements quoted) instead of bailing to `x`.
-            let parts: Vec<String> = match self.p_elem_type(name) {
+            // A class member's element type is on its class; one that does
+            // not resolve here (a type parameter) keeps the value path.
+            let elem_dt = match self.class_member_coll_type(name) {
+                Some(dt) if !matches!(self.resolve_dt_ref(dt), DataType::TypeReference { .. }) => {
+                    Some(dt.clone())
+                }
+                Some(_) => None,
+                None => self.p_elem_type(name),
+            };
+            let parts: Vec<String> = match elem_dt {
                 Some(dt) => (0..sz)
                     .map(|i| self.render_p_typed(&format!("{}[{}]", name, i), &dt))
                     .collect(),
@@ -116672,7 +117144,13 @@ impl Simulator {
                 .collect();
             return Some(format!("'{{{} }}", parts.join(", ")));
         }
-        let Some(dt) = self.module.var_decl_types.get(name).cloned() else {
+        let decl = self.module.var_decl_types.get(name).cloned().or_else(|| {
+            // §8.9: a static fixed-array member's store (`Cls::S`).
+            (name.contains("::") && self.module.arrays.contains_key(name))
+                .then(|| self.class_member_coll_type(name).cloned())
+                .flatten()
+        });
+        let Some(dt) = decl else {
             let (dt, arr) = self.flat_path_type(name)?;
             if let Some(lists) = arr {
                 return Some(self.render_p_elem_lists(name, &dt, &lists));
@@ -116742,7 +117220,8 @@ impl Simulator {
     fn render_p_value_typed(&mut self, v: &Value, dt: &DataType) -> String {
         if let DataType::TypeReference { name: tn, .. } = dt {
             if let Some(members) = self.module.enum_members.get(&tn.name.name).cloned() {
-                if let Some(x) = v.to_u64() {
+                // An x/z value matches no label (§6.19): it prints as a number.
+                if let Some(x) = v.to_u64().filter(|_| !v.has_xz()) {
                     if let Some((label, _)) = members.iter().find(|(_, mv)| *mv == x) {
                         return label.clone();
                     }
@@ -117024,6 +117503,203 @@ impl Simulator {
         format!("'{{{}}}", parts.join(", "))
     }
 
+    /// §21.2.1.7: `%p` of class property `prop` of object `handle` from its
+    /// declared type — a fixed array (one or more dimensions) as a nested
+    /// list of its `<handle>#prop[i]` elements, an unpacked-struct element or
+    /// property member-wise from its instance cells. `None` when `prop` is not
+    /// such a property of the object's class chain.
+    fn render_p_class_prop(&mut self, handle: usize, prop: &str) -> Option<String> {
+        let cd = self.class_prop_declarer(handle, prop)?;
+        if cd.static_properties.contains(prop) {
+            // §8.9: a static fixed array has one store per declaring class.
+            if cd.static_fixed_arrays.iter().any(|(n, ..)| n == prop) {
+                let key = self.static_fixed_key_in(&cd.name, prop)?;
+                return self.render_p_var(&key);
+            }
+            return None;
+        }
+        let dt = self
+            .class_member_coll_type(&format!("{}#{}", handle, prop))?
+            .clone();
+        if cd.array_of_coll_properties.contains_key(prop) {
+            // §7.4.5: each element of the fixed outer shape is a collection.
+            let scoped = format!("{}#{}", handle, prop);
+            let (shape, _, _) = cd.array_of_coll_properties.get(prop)?.clone();
+            return Some(self.render_p_coll_elems(&scoped, &shape));
+        }
+        let fixed =
+            cd.array_properties.contains_key(prop) || cd.array_nd_properties.contains_key(prop);
+        let su = match self.resolve_dt_ref(&dt) {
+            DataType::Struct(su) if Self::spreads_member_wise(su) => Some(su.clone()),
+            _ => None,
+        };
+        if !fixed {
+            // A scalar unpacked struct; other scalars and collections take
+            // the existing paths.
+            if cd.queue_properties.contains_key(prop) || cd.assoc_properties.contains_key(prop) {
+                return None;
+            }
+            return su.map(|su| self.render_p_class_prop_struct(handle, prop, &su));
+        }
+        let scoped = format!("{}#{}", handle, prop);
+        let dims: Vec<(i64, i64)> = if let Some(&(lo, hi, _)) = self.module.arrays.get(&scoped) {
+            vec![(lo, hi)]
+        } else if let Some(&(d1, d2, _)) = self.module.arrays_2d.get(&scoped) {
+            vec![d1, d2]
+        } else if let Some((sh, _)) = self.module.arrays_nd.get(&scoped) {
+            sh.clone()
+        } else {
+            return None;
+        };
+        if dims.iter().any(|&(lo, hi)| hi < lo || hi - lo >= 4096) {
+            return None;
+        }
+        Some(self.render_p_class_elems(handle, prop, "", &dims, &dt, su.as_ref()))
+    }
+
+    /// `%p` of an element of a fixed-array class property of unpacked structs
+    /// (`c.sta[1]`, `sta[i][j]` in a method): its member cells live in the
+    /// instance map under `sta[1].<member>`.
+    fn render_p_class_struct_elem(&mut self, arg: &Expression) -> Option<String> {
+        let mut idx: Vec<&Expression> = Vec::new();
+        let mut base = arg;
+        while let ExprKind::Index { expr, index } = &base.kind {
+            idx.push(index);
+            base = expr;
+        }
+        if idx.is_empty() {
+            return None;
+        }
+        idx.reverse();
+        let (handle, prop) = self.class_prop_receiver(base)?;
+        let cd = self.class_prop_declarer(handle, &prop)?;
+        if cd.static_properties.contains(&prop)
+            || !(cd.array_properties.contains_key(&prop)
+                || cd.array_nd_properties.contains_key(&prop))
+        {
+            return None;
+        }
+        let ndims = cd
+            .array_nd_properties
+            .get(&prop)
+            .map(|(sh, _)| sh.len())
+            .unwrap_or(1);
+        if idx.len() != ndims {
+            return None;
+        }
+        let su = self
+            .class_prop_struct(handle, &prop)
+            .filter(Self::spreads_member_wise)?;
+        let mut key = prop;
+        for e in idx {
+            let i = self.eval_expr(e).to_i64()?;
+            key.push_str(&format!("[{}]", i));
+        }
+        Some(self.render_p_class_prop_struct(handle, &key, &su))
+    }
+
+    /// The class on `handle`'s `extends` chain (leaf first) that declares
+    /// property `prop`.
+    fn class_prop_declarer(
+        &self,
+        handle: usize,
+        prop: &str,
+    ) -> Option<Arc<crate::compiler::elaborate::ElaboratedClass>> {
+        let mut cur = Some(self.heap.get(handle)?.as_ref()?.class_name.as_str());
+        let mut hops = 0;
+        while let Some(c) = cur {
+            let cd = self.module.classes.get(c)?;
+            if cd.property_types.contains_key(prop) || cd.properties.contains_key(prop) {
+                return Some(cd.clone());
+            }
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
+    /// `%p` of a fixed outer shape whose elements are collections.
+    fn render_p_coll_elems(&mut self, base: &str, dims: &[(i64, i64)]) -> String {
+        let Some((&(lo, hi), rest)) = dims.split_first() else {
+            return self.render_p_var(base).unwrap_or_else(|| "'{}".to_string());
+        };
+        let parts: Vec<String> = (lo..=hi)
+            .map(|i| self.render_p_coll_elems(&format!("{}[{}]", base, i), rest))
+            .collect();
+        format!("'{{{}}}", parts.join(", "))
+    }
+
+    /// §21.2.1.7: one member of a whole-object `%p` (`'{name:value, ...}`):
+    /// arrays, structs and collections from their declared type, an enum by
+    /// its label, a null handle as `null`.
+    fn render_p_object_member(
+        &mut self,
+        handle: usize,
+        prop: &str,
+        v: Option<&Value>,
+        is_str: bool,
+    ) -> Option<String> {
+        if let Some(s) = self.render_p_class_prop(handle, prop) {
+            return Some(s);
+        }
+        let cd = self.class_prop_declarer(handle, prop)?;
+        if cd.queue_properties.contains_key(prop) || cd.assoc_properties.contains_key(prop) {
+            return self.render_p_var(&format!("{}#{}", handle, prop));
+        }
+        let v = v?;
+        if is_str {
+            return Some(Self::render_p_value(v, true));
+        }
+        let is_handle = cd
+            .properties
+            .get(prop)
+            .and_then(|sig| sig.type_name.as_deref())
+            .is_some_and(|tn| self.module.classes.contains_key(tn));
+        if is_handle && v.to_u64() == Some(0) {
+            return Some("null".to_string());
+        }
+        match cd.property_types.get(prop) {
+            Some(dt) if !is_handle && !v.is_real => {
+                let dt = self.class_prop_elem_type(&cd, prop).unwrap_or(dt).clone();
+                Some(self.render_p_value_typed(v, &dt))
+            }
+            _ => Some(Self::render_p_value(v, false)),
+        }
+    }
+
+    fn render_p_class_elems(
+        &mut self,
+        handle: usize,
+        prop: &str,
+        sfx: &str,
+        dims: &[(i64, i64)],
+        dt: &DataType,
+        su: Option<&crate::ast::types::StructUnionType>,
+    ) -> String {
+        let Some((&(lo, hi), rest)) = dims.split_first() else {
+            return match su {
+                Some(su) => {
+                    self.render_p_class_prop_struct(handle, &format!("{}{}", prop, sfx), su)
+                }
+                None => {
+                    let v = self
+                        .get_signal_value_by_name(&format!("{}#{}{}", handle, prop, sfx))
+                        .unwrap_or_else(|| Value::new(1));
+                    self.render_p_value_typed(&v, dt)
+                }
+            };
+        };
+        let parts: Vec<String> = (lo..=hi)
+            .map(|i| {
+                self.render_p_class_elems(handle, prop, &format!("{}[{}]", sfx, i), rest, dt, su)
+            })
+            .collect();
+        format!("'{{{}}}", parts.join(", "))
+    }
+
     fn render_p_value(v: &Value, is_string: bool) -> String {
         if is_string {
             format!("\"{}\"", v.to_sv_string())
@@ -117036,7 +117712,7 @@ impl Simulator {
 
     /// `(property, value, is_string)` of a class object, in DECLARATION order
     /// with base classes first — what `%p` prints for a class handle (§21.2.1.7).
-    fn class_object_members(&self, handle: usize) -> Option<Vec<(String, Value, bool)>> {
+    fn class_object_members(&self, handle: usize) -> Option<Vec<(String, Option<Value>, bool)>> {
         let inst = self.heap.get(handle)?.as_ref()?;
         // Walk the inheritance chain, then emit base-first.
         let mut chain: Vec<String> = Vec::new();
@@ -117055,9 +117731,16 @@ impl Simulator {
             if let Some(k) = self.module.classes.get(c) {
                 for p in &k.property_order {
                     if seen.insert(p.clone()) {
+                        let is_str = k.string_properties.contains(p);
                         if let Some(v) = inst.properties.get(p) {
-                            let is_str = k.string_properties.contains(p);
-                            out.push((p.clone(), v.clone(), is_str));
+                            out.push((p.clone(), Some(v.clone()), is_str));
+                        } else if k.queue_properties.contains_key(p)
+                            || k.assoc_properties.contains_key(p)
+                            || k.array_of_coll_properties.contains_key(p)
+                        {
+                            // A collection member's storage is outside the
+                            // instance map (`<handle>#<member>`).
+                            out.push((p.clone(), None, is_str));
                         }
                     }
                 }
@@ -119752,8 +120435,20 @@ impl Simulator {
         }
         if bm == BuiltinM::Insert {
             if args.len() >= 2 {
-                let idx = self.eval_expr(&args[0]).to_u64().unwrap_or(0);
+                let iv = self.eval_expr(&args[0]);
                 let cur_size = self.get_queue_size(obj_name);
+                // §7.10.2.2: an index with x/z bits, a negative one or one
+                // past `size()` leaves the queue unchanged.
+                let idx = match iv.to_u64() {
+                    Some(i)
+                        if !iv.has_xz()
+                            && !(iv.is_signed && iv.to_i64().is_some_and(|v| v < 0))
+                            && i <= cur_size =>
+                    {
+                        i
+                    }
+                    _ => return Some(Value::zero(32)),
+                };
                 // Move elements member-wise: an unpacked-struct element has no
                 // container signal, so a packed copy shifts nothing at all.
                 for i in (idx..cur_size).rev() {
@@ -138898,6 +139593,37 @@ impl Simulator {
                     self.signals.insert(format!("{}[{}]", n_name, key), v);
                 }
             }
+            // §8.12: a shallow copy copies every property's value — a fixed
+            // array member too. Its elements live outside the instance map
+            // (`<handle>#arr[i]`), so the copy had no storage at all and read
+            // back 32-bit zeros.
+            for prop in cd
+                .array_properties
+                .keys()
+                .chain(cd.array_nd_properties.keys())
+            {
+                let s_name = format!("{}#{}", src_handle, prop);
+                let n_name = format!("{}#{}", new_handle, prop);
+                if let Some(&t) = self.module.arrays.get(&s_name) {
+                    self.module.arrays.insert(n_name.clone(), t);
+                }
+                if let Some(&t) = self.module.arrays_2d.get(&s_name) {
+                    self.module.arrays_2d.insert(n_name.clone(), t);
+                }
+                if let Some(t) = self.module.arrays_nd.get(&s_name).cloned() {
+                    self.module.arrays_nd.insert(n_name.clone(), t);
+                }
+                for k in self.signals.keys_with_elem_prefix(&format!("{}[", s_name)) {
+                    let Some(v) = self.signals.get(&k).cloned() else {
+                        continue;
+                    };
+                    let nk = format!("{}{}", n_name, &k[s_name.len()..]);
+                    if let Some(&w) = self.widths.get(&k) {
+                        self.widths.insert(nk.clone(), w);
+                    }
+                    self.signals.insert(nk, v);
+                }
+            }
         }
         Value::from_u64(new_handle as u64, 32)
     }
@@ -140448,16 +141174,24 @@ impl Simulator {
                             .get(prop_name.as_str())
                             .is_some_and(|l| *l != cdef.name.as_str())
                         {
-                            2
+                            2 | if self.prop_seeds_x(cdef, prop_name) {
+                                SEED_X
+                            } else {
+                                0
+                            }
                         } else {
-                            1
+                            1 | if self.prop_seeds_x(cdef, prop_name) {
+                                SEED_X
+                            } else {
+                                0
+                            }
                         }
                     }
                 };
                 if seed == 0 {
                     continue;
                 }
-                let key = if seed == 2 {
+                let key = if seed & 3 == 2 {
                     if !self.shadowed_prop_names.contains(prop_name.as_str()) {
                         self.shadowed_prop_mask |= meta_key_bits(prop_name);
                         self.shadowed_prop_names.insert(prop_name.clone());
@@ -140466,6 +141200,13 @@ impl Simulator {
                 } else {
                     prop_name.clone()
                 };
+                if seed & SEED_X != 0 {
+                    // §6.8, §8.7: a 4-state property of a named type starts at x.
+                    let mut v = Value::new(prop_sig.width.max(1));
+                    v.is_signed = prop_sig.is_signed;
+                    instance.properties.insert(key, v);
+                    continue;
+                }
                 instance.properties.insert(key, prop_sig.value.clone());
             }
             // Bind class VALUE parameters (§8.25): each parameter gets the
@@ -140638,10 +141379,28 @@ impl Simulator {
                     _ => (lo, hi),
                 };
                 self.module.arrays.insert(scoped.clone(), (lo, hi, width));
+                // §6.8, §7.4: each element starts at its type's default — x
+                // for a 4-state element; an unpacked-struct element as its
+                // member leaves.
+                // An unpacked-struct element keeps its member cells in the
+                // instance (`sta[1].f`), where member reads and writes go.
+                let (fill, elem_su) = self.class_array_elem_fill(cdef, prop, width);
                 for i in lo..=hi {
-                    self.signals
-                        .insert(format!("{}[{}]", scoped, i), Value::zero(width));
-                    self.widths.insert(format!("{}[{}]", scoped, i), width);
+                    let elem = format!("{}[{}]", scoped, i);
+                    if let Some(su) = &elem_su {
+                        let mut cells = Vec::new();
+                        self.struct_leaf_plain_defaults(
+                            &format!("{}[{}]", prop, i),
+                            su,
+                            0,
+                            &mut cells,
+                        );
+                        for (k, v) in cells {
+                            instance.properties.insert(k, v);
+                        }
+                    }
+                    self.signals.insert(elem.clone(), fill.clone());
+                    self.widths.insert(elem, width);
                 }
             }
             // Per-instance MULTI-dim fixed array members (`test_t foo[0:3][0:7]`):
@@ -140667,6 +141426,8 @@ impl Simulator {
                         .insert(scoped.clone(), (shape.clone(), *width));
                 }
                 let total: i64 = shape.iter().map(|&(lo, hi)| (hi - lo + 1).max(0)).product();
+                // §6.8, §7.4: x for a 4-state element type (see above).
+                let (fill, elem_su) = self.class_array_elem_fill(cdef, prop, *width);
                 if total > 0 && total <= 65536 {
                     let mut idx: Vec<i64> = shape.iter().map(|d| d.0).collect();
                     'fill: loop {
@@ -140674,8 +141435,16 @@ impl Simulator {
                         for v in &idx {
                             name = format!("{}[{}]", name, v);
                         }
+                        if let Some(su) = &elem_su {
+                            let mut cells = Vec::new();
+                            let cell = format!("{}{}", prop, &name[scoped.len()..]);
+                            self.struct_leaf_plain_defaults(&cell, su, 0, &mut cells);
+                            for (k, v) in cells {
+                                instance.properties.insert(k, v);
+                            }
+                        }
                         self.widths.insert(name.clone(), *width);
-                        self.signals.insert(name, Value::zero(*width));
+                        self.signals.insert(name, fill.clone());
                         let mut k = shape.len();
                         loop {
                             if k == 0 {
@@ -140899,8 +141668,48 @@ impl Simulator {
         // §7.2.2: an unpacked-struct property starts with its members'
         // declared defaults (its own initializer, if any, runs below and
         // overrides them). The member cells used to stay absent and read 0.
-        if let Some(t) = tpl.as_ref().filter(|t| !t.struct_defaults.is_empty()) {
-            let defs = t.struct_defaults.clone();
+        if let Some(t) = tpl.as_ref().filter(|t| !t.struct_cells.is_empty()) {
+            if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                for (key, v) in &t.struct_cells {
+                    inst.properties.insert(key.clone(), v.clone());
+                }
+            }
+        }
+        {
+            let mut defs = tpl
+                .as_ref()
+                .map(|t| t.struct_defaults.clone())
+                .unwrap_or_default();
+            // Fixed struct arrays use heap member cells too. Their bounds may
+            // depend on this object's parameters, not the cached class shape.
+            for cdef in &classes_to_init {
+                for prop in cdef
+                    .array_properties
+                    .keys()
+                    .chain(cdef.array_nd_properties.keys())
+                {
+                    let Some(su) = self
+                        .class_prop_struct(handle, prop)
+                        .filter(Self::spreads_member_wise)
+                    else {
+                        continue;
+                    };
+                    let shape = if let Some(&(lo, hi, _)) = cdef.array_properties.get(prop) {
+                        vec![self.inst_fixed_bounds(cdef, handle, prop, (lo, hi))]
+                    } else {
+                        self.inst_nd_shape(cdef, handle, prop)
+                            .unwrap_or_else(|| cdef.array_nd_properties[prop].0.clone())
+                    };
+                    for suffix in Self::nd_index_suffixes(&shape) {
+                        self.struct_member_defaults(
+                            &format!("{}{}", prop, suffix),
+                            &su,
+                            0,
+                            &mut defs,
+                        );
+                    }
+                }
+            }
             for (key, init, mdt) in defs {
                 let w = super::elaborate::resolve_type_width(
                     &mdt,
@@ -141173,6 +141982,16 @@ impl Simulator {
                             }
                         }
                     }
+                    continue;
+                }
+                if matches!(init.kind, ExprKind::AssignmentPattern(_))
+                    && let Some(su) = self
+                        .class_prop_struct(handle, &pname)
+                        .filter(Self::spreads_member_wise)
+                {
+                    let base =
+                        Self::hier_ident_expr(Self::iface_path_segs(&pname, init.span), init.span);
+                    self.assign_class_unpacked_elem(&base, init, &su);
                     continue;
                 }
                 let mut val = self.eval_expr(&init);
@@ -142264,6 +143083,36 @@ impl Simulator {
             key.push(']');
         }
         Some(key)
+    }
+
+    /// Whether the collection element `key` (`<h>#m[i]`, or `m[i]` of
+    /// `handle`) belongs to a `rand` member of its object's class.
+    fn coll_key_is_rand(&self, handle: usize, key: &str) -> bool {
+        let (h, rest) = match key.split_once('#') {
+            Some((h, r)) => (h.parse::<usize>().unwrap_or(handle), r),
+            None => (handle, key),
+        };
+        self.prop_is_rand(h, rest.split('[').next().unwrap_or(""))
+    }
+
+    /// Whether `prop` is declared `rand`/`randc` in the class of `h` or a
+    /// base class.
+    fn prop_is_rand(&self, h: usize, prop: &str) -> bool {
+        let mut cur = self
+            .heap
+            .get(h)
+            .and_then(|o| o.as_ref())
+            .map(|i| i.class_name.clone());
+        while let Some(cn) = cur {
+            let Some(cd) = self.module.classes.get(&cn) else {
+                return false;
+            };
+            if cd.random_properties.contains(prop) {
+                return true;
+            }
+            cur = cd.extends.clone();
+        }
+        false
     }
 
     fn coll_elem_expr_key(&mut self, e: &Expression) -> Option<String> {
@@ -145374,6 +146223,8 @@ impl Simulator {
         // below cannot honour (see `rand_order_sensitive`) goes to the joint
         // solver first; the trials stay the fallback.
         let mut trials = 1000;
+        // The joint solver proved that the set has no solution.
+        let mut csp_unsat = false;
         let has_soft = Self::rand_has_soft(&constraints);
         if csp_ok
             && rand_obj_props.is_empty()
@@ -145411,7 +146262,10 @@ impl Simulator {
                 }
                 out => {
                     match out {
-                        rand_csp::CspOutcome::Unsat => trials = 0,
+                        rand_csp::CspOutcome::Unsat => {
+                            trials = 0;
+                            csp_unsat = true;
+                        }
                         rand_csp::CspOutcome::NotApplicable => csp_ok = false,
                         _ => {}
                     }
@@ -146703,7 +147557,12 @@ impl Simulator {
             // final only when no array is sized at random: with fixed shapes
             // every trial would hand the solver the same problem.
             if csp_ok && csp_runs < 8 {
-                let sized = rand_colls.iter().any(|c| c.kind == CollKind::Dyn);
+                // §18.5.8.1: the joint solve sizes an array whose size a
+                // constraint reads itself (`csp_size_phase`).
+                let sized = rand_colls.iter().any(|c| {
+                    c.kind == CollKind::Dyn
+                        && !(sub_objs.is_empty() && Self::csp_size_solved(c, &constraints))
+                });
                 csp_runs += 1;
                 match self.rand_csp_solve(
                     handle,
@@ -146750,6 +147609,7 @@ impl Simulator {
                                 inst.properties.insert(name, val);
                             }
                         }
+                        csp_unsat = true;
                         break;
                     }
                     rand_csp::CspOutcome::NotApplicable => csp_ok = false,
@@ -146832,6 +147692,11 @@ impl Simulator {
                 &constraint_src_files,
                 diag,
             );
+        }
+        // §18.6.3: say why the outermost call returns 0 (a budget overrun
+        // has already been reported).
+        if self.randomize_depth == 0 && !self.randomize_budget_exhausted {
+            self.rand_fail_warn(&class_name, &constraints, &constraint_src_files, csp_unsat);
         }
         // §18.4: randomize() failed — no value was actually produced, so give
         // every tentatively-drawn randc value back to its permutation cycle.
@@ -147579,27 +148444,74 @@ impl Simulator {
         chain: &[std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>],
     ) {
         for cdef in chain {
-            for (prop, &(lo, hi, width)) in &cdef.array_properties {
+            // §8.25: the default specialization and an explicit binding can
+            // have equal widths but different state domains (int/integer).
+            for (prop, sig) in &cdef.properties {
+                if !sig
+                    .type_name
+                    .as_ref()
+                    .is_some_and(|t| cdef.type_param_names.contains(t))
+                    || cdef.static_properties.contains(prop)
+                    || cdef.property_inits.contains_key(prop)
+                    || cdef.array_properties.contains_key(prop)
+                    || cdef.array_nd_properties.contains_key(prop)
+                    || cdef.queue_properties.contains_key(prop)
+                    || cdef.assoc_properties.contains_key(prop)
+                {
+                    continue;
+                }
+                if let Some(concrete) = self.class_prop_type_name(handle, prop)
+                    && let Some(starts_x) = self.concrete_type_starts_x(&concrete)
+                {
+                    let w = self
+                        .class_prop_width_impl(&cdef.name, Some(handle), prop)
+                        .unwrap_or(sig.width)
+                        .max(1);
+                    let mut v = if starts_x {
+                        Value::new(w)
+                    } else {
+                        Value::zero(w)
+                    };
+                    v.is_signed = self.class_prop_signed_of(handle, prop);
+                    if let Some(Some(inst)) = self.heap.get_mut(handle) {
+                        inst.properties.insert(prop.clone(), v);
+                    }
+                } else if let Some(su) = self
+                    .class_prop_struct(handle, prop)
+                    .filter(Self::spreads_member_wise)
+                {
+                    self.seed_class_struct_cells(handle, prop, &su);
+                }
+            }
+            for (prop, &(lo, hi, _)) in &cdef.array_properties {
                 let Some(w) = self.spec_member_elem_width(cdef, handle, prop) else {
                     continue;
                 };
-                if w == width || w == 0 {
+                if w == 0 {
                     continue;
                 }
                 let (lo, hi) = self.inst_fixed_bounds(cdef, handle, prop, (lo, hi));
                 let scoped = format!("{}#{}", handle, prop);
                 self.module.arrays.insert(scoped.clone(), (lo, hi, w));
+                // §6.8: x for a 4-state element type.
+                let fill = self.class_bound_array_fill(cdef, handle, prop, w);
+                let su = self
+                    .class_prop_struct(handle, prop)
+                    .filter(Self::spreads_member_wise);
                 for i in lo..=hi {
                     let en = format!("{}[{}]", scoped, i);
-                    self.signals.insert(en.clone(), Value::zero(w));
+                    self.signals.insert(en.clone(), fill.clone());
                     self.widths.insert(en, w);
+                    if let Some(su) = &su {
+                        self.seed_class_struct_cells(handle, &format!("{}[{}]", prop, i), su);
+                    }
                 }
             }
-            for (prop, (shape, width)) in &cdef.array_nd_properties {
+            for (prop, (shape, _)) in &cdef.array_nd_properties {
                 let Some(w) = self.spec_member_elem_width(cdef, handle, prop) else {
                     continue;
                 };
-                if w == *width || w == 0 {
+                if w == 0 {
                     continue;
                 }
                 let own = self.inst_nd_shape(cdef, handle, prop);
@@ -147611,11 +148523,22 @@ impl Simulator {
                 if let Some(e) = self.module.arrays_nd.get_mut(&scoped) {
                     e.1 = w;
                 }
+                let fill = self.class_bound_array_fill(cdef, handle, prop, w);
+                let su = self
+                    .class_prop_struct(handle, prop)
+                    .filter(Self::spreads_member_wise);
                 for suffix in Self::nd_index_suffixes(shape) {
                     let en = format!("{}{}", scoped, suffix);
                     if self.widths.contains_key(&en) {
-                        self.signals.insert(en.clone(), Value::zero(w));
+                        self.signals.insert(en.clone(), fill.clone());
                         self.widths.insert(en, w);
+                        if let Some(su) = &su {
+                            self.seed_class_struct_cells(
+                                handle,
+                                &format!("{}{}", prop, suffix),
+                                su,
+                            );
+                        }
                     }
                 }
             }
@@ -149596,6 +150519,11 @@ impl Simulator {
                         let Some(key) = self.coll_elem_expr_key(side) else {
                             continue;
                         };
+                        // §18.3: an element of a state collection
+                        // (`x != q[i]`, `q` not rand) is never assigned.
+                        if !self.coll_key_is_rand(handle, &key) {
+                            continue;
+                        }
                         let w = self
                             .read_coll_elem(&key)
                             .map(|v| v.width)
@@ -149938,7 +150866,31 @@ impl Simulator {
                     .fixed_foreach_dims(handle, &arr_name)
                     .or_else(|| self.packed_prop_foreach_dims(handle, &arr_name))
                 else {
-                    return false;
+                    // §18.5.8.1: a loop over a state vector (`bit [0:3]
+                    // it;`) only supplies indices: solve the body once per
+                    // index, as an unrolled loop would.
+                    if rand_set.contains(&arr_name) || self.prop_is_rand(handle, &arr_name) {
+                        return false;
+                    }
+                    let names: Vec<String> = vars
+                        .iter()
+                        .filter_map(|v| v.as_ref().map(|id| id.name.clone()))
+                        .collect();
+                    let Some(dims) = self.state_foreach_dims(handle, array, &arr_name, names.len())
+                    else {
+                        return false;
+                    };
+                    if names.is_empty() || names.len() > dims.len() {
+                        return false;
+                    }
+                    let mut changed = false;
+                    self.for_each_index(&names, &dims, |sim| {
+                        if sim.solve_forced(handle, body, rand_set) {
+                            changed = true;
+                        }
+                        None::<()>
+                    });
+                    return changed;
                 };
                 // One loop variable per leading dimension (§12.7.3).
                 let idx_names: Vec<String> = vars
@@ -150731,9 +151683,22 @@ impl Simulator {
         handle: usize,
         array: &Expression,
     ) -> Option<Vec<(i64, i64)>> {
-        use crate::ast::types::UnpackedDimension as UD;
         let (root, members) = Self::foreach_member_chain(array)?;
-        let mut level = self.class_prop_struct(handle, &root)?;
+        self.struct_chain_foreach_dims(handle, &root, &members)
+    }
+
+    /// The loop bounds of the struct-member chain `root.m1…mn` of `handle`
+    /// (`root` a struct property): the last member's fixed unpacked
+    /// dimensions, or, with none, its packed dimensions when it is a
+    /// multi-dimensional packed array (§7.4.1).
+    fn struct_chain_foreach_dims(
+        &mut self,
+        handle: usize,
+        root: &str,
+        members: &[String],
+    ) -> Option<Vec<(i64, i64)>> {
+        use crate::ast::types::UnpackedDimension as UD;
+        let mut level = self.class_prop_struct(handle, root)?;
         let (last, path) = members.split_last()?;
         for m in path {
             let (dt, dims) = Self::struct_member_decl(&level, m)?;
@@ -150745,9 +151710,15 @@ impl Simulator {
                 _ => return None,
             }
         }
-        let (_, dims) = Self::struct_member_decl(&level, last)?;
+        let (dt, dims) = Self::struct_member_decl(&level, last)?;
         if dims.is_empty() {
-            return None;
+            let params = self.instance_param_scope(handle);
+            let pd = crate::compiler::elaborate::packed_full_dims_chained(
+                &dt,
+                &params,
+                &self.module.typedef_types,
+            )?;
+            return Some(pd.iter().map(|&(l, r)| (l.min(r), l.max(r))).collect());
         }
         let mut out = Vec::with_capacity(dims.len());
         for d in &dims {
@@ -150768,6 +151739,37 @@ impl Simulator {
             }
         }
         Some(out)
+    }
+
+    /// The loop bounds (lo, hi) of every dimension of `root.m1…mn` when
+    /// `root` holds a class handle (as may the members after it) and the
+    /// rest names a fixed unpacked or a packed multi-dimensional array of
+    /// that object, or a member of one of its struct properties.
+    fn sub_member_foreach_dims(
+        &mut self,
+        handle: usize,
+        root: &str,
+        members: &[String],
+    ) -> Option<Vec<(i64, i64)>> {
+        self.prop_class_type(handle, root)?;
+        let mut h = self.member_handle(handle, root)?;
+        let mut rest = members;
+        while rest.len() > 1 && self.prop_class_type(h, &rest[0]).is_some() {
+            h = self.member_handle(h, &rest[0])?;
+            rest = &rest[1..];
+        }
+        if !matches!(self.heap.get(h), Some(Some(_))) {
+            return None;
+        }
+        match rest {
+            [last] => self
+                .fixed_foreach_dims(h, last)
+                .or_else(|| self.packed_prop_foreach_dims(h, last))
+                .map(|d| d.0),
+            // A member of a struct property of the sub-object (`a.s.f`).
+            [first, more @ ..] => self.struct_chain_foreach_dims(h, first, more),
+            [] => None,
+        }
     }
 
     /// The `(root, members)` of a foreach array that names a member of a
@@ -151113,7 +152115,12 @@ impl Simulator {
         // An array MEMBER of a struct property (`foreach (u.arr[i])`).
         if Self::foreach_member_chain(array).is_some() {
             if let Some(dims) = self.member_foreach_dims(handle, array) {
-                if idx_names.len() != dims.len() || Self::foreach_body_unmodeled(body) {
+                // §12.7.3: fewer loop variables than dimensions iterate the
+                // leading ones.
+                if vars.iter().any(|v| v.is_none())
+                    || idx_names.len() > dims.len()
+                    || Self::foreach_body_unmodeled(body)
+                {
                     return None;
                 }
                 let body = (**body).clone();
@@ -151122,6 +152129,24 @@ impl Simulator {
                 });
                 return Some(failed.is_none());
             }
+        }
+        // §18.5.9: a loop over an array member of a rand sub-object
+        // (`foreach (a.w[i])`, `w` unpacked or packed): every element the
+        // loop names is checked.
+        if let Some((root, members)) = Self::foreach_member_chain(array)
+            && let Some(dims) = self.sub_member_foreach_dims(handle, &root, &members)
+        {
+            if vars.iter().any(|v| v.is_none())
+                || idx_names.len() > dims.len()
+                || Self::foreach_body_unmodeled(body)
+            {
+                return None;
+            }
+            let body = (**body).clone();
+            let failed = self.for_each_index(&idx_names, &dims, |sim| {
+                (!sim.item_holds(handle, &body)).then_some(())
+            });
+            return Some(failed.is_none());
         }
         let arr_name = Self::foreach_base_name(array)?;
         let dims = match self.fixed_foreach_dims(handle, &arr_name) {
@@ -152371,9 +153396,17 @@ impl Simulator {
                             .get(p.as_str())
                             .is_some_and(|l| *l != cdef.name.as_str())
                         {
-                            2
+                            2 | if self.prop_seeds_x(cdef, p) {
+                                SEED_X
+                            } else {
+                                0
+                            }
                         } else {
-                            1
+                            1 | if self.prop_seeds_x(cdef, p) {
+                                SEED_X
+                            } else {
+                                0
+                            }
                         }
                     })
                     .collect()
@@ -152416,11 +153449,37 @@ impl Simulator {
                 }
             }
         }
+        // §6.8 / §7.2: every member cell of an unpacked-struct property starts
+        // at its type's default; an absent cell read back 0.
+        let mut struct_cells = Vec::new();
+        for cdef in chain.iter().rev() {
+            for (prop, dt) in &cdef.property_types {
+                if cdef.static_properties.contains(prop)
+                    || cdef.property_inits.contains_key(prop)
+                    || !cdef.properties.contains_key(prop)
+                    || cdef.array_properties.contains_key(prop)
+                    || cdef.array_nd_properties.contains_key(prop)
+                    || cdef.array_of_coll_properties.contains_key(prop)
+                    || cdef.queue_properties.contains_key(prop)
+                    || cdef.assoc_properties.contains_key(prop)
+                    || leaf_declarer
+                        .get(prop.as_str())
+                        .is_some_and(|l| *l != cdef.name.as_str())
+                {
+                    continue;
+                }
+                let dt = self.class_prop_elem_type(cdef, prop).unwrap_or(dt);
+                if let DataType::Struct(su) = self.typedef_chain_end(dt) {
+                    self.struct_leaf_plain_defaults(prop, su, 0, &mut struct_cells);
+                }
+            }
+        }
         let t = std::rc::Rc::new(InstTemplate {
             chain: chain.to_vec(),
             seed,
             coll_candidates,
             struct_defaults,
+            struct_cells,
         });
         self.inst_templates
             .borrow_mut()
@@ -152472,6 +153531,301 @@ impl Simulator {
                     (Some(inner), _) => self.struct_member_defaults(&key, inner, depth + 1, out),
                     (None, Some(init)) => out.push((key, init.clone(), m.data_type.clone())),
                     (None, None) => {}
+                }
+            }
+        }
+    }
+
+    /// §6.8 Table 6-7, §8.7: whether scalar property `prop` of `cdef` must be
+    /// seeded with x. Elaboration seeds a property of a NAMED type (`l4_t m;`,
+    /// an enum, a packed struct) with 0, since it cannot tell a typedef from a
+    /// class handle; the typedef table can. Collections and initialized
+    /// properties keep their elaborated seed.
+    fn prop_seeds_x(&self, cdef: &crate::compiler::elaborate::ElaboratedClass, prop: &str) -> bool {
+        let Some(sig) = cdef.properties.get(prop) else {
+            return false;
+        };
+        sig.type_name.is_some()
+            && !sig.is_real
+            && !cdef.property_inits.contains_key(prop)
+            && !cdef.queue_properties.contains_key(prop)
+            && !cdef.array_properties.contains_key(prop)
+            && !cdef.array_nd_properties.contains_key(prop)
+            && !cdef.array_of_coll_properties.contains_key(prop)
+            && !cdef.string_properties.contains(prop)
+            && !cdef.virtual_iface_properties.contains_key(prop)
+            && self
+                .class_prop_elem_type(cdef, prop)
+                .is_some_and(|dt| self.type_starts_x(dt))
+    }
+
+    /// §6.8, §7.4: the initial value of each element of class array property
+    /// `prop` (x for a 4-state element type, else 0), plus the element's
+    /// unpacked struct type when its elements are stored member-wise.
+    fn class_array_elem_fill(
+        &self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        prop: &str,
+        width: u32,
+    ) -> (Value, Option<crate::ast::types::StructUnionType>) {
+        let Some(dt) = self.class_prop_elem_type(cdef, prop) else {
+            return (Value::zero(width), None);
+        };
+        let su = match self.resolve_dt_ref(dt) {
+            DataType::Struct(su) if Self::spreads_member_wise(su) => Some(su.clone()),
+            _ => None,
+        };
+        let fill = if su.is_none() && self.type_starts_x(dt) {
+            Value::new(width)
+        } else {
+            Value::zero(width)
+        };
+        (fill, su)
+    }
+
+    fn class_bound_array_fill(
+        &self,
+        cdef: &crate::compiler::elaborate::ElaboratedClass,
+        handle: usize,
+        prop: &str,
+        width: u32,
+    ) -> Value {
+        if let Some(concrete) = self.class_prop_type_name(handle, prop)
+            && let Some(starts_x) = self.concrete_type_starts_x(&concrete)
+        {
+            return if starts_x {
+                Value::new(width)
+            } else {
+                Value::zero(width)
+            };
+        }
+        self.class_array_elem_fill(cdef, prop, width).0
+    }
+
+    /// Seed the member leaves of the unpacked-struct element `elem` with their
+    /// §6.8 defaults (see `struct_leaf_plain_defaults`).
+    fn seed_struct_elem_cells(&mut self, elem: &str, su: &crate::ast::types::StructUnionType) {
+        let mut cells = Vec::new();
+        self.struct_leaf_plain_defaults(elem, su, 0, &mut cells);
+        for (k, v) in cells {
+            if !v.is_real {
+                self.widths.insert(k.clone(), v.width);
+            }
+            self.signals.insert(k, v);
+        }
+        let mut defaults = Vec::new();
+        self.struct_member_defaults(elem, su, 0, &mut defaults);
+        for (key, init, dt) in defaults {
+            self.assign_pattern_or_leaf(&key, &dt, &init);
+        }
+    }
+
+    fn seed_class_struct_cells(
+        &mut self,
+        handle: usize,
+        prop: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) {
+        let mut cells = Vec::new();
+        self.struct_leaf_plain_defaults(prop, su, 0, &mut cells);
+        if let Some(Some(inst)) = self.heap.get_mut(handle) {
+            for (key, value) in cells {
+                inst.properties.insert(key, value);
+            }
+        }
+    }
+
+    /// §6.8, §7.5.1: whether a new element of the collection stored at
+    /// `name` starts at x. A class member (`<handle>#da`) takes its type from
+    /// the class; anything else from its declaration.
+    fn coll_elem_starts_x(&self, name: &str) -> bool {
+        if let Some((h, member)) = name.split_once('#')
+            && let Ok(handle) = h.parse::<usize>()
+            && let Some(concrete) =
+                self.class_prop_type_name(handle, member.split('[').next().unwrap_or(member))
+            && let Some(starts_x) = self.concrete_type_starts_x(&concrete)
+        {
+            return starts_x;
+        }
+        if let Some(dt) = self.class_member_coll_type(name) {
+            return self.type_starts_x(dt);
+        }
+        self.p_elem_type_ref(name)
+            .is_some_and(|dt| self.type_starts_x(&dt))
+    }
+
+    /// The declared element type of the class-member collection stored at
+    /// `<handle>#<member>` (or an element of one, `<handle>#<member>[i]`),
+    /// from the object's class chain. `None` for any other name.
+    fn class_member_coll_type(&self, name: &str) -> Option<&DataType> {
+        // A static member's store `Cls::member` (`Cls#<spec>::member`).
+        if let Some((cls, member)) = name.split_once("::") {
+            let cls = cls.split('#').next()?;
+            let member = member.split('[').next()?;
+            let cd = self.module.classes.get(cls)?;
+            return self.class_prop_elem_type(cd, member);
+        }
+        let (h, member) = name.split_once('#')?;
+        let handle: usize = h.parse().ok()?;
+        let member = member.split('[').next()?;
+        if member.is_empty() || member.contains('.') {
+            return None;
+        }
+        let mut cur = self
+            .heap
+            .get(handle)?
+            .as_ref()
+            .map(|i| i.class_name.as_str());
+        let mut hops = 0;
+        while let Some(cn) = cur {
+            let cd = self.module.classes.get(cn)?;
+            if cd.property_types.contains_key(member) {
+                if cd
+                    .properties
+                    .get(member)
+                    .and_then(|sig| sig.type_name.as_ref())
+                    .is_some_and(|name| cd.type_param_names.contains(name))
+                    && let Some(concrete) = self.class_prop_type_name(handle, member)
+                    && let Some(dt) = self.module.typedef_types.get(&concrete)
+                {
+                    return Some(dt);
+                }
+                return self.class_prop_elem_type(cd, member);
+            }
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            cur = cd.extends.as_deref();
+        }
+        None
+    }
+
+    /// §6.8 Table 6-7: whether a variable of `dt` held as ONE value starts
+    /// at x — a 4-state integral type (`logic`, `reg`, `integer`, `time`, an
+    /// enum over one of them, a packed struct or union with a 4-state member)
+    /// — rather than 0. Strings, reals, handles, unresolved type names and
+    /// unpacked structs (stored as member leaves) answer false.
+    fn type_starts_x(&self, dt: &DataType) -> bool {
+        let r = self.resolve_dt_ref(dt);
+        match r {
+            DataType::IntegerVector { .. }
+            | DataType::IntegerAtom { .. }
+            | DataType::Implicit { .. }
+            | DataType::Enum(_) => {
+                !super::elaborate::is_type_two_state_resolved(r, &self.module.typedef_types)
+            }
+            DataType::Struct(su) if !Self::spreads_member_wise(su) => {
+                !super::elaborate::is_type_two_state_resolved(r, &self.module.typedef_types)
+            }
+            _ => false,
+        }
+    }
+
+    /// The declared (element) type of property `prop` of class `cd`, with a
+    /// class-local typedef (`typedef logic [3:0] n_t; n_t m[2];`) followed
+    /// into the class's own typedef table.
+    fn class_prop_elem_type<'a>(
+        &'a self,
+        cd: &'a crate::compiler::elaborate::ElaboratedClass,
+        prop: &str,
+    ) -> Option<&'a DataType> {
+        self.class_prop_decl_type(cd, prop)
+    }
+
+    /// §6.8 / §8.25: an integral type parameter takes its bound type's default.
+    /// Non-integral and unresolved bindings keep their existing storage paths.
+    fn concrete_type_starts_x(&self, name: &str) -> Option<bool> {
+        match name {
+            "logic" | "reg" | "integer" | "time" => Some(true),
+            "bit" | "byte" | "shortint" | "int" | "longint" => Some(false),
+            _ if vector_fragment_width(name).is_some() => Some(!name.starts_with("bit")),
+            _ => self
+                .module
+                .typedef_types
+                .get(name)
+                .and_then(|dt| match self.resolve_dt_ref(dt) {
+                    DataType::IntegerVector { .. }
+                    | DataType::IntegerAtom { .. }
+                    | DataType::Implicit { .. }
+                    | DataType::Enum(_) => Some(self.type_starts_x(dt)),
+                    DataType::Struct(su) if !Self::spreads_member_wise(su) => {
+                        Some(self.type_starts_x(dt))
+                    }
+                    _ => None,
+                }),
+        }
+    }
+
+    /// §6.8 / §7.2: the initial cells of an unpacked struct stored member-wise
+    /// under `prefix` — `(prefix.member[...], default)` per leaf, x for a
+    /// 4-state member and 0 for a 2-state one (0.0 for a real; a
+    /// non-integral member gets no cell). Same keys as `unpacked_struct_leaves`; member initializers are
+    /// not evaluated here (callers apply them on top).
+    fn struct_leaf_plain_defaults(
+        &self,
+        prefix: &str,
+        su: &crate::ast::types::StructUnionType,
+        depth: u32,
+        out: &mut Vec<(String, Value)>,
+    ) {
+        if depth > 8 || !Self::spreads_member_wise(su) {
+            return;
+        }
+        for m in &su.members {
+            let nested = match self.resolve_dt_ref(&m.data_type) {
+                DataType::Struct(inner) if Self::spreads_member_wise(inner) => Some(inner),
+                _ => None,
+            };
+            let dv = if nested.is_some() {
+                Value::zero(0)
+            } else if super::elaborate::is_type_real(self.resolve_dt_ref(&m.data_type)) {
+                Value::from_f64(0.0)
+            } else if !matches!(
+                self.resolve_dt_ref(&m.data_type),
+                DataType::IntegerVector { .. }
+                    | DataType::IntegerAtom { .. }
+                    | DataType::Implicit { .. }
+                    | DataType::Enum(_)
+                    | DataType::Struct(_)
+            ) {
+                // A string, handle or other non-integral member keeps the
+                // storage paths' own default.
+                continue;
+            } else {
+                let mw = super::elaborate::resolve_type_width(
+                    &m.data_type,
+                    Some(&self.module.parameters),
+                    Some(&self.module.typedefs),
+                )
+                .max(1);
+                let mut v = if self.type_starts_x(&m.data_type) {
+                    Value::new(mw)
+                } else {
+                    Value::zero(mw)
+                };
+                v.is_signed = super::elaborate::is_type_signed_resolved(
+                    &m.data_type,
+                    &self.module.typedef_types,
+                );
+                v
+            };
+            for md in &m.declarators {
+                let mkey = format!("{}.{}", prefix, md.name.name);
+                let keys: Vec<String> = match self.member_elem_indices(&md.dimensions) {
+                    Some(tups) => tups
+                        .iter()
+                        .map(|t| format!("{}{}", mkey, Self::index_suffix(t)))
+                        .collect(),
+                    None if md.dimensions.is_empty() => vec![mkey],
+                    // A dynamic / queue / associative member has no cells.
+                    None => continue,
+                };
+                for k in keys {
+                    match nested {
+                        Some(inner) => self.struct_leaf_plain_defaults(&k, inner, depth + 1, out),
+                        None => out.push((k, dv.clone())),
+                    }
                 }
             }
         }
@@ -158758,9 +160112,22 @@ impl Simulator {
     /// (`class p::C`) as the reference simulator prints it.
     fn class_typename_head(&self, base: &str) -> String {
         match self.module.class_decl_pkg.get(base) {
-            Some(pkg) => format!("class {}::{}", pkg, base),
+            Some(pkg) => format!("class {}::{}", pkg, self.class_source_name(base)),
             None => format!("class {}", base),
         }
+    }
+
+    /// The name a package class was declared with. A class whose name is
+    /// also declared in another package is elaborated under its qualified
+    /// spelling `pkg::C` (§26.3, see `xezim_core::pkg_scope`); this strips
+    /// that prefix again for output that names the class.
+    fn class_source_name<'a>(&self, base: &'a str) -> &'a str {
+        self.module
+            .class_decl_pkg
+            .get(base)
+            .and_then(|pkg| base.strip_prefix(pkg.as_str()))
+            .and_then(|rest| rest.strip_prefix("::"))
+            .unwrap_or(base)
     }
 
     /// `class_typename_with_args` from a specialization's raw `#(...)` text.

@@ -37,7 +37,7 @@ fn dynamic_array_property_initializer_sizes_the_array() {
         [
             "T|da=4 db=3 o2da0=0 oda0=11",
             "T|n=6 n5=5 e=3 e2=9",
-            "T|ds=2 dl=2 dl0=0000 da=4",
+            "T|ds=2 dl=2 dl0=xxxx da=4",
             "T|dd=2 0 6",
         ]
     );

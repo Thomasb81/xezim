@@ -732,6 +732,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
         "Debug: on a failed randomize(), report the switched-off variables and constraints and the unsatisfied constraint items",
     ),
     (
+        "XEZIM_RAND_WARN",
+        "0 silences the warning printed when randomize() fails (default: on, first 3 failures per class)",
+    ),
+    (
         "XEZIM_RANGE_COPY",
         "Comb settle: lower direct constant-range assignments to slice copies (1 enables)",
     ),

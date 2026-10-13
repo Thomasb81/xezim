@@ -276,6 +276,21 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 * `std::randomize()` solves dynamic arrays and queues local to automatic
   tasks jointly with the other variables, and `bit` array elements are
   solved unsigned. (#297, reported by Ganesh-TNL)
+* `randomize()` and `std::randomize()` solve the size of a dynamic array
+  before its elements when a constraint ties the size to other variables
+  (`beats.size() == cmd.count + 1`, `a.size() + b.size() == t`) (§18.5.8.1);
+  they used to draw a size and retry until the time budget ran out.
+  Packed-struct elements whose type is a class type parameter are solved,
+  `(a >> k) == (b >> k)` and alignment masks on struct fields no longer stall
+  the solver, and a variable that caps another through a guarded `dist` is
+  drawn by the solutions it leaves. (#298, reported by Ganesh-TNL)
+* `std::randomize()` over several dynamic arrays with `foreach` constraints
+  succeeds, also when a size comes from another target (`p.size() == n`),
+  which used to allocate an array as large as a random `n` and hang. (#299,
+  reported by Ganesh-TNL)
+* `a.size() == n + m` compares at 32 bits, since `size()` and `num()` return
+  an `int`; narrower operands used to wrap. A field write to an element of a
+  class array of packed structs (`beats[i].last = 1`) is no longer dropped.
 
 **Usability**
 
