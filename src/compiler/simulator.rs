@@ -32790,9 +32790,19 @@ impl Simulator {
                         None if handle == 0 => Value::zero(32),
                         None => self.exec_method_call(handle, m, &args),
                     }
-                } else if handle == 0 {
-                    // Null receiver: the AST funnel falls through to
-                    // `Value::zero(32)` (no storage, no fault).
+                } else if handle == 0 && *bare == 0 {
+                    // Null DOTTED receiver (`obj.coll.m()` with obj == null):
+                    // the AST funnel falls through to `Value::zero(32)` (no
+                    // storage, no fault). A BARE receiver must NOT take this
+                    // path: in a frame with no `this` (a static method, or an
+                    // instance method dispatched through a class-scope static
+                    // call) the member can still be a STATIC collection of
+                    // the lexical class — `instance_assoc_member` below
+                    // resolves it through `class_context_stack` to the same
+                    // per-spec store the interpreter uses, so a bare
+                    // `q.push_back(v)` / `q.size()` in such frames must reach
+                    // that arm instead of being dropped here (its writes
+                    // silently vanished otherwise).
                     Value::zero(32)
                 } else if *bare != 0 {
                     // Bare receiver (`q.size()`): the receiver IS
@@ -154112,6 +154122,117 @@ impl Simulator {
         }
     }
 
+    /// §8.25: seed `current_spec` from a receiver instance (and, for a
+    /// method declared in a parameterized ancestor, the receiver's derived
+    /// ancestor spec) so the callee's BARE static member accesses key the
+    /// same per-specialization cell regardless of dispatch route. Extracted
+    /// from `exec_method_in_class_hierarchy`, which seeds for interpreter
+    /// calls; the VM's direct dispatch (`vm_try_direct_call`) skips that
+    /// prologue and must seed identically or a compiled callee of
+    /// `C#(spec)` resolves bare statics to the shared `C::member` cell
+    /// while every interpreter route uses `C#spec::member` — storage
+    /// silently splits. Returns the saved spec for restore.
+    fn seed_callee_spec_from_instance(
+        &mut self,
+        handle: usize,
+        def_class: &str,
+    ) -> Option<(String, String)> {
+        let saved = self.clone_spec_pooled();
+        if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
+            let cn = &inst.class_name;
+            let bindings = &inst.type_bindings;
+            // Override the active spec with THIS instance's own
+            // specialization when it differs from the active
+            // spec's class. Prefer the instance's captured full
+            // specialization (`spec`), which carries BOTH type
+            // and value params as a complete sig (unlike the
+            // type_bindings-only rebuild below). The full `spec`
+            // is what restores the specialization a
+            // typedef-specialization singleton was constructed
+            // under, so a later virtual call can answer
+            // value-param lookups (the factory
+            // get_type_name chain). The type_bindings rebuild is
+            // the legacy fallback: an instance method of
+            // `resource#(int)` must key resource's
+            // per-spec cell even when called while an UNRELATED
+            // spec is active (e.g. the enclosing
+            // `config_db#(int)`, whose base `config_db`
+            // wouldn't match `resource` in static_prop_key
+            // and would fall back to the shared unspec'd cell →
+            // the get_type/get_type_handle mismatch).
+            let differs = match self.current_spec.as_ref() {
+                None => true,
+                // Switch when the base class differs OR the
+                // instance's own specialization (same base,
+                // different sig) differs. The latter is the
+                // callback typewide-recursion case:
+                // `base_comp.m_add_tw_cbs` calls
+                // `cb_pair.m_add_tw_cbs(cb)` where cb_pair is a
+                // DIFFERENT specialization's instance (e.g.
+                // `callbacks#(b_comp)`). Without restoring
+                // the instance's spec, the recursed method's
+                // `m_t_inst.m_tw_cb_q` static access keys off
+                // the caller's (base_comp) cell, so typewide
+                // callbacks never propagate to derived types.
+                Some((b, s)) => {
+                    b != self.class_origin(cn)
+                        || inst
+                            .spec
+                            .as_ref()
+                            .is_some_and(|(ib, is)| ib != b || is != s)
+                }
+            };
+            if differs {
+                if let Some(src) = inst.spec.as_ref() {
+                    // Copied into the current buffers when there are
+                    // any (same value as a fresh clone).
+                    match self.current_spec.as_mut() {
+                        Some(dst) => {
+                            dst.0.clone_from(&src.0);
+                            dst.1.clone_from(&src.1);
+                        }
+                        None => self.current_spec = Some(src.clone()),
+                    }
+                } else if let Some(cd) = self.module.classes.get(cn) {
+                    let param_names: &[String] = if cd.param_order.is_empty() {
+                        &cd.type_param_names
+                    } else {
+                        &cd.param_order
+                    };
+                    if !param_names.is_empty() {
+                        let sig_frags: Vec<String> = param_names
+                            .iter()
+                            .filter_map(|p| {
+                                if let Some(b) = bindings.get(p) {
+                                    Some(b.clone())
+                                } else if let Some(v) = inst.properties.get(p) {
+                                    Some(v.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        if sig_frags.len() == param_names.len() {
+                            self.current_spec = Some((cn.clone(), sig_frags.join(",")));
+                        }
+                    }
+                }
+            }
+        }
+        // §8.25 (generic receiver specialization): when a method is
+        // reached on a CONCRETE receiver (static, `ext1::ID()`; or
+        // instance, `x3.get_type_handle()`) but is DECLARED in a
+        // PARAMETERIZED ancestor (`uvm_tlm_extension#(ext1)`), the
+        // receiver's `#(...)` specialization is not captured anywhere
+        // once the body runs a BARE static member like `m_singleton`.
+        // Seed current_spec from the concrete receiver's extends chain
+        // so the body's inner static access keys per specialization.
+        if let Some(spec) = self.inherited_method_spec(handle, def_class) {
+            self.current_spec = Some(spec);
+        }
+        saved
+    }
+
     /// A copy of `current_spec` in recycled buffers (see `recycle_spec`):
     /// the save half of a save/restore around a call, without allocating.
     fn clone_spec_pooled(&mut self) -> Option<(String, String)> {
@@ -154951,99 +155072,10 @@ impl Simulator {
                 // bound leaf names in declaration order (the parser now captures
                 // builtin type args as Ident leaf names, so this matches
                 // extract_call_spec's type_args_text).
-                let saved_spec = self.clone_spec_pooled();
-                if let Some(inst) = self.heap.get(handle).and_then(|o| o.as_ref()) {
-                    let cn = &inst.class_name;
-                    let bindings = &inst.type_bindings;
-                    // Override the active spec with THIS instance's own
-                    // specialization when it differs from the active
-                    // spec's class. Prefer the instance's captured full
-                    // specialization (`spec`), which carries BOTH type
-                    // and value params as a complete sig (unlike the
-                    // type_bindings-only rebuild below). The full `spec`
-                    // is what restores the specialization a
-                    // typedef-specialization singleton was constructed
-                    // under, so a later virtual call can answer
-                    // value-param lookups (the factory
-                    // get_type_name chain). The type_bindings rebuild is
-                    // the legacy fallback: an instance method of
-                    // `resource#(int)` must key resource's
-                    // per-spec cell even when called while an UNRELATED
-                    // spec is active (e.g. the enclosing
-                    // `config_db#(int)`, whose base `config_db`
-                    // wouldn't match `resource` in static_prop_key
-                    // and would fall back to the shared unspec'd cell →
-                    // the get_type/get_type_handle mismatch).
-                    let differs = match self.current_spec.as_ref() {
-                        None => true,
-                        // Switch when the base class differs OR the
-                        // instance's own specialization (same base,
-                        // different sig) differs. The latter is the
-                        // callback typewide-recursion case:
-                        // `base_comp.m_add_tw_cbs` calls
-                        // `cb_pair.m_add_tw_cbs(cb)` where cb_pair is a
-                        // DIFFERENT specialization's instance (e.g.
-                        // `callbacks#(b_comp)`). Without restoring
-                        // the instance's spec, the recursed method's
-                        // `m_t_inst.m_tw_cb_q` static access keys off
-                        // the caller's (base_comp) cell, so typewide
-                        // callbacks never propagate to derived types.
-                        Some((b, s)) => {
-                            b != self.class_origin(cn)
-                                || inst
-                                    .spec
-                                    .as_ref()
-                                    .is_some_and(|(ib, is)| ib != b || is != s)
-                        }
-                    };
-                    if differs {
-                        if let Some(src) = inst.spec.as_ref() {
-                            // Copied into the current buffers when there are
-                            // any (same value as a fresh clone).
-                            match self.current_spec.as_mut() {
-                                Some(dst) => {
-                                    dst.0.clone_from(&src.0);
-                                    dst.1.clone_from(&src.1);
-                                }
-                                None => self.current_spec = Some(src.clone()),
-                            }
-                        } else if let Some(cd) = self.module.classes.get(cn) {
-                            let param_names: &[String] = if cd.param_order.is_empty() {
-                                &cd.type_param_names
-                            } else {
-                                &cd.param_order
-                            };
-                            if !param_names.is_empty() {
-                                let sig_frags: Vec<String> = param_names
-                                    .iter()
-                                    .filter_map(|p| {
-                                        if let Some(b) = bindings.get(p) {
-                                            Some(b.clone())
-                                        } else if let Some(v) = inst.properties.get(p) {
-                                            Some(v.to_string())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                if sig_frags.len() == param_names.len() {
-                                    self.current_spec = Some((cn.clone(), sig_frags.join(",")));
-                                }
-                            }
-                        }
-                    }
-                }
-                // §8.25 (generic receiver specialization): when a method is
-                // reached on a CONCRETE receiver (static, `ext1::ID()`; or
-                // instance, `x3.get_type_handle()`) but is DECLARED in a
-                // PARAMETERIZED ancestor (`uvm_tlm_extension#(ext1)`), the
-                // receiver's `#(...)` specialization is not captured anywhere
-                // once the body runs a BARE static member like `m_singleton`.
-                // Seed current_spec from the concrete receiver's extends chain
-                // so the body's inner static access keys per specialization.
-                if let Some(spec) = self.inherited_method_spec(handle, &cname) {
-                    self.current_spec = Some(spec);
-                }
+                // §8.25 (seeded callee spec — see
+                // seed_callee_spec_from_instance): interpreter-route parity
+                // for per-specialization statics.
+                let saved_spec = self.seed_callee_spec_from_instance(handle, &cname);
                 self.this_stack.push(Some(handle));
                 // §23.8 / §23.10.1: hierarchical names in the method body
                 // resolve upward from the object's CREATION scope, not the
@@ -158902,7 +158934,13 @@ impl Simulator {
         // --- every guard passed; state changes from here on ---
         self.push_queue_frame();
         self.this_stack.push(Some(handle));
-        self.class_context_stack.push(Some(md.class));
+        self.class_context_stack.push(Some(md.class.clone()));
+        // §8.25 (seeded callee spec): parity with the interpreter call
+        // route — the direct dispatch skips exec_method_in_class_hierarchy's
+        // seeding, so a callee of `C#(spec)` would resolve its bare static
+        // members to the shared `C::member` cell while interpreter routes
+        // use `C#spec::member` (silently split storage).
+        let saved_spec = self.seed_callee_spec_from_instance(handle, &md.class);
         let mut locals = self.take_pooled_frame();
         for ((name, _, _), v) in entry.coerce.iter().zip(args.iter()) {
             locals.insert(name.to_string(), v.clone());
@@ -158966,6 +159004,7 @@ impl Simulator {
         self.local_iface_aliases.pop();
         self.class_context_stack.pop();
         self.this_stack.pop();
+        self.restore_spec_pooled(saved_spec);
         self.pop_and_restore_queue_frame();
         // Result clamping mirrors `try_run_compiled_method`'s tail.
         let mut result = result;
