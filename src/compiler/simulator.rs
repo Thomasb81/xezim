@@ -5332,6 +5332,15 @@ enum ClassAggRef {
     },
 }
 
+/// Where a `class_packed_operand` value lives: the whole property, or an
+/// element of its unpacked dimension(s) under the per-instance key
+/// `<h>#<prop>[k]...` — the write counterpart splices back there.
+#[derive(Clone, Debug)]
+enum ClassPackedStore {
+    Prop,
+    ElemSuffix(String),
+}
+
 /// One step of a member/select chain being resolved into class aggregate
 /// storage: a named member, a constant index, or a part-select.
 #[derive(Debug, Clone)]
@@ -65520,6 +65529,31 @@ impl Simulator {
                 }
             }
         }
+        // §7.4.2/§7.4.1: an indexed/part-select write INTO an element of an
+        // unpacked-array class property whose element type is a
+        // multi-dimensional packed array (`d.arr[1][2] = v`,
+        // `d.arr[1][8:0] = v` on `bit [8:0][7:0] arr[3]`; bare in a method
+        // too). The element lives whole under the per-instance key
+        // `<h>#arr[1]`, and the trailing select names a packed ELEMENT (an
+        // ew-bit slice) or an element RANGE — but the generic arms below
+        // treat it as a bit-select/bit-range of a phantom scalar, so the
+        // write was silently dropped (bit form) or spliced at raw bit
+        // offsets (range form). The read side (`class_packed_operand`)
+        // already does this walk; mirror it for the store.
+        if !self.no_class_objects()
+            && match &lhs.kind {
+                ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => matches!(
+                    &expr.kind,
+                    ExprKind::Index { .. }
+                        | ExprKind::MemberAccess { .. }
+                        | ExprKind::Ident(_)
+                ),
+                _ => false,
+            }
+            && let Some(r) = self.class_packed_elem_sel_write(lhs, val)
+        {
+            return r;
+        }
         // §13.5.2: a write to an ALIASED `ref` formal writes THROUGH to the
         // caller's storage immediately, so concurrent observers of the actual
         // see it mid-call (see `ref_alias_stack`). The storage is written BY
@@ -68033,11 +68067,11 @@ impl Simulator {
         h: usize,
         prop: &str,
         idx_exprs: &[&Expression],
-    ) -> Option<(Value, Vec<(i64, i64)>, Vec<Value>)> {
+    ) -> Option<(Value, Vec<(i64, i64)>, Vec<Value>, ClassPackedStore)> {
         if let Some(dims) = self.class_prop_packed_dims(h, prop) {
             let base = self.read_member_value(h, prop)?;
             let idx = idx_exprs.iter().map(|ie| self.eval_expr(ie)).collect();
-            return Some((base, dims, idx));
+            return Some((base, dims, idx, ClassPackedStore::Prop));
         }
         if idx_exprs.is_empty() {
             return None;
@@ -68072,7 +68106,117 @@ impl Simulator {
             sfx.push_str(&format!("[{}]", v.to_i64()?));
         }
         let elem = self.class_elem_load(h, prop, &sfx)?;
-        Some((elem, pdims, idx[udims.len()..].to_vec()))
+        let store = ClassPackedStore::ElemSuffix(sfx);
+        Some((elem, pdims, idx[udims.len()..].to_vec(), store))
+    }
+
+    /// §7.4.2/§7.4.1: WRITE counterpart of [`Self::class_packed_operand`] —
+    /// `d.arr[1][2] = v`, `d.arr[1][8:0] = v`, `d.w[i][4 +: 2] = v` (also
+    /// bare `arr[1][2]` in a method). Resolves the element and its packed
+    /// dims through the same walk the read uses, splices the fitted value
+    /// into the addressed element(s) of the next packed dimension, and
+    /// stores the element back under the same per-instance key. `None`
+    /// when the lvalue is not such a member chain (the caller falls
+    /// through); `Some(false)` for an x/z or out-of-range select (§11.5.1:
+    /// the write selects nothing).
+    fn class_packed_elem_sel_write(&mut self, lhs: &Expression, val: &Value) -> Option<bool> {
+        use crate::ast::expr::RangeKind;
+        let (base, tail_bit, tail_range) = match &lhs.kind {
+            ExprKind::Index { expr, index } => (expr, Some(index), None),
+            ExprKind::RangeSelect {
+                expr,
+                kind,
+                left,
+                right,
+            } => (expr, None, Some((*kind, left, right))),
+            _ => return None,
+        };
+        // Unpacked-index chain below the trailing select.
+        let mut idx_exprs: Vec<&Expression> = Vec::new();
+        let mut cur = base;
+        while let ExprKind::Index { expr: b, index } = &cur.kind {
+            idx_exprs.push(index);
+            cur = b;
+        }
+        idx_exprs.reverse();
+        if idx_exprs.is_empty() {
+            // A single select on the property itself is
+            // `class_packed_elem_ref`'s case (hooked earlier).
+            return None;
+        }
+        let (h, prop) = self.prop_chain_root(cur)?;
+        let (elem, dims, pidx, store) = self.class_packed_operand(h, &prop, &idx_exprs)?;
+        let depth = pidx.len();
+        let &(dl, dr) = dims.get(depth)?;
+        let (lo_b, hi_b) = (dl.min(dr), dl.max(dr));
+        let ew = Self::packed_chain_width(elem.width as u64, &dims, depth + 1);
+        // Offset of any packed selects already consumed by the operand
+        // walk (`w[i][k] = v`, property itself multi-dim): the tail indexes
+        // the element `pidx` addressed, not bit 0 of the property.
+        let (mut lsb, _) = Self::packed_chain_slice(elem.width as u64, &dims, &pidx)?;
+        let slot = |k: i64| {
+            if dl >= dr {
+                k - lo_b
+            } else {
+                hi_b - k
+            }
+        };
+        let (first, last, n) = match (tail_bit, tail_range) {
+            (Some(ix), _) => {
+                let v = self.eval_expr(ix);
+                if v.has_xz() || v.is_real {
+                    return Some(false); // §11.5.1: x/z index selects nothing
+                }
+                let k = v.to_i64()?;
+                if k < lo_b || k > hi_b {
+                    return Some(false); // out-of-range select: no write
+                }
+                (k, k, 1i64)
+            }
+            (_, Some((kind, left, right))) => {
+                let l = self.eval_expr(left);
+                let r = self.eval_expr(right);
+                let (a, b) = match (l.to_i64(), r.to_i64()) {
+                    (Some(a), Some(b)) if !l.has_xz() && !r.has_xz() => match kind {
+                        RangeKind::Constant => (a, b),
+                        RangeKind::IndexedUp => (a, a + b - 1),
+                        RangeKind::IndexedDown => (a - b + 1, a),
+                    },
+                    _ => return Some(false),
+                };
+                if a < lo_b || a > hi_b || b < lo_b || b > hi_b {
+                    return Some(false); // out-of-range select: no write
+                }
+                (a, b, (a - b).abs() + 1)
+            }
+            _ => return None,
+        };
+        lsb += slot(first).min(slot(last)) as u64 * ew;
+        let out_w = (n as u64 * ew) as u32;
+        if lsb + out_w as u64 > elem.width as u64 {
+            return None;
+        }
+        let piece = val.resize(out_w);
+        let mut nv = elem.clone();
+        for i in 0..(out_w as usize) {
+            nv.set_bit(lsb as usize + i, piece.get_bit(i));
+        }
+        if nv == elem {
+            return Some(false);
+        }
+        match store {
+            ClassPackedStore::Prop => {
+                if let Some(Some(inst)) = self.heap.get_mut(h) {
+                    inst.properties.insert(prop.to_string(), nv);
+                } else {
+                    return Some(false);
+                }
+            }
+            ClassPackedStore::ElemSuffix(sfx) => {
+                self.class_elem_store(h, &prop, &sfx, nv);
+            }
+        }
+        Some(true)
     }
 
     /// §7.4.1/§11.5.1: a part-select of a multi-dimensional packed class
@@ -68095,7 +68239,7 @@ impl Simulator {
         }
         idx_exprs.reverse();
         let (h, prop) = self.prop_chain_root(cur)?;
-        let (base_v, dims, idx) = self.class_packed_operand(h, &prop, &idx_exprs)?;
+        let (base_v, dims, idx, _) = self.class_packed_operand(h, &prop, &idx_exprs)?;
         let &(dl, dr) = dims.get(idx.len())?;
         let l = self.eval_expr(left);
         let r = self.eval_expr(right);
@@ -74983,7 +75127,7 @@ impl Simulator {
                     // multi-dimensional packed elements, then packed selects.
                     if idx_exprs.len() >= 2
                         && !self.class_prop_packed_dims(h, &prop).is_some()
-                        && let Some((ev, pd, pidx)) =
+                        && let Some((ev, pd, pidx, _)) =
                             self.class_packed_operand(h, &prop, &idx_exprs)
                         && !pidx.is_empty()
                         && pidx.len() <= pd.len()

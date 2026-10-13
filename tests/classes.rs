@@ -699,3 +699,6 @@ mod dynamic_array_property_new_init;
 mod type_param_handle_not_struct;
 #[path = "classes/compiled_method_packed_elem_select.rs"]
 mod compiled_method_packed_elem_select;
+
+#[path = "classes/class_packed_elem_store.rs"]
+mod class_packed_elem_store;
