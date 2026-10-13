@@ -7465,6 +7465,12 @@ pub struct Simulator {
     /// `Entry` runs the callee's block in-place with a fresh register
     /// file, skipping arg materialization + interpreter binding.
     compiled_fast_calls: HashMap<(u32, u32, u32), FastCallState>,
+    /// Static-method twin of `compiled_fast_calls` (class-perf Change 3):
+    /// memoized direct-call entries for no-arg static class functions, keyed
+    /// (cid, mid, 0). A separate map because `vm_fast_entry_for` permanently
+    /// declines static methods in the instance map, which would poison this
+    /// path's memoization.
+    compiled_fast_static_calls: HashMap<(u32, u32, u32), FastCallState>,
     /// Phase 2 (class-perf): intern a `(base_class, spec_sig)` specialization to a
     /// u32 id (0 = non-specialized / no spec), so the plan / skip / fast-call caches
     /// can be keyed by `(spec_id, cid, mid)` instead of `(cid, mid)`. Without this, a
@@ -12296,6 +12302,7 @@ impl Simulator {
             compiled_method_skip: HashSet::default(),
             compiled_method_call_counts: HashMap::default(),
             compiled_fast_calls: HashMap::default(),
+            compiled_fast_static_calls: HashMap::default(),
             compiled_spec_intern: HashMap::default(),
             typeref_class_memo: std::cell::RefCell::new(HashMap::default()),
             task_cleanup: Vec::new(),
@@ -32627,13 +32634,39 @@ impl Simulator {
                 // aliases), exactly the AST member-call path.
                 let base = *arg_start as usize;
                 let n = *n_args as usize;
-                let (args, temps) = self.vm_args_with_writeback(recv, method, base, n);
-                let v = self
-                    .exec_class_scope_static_call(recv, method, &args)
-                    .unwrap_or_else(|| Value::zero(32));
-                if temps {
-                    self.vm_drain_arg_temps(base, n);
-                }
+                // class-perf Change 3: a no-arg static call may run the
+                // callee's compiled block in place, skipping the per-call
+                // resolution walk + `try_run_compiled_method` prologue
+                // (singleton getters in hot loops). `None` falls through to
+                // the historic interpreter route, byte-identical.
+                let v = if n == 0
+                    && self
+                        .module
+                        .classes
+                        .contains_key(recv)
+                {
+                    self.vm_try_direct_static_call(recv, method, base, n)
+                        .unwrap_or_else(|| {
+                            let (args, temps) =
+                                self.vm_args_with_writeback(recv, method, base, n);
+                            let v = self
+                                .exec_class_scope_static_call(recv, method, &args)
+                                .unwrap_or_else(|| Value::zero(32));
+                            if temps {
+                                self.vm_drain_arg_temps(base, n);
+                            }
+                            v
+                        })
+                } else {
+                    let (args, temps) = self.vm_args_with_writeback(recv, method, base, n);
+                    let v = self
+                        .exec_class_scope_static_call(recv, method, &args)
+                        .unwrap_or_else(|| Value::zero(32));
+                    if temps {
+                        self.vm_drain_arg_temps(base, n);
+                    }
+                    v
+                };
                 self.vm_regs[*dest as usize] = v;
                 self.vm_ret_coll = self.pending_ret_collection.clone();
                 local_count += 1;
@@ -156851,6 +156884,297 @@ impl Simulator {
         self.return_flag = saved_return;
         self.func_call_stack.pop();
         self.pkg_scope_stack.pop();
+        self.pop_local_frame();
+        self.class_context_stack.pop();
+        self.this_stack.pop();
+        self.pop_and_restore_queue_frame();
+        let mut result = result;
+        if entry.result_width > 0 && result.width != entry.result_width {
+            result = result.resize_for_assign(entry.result_width);
+        }
+        if !entry.is_class_result && !entry.is_void_result && !result.is_real {
+            result.is_signed = entry.result_signed;
+        }
+        Some(result)
+    }
+
+    /// class-perf Change 3: build (or permanently decline) the direct-call
+    /// entry for a NO-ARG STATIC class function, from the cached plan +
+    /// compiled block. Mirrors `vm_fast_free_fn_entry_for` but (a) admits
+    /// static methods — this is their home — and (b) admits bodies with
+    /// `static` locals: the runner opens the exact §6.21 sync frame
+    /// `try_run_compiled_method` opens, keyed on the callee's class context
+    /// pushed by `exec_method_in_class_hierarchy`, so the persisted keys are
+    /// identical. Memoized in `compiled_fast_static_calls`.
+    fn vm_fast_static_entry_for(
+        &mut self,
+        dclass: &str,
+        method: &str,
+        mdef: &std::sync::Arc<crate::ast::decl::ClassMethod>,
+    ) -> Option<std::rc::Rc<FastCallEntry>> {
+        use super::bytecode::Insn;
+        let crate::ast::decl::ClassMethodKind::Function(f) = &mdef.kind else {
+            return None;
+        };
+        // The runner here opens no formal binding and no default-arg fill:
+        // a no-arg shape only.
+        if !f.ports.is_empty() {
+            return None;
+        }
+        let ids = &self.compiled_class_method_ids;
+        let (cid, mid) = match (ids.get(dclass), ids.get(method)) {
+            (Some(&c), Some(&m)) => (c, m),
+            _ => return None, // never interned: never compiled
+        };
+        if let Some(state) = self.compiled_fast_static_calls.get(&(cid, mid, 0)) {
+            return match state {
+                FastCallState::Entry(rc) => Some(rc.clone()),
+                FastCallState::Never => None,
+                FastCallState::Pending => None, // re-probed below
+            };
+        }
+        let never = |sim: &mut Self| {
+            sim.compiled_fast_static_calls
+                .insert((cid, mid, 0), FastCallState::Never);
+        };
+        if self.compiled_method_skip.contains(&(cid, mid, 0)) {
+            never(self);
+            return None;
+        }
+        let Some(pre) = self.compiled_method_plans.get(&(cid, mid, 0)).cloned() else {
+            return None; // no plan yet: this call goes the interpreter route
+        };
+        if pre.param_able_result || pre.is_collection_result {
+            never(self);
+            return None;
+        }
+        // Only a non-parameterized defining class: the interpreter path's
+        // static-local keys branch on `current_spec` matching the pushed
+        // class context, and a spec (or a `#(...)` header) changes them.
+        // Keeping parameterized classes on the interpreter route is the
+        // safe subset — `uvm_regex_cache` and other plain singletons are
+        // what this path exists for. An ACTIVE spec belonging to a
+        // DIFFERENT (caller) class is harmless: the §6.21 key branch fires
+        // only when `spec_base == cn`, and the runner replicates the slow
+        // path's derivation verbatim.
+        if self.class_is_parameterized(dclass) {
+            never(self);
+            return None;
+        }
+        let key = (cid, mid, pre.formal_widths.clone(), pre.static_result_width);
+        let Some(super::bytecode::CompiledMethodOutcome::Block(rc_entry)) =
+            self.compiled_method_block_cache.get(&key).cloned()
+        else {
+            return None; // block not compiled yet (Pending)
+        };
+        // Instruction guards (permanent): the block must be frame-free —
+        // no interpreter re-entry that resolves NAMES against the binding
+        // loop's frames (EvalExprFallback/StmtFallback would read formals
+        // the fast path never records into `var_class_types`/
+        // `class_of_var`-style metadata), no process-local loads, and no
+        // `$cast` (its runtime type check reads the binding loop's
+        // per-formal class/enum recordings). `InitLocalColl` stays legal
+        // for the same reason as the other fast paths.
+        let block = rc_entry.block.clone();
+        let has_forbidden = block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Insn::EvalExprFallback(..)
+                    | Insn::StmtFallback(..)
+                    | Insn::LoadProcessLocal(..)
+                    | Insn::Cast(..)
+            )
+        });
+        if has_forbidden {
+            never(self);
+            return None;
+        }
+        let entry = std::rc::Rc::new(FastCallEntry {
+            block,
+            defining_class: Box::from(dclass),
+            this_reg: rc_entry.this_reg,
+            result_reg: rc_entry.result_reg,
+            coerce: Vec::new(), // no-arg only
+            seed: Value::zero(32),
+            result_width: pre.static_result_width,
+            result_signed: pre.result_signed,
+            is_class_result: pre.is_class_result,
+            is_void_result: pre.is_void_result,
+            accessor: FastAccessor::None,
+        });
+        self.compiled_fast_static_calls
+            .insert((cid, mid, 0), FastCallState::Entry(entry.clone()));
+        Some(entry)
+    }
+
+    /// class-perf Change 3: direct VM->VM dispatch for `CallStaticScoped` —
+    /// run a compiled NO-ARG STATIC class function's block in place,
+    /// skipping the per-call `exec_class_scope_static_call` resolution walk
+    /// (type-param binding, spec extraction, typedef aliases), the class-
+    /// chain walk and `exec_method_in_class_hierarchy`'s frame setup, and
+    /// `try_run_compiled_method`'s interning/plan/key prologue — the whole
+    /// of which re-paid every call for singleton getters in hot loops
+    /// (`uvm_regex_cache::get_inst`, 1293 AST samples per 5M run).
+    ///
+    /// Static-local correctness: opens the SAME §6.21 sync frame the slow
+    /// path opens (via `exec_method_in_class_hierarchy`), pushes the SAME
+    /// class context (`Some(defining_class)`), and seeds/persists through
+    /// `static_local_vars` with the identical key derivation — so the AST
+    /// path, the compiled slow path and this path share one cell.
+    /// `None` = not eligible; the caller then runs the historic interpreter
+    /// path, byte-identical.
+    fn vm_try_direct_static_call(
+        &mut self,
+        dclass: &str,
+        method: &str,
+        arg_base: usize,
+        n: usize,
+    ) -> Option<Value> {
+        use super::bytecode::Insn;
+        if !fast_calls_enabled() || n != 0 || method == "new" {
+            return None;
+        }
+        // Built-in interception set (exec_method_call's early arms): keep
+        // the interpreter route.
+        if matches!(
+            method,
+            "srandom"
+                | "get_randstate"
+                | "set_randstate"
+                | "randomize"
+                | "kill"
+                | "await"
+                | "suspend"
+                | "resume"
+                | "status"
+        ) {
+            return None;
+        }
+        // Resolve the defining method WITHOUT the resolution walk: the
+        // class must name a concrete class that directly defines (or
+        // inherits) the method; the hierarchy walk is the memoized part.
+        let md = self.method_defining_class(dclass, method)?;
+        let mdef = md.method.clone();
+        let cname = md.class.to_string();
+        let entry = self.vm_fast_static_entry_for(&cname, method, &mdef)?;
+        // --- every guard passed; state changes from here on ---
+        let caller_regs = std::mem::take(&mut self.vm_regs);
+        let saved_foreach_arena = std::mem::take(&mut self.foreach_arena);
+        self.push_queue_frame();
+        self.this_stack.push(None);
+        self.class_context_stack.push(Some(cname.clone()));
+        let locals = self.take_pooled_frame();
+        self.push_local_frame(locals);
+        // §6.21: open the static-local sync frame exactly as
+        // `exec_method_in_class_hierarchy` does, then seed the body's
+        // static locals from the persistent store with the identical key
+        // derivation (`class_context_stack.last()` is the class just
+        // pushed, `current_spec` is None for the admitted shape).
+        let sync_name = self.sync_frame_name(method);
+        self.static_local_syncs.push((sync_name, Vec::new()));
+        // Install the callee's register file BEFORE seeding: the static-
+        // local seed writes callee registers (mirrors `try_run_compiled_
+        // method`, which resizes the taken file and seeds into it).
+        let mut regs = vec![Value::zero(1); entry.block.num_regs as usize];
+        regs[entry.this_reg as usize] = Value::from_u64(0, 32);
+        if (entry.is_void_result || entry.is_class_result)
+            && (entry.result_reg as usize) < entry.block.num_regs as usize
+        {
+            regs[entry.result_reg as usize] = entry.seed.clone();
+        }
+        self.vm_regs = regs;
+        if !entry.block.static_locals.is_empty() {
+            let sub_name = self
+                .static_local_syncs
+                .last()
+                .map(|(n, _)| n.clone())
+                .unwrap_or_default();
+            let mut seeds: Vec<(String, usize, Value)> = Vec::new();
+            for (nm, reg, default) in &entry.block.static_locals {
+                let key = match (
+                    self.class_context_stack.last().and_then(|c| c.as_ref()),
+                    self.current_spec.as_ref(),
+                ) {
+                    (Some(cn), Some((spec_base, sig))) if spec_base == cn => {
+                        format!("{}#{}::{}::{}", cn, sig, sub_name, nm)
+                    }
+                    (Some(cn), _) => format!("{}::{}::{}", cn, sub_name, nm),
+                    _ => format!("{}::{}", sub_name, nm),
+                };
+                let persisted = self.static_local_vars.get(&key).cloned();
+                if let Some((_n, syncs)) = self.static_local_syncs.last_mut() {
+                    syncs.push((nm.clone(), key));
+                }
+                seeds.push((
+                    nm.clone(),
+                    *reg as usize,
+                    persisted.unwrap_or_else(|| default.clone()),
+                ));
+            }
+            for (nm, reg, v) in seeds {
+                if reg < self.vm_regs.len() {
+                    self.vm_regs[reg] = v.clone();
+                }
+                if let Some(fr) = self.local_stack.last_mut() {
+                    fr.insert(nm, v);
+                }
+            }
+        }
+        let _prev_compiled = if SAMPLER_READY.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(CUR_METHOD_COMPILED.swap(true, std::sync::atomic::Ordering::Relaxed))
+        } else {
+            None
+        };
+        let saved_return = self.return_flag;
+        self.return_flag = false;
+        self.exec_insns(&entry.block.instructions);
+        let result = self
+            .vm_regs
+            .get(entry.result_reg as usize)
+            .cloned()
+            .unwrap_or_else(|| Value::zero(32));
+        // §6.21: persist the final STATIC-local registers (same derivation
+        // as the exit path of `try_run_compiled_method`).
+        if !entry.block.static_locals.is_empty() {
+            let keys: Vec<String> = self
+                .static_local_syncs
+                .last()
+                .map(|(_, syncs)| {
+                    entry
+                        .block
+                        .static_locals
+                        .iter()
+                        .map(|(nm, _, _)| {
+                            syncs
+                                .iter()
+                                .find(|(n, _)| n == nm)
+                                .map(|(_, k)| k.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (i, (nm, reg, _)) in entry.block.static_locals.iter().enumerate() {
+                let Some(v) = self.vm_regs.get(*reg as usize).cloned() else {
+                    continue;
+                };
+                if let Some(k) = keys.get(i)
+                    && !k.is_empty()
+                {
+                    self.static_local_vars.insert(k.clone(), v.clone());
+                }
+                if let Some(fr) = self.local_stack.last_mut() {
+                    fr.insert(nm.clone(), v);
+                }
+            }
+        }
+        self.vm_regs = caller_regs;
+        self.foreach_arena = saved_foreach_arena;
+        if let Some(prev) = _prev_compiled {
+            CUR_METHOD_COMPILED.store(prev, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.return_flag = saved_return;
+        self.static_local_syncs.pop();
         self.pop_local_frame();
         self.class_context_stack.pop();
         self.this_stack.pop();
