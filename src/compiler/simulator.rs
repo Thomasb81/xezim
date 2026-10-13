@@ -32836,7 +32836,10 @@ impl Simulator {
                 let value = match store {
                     Some(an) => {
                         let key = self.assoc_key_str(&an, &idx_val);
-                        let elem = format!("{}[{}]", an, key);
+                        // class-perf: use the pre-sized manual renderer instead
+                        // of `format!` — this runs once per element access on
+                        // associative-array procedural loops.
+                        let elem = Self::name_with_key(&an, &key);
                         self.signals
                             .get(&elem)
                             .cloned()
@@ -32879,7 +32882,8 @@ impl Simulator {
                 };
                 if let Some(an) = store {
                     let key = self.assoc_key_str(&an, &idx_val);
-                    let elem_name = format!("{}[{}]", an, key);
+                    // class-perf: pre-sized manual renderer, as in `LoadCollElem`.
+                    let elem_name = Self::name_with_key(&an, &key);
                     // §7.10.2.3: `q[i] = v` with `i >= size` APPENDS to
                     // a queue / dynamic array (auto-grows to `i+1`).
                     if !self.is_associative_array(&an) {
@@ -119930,22 +119934,34 @@ impl Simulator {
                 let kv = self.eval_expr(arg);
                 let key = self.assoc_key_str(obj_name, &kv);
                 let elem_name = Self::name_with_key(obj_name, &key);
-                // A multidimensional associative array (`m[K1][K2]`, IEEE 1800-2023 §7.8.1)
-                // stores elements under the compound key `m[K1][K2]`; the bare `m[K1]`
-                // is never a direct entry. So a hit is EITHER the flat 1D key OR any
-                // compound `m[K1][...]` element (prefix scan).
-                let nested_prefix = Self::name_with_suffix(&elem_name, "[");
-                // A STRUCT element stores member-wise leaves
-                // (`sa[k].id`) — no `sa[k]` entry ever exists.
-                let member_prefix = Self::name_with_suffix(&elem_name, ".");
-                let found = self.signals.contains_key(&elem_name)
+                // class-perf: the hot path (a flat key that exists) must not pay
+                // for the prefix/`.size` probes that only disambiguate MAP and
+                // STRUCT assoc elements. Probe the direct scalar entry first and
+                // build the sacrificial Strings lazily on the miss only — every
+                // entry probe here allocates a heap String (`name_with_suffix`),
+                // and the common regex-cache loop looks up an existing key every
+                // iteration.
+                if self.signals.contains_key(&elem_name)
                     || self.signal_name_to_id.contains_key(elem_name.as_str())
-                    // An assoc element that is itself a collection is stored
-                    // under `<assoc>[<key>].size` / `<assoc>[<key>][i]`.
-                    || self.signals.contains_key(&Self::name_with_suffix(&elem_name, ".size"))
                     || self.module.dynamic_arrays.contains(&elem_name)
-                    || self.signals.any_key_with_prefix(&nested_prefix)
-                    || self.signals.any_key_with_prefix(&member_prefix);
+                {
+                    return Some(Value::from_u64(1, 1));
+                }
+                // A multidimensional associative array (`m[K1][K2]`, IEEE
+                // 1800-2023 §7.8.1) stores elements under the compound key
+                // `m[K1][K2]`; the bare `m[K1]` is never a direct entry. So a
+                // hit is EITHER the flat 1D key OR any compound `m[K1][...]`
+                // element (prefix scan). An assoc element that is itself a
+                // collection is stored under `<assoc>[<key>].size` / `<assoc>[<key>][i]`.
+                // A STRUCT element stores member-wise leaves (`sa[k].id`) — no
+                // `sa[k]` entry ever exists.
+                let found = self
+                    .signals
+                    .contains_key(&Self::name_with_suffix(&elem_name, ".size"))
+                    || self.signals.any_key_with_prefix(&Self::name_with_suffix(&elem_name, "["))
+                    || self
+                        .signals
+                        .any_key_with_prefix(&Self::name_with_suffix(&elem_name, "."));
                 return Some(Value::from_u64(found as u64, 1));
             }
         }
