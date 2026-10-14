@@ -73780,6 +73780,8 @@ impl Simulator {
                     // code, and it used to allocate three times per read (the
                     // class-context name, one `extends` clone per ancestor
                     // level, and the property key).
+                    if hier.path.len() == 1 {
+                    }
                     let is_static_prop = match self.class_context_stack.last() {
                         Some(Some(_))
                             if !self.class_member_names().statics.contains(name.as_str()) =>
@@ -73945,7 +73947,7 @@ impl Simulator {
                         // cell per-spec.
                         if let Some((base, sig)) = self.resolve_typedef_spec(cls) {
                             let saved = self.current_spec.take();
-                            self.current_spec = Some((base.clone(), sig));
+                            self.current_spec = Some((base.clone(), sig.clone()));
                             let v = self.class_static_get(&base, prop);
                             self.current_spec = saved;
                             if let Some(v) = v {
@@ -127342,6 +127344,28 @@ impl Simulator {
             ExprKind::MemberAccess { expr: base, member } => match &base.kind {
                 ExprKind::This => obj_member(self, "this", &member.name),
                 ExprKind::Ident(bh) if bh.path.len() == 1 => {
+                    // A typedef-ALIAS base (`typedef rt#(int) rt_i;` then
+                    // `rt_i::all` as a whole-collection RHS) — not a class
+                    // name and not an object: resolve the alias's per-spec
+                    // static-collection key like the Specialization arm.
+                    if !self.module.classes.contains_key(&bh.path[0].name.name)
+                        && !self.signal_name_to_id.contains_key(bh.path[0].name.name.as_str())
+                        && self
+                            .current_spec
+                            .as_ref()
+                            .is_none_or(|(b, _)| b != &bh.path[0].name.name)
+                    {
+                        if let Some((base, sig)) = self.resolve_typedef_spec(&bh.path[0].name.name)
+                        {
+                            if self.member_is_static_coll(&base, &member.name) {
+                                let saved = self.current_spec.take();
+                                self.current_spec = Some((base.clone(), sig.clone()));
+                                let key = self.static_prop_key(&base, &member.name);
+                                self.current_spec = saved;
+                                return key;
+                            }
+                        }
+                    }
                     // `ClassName::static_collection.first(ref k)` — when the
                     // base is a CLASS name (not an object variable) and the
                     // member is a static associative-array collection, return
@@ -127465,6 +127489,32 @@ impl Simulator {
             }
             // Flattened `obj.member` as a 2-segment hierarchical Ident.
             ExprKind::Ident(h) if h.path.len() == 2 => {
+                // §8.25.1: a leading segment that is a TYPEDEF ALIAS of a
+                // parameterized-class specialization (`typedef rt#(int) rt_i;`
+                // then `rt_i::all.push_back(v)` — the call path strips the
+                // specialization into `current_spec` and leaves a 2-segment
+                // `rt_i.all`) resolves to the per-spec static-collection key,
+                // like the `Specialization` and class-name arms above.
+                // A leading TYPEDEF-ALIAS segment of a parameterized-class
+                // specialization (`typedef rt#(int) rt_i;` — the call path
+                // lifts the specialization into `current_spec` and leaves a
+                // 2-segment `rt_i.all`): resolve to the per-spec
+                // static-collection key like the `Specialization` arm.
+                if h.path[0].selects.is_empty()
+                    && !self.module.classes.contains_key(&h.path[0].name.name)
+                    && !self.signal_name_to_id.contains_key(h.path[0].name.name.as_str())
+                    && self.current_spec.as_ref().is_none_or(|(b, _)| b != &h.path[0].name.name)
+                {
+                    if let Some((base, sig)) = self.resolve_typedef_spec(&h.path[0].name.name) {
+                        if self.member_is_static_coll(&base, &h.path[1].name.name) {
+                            let saved = self.current_spec.take();
+                            self.current_spec = Some((base.clone(), sig.clone()));
+                            let key = self.static_prop_key(&base, &h.path[1].name.name);
+                            self.current_spec = saved;
+                            return key;
+                        }
+                    }
+                }
                 // `arr[i].member` flattened to `Ident([arr[selects], member])` —
                 // the parser keeps the index in `path[0].selects`. Evaluate
                 // the indexed element to a handle and resolve its collection
@@ -127503,6 +127553,28 @@ impl Simulator {
                     return self.handle_collection_name(hd, &h.path[1].name.name);
                 }
                 obj_member(self, &h.path[0].name.name, &h.path[1].name.name)
+            }
+            // Flattened `TypedefAlias::member` (2 segments, leading a class
+            // typedef specialization alias): resolve the alias's per-spec
+            // static-collection key like the MemberAccess arms above. Reachable
+            // when a Specialization-wrapping arm already consumed the head —
+            // without it the whole-copy read resolved to None.
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                if !h.path[0].selects.is_empty()
+                    || self.module.classes.contains_key(&h.path[0].name.name)
+                {
+                    return None;
+                }
+                if let Some((base, sig)) = self.resolve_typedef_spec(&h.path[0].name.name) {
+                    if self.member_is_static_coll(&base, &h.path[1].name.name) {
+                        let saved = self.current_spec.take();
+                        self.current_spec = Some((base.clone(), sig.clone()));
+                        let key = self.static_prop_key(&base, &h.path[1].name.name);
+                        self.current_spec = saved;
+                        return key;
+                    }
+                }
+                None
             }
             // Flattened `ClassName::static_handle.member` (3+ segments, e.g.
             // a singleton property reached through a static handle `m_inst`,
