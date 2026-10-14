@@ -515,6 +515,14 @@ struct Csp {
     /// and are decided first: the last open term is then fixed by the
     /// equality instead of guessed against a set of allowed sums.
     carries: Vec<(usize, usize, Vec<usize>)>,
+    /// Reused modular identities of an array `sum()`: the canonical form of
+    /// the sum's accumulator (its element linear form, width, signedness) to
+    /// its wrapped-sum variable `s`. Two constraints that re-translate the
+    /// same `arr.sum() with (...)` (`sum >= lo` and `sum <= hi`, or a rand-
+    /// bounded `inside`) must share this `s` and the one carry identity node
+    /// — or independent wrap counts refute elements one at a time, exhausting
+    /// the work budget (issue #302, RC2).
+    carry_memo: HashMap<(Vec<(usize, i128)>, u32, bool), usize>,
     /// Variable count before translation: the carry variables live above
     /// it and are made afresh by every translation.
     carry_base: Option<usize>,
@@ -554,14 +562,20 @@ struct LinCx<'a> {
     dom0: &'a [Dom],
     base: usize,
     carries: Vec<Carry>,
+    /// The cross-translation carry memo (`Csp::carry_memo`): array sums
+    /// already given a wrapped-sum variable are reused, not re-minted.
+    memo: &'a mut HashMap<(Vec<(usize, i128)>, u32, bool), usize>,
 }
 
 impl<'a> LinCx<'a> {
-    fn new(csp: &'a Csp) -> Self {
+    fn new(csp: &'a mut Csp) -> Self {
+        let dom0 = &csp.dom0;
+        let memo = &mut csp.carry_memo;
         LinCx {
-            dom0: &csp.dom0,
+            dom0,
             base: csp.vars.len(),
             carries: Vec::new(),
+            memo,
         }
     }
 
@@ -594,6 +608,13 @@ impl<'a> LinCx<'a> {
     /// that type: its value is then a new variable (`Csp::carries`). None
     /// when it cannot wrap, or the modulus is too large a coefficient.
     fn carry(&mut self, acc: &Lin, w: u32, s: bool) -> Option<usize> {
+        // A sum already translated (by another relation, or the other bound
+        // of the same window) reuses its wrapped-sum variable, keeping one
+        // modular identity for the whole solve (#302, RC2).
+        let key = (acc.t.clone(), w, s);
+        if let Some(&v) = self.memo.get(&key) {
+            return Some(v);
+        }
         let (lo, hi) = self.range(acc)?;
         let (rlo, rhi) = ws_range(w, s);
         if lo >= rlo && hi <= rhi {
@@ -604,13 +625,17 @@ impl<'a> LinCx<'a> {
             return None;
         }
         let k = (floor_div(lo - rlo, m), floor_div(hi - rlo, m));
+        let v = self.base + 2 * self.carries.len();
         self.carries.push(Carry {
             acc: acc.clone(),
             w,
             s,
             k,
         });
-        Some(self.base + 2 * (self.carries.len() - 1))
+        // Remember the local id; `csp_add_carries` overwrites the memo with
+        // the final variable id once the carry variables are created.
+        self.memo.insert(key, v);
+        Some(v)
     }
 }
 
@@ -721,6 +746,23 @@ impl St {
             let (lo, hi) = self.lin_bounds(&f.lin);
             lo >= f.lo && hi <= f.hi
         })
+    }
+    /// `fits_hold`, but ignoring the symmetric signed→unsigned zero-extension
+    /// "x ≥ 0" fits (`hi == i128::MAX`). Those assert a sign-reinterpreting
+    /// operand stays non-negative, which a bit-identical (mod 2^w) equality
+    /// deliberately wraps through — so they must not gate the modular fallback
+    /// `csp_wrap_eq`. Without this an `int total == <expr with a 32'(...)>`
+    /// (unsigned comparison) pushes `total >= 0`, that fit can never hold on
+    /// the signed variable's domain, and the whole equality lost every
+    /// propagation — total stayed 2^32 wide and the value picker hit the
+    /// wrap-equivalent values with ~2^-32 probability (#302).
+    fn fits_hold_eq(&self, fits: &[Fit]) -> bool {
+        fits.iter()
+            .filter(|f| f.hi != i128::MAX)
+            .all(|f| {
+                let (lo, hi) = self.lin_bounds(&f.lin);
+                lo >= f.lo && hi <= f.hi
+            })
     }
     fn all_fixed(&self, vs: &[usize]) -> bool {
         vs.iter().all(|&v| self.fixed(v).is_some())
@@ -1288,6 +1330,7 @@ impl Simulator {
             pop: HashMap::default(),
             pop_rev: HashMap::default(),
             carries: Vec::new(),
+            carry_memo: HashMap::default(),
             carry_base: None,
             sizes: HashMap::default(),
             size_phase: false,
@@ -1472,6 +1515,7 @@ impl Simulator {
             pop: HashMap::default(),
             pop_rev: HashMap::default(),
             carries: Vec::new(),
+            carry_memo: HashMap::default(),
             carry_base: None,
             sizes: HashMap::default(),
             size_phase: false,
@@ -1621,6 +1665,7 @@ impl Simulator {
         csp.soft_priority.clear();
         csp.opaque = false;
         csp.carries.clear();
+        csp.carry_memo.clear();
         match csp.carry_base {
             Some(b) => {
                 csp.vars.truncate(b);
@@ -2557,7 +2602,7 @@ impl Simulator {
             } => {
                 if !st.fits_hold(fits) {
                     if let Some((w, n)) = *wrap
-                        && st.fits_hold(&fits[..n])
+                        && st.fits_hold_eq(&fits[..n])
                         && let Some(ok) = Self::csp_wrap_eq(lin, w, st)
                     {
                         return ok;
@@ -4678,6 +4723,7 @@ impl Simulator {
         let mut cx = LinCx::new(csp);
         let lin = Self::csp_lin(&a, w, false, &mut fits, &mut cx)?;
         let carries = std::mem::take(&mut cx.carries);
+        drop(cx);
         self.csp_add_carries(csp, carries);
         fits.push(Fit {
             lin: lin.clone(),
@@ -4764,6 +4810,7 @@ impl Simulator {
             return fallback(self, csp);
         };
         let carries = std::mem::take(&mut cx.carries);
+        drop(cx);
         let (rlo, rhi) = ws_range(w, s);
         let nleaf = fits.len();
         fits.push(Fit {
@@ -4970,9 +5017,22 @@ impl Simulator {
                         {
                             return self.csp_eval_node(csp, whole, env, neg);
                         }
-                        let a = self.csp_bool(csp, &rel(BinaryOp::Leq, lo, expr), env, false)?;
-                        let b = self.csp_bool(csp, &rel(BinaryOp::Leq, expr, hi), env, false)?;
-                        Node::And(vec![a, b])
+                        // Share one translation of `expr` across `lo <= expr`
+                        // and `expr <= hi` so an array sum keeps a single
+                        // modular identity (otherwise the two relations give
+                        // it independent carry pairs and the search refutes
+                        // elements one at a time — issue #302, RC2). When
+                        // either side is not affine, fall back to the two
+                        // separate relations below.
+                        if let Some(n) = self.csp_range_shared(csp, expr, lo, hi, env, &whole) {
+                            n
+                        } else {
+                            let a =
+                                self.csp_bool(csp, &rel(BinaryOp::Leq, lo, expr), env, false)?;
+                            let b =
+                                self.csp_bool(csp, &rel(BinaryOp::Leq, expr, hi), env, false)?;
+                            Node::And(vec![a, b])
+                        }
                     }
                 };
                 alts.push(n);
@@ -4999,6 +5059,7 @@ impl Simulator {
             None
         };
         let carries = std::mem::take(&mut cx.carries);
+        drop(cx);
         let Some(lin) = lin else {
             return self.csp_eval_node(csp, whole, env, neg);
         };
@@ -5032,6 +5093,101 @@ impl Simulator {
             fits,
             src,
         })
+    }
+
+    /// `lo <= expr <= hi` as two linear relations that share ONE translation
+    /// of `expr` — one linear form, one set of fits, and one carry pair for
+    /// an array `sum()`. The plain lowering (two independent `csp_bool`
+    /// calls) re-translates `expr` for each bound, so a sum keeps two
+    /// independent modular identities `Σ elems == s + 2^w·k`; their wrap
+    /// counts make the elements refute one at a time, exhausting the work
+    /// budget instead of deciding the shared carry (issue #302, RC2). None
+    /// when either side is not affinely translatable (the caller falls back
+    /// to the two-relation lowering).
+    #[allow(clippy::too_many_arguments)]
+    fn csp_range_shared(
+        &mut self,
+        csp: &mut Csp,
+        expr: &Expression,
+        lo: &Expression,
+        hi: &Expression,
+        env: &Env,
+        whole: &SrcItem,
+    ) -> Option<Node> {
+        let (a, l, h) = (
+            self.csp_ae(csp, expr, env)?,
+            self.csp_ae(csp, lo, env)?,
+            self.csp_ae(csp, hi, env)?,
+        );
+        let ((we, se), (wl, sl), (wh, sh)) =
+            (Self::csp_ws(&a), Self::csp_ws(&l), Self::csp_ws(&h));
+        let w = we.max(wl).max(wh).max(1);
+        if w > 64 {
+            return None;
+        }
+        let s = se && sl && sh;
+        // Translate `expr` once under the shared context: its fits and
+        // carries (the sum's single modular identity) are reused by both
+        // bounds below.
+        let mut fits = Vec::new();
+        let mut cx = LinCx::new(csp);
+        let le = Self::csp_lin(&a, w, s, &mut fits, &mut cx)?;
+        let carried = std::mem::take(&mut cx.carries);
+        drop(cx);
+        self.csp_add_carries(csp, carried);
+        let (rlo, rhi) = ws_range(w, s);
+        // `lo - expr <= 0` (lo <= expr)
+        let mut fits_lo = fits.clone();
+        let ll = Self::csp_lin(&l, w, s, &mut fits_lo, &mut LinCx::new(csp))?;
+        let d_lo = ll.clone().plus(&le, -1)?;
+        if d_lo.t.is_empty() || d_lo.k.abs() > KONST_MAX {
+            return None;
+        }
+        fits_lo.push(Fit {
+            lin: ll,
+            lo: rlo,
+            hi: rhi,
+        });
+        fits_lo.push(Fit {
+            lin: le.clone(),
+            lo: rlo,
+            hi: rhi,
+        });
+        // `expr - hi <= 0` (expr <= hi)
+        let mut fits_hi = fits;
+        let lh = Self::csp_lin(&h, w, s, &mut fits_hi, &mut LinCx::new(csp))?;
+        let d_hi = le.clone().plus(&lh.clone(), -1)?;
+        if d_hi.t.is_empty() || d_hi.k.abs() > KONST_MAX {
+            return None;
+        }
+        fits_hi.push(Fit {
+            lin: le,
+            lo: rlo,
+            hi: rhi,
+        });
+        fits_hi.push(Fit {
+            lin: lh,
+            lo: rlo,
+            hi: rhi,
+        });
+        let mut mk = |me: &mut Self, lin: Lin, fits: Vec<Fit>| {
+            let mut deps: Vec<usize> = lin.t.iter().map(|t| t.0).collect();
+            for f in &fits {
+                deps.extend(f.lin.t.iter().map(|t| t.0));
+            }
+            deps.sort_unstable();
+            deps.dedup();
+            let src = me.csp_src(csp, whole.clone(), env, deps);
+            Node::Lin {
+                lin,
+                rel: Rel::Le,
+                fits,
+                src,
+                sneg: false,
+                wrap: None,
+            }
+        };
+        Some(Node::And(vec![mk(self, d_lo, fits_lo), mk(self, d_hi, fits_hi)]))
     }
 
     /// The object's own member named by `e` (`x`, `this.x`, `obj.x` for the
@@ -6113,6 +6269,10 @@ impl Simulator {
         for c in carries {
             debug_assert!(csp.vars.len() >= csp.carry_base.unwrap_or(0));
             let sv = csp.vars.len();
+            // Record the final wrapped-sum variable id (the memo entry set by
+            // `LinCx::carry` was the local, pre-creation id).
+            let key = (c.acc.t.clone(), c.w, c.s);
+            csp.carry_memo.insert(key, sv);
             csp.vars.push(CspVar {
                 key: VarKey::Aux,
                 width: c.w,

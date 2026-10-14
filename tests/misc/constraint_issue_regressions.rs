@@ -47,3 +47,8 @@ fn issue_253_four_state_wide_implication() {
 fn issue_254_joint_sizes_sum_and_integer_size() {
     check_case("constraint_254.sv");
 }
+
+#[test]
+fn issue_302_sum_window_rand_bounds_budget() {
+    check_case("constraint_302.sv");
+}
