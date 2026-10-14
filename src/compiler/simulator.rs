@@ -156705,8 +156705,22 @@ impl Simulator {
         // ... }`, TLM transport tasks) must keep the suspend-aware, possibly
         // non-compilable path, or the eager compile would spin the compiled
         // body. `run_phase`'s 5M for-loop is wait-free, so it qualifies.
+        // For a TASK the wait-freedom test is the precise suspension analysis
+        // (`method_body_can_suspend`) — the structural `stmts_have_blocking`
+        // over-approximates method calls by NAME across every class, so a
+        // report-macro call (`uvm_fatal` → the report machinery) marks any
+        // loop body blocking and the boost is lost. The precise analysis is
+        // the same one that gates the compile below, so a body that passes
+        // here reaches the real gate; one that would fail it keeps the
+        // suspend-aware path exactly as before.
+        let boost_wait_free = match kind {
+            CompiledBodyKind::Task(t) => {
+                !self.method_body_can_suspend(cname, &t.ports, &t.items)
+            }
+            _ => !self.stmts_have_blocking(body),
+        };
         let tier = method_tier_threshold();
-        if tier > 0 && !(self.body_has_loop(body) && !self.stmts_have_blocking(body)) {
+        if tier > 0 && !(self.body_has_loop(body) && boost_wait_free) {
             let calls = self
                 .compiled_method_call_counts
                 .entry((cid, mid, spec_id))

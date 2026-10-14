@@ -378,11 +378,164 @@ impl Simulator {
                             name,
                             cx,
                         ),
-                    _ => true,
+                    _ => {
+                        // A member chain (`base.member.method()` — e.g.
+                        // `m_base_inst.m_this_type.push_back()`): resolve
+                        // the receiver chain's type when every link is
+                        // known, else fail closed.
+                        let Some(kind) = self.ts_chain_recv(base, cx) else {
+                            return true;
+                        };
+                        let kind = match self.ts_collapse(Some(kind), selected) {
+                            Some(k) => k,
+                            None => return true,
+                        };
+                        self.ts_on_kind(kind, name)
+                    }
                 }
             }
             _ => true,
         }
+    }
+
+    /// The verdict for calling `name` on a receiver of handle kind `kind`.
+    fn ts_on_kind(&self, kind: TsRecv, name: &str) -> bool {
+        match kind {
+            TsRecv::Class(c) => self.ts_in_class(&c, name),
+            TsRecv::Plain | TsRecv::Collection(_) => false,
+            TsRecv::Builtin => !matches!(
+                name,
+                "try_get"
+                    | "try_put"
+                    | "try_peek"
+                    | "num"
+                    | "kill"
+                    | "status"
+                    | "self"
+                    | "srandom"
+                    | "get_randstate"
+                    | "set_randstate"
+            ),
+            TsRecv::Interface => true,
+        }
+    }
+
+    /// The handle kind of a receiver expression — `this`, a
+    /// local/formal/property name, a member chain (`obj.member.x`), or
+    /// an element select of any of those — collapsing inner selects.
+    /// `None` when any link's type is unknown (fail closed).
+    fn ts_chain_recv(&self, e: &Expression, cx: TsCtx<'_>) -> Option<TsRecv> {
+        match &e.kind {
+            ExprKind::Paren(inner) => self.ts_chain_recv(inner, cx),
+            ExprKind::Index { expr, .. } => {
+                let k = self.ts_chain_recv(expr, cx)?;
+                self.ts_collapse(Some(k), true)
+            }
+            ExprKind::This => Some(TsRecv::Class(cx.owner?.to_string())),
+            ExprKind::Ident(h)
+                if h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty() =>
+            {
+                if let Some(k) = self.ts_lookup(&h.path[0].name.name, cx) {
+                    return k;
+                }
+                // A package-scope variable (uvm_pkg data): a queue /
+                // dynamic array (element kind from its element type name)
+                // or a signal, whose type name may name a class.
+                self.ts_pkg_var_kind(&h.path[0].name.name)
+            }
+            ExprKind::MemberAccess { expr: inner, member } => {
+                let TsRecv::Class(c) = self.ts_chain_recv(inner, cx)? else {
+                    return None;
+                };
+                let (kind, collection) = self.ts_prop_kind(&c, &member.name)?;
+                if collection {
+                    Some(TsRecv::Collection(kind.map(Box::new)))
+                } else {
+                    kind
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The handle kind of a package-scope variable: a queue / dynamic
+    /// array (element kind from its element type name), or a signal whose
+    /// type name names a class. `None` when the name is unknown.
+    fn ts_pkg_var_kind(&self, n: &str) -> Option<TsRecv> {
+        if self.module.dynamic_arrays.contains(n) {
+            let elem = self
+                .module
+                .signals
+                .get(n)
+                .and_then(|s| s.type_name.clone())
+                .and_then(|tn| self.ts_type_name_kind(&tn));
+            return Some(TsRecv::Collection(elem.map(Box::new)));
+        }
+        self.module
+            .signals
+            .get(n)
+            .and_then(|s| s.type_name.clone())
+            .and_then(|tn| self.ts_type_name_kind(&tn))
+    }
+
+    /// The handle kind of a declared type NAME (a `signals` type name or
+    /// similar): the class it names (or its typedef alias), else a plain
+    /// value. `None` when the name names no known type.
+    fn ts_type_name_kind(&self, tn: &str) -> Option<TsRecv> {
+        let base = tn.rsplit("::").next().unwrap_or(tn);
+        let base = base.split('#').next().unwrap_or(base).trim();
+        if let Some(cd) = self.module.classes.get(base) {
+            return Some(if cd.is_interface {
+                TsRecv::Interface
+            } else {
+                TsRecv::Class(base.to_string())
+            });
+        }
+        if let Some(dt) = self.module.typedef_types.get(tn) {
+            return self.ts_recv_kind(dt);
+        }
+        if let Some(dt) = self.module.typedef_types.get(base) {
+            return self.ts_recv_kind(dt);
+        }
+        None
+    }
+
+    /// An element/part select of `kind`: the element type of a
+    /// collection, a plain integral of a plain value, else unknown.
+    fn ts_collapse(&self, kind: Option<TsRecv>, selected: bool) -> Option<TsRecv> {
+        match (kind, selected) {
+            (Some(TsRecv::Collection(elem)), true) => elem.map(|b| *b),
+            (Some(TsRecv::Plain), true) => Some(TsRecv::Plain),
+            (_, true) => None,
+            (k, false) => k,
+        }
+    }
+
+    /// The property `prop` of class `class`'s inheritance chain: its
+    /// handle kind and whether it is a collection. `None` when the
+    /// chain lacks the property or cannot be followed.
+    fn ts_prop_kind(&self, class: &str, prop: &str) -> Option<(Option<TsRecv>, bool)> {
+        let mut cur = Self::ts_base(class).to_string();
+        let mut seen: HashSet<String> = HashSet::default();
+        while let Some(cd) = self.module.classes.get(&cur) {
+            if !seen.insert(cur.clone()) {
+                return None;
+            }
+            if let Some(dt) = cd.property_types.get(prop) {
+                let collection = cd.array_properties.contains_key(prop)
+                    || cd.queue_properties.contains_key(prop)
+                    || cd.assoc_properties.contains_key(prop)
+                    || cd.static_collections.iter().any(|(n, _, _)| n == prop);
+                return Some((self.ts_recv_kind(dt), collection));
+            }
+            match &cd.extends {
+                Some(b) => cur = Self::ts_base(b).to_string(),
+                None => return None,
+            }
+        }
+        None
     }
 
     /// `name(...)` with no receiver: the enclosing class chain first
@@ -462,6 +615,20 @@ impl Simulator {
                 let q = format!("{recv}::{name}");
                 if self.module.tasks.contains_key(&q) || self.module.functions.get(&q).is_some() {
                     return self.ts_free(&q);
+                }
+                // `typedef_name::m()` (§8.23 static call through a class
+                // typedef, e.g. a parameterized `uvm_callbacks`
+                // specialization aliased as `cbs_type`). Resolve the typedef
+                // to its class before failing closed.
+                if let Some(dt) = self.module.typedef_types.get(recv)
+                    && let Some(c) = self.typeref_class_name(dt)
+                {
+                    return self.ts_in_class(&c, name);
+                }
+                // A package-scope variable receiver (`m_state.push_front()`:
+                // uvm_pkg data reached from a class method).
+                if let Some(kind) = self.ts_pkg_var_kind(recv) {
+                    return self.ts_on_kind(kind, name);
                 }
                 true
             }

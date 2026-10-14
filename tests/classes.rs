@@ -547,6 +547,8 @@ mod class_randomize_multidim;
 mod cls_agg_members_in_struct;
 #[path = "classes/cls_agg_members_matrix.rs"]
 mod cls_agg_members_matrix;
+#[path = "classes/compiled_task_suspension_analysis.rs"]
+mod compiled_task_suspension_analysis;
 #[path = "classes/compiled_method_admission_regression.rs"]
 mod compiled_method_admission_regression;
 #[path = "classes/compiled_task_and_free_fn_chain.rs"]
