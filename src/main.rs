@@ -3080,7 +3080,7 @@ suppressed but the explicit SDF annotation still applies."
                         chatter_out!("Loaded compiled: {}", sf);
                         chatter_out!("Max time: {} ns", max_time);
                         chatter_out!("------------------------------");
-                        let total_start = std::time::Instant::now();
+                        let total_start = xezim::WallTimer::now();
                         xezim::compiler::simulator::set_sim_debug(sim_debug);
                         xezim::compiler::simulator::set_dump_timescales(dump_timescales);
                         xezim::compiler::simulator::set_dpi_libs(&dpi_libs);
@@ -3101,7 +3101,7 @@ suppressed but the explicit SDF annotation still applies."
                         // all args + plusargs) so vpi_get_vlog_info
                         // can hand the same argv back to UVM.
                         sim.set_args(&args);
-                        let compilation_start = std::time::Instant::now();
+                        let compilation_start = xezim::WallTimer::now();
                         sim.compile();
                         if !sim.compile_errors.is_empty() {
                             for e in &sim.compile_errors {
@@ -3113,7 +3113,7 @@ suppressed but the explicit SDF annotation still applies."
                             "[PHASE] compilation: {:.1}ms",
                             compilation_start.elapsed().as_secs_f64() * 1000.0
                         );
-                        let simulation_start = std::time::Instant::now();
+                        let simulation_start = xezim::WallTimer::now();
                         sim.simulate();
                         chatter!(
                             "[PHASE] simulation: {:.1}ms",

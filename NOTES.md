@@ -10,6 +10,16 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
 
 **Correctness**
 
+* A type name declared in more than one package (`pkg_one::blk_t` and
+  `pkg_two::blk_t`, or a package and `$unit` or a module) resolves by the
+  §26.3 rules instead of to the package elaborated last: `$bits`, struct
+  layouts, enum members, `rand` members and same-named classes each come
+  from their own package, so `randomize()` succeeds. (#300, reported by
+  Ganesh-TNL)
+* Unpacked-array, struct and dynamic-array properties of a class start at x
+  for 4-state element types when the object is constructed (§6.8 Table
+  6-7); they used to start at 0. A test pins the time-0 value of every
+  kind of declaration.
 * In a method of a class with an `int s` property, `s = v` writes the
   property even when another class has a struct property `s` and the module
   has a struct variable `s`; the write used to land in the module struct.
@@ -288,12 +298,29 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   succeeds, also when a size comes from another target (`p.size() == n`),
   which used to allocate an array as large as a random `n` and hang. (#299,
   reported by Ganesh-TNL)
+* `randomize()` solves `foreach` constraints over multi-dimensional packed
+  members wider than 64 bits of several rand sub-objects
+  (`foreach (sel[i]) b.W == a.W;` with `bit [8:0][7:0] W`), and element and
+  part selects of such members read the right bits (§7.4.1, §11.5.1). A
+  `randomize()` that fails now prints a warning naming the class and its
+  constraint blocks (first 3 failures per class; `XEZIM_RAND_WARN=0`
+  silences it). (#301, reported by Ganesh-TNL)
+* Edges on bits of a vector driven by one replicate assign
+  (`assign clk_v[7:0] = {8{gclk}}`) share one internal edge alias instead of
+  one per bit, so the flops they clock wake once per edge. The c906
+  memcpy benchmark runs 7.8% fewer instructions (4.1% fewer cycles); edge
+  timing is unchanged.
+* With the `jit` feature and `XEZIM_TS_JIT=1`, a native two-state stream
+  that reads an x re-runs on the two-state executor's x path instead of the
+  four-state interpreter (20x fewer such re-runs on c906).
 * `a.size() == n + m` compares at 32 bits, since `size()` and `num()` return
   an `int`; narrower operands used to wrap. A field write to an element of a
   class array of packed structs (`beats[i].last = 1`) is no longer dropped.
 
 **Usability**
 
+* `[PHASE]` times from a precompiled model file use the wall clock, like a
+  run from source, so the two report comparable phase totals.
 * `XEZIM_INIT_REG=random` now varies with the run's seed (`+seed=<n>`,
   `-sv_seed <n>`), so a reset bug that depends on the power-up value can be
   found by changing the seed; the same seed reproduces the same values, and
