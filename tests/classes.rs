@@ -704,3 +704,6 @@ mod compiled_method_packed_elem_select;
 
 #[path = "classes/class_packed_elem_store.rs"]
 mod class_packed_elem_store;
+
+#[path = "classes/nonstatic_method_class_scope_fatal.rs"]
+mod nonstatic_method_class_scope_fatal;

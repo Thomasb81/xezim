@@ -6302,6 +6302,9 @@ pub struct Simulator {
     dpi_bindings: HashMap<String, DpiBinding>,
     dpi_unsupported: HashSet<String>,
     dpi_unresolved: HashSet<String>,
+    /// §8.10 non-static-method-through-`::` diagnostics already emitted
+    /// (`(class, method)` pairs) — a given pair is reported once.
+    nonstatic_scope_reported: HashSet<(String, String)>,
     /// Imports whose library binding has been attempted.
     dpi_bind_tried: HashSet<String>,
     /// State of the built-in UVM DPI-C helpers (`uvm_dpi.rs`).
@@ -12251,6 +12254,7 @@ impl Simulator {
             dpi_bindings: HashMap::default(),
             dpi_unsupported: HashSet::default(),
             dpi_unresolved: HashSet::default(),
+            nonstatic_scope_reported: HashSet::default(),
             dpi_bind_tried: HashSet::default(),
             uvm_dpi: Default::default(),
             heap: vec![None], // index 0 is null
@@ -129684,6 +129688,27 @@ impl Simulator {
         if method_name == "new" {
             return None;
         }
+        // IEEE 1800-2023 §8.10: a class-scope `::` access names a STATIC
+        // class member. A method reached this way that is not declared
+        // `static` (no instance receiver) is an error, not a silent call —
+        // reference simulators reject it at compile time (`Illegal to access
+        // non-static method 'm' outside its class scope`). xezim's dispatch
+        // reaches here only for the `Class::method(...)` shapes, so firing
+        // once is safe; the error is fatal, matching the reference.
+        if self.class_has_method(class_name, method_name)
+            && !self.is_static_method(class_name, method_name)
+            && self.nonstatic_scope_reported
+                .insert((class_name.to_string(), method_name.to_string()))
+        {
+            let msg = format!(
+                "Illegal to access non-static method '{}' outside its class scope (IEEE 1800-2023 §8.10): {}::{} requires an instance",
+                method_name, class_name, method_name
+            );
+            self.emit_severity_text("Fatal", &msg);
+            self.fatal_finish_number = Some(1);
+            self.finished = true;
+            return Some(Value::zero(32));
+        }
         let mut cur = Some(class_name.to_string());
         while let Some(cname) = cur {
             let Some((has_method, parent)) = self
@@ -158986,6 +159011,15 @@ impl Simulator {
     ) -> Option<Value> {
         use super::bytecode::Insn;
         if !fast_calls_enabled() || n != 0 || method == "new" {
+            return None;
+        }
+        // §8.10: a class-scope `::` call names a STATIC member. A non-static
+        // method reached this way must be a fatal (reference simulators reject
+        // it at compile time) — never a fast-path dispatch. Route through the
+        // interpreter's check so the message is emitted once, identically.
+        if self.class_has_method(dclass, method)
+            && !self.is_static_method(dclass, method)
+        {
             return None;
         }
         // Built-in interception set (exec_method_call's early arms): keep
