@@ -52,3 +52,8 @@ fn issue_254_joint_sizes_sum_and_integer_size() {
 fn issue_305_instance_dyn_array_randomize_bare_leaf() {
     check_case("constraint_305.sv");
 }
+
+#[test]
+fn issue_304_presized_instance_dyn_array_size_checker() {
+    check_case("constraint_304.sv");
+}
