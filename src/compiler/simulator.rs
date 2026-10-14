@@ -93709,6 +93709,14 @@ impl Simulator {
             .map(|s| s.name.name.as_str())
             .collect::<Vec<_>>()
             .join(".");
+        let coll_registered = |name: &str, this: &Self| -> bool {
+            this.module.arrays.contains_key(name)
+                || this.module.arrays_2d.contains_key(name)
+                || this.module.arrays_nd.contains_key(name)
+                || this.module.dynamic_arrays.contains(name)
+                || this.module.struct_members.contains_key(name)
+                || this.module.var_decl_types.contains_key(name)
+        };
         // `a.b.c` where `a.b` carries a bit layout (a nested packed struct, or
         // an untagged union whose members share one storage): the dotted name
         // IS the leaf. Without this the suffix-scan fallback below collapses it
@@ -93851,6 +93859,20 @@ impl Simulator {
                 Some(scope) => {
                     let scoped = format!("{}.{}", scope, raw);
                     if self.signal_name_to_id.contains_key(scoped.as_str()) {
+                        return scoped;
+                    }
+                    // A COLLECTION (dynamic/queue/assoc array, struct) is not a
+                    // signal — it lives in the array/struct registries keyed
+                    // by the instance-scoped name. Without this, a bare
+                    // `delays` inside a submodule (`u1`) resolved to the bare
+                    // leaf `delays`, so `std::randomize(delays)` and its
+                    // checker read/wrote the bare (TOP-level) array instead of
+                    // the child's own — the top's was silently randomized
+                    // while the child's stayed empty (issue #305), or a valid
+                    // solution was rejected when the checker read a bare `.size`
+                    // of 0 from storage actually keyed `u1.delays.size` (issue
+                    // #304).
+                    if coll_registered(&scoped, self) {
                         return scoped;
                     }
                     // An input-port net of this instance, left out as
@@ -129817,6 +129839,45 @@ impl Simulator {
                             } else {
                                 coll.to_string()
                             };
+                        }
+                    }
+                    // A bare single-segment RECEIVER (`delays.push_back(x)` /
+                    // `delays.size()`) reached from INSIDE an instance (`u1`)
+                    // must resolve to the SCOPED storage name — otherwise the
+                    // bare name's own module-template registration
+                    // (`dynamic_arrays`/`arrays` hold bare `delays` too)
+                    // dispatches the builtin on the TOP-level array, which is
+                    // empty/wrong. Issue #305: `std::randomize(delays)` in a
+                    // child drove the solver on the child's `u1.delays` but a
+                    // `.size()`/`.push_back` on the receiver here read the
+                    // parent's bare `delays` (size 0), rejecting a valid
+                    // solution and/or mutating the wrong storage.
+                    //
+                    // Only rewrite when the resolution produced an
+                    // INSTANCE-HIERARCHICAL path (contains a `.`, e.g.
+                    // `u1.delays`). A name that stays bare is a top-level
+                    // module array or package member (leave as-is); a
+                    // frame-local of an enclosing interpreted frame resolves
+                    // to a `@`-marked key (e.g. `@elements#0`) with NO dot and
+                    // must NOT be dispatched here — a same-named class
+                    // member (`this.elements`) reached through an enclosing
+                    // local's shadow belongs to `expr_assoc_name`'s member
+                    // resolver, and dispatching on the empty local is exactly
+                    // the corruption `bare_member_coll_call_ignores_*
+                    // _enclosing_local_shadow` guards against.
+                    if !recv_name.contains('.') {
+                        if let ExprKind::Ident(h) = &recv.kind {
+                            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                                let resolved = self.resolve_hier_name(h);
+                                if resolved.contains('.')
+                                    && (self.module.dynamic_arrays.contains(&*resolved)
+                                        || self.module.associative_arrays
+                                            .contains_key(&*resolved)
+                                        || self.module.arrays.contains_key(&*resolved))
+                                {
+                                    recv_name = resolved.into_owned();
+                                }
+                            }
                         }
                     }
                     if self.module.dynamic_arrays.contains(&recv_name)

@@ -47,3 +47,8 @@ fn issue_253_four_state_wide_implication() {
 fn issue_254_joint_sizes_sum_and_integer_size() {
     check_case("constraint_254.sv");
 }
+
+#[test]
+fn issue_305_instance_dyn_array_randomize_bare_leaf() {
+    check_case("constraint_305.sv");
+}
