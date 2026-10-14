@@ -93853,6 +93853,19 @@ impl Simulator {
                     if self.signal_name_to_id.contains_key(scoped.as_str()) {
                         return scoped;
                     }
+                    // An inlined-instance FIXED-SIZE unpacked array is stored
+                    // under the scope-qualified key (`u_child.delays`) in the
+                    // array tables, but its base name is not a scalar signal
+                    // (only its elements are) — so it is absent from
+                    // `signal_name_to_id`. Resolving a bare `delays` in the
+                    // instance's own process used to fall through and name the
+                    // unprefixed global slot (which has no geometry), and
+                    // `std::randomize(delays)` then silently randomized
+                    // nothing. Consult the collection tables too, exactly as
+                    // the element-access path (`lookup_signal_id`) does.
+                    if self.is_collection_store(&scoped) {
+                        return scoped;
+                    }
                     // An input-port net of this instance, left out as
                     // unobserved, would have been found right here.
                     self.signal_name_to_id.check_miss(scoped.as_str());
@@ -93867,7 +93880,9 @@ impl Simulator {
             }
             if let Some(hint) = self.name_resolve_hint.borrow().as_ref() {
                 let scoped = format!("{}.{}", hint, raw);
-                if self.signal_name_to_id.contains_key(scoped.as_str()) {
+                if self.signal_name_to_id.contains_key(scoped.as_str())
+                    || self.is_collection_store(&scoped)
+                {
                     return scoped;
                 }
             }
