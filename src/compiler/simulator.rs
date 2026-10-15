@@ -276,6 +276,18 @@ fn method_tier_threshold() -> u32 {
     })
 }
 
+/// class-perf loop-heat boost: the adaptive tier counter measures heat by
+/// *number of calls* (a method compiles after `HOT_CALLS`). That is blind to
+/// heat that lives in the *iterations of a single call* — a task or function
+/// invoked exactly once that owns a 5M-iteration `for` loop never graduates,
+/// so every iteration runs on the proven-but-slow AST interpreter. This
+/// boost treats a body whose STATEMENTS contain a loop as hot on first call
+/// (bypasses the counter) provided it is wait-free (see the tier gate). It
+/// is a GENERIC SystemVerilog rule — it predicates on loop statements, not
+/// on any UVM/library shape. Correctness is preserved: the boost only
+/// changes WHETHER compilation is *attempted*; if `BytecodeCompiler` cannot
+/// lower a plan the body runs on the AST interpreter exactly as before.
+
 /// Compiler salt for the persistent compiled-method cache (XEZIM_METHOD_CACHE).
 /// Bump on ANY change that can alter the compiled instructions or the
 /// admit/decline decision for the same source text — admission inputs,
@@ -56267,6 +56279,42 @@ impl Simulator {
     }
 
     /// Check if any statements contain blocking constructs (timing, events, wait).
+    /// class-perf loop-heat probe: does this statement tree contain a looping
+    /// statement (`for`/`while`/`do`/`foreach`/`repeat`/`forever`)? The
+    /// adaptive tier counter measures heat by *number of calls*; this is the
+    /// *iterations-of-one-call* heat signal that once-called loop-heavy bodies
+    /// (a UVM `run_phase` holding a 5M loop) expose. Structural only — cheap,
+    /// pure traversal, no per-iteration cost, generality independent of any
+    /// library.
+    fn body_has_loop(&self, stmts: &[Statement]) -> bool {
+        stmts.iter().any(|s| self.stmt_has_loop(s))
+    }
+    fn stmt_has_loop(&self, stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body } => true,
+            StatementKind::SeqBlock { stmts, .. } => stmts.iter().any(|s| self.stmt_has_loop(s)),
+            StatementKind::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                self.stmt_has_loop(then_stmt)
+                    || else_stmt.as_ref().is_some_and(|e| self.stmt_has_loop(e))
+            }
+            StatementKind::Case { items, .. } => {
+                items.iter().any(|it| self.stmt_has_loop(&it.stmt))
+            }
+            StatementKind::RandCase { items } => items.iter().any(|(_, s)| self.stmt_has_loop(s)),
+            StatementKind::ParBlock { stmts, .. } => stmts.iter().any(|s| self.stmt_has_loop(s)),
+            _ => false,
+        }
+    }
+
     fn stmts_have_blocking(&self, stmts: &[Statement]) -> bool {
         stmts.iter().any(|s| self.stmt_is_blocking(s))
     }
@@ -167817,8 +167865,17 @@ impl Simulator {
         // misses HM catch below is zero-cost); one that never crosses pays
         // the counter only while below the threshold, and the count is
         // keyed by u32 ids (the same key the block cache uses).
+        // LOOP-HEAT BOOST: a wait-free body whose statements contain a loop is
+        // treated as hot on its FIRST call — heat here lives in the *iterations*,
+        // not the call count. The wait-free probe is structural for functions and
+        // the precise suspension analysis for tasks (see below).
         let tier = method_tier_threshold();
-        if tier > 0 {
+        let boost_wait_free = match kind {
+            CompiledBodyKind::Task(t) => !self.method_body_can_suspend(cname, &t.ports, &t.items),
+            _ => !self.stmts_have_blocking(body),
+        };
+        let loop_hot = self.body_has_loop(body) && boost_wait_free;
+        if tier > 0 && !loop_hot {
             let calls = self
                 .compiled_method_call_counts
                 .entry((cid, mid, spec_id))
