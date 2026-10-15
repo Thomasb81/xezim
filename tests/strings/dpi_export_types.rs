@@ -212,3 +212,37 @@ fn exported_integral_returns_value_convert_a_real() {
         "{text}"
     );
 }
+
+/// #324 cousin: scalar `bit` DPI formals carry only their single meaningful
+/// bit (an svBit is a 1-bit value, not the low 8 bits of an i32 slot), on every
+/// direction (input lays bit 0 down, inout/out mask C's written byte to bit 0);
+/// and a real->longint conversion at the DPI boundary wraps modulo 2^64
+/// (two's complement) instead of saturating: real 2^63 -> INT64_MIN, 2^64 -> 0.
+#[test]
+fn scalar_bit_width_marshals_one_bit_and_wraps_longint() {
+    let (ok, text) = run("scalar_bit_width");
+    assert!(ok, "{text}");
+    // C `printf` (the B/L marshalling lines) flushes on exit, `$display`
+    // (IO/OUT) flushes immediately, so their relative order is not stable;
+    // assert each group separately.
+    let marshalled: Vec<String> = tagged(&text)
+        .into_iter()
+        .filter(|l| l.starts_with("T|B ") || l.starts_with("T|L "))
+        .map(|l| l.to_string())
+        .collect();
+    let wb: Vec<String> = tagged(&text)
+        .into_iter()
+        .filter(|l| l.starts_with("T|IO ") || l.starts_with("T|OUT "))
+        .map(|l| l.to_string())
+        .collect();
+    assert_eq!(
+        marshalled,
+        [
+            "T|B 0 0 1 0",          // bit(2)=0, bit(1.75)=0, bit(-0.5)=1, bit(300)=0
+            "T|L -9223372036854775808", // real 2^63 wraps to INT64_MIN
+            "T|L 0",                    // real 2^64 wraps to 0
+        ],
+        "{text}"
+    );
+    assert_eq!(wb, ["T|IO 1", "T|OUT 1"], "{text}");
+}

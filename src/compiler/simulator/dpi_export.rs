@@ -140,7 +140,7 @@ impl DpiCScalar {
                     if !f.is_finite() {
                         return 0;
                     }
-                    v = Value::from_u64(f.round() as i64 as u64, 64);
+                    v = Value::from_u64(dpi_round_real(f), 64);
                 }
                 v.to_u64().map_or(0, |u| u as i64)
             }
@@ -757,7 +757,7 @@ impl Simulator {
             // truncation toward zero nor a bit reinterpretation (#324).
             let f = v.to_f64();
             if f.is_finite() {
-                Value::from_u64(f.round() as i64 as u64, 64).resize(width)
+                Value::from_u64(dpi_round_real(f), 64).resize(width)
             } else {
                 Value::zero(width.max(1))
             }
