@@ -81,7 +81,7 @@
 
 **Open**
 - Apache 2.0 licensed, developed in the open
-- More than 3,200 regression tests, many checked against a commercial
+- More than 4,200 regression tests, many checked against a commercial
   reference simulator
 - Built with AI assistance as part of the engineering workflow
 
@@ -149,23 +149,22 @@ See the [user guide](docs/user-guide.md) and the
 ## Performance
 
 Whole-run wall-clock time on one machine (Intel Core i7-9800X, 6 cores,
-Linux): xezim 0.11 as a plain release build, against a commercial reference
-simulator in its optimized mode (no debug visibility). Both simulators produce
-the same results on every row.
+Linux): the current xezim main branch as a plain release build, against a
+commercial reference simulator in its optimized mode (no debug visibility).
+Both simulators produce the same results on every row.
 
-| Workload | xezim 0.11 | Reference simulator |
+| Workload | xezim | Reference simulator |
 |---|---|---|
-| XuanTie C906 SoC, CoreMark ×1 (295,294 cycles) | 91 s | 82 s, 44 s of it simulating |
-| XuanTie C910 dual-core SoC, memcpy ×200, cold start | 118 s, about 18 s of it compiling | 136 s, 97 s of it simulating |
-| AXI4 AVIP, UVM base test | 5.8 s | 97 s, 51 s of it simulating |
+| XuanTie C906 SoC, CoreMark ×1 (295,294 cycles) | 82 s, 0.65 GB peak | 82 s, 44 s of it simulating |
+| XuanTie C910 dual-core SoC, memcpy ×200, cold start | 106 s, about 10 s of it compiling | 136 s, 97 s of it simulating |
+| AXI4 AVIP, UVM base test | 7.0 s | 97 s, 51 s of it simulating |
 
 - **xezim starts fast.** Compiling and elaborating is a small part of a run,
   so short tests and suites of many runs favour xezim.
-- **On long runs the reference kernel is faster**, about 2× in the
+- **On long runs the reference kernel is faster**, about 1.8× in the
   simulation phase on the C906, and more on long UVM runs. Closing this gap
-  is where current work goes: since 0.11, host instructions are down 7% on
-  CoreMark and on the AXI4 AVIP and 11% on the C910 memcpy, and peak memory
-  on the C906 CoreMark run is down from 2.6 GB to 0.6 GB (see the
+  is where current work goes: since 0.11.1, CoreMark runs 8.6% fewer host
+  instructions and C910 compilation takes 20% less time (see the
   [release notes](NOTES.md)).
 
 To get the most out of a build, use the
@@ -182,7 +181,7 @@ with few, very hot blocks (Ibex CoreMark −23%), so measure it on yours.
 - **UVM:** the mbits-mirafra AVIP base tests for AXI4, APB, I3C, SPI and
   AXI4-Lite print the same UVM messages as a commercial reference simulator,
   and 32 of 35 UVM 1800.2-2017 example testbenches pass.
-- **Regression suite:** more than 3,200 tests, run in CI with and without the
+- **Regression suite:** more than 4,200 tests, run in CI with and without the
   JIT. Many are differential tests whose expected values were measured on a
   commercial reference simulator; see [CONTRIBUTING.md](CONTRIBUTING.md#test-suites).
 
@@ -223,7 +222,15 @@ The project was previously developed under the name `sisSIM`.
 
 ## Contributors
 
-See [CONTRIBUTORS.md](CONTRIBUTORS.md) for contributor credits and
+Thank you to everyone who has contributed code to xezim: Thomas Burg,
+Vrajesh Prakhya, Oscar Gustafsson, Chen Ben Haroosh, Jayaraman RP, Ganesh T S,
+eenky, Francesco Urbani, Taichi Ishitani and AaronKel.
+
+Detailed bug reports from AaronKel, bharathnaruto-spec, chenbhil, Dragon-Git,
+Ganesh-TNL, jjts, overcookedlobster, rharikrishna25, soronpo, taichi-ishitani
+and vrajeshprakhya have driven much of xezim's conformance work.
+
+See [CONTRIBUTORS.md](CONTRIBUTORS.md) for what each person contributed, and
 [CONTRIBUTING.md](CONTRIBUTING.md) to get involved.
 
 ## Acknowledgements

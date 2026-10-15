@@ -495,6 +495,8 @@ mod uninstantiated_module_params;
 mod virtual_array_names;
 #[path = "misc/while_continue_final_iter.rs"]
 mod while_continue_final_iter;
+#[path = "misc/x_propagation_assertions.rs"]
+mod x_propagation_assertions;
 #[path = "misc/zero_width_select_unselected_generate.rs"]
 mod zero_width_select_unselected_generate;
 #[path = "misc/let_declaration_scopes.rs"]

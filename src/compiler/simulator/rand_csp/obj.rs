@@ -135,6 +135,7 @@ impl Simulator {
                         return None;
                     }
                     out.push((p.clone(), sub));
+                    self.rand_csp_nested_subs(p, sub, handle, &mut seen, &mut out, 0)?;
                 }
             }
         }
@@ -143,6 +144,75 @@ impl Simulator {
             return None;
         }
         Some(out)
+    }
+
+    /// §18.5.9: the rand sub-objects of sub-object `sub` (member path
+    /// `prefix`), recursively, as `prefix.member`. A null member holds no
+    /// object; an array of handles, a shared object or a cycle keeps the
+    /// whole set out of the joint solve (None).
+    fn rand_csp_nested_subs(
+        &self,
+        prefix: &str,
+        sub: usize,
+        root: usize,
+        seen: &mut HashSet<usize>,
+        out: &mut Vec<(String, usize)>,
+        depth: u32,
+    ) -> Option<()> {
+        if depth > 8 {
+            return None;
+        }
+        let rand_disabled = self
+            .rand_mode_disabled
+            .get(&sub)
+            .cloned()
+            .unwrap_or_default();
+        let mut cur = self.heap.get(sub)?.as_ref().map(|i| i.class_name.clone());
+        let mut members: Vec<String> = Vec::new();
+        let mut hops = 0;
+        while let Some(cn) = cur {
+            hops += 1;
+            if hops > 64 {
+                break;
+            }
+            let cd = self.module.classes.get(&cn)?;
+            for m in self.randomize_members(cd, &rand_disabled) {
+                let Some(sig) = cd.properties.get(&m) else {
+                    continue;
+                };
+                let is_obj = sig
+                    .type_name
+                    .as_ref()
+                    .is_some_and(|tn| self.module.classes.contains_key(tn));
+                if !is_obj {
+                    continue;
+                }
+                if cd.array_properties.contains_key(&m)
+                    || cd.array_nd_properties.contains_key(&m)
+                    || cd.queue_properties.contains_key(&m)
+                    || cd.assoc_properties.contains_key(&m)
+                {
+                    return None;
+                }
+                if !members.contains(&m) {
+                    members.push(m);
+                }
+            }
+            cur = cd.extends.clone();
+        }
+        for m in members {
+            let h = self.member_handle(sub, &m).unwrap_or(0);
+            if h == 0 || self.heap.get(h).and_then(|o| o.as_ref()).is_none() {
+                continue;
+            }
+            if h == root || !seen.insert(h) {
+                return None;
+            }
+            let path = format!("{}.{}", prefix, m);
+            out.push((path.clone(), h));
+            self.rand_csp_nested_subs(&path, h, root, seen, out, depth + 1)?;
+        }
+        Some(())
     }
 
     /// Some constraint reads the size of the collection `prop`.

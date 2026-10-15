@@ -190,6 +190,9 @@ fn design_cache_key(
     // An elaboration with unobserved-port elision on leaves nets out, so it
     // must not serve a run that may observe them.
     hash.bytes(&[xezim_core::elaborate::port_elision_requested() as u8]);
+    // A run that downgraded driver conflicts to warnings must not serve one
+    // that reports them as errors.
+    hash.bytes(&[xezim_core::elaborate::relax_driver_conflicts() as u8]);
 
     // Invalidate after a local rebuild even when the package version did not
     // change, since the executable may contain elaboration fixes.

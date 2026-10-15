@@ -761,6 +761,10 @@ pub static ENV_VARS: &[(&str, &str)] = &[
     ),
     ("XEZIM_REG_DBG", "Debug: trace VM register allocation"),
     (
+        "XEZIM_RELAX_DRIVER_CONFLICTS",
+        "Elab: report conflicting variable drivers (§6.5, §9.2.2) as warnings, not errors (1 enables)",
+    ),
+    (
         "XEZIM_REPORT_STATS",
         "Print summary statistics at end of run",
     ),

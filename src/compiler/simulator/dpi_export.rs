@@ -205,7 +205,7 @@ pub(super) enum DpiCType {
 }
 
 impl DpiCType {
-    fn size_align(&self) -> (usize, usize) {
+    pub(super) fn size_align(&self) -> (usize, usize) {
         match self {
             DpiCType::Scalar(s) => (s.size(), s.size()),
             DpiCType::Vec { width, four } => {
@@ -764,7 +764,7 @@ impl Simulator {
     ///
     /// # Safety
     /// `p` points at a valid object of type `ty`.
-    unsafe fn dpi_load_leaves(
+    pub(super) unsafe fn dpi_load_leaves(
         ty: &DpiCType,
         p: *const u8,
         sfx: &str,
@@ -799,7 +799,7 @@ impl Simulator {
     ///
     /// # Safety
     /// `p` points at a valid, writable object of type `ty`.
-    unsafe fn dpi_store_leaves(
+    pub(super) unsafe fn dpi_store_leaves(
         ty: &DpiCType,
         p: *mut u8,
         sfx: &str,

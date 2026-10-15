@@ -52,6 +52,7 @@ how to use them together, see the [user guide](user-guide.md).
 | `--xtrace <file>` | Emit an XTrace v1.0 dump (`.zst`/`.zstd` ⇒ zstd-compressed) |
 | `--xtrace-scope <hier>` | Restrict the XTrace dump to signals under `<hier>` (repeatable) |
 | `--relax-implicit-static` | Accept `int x = ...;` inside a static task/function (§6.21) with a warning instead of an error — for third-party sources you cannot edit |
+| `--relax-driver-conflicts` | Report a variable with conflicting drivers — two continuous assigns, a continuous assign plus procedural writes, or an `always_comb`/`always_latch`/`always_ff` variable also written by another process (§6.5, §9.2.2) — as a warning instead of an error, so existing designs (e.g. an `initial` block that initializes an `always_ff` register) still run |
 | `--error-exit` | Exit nonzero if any `$error` was reported (`$fatal` always does) |
 | `--code-coverage[=<kinds>]` | Collect code coverage: `stmt`, `branch`, `toggle` (comma-separated) or `all` (the default). Results go to `xezim_cov.json` next to the functional coverage; `--verbose` adds a per-instance summary. See the [coverage guide](coverage-guide.md#code-coverage) |
 | `--code-coverage-scope=<path>[,<path>...]` | Only cover these instance subtrees (`tb.dut`) and packages (repeatable) |
@@ -88,6 +89,7 @@ unless noted.
 | `XEZIM_NO_CACHE=1` | Disable the automatic elaborated-design cache |
 | `XEZIM_COMPILE_PHASES=1` | Report detailed simulator compilation phase timings |
 | `XEZIM_ALLOW_IMPLICIT_STATIC=1` | Same as `--relax-implicit-static` |
+| `XEZIM_RELAX_DRIVER_CONFLICTS=1` | Same as `--relax-driver-conflicts` |
 | `XEZIM_PROFILE_REPORT=1` | Same as `--profile` |
 | `XEZIM_VERBOSE=1` | Same as `--verbose` (for scripts that grep `[PHASE]`/`[PROF]` lines without adding a flag) |
 | `XEZIM_CODE_COVERAGE=<kinds>` | Same as `--code-coverage=<kinds>`; the flag wins |

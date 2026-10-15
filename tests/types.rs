@@ -456,3 +456,9 @@ mod zero_width_select_confidence;
 mod array_query_packed_decl_type;
 #[path = "types/package_type_name_collision.rs"]
 mod package_type_name_collision;
+#[path = "types/package_value_name_collision.rs"]
+mod package_value_name_collision;
+#[path = "types/class_type_name_collision.rs"]
+mod class_type_name_collision;
+#[path = "types/wide_equality.rs"]
+mod wide_equality;

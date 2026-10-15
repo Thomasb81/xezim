@@ -591,7 +591,7 @@ fn test_sim_dff_posedge() {
         "
         module test;
             logic clk, d, q;
-            always_ff @(posedge clk) q <= d;
+            always @(posedge clk) q <= d;
             initial begin
                 clk = 0; d = 1; q = 0;
                 #5 clk = 1;  // posedge: q captures d=1
@@ -612,7 +612,7 @@ fn test_sim_dff_with_reset() {
         module test;
             logic clk, rst_n;
             logic [7:0] q;
-            always_ff @(posedge clk or negedge rst_n) begin
+            always @(posedge clk or negedge rst_n) begin
                 if (!rst_n) q <= 0;
                 else q <= q + 1;
             end
@@ -639,7 +639,7 @@ fn test_sim_counter_posedge() {
         module test;
             logic clk;
             logic [3:0] count;
-            always_ff @(posedge clk) count <= count + 1;
+            always @(posedge clk) count <= count + 1;
             initial begin
                 clk = 0; count = 0;
                 #5 clk = 1; #5 clk = 0;
@@ -664,7 +664,7 @@ fn test_sim_nba_deferred() {
         module test;
             logic clk;
             logic [7:0] a, b;
-            always_ff @(posedge clk) begin
+            always @(posedge clk) begin
                 a <= b;
                 b <= a;
             end
@@ -691,7 +691,7 @@ fn test_sim_blocking_vs_nonblocking() {
         module test;
             logic clk;
             logic [7:0] x, y;
-            always_ff @(posedge clk) begin
+            always @(posedge clk) begin
                 x <= x + 1;
                 y <= x;  // y gets OLD x (non-blocking)
             end
@@ -718,7 +718,7 @@ fn test_sim_clock_forever() {
         module test;
             logic clk;
             logic [3:0] count;
-            always_ff @(posedge clk) count <= count + 1;
+            always @(posedge clk) count <= count + 1;
             initial begin
                 clk = 0; count = 0;
                 forever #5 clk = ~clk;
@@ -742,7 +742,7 @@ fn test_sim_shift_register() {
         module test;
             logic clk, din;
             logic [3:0] sr;
-            always_ff @(posedge clk) sr <= {sr[2:0], din};
+            always @(posedge clk) sr <= {sr[2:0], din};
             initial begin
                 clk = 0; din = 1; sr = 4'b0000;
                 #5 clk = 1; #5 clk = 0; // sr=0001
@@ -768,7 +768,7 @@ fn test_sim_negedge() {
         module test;
             logic clk;
             logic [3:0] count;
-            always_ff @(negedge clk) count <= count + 1;
+            always @(negedge clk) count <= count + 1;
             initial begin
                 clk = 1; count = 0;
                 #5 clk = 0;  // negedge

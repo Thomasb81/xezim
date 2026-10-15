@@ -454,3 +454,84 @@ fn vpi_timed_and_synch_callbacks() {
         log
     );
 }
+
+#[test]
+fn dpi_issue_306_logic_x_z_and_enum_prototype_test() {
+    // §35.5.6.1 and §35.5.5 (issue #306, reported by rharikrishna25): C
+    // writing or returning sv_x / sv_z reached SV as 1 / 0, and an import
+    // whose prototype uses an enum type was left unbound.
+    assert_dpi_pass(
+        "tests/dpi/issue_306_logic_enum.c",
+        "issue_306_logic_enum",
+        "tests/dpi/issue_306_logic_enum_test.sv",
+    );
+}
+
+#[test]
+fn dpi_issue_306_svlogic_shapes_test() {
+    // §35.5.6.1 / Annex H (issue #306 neighbours): x and z through scalar
+    // logic outputs, results, inouts, implicit formals and task outputs, and
+    // through svLogicVecVal outputs, inouts and inputs.
+    assert_dpi_pass(
+        "tests/dpi/issue_306_svlogic_shapes.c",
+        "issue_306_svlogic_shapes",
+        "tests/dpi/issue_306_svlogic_shapes_test.sv",
+    );
+}
+
+#[test]
+fn dpi_issue_306_enum_shapes_test() {
+    // §35.5.6 (issue #306 neighbours): enums with int, byte, logic,
+    // bit [7:0] and logic [3:0] base types and a package enum, as arguments,
+    // outputs, inouts and results.
+    assert_dpi_pass(
+        "tests/dpi/issue_306_enum_shapes.c",
+        "issue_306_enum_shapes",
+        "tests/dpi/issue_306_enum_shapes_test.sv",
+    );
+}
+
+#[test]
+fn dpi_audit_scalar_arrays_test() {
+    // §35.5.6.1 / H.7.4 (DPI audit, family A): unpacked arrays of scalar
+    // bit / logic hold one svBit / svLogic byte per element.
+    assert_dpi_pass(
+        "tests/dpi/dpi_audit_scalar_arrays.c",
+        "dpi_audit_scalar_arrays",
+        "tests/dpi/dpi_audit_scalar_arrays_test.sv",
+    );
+}
+
+#[test]
+fn dpi_audit_array_elems_test() {
+    // §35.5.6.1 / H.7 / §10.9.1 (DPI audit, family C): canonical elements of
+    // enum, packed-struct, integer, time and implicit-vector array formals,
+    // and assignment-pattern actuals.
+    assert_dpi_pass(
+        "tests/dpi/dpi_audit_array_elems.c",
+        "dpi_audit_array_elems",
+        "tests/dpi/dpi_audit_array_elems_test.sv",
+    );
+}
+
+#[test]
+fn dpi_audit_binding_test() {
+    // §13.5.4 / §35.5.3 (DPI audit, family E): named and default actuals of
+    // import calls, and the scope a context import runs in.
+    assert_dpi_pass(
+        "tests/dpi/dpi_audit_binding.c",
+        "dpi_audit_binding",
+        "tests/dpi/dpi_audit_binding_test.sv",
+    );
+}
+
+#[test]
+fn dpi_audit_types_test() {
+    // §35.5.6 / H.7 (DPI audit, family B): integer / time formals are
+    // svLogicVecVal*, unpacked structs pass as C structs.
+    assert_dpi_pass(
+        "tests/dpi/dpi_audit_types.c",
+        "dpi_audit_types",
+        "tests/dpi/dpi_audit_types_test.sv",
+    );
+}

@@ -74,7 +74,8 @@ module check_top;
         if (node0.power_o  !== 1'b1) failures++;
         if (node0.and_o    !== 1'bz) failures++;
         if (node0.or_o     !== 1'bz) failures++;
-        if (node0.stored_o !== 1'bx) failures++;
+        // §6.6.4: a trireg nothing drives is high-impedance (reference).
+        if (node0.stored_o !== 1'bz) failures++;
         if (node0.low_i    !== 1'b0) failures++;
         if (node0.high_i   !== 1'b1) failures++;
     end

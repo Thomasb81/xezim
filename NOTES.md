@@ -242,8 +242,121 @@ in [docs/user-guide.md](docs/user-guide.md); building and contributing are in
   function now runs. A task that reaches a wait only through a call cycle
   (`a` calls `b`, `b` calls `a`, and `a` waits) suspends its caller again.
   (from PR #265 by Thomas Burg, with follow-ups)
+* `randomize() with { ... }` and `std::randomize() with { ... }` inside a
+  module instance constrain the instance's own variables. A fixed array was
+  left unconstrained, a dynamic array's `size()` read as 0, and a variable of
+  the same name in the top module was randomized instead (§18.7). Array-method
+  `with (...)` clauses and `matches` inside instances work too. (#303, #304,
+  #305, reported by Ganesh-TNL)
+* `std::randomize()` no longer runs out of its budget when an array `sum()`
+  must land in a window around a random centre built with a cast, written as
+  `inside {[lo:hi]}` or as a `>=`/`<=` pair. (#302, reported by Ganesh-TNL)
+* Package functions, tasks, parameters, variables and `let`s declared in more
+  than one package resolve by the §26.3 and §26.6 rules, through imports,
+  re-exports and package bodies; same-named package covergroups no longer
+  collide, a package `let` is visible through a wildcard import, and static
+  members of same-named classes in different packages start at their own
+  initializers.
+* `randomize()` solves `dist` and `inside` over members wider than 64 bits.
+* Unpacked arrays of class handles and class-handle struct members start
+  null, 4-state static class properties without an initializer start x, the
+  default of a missing associative-array key covers packed structs, and
+  `$cast` to an enum fails for a source with x or z bits.
+* Nets driven through overlapping bit and part selects resolve every driver
+  bit by bit, so edges on those bits are counted from the resolved value
+  (§6.6.1). `bufif` gates drive x for z data and L/H for an unknown enable,
+  and drive strengths resolve by level: supply over strong over pull over
+  weak (§28.7, §28.12).
+* 2-state array elements and 2-state casts store x and z as 0, and arrays
+  declared inside procedural blocks hold their declared element type.
+* Conflicting variable drivers are compile errors, checked per written bit
+  (§6.5, §9.2.2.2, §9.2.2.4): two continuous assigns, a continuous assign plus
+  a procedural write, and an `always_comb`, `always_latch` or `always_ff`
+  variable written by another process. `--relax-driver-conflicts` (or
+  `XEZIM_RELAX_DRIVER_CONFLICTS=1`) reports them as warnings instead.
+  Designs that write an `always_ff` variable from an `initial` block now need
+  that switch.
+* A vector with a `force` on one bit keeps an edge alias per bit, so the
+  forced bit's edges are not shared with the other bits of a replicate.
+* DPI-C: a C function writing or returning `sv_x` or `sv_z` through a
+  `logic` output, inout or result reaches SV as x or z, and an import whose
+  prototype uses an enum type binds and passes the enum's base type
+  (§35.5.5, §35.5.6.1). (#306, reported by rharikrishna25)
+* DPI-C: `integer` and `time` formals are passed as `svLogicVecVal*` (C code
+  reading them crashed), unpacked struct formals are passed as C structs,
+  arrays of scalar `bit` and `logic` hold one `svBit`/`svLogic` per element,
+  array formals of enum, packed-struct, `integer` and `time` types bind, an
+  assignment-pattern actual passes every element, named and default
+  arguments on import calls bind, and `svGetScope` in a context import
+  declared in a package, interface or generate block names the declaring
+  scope (§35.5.3, §35.5.6, §13.5.4, Annex H).
+* A typedef, enum or nested class declared in one class no longer replaces a
+  same-named declaration in another class, a package or `$unit` (§8.3,
+  §6.18). (#307, reported by Ganesh-TNL)
+* `$bits` of a class typedef sized by a class parameter follows the object's
+  parameter values. `pkg::C#(..)::static` reads that specialization's value,
+  and `pkg::P` in a module instance's continuous assignment reads the
+  package's parameter (§8.25, §26.3).
+* `randomize()` solves constraints through sub-objects of sub-objects, on wide
+  fields of `rand` unpacked struct members, on `x == f(y, z)` over wide
+  values, and on `std::randomize` locals wider than 64 bits. A wide `dist`
+  honours its weights (§18.4, §18.5.4, §18.12).
+* `==` and `!=` on values wider than 64 bits compare every bit (§11.4.5).
+* Package-scope initializers of unpacked structs and associative arrays,
+  including associative arrays of structs, run once before any initial
+  block, as module-scope ones do (§6.8, §7.9.11). (#309, reported by
+  Ganesh-TNL)
+* A struct member that is a queue, dynamic array or associative array behaves
+  as a collection wherever the struct lives: a variable, a nested struct, an
+  element of any array (`aa[k].q.push_back(v)`, `foreach (aa[k].q[i])`), or a
+  class property. Assignment patterns replace such members, and copies, `==`,
+  `%p`, subroutine formals and struct return values carry them by value
+  (§7.2.1, §7.10). (#310, #311, reported by Ganesh-TNL)
+* An assignment pattern written to an unpacked-struct class property assigns
+  its members (§10.9.2).
+* A class typedef of a type parameter (`typedef T payload_t;`) follows each
+  specialization in members, locals, return types, `$bits`, casts,
+  `randomize()`, derived classes and `C#(args)::name`, including packed and
+  unpacked array typedefs (§8.25, §6.18). `T'(v)` casts to the bound type,
+  `T [1:0]` sizes by it, and `$bits(obj.arr)` sizes the whole array member.
+  `obj.m = new` for a `self_t` or `G#(T)` member, packed structs with
+  type-parameter members and nested classes using the enclosing class's
+  parameters follow the object's specialization too (§8.23).
+* Values stored into queues and dynamic arrays (`push_back`, `push_front`,
+  `insert`, indexed writes, `q = {q, v}`) are converted to the element type in
+  every scope, and concatenation onto class queue members works (§7.10.2,
+  §10.10).
+* Compiled class methods: element selects and stores on multi-dimensional
+  packed members give the right bits, collection returns and typedef-alias
+  reads of static collections resolve per specialization, `Class::m()` inside
+  a class or subclass calls `m` on the implicit `this` (§8.23) while the same
+  call from outside a class is an error (§8.10), and typedef'd local queues
+  behave as queues (from PR #308 by Thomas Burg).
+* Missing collection elements read their element type's default: class and
+  module queues read past the end, missing associative-array keys (including
+  multidimensional class members) and members of missing struct elements
+  (§7.8.6, §7.10.1). Class associative-array properties accept assignment
+  patterns with keys and `default:` (§7.9.11).
+* Static unpacked-struct class properties are one shared store (§8.9);
+  functions returning unpacked structs start each member at its default
+  (§13.4.1); packed structs mixing 2-state and 4-state members start all x
+  and keep their 2-state members at 0 or 1 (§7.2.1). `%p` prints struct
+  members holding fixed arrays as nested lists and null handles as `null`
+  (§21.2.1.7).
+* Initial blocks of instantiated programs run in the reactive region (§24.3).
+* `force` of one bit of a vector driven by a part-select assign holds
+  (§10.6.2). Pulls and gates on one bit of a strength-driven vector resolve by
+  strength, `%v` prints the resolved strength, including ranges and L/H, and an
+  undriven trireg reads z (§28.12, §21.2.1.5). An output-port connection beside
+  another continuous driver of the same variable is a driver conflict (§6.5).
 
 **Performance**
+
+* Measured against 0.11.1 on the README workloads (cold cache, plain release
+  build): C906 CoreMark ×1 runs 8.6% fewer host instructions (376.7 G against
+  412.0 G, 82 s); the C910 memcpy ×200 compiles 20% faster (9.1 s against
+  11.3 s, 106 s whole run); the AXI4 AVIP runs about 5% more cycles (7.0 s),
+  the cost of this release's correctness fixes.
 
 * More class methods and package functions run as bytecode: those that read
   a member off an element of a class-handle collection (`m[k].val`,

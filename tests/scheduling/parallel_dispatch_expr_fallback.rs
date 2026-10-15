@@ -48,7 +48,8 @@ module tb;
   function automatic logic [31:0] mixm(input logic [31:0] x);
     return x + mode;
   endfunction
-  always_ff @(posedge clk) fb_r <= mixm(fb_r) ^ 32'h5;
+  // Plain `always`: the `initial` below also writes fb_r (§9.2.2.4).
+  always @(posedge clk) fb_r <= mixm(fb_r) ^ 32'h5;
 
   genvar g;
   logic [31:0] accs [192];

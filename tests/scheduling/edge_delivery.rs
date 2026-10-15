@@ -268,10 +268,12 @@ fn settle_limit_warning_names_the_oscillating_signals() {
     std::fs::create_dir_all(&dir).expect("mkdir");
     let sv = dir.join("settle_ring.sv");
     // A zero-delay combinational oscillator: a -> b -> a with an inverter.
-    // The always_comb blocks sit on lines 3 and 4 of the file.
+    // The always_comb blocks sit on lines 3 and 4 of the file. The ring starts
+    // from a known 0 and is released by `go` at time 0: an `initial` write to
+    // an always_comb variable itself is illegal (IEEE 1800-2017 §9.2.2.2).
     std::fs::write(
         &sv,
-        "module t;\n  logic a, b;\n  always_comb a = ~b;\n  always_comb b = a;\n  initial begin a = 0; #10 $finish; end\nendmodule\n",
+        "module t;\n  logic a, b, go;\n  always_comb a = go === 1'b1 ? ~b : 1'b0;\n  always_comb b = a;\n  initial begin go = 1; #10 $finish; end\nendmodule\n",
     )
     .expect("write sv");
     let out = Command::new(xezim_bin())

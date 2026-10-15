@@ -37,6 +37,8 @@ mod fst_time_table_breakeven;
 mod interrupt_finalizes_dumps;
 #[path = "gates/interrupt_fst_tail.rs"]
 mod interrupt_fst_tail;
+#[path = "gates/multi_driver_contention.rs"]
+mod multi_driver_contention;
 #[path = "gates/nameless_udp_instance.rs"]
 mod nameless_udp_instance;
 #[path = "gates/net_declaration_delay.rs"]

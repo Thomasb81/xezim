@@ -41,6 +41,10 @@ mod compiled_method_static_locals;
 mod class_param_default_scope;
 #[path = "classes/class_property_x_default.rs"]
 mod class_property_x_default;
+#[path = "classes/x_default_neighbours.rs"]
+mod x_default_neighbours;
+#[path = "classes/x_default_open.rs"]
+mod x_default_open;
 #[path = "classes/class_queue_struct_member_arrays.rs"]
 mod class_queue_struct_member_arrays;
 #[path = "classes/class_struct_collection_elements.rs"]
@@ -362,8 +366,16 @@ mod randomize_foreach_accept;
 mod randomize_issues_295_297;
 #[path = "classes/randomize_issues_298_299.rs"]
 mod randomize_issues_298_299;
+#[path = "classes/randomize_issue_302.rs"]
+mod randomize_issue_302;
+#[path = "classes/randomize_issues_303_305.rs"]
+mod randomize_issues_303_305;
 #[path = "classes/randomize_issue_301_wide2d.rs"]
 mod randomize_issue_301_wide2d;
+#[path = "classes/randomize_wide_sets.rs"]
+mod randomize_wide_sets;
+#[path = "classes/randomize_wide_open.rs"]
+mod randomize_wide_open;
 #[path = "classes/randomize_shift_mask_wide_peer.rs"]
 mod randomize_shift_mask_wide_peer;
 #[path = "classes/randomize_inside_range.rs"]
@@ -547,6 +559,8 @@ mod class_randomize_multidim;
 mod cls_agg_members_in_struct;
 #[path = "classes/cls_agg_members_matrix.rs"]
 mod cls_agg_members_matrix;
+#[path = "classes/class_scope_call_implicit_this.rs"]
+mod class_scope_call_implicit_this;
 #[path = "classes/compiled_task_suspension_analysis.rs"]
 mod compiled_task_suspension_analysis;
 #[path = "classes/compiled_method_admission_regression.rs"]
@@ -707,3 +721,6 @@ mod class_packed_elem_store;
 
 #[path = "classes/nonstatic_method_class_scope_fatal.rs"]
 mod nonstatic_method_class_scope_fatal;
+
+#[path = "classes/struct_class_prop_patterns.rs"]
+mod struct_class_prop_patterns;

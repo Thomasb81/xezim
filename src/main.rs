@@ -220,7 +220,12 @@ fn print_usage() {
         "  --error-exit     Exit nonzero if any $error was reported ($fatal always does)
   --relax-implicit-static  Accept `int x = ...;` inside a static subroutine
                    (§6.21) with a warning instead of an error. Also enabled by
-                   XEZIM_ALLOW_IMPLICIT_STATIC=1."
+                   XEZIM_ALLOW_IMPLICIT_STATIC=1.
+  --relax-driver-conflicts  Report a variable written by conflicting drivers
+                   (two continuous assigns, continuous plus procedural writes,
+                   an always_comb/always_latch/always_ff variable written by
+                   another process; §6.5, §9.2.2) as a warning instead of an
+                   error. Also enabled by XEZIM_RELAX_DRIVER_CONFLICTS=1."
     );
     eprintln!("  --code-coverage[=<kinds>]  Collect code coverage: <kinds> is a comma list of");
     eprintln!("                   stmt, branch, toggle (or all, the default). Counts go to");
@@ -1028,6 +1033,9 @@ fn process_command_file(
                 }
                 "--no-strict-top" => {
                     xezim::set_strict_top(false);
+                }
+                "--relax-driver-conflicts" => {
+                    xezim_core::elaborate::set_relax_driver_conflicts(true);
                 }
                 _ if t.starts_with("+define+") => {
                     push_plus_define(t, defines);
@@ -2173,6 +2181,14 @@ fn run_main() -> i32 {
             // forward that is not "edit a vendor's source tree".
             "--relax-implicit-static" => {
                 xezim_core::elaborate::set_relax_implicit_static(true);
+            }
+            // §6.5/§9.2.2: downgrade a conflicting variable driver (two
+            // continuous assigns, continuous plus procedural, an always_comb/
+            // always_latch/always_ff variable written by another process) to
+            // a warning, for existing designs written against tools that
+            // accept them.
+            "--relax-driver-conflicts" => {
+                xezim_core::elaborate::set_relax_driver_conflicts(true);
             }
             // The end-of-run [PROF] report (edge-block, settle and timing
             // counters). Every reader consults the environment switch, so

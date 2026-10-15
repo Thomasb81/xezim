@@ -19,6 +19,8 @@ mod nba_region_waiter_order;
 mod property_wait_shapes;
 #[path = "scheduling/replicated_clock_edges.rs"]
 mod replicated_clock_edges;
+#[path = "scheduling/replicated_edges_forced.rs"]
+mod replicated_edges_forced;
 
 #[path = "scheduling/active_region_fifo.rs"]
 mod active_region_fifo;

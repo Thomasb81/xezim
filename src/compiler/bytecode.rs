@@ -1730,6 +1730,11 @@ pub struct BytecodeCompiler<'a> {
     /// array — `arr[j][2]` must select the packed ELEMENT (ew-bit slice),
     /// not one bit of the loaded element.
     pub coll_elem_packed_dims: HashMap<String, Vec<(i64, i64)>>,
+    /// Unpacked dims of the typedefs this body's locals are declared with
+    /// (`typedef int q_t[$]; q_t q;`), keyed by the type's source spelling
+    /// (`p::q_t`). The declarator itself carries no dims, so without this a
+    /// typedef'd collection local lowered as a scalar register.
+    pub typedef_coll_dims: HashMap<String, Vec<crate::ast::types::UnpackedDimension>>,
     /// class-perf Step 9c: names whose `$cast` destination may take the
     /// register route — formals, the result cell, and TOP-LEVEL body
     /// locals. A nested-block local is register-backed too, but its
@@ -2024,6 +2029,7 @@ impl<'a> BytecodeCompiler<'a> {
             static_coll_member_names: HashSet::default(),
             coll_elem_member_names: HashSet::default(),
             coll_elem_packed_dims: HashMap::default(),
+            typedef_coll_dims: HashMap::default(),
             cast_reg_ok_locals: HashSet::default(),
             method_ret_jumps: Vec::new(),
             decl_local_regs: std::collections::HashSet::default(),
@@ -5027,8 +5033,9 @@ impl<'a> BytecodeCompiler<'a> {
                 while let Some(c) = cur
                     && guard < 128
                 {
-                    if let Some(pos) =
-                        admission.writeback_positions.get(&(c.to_string(), method.to_string()))
+                    if let Some(pos) = admission
+                        .writeback_positions
+                        .get(&(c.to_string(), method.to_string()))
                     {
                         acc.extend(pos.iter().copied());
                     }
@@ -5559,10 +5566,7 @@ impl<'a> BytecodeCompiler<'a> {
     /// ELEMENT width, when `root` admits to the member element read and the
     /// plan carries multi-dim packed dims for the member. Feeds
     /// `expr_max_width` (self-determined compare/shift contexts).
-    fn member_coll_elem_index_width(
-        &self,
-        root: &crate::ast::expr::Expression,
-    ) -> Option<u32> {
+    fn member_coll_elem_index_width(&self, root: &crate::ast::expr::Expression) -> Option<u32> {
         let (coll, ..) = self.member_coll_elem_target(root)?;
         let dims = self.coll_elem_packed_dims.get(&coll)?;
         if dims.len() != 2 {
@@ -9223,6 +9227,18 @@ impl<'a> BytecodeCompiler<'a> {
         if let Some(v) = params.get(raw) {
             return Some(v.clone());
         }
+        // §26.3: `pkg::P` (a two-segment path) is the package's own
+        // parameter, keyed `pkg::P`; the suffix match below would take any
+        // bare `P` — another package's, imported here.
+        if hier.root.is_none()
+            && hier.path.len() == 2
+            && hier.path.iter().all(|s| s.selects.is_empty())
+        {
+            let q = format!("{}::{}", hier.path[0].name.name, hier.path[1].name.name);
+            if let Some(v) = params.get(q.as_str()) {
+                return Some(v.clone());
+            }
+        }
         if let Some(scope) = &self.scope_hint {
             if let Some(v) = with_dotted(scope, raw, |k| params.get(k).cloned()) {
                 return Some(v);
@@ -10578,6 +10594,39 @@ impl<'a> BytecodeCompiler<'a> {
                 declarators,
             } => {
                 for decl in declarators {
+                    // §6.18: a local declared through a typedef that carries
+                    // unpacked dims is a collection too. A queue / unsized
+                    // array without an initializer takes the local-collection
+                    // path below; any other shape stays on the AST path.
+                    if decl.dimensions.is_empty()
+                        && let crate::ast::types::DataType::TypeReference { name: tn, .. } =
+                            data_type
+                        && let Some(dims) = self.typedef_coll_dims.get(&type_name_key(tn))
+                    {
+                        use crate::ast::types::UnpackedDimension as UD;
+                        if self.method_mode
+                            && decl.init.is_none()
+                            && dims.len() == 1
+                            && matches!(dims[0], UD::Queue { .. } | UD::Unsized(_))
+                        {
+                            let synth = Statement::new(
+                                StatementKind::VarDecl {
+                                    data_type: data_type.clone(),
+                                    lifetime: lifetime.clone(),
+                                    declarators: vec![decl.clone()],
+                                },
+                                stmt.span,
+                            );
+                            self.emit(Insn::InitLocalColl(Box::new((
+                                Arc::new(synth),
+                                Arc::from("VarDecl_local_coll"),
+                            ))));
+                            self.local_coll_names.insert(decl.name.name.clone());
+                            continue;
+                        }
+                        self.bail("VarDecl_typedef_array");
+                        return false;
+                    }
                     if !decl.dimensions.is_empty() {
                         // class-perf row 3: a LOCAL queue / dynamic array
                         // (single queue / unsized unpacked dimension, no
@@ -13967,6 +14016,12 @@ impl<'a> BytecodeCompiler<'a> {
                         return Some(r);
                     }
                     self.emit(Insn::Resize(r, w));
+                    // §6.24.1: the cast value is what a variable of the
+                    // target type holds, so a 2-state target (`int'`,
+                    // `bit [7:0]'`) maps x/z bits to 0.
+                    if crate::compiler::elaborate::is_type_two_state(&dt) {
+                        self.emit(Insn::DropXz(r));
+                    }
                     if crate::compiler::elaborate::is_type_signed(&dt) {
                         self.emit(Insn::SetSigned(r));
                     } else {
@@ -14414,7 +14469,11 @@ impl<'a> BytecodeCompiler<'a> {
                             arg_start,
                             n,
                         ));
-                        self.emit_arg_slot_writeback(args, arg_start, Some((parent.as_str(), member.name.as_str())))?;
+                        self.emit_arg_slot_writeback(
+                            args,
+                            arg_start,
+                            Some((parent.as_str(), member.name.as_str())),
+                        )?;
                         return Some(dest);
                     }
                     self.truncate_insns(call_start);
@@ -14634,7 +14693,9 @@ impl<'a> BytecodeCompiler<'a> {
                         self.emit_arg_slot_writeback(
                             args,
                             arg_start,
-                            this_cls.as_deref().map(|c| (c, h.path[0].name.name.as_str())),
+                            this_cls
+                                .as_deref()
+                                .map(|c| (c, h.path[0].name.name.as_str())),
                         )?;
                         return Some(dest);
                     }
@@ -25992,9 +26053,22 @@ pub fn lower_two_state(
         .collect();
     let mut writes: Vec<u32> = Vec::new();
     let mut writes_span: Vec<(u32, u32)> = Vec::new();
+    // §10.6.2: every store kind names its destination here — a block whose
+    // write a force drops must leave the two-state executor, and a store
+    // left out (a part-select `RangeStore`) kept writing a forced net.
     for i in out.iter() {
         match i {
-            TsInsn::Store { sig, .. }
+            TsInsn::LogAndStore { sig, .. }
+            | TsInsn::AndRangeStore { sig, .. }
+            | TsInsn::LogOrStore { sig, .. }
+            | TsInsn::OrRangeStore { sig, .. }
+            | TsInsn::BitStoreDyn { sig, .. }
+            | TsInsn::ConstStoreX { sig, .. }
+            | TsInsn::ConstStoreNba { sig, .. }
+            | TsInsn::RangeStore { sig, .. }
+            | TsInsn::RangeStoreNba { sig, .. }
+            | TsInsn::RangeStoreW { sig, .. }
+            | TsInsn::Store { sig, .. }
             | TsInsn::StoreNba { sig, .. }
             | TsInsn::BitStoreNbaDyn { sig, .. }
             | TsInsn::RangeStoreDyn { sig, .. }
@@ -26007,6 +26081,7 @@ pub fn lower_two_state(
             | TsInsn::WRangeStoreNba { sig, .. }
             | TsInsn::WStore { sig, .. }
             | TsInsn::WStoreNba { sig, .. } => writes.push(*sig),
+            TsInsn::RangeStoreX(p) | TsInsn::RangeStoreXW(p) => writes.push(p.sig),
             TsInsn::NbaFromElem(op) | TsInsn::WNbaFromElem(op) => writes.push(op.dst),
             TsInsn::ElemStoreNbaFromSig(f) => {
                 let op = &f.op;
@@ -26167,4 +26242,16 @@ pub(crate) fn system_function_result(name: &str) -> Option<(u32, bool)> {
 /// System functions whose result has the TYPE of their first argument.
 pub(crate) fn system_function_carries_arg(name: &str) -> bool {
     matches!(name, "$signed" | "$unsigned" | "$past" | "$sampled")
+}
+
+/// Source spelling of a type name, `::`-joined (`p::q_t`), the key of
+/// `BytecodeCompiler::typedef_coll_dims`.
+pub(crate) fn type_name_key(tn: &crate::ast::types::TypeName) -> String {
+    let mut k = String::new();
+    for sc in &tn.scopes {
+        k.push_str(&sc.name.name);
+        k.push_str("::");
+    }
+    k.push_str(&tn.name.name);
+    k
 }

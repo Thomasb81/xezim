@@ -1738,3 +1738,272 @@ impl Simulator {
         }
     }
 }
+
+impl Simulator {
+    /// §18.7: an unqualified name in `obj.randomize() with { … }` binds in
+    /// the object's class scope first. Inside a module instance the
+    /// elaborator has already rewritten the block's names that the INSTANCE
+    /// declares to their instance-scoped storage names (`u1.x`, a single
+    /// dotted segment), as for every other operand of the instance. Where the
+    /// object's class also declares the leaf, the object hides the instance's
+    /// object: restore the plain leaf so it binds to the member. Returns None
+    /// when no name needs it (the original items are used).
+    pub(super) fn unscope_object_member_names(
+        &self,
+        handle: usize,
+        items: &[ConstraintItem],
+    ) -> Option<Vec<ConstraintItem>> {
+        let class = self.heap.get(handle)?.as_ref()?.class_name.clone();
+        let hides = |name: &str| -> Option<String> {
+            let (_, leaf) = name.rsplit_once('.')?;
+            self.class_chain_declares(Some(&class), leaf)
+                .then(|| leaf.to_string())
+        };
+        let mut any = false;
+        let mut probe = |n: &str| any |= n.contains('.') && hides(n).is_some();
+        for it in items {
+            Self::visit_constraint_root_names(it, &mut probe);
+        }
+        if !any {
+            return None;
+        }
+        let mut scan = items.to_vec();
+        let mut fix = |id: &mut crate::ast::Identifier| {
+            if let Some(leaf) = hides(&id.name) {
+                id.name = leaf;
+            }
+        };
+        for it in &mut scan {
+            Self::for_each_constraint_root_name(it, &mut fix);
+        }
+        Some(scan)
+    }
+
+    /// Read-only twin of [`Self::for_each_constraint_root_name`].
+    fn visit_constraint_root_names(it: &ConstraintItem, f: &mut dyn FnMut(&str)) {
+        let mut fx = |e: &Expression| Self::visit_expr_root_names(e, f);
+        match it {
+            ConstraintItem::Expr(e) => fx(e),
+            ConstraintItem::Inside {
+                expr,
+                range,
+                dist_weights,
+                ..
+            } => {
+                fx(expr);
+                for r in range {
+                    match r {
+                        ConstraintRange::Value(v) => fx(v),
+                        ConstraintRange::Range { lo, hi } => {
+                            fx(lo);
+                            fx(hi);
+                        }
+                    }
+                }
+                for w in dist_weights.iter().flatten() {
+                    match w {
+                        DistWeight::Each(e) | DistWeight::Total(e) => fx(e),
+                    }
+                }
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                fx(condition);
+                Self::visit_constraint_root_names(constraint, f);
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                fx(condition);
+                Self::visit_constraint_root_names(then_item, f);
+                if let Some(e) = else_item {
+                    Self::visit_constraint_root_names(e, f);
+                }
+            }
+            ConstraintItem::Foreach { array, item, .. } => {
+                fx(array);
+                Self::visit_constraint_root_names(item, f);
+            }
+            ConstraintItem::Soft(inner) => Self::visit_constraint_root_names(inner, f),
+            ConstraintItem::Block(items) => {
+                for i in items {
+                    Self::visit_constraint_root_names(i, f);
+                }
+            }
+            ConstraintItem::Unique { exprs, .. } => exprs.iter().for_each(fx),
+            ConstraintItem::Solve {
+                before,
+                after,
+                before_paths,
+                after_paths,
+                ..
+            } => {
+                for id in before.iter().chain(after.iter()) {
+                    f(&id.name);
+                }
+                for e in before_paths.iter().chain(after_paths.iter()) {
+                    Self::visit_expr_root_names(e, f);
+                }
+            }
+        }
+    }
+
+    fn visit_expr_root_names(e: &Expression, f: &mut dyn FnMut(&str)) {
+        Self::walk_operands(e, &mut |x| match &x.kind {
+            ExprKind::Ident(h) if h.root.is_none() => {
+                if let Some(seg) = h.path.first() {
+                    f(&seg.name.name);
+                }
+            }
+            ExprKind::WithClause { expr, filter } => {
+                Self::visit_expr_root_names(expr, f);
+                Self::visit_expr_root_names(filter, f);
+            }
+            _ => {}
+        });
+    }
+
+    /// Visit the root identifier of every unrooted name in `it` (the first
+    /// path segment, and each `solve ... before` operand).
+    fn for_each_constraint_root_name(
+        it: &mut ConstraintItem,
+        f: &mut dyn FnMut(&mut crate::ast::Identifier),
+    ) {
+        let mut fx = |e: &mut Expression| Self::for_each_expr_root_name(e, f);
+        match it {
+            ConstraintItem::Expr(e) => fx(e),
+            ConstraintItem::Inside {
+                expr,
+                range,
+                dist_weights,
+                ..
+            } => {
+                fx(expr);
+                for r in range.iter_mut() {
+                    r.for_each_expr_mut(&mut fx);
+                }
+                for w in dist_weights.iter_mut().flatten() {
+                    match w {
+                        DistWeight::Each(e) | DistWeight::Total(e) => fx(e),
+                    }
+                }
+            }
+            ConstraintItem::Implication {
+                condition,
+                constraint,
+                ..
+            } => {
+                fx(condition);
+                Self::for_each_constraint_root_name(constraint, f);
+            }
+            ConstraintItem::IfElse {
+                condition,
+                then_item,
+                else_item,
+                ..
+            } => {
+                fx(condition);
+                Self::for_each_constraint_root_name(then_item, f);
+                if let Some(e) = else_item {
+                    Self::for_each_constraint_root_name(e, f);
+                }
+            }
+            ConstraintItem::Foreach { array, item, .. } => {
+                fx(array);
+                Self::for_each_constraint_root_name(item, f);
+            }
+            ConstraintItem::Soft(inner) => Self::for_each_constraint_root_name(inner, f),
+            ConstraintItem::Block(items) => {
+                for i in items {
+                    Self::for_each_constraint_root_name(i, f);
+                }
+            }
+            ConstraintItem::Unique { exprs, .. } => exprs.iter_mut().for_each(fx),
+            ConstraintItem::Solve {
+                before,
+                after,
+                before_paths,
+                after_paths,
+                ..
+            } => {
+                before.iter_mut().chain(after.iter_mut()).for_each(&mut *f);
+                for e in before_paths.iter_mut().chain(after_paths.iter_mut()) {
+                    Self::for_each_expr_root_name(e, f);
+                }
+            }
+        }
+    }
+
+    fn for_each_expr_root_name(e: &mut Expression, f: &mut dyn FnMut(&mut crate::ast::Identifier)) {
+        if let ExprKind::Ident(h) = &mut e.kind {
+            if h.root.is_none() {
+                if let Some(seg) = h.path.first_mut() {
+                    f(&mut seg.name);
+                }
+            }
+        }
+        let mut sub = |x: &mut Expression| Self::for_each_expr_root_name(x, f);
+        match &mut e.kind {
+            ExprKind::Ident(h) => {
+                for seg in &mut h.path {
+                    seg.selects.iter_mut().for_each(&mut sub);
+                }
+            }
+            ExprKind::Unary { operand, .. } => sub(operand),
+            ExprKind::Binary { left, right, .. } => {
+                sub(left);
+                sub(right);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                sub(condition);
+                sub(then_expr);
+                sub(else_expr);
+            }
+            ExprKind::Concatenation(parts) => parts.iter_mut().for_each(sub),
+            ExprKind::Replication { count, exprs } => {
+                sub(count);
+                exprs.iter_mut().for_each(sub);
+            }
+            ExprKind::Call { func, args } => {
+                sub(func);
+                args.iter_mut().for_each(sub);
+            }
+            ExprKind::SystemCall { args, .. } => args.iter_mut().for_each(sub),
+            ExprKind::Inside { expr, ranges } => {
+                sub(expr);
+                ranges.iter_mut().for_each(sub);
+            }
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Paren(expr) => sub(expr),
+            ExprKind::Index { expr, index } => {
+                sub(expr);
+                sub(index);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                sub(expr);
+                sub(left);
+                sub(right);
+            }
+            ExprKind::Range(a, b) => {
+                sub(a);
+                sub(b);
+            }
+            ExprKind::WithClause { expr, filter } => {
+                sub(expr);
+                sub(filter);
+            }
+            _ => {}
+        }
+    }
+}

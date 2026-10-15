@@ -433,9 +433,7 @@ impl Simulator {
             }
             ExprKind::This => Some(TsRecv::Class(cx.owner?.to_string())),
             ExprKind::Ident(h)
-                if h.root.is_none()
-                    && h.path.len() == 1
-                    && h.path[0].selects.is_empty() =>
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
             {
                 if let Some(k) = self.ts_lookup(&h.path[0].name.name, cx) {
                     return k;
@@ -445,7 +443,10 @@ impl Simulator {
                 // or a signal, whose type name may name a class.
                 self.ts_pkg_var_kind(&h.path[0].name.name)
             }
-            ExprKind::MemberAccess { expr: inner, member } => {
+            ExprKind::MemberAccess {
+                expr: inner,
+                member,
+            } => {
                 let TsRecv::Class(c) = self.ts_chain_recv(inner, cx)? else {
                     return None;
                 };

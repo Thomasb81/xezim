@@ -9,8 +9,13 @@ Thank you to everyone who has improved xezim through pull requests:
   condition-waiter drain de-duplication, the NBA-region lane in the
   `--max-time` hang report, class-method performance (fast accessor inlining,
   peephole branch fusion), packed-struct rand-array constraints, queue and
-  associative-array returns, handle-keyed `foreach` binding, and the resume
-  order of NBA-region waiters.
+  associative-array returns, handle-keyed `foreach` binding, the resume
+  order of NBA-region waiters, bytecode compilation of wait-free class tasks
+  and package functions, character writes into strings through every
+  receiver shape, block-local scoping in tasks and methods, per-invocation
+  task-local arrays and array formals that write back to class properties,
+  `@(... iff g)` guards evaluated in the waiting process, and fork children
+  waking a parked parent.
 - **Vrajesh Prakhya** — real-number modelling: Verilog-AMS `wreal` nets
   resolved by summing, user-defined nettypes across the hierarchy and in
   packages (§6.6.7, §6.6.8), real-ness of members projected from call results,
@@ -47,5 +52,21 @@ Thank you to everyone who has improved xezim through pull requests:
   static-call specializations, so `uvm_config_db#(cfg#(AW,DW))::get` reaches
   the configuration that was set, and factory `type_id::create` through chains
   of class typedefs.
+
+## Bug reports
+
+Detailed, self-checking bug reports have driven much of xezim's conformance
+work. Thank you in particular to
+[AaronKel](https://github.com/AaronKel),
+[bharathnaruto-spec](https://github.com/bharathnaruto-spec),
+[chenbhil](https://github.com/chenbhil),
+[Dragon-Git](https://github.com/Dragon-Git),
+[Ganesh-TNL](https://github.com/Ganesh-TNL),
+[jjts](https://github.com/jjts),
+[overcookedlobster](https://github.com/overcookedlobster),
+[rharikrishna25](https://github.com/rharikrishna25),
+[soronpo](https://github.com/soronpo),
+[taichi-ishitani](https://github.com/taichi-ishitani) and
+[vrajeshprakhya](https://github.com/vrajeshprakhya).
 
 New contributors are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
