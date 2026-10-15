@@ -316,70 +316,92 @@ void svGetLogicArrElem3VecVal(svLogicVecVal *d, const svOpenArrayHandle s, int i
     get_logic_vec(d, svGetArrElemPtr3(s, i1, i2, i3), s);
 }
 
-/* Scalar (1-bit) elements: bit 0 of the element. */
+/* Scalar (1-bit) elements. An unpacked array of SCALAR bit/logic stores
+ * 1-byte svBit/svLogic CELLS (elem_bytes == 1); a packed-vector element
+ * keeps the svBitVecVal/svLogicVecVal word form. These helpers pick the
+ * right one so svGetLogicArrElem1 etc. see x/z on scalar arrays. */
+static svBit get_bit_elem(const svOpenArrayHandle h, const void *e) {
+    if (!e) return 0;
+    const xz_oa_hdr *hd = oa_hdr(h);
+    if (hd && hd->elem_bytes == 1) return (svBit)(*(const unsigned char *)e & 1u);
+    return (svBit)(*(const svBitVecVal *)e & 1u);
+}
+static void put_bit_elem(const svOpenArrayHandle h, void *e, svBit v) {
+    if (!e) return;
+    const xz_oa_hdr *hd = oa_hdr(h);
+    if (hd && hd->elem_bytes == 1) {
+        *(unsigned char *)e = (unsigned char)(v & 1u);
+        return;
+    }
+    svPutBitselBit((svBitVecVal *)e, 0, v);
+}
+static svLogic get_logic_elem(const svOpenArrayHandle h, const void *e) {
+    if (!e) return sv_x;
+    const xz_oa_hdr *hd = oa_hdr(h);
+    if (hd && hd->elem_bytes == 1) return (svLogic)(*(const unsigned char *)e & 3u);
+    return svGetBitselLogic((const svLogicVecVal *)e, 0);
+}
+static void put_logic_elem(const svOpenArrayHandle h, void *e, svLogic v) {
+    if (!e) return;
+    const xz_oa_hdr *hd = oa_hdr(h);
+    if (hd && hd->elem_bytes == 1) {
+        *(unsigned char *)e = (unsigned char)(v & 3u);
+        return;
+    }
+    svPutBitselLogic((svLogicVecVal *)e, 0, v);
+}
+
 svBit svGetBitArrElem(const svOpenArrayHandle s, int indx1, ...) {
     ELEM_VARIADIC(s, indx1, e);
-    return e ? (svBit)(*(const svBitVecVal *)e & 1u) : 0;
+    return get_bit_elem(s, e);
 }
 svBit svGetBitArrElem1(const svOpenArrayHandle s, int i1) {
-    const svBitVecVal *e = svGetArrElemPtr1(s, i1);
-    return e ? (svBit)(*e & 1u) : 0;
+    return get_bit_elem(s, svGetArrElemPtr1(s, i1));
 }
 svBit svGetBitArrElem2(const svOpenArrayHandle s, int i1, int i2) {
-    const svBitVecVal *e = svGetArrElemPtr2(s, i1, i2);
-    return e ? (svBit)(*e & 1u) : 0;
+    return get_bit_elem(s, svGetArrElemPtr2(s, i1, i2));
 }
 svBit svGetBitArrElem3(const svOpenArrayHandle s, int i1, int i2, int i3) {
-    const svBitVecVal *e = svGetArrElemPtr3(s, i1, i2, i3);
-    return e ? (svBit)(*e & 1u) : 0;
+    return get_bit_elem(s, svGetArrElemPtr3(s, i1, i2, i3));
 }
 svLogic svGetLogicArrElem(const svOpenArrayHandle s, int indx1, ...) {
     ELEM_VARIADIC(s, indx1, e);
-    return e ? svGetBitselLogic((const svLogicVecVal *)e, 0) : sv_x;
+    return get_logic_elem(s, e);
 }
 svLogic svGetLogicArrElem1(const svOpenArrayHandle s, int i1) {
-    const svLogicVecVal *e = svGetArrElemPtr1(s, i1);
-    return e ? svGetBitselLogic(e, 0) : sv_x;
+    return get_logic_elem(s, svGetArrElemPtr1(s, i1));
 }
 svLogic svGetLogicArrElem2(const svOpenArrayHandle s, int i1, int i2) {
-    const svLogicVecVal *e = svGetArrElemPtr2(s, i1, i2);
-    return e ? svGetBitselLogic(e, 0) : sv_x;
+    return get_logic_elem(s, svGetArrElemPtr2(s, i1, i2));
 }
 svLogic svGetLogicArrElem3(const svOpenArrayHandle s, int i1, int i2, int i3) {
-    const svLogicVecVal *e = svGetArrElemPtr3(s, i1, i2, i3);
-    return e ? svGetBitselLogic(e, 0) : sv_x;
+    return get_logic_elem(s, svGetArrElemPtr3(s, i1, i2, i3));
 }
 void svPutBitArrElem(const svOpenArrayHandle d, svBit value, int indx1, ...) {
     ELEM_VARIADIC(d, indx1, e);
-    if (e) svPutBitselBit((svBitVecVal *)e, 0, value);
+    put_bit_elem(d, e, value);
 }
 void svPutBitArrElem1(const svOpenArrayHandle d, svBit value, int i1) {
-    svBitVecVal *e = svGetArrElemPtr1(d, i1);
-    if (e) svPutBitselBit(e, 0, value);
+    put_bit_elem(d, svGetArrElemPtr1(d, i1), value);
 }
 void svPutBitArrElem2(const svOpenArrayHandle d, svBit value, int i1, int i2) {
-    svBitVecVal *e = svGetArrElemPtr2(d, i1, i2);
-    if (e) svPutBitselBit(e, 0, value);
+    put_bit_elem(d, svGetArrElemPtr2(d, i1, i2), value);
 }
 void svPutBitArrElem3(const svOpenArrayHandle d, svBit value, int i1, int i2, int i3) {
-    svBitVecVal *e = svGetArrElemPtr3(d, i1, i2, i3);
-    if (e) svPutBitselBit(e, 0, value);
+    put_bit_elem(d, svGetArrElemPtr3(d, i1, i2, i3), value);
 }
 void svPutLogicArrElem(const svOpenArrayHandle d, svLogic value, int indx1, ...) {
     ELEM_VARIADIC(d, indx1, e);
-    if (e) svPutBitselLogic((svLogicVecVal *)e, 0, value);
+    put_logic_elem(d, e, value);
 }
 void svPutLogicArrElem1(const svOpenArrayHandle d, svLogic value, int i1) {
-    svLogicVecVal *e = svGetArrElemPtr1(d, i1);
-    if (e) svPutBitselLogic(e, 0, value);
+    put_logic_elem(d, svGetArrElemPtr1(d, i1), value);
 }
 void svPutLogicArrElem2(const svOpenArrayHandle d, svLogic value, int i1, int i2) {
-    svLogicVecVal *e = svGetArrElemPtr2(d, i1, i2);
-    if (e) svPutBitselLogic(e, 0, value);
+    put_logic_elem(d, svGetArrElemPtr2(d, i1, i2), value);
 }
 void svPutLogicArrElem3(const svOpenArrayHandle d, svLogic value, int i1, int i2, int i3) {
-    svLogicVecVal *e = svGetArrElemPtr3(d, i1, i2, i3);
-    if (e) svPutBitselLogic(e, 0, value);
+    put_logic_elem(d, svGetArrElemPtr3(d, i1, i2, i3), value);
 }
 
 /* ---- H.9.3: per-scope user data ----------------------------------------

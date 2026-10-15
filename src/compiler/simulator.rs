@@ -4325,6 +4325,12 @@ enum DpiOaElem {
     F64,
     Bit(u32),
     Logic(u32),
+    /// An unpacked array of SCALAR `bit` — 1-byte `svBit` cells (0/1),
+    /// per §35.5.6/H.7's canonical element form. Not svBitVecVal words.
+    SvBit,
+    /// An unpacked array of SCALAR `logic`/`reg` — 1-byte `svLogic` cells
+    /// (0/1/2/3 = 0/1/z/x), round-tripping 4-state like the scalar formals.
+    SvLogic,
 }
 
 impl DpiOaElem {
@@ -4336,6 +4342,7 @@ impl DpiOaElem {
             DpiOaElem::I64 | DpiOaElem::F64 => 8,
             DpiOaElem::Bit(w) => 4 * w.div_ceil(32).max(1) as usize,
             DpiOaElem::Logic(w) => 8 * w.div_ceil(32).max(1) as usize,
+            DpiOaElem::SvBit | DpiOaElem::SvLogic => 1,
         }
     }
 
@@ -4347,6 +4354,7 @@ impl DpiOaElem {
             DpiOaElem::I32 | DpiOaElem::F32 => 32,
             DpiOaElem::I64 | DpiOaElem::F64 => 64,
             DpiOaElem::Bit(w) | DpiOaElem::Logic(w) => w.max(1),
+            DpiOaElem::SvBit | DpiOaElem::SvLogic => 1,
         }
     }
 }
@@ -4445,6 +4453,12 @@ impl DpiOpenArrayArg {
                         dst[k * 4..k * 4 + 4].copy_from_slice(&word.to_le_bytes());
                     }
                 }
+                DpiOaElem::SvBit => {
+                    dst[0] = (v.get_bit(0) == LogicBit::One) as u8;
+                }
+                DpiOaElem::SvLogic => {
+                    dst[0] = Simulator::dpi_svlogic_encode_1(v) as u8;
+                }
             }
         }
         DpiOpenArrayArg { buf, elem, count }
@@ -4501,6 +4515,14 @@ impl DpiOpenArrayArg {
                         let il: Vec<u32> = (0..eb / 4).map(word).collect();
                         Simulator::dpi_logic_interleaved_to_value(&il, w)
                     }
+                    DpiOaElem::SvBit => {
+                        let mut val = Value::zero(1);
+                        if src[0] & 1 != 0 {
+                            val.set_bit(0, LogicBit::One);
+                        }
+                        val
+                    }
+                    DpiOaElem::SvLogic => Simulator::dpi_svlogic_decode_1(src[0] as i32),
                 }
             })
             .collect()
@@ -15710,8 +15732,25 @@ impl Simulator {
                     _ => DpiOaElem::F64,
                 },
                 DataType::IntegerVector { kind, .. } => match kind {
-                    crate::ast::types::IntegerVectorType::Bit => DpiOaElem::Bit(w),
-                    _ => DpiOaElem::Logic(w),
+                    // §35.5.6/H.7: a SCALAR `bit`/`logic` element is a 1-byte
+                    // svBit/svLogic cell; a PACKED vector element is
+                    // svBitVecVal/svLogicVecVal words. The old mapping used
+                    // the word forms for scalars too, so 1-bit cells read
+                    // back garbage and 4-state bits never round-tripped.
+                    crate::ast::types::IntegerVectorType::Bit => {
+                        if w <= 1 {
+                            DpiOaElem::SvBit
+                        } else {
+                            DpiOaElem::Bit(w)
+                        }
+                    }
+                    _ => {
+                        if w <= 1 {
+                            DpiOaElem::SvLogic
+                        } else {
+                            DpiOaElem::Logic(w)
+                        }
+                    }
                 },
                 DataType::Implicit { .. } if w <= 32 => DpiOaElem::I32,
                 _ => return None,
@@ -15899,6 +15938,14 @@ impl Simulator {
                 crate::ast::types::SimpleType::String => Some(DpiRetKind::String),
                 _ => None,
             },
+            // §35.5.5: an enum return maps to its base C type (`int` when
+            // no explicit base). dpi_signature resolves typedef'd bases
+            // before this, so a bare TypeReference base stays unsupported
+            // rather than guessing an ABI.
+            DataType::Enum(e) => match e.base_type.as_deref() {
+                Some(bt) => Self::dpi_return_kind(bt),
+                None => Some(DpiRetKind::Int32),
+            },
             _ => None,
         }
     }
@@ -15928,10 +15975,30 @@ impl Simulator {
         cur
     }
 
+    /// §35.5.5: an enum's C form is its base type's (`typedef enum int
+    /// {...} color_e; import "DPI-C" function color_e f();` is an `int`
+    /// return). Resolve the declared return type through typedefs and enum
+    /// bases so it maps to the right C type; an enum without an explicit
+    /// base keeps `int` semantics (dpi_return_kind's Enum arm).
+    fn dpi_resolve_return_type(&self, dt: &DataType) -> DataType {
+        let mut cur = self.dpi_resolve_typedef(dt);
+        for _ in 0..4 {
+            let base = match &cur {
+                DataType::Enum(e) => match e.base_type.as_deref() {
+                    Some(bt) => self.dpi_resolve_typedef(bt),
+                    None => break,
+                },
+                _ => break,
+            };
+            cur = base;
+        }
+        cur
+    }
+
     fn dpi_signature(&self, spec: &DpiImportSpec) -> Option<(DpiRetKind, Vec<DpiArgKind>)> {
         match &spec.proto {
             crate::ast::decl::DPIProto::Function(fd) => {
-                let ret = Self::dpi_return_kind(&self.dpi_resolve_typedef(&fd.return_type))?;
+                let ret = Self::dpi_return_kind(&self.dpi_resolve_return_type(&fd.return_type))?;
                 let mut args = Vec::with_capacity(fd.ports.len());
                 for p in &fd.ports {
                     args.push(self.dpi_atom_kind(&p.data_type, &p.dimensions, p.direction)?);
@@ -16117,6 +16184,42 @@ impl Simulator {
             out.set_bit(bit, lb);
         }
         out.resize(width)
+    }
+
+    /// §35.5.5: a 1-bit 4-state scalar formal/return (`logic`, `reg`, or a
+    /// typedef of one) travels as a `svLogic` cell, not a plain integer —
+    /// z is 2 and x is 3 there. Every path touching such a port must test
+    /// this and use the cell encode/decode below, or x/z collapse into
+    /// their low bit (x->1, z->0).
+    fn dpi_scalar_4state_1bit(&self, dt: &DataType) -> bool {
+        !super::elaborate::is_type_two_state_resolved(dt, &self.module.typedef_types)
+            && self
+                .scalar_formal_integral(dt)
+                .is_some_and(|(w, _)| w == 1)
+    }
+
+    /// One `svLogic` cell (0/1/2/3) -> a 1-bit 4-state Value. Unknown high
+    /// bits collapse via `& 3` (aval=bit0, bval=bit1).
+    fn dpi_svlogic_decode_1(v: i32) -> Value {
+        let lb = match v & 3 {
+            0 => LogicBit::Zero,
+            1 => LogicBit::One,
+            2 => LogicBit::Z,
+            _ => LogicBit::X,
+        };
+        let mut out = Value::zero(1);
+        out.set_bit(0, lb);
+        out
+    }
+
+    /// The inverse: a 1-bit Value -> its `svLogic` cell encoding.
+    fn dpi_svlogic_encode_1(v: &Value) -> i32 {
+        match v.get_bit(0) {
+            LogicBit::Zero => 0,
+            LogicBit::One => 1,
+            LogicBit::Z => 2,
+            LogicBit::X => 3,
+        }
     }
 
     /// The elements of an open-array actual and its declared bounds
@@ -16395,6 +16498,21 @@ impl Simulator {
         let cif = binding.cif.clone();
         let fn_ptr = binding.fn_ptr;
 
+        // §35.5.5: per-port flag — is this a 1-bit 4-state scalar (`logic`,
+        // `reg`, or a typedef of one)? Such ports travel as `svLogic` cells
+        // (z=2, x=3) on every direction: input, output/ref/inout write-in,
+        // and writeback. Missing any one direction collapses x/z to their
+        // low bit.
+        let svlogic_ports: Vec<bool> = (0..arg_kinds.len())
+            .map(|i| {
+                match &spec.proto {
+                    crate::ast::decl::DPIProto::Function(fd) => fd.ports.get(i),
+                    crate::ast::decl::DPIProto::Task(td) => td.ports.get(i),
+                }
+                .is_some_and(|pt| self.dpi_scalar_4state_1bit(&pt.data_type))
+            })
+            .collect();
+
         let mut arg_refs = Vec::with_capacity(arg_kinds.len());
         let mut i32_vals: Vec<Box<i32>> = Vec::with_capacity(arg_kinds.len());
         let mut i64_vals: Vec<Box<i64>> = Vec::with_capacity(arg_kinds.len());
@@ -16409,7 +16527,9 @@ impl Simulator {
         let mut open_arrays: Vec<DpiOpenArrayArg> = Vec::with_capacity(arg_kinds.len());
         let mut cstrings: Vec<CString> = Vec::with_capacity(arg_kinds.len());
         let mut logic_aval: Vec<Vec<u32>> = Vec::with_capacity(arg_kinds.len());
-        let mut writebacks: Vec<(usize, DpiArgKind, Expression)> = Vec::new();
+        // (storage index, arg kind, SV actual, port index) — the port index
+        // lets the writeback consult svlogic_ports.
+        let mut writebacks: Vec<(usize, DpiArgKind, Expression, usize)> = Vec::new();
 
         for (i, kind) in arg_kinds.iter().enumerate() {
             match kind {
@@ -16417,29 +16537,13 @@ impl Simulator {
                     // §35.5.6.1: a 1-bit 4-state formal (`logic`/`reg`) travels
                     // as svLogic — x is 3 and z is 2, not the 0 a plain
                     // integer conversion produced.
-                    let four_state_bit = match &spec.proto {
-                        crate::ast::decl::DPIProto::Function(fd) => fd.ports.get(i),
-                        crate::ast::decl::DPIProto::Task(td) => td.ports.get(i),
-                    }
-                    .map(|pt| {
-                        !super::elaborate::is_type_two_state_resolved(
-                            &pt.data_type,
-                            &self.module.typedef_types,
-                        ) && self
-                            .scalar_formal_integral(&pt.data_type)
-                            .is_some_and(|(w, _)| w == 1)
-                    })
-                    .unwrap_or(false);
+                    let four_state_bit = svlogic_ports[i];
                     let v = Box::new(
                         args.get(i)
                             .map(|e| {
                                 let val = self.eval_expr(e);
-                                if four_state_bit && val.has_xz() {
-                                    if matches!(val.get_bit(0), LogicBit::Z) {
-                                        2
-                                    } else {
-                                        3
-                                    }
+                                if four_state_bit {
+                                    Self::dpi_svlogic_encode_1(&val)
                                 } else {
                                     val.to_i64().unwrap_or(0) as i32
                                 }
@@ -16532,11 +16636,26 @@ impl Simulator {
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
-                        writebacks.push((string_ptr_cells.len() - 1, *kind, expr.clone()));
+                        writebacks.push((string_ptr_cells.len() - 1, *kind, expr.clone(), i));
                     }
                 }
                 DpiArgKind::OpenArrayIn(elem) | DpiArgKind::OpenArrayOut(elem) => {
                     let (values, shape) = self.dpi_collect_open_array(args.get(i));
+                    // §35.5.6: an output-only open array's entry value is
+                    // unspecified; reference simulators hand C a zeroed
+                    // buffer (elements read 0 even when the actual holds
+                    // x), and write the whole array back afterwards.
+                    // inout/ref keep passing the actual, as for scalars.
+                    let out_only = match &spec.proto {
+                        crate::ast::decl::DPIProto::Function(fd) => fd.ports.get(i),
+                        crate::ast::decl::DPIProto::Task(td) => td.ports.get(i),
+                    }
+                    .is_some_and(|pt| matches!(pt.direction, PortDirection::Output));
+                    let values = if out_only && matches!(kind, DpiArgKind::OpenArrayOut(_)) {
+                        vec![Value::zero(elem.width().max(1)); values.len()]
+                    } else {
+                        values
+                    };
                     let mut oa = DpiOpenArrayArg::new(*elem, &values, &shape);
                     let p = Box::new(oa.handle());
                     open_arrays.push(oa);
@@ -16544,7 +16663,7 @@ impl Simulator {
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if matches!(kind, DpiArgKind::OpenArrayOut(_)) {
                         if let Some(expr) = args.get(i) {
-                            writebacks.push((open_arrays.len() - 1, *kind, expr.clone()));
+                            writebacks.push((open_arrays.len() - 1, *kind, expr.clone(), i));
                         }
                     }
                 }
@@ -16572,7 +16691,7 @@ impl Simulator {
                     ptr_vals.push(Box::new(raw_ptr));
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
-                        writebacks.push((logic_aval.len() - 1, *kind, expr.clone()));
+                        writebacks.push((logic_aval.len() - 1, *kind, expr.clone(), i));
                     }
                 }
                 DpiArgKind::VecBitIn(width) => {
@@ -16602,13 +16721,24 @@ impl Simulator {
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
                         // Track which logical_aval slot to read back.
-                        writebacks.push((logic_aval.len() - 1, *kind, expr.clone()));
+                        writebacks.push((logic_aval.len() - 1, *kind, expr.clone(), i));
                     }
                 }
                 DpiArgKind::Int32Out => {
+                    // §35.5.6.1: an output/ref/inout 1-bit 4-state formal is a
+                    // `svLogic*` cell — the value C reads on entry must be
+                    // cell-encoded too (an `inout logic` seeing x used to
+                    // hand C 0 instead of 3).
                     let init = args
                         .get(i)
-                        .map(|e| self.eval_expr(e).to_i64().unwrap_or(0) as i32)
+                        .map(|e| {
+                            let val = self.eval_expr(e);
+                            if svlogic_ports[i] {
+                                Self::dpi_svlogic_encode_1(&val)
+                            } else {
+                                val.to_i64().unwrap_or(0) as i32
+                            }
+                        })
                         .unwrap_or(0);
                     let b = Box::new(init);
                     let p = Box::new((&*b as *const i32 as *mut i32).cast::<c_void>());
@@ -16616,7 +16746,7 @@ impl Simulator {
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
-                        writebacks.push((i32_vals.len() - 1, *kind, expr.clone()));
+                        writebacks.push((i32_vals.len() - 1, *kind, expr.clone(), i));
                     }
                 }
                 DpiArgKind::Int64Out => {
@@ -16630,7 +16760,7 @@ impl Simulator {
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
-                        writebacks.push((i64_vals.len() - 1, *kind, expr.clone()));
+                        writebacks.push((i64_vals.len() - 1, *kind, expr.clone(), i));
                     }
                 }
                 DpiArgKind::Real32Out => {
@@ -16644,7 +16774,7 @@ impl Simulator {
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
-                        writebacks.push((f32_vals.len() - 1, *kind, expr.clone()));
+                        writebacks.push((f32_vals.len() - 1, *kind, expr.clone(), i));
                     }
                 }
                 DpiArgKind::Real64Out => {
@@ -16658,7 +16788,7 @@ impl Simulator {
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
-                        writebacks.push((f64_vals.len() - 1, *kind, expr.clone()));
+                        writebacks.push((f64_vals.len() - 1, *kind, expr.clone(), i));
                     }
                 }
                 DpiArgKind::ChandleOut => {
@@ -16673,7 +16803,7 @@ impl Simulator {
                     ptr_vals.push(p);
                     arg_refs.push(Arg::new(ptr_vals.last().unwrap().as_ref()));
                     if let Some(expr) = args.get(i) {
-                        writebacks.push((ptr_vals.len() - 2, *kind, expr.clone()));
+                        writebacks.push((ptr_vals.len() - 2, *kind, expr.clone(), i));
                     }
                 }
             }
@@ -16762,14 +16892,29 @@ impl Simulator {
                 }
             }
         };
+        // §35.5.5: a 1-bit 4-state return type (`logic f()`, or a typedef of
+        // one) is returned as a `svLogic` cell — z=2, x=3. Reading it as a
+        // plain integer and letting the width adaptation below mask it to
+        // one bit turned x into 1 and z into 0.
+        if matches!(ret_kind, DpiRetKind::Int32 | DpiRetKind::Int64) {
+            if let crate::ast::decl::DPIProto::Function(fd) = &spec.proto {
+                if self.dpi_scalar_4state_1bit(&fd.return_type) {
+                    result = Self::dpi_svlogic_decode_1(result.to_i64().unwrap_or(0) as i32);
+                }
+            }
+        }
         // §35.5.5: the C ABI hands a small integral return back promoted to
         // 32/64 bits; the SV side sees the DECLARED type. `byte unsigned`
         // returning 256 and `shortint` reading 65530 in an expression were
         // the symptoms (an assignment to a typed variable fitted it, a direct
-        // use in `$display` did not).
+        // use in `$display` did not). An enum adapts to its base type's
+        // width/signedness the same way (`typedef enum byte {...} e;` is an
+        // 8-bit signed return, so 200 reads back as -56).
         if matches!(ret_kind, DpiRetKind::Int32 | DpiRetKind::Int64) {
             if let crate::ast::decl::DPIProto::Function(fd) = &spec.proto {
-                if let Some((w, signed)) = self.scalar_formal_integral(&fd.return_type) {
+                if let Some((w, signed)) =
+                    self.scalar_formal_integral(&self.dpi_resolve_return_type(&fd.return_type))
+                {
                     if w > 0 && w <= 64 && (w != result.width || signed != result.is_signed) {
                         result = result.resize(w);
                         result.is_signed = signed;
@@ -16792,12 +16937,20 @@ impl Simulator {
             writebacks.clear();
         }
         // Write back output/ref/inout values.
-        for (idx, kind, expr) in writebacks {
+        for (idx, kind, expr, port) in writebacks {
             match kind {
                 DpiArgKind::Int32Out => {
                     if let Some(v) = i32_vals.get(idx) {
                         let w = self.infer_lhs_width(&expr);
-                        self.assign_value(&expr, &Value::from_u64(**v as u32 as u64, w));
+                        // §35.5.6.1: a 1-bit 4-state output formal is a
+                        // `svLogic*` cell — decode 2/3 back into z/x rather
+                        // than masking them to 0/1.
+                        let out = if svlogic_ports.get(port).copied().unwrap_or(false) {
+                            Self::dpi_svlogic_decode_1(**v)
+                        } else {
+                            Value::from_u64(**v as u32 as u64, w)
+                        };
+                        self.assign_value(&expr, &out.resize(w.max(1)));
                     }
                 }
                 DpiArgKind::Int64Out => {
