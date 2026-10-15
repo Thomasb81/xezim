@@ -140361,6 +140361,91 @@ impl Simulator {
         }
     }
 
+    /// §13.5.3: an UNPACKED-ARRAY formal whose call omitted the argument is
+    /// filled from its default value. `eval_expr` packs an aggregate default
+    /// (`byte v[2] = '{8'hA5, 8'h5A}`) into one contiguous value, but the
+    /// formal must be materialised as NAMED element signals with the element's
+    /// real width and registered in `module.arrays` — exactly as `bind_array_arg`
+    /// does for a bound actual (§13.5.2).
+    ///
+    /// Without this the default-supplied formal is unregistered, so a later
+    /// `output`/`ref`/`inout` call that binds it as its caller actual
+    /// (`bind_array_arg`) returns `None` (caller not in `module.arrays`), drops
+    /// the write-back, and each element comes back as a 1-bit ghost
+    /// (`8'hA5` -> `1`). The bug is cold-path only because a prior bound-array
+    /// call to ANY same-named formal registers the width, silently "warming"
+    /// every later default-actual call.
+    ///
+    /// Returns `Some(())` when the 1-D shape and element width could be
+    /// resolved and the element signals were laid down; `None` leaves the
+    /// packed default in place (fall back to the scalar-local path).
+    fn materialize_array_formal_default(
+        &mut self,
+        name: &str,
+        data_type: &crate::ast::types::DataType,
+        dims: &[crate::ast::types::UnpackedDimension],
+        val: &Value,
+    ) -> Option<()> {
+        use crate::ast::types::UnpackedDimension as UD;
+        let params = Some(&self.module.parameters);
+        let (lo, hi) = match dims.first()? {
+            UD::Range { left, right, .. } => {
+                let l = super::elaborate::const_eval_i64_with_params(left, params)?;
+                let r = super::elaborate::const_eval_i64_with_params(right, params)?;
+                (l.min(r), l.max(r))
+            }
+            UD::Expression { expr, .. } => {
+                let n = super::elaborate::const_eval_i64_with_params(expr, params)?;
+                if n <= 0 {
+                    return None;
+                }
+                (0, n - 1)
+            }
+            _ => return None,
+        };
+        // Element width: for an unpacked-array formal the declared data type
+        // is the ELEMENT type (`byte v[2]` -> `byte`, width 8) and the unpacked
+        // dims live on the port. 0 means unresolvable (e.g. an opaque type);
+        // refuse rather than build a width-0 array.
+        let w = super::elaborate::resolve_type_width(
+            data_type,
+            Some(&self.module.parameters),
+            Some(&self.module.typedefs),
+        );
+        if w == 0 {
+            return None;
+        }
+        let n = (hi - lo + 1).max(0) as usize;
+        // Element signedness (a `byte`/`shortint`/`int` element prints signed
+        // on `%0d`); match what a bound actual's pre-existing signal carries.
+        let signed = super::elaborate::is_type_signed_resolved(
+            data_type,
+            &self.module.typedef_types,
+        );
+        // Aggregate defaults pack left-to-right elements into high-to-low bits
+        // (`'{A5,5A}` -> 0xA55A with element 0 at [15:8]); peel each element out
+        // at `[(n-1-i)*w .. (n-i)*w)` into its own signal, preserving X/Z.
+        for (k, i) in (lo..=hi).enumerate() {
+            let top = (n - 1 - k) * (w as usize) + (w as usize) - 1;
+            let bot = (n - 1 - k) * (w as usize);
+            let mut ev = val.range_select(top, bot);
+            ev.is_signed = signed;
+            let elem = format!("{}[{}]", name, i);
+            // Register the element's SIGNEDNESS so a later blocking write to it
+            // (e.g. through an output/inout/ref sibling that binds this formal)
+            // stores `%0d`-signed, not unsigned-lit —— the fallback write path
+            // derives `is_signed` from `signed_signals`, not the rvalue.
+            if signed {
+                self.signed_signals.insert(elem.clone());
+            } else {
+                self.signed_signals.remove(&elem);
+            }
+            self.signals.insert(elem, ev);
+        }
+        self.module.arrays.insert(name.to_string(), (lo, hi, w));
+        Some(())
+    }
+
     /// Copy a fixed unpacked ARRAY actual into the formal's element signals and
     /// register the formal as an array so `a[i]` resolves inside the body.
     /// Returns `(formal, actual, lo, hi)` so an `output`/`inout`/`ref` formal
@@ -141484,6 +141569,28 @@ impl Simulator {
                 self.push_local_frame_typed(locals.clone(), frame_types.clone());
                 let v = self.eval_expr(def);
                 self.pop_local_frame();
+                // §13.5.3 / §13.5.2: an UNPACKED-ARRAY formal filled from its
+                // default must be materialised as named element signals and
+                // registered in `module.arrays`, exactly like a bound array
+                // actual (`bind_array_arg`). If it is not, a later output/ref
+                // call that binds this formal as its caller actual drops the
+                // write-back and every element comes back 1-bit (#327).
+                if !port.dimensions.is_empty()
+                    && !self.module.arrays.contains_key(&port.name.name)
+                    && self
+                        .materialize_array_formal_default(
+                            &port.name.name,
+                            &port.data_type,
+                            &port.dimensions,
+                            &v,
+                        )
+                        .is_some()
+                {
+                    // Handled as a real array formal (mirroring `bind_array_arg`'s
+                    // `continue`): skip the scalar-local insertion and the scalar
+                    // width/signedness adoption below.
+                    continue;
+                }
                 v
             } else {
                 Value::zero(32)

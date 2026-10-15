@@ -63,6 +63,8 @@ mod nba_last_write_wins_elision;
 mod nested_fork_shared_write;
 #[path = "strings/nonzero_lsb_part_select_write.rs"]
 mod nonzero_lsb_part_select_write;
+#[path = "strings/output_array_formal_default_writeback.rs"]
+mod output_array_formal_default_writeback;
 #[path = "strings/p_format_assoc.rs"]
 mod p_format_assoc;
 #[path = "strings/p_format_named.rs"]
