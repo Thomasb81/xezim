@@ -16737,6 +16737,38 @@ impl Simulator {
         }
     }
 
+    /// A marshalled DPI packed-vector value: an integer passes through; a real
+    /// is VALUE-converted to the integral width (rounding to nearest, ties
+    /// away from zero, §5.2/§6.12) rather than bit-reinterpreting its IEEE-754
+    /// bits. `time`/`integer`/`logic`/`bit` formals are passed as
+    /// svLogicVecVal*/svBitVecVal*; without this a real actual named `3.75`
+    /// into a `time` formal fetched a C side the bits of double 3.75, not 4.
+    fn dpi_marshal_packed(v: &Value, width: u32) -> Value {
+        if v.is_real {
+            let f = v.to_f64();
+            if !f.is_finite() {
+                return Value::zero(width.max(1));
+            }
+            return Value::from_u64(f.round() as i64 as u64, width.max(1));
+        }
+        v.clone()
+    }
+
+    /// A value marshalled into a C integral DPI argument. An integer is taken
+    /// by value; a real is a VALUE conversion (rounding to nearest, ties away
+    /// from zero, §5.2/§6.12) to match the reference and the normal call path —
+    /// not a bit reinterpretation of its IEEE-754 bits (#324, argument side).
+    fn dpi_value_to_i64(v: &Value) -> i64 {
+        if v.is_real {
+            let f = v.to_f64();
+            if !f.is_finite() {
+                return 0;
+            }
+            return f.round() as i64;
+        }
+        v.to_i64().unwrap_or(0)
+    }
+
     /// The 1-bit SV value of an svLogic the C side wrote or returned. Only
     /// the two low bits are defined (H.7.4).
     fn dpi_svlogic_value(code: u8) -> Value {
@@ -17234,7 +17266,7 @@ impl Simulator {
                 DpiArgKind::Int32In => {
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| self.eval_expr(e).to_i64().unwrap_or(0) as i32)
+                            .map(|e| Self::dpi_value_to_i64(&self.eval_expr(e)) as i32)
                             .unwrap_or(0),
                     );
                     i32_vals.push(v);
@@ -17269,7 +17301,7 @@ impl Simulator {
                 DpiArgKind::Int64In => {
                     let v = Box::new(
                         args.get(i)
-                            .map(|e| self.eval_expr(e).to_i64().unwrap_or(0))
+                            .map(|e| Self::dpi_value_to_i64(&self.eval_expr(e)))
                             .unwrap_or(0),
                     );
                     i64_vals.push(v);
@@ -17383,7 +17415,7 @@ impl Simulator {
                     // of {aval, bval} u32 pairs (see dpi_value_to_logic_interleaved).
                     let vv = args
                         .get(i)
-                        .map(|e| self.eval_expr(e))
+                        .map(|e| Self::dpi_marshal_packed(&self.eval_expr(e), *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let buf = Self::dpi_value_to_logic_interleaved(&vv, *width);
                     logic_aval.push(buf);
@@ -17394,7 +17426,7 @@ impl Simulator {
                 DpiArgKind::VecLogicOut(width) => {
                     let init = args
                         .get(i)
-                        .map(|e| self.eval_expr(e))
+                        .map(|e| Self::dpi_marshal_packed(&self.eval_expr(e), *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let buf = Self::dpi_value_to_logic_interleaved(&init, *width);
                     logic_aval.push(buf);
@@ -17410,7 +17442,7 @@ impl Simulator {
                     // ABI differs from VecLogicIn: no bval field.
                     let vv = args
                         .get(i)
-                        .map(|e| self.eval_expr(e))
+                        .map(|e| Self::dpi_marshal_packed(&self.eval_expr(e), *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let (aval, _bval) = Self::dpi_value_to_logic_words(&vv, *width);
                     // Store in a dedicated Vec<Vec<u32>> to keep storage stable.
@@ -17423,7 +17455,7 @@ impl Simulator {
                 DpiArgKind::VecBitOut(width) => {
                     let init = args
                         .get(i)
-                        .map(|e| self.eval_expr(e))
+                        .map(|e| Self::dpi_marshal_packed(&self.eval_expr(e), *width))
                         .unwrap_or_else(|| Value::zero(*width));
                     let (aval, _bval) = Self::dpi_value_to_logic_words(&init, *width);
                     logic_aval.push(aval);

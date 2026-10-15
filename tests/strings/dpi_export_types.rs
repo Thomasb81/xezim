@@ -184,3 +184,31 @@ fn export_with_a_wide_result_is_rejected() {
         "{text}"
     );
 }
+
+/// #324: a real-valued expression crossing a DPI integral-scalar boundary in
+/// either direction is VALUE-converted (rounding to nearest, ties away from
+/// zero, §5.2/§6.12) instead of bit-reinterpreting its IEEE-754 pattern —
+/// covering scalar `bit`/`byte`/`shortint`/`int`/`longint` formals and the
+/// packed-vector `time`/`integer`/`logic`/`bit [N]` formals (svLogicVecVal* /
+/// svBitVecVal*). Before the fix, returning `100ns / 1ns` (real 100.0) through
+/// a `longint` fetched the C side `0x4059000000000000` (the bits of double
+/// 100.0) instead of 100, a real actual into a C `int` formal passed 0, and a
+/// real actual into a `time` formal passed the f64 bits (0x400E...).
+#[test]
+fn exported_integral_returns_value_convert_a_real() {
+    let (ok, text) = run("real_return");
+    assert!(ok, "{text}");
+    assert_eq!(
+        tagged(&text),
+        ["T|T4", "T|I4", "T|B4", "T|100 4 -4"],
+        "{text}"
+    );
+    assert!(
+        text.contains("PASS: get_drain_time returned 100"),
+        "{text}"
+    );
+    assert!(
+        text.contains("PASS: c_take_int(3.75) == 4"),
+        "{text}"
+    );
+}

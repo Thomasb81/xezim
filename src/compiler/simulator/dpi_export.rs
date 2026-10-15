@@ -128,7 +128,20 @@ impl DpiCScalar {
             DpiCScalar::Bit => (v.get_bit(0) == LogicBit::One) as i64,
             _ => {
                 let mut v = v.clone();
-                v.is_real = false;
+                if v.is_real {
+                    // §35.5.2 + §6.12.3: a real converted to a 2-state integral
+                    // scalar is a VALUE conversion that ROUNDS to nearest with
+                    // ties away from zero (f64::round), exactly like the
+                    // assignment/return path (real_to_int) and the reference.
+                    // Before the fix the stored IEEE-754 bits were emitted
+                    // bit-reinterpreted (100.0 -> 0x4059...); truncating via
+                    // `as i64` also disagreed with the reference (3.75 -> 3, not 4).
+                    let f = v.to_f64();
+                    if !f.is_finite() {
+                        return 0;
+                    }
+                    v = Value::from_u64(f.round() as i64 as u64, 64);
+                }
                 v.to_u64().map_or(0, |u| u as i64)
             }
         }
@@ -739,7 +752,15 @@ impl Simulator {
     /// `p` points at `ceil(width / 32)` writable elements.
     unsafe fn dpi_store_vec(p: *mut u8, width: u32, four: bool, v: &Value) {
         let v = if v.is_real {
-            Value::from_u64(v.to_f64() as i64 as u64, 64).resize(width)
+            // A real stored into a packed vector is a VALUE conversion
+            // (round to nearest, ties away from zero, §5.2/§6.12), not a
+            // truncation toward zero nor a bit reinterpretation (#324).
+            let f = v.to_f64();
+            if f.is_finite() {
+                Value::from_u64(f.round() as i64 as u64, 64).resize(width)
+            } else {
+                Value::zero(width.max(1))
+            }
         } else {
             v.resize(width)
         };
