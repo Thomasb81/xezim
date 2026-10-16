@@ -73034,6 +73034,16 @@ impl Simulator {
                         }
                     }
                 }
+                // §7.2: a leaf of a default-filled unpacked-array formal that
+                // later acted as an output actual had its signedness flag
+                // clobbered through the copy-back (`copy_unpacked_struct` /
+                // `write_leaf_by_name`) even though the caller's leaf declared
+                // it signed. The read path stamps the queue-element case above;
+                // mirror it here for any leaf `signed_signals` records, so
+                // `%0d` on `v[0].a` prints a `byte` as -16, not 240.
+                if !v.is_real && self.signed_signals.contains(&flat) {
+                    v.is_signed = true;
+                }
                 return v;
             }
             if let Some(fields) = self.module.packed_struct_fields.get(&base_flat).cloned() {
@@ -140388,21 +140398,104 @@ impl Simulator {
     ) -> Option<()> {
         use crate::ast::types::UnpackedDimension as UD;
         let params = Some(&self.module.parameters);
-        let (lo, hi) = match dims.first()? {
-            UD::Range { left, right, .. } => {
-                let l = super::elaborate::const_eval_i64_with_params(left, params)?;
-                let r = super::elaborate::const_eval_i64_with_params(right, params)?;
-                (l.min(r), l.max(r))
-            }
-            UD::Expression { expr, .. } => {
-                let n = super::elaborate::const_eval_i64_with_params(expr, params)?;
-                if n <= 0 {
-                    return None;
+        let elems = super::elaborate::normalize_unpacked_dims(
+            dims,
+            &self.module.parameters,
+            &self.module.typedef_types,
+        );
+        // Resolve every dimension into `(lo,hi)` bounds plus whether it was
+        // declared DESCENDING (`[1:0]`). §10.10: a positional item fills the
+        // LEFT bound first, so a descending dim's first item lands at the
+        // HIGHER index — `byte v[1:0] = '{A5,5A}` gives v[1]=A5, v[0]=5A.
+        let mut lo_hi: Vec<(i64, i64)> = Vec::new();
+        let mut desc: Vec<bool> = Vec::new();
+        for d in &elems {
+            match d {
+                UD::Range { left, right, .. } => {
+                    let l = super::elaborate::const_eval_i64_with_params(left, params)?;
+                    let r = super::elaborate::const_eval_i64_with_params(right, params)?;
+                    desc.push(l > r);
+                    lo_hi.push((l.min(r), l.max(r)));
                 }
-                (0, n - 1)
+                UD::Expression { expr, .. } => {
+                    let n = super::elaborate::const_eval_i64_with_params(expr, params)?;
+                    if n <= 0 {
+                        return None;
+                    }
+                    desc.push(false);
+                    lo_hi.push((0, n - 1));
+                }
+                _ => return None,
             }
-            _ => return None,
-        };
+        }
+        if lo_hi.is_empty() {
+            return None;
+        }
+        // Unpacked-STRUCT element arrays (§7.2): a struct element has no
+        // storage of its own — this default must spread into MEMBER LEAVES
+        // `v[i].a`, `v[i].b` exactly as a bound actual does (`bind_array_arg`'s
+        // struct arm), or the leaves read x and an output write-back via
+        // `copy_unpacked_struct` copies nothing back (every member stayed its
+        // zero default).
+        if let Some(su) = self.unpacked_struct_of(data_type) {
+            let suffixes = Self::default_nd_suffixes(&lo_hi, &desc);
+            let n = suffixes.len();
+            if n == 0 {
+                return None;
+            }
+            // Packed width of ONE element (the struct's leaf-layout total).
+            let sw = self
+                .struct_leaf_layout(name, &su)
+                .iter()
+                .map(|(_, o, w, _)| o + w)
+                .max()
+                .unwrap_or(0);
+            if sw == 0 {
+                return None;
+            }
+            for (k, sfx) in suffixes.iter().enumerate() {
+                let top = (n - 1 - k) * (sw as usize) + (sw as usize) - 1;
+                let bot = (n - 1 - k) * (sw as usize);
+                let elem_packed = val.range_select(top, bot);
+                let elem_base = format!("{}{}", name, sfx);
+                for (leaf, lv) in
+                    self.split_packed_struct(&elem_base, &su, &elem_packed)
+                {
+                    self.signals.insert(leaf, lv);
+                }
+            }
+            // §7.2: also record each leaf's signedness so `%0d` prints it
+            // signed (a `byte` member of a default array element is `-16`,
+            // not `240`) and a later write stores signed — the fallback write
+            // path consults `signed_signals`, and the pre-packed values from
+            // `split_packed_struct` carry no signing flag.
+            for (k, sfx) in suffixes.iter().enumerate() {
+                let elem_base = format!("{}{}", name, sfx);
+                self.mark_struct_default_signed(&elem_base, &su);
+            }
+            match lo_hi.len() {
+                // `1 =>` returns `()`, matching the other arms.
+                1 => {
+                    self.module
+                        .arrays
+                        .insert(name.to_string(), (lo_hi[0].0, lo_hi[0].1, sw));
+                }
+                2 => {
+                    self.module.arrays_2d.insert(
+                        name.to_string(),
+                        ((lo_hi[0].0, lo_hi[0].1), (lo_hi[1].0, lo_hi[1].1), sw),
+                    );
+                    self.multi_dim_array_names.insert(name.to_string());
+                }
+                _ => {
+                    self.module
+                        .arrays_nd
+                        .insert(name.to_string(), (lo_hi.clone(), sw));
+                    self.multi_dim_array_names.insert(name.to_string());
+                }
+            }
+            return Some(());
+        }
         // Element width: for an unpacked-array formal the declared data type
         // is the ELEMENT type (`byte v[2]` -> `byte`, width 8) and the unpacked
         // dims live on the port. 0 means unresolvable (e.g. an opaque type);
@@ -140415,7 +140508,6 @@ impl Simulator {
         if w == 0 {
             return None;
         }
-        let n = (hi - lo + 1).max(0) as usize;
         // Element signedness (a `byte`/`shortint`/`int` element prints signed
         // on `%0d`); match what a bound actual's pre-existing signal carries.
         let signed = super::elaborate::is_type_signed_resolved(
@@ -140423,14 +140515,18 @@ impl Simulator {
             &self.module.typedef_types,
         );
         // Aggregate defaults pack left-to-right elements into high-to-low bits
-        // (`'{A5,5A}` -> 0xA55A with element 0 at [15:8]); peel each element out
-        // at `[(n-1-i)*w .. (n-i)*w)` into its own signal, preserving X/Z.
-        for (k, i) in (lo..=hi).enumerate() {
+        // across EVERY unpacked dim (`'{'{A5,B5},'{C5,D5}}` -> 0xA5B5C5D5 with
+        // flat element 0 = v[0][0] at [31:24]), descending dims included:
+        // peel each flat element out at `[(N-1-k)*w .. (N-k)*w)` into its own
+        // named signal, preserving X/Z.
+        let suffixes = Self::default_nd_suffixes(&lo_hi, &desc);
+        let n = suffixes.len();
+        for (k, sfx) in suffixes.iter().enumerate() {
             let top = (n - 1 - k) * (w as usize) + (w as usize) - 1;
             let bot = (n - 1 - k) * (w as usize);
             let mut ev = val.range_select(top, bot);
             ev.is_signed = signed;
-            let elem = format!("{}[{}]", name, i);
+            let elem = format!("{}{}", name, sfx);
             // Register the element's SIGNEDNESS so a later blocking write to it
             // (e.g. through an output/inout/ref sibling that binds this formal)
             // stores `%0d`-signed, not unsigned-lit —— the fallback write path
@@ -140442,8 +140538,106 @@ impl Simulator {
             }
             self.signals.insert(elem, ev);
         }
-        self.module.arrays.insert(name.to_string(), (lo, hi, w));
+        match lo_hi.len() {
+            1 => {
+                self.module
+                    .arrays
+                    .insert(name.to_string(), (lo_hi[0].0, lo_hi[0].1, w));
+            }
+            2 => {
+                self.module.arrays_2d.insert(
+                    name.to_string(),
+                    ((lo_hi[0].0, lo_hi[0].1), (lo_hi[1].0, lo_hi[1].1), w),
+                );
+                self.multi_dim_array_names.insert(name.to_string());
+            }
+            _ => {
+                self.module
+                    .arrays_nd
+                    .insert(name.to_string(), (lo_hi.clone(), w));
+                self.multi_dim_array_names.insert(name.to_string());
+            }
+        }
         Some(())
+    }
+
+    /// Record the SIGNEDNESS of every member-leaf of an unpacked struct so the
+    /// synthetic default array's leaves print `%0d`-signed exactly as a bound
+    /// array's declared leaves do, and a later write to `v[0].a` stores signed.
+    /// Mirror `copy_unpacked_struct`'s leaf walk (scalar members, nested
+    /// structs, member arrays-of-structs) so the keys match `split_packed_struct`.
+    fn mark_struct_default_signed(
+        &mut self,
+        base: &str,
+        su: &crate::ast::types::StructUnionType,
+    ) {
+        for m in &su.members {
+            for md in &m.declarators {
+                let d = format!("{}.{}", base, md.name.name);
+                if md.dimensions.is_empty() {
+                    if let crate::ast::types::DataType::Struct(inner) = self.resolve_dt(&m.data_type)
+                    {
+                        if Self::spreads_member_wise(&inner) {
+                            self.mark_struct_default_signed(&d, &inner);
+                            continue;
+                        }
+                    }
+                    let s = self.type_is_signed_concrete(&m.data_type);
+                    if let Some(v) = self.signals.get_mut(&d) {
+                        v.is_signed = s;
+                    }
+                    if s {
+                        self.signed_signals.insert(d.clone());
+                    } else {
+                        self.signed_signals.remove(&d);
+                    }
+                } else if let Some(tups) = self.member_elem_indices(&md.dimensions) {
+                    let elem_su = self.unpacked_struct_of(&m.data_type);
+                    let m_signed = self.type_is_signed_concrete(&m.data_type);
+                    for t in tups {
+                        let sfx = Self::index_suffix(&t);
+                        let di = format!("{}{}", d, sfx);
+                        if let Some(inner) = &elem_su {
+                            self.mark_struct_default_signed(&di, inner);
+                        } else {
+                            if let Some(v) = self.signals.get_mut(&di) {
+                                v.is_signed = m_signed;
+                            }
+                            if m_signed {
+                                self.signed_signals.insert(di.clone());
+                            } else {
+                                self.signed_signals.remove(&di);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Row-major `[i][j]…` element suffixes for the given unpacked dimensions,
+    /// with each DESCENDING dimension iterating high->low (§10.10 positional
+    /// fills the left bound first — `byte v[1:0]` takes its first item at
+    /// index 1). Ascending dims yield exactly what `nd_elem_suffixes` does.
+    fn default_nd_suffixes(dims: &[(i64, i64)], desc: &[bool]) -> Vec<String> {
+        let mut out: Vec<String> = vec![String::new()];
+        for (di, &(d0, d1)) in dims.iter().enumerate() {
+            let (lo, hi) = (d0.min(d1), d0.max(d1));
+            let mut next = Vec::with_capacity(out.len() * ((hi - lo + 1).max(0) as usize));
+            for prefix in &out {
+                if desc.get(di).copied().unwrap_or(false) {
+                    for i in (lo..=hi).rev() {
+                        next.push(format!("{}[{}]", prefix, i));
+                    }
+                } else {
+                    for i in lo..=hi {
+                        next.push(format!("{}[{}]", prefix, i));
+                    }
+                }
+            }
+            out = next;
+        }
+        out
     }
 
     /// Copy a fixed unpacked ARRAY actual into the formal's element signals and
@@ -140514,20 +140708,57 @@ impl Simulator {
                     return None;
                 };
             self.multi_dim_array_names.insert(param.clone());
-            if param != caller {
-                let w = match self.module.arrays_2d.get(&param) {
-                    Some(&(_, _, w)) => w,
-                    None => self.module.arrays_nd.get(&param).map_or(32, |t| t.1),
-                };
-                let out_default = self.output_formal_elem_default(port, w);
-                for sfx in &suffixes {
-                    let v = match &out_default {
-                        Some(d) => Some(d.clone()),
-                        None => self.get_signal_value_by_name(&format!("{}{}", caller, sfx)),
-                    };
-                    if let Some(v) = v {
-                        self.signals.insert(format!("{}{}", param, sfx), v);
+            // §7.2: elements of an UNPACKED-struct array are member leaves,
+            // so a whole-element value has no signal to fetch or store. Reuse
+            // `copy_unpacked_struct` per element (the 1-D branch does) so a
+            // 2-D `pkt_t w[2][2]` formal reads/writes the caller's leaves
+            // instead of zero. Run for identity bindings too (caller's array
+            // IS the formal): binding materializes the formal's leaves under
+            // the shared name, so in/out writes land and read back.
+            // Caller-or-formal element struct type (unpacked, spread
+            // member-wise); resolved once, then filtered by spreadability.
+            let su = self
+                .p_elem_type(&caller)
+                .or_else(|| self.p_elem_type(&param))
+                .and_then(|dt| self.unpacked_struct_of(&dt))
+                .filter(|su| Self::spreads_member_wise(su));
+            let w = match self.module.arrays_2d.get(&param) {
+                Some(&(_, _, w)) => w,
+                None => self.module.arrays_nd.get(&param).map_or(32, |t| t.1),
+            };
+            let out_default = if param == caller {
+                None
+            } else {
+                self.output_formal_elem_default(port, w)
+            };
+            for sfx in &suffixes {
+                if let Some(su) = &su {
+                    if out_default.is_some() {
+                        let mut leaves = Vec::new();
+                        self.unpacked_struct_leaf_defaults(
+                            &format!("{}{}", param, sfx),
+                            su,
+                            0,
+                            &mut leaves,
+                        );
+                        for (k, dv, _) in leaves {
+                            self.signals.insert(k, dv);
+                        }
+                    } else {
+                        self.copy_unpacked_struct(
+                            &format!("{}{}", param, sfx),
+                            &format!("{}{}", caller, sfx),
+                            &su.clone(),
+                        );
                     }
+                    continue;
+                }
+                let v = match &out_default {
+                    Some(d) => Some(d.clone()),
+                    None => self.get_signal_value_by_name(&format!("{}{}", caller, sfx)),
+                };
+                if let Some(v) = v {
+                    self.signals.insert(format!("{}{}", param, sfx), v);
                 }
             }
             return Some((param, caller.to_string(), lo, hi));
@@ -140751,8 +140982,26 @@ impl Simulator {
         for (param, caller, lo, hi) in wb {
             if let Some(sfxs) = self.nd_formal_suffixes(param) {
                 if param != caller {
+                    // §7.2: elements of an UNPACKED-struct array are member
+                    // leaves, not whole-element values, so the whole-element
+                    // copy below would silently drop the writeback. Reuse
+                    // `copy_unpacked_struct` per element (as the 1-D branch
+                    // below does) so a 2-D `output pkt_t w[2][2]` writes the
+                    // caller's member leaves back.
+                    let su = self
+                        .p_elem_type(param)
+                        .or_else(|| self.p_elem_type(caller))
+                        .and_then(|dt| self.unpacked_struct_of(&dt))
+                        .filter(|su| Self::spreads_member_wise(su));
                     for sfx in sfxs {
-                        if let Some(v) = self.get_signal_value_by_name(&format!("{}{}", param, sfx))
+                        if let Some(su) = &su {
+                            self.copy_unpacked_struct(
+                                &format!("{}{}", caller, sfx),
+                                &format!("{}{}", param, sfx),
+                                &su.clone(),
+                            );
+                        } else if let Some(v) =
+                            self.get_signal_value_by_name(&format!("{}{}", param, sfx))
                         {
                             self.set_signal_value_by_name(&format!("{}{}", caller, sfx), v);
                         }
