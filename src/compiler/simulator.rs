@@ -4212,11 +4212,13 @@ const SEED_X: u8 = 4;
 
 struct InstTemplate {
     chain: Vec<Arc<crate::compiler::elaborate::ElaboratedClass>>,
-    /// Per chain entry, per property in `properties` order: 0 = static or
-    /// associative (not seeded per instance), 1 = seeded under its bare
-    /// name, 2 = seeded under `Class::name` (redeclared nearer the leaf);
-    /// `SEED_X` set = seeded with x (see `prop_seeds_x`).
-    seed: Vec<Vec<u8>>,
+    /// Pre-seeded scalar/handle property map for the chain (cloned in one
+    /// allocation per `new()` instead of inserting property-by-property).
+    base_props: HashMap<String, Value>,
+    /// Property names redeclared along the chain (`seed & 3 == 2`).
+    shadowed_props: Vec<String>,
+    /// Whether any class in `chain` has `param_defaults` (value parameters).
+    has_value_params: bool,
     /// The `(chain index, property)` pairs, in the registration loop's
     /// order, that the type-parameter-bound collection registration can
     /// claim: a declared type name and no queue, associative, fixed,
@@ -151964,26 +151966,44 @@ impl Simulator {
             .filter(|c| std::sync::Arc::as_ptr(c) == class_def as *const _)
             .cloned();
         let leaf_in_map = leaf_from_map.is_some();
-        let leaf_arc = leaf_from_map.unwrap_or_else(|| std::sync::Arc::new(class_def.clone()));
-        let mut classes_to_init = vec![leaf_arc];
-        let mut cur: Option<&str> = class_def.extends.as_deref();
-        // Cycle guard — `sanitize_class_hierarchy` already severs `extends`
-        // cycles, but keep a defensive `seen` check so a stale chain can
-        // never spin this walk. (A chain is a handful of names: a linear
-        // scan of borrowed names, no copies.)
-        let mut seen: Vec<&str> = vec![class_def.name.as_str()];
-        while let Some(cname) = cur {
-            if seen.contains(&cname) {
-                break;
-            }
-            seen.push(cname);
-            if let Some(cdef) = self.module.classes.get(cname) {
-                classes_to_init.push(std::sync::Arc::clone(cdef));
-                cur = cdef.extends.as_deref();
+        let cached_tpl = leaf_from_map.as_ref().and_then(|la| {
+            self.inst_templates
+                .borrow()
+                .get(class_def.name.as_str())
+                .filter(|t| t.chain.first().is_some_and(|c0| std::sync::Arc::ptr_eq(c0, la)))
+                .cloned()
+        });
+        let (tpl, owned_chain);
+        let classes_to_init: &[std::sync::Arc<crate::compiler::elaborate::ElaboratedClass>] =
+            if let Some(t) = cached_tpl {
+                tpl = Some(t);
+                &tpl.as_ref().unwrap().chain
             } else {
-                break;
-            }
-        }
+                let leaf_arc =
+                    leaf_from_map.unwrap_or_else(|| std::sync::Arc::new(class_def.clone()));
+                let mut chain = vec![leaf_arc];
+                let mut cur: Option<&str> = class_def.extends.as_deref();
+                let mut seen: Vec<&str> = vec![class_def.name.as_str()];
+                while let Some(cname) = cur {
+                    if seen.contains(&cname) {
+                        break;
+                    }
+                    seen.push(cname);
+                    if let Some(cdef) = self.module.classes.get(cname) {
+                        chain.push(std::sync::Arc::clone(cdef));
+                        cur = cdef.extends.as_deref();
+                    } else {
+                        break;
+                    }
+                }
+                tpl = leaf_in_map.then(|| self.inst_template(&chain));
+                owned_chain = chain;
+                &owned_chain
+            };
+        let chain_has_params = match tpl.as_ref() {
+            Some(t) => t.has_value_params,
+            None => classes_to_init.iter().any(|c| !c.param_defaults.is_empty()),
+        };
         // §8.25 / §8.13: `class D extends B #(8);` supplies B's VALUE
         // parameters. `classes_to_init` is leaf-first, so entry `i`'s
         // `extends_type_args` binds entry `i+1`'s parameters. Without this an
@@ -151994,7 +152014,9 @@ impl Simulator {
         // directly; a bare identifier is resolved against the LEAF's own
         // parameters (`class D #(int N) extends B #(N);`), which are known
         // here from `arg_map`/defaults even though the leaf is bound last.
-        let ancestor_value_args: HashMap<String, HashMap<String, Value>> = {
+        let ancestor_value_args: HashMap<String, HashMap<String, Value>> = if !chain_has_params {
+            HashMap::default()
+        } else {
             let mut leaf_params: HashMap<String, Value> = HashMap::default();
             for (pname, pdefault) in class_def.param_defaults.iter() {
                 // An actual argument belongs to the specialization site's
@@ -152124,71 +152146,71 @@ impl Simulator {
         // other declarer stores under `"<Class>::<name>"`.
         // A chain from the class table has its per-property facts in a
         // template (see `InstTemplate`); an off-table definition derives them.
-        let tpl = leaf_in_map.then(|| self.inst_template(&classes_to_init));
-        let leaf_declarer: HashMap<&str, &str> = if tpl.is_some() {
-            HashMap::default()
+        if let Some(t) = tpl.as_ref() {
+            for sp in &t.shadowed_props {
+                if !self.shadowed_prop_names.contains(sp.as_str()) {
+                    self.shadowed_prop_mask |= meta_key_bits(sp);
+                    self.shadowed_prop_names.insert(sp.clone());
+                }
+            }
+            bump_store_gen();
+            instance.properties = PropMap(t.base_props.clone());
         } else {
-            let mut m: HashMap<&str, &str> = HashMap::default();
-            for cdef in &classes_to_init {
+            let mut leaf_declarer: HashMap<&str, &str> = HashMap::default();
+            for cdef in classes_to_init {
                 // leaf-first: the first declarer seen is the leaf-most.
                 for p in cdef.properties.keys() {
-                    m.entry(p.as_str()).or_insert(cdef.name.as_str());
+                    leaf_declarer.entry(p.as_str()).or_insert(cdef.name.as_str());
                 }
             }
-            m
-        };
-        for (ci, cdef) in classes_to_init.iter().enumerate().rev() {
-            for (pi, (prop_name, prop_sig)) in cdef.properties.iter().enumerate() {
-                // Static properties live in the shared `class_statics`
-                // cell; associative-array properties live in the
-                // instance-scoped signal map — neither is a per-instance
-                // scalar, so skip both here.
-                let seed = match tpl.as_ref() {
-                    Some(t) => t.seed[ci][pi],
-                    None => {
-                        if cdef.static_properties.contains(prop_name)
-                            || cdef.assoc_properties.contains_key(prop_name)
-                        {
-                            0
-                        } else if leaf_declarer
-                            .get(prop_name.as_str())
-                            .is_some_and(|l| *l != cdef.name.as_str())
-                        {
-                            2 | if self.prop_seeds_x(cdef, prop_name) {
-                                SEED_X
-                            } else {
-                                0
-                            }
+            for cdef in classes_to_init.iter().rev() {
+                for (prop_name, prop_sig) in cdef.properties.iter() {
+                    if cdef.static_properties.contains(prop_name)
+                        || cdef.assoc_properties.contains_key(prop_name)
+                    {
+                        continue;
+                    }
+                    let seed = if leaf_declarer
+                        .get(prop_name.as_str())
+                        .is_some_and(|l| *l != cdef.name.as_str())
+                    {
+                        2 | if self.prop_seeds_x(cdef, prop_name) {
+                            SEED_X
                         } else {
-                            1 | if self.prop_seeds_x(cdef, prop_name) {
-                                SEED_X
-                            } else {
-                                0
-                            }
+                            0
                         }
+                    } else {
+                        1 | if self.prop_seeds_x(cdef, prop_name) {
+                            SEED_X
+                        } else {
+                            0
+                        }
+                    };
+                    let key = if seed & 3 == 2 {
+                        if !self.shadowed_prop_names.contains(prop_name.as_str()) {
+                            self.shadowed_prop_mask |= meta_key_bits(prop_name);
+                            self.shadowed_prop_names.insert(prop_name.clone());
+                        }
+                        format!("{}::{}", cdef.name, prop_name)
+                    } else {
+                        prop_name.clone()
+                    };
+                    if seed & SEED_X != 0 {
+                        let mut v = Value::new(prop_sig.width.max(1));
+                        v.is_signed = prop_sig.is_signed;
+                        instance.properties.insert(key, v);
+                        continue;
                     }
-                };
-                if seed == 0 {
-                    continue;
+                    instance.properties.insert(key, prop_sig.value.clone());
                 }
-                let key = if seed & 3 == 2 {
-                    if !self.shadowed_prop_names.contains(prop_name.as_str()) {
-                        self.shadowed_prop_mask |= meta_key_bits(prop_name);
-                        self.shadowed_prop_names.insert(prop_name.clone());
-                    }
-                    format!("{}::{}", cdef.name, prop_name)
-                } else {
-                    prop_name.clone()
-                };
-                if seed & SEED_X != 0 {
-                    // §6.8, §8.7: a 4-state property of a named type starts at x.
-                    let mut v = Value::new(prop_sig.width.max(1));
-                    v.is_signed = prop_sig.is_signed;
-                    instance.properties.insert(key, v);
-                    continue;
-                }
-                instance.properties.insert(key, prop_sig.value.clone());
             }
+        }
+        for (ci, cdef) in classes_to_init
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|_| chain_has_params)
+        {
             // Bind class VALUE parameters (§8.25): each parameter gets the
             // specialization's argument (on the leaf class only, matched by
             // NAME through `arg_map` — never by raw slot, since type and
@@ -152317,7 +152339,7 @@ impl Simulator {
         // Register per-instance associative-array members under an
         // instance-scoped name `<handle>#<member>` so the existing
         // signal-keyed assoc machinery gives each instance its own map.
-        for cdef in &classes_to_init {
+        for cdef in classes_to_init {
             for (prop, &is_str) in &cdef.assoc_properties {
                 self.module
                     .associative_arrays
@@ -152679,7 +152701,7 @@ impl Simulator {
                 .unwrap_or_default();
             // Fixed struct arrays use heap member cells too. Their bounds may
             // depend on this object's parameters, not the cached class shape.
-            for cdef in &classes_to_init {
+            for cdef in classes_to_init {
                 for prop in cdef
                     .array_properties
                     .keys()
@@ -164889,36 +164911,37 @@ impl Simulator {
                     .or_insert(cdef.name.as_str());
             }
         }
-        let seed = chain
-            .iter()
-            .map(|cdef| {
-                cdef.properties
-                    .keys()
-                    .map(|p| {
-                        if cdef.static_properties.contains(p)
-                            || cdef.assoc_properties.contains_key(p)
-                        {
-                            0
-                        } else if leaf_declarer
-                            .get(p.as_str())
-                            .is_some_and(|l| *l != cdef.name.as_str())
-                        {
-                            2 | if self.prop_seeds_x(cdef, p) {
-                                SEED_X
-                            } else {
-                                0
-                            }
-                        } else {
-                            1 | if self.prop_seeds_x(cdef, p) {
-                                SEED_X
-                            } else {
-                                0
-                            }
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
+        let mut base_props: HashMap<String, Value> = HashMap::default();
+        let mut shadowed_props: Vec<String> = Vec::new();
+        for cdef in chain.iter().rev() {
+            for (prop_name, prop_sig) in cdef.properties.iter() {
+                if cdef.static_properties.contains(prop_name)
+                    || cdef.assoc_properties.contains_key(prop_name)
+                {
+                    continue;
+                }
+                let redeclared = leaf_declarer
+                    .get(prop_name.as_str())
+                    .is_some_and(|l| *l != cdef.name.as_str());
+                let key = if redeclared {
+                    if !shadowed_props.contains(prop_name) {
+                        shadowed_props.push(prop_name.clone());
+                    }
+                    format!("{}::{}", cdef.name, prop_name)
+                } else {
+                    prop_name.clone()
+                };
+                let v = if self.prop_seeds_x(cdef, prop_name) {
+                    let mut x = Value::new(prop_sig.width.max(1));
+                    x.is_signed = prop_sig.is_signed;
+                    x
+                } else {
+                    prop_sig.value.clone()
+                };
+                base_props.insert(key, v);
+            }
+        }
+        let has_value_params = chain.iter().any(|c| !c.param_defaults.is_empty());
         let mut coll_candidates = Vec::new();
         for (ci, cdef) in chain.iter().enumerate() {
             for (prop, sig) in &cdef.properties {
@@ -164983,7 +165006,9 @@ impl Simulator {
         }
         let t = std::rc::Rc::new(InstTemplate {
             chain: chain.to_vec(),
-            seed,
+            base_props,
+            shadowed_props,
+            has_value_params,
             coll_candidates,
             struct_defaults,
             struct_cells,
