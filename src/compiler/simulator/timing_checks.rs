@@ -221,7 +221,7 @@ fn terminal_text(text: &str) -> &str {
 
 impl Simulator {
     /// Resolve `module.timing_checks` into comb entries (see the module doc).
-    pub(super) fn build_timing_check_entries(&mut self, entries: &mut Vec<CombEntry>) {
+    pub(super) fn build_timing_check_entries(&mut self, _entries: &mut Vec<CombEntry>) {
         let checks = std::mem::take(&mut self.module.timing_checks);
         if checks.is_empty()
             || NO_TIMING_CHECKS.load(std::sync::atomic::Ordering::Relaxed)

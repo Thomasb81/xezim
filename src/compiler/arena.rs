@@ -157,7 +157,7 @@ impl Arena {
     /// Allocate a Vec and return it wrapped in an ArenaVec.
     /// This allows storing the Vec in the arena while providing a convenient API.
     #[inline]
-    pub fn alloc_vec<T>(&self, capacity: usize) -> ArenaVec<'_, T> {
+    pub fn alloc_vec<T>(&self, _capacity: usize) -> ArenaVec<'_, T> {
         ArenaVec {
             arena: self,
             _marker: PhantomData,
@@ -251,7 +251,7 @@ mod tests {
     fn test_arena_reset() {
         let arena = Arena::with_capacity(1024);
 
-        let v1 = arena.alloc(42u32);
+        let _v1 = arena.alloc(42u32);
         assert_eq!(arena.offset(), 4); // u32 is 4 bytes
 
         arena.reset();

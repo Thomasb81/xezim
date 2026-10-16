@@ -8449,7 +8449,7 @@ impl Simulator {
         if !self.csp_wide_touch(csp, e, env) {
             return self.csp_refs(csp, e, env, out);
         }
-        let mut all = |me: &mut Self, xs: &[&Expression], out: &mut Vec<usize>| {
+        let all = |me: &mut Self, xs: &[&Expression], out: &mut Vec<usize>| {
             xs.iter().all(|x| me.csp_wide_deps(csp, x, env, out))
         };
         match &e.kind {

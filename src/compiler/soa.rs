@@ -349,7 +349,6 @@ impl SoaSignalTable {
 #[cfg(test)]
 mod benchmarks {
     use super::*;
-    use std::time::Instant;
 
     #[test]
     fn test_soa_vs_aos_memory() {

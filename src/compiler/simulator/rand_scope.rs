@@ -1634,7 +1634,7 @@ impl Simulator {
         rand_roots: &HashSet<String>,
         bound: &mut Vec<String>,
     ) -> Option<ConstraintItem> {
-        let mut fold = |me: &mut Self, x: &ConstraintItem, bound: &mut Vec<String>| {
+        let fold = |me: &mut Self, x: &ConstraintItem, bound: &mut Vec<String>| {
             me.fold_state_guard_item(x, rand_roots, bound)
         };
         match it {

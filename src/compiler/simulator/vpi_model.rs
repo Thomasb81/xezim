@@ -3978,7 +3978,7 @@ impl<'a> Builder<'a> {
                 false,
                 true,
             );
-            let mut term = |b: &mut Self, i: Option<usize>, is_notifier: bool| -> u32 {
+            let term = |b: &mut Self, i: Option<usize>, is_notifier: bool| -> u32 {
                 let Some(Some(a)) = i.and_then(|i| tc.args.get(i)) else {
                     return NONE;
                 };
@@ -4719,7 +4719,7 @@ pub(super) fn handle_by_index(
     h: &VpiHandle,
     index: i64,
 ) -> Option<*mut libc::c_void> {
-    let r = with_model(sim, |m, sim| match ident(m, h)? {
+    let r = with_model(sim, |m, _sim| match ident(m, h)? {
         MRef::Obj(o) => {
             if let OData::GenArray { elems } = &m.objs[o as usize].d {
                 let s = elems

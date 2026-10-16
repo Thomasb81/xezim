@@ -22,7 +22,7 @@ use super::interrupt::{
     publish_sim_time,
 };
 use fst_writer::{
-    FstBodyWriter, FstHeaderWriter, FstScopeType, FstSignalId, FstSignalType, FstVarDirection,
+    FstHeaderWriter, FstScopeType, FstSignalId, FstSignalType, FstVarDirection,
     FstVarType,
 };
 use libffi::middle::{Arg, Cif, CodePtr, Type};
@@ -5144,7 +5144,6 @@ fn bytecode_array_first_id(
 // ---- Wide two-state register word helpers (little-endian `[u64; N]`). ----
 
 /// Top word index of a `w`-bit value and the mask of its live bits.
-#[inline(always)]
 fn wtop(w: u16) -> (usize, u64) {
     let top = ((w as usize).max(1) - 1) >> 6;
     let r = w as u32 - (top as u32) * 64;
@@ -13892,10 +13891,10 @@ impl Drop for Simulator {
     }
 }
 
-/// Per-thread path of value-parameter names currently being resolved by
-/// `Simulator::resolve_value_param_from_spec`. Used to break cyclic value-param
-/// references (a specialization argument that names a value param of the same
-/// class, which would otherwise recurse infinitely and overflow the stack).
+// Per-thread path of value-parameter names currently being resolved by
+// `Simulator::resolve_value_param_from_spec`. Used to break cyclic value-param
+// references (a specialization argument that names a value param of the same
+// class, which would otherwise recurse infinitely and overflow the stack).
 thread_local! {
     static VALPARAM_RESOLVING: std::cell::RefCell<Vec<String>> =
         std::cell::RefCell::new(Vec::new());
@@ -16426,7 +16425,7 @@ impl Simulator {
             } else {
                 DpiArgKind::LogicIn
             }),
-            DataType::Implicit { dimensions, .. } => {
+            DataType::Implicit { dimensions: _, .. } => {
                 // Implicitly-typed with a packed range (`[N:0] x`) is a 4-state
                 // packed vector -> svLogicVecVal* pointer at every width
                 // (Annex H.10.2), same as an explicit `logic [N:0]`.
@@ -18108,7 +18107,7 @@ impl Simulator {
         // from each declaring class's `static_assoc_key_types` so a
         // `static T map[string]` gets string storage (hashing the bare name
         // as NUMERIC would corrupt foreach()/first()/next()).
-        let static_cols: Vec<(String, bool, u32, bool)> = self
+        let _static_cols: Vec<(String, bool, u32, bool)> = self
             .module
             .classes
             .values()
@@ -21530,7 +21529,6 @@ impl Simulator {
                         !id.name.starts_with("__xz_")
                     }
                     TimingControl::Event(_) => true,
-                    _ => false,
                 };
                 ok && self.stmt_is_plain_stimulus(stmt)
             }
@@ -23236,7 +23234,7 @@ impl Simulator {
         }
         fn canon_arr(
             map: &mut HashMap<usize, u32>,
-            smap: &mut HashMap<u32, u32>,
+            _smap: &mut HashMap<u32, u32>,
             a: &ArrayOperand,
         ) -> (u32, i64, i64) {
             match a {
@@ -24508,7 +24506,7 @@ impl Simulator {
         let mut frontier: Vec<usize> = Vec::new();
         let dep_off = &self.comb_dep_offsets;
         let dep_ent = &self.comb_dep_entries;
-        let mut push_readers = |sig: usize, frontier: &mut Vec<usize>, in_cone: &mut Vec<bool>| {
+        let push_readers = |sig: usize, frontier: &mut Vec<usize>, in_cone: &mut Vec<bool>| {
             if sig + 1 < dep_off.len() {
                 for &e in &dep_ent[dep_off[sig] as usize..dep_off[sig + 1] as usize] {
                     let e = e as usize;
@@ -24966,7 +24964,7 @@ impl Simulator {
         }
         let widths = &self.signal_widths;
         let mut out: Vec<(u32, u64)> = Vec::new();
-        let mut add_bit = |out: &mut Vec<(u32, u64)>, b: BitRef| {
+        let add_bit = |out: &mut Vec<(u32, u64)>, b: BitRef| {
             let w = widths.get(b.sig_id as usize).copied().unwrap_or(0);
             let m = super::bytecode::sig_span_mask(w, b.bit, 1);
             if let Some(e) = out.iter_mut().find(|e| e.0 == b.sig_id) {
@@ -24975,7 +24973,7 @@ impl Simulator {
                 out.push((b.sig_id, m));
             }
         };
-        let mut add_gate = |out: &mut Vec<(u32, u64)>, g: &FusedGate| match g {
+        let add_gate = |out: &mut Vec<(u32, u64)>, g: &FusedGate| match g {
             FusedGate::Buf1 { src, .. } => add_bit(out, *src),
             FusedGate::Bin2 { a, b, .. } => {
                 add_bit(out, *a);
@@ -25148,7 +25146,7 @@ impl Simulator {
         if !self.ctl_on || !self.sdf_delays.is_empty() {
             return;
         }
-        let n = self.comb_entries.len();
+        let _n = self.comb_entries.len();
         let nsig = self.comb_dep_offsets.len().saturating_sub(1);
         let offs = &self.comb_dep_offsets;
         let fanout = |s: u32| -> u32 {
@@ -25608,7 +25606,7 @@ impl Simulator {
 
     /// A JIT slot died: re-plan without it (Ts entries keep their island —
     /// only a Jit plan decays to Interp).
-    fn downgrade_comb_plan(&mut self, eidx: usize) {
+    fn downgrade_comb_plan(&mut self, _eidx: usize) {
         #[cfg(feature = "jit")]
         if matches!(
             self.comb_plan.get(eidx),
@@ -27090,7 +27088,7 @@ impl Simulator {
                     // The window is fully defined on an X-free selector, so
                     // `xz_path` (the wildcard compare chain) cannot be taken.
                     let v = regs[*s as usize] & *mask;
-                    pc = mj.table[(((v >> *lo) & *wmask) as usize)] as usize;
+                    pc = mj.table[((v >> *lo) & *wmask) as usize] as usize;
                     continue;
                 }
                 TsInsn::ElemLoad(op) => {
@@ -27413,7 +27411,7 @@ impl Simulator {
                     }
                 } else {
                     debug_assert!(__s < self.signal_table.len());
-                    unsafe { self.signal_table.get_unchecked(__s) }.raw_bits()
+                    { self.signal_table.get_unchecked(__s) }.raw_bits()
                 }
             }};
         }
@@ -27868,8 +27866,7 @@ impl Simulator {
                     | TsInsn::SaveSigW { .. }
                     | TsInsn::WNbaFromElem(..)
                     | TsInsn::RangeFillXW { .. }
-                    | TsInsn::LoopPoll => match unsafe { self.ts_exec_dyn(insn, rp) } {
-                        0 => {}
+                    | TsInsn::LoopPoll => match self.ts_exec_dyn(insn, rp) {
                         1 => return false,
                         _ => xbail!(),
                     },
@@ -28579,7 +28576,7 @@ impl Simulator {
     /// SAFETY: `regs` is the executor's register file, sized for every
     /// register index the lowered stream names.
     #[inline(never)]
-    unsafe fn ts_exec_dyn(&mut self, insn: &super::bytecode::TsInsn, regs: *mut u64) -> u8 {
+    unsafe fn ts_exec_dyn(&mut self, insn: &super::bytecode::TsInsn, regs: *mut u64) -> u8 { unsafe {
         use super::bytecode::TsInsn;
         match insn {
             // 1 = bail: the four-state re-run takes the interrupt at the
@@ -28665,7 +28662,7 @@ impl Simulator {
             }
             _ => 0,
         }
-    }
+    }}
 
     /// `sig[lo +: w]` at a run-time offset, for the two-state executors.
     #[inline(never)]
@@ -28793,7 +28790,7 @@ impl Simulator {
                     }
                 } else {
                     debug_assert!(__s < self.signal_table.len());
-                    unsafe { self.signal_table.get_unchecked(__s) }.raw_bits()
+                    { self.signal_table.get_unchecked(__s) }.raw_bits()
                 }
             }};
         }
@@ -28891,9 +28888,9 @@ impl Simulator {
                     }
                     TsInsn::Sel { d, c, a, b, .. } => {
                         (*rp.add(*d as usize)) = if (*rp.add(*c as usize)) != 0 {
-                            (*rp.add(*a as usize))
+                            *rp.add(*a as usize)
                         } else {
-                            (*rp.add(*b as usize))
+                            *rp.add(*b as usize)
                         };
                     }
                     TsInsn::Not { d, s, mask } => {
@@ -28910,13 +28907,13 @@ impl Simulator {
                     }
                     TsInsn::Add { d, a, b, mask } => {
                         (*rp.add(*d as usize)) =
-                            (*rp.add(*a as usize)).wrapping_add((*rp.add(*b as usize))) & mask;
+                            (*rp.add(*a as usize)).wrapping_add(*rp.add(*b as usize)) & mask;
                     }
                     TsInsn::AddC { d, s: sr, k, mask } => {
                         (*rp.add(*d as usize)) = (*rp.add(*sr as usize)).wrapping_add(*k) & mask;
                     }
                     TsInsn::Shl { d, a, b, w, mask } => {
-                        let amt = (*rp.add(*b as usize));
+                        let amt = *rp.add(*b as usize);
                         (*rp.add(*d as usize)) = if amt >= *w as u64 {
                             0
                         } else {
@@ -28924,7 +28921,7 @@ impl Simulator {
                         };
                     }
                     TsInsn::Shr { d, a, b, w } => {
-                        let amt = (*rp.add(*b as usize));
+                        let amt = *rp.add(*b as usize);
                         (*rp.add(*d as usize)) = if amt >= *w as u64 {
                             0
                         } else {
@@ -28933,7 +28930,7 @@ impl Simulator {
                     }
                     TsInsn::Sub { d, a, b, mask } => {
                         (*rp.add(*d as usize)) =
-                            (*rp.add(*a as usize)).wrapping_sub((*rp.add(*b as usize))) & mask;
+                            (*rp.add(*a as usize)).wrapping_sub(*rp.add(*b as usize)) & mask;
                     }
                     TsInsn::Eq { d, a, b } => {
                         (*rp.add(*d as usize)) =
@@ -28961,14 +28958,14 @@ impl Simulator {
                         } as u64;
                     }
                     TsInsn::BitStoreNbaDyn { sig, i, s, w } => {
-                        let idx = (*rp.add(*i as usize));
+                        let idx = *rp.add(*i as usize);
                         if idx < *w as u64 {
                             let bit = (*rp.add(*s as usize)) & 1;
                             self.ts_bit_store_nba(*sig as usize, idx as u32, bit);
                         }
                     }
                     TsInsn::BitDyn { d, s, i, w } => {
-                        let idx = (*rp.add(*i as usize));
+                        let idx = *rp.add(*i as usize);
                         if idx >= *w as u64 {
                             return false;
                         }
@@ -29288,7 +29285,7 @@ impl Simulator {
                     TsInsn::BitStoreDyn { sig, i, s, w } => {
                         // §11.5.1: an out-of-range dynamic bit-select target
                         // drops the write (`Value::set_bit` is a no-op there).
-                        let idx = (*rp.add(*i as usize));
+                        let idx = *rp.add(*i as usize);
                         if idx < *w as u64 {
                             let b = (*rp.add(*s as usize)) & 1;
                             if *w > 64 {
@@ -29308,8 +29305,7 @@ impl Simulator {
                     | TsInsn::SaveSigW { .. }
                     | TsInsn::WNbaFromElem(..)
                     | TsInsn::RangeFillXW { .. }
-                    | TsInsn::LoopPoll) => match unsafe { self.ts_exec_dyn(insn, rp) } {
-                        0 => {}
+                    | TsInsn::LoopPoll) => match self.ts_exec_dyn(insn, rp) {
                         1 => return false,
                         _ => xbail!(),
                     },
@@ -29386,10 +29382,10 @@ impl Simulator {
                     }
                     TsInsn::Mul { d, a, b, mask } => {
                         (*rp.add(*d as usize)) =
-                            (*rp.add(*a as usize)).wrapping_mul((*rp.add(*b as usize))) & mask;
+                            (*rp.add(*a as usize)).wrapping_mul(*rp.add(*b as usize)) & mask;
                     }
                     TsInsn::Repl { d, s, w, count } => {
-                        let part = (*rp.add(*s as usize));
+                        let part = *rp.add(*s as usize);
                         (*rp.add(*d as usize)) = replicate_narrow(part, *w, *count);
                     }
                     TsInsn::WSigRange { .. } => {
@@ -29462,7 +29458,7 @@ impl Simulator {
                         // The window is fully defined on an X-free selector, so
                         // `xz_path` (the wildcard compare chain) cannot be taken.
                         let v = (*rp.add(*s as usize)) & *mask;
-                        pc = mj.table[(((v >> *lo) & *wmask) as usize)] as usize;
+                        pc = mj.table[((v >> *lo) & *wmask) as usize] as usize;
                         continue;
                     }
                     TsInsn::ElemLoad(op) => {
@@ -37860,7 +37856,7 @@ impl Simulator {
                         }
                     }
                 };
-                let is_pure_observer = wids.is_empty();
+                let _is_pure_observer = wids.is_empty();
                 entries.push(CombEntry {
                     item,
                     cold: Box::new(CombEntryCold {
@@ -52559,7 +52555,7 @@ impl Simulator {
                 };
                 if let Some(call) = rewritten {
                     let call_stmt = Statement::new(StatementKind::Expr(call), stmt.span);
-                    let mut cont = vec![call_stmt];
+                    let cont = vec![call_stmt];
                     // Chain the caller's tail instead of copying it onto the end of
                     // the spliced body (ProcCont::pushed).
                     self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
@@ -53280,7 +53276,7 @@ impl Simulator {
                     let val = self.eval_expr(rhs);
                     let delay = self.eval_delay_ticks(d_expr);
                     let saved = self.make_intra_saved_expr(val, rvalue.span);
-                    let mut cont = vec![Statement::new(
+                    let cont = vec![Statement::new(
                         StatementKind::BlockingAssign {
                             lvalue: lvalue.clone(),
                             rvalue: saved,
@@ -53388,7 +53384,7 @@ impl Simulator {
                             .collect();
                         let sens =
                             self.event_to_sens(&crate::ast::stmt::EventControl::EventExpr(evs));
-                        let mut cont = vec![Statement::new(
+                        let cont = vec![Statement::new(
                             StatementKind::WaitOrder {
                                 events: events.clone(),
                                 pass: pass.clone(),
@@ -53450,7 +53446,7 @@ impl Simulator {
                             && !matches!(d.kind, ExprKind::Number(_))
                             && self.t0_delay_deferred.insert(pid)
                         {
-                            let mut whole = vec![Statement::new(
+                            let whole = vec![Statement::new(
                                 StatementKind::TimingControl {
                                     control: TimingControl::Delay(d.clone()),
                                     stmt: body.clone(),
@@ -53462,7 +53458,7 @@ impl Simulator {
                             self.inactive_queue.push((pid, whole));
                             return;
                         }
-                        let mut cont = vec![*body.clone()];
+                        let cont = vec![*body.clone()];
                         // Chain the caller's tail rather than copying it (ProcCont::pushed).
                         let cont = pc.pushed(cont, pc.start + i + 1);
                         if delay == 0 {
@@ -53518,7 +53514,7 @@ impl Simulator {
                         // so accept both shapes.
                         if let Some(fname) = self.event_control_field_name(event) {
                             if let Some(key) = self.resolve_this_event_field(&fname) {
-                                let mut cont = vec![*body.clone()];
+                                let cont = vec![*body.clone()];
                                 // Chain the caller's tail rather than copying it (ProcCont::pushed).
                                 let cont = pc.pushed(cont, pc.start + i + 1);
                                 self.instance_event_waiters.push(InstanceEventWaiter {
@@ -53609,7 +53605,7 @@ impl Simulator {
                             return;
                         }
                         if !sens.is_empty() {
-                            let mut cont = vec![*body.clone()];
+                            let cont = vec![*body.clone()];
                             // Chain the caller's tail rather than copying it (ProcCont::pushed).
                             let cont = pc.pushed(cont, pc.start + i + 1);
                             // Late-bind virtual-interface / handle-chained
@@ -53691,7 +53687,7 @@ impl Simulator {
                     // peer process writing `sig` at the same simtime. Level-sensitive
                     // condition handoffs depend on exactly this delta-cycle
                     // handoff. Always park in condition_waiters.
-                    let mut cont = vec![stmt.clone()];
+                    let cont = vec![stmt.clone()];
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
                     self.park_condition_waiter(pid, cont, condition);
@@ -54005,7 +54001,7 @@ impl Simulator {
                     match chosen {
                         Some(arm) if self.stmt_is_blocking(arm) => {
                             let arm_stmts: Vec<Statement> = Self::spliced_body(arm);
-                            let mut cont = arm_stmts;
+                            let cont = arm_stmts;
                             // Chain the caller's tail instead of copying it onto the end of
                             // the spliced body (ProcCont::pushed).
                             self.run_process_stmts(pid, &pc.pushed(cont, pc.start + i + 1));
@@ -54126,7 +54122,7 @@ impl Simulator {
                         },
                         stmt.span,
                     );
-                    let mut cont = vec![while_stmt];
+                    let cont = vec![while_stmt];
                     // Chain the caller's tail rather than copying it (ProcCont::pushed).
                     let cont = pc.pushed(cont, pc.start + i + 1);
                     self.continue_stmts_or_trampoline(pid, cont);
@@ -54566,7 +54562,7 @@ impl Simulator {
                 let is_foreach_fallback = matches!(&stmt.kind, StatementKind::Foreach { .. });
                 if is_foreach_fallback {
                     self.exec_park_cont = Some({
-                        let mut c = vec![stmt.clone()];
+                        let c = vec![stmt.clone()];
                         // Chain the caller's tail rather than copying it (ProcCont::pushed).
                         let c = pc.pushed(c, pc.start + i + 1);
                         c
@@ -56046,7 +56042,7 @@ impl Simulator {
                             && !matches!(d.kind, ExprKind::Number(_))
                             && self.t0_delay_deferred.insert(pid)
                         {
-                            let mut restart = vec![Statement::new(
+                            let restart = vec![Statement::new(
                                 StatementKind::Forever {
                                     body: Box::new(body.clone()),
                                 },
@@ -61543,7 +61539,7 @@ impl Simulator {
         let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut reads: Vec<String> = Vec::new();
         let mut writes: Vec<String> = Vec::new();
-        let mut link = |reads: &[String], writes: &[String], adj: &mut Vec<Vec<u32>>| {
+        let link = |reads: &[String], writes: &[String], adj: &mut Vec<Vec<u32>>| {
             let rs: Vec<usize> = reads
                 .iter()
                 .filter_map(|r| pos.get(r.as_str()).copied())
@@ -62418,11 +62414,11 @@ impl Simulator {
                 // bail falls through to the ordinary path below, which
                 // re-dispatches (and demotes) exactly as before.
                 let mut ts_fast = false;
-                let mut ts_native_bailed = false;
+                let ts_native_bailed = false;
                 // A native x-read bail keeps its write records: the stores it
                 // made before the bail are already in the table, and the
                 // executor's re-run below finds them unchanged.
-                let mut ts_keep_recs = false;
+                let ts_keep_recs = false;
                 #[cfg(feature = "jit")]
                 if self.proc_depth == 0 && self.ts_jit_on {
                     if let Some(Some(f)) = self.ts_jit_fns.get(eidx) {
@@ -71316,76 +71312,6 @@ impl Simulator {
                 }
                 Value::from_u64(u32::MAX as u64, 32)
             }
-            // §21.3.4.2 `$fgets(str, fd)`: read a line into the string
-            // variable; returns the count of chars read, or 0 on EOF/error.
-            "$fgets" => {
-                use std::io::Read;
-                let dest = args.first();
-                let fd = args
-                    .get(1)
-                    .map(|a| self.eval_file_handle_arg(a))
-                    .unwrap_or(0);
-                let mut line = Vec::new();
-                let mut got_eof = true;
-                let mut hit_end = false;
-                if let Some(f) = self.file_handles.get_mut(&fd) {
-                    let mut b = [0u8; 1];
-                    loop {
-                        // Check ungetc buffer first
-                        if let Some(buf) = self.ungetc_buf.get_mut(&fd) {
-                            if let Some(c) = buf.pop() {
-                                got_eof = false;
-                                if c == b'\n' {
-                                    line.push(c);
-                                    break;
-                                }
-                                line.push(c);
-                                continue;
-                            }
-                        }
-                        match f.read(&mut b) {
-                            Ok(0) => {
-                                hit_end = true;
-                                break;
-                            }
-                            Ok(_) => {
-                                got_eof = false;
-                                if b[0] == b'\n' {
-                                    line.push(b[0]);
-                                    break;
-                                }
-                                line.push(b[0]);
-                            }
-                            Err(_) => {
-                                hit_end = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if hit_end {
-                    self.file_eof.insert(fd);
-                }
-                // §21.3.4.2: the line's raw BYTES — a byte >= 0x80 is one
-                // string character, not part of a UTF-8 sequence.
-                if let Some(d) = dest {
-                    self.assign_value(d, &Self::sv_string_from_bytes(&line));
-                }
-                if got_eof && line.is_empty() {
-                    Value::zero(32)
-                } else {
-                    Value::from_u64(line.len() as u64, 32)
-                }
-            }
-            // §21.3.8 `$feof(fd)`: returns nonzero if the file is at EOF.
-            "$feof" => {
-                let fd = args
-                    .first()
-                    .map(|a| self.eval_file_handle_arg(a))
-                    .unwrap_or(0);
-                let flag = self.file_eof.contains(&fd) || !self.file_handles.contains_key(&fd);
-                Value::from_u64(flag as u64, 32)
-            }
             // §21.3.7 `$ferror(fd, str)`: returns 0 if no error, writes a
             // description string to the 2nd argument.
             "$ferror" => {
@@ -75697,7 +75623,7 @@ impl Simulator {
                     // method), a local, a `this` property, or a signal.
                     // `eval_ident_handle` covers local/this/static; signals
                     // need an explicit fallback.
-                    let mut cur_handle = self
+                    let cur_handle = self
                         .eval_ident_handle(obj_name)
                         .filter(|&h| h != 0 && h < self.heap.len())
                         .or_else(|| {
@@ -75714,10 +75640,9 @@ impl Simulator {
                                 .map(|h| h as usize)
                                 .filter(|&h| h != 0 && h < self.heap.len())
                         });
-                    while let Some(h) = cur_handle {
+                    if let Some(h) = cur_handle {
                         for i in 1..hier.path.len() {
                             if h == 0 || h >= self.heap.len() {
-                                cur_handle = None;
                                 break;
                             }
                             let member_name = &hier.path[i].name.name;
@@ -75733,13 +75658,10 @@ impl Simulator {
                                 if i == hier.path.len() - 1 {
                                     return mval;
                                 }
-                                cur_handle = Some(mval.to_u64().unwrap_or(0) as usize);
                             } else {
-                                cur_handle = None;
                                 break;
                             }
                         }
-                        break;
                     }
                 }
                 // §26.3: `pkg::MEMBER` reaching here is an enum member of a
@@ -76938,7 +76860,7 @@ impl Simulator {
                 // element 0 and an unknown index returned real array data.
                 // Only for a side-effect-free index, so the extra evaluation
                 // cannot run a call twice.
-                if let ExprKind::Ident(h) = &expr.kind
+                if let ExprKind::Ident(_h) = &expr.kind
                     && Self::cond_expr_is_effect_free(index, false)
                 {
                     let nm = base_nm.as_deref().unwrap_or("");
@@ -77009,7 +76931,7 @@ impl Simulator {
                 // Guarded on the base NOT being an unpacked array: for
                 // `wire [1:0][7:0] w [0:1]`, `w[0]` indexes the UNPACKED
                 // dimension first and must stay on the existing path.
-                if let ExprKind::Ident(h) = &expr.kind {
+                if let ExprKind::Ident(_h) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
                     if !self.module.arrays.contains_key(nm)
                         && self.signal_name_to_id.contains_key(nm)
@@ -77232,7 +77154,7 @@ impl Simulator {
                 // Ascending packed vector bit-select (`logic [0:7] pa; pa[i]`):
                 // label i is the MSB end, so it reads internal bit (W-1)-i
                 // (LRM §7.4.1, §11.5.1). Whole-value storage is normal.
-                if let ExprKind::Ident(h) = &expr.kind {
+                if let ExprKind::Ident(_h) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
                     if let Some((lo_l, hi_l)) = self.module.ascending_packed.get(nm).copied() {
                         // §11.5.1: unknown or out-of-range label reads x.
@@ -77651,7 +77573,7 @@ impl Simulator {
                 // fixed-width container (e.g. 1024 bits), so `width/8` is the
                 // container size, not the string length — indexing that read
                 // the empty leading bytes and always returned 0.
-                if let ExprKind::Ident(hier) = &expr.kind {
+                if let ExprKind::Ident(_hier) = &expr.kind {
                     let nm = base_nm.as_deref().unwrap_or("");
                     if self.string_signals.contains(nm) {
                         let content = self.eval_expr(expr).sv_string_bytes();
@@ -80728,7 +80650,7 @@ impl Simulator {
                                     .or_else(|| self.this_property_type_args(&bname))
                                     .or_else(|| self.var_type_args.get(&bname).cloned());
                             }
-                            let mut v = None;
+                            let v;
                             if let Some(ta_args) = ta {
                                 v = Some(self.instantiate_class_with_type_args(
                                     &cd,
@@ -82761,7 +82683,7 @@ impl Simulator {
     #[inline(never)]
     fn exec_stmt_foreach(
         &mut self,
-        stmt: &Statement,
+        _stmt: &Statement,
         array: &Expression,
         vars: &[Option<crate::ast::Identifier>],
         body: &Statement,
@@ -83889,7 +83811,7 @@ impl Simulator {
     #[inline(never)]
     fn exec_stmt_var_decl(
         &mut self,
-        stmt: &Statement,
+        _stmt: &Statement,
         data_type: &DataType,
         lifetime: &Option<crate::ast::types::Lifetime>,
         declarators: &[VarDeclarator],
@@ -96932,11 +96854,6 @@ impl Simulator {
     /// of its per-destination loop — SDF annotation cannot change while a
     /// fanout group is being written.
     #[inline(always)]
-    /// Gate-lane commit for a ≤64-bit destination (always inline storage):
-    /// direct plane update, and only the write notes the destination needs
-    /// (`obs` bits from `build_gate_lane`). Falls back to the generic commit
-    /// when any global observer is active.
-    #[inline(always)]
     /// Whether a gate-lane commit must take the full `fused_bit_commit`
     /// path because a global observer is active. Nothing a lane commit does
     /// changes any of these, so the lane tests it once per drain.
@@ -98950,7 +98867,7 @@ impl Simulator {
             }
         }
         let mut sigs: Vec<usize> = Vec::new();
-        let mut push = |id: u32, out: &mut Vec<usize>| out.push(id as usize);
+        let push = |id: u32, out: &mut Vec<usize>| out.push(id as usize);
         match insn {
             Insn::LoadSignal(_, id)
             | Insn::LoadSignalSigned(_, id)
@@ -100382,8 +100299,6 @@ impl Simulator {
     /// existing evaluation fallback), so this only ever widens the set of
     /// calls whose width is taken statically. See `call_return_width`.
     fn class_method_return_width(&self, func: &Expression) -> Option<u32> {
-        use crate::ast::decl::ClassMethodKind;
-        use crate::ast::types::DataType;
         // Extract the receiver expression + method name. `infer_width` probes
         // every arithmetic/bitwise operand each evaluation, so keep this free
         // of allocations.
@@ -105123,7 +105038,7 @@ impl Simulator {
                             return Some(format!("{}#({})", b, s));
                         }
                     }
-                    let mut frag = self.substitute_spec_params(&frag);
+                    let frag = self.substitute_spec_params(&frag);
                     // Check if frag is a type/value param of the spec base
                     if let Some((b, s)) = &self.current_spec {
                         if let Some(cd) = self.get_class_def(b) {
@@ -106679,7 +106594,7 @@ impl Simulator {
     }
 
     fn restore_loop_vars(&mut self, saved: &[LoopVarSnapshot]) {
-        for (n, cur, had_frame, prior_td, was_trusted, prior_ps) in saved {
+        for (n, _cur, _had_frame, prior_td, was_trusted, prior_ps) in saved {
             self.meta_note(n);
             match prior_td {
                 Some(t) => {
@@ -124701,7 +124616,7 @@ impl Simulator {
         queue_data_type: &crate::ast::types::DataType,
         dir: PortDirection,
     ) -> Option<(String, String)> {
-        use crate::ast::types::{DataType, UnpackedDimension};
+        use crate::ast::types::UnpackedDimension;
         self.meta_note(pname);
         if !matches!(
             dims.first(),
@@ -127109,7 +127024,7 @@ impl Simulator {
         // hop early and loses the base's members/methods. Rewrite it to the
         // concrete key (`"base"`) so the walks see the real ancestor.
         for cname in &names {
-            let mut resolved_extends = None;
+            let resolved_extends;
             let mut resolved_args: Vec<String> = Vec::new();
             {
                 let cd = self.module.classes.get(cname);
@@ -132681,31 +132596,9 @@ impl Simulator {
                 }
                 None
             }
-            ExprKind::MemberAccess { expr: base, member } => {
-                if let ExprKind::Ident(bh) = &base.kind {
-                    if bh.path.len() == 1 {
-                        return obj_member(self, &bh.path[0].name.name, &member.name);
-                    }
-                }
-                // Indexed base (`arr[i].member`, e.g. `main_program[hart].q`):
-                // evaluate the element's handle and scope the member to it.
-                if let Some(handle) = self.eval_handle_expr(base) {
-                    if handle != 0 {
-                        if let Some(cn) = self
-                            .heap
-                            .get(handle)
-                            .and_then(|x| x.as_ref())
-                            .map(|i| i.class_name.clone())
-                        {
-                            if self.class_assoc_member(&cn, &member.name) {
-                                return Some(format!("{}#{}", handle, member.name));
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            // Gated by name first: resolving evaluates the selects.
+            // A top-level select (`q3[0]`, `s.sp[1]`) may name an ELEMENT of
+            // a fixed array of collections, which is itself a collection
+            // (§7.4.5).
             ExprKind::Index { .. } if self.indexed_colls_live() => {
                 self.indexed_coll_name_gated(expr)
             }
@@ -135472,7 +135365,7 @@ impl Simulator {
                             *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
                         }
                         let saved_ts = self.timescale_scope_override.take();
-                        if let Some(sc) = &scope {
+                        if let Some(_sc) = &scope {
                             self.timescale_scope_override = scope.clone();
                         }
                         self.exec_task_call(&td, args);
@@ -141187,7 +141080,7 @@ impl Simulator {
             *self.name_resolve_hint.borrow_mut() = Some(sc.clone());
         }
         let saved_ts = self.timescale_scope_override.take();
-        if let Some(sc) = &scope {
+        if let Some(_sc) = &scope {
             self.timescale_scope_override = scope.clone();
         }
         let r = self.exec_function_call(fd, args);
@@ -141381,7 +141274,7 @@ impl Simulator {
         // `o.a`, `o.b`), so they bypass the whole-value `output_bindings`
         // path — collect their `(local_key, caller_lvalue)` pairs to copy
         // each member back to the caller's actual on return.
-        let mut struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
+        let struct_output_writebacks: Vec<(String, Expression)> = Vec::new();
         for (i, port) in fd.ports.iter().enumerate() {
             let is_out = matches!(
                 port.direction,
@@ -146255,7 +146148,6 @@ impl Simulator {
                 // then resolve the corresponding type arg from the extends
                 // clause. The arg is often `this_type` (a typedef for the
                 // current specialization) or another type param of `base`.
-                let mut cur_name = cd.name.clone();
                 let mut cur_extends = cd.extends.clone();
                 let mut cur_type_args = cd.extends_type_args.clone();
                 let mut level = 0;
@@ -146329,7 +146221,6 @@ impl Simulator {
                         }
                         break;
                     }
-                    cur_name = ancestor.clone();
                     cur_extends = acd.extends.clone();
                     cur_type_args = acd.extends_type_args.clone();
                 }
@@ -151692,14 +151583,14 @@ impl Simulator {
             }
             None
         };
-        let full = |w: u32| -> i128 {
+        let _full = |w: u32| -> i128 {
             if w >= 127 {
                 i128::MAX
             } else {
                 (1i128 << w) - 1
             }
         };
-        let inside_ranges = |me: &mut Self, ranges: &[Expression]| -> Vec<(i128, i128)> {
+        let _inside_ranges = |me: &mut Self, ranges: &[Expression]| -> Vec<(i128, i128)> {
             let cr: Vec<ConstraintRange> = ranges
                 .iter()
                 .map(|r| match &r.kind {
@@ -151777,7 +151668,7 @@ impl Simulator {
         }
         let cands: Vec<i128> = ranges
             .iter()
-            .flat_map(|(lo, hi)| (*lo..=*hi))
+            .flat_map(|(lo, hi)| *lo..=*hi)
             .filter(|c| *c >= 0)
             .collect();
         let saved = self
@@ -164918,7 +164809,7 @@ impl Simulator {
         &mut self,
         dclass: &str,
         method: &str,
-        arg_base: usize,
+        _arg_base: usize,
         n: usize,
     ) -> Option<Value> {
         if !fast_calls_enabled() || n != 0 || method == "new" {
@@ -165108,7 +164999,6 @@ impl Simulator {
         arg_base: usize,
         n: usize,
     ) -> Option<Value> {
-        use super::bytecode::Insn;
         if !fast_calls_enabled() || handle == 0 || method == "new" {
             return None;
         }
@@ -167470,8 +167360,8 @@ fn vpi_radix_string(v: &Value, bits_per_digit: usize) -> String {
     s
 }
 
-/// Thread-local pointer to the current simulator instance.
-/// Set during DPI import calls so VPI C callbacks can access it.
+// Thread-local pointer to the current simulator instance.
+// Set during DPI import calls so VPI C callbacks can access it.
 thread_local! {
     static ACTIVE_SIMULATOR: std::cell::Cell<*mut Simulator> = const { std::cell::Cell::new(std::ptr::null_mut()) };
     /// Current DPI scope set by `svSetScope` and read by `svGetScope`.
@@ -168838,7 +168728,7 @@ pub fn vpi_run_startup_routines(libs: &mut Vec<Library>, paths: &[String]) {
         // pointers, not a function.
         let routines: *const Option<StartupFn> =
             match unsafe { lib.get::<*const Option<StartupFn>>(b"vlog_startup_routines\0") } {
-                Ok(sym) => unsafe { *sym },
+                Ok(sym) => *sym,
                 Err(_) => {
                     eprintln!(
                         "[VPI] '{}' has no vlog_startup_routines; nothing to register",
@@ -168906,7 +168796,7 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
                     prec
                 }
             }
-            None => Self_secs_to_exp(sim.module.tick_s),
+            None => self_secs_to_exp(sim.module.tick_s),
         });
         return exp.unwrap_or(vpi::UNDEFINED);
     }
@@ -168989,7 +168879,7 @@ pub extern "C" fn vpi_get(property: libc::c_int, handle: *mut libc::c_void) -> l
 
 /// Base-10 exponent of a seconds value, as VPI reports time unit/precision.
 /// Mirrors `Simulator::secs_to_exp`, which is a private associated fn.
-fn Self_secs_to_exp(s: f64) -> libc::c_int {
+fn self_secs_to_exp(s: f64) -> libc::c_int {
     if s <= 0.0 {
         -9
     } else {
@@ -169749,7 +169639,7 @@ pub extern "C" fn svSetScope(scope: *mut libc::c_void) -> *mut libc::c_void {
 
 fn dpi_scope_timescale(sim: &Simulator, scope: *mut libc::c_void) -> (i32, i32) {
     if scope.is_null() {
-        let exp = Self_secs_to_exp(sim.module.tick_s);
+        let exp = self_secs_to_exp(sim.module.tick_s);
         return (exp, exp);
     }
     let s = unsafe { &*(scope as *const DpiScope) };

@@ -1879,7 +1879,6 @@ fn run_main() -> i32 {
     let mut dump_files_list = false;
     let mut dump_merged_sv: Option<String> = None;
     let mut upf_files: Vec<String> = Vec::new();
-    let mut upf_top: Option<String> = None;
     let mut dpi_libs: Vec<String> = Vec::new();
     let mut vpi_libs: Vec<String> = Vec::new();
     let mut module_timescale_args: Vec<String> = Vec::new();
@@ -2521,7 +2520,6 @@ fn run_main() -> i32 {
             "--upf-top" => {
                 i += 1;
                 if i < args.len() {
-                    upf_top = Some(args[i].clone());
                     xezim_core::upf::set_upf_top(args[i].clone());
                 } else {
                     eprintln!("Error: --upf-top requires an instance path");

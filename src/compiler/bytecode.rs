@@ -3403,11 +3403,11 @@ impl<'a> BytecodeCompiler<'a> {
     fn compile_pure_body(
         &mut self,
         items: &[Statement],
-        ret_slot: RegId,
-        ret_w: u32,
-        ctx_width: u32,
+        _ret_slot: RegId,
+        _ret_w: u32,
+        _ctx_width: u32,
     ) -> bool {
-        for (idx, st) in items.iter().enumerate() {
+        for (_idx, st) in items.iter().enumerate() {
             match &st.kind {
                 StatementKind::VarDecl {
                     data_type,
@@ -3415,7 +3415,7 @@ impl<'a> BytecodeCompiler<'a> {
                     ..
                 } => {
                     for d in declarators {
-                        let is_real = crate::compiler::elaborate::is_type_real(data_type);
+                        let _is_real = crate::compiler::elaborate::is_type_real(data_type);
                         // Step 6: a CLASS-typed local holds a heap HANDLE in a
                         // register — default null (0), no resize (handles
                         // round-trip untouched), and the name joins
@@ -4128,7 +4128,7 @@ impl<'a> BytecodeCompiler<'a> {
             // they are not (e.g. a member-array lvalue with a runtime index,
             // which needs StmtFallback, unavailable under reg_var_loop_depth).
             StatementKind::Expr(e) => expr_simple(e),
-            other => false,
+            _other => false,
         }
     }
 
@@ -8330,7 +8330,7 @@ impl<'a> BytecodeCompiler<'a> {
         let mut lhs: Option<Expression> = None;
         let mut entries: Vec<(u64, Value)> = Vec::new();
         let mut default: Option<Value> = None;
-        let mut same_lhs = |l: &Expression, lhs: &mut Option<Expression>| -> bool {
+        let same_lhs = |l: &Expression, lhs: &mut Option<Expression>| -> bool {
             let ExprKind::Ident(h) = &l.kind else {
                 return false;
             };
@@ -13859,7 +13859,7 @@ impl<'a> BytecodeCompiler<'a> {
                 // leftover high bits of the source. Chunk k occupies source
                 // bits [k*slice + slice-1 : k*slice].
                 let mut parts: Vec<RegId> = Vec::with_capacity(full as usize + 1);
-                let mut range = |me: &mut Self, hi: u32, lo: u32| -> RegId {
+                let range = |me: &mut Self, hi: u32, lo: u32| -> RegId {
                     let hr = me.alloc_reg();
                     me.emit(Insn::LoadConst(
                         hr,
@@ -15189,7 +15189,7 @@ impl<'a> BytecodeCompiler<'a> {
         }
 
         let mut acc: Option<RegId> = None;
-        let mut add_term = |c: &mut Self, term: RegId, acc: &mut Option<RegId>| match *acc {
+        let add_term = |c: &mut Self, term: RegId, acc: &mut Option<RegId>| match *acc {
             None => *acc = Some(term),
             Some(a) => {
                 let sum = c.alloc_reg();
@@ -15287,7 +15287,6 @@ impl<'a> BytecodeCompiler<'a> {
                     }
                     w
                 }
-                _ => return None,
             }
         } else {
             u32::try_from(stride(idx_nodes.len() - 1)).ok()?
@@ -18571,30 +18570,30 @@ impl<'a> BytecodeCompiler<'a> {
             }
             Insn::CallMethod(_, h, _, a, n) => {
                 f(*h);
-                for x in (*a as usize..*a as usize + *n as usize) {
+                for x in *a as usize..*a as usize + *n as usize {
                     f(x as RegId);
                 }
             }
             Insn::CallScopedMethod(_, t, _, a, n) => {
                 f(*t);
-                for x in (*a as usize..*a as usize + *n as usize) {
+                for x in *a as usize..*a as usize + *n as usize {
                     f(x as RegId);
                 }
             }
             Insn::ConstructObject(_, _, a, n) => {
-                for x in (*a as usize..*a as usize + *n as usize) {
+                for x in *a as usize..*a as usize + *n as usize {
                     f(x as RegId);
                 }
             }
             // Step 9h: a class-scope static call reads its arg range only.
             Insn::CallStaticScoped(_, _, a, n) => {
-                for x in (*a as usize..*a as usize + *n as usize) {
+                for x in *a as usize..*a as usize + *n as usize {
                     f(x as RegId);
                 }
             }
             // class-perf P2: a free-function call reads its arg range only.
             Insn::CallFreeFunction(_, _, a, n) => {
-                for x in (*a as usize..*a as usize + *n as usize) {
+                for x in *a as usize..*a as usize + *n as usize {
                     f(x as RegId);
                 }
             }
@@ -18611,7 +18610,7 @@ impl<'a> BytecodeCompiler<'a> {
             Insn::StoreClassStatic(_, src) => f(*src),
             Insn::CallCollMethod(_, h, _, a, n, _) => {
                 f(*h);
-                for x in (*a as usize..*a as usize + *n as usize) {
+                for x in *a as usize..*a as usize + *n as usize {
                     f(x as RegId);
                 }
             }
@@ -21691,7 +21690,7 @@ mod tests {
 
         // Without the shadow set the bare `os` lowers as a module signal; with
         // `os` listed as a class-scope name it must bail all-or-nothing.
-        let shadow: HashSet<String> = ["os".to_string()].into_iter().collect();
+        let _shadow: HashSet<String> = ["os".to_string()].into_iter().collect();
         let mut compiler = BytecodeCompiler::new(&sigmap, &sig_signed, &sig_w, &arrays, &widths);
         let empty_fns: HashMap<String, FunctionDeclaration> = HashMap::default();
         assert!(
@@ -23951,7 +23950,7 @@ pub fn lower_two_state(
     let mut def_tc: Vec<u32> = vec![0; cb.num_regs as usize];
     // Mirror of the loop index, readable from `def!` (a `for` pattern binding
     // is not, due to macro hygiene).
-    let mut cur_i: usize = 0;
+    let mut cur_i: usize;
     // Registers holding a folded 4-state constant: (value plane, xz plane).
     // These registers are NEVER materialized in the u64 file, so any reader
     // outside the fold set would see an unwritten slot -- the guard at the

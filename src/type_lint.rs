@@ -2667,7 +2667,7 @@ pub fn check(defs: &[&SourceDefinition], elab: &ElaboratedModule) -> Vec<String>
     // Phase 1: package scopes (twice, so a package sees the ones it imports).
     let no_classes: HashMap<String, Option<Rc<ClassInfo>>> = HashMap::default();
     let empty_pkgs: HashMap<String, Scope> = HashMap::default();
-    let mut unit = Scope::default();
+    let unit;
     {
         let env = Env {
             class_names: &class_names,
