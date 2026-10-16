@@ -362,6 +362,117 @@ endmodule
     let _ = std::fs::remove_file(&src2);
 }
 
+/// class-perf loop-heat boost (measured heat): a wait-free LOOP-CANDIDATE
+/// body must NOT be admitted merely because its body structurally contains a
+/// loop — it is admitted only once its MEASURED loop iterations (back-edges
+/// run on the AST interpreter) reach the tier threshold. A SHORT loop called
+/// a moderate number of times stays on the AST interpreter (0 VM samples)
+/// even though its structure is a loop; a loop whose iterations cross the
+/// threshold compiles (positive VM samples). Both stay byte-identical to the
+/// gate-OFF interpreter. Locks in the difference vs the older structural
+/// first-call boost.
+#[test]
+fn measured_loop_heat_admits_only_bodies_with_enough_iterations() {
+    if !super::compiled_method_test_env::policies(&[("1", "1000000"), ("1", "100")]) {
+        return;
+    }
+    // 30 calls x an 80-iteration loop = 2400 measured back-edges.
+    // tier=1000000 -> heat (2400) < tier, never compiles.
+    // tier=100    -> heat (2400) >= tier, compiles.
+    let src = write_tier_src(
+        "loopheat",
+        r#"
+class K;
+  int acc = 0;
+  function automatic int step(int v);
+    int t;
+    acc = acc + v;
+    for (t = 0; t < 80; t = t + 1) acc = acc + ((t * v) % 7);
+    return acc;
+  endfunction
+endclass
+module top;
+  integer r;
+  integer i;
+  initial begin
+    K k;
+    k = new();
+    for (i = 0; i < 30; i = i + 1) begin
+      r = r + k.step(1);
+    end
+    $display("TAG r=%0d", r);
+  end
+endmodule
+"#,
+    );
+    let off = run_cli(&src, Some("0"), None);
+
+    // Sub-threshold heat: body is a loop structurally, but measured heat
+    // (2400) is below the 1000000 tier, so it must stay on AST.
+    let cold = run_cli(&src, Some("1"), Some("1000000"));
+    assert_eq!(
+        off, cold,
+        "sub-heat loop body diverged from gate-off
+--- BOOST ---
+{}
+--- OFF ---
+{}",
+        cold, off
+    );
+    let mut cmd = Command::new(xezim_bin2());
+    cmd.arg("--simulate").arg("-s").arg("top").arg(&src);
+    cmd.env("XEZIM_COMPILE_METHODS", "1");
+    cmd.env("XEZIM_METHOD_TIER", "1000000");
+    cmd.env("XEZIM_METHOD_PROFILE", "1");
+    let prof = cmd.output().expect("cold-profile subprocess failed");
+    let prof = format!(
+        "{}{}",
+        String::from_utf8_lossy(&prof.stdout),
+        String::from_utf8_lossy(&prof.stderr)
+    );
+    assert_eq!(
+        step_vm_count(&prof),
+        0,
+        "short/rare loop body must stay on AST (heat < tier): profile
+{}
+",
+        prof
+    );
+
+    // Above-threshold heat: the SAME body, with a low tier so its measured
+    // iterations cross, must compile and stay byte-identical.
+    let hot = run_cli(&src, Some("1"), Some("100"));
+    assert_eq!(
+        off, hot,
+        "crossed-heat loop body diverged from gate-off
+--- BOOST ---
+{}
+--- OFF ---
+{}",
+        hot, off
+    );
+    let mut cmd = Command::new(xezim_bin2());
+    cmd.arg("--simulate").arg("-s").arg("top").arg(&src);
+    cmd.env("XEZIM_COMPILE_METHODS", "1");
+    cmd.env("XEZIM_METHOD_TIER", "100");
+    cmd.env("XEZIM_METHOD_PROFILE", "1");
+    let prof = cmd.output().expect("hot-profile subprocess failed");
+    let prof = format!(
+        "{}{}",
+        String::from_utf8_lossy(&prof.stdout),
+        String::from_utf8_lossy(&prof.stderr)
+    );
+    assert!(
+        step_vm_count(&prof) > 0,
+        "crossed-heat loop body must compile (heat >= tier): profile
+{}
+",
+        prof
+    );
+
+    let _ = std::fs::remove_file(&src);
+}
+
 /// Parse the method-profiler histogram for `step` and return its VM counter.
 /// The histogram line has the form `   AST  VM  step`; a positive VM count
 /// means the method was admitted to the compiled bytecode path.

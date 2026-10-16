@@ -276,17 +276,34 @@ fn method_tier_threshold() -> u32 {
     })
 }
 
-/// class-perf loop-heat boost: the adaptive tier counter measures heat by
-/// *number of calls* (a method compiles after `HOT_CALLS`). That is blind to
-/// heat that lives in the *iterations of a single call* — a task or function
-/// invoked exactly once that owns a 5M-iteration `for` loop never graduates,
-/// so every iteration runs on the proven-but-slow AST interpreter. This
-/// boost treats a body whose STATEMENTS contain a loop as hot on first call
-/// (bypasses the counter) provided it is wait-free (see the tier gate). It
-/// is a GENERIC SystemVerilog rule — it predicates on loop statements, not
-/// on any UVM/library shape. Correctness is preserved: the boost only
-/// changes WHETHER compilation is *attempted*; if `BytecodeCompiler` cannot
-/// lower a plan the body runs on the AST interpreter exactly as before.
+/// Loops carried this gate: the loop-heat boost (see the tier gate below) is
+/// OFF by default so the admission behaviour on the reference workloads stays
+/// byte-for-byte the pure call-count tier (flat within ±0.1%). Setting
+/// `XEZIM_METHOD_TIER` to *any* explicit value opts the boost in: a wait-free
+/// loop-candidate method is then compiled as soon as its MEASURED loop
+/// iterations (back-edges run on the AST interpreter) reach the threshold —
+/// not on its first call, and not merely because its body structurally
+/// contains a loop. The call-count tier still uses the parsed value, so
+/// `XEZIM_METHOD_TIER` remains the single threshold control.
+#[inline]
+fn method_boost_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XEZIM_METHOD_TIER").is_some())
+}
+
+// class-perf loop-heat boost: the adaptive tier counter measures heat by
+// *number of calls* (a method compiles after `HOT_CALLS`). That is blind to
+// heat that lives in the *iterations of a single call* — a task or function
+// invoked exactly once that owns a 5M-iteration `for` loop never graduates,
+// so every iteration runs on the proven-but-slow AST interpreter. This
+// boost treats a body whose STATEMENTS contain a loop as hot on first call
+// (bypasses the counter) provided it is wait-free (see the tier gate). It
+// is a GENERIC SystemVerilog rule — it predicates on loop statements, not
+// on any UVM/library shape. Correctness is preserved: the boost only
+// changes WHETHER compilation is *attempted*; if `BytecodeCompiler` cannot
+// lower a plan the body runs on the AST interpreter exactly as before.
+// It is opt-in: gated on an explicitly-set `XEZIM_METHOD_TIER` (see
+// `method_boost_enabled`).
 
 /// Compiler salt for the persistent compiled-method cache (XEZIM_METHOD_CACHE).
 /// Bump on ANY change that can alter the compiled instructions or the
@@ -7773,6 +7790,27 @@ pub struct Simulator {
     /// compiled path above the threshold is counter-free). Keyed by the
     /// (cid, mid) ids the block cache uses, so interning is done once.
     compiled_method_call_counts: HashMap<(u32, u32, u32), u32>,
+    /// class-perf loop-heat boost (MEMOIZATION / pass B): whether a method
+    /// is a wait-free loop candidate, keyed (cid, mid, spec_id). Computing it
+    /// runs a structural statement walk (`body_has_loop` + a wait-free probe),
+    /// which the maintainer flagged as a per-call cost; it is a pure function
+    /// of the declaration (instance-independent), so it is memoized once and
+    /// never re-walked. `None` = not yet decided; `Some(true)` = candidate.
+    compiled_method_boost_qual: HashMap<(u32, u32, u32), bool>,
+    /// class-perf loop-heat boost (MEASURED HEAT / pass C): stack of interned
+    /// (cid, mid, spec_id) keys for the wait-free loop-candidate methods
+    /// currently interpreting on the AST function path. `exec_statement`'s
+    /// loop arms add their back-edge count to the innermost key, so heat is
+    /// attributed to the actual method running the loop (nested calls
+    /// attribute to the innermost active one). Empty when the boost is off,
+    /// keeping the default path flat.
+    compiled_method_heat_stack: Vec<(u32, u32, u32)>,
+    /// class-perf loop-heat boost (MEASURED HEAT / pass C): accumulated loop
+    /// back-edges (iterations) a method's body actually ran while on the AST
+    /// interpreter, keyed (cid, mid, spec_id). A body crosses the tier here
+    /// -> treated as loop-hot (compiles) instead of compiling any short loop
+    /// on first call.
+    compiled_method_loop_heat: HashMap<(u32, u32, u32), u64>,
     /// class-perf P3: direct VM->VM dispatch entries for `CallMethod`,
     /// keyed (cid, mid) of the DEFINING class. `Pending` re-probes after
     /// the plan / block caches fill; `Never` is a permanent decline
@@ -13339,6 +13377,9 @@ impl Simulator {
             compiled_method_plans: HashMap::default(),
             compiled_method_skip: HashSet::default(),
             compiled_method_call_counts: HashMap::default(),
+            compiled_method_boost_qual: HashMap::default(),
+            compiled_method_heat_stack: Vec::new(),
+            compiled_method_loop_heat: HashMap::default(),
             compiled_fast_calls: HashMap::default(),
             compiled_fast_static_calls: HashMap::default(),
             compiled_spec_intern: HashMap::default(),
@@ -56278,7 +56319,6 @@ impl Simulator {
         f
     }
 
-    /// Check if any statements contain blocking constructs (timing, events, wait).
     /// class-perf loop-heat probe: does this statement tree contain a looping
     /// statement (`for`/`while`/`do`/`foreach`/`repeat`/`forever`)? The
     /// adaptive tier counter measures heat by *number of calls*; this is the
@@ -56289,14 +56329,50 @@ impl Simulator {
     fn body_has_loop(&self, stmts: &[Statement]) -> bool {
         stmts.iter().any(|s| self.stmt_has_loop(s))
     }
+    /// class-perf loop-heat boost (MEMOIZATION / pass B): whether a method is
+    /// a wait-free loop candidate = its body structurally contains a loop and
+    /// does not block. This is the probe the maintainer flagged as a per-call
+    /// cost; it is a pure function of the declaration (instance-independent),
+    /// so it is memoized once per method id and never re-walked.
+    fn is_loop_candidate(
+        &mut self,
+        key: (u32, u32, u32),
+        cname: &str,
+        kind: &CompiledBodyKind,
+        body: &[Statement],
+    ) -> bool {
+        if let Some(v) = self.compiled_method_boost_qual.get(&key) {
+            return *v;
+        }
+        let has_loop = self.body_has_loop(body);
+        let wait_free = match kind {
+            CompiledBodyKind::Task(t) => !self.method_body_can_suspend(cname, &t.ports, &t.items),
+            _ => !self.stmts_have_blocking(body),
+        };
+        let v = has_loop && wait_free;
+        self.compiled_method_boost_qual.insert(key, v);
+        v
+    }
+    /// class-perf loop-heat boost (MEASURED HEAT / pass C): record `iters`
+    /// loop back-edges (iterations) executed by the innermost not-yet-compiled
+    /// loop-candidate method currently on the AST interpreter. Called once per
+    /// loop EXIT (never per iteration), and a no-op when the heat stack is
+    /// empty (boost off), so the default path pays only the `last()` branch.
+    fn record_ast_loop_heat(&mut self, iters: u64) {
+        if let Some(&key) = self.compiled_method_heat_stack.last() {
+            let e = self.compiled_method_loop_heat.entry(key).or_insert(0);
+            *e = e.saturating_add(iters);
+        }
+    }
+
     fn stmt_has_loop(&self, stmt: &Statement) -> bool {
         match &stmt.kind {
-            StatementKind::For { body, .. }
-            | StatementKind::While { body, .. }
-            | StatementKind::DoWhile { body, .. }
-            | StatementKind::Foreach { body, .. }
-            | StatementKind::Repeat { body, .. }
-            | StatementKind::Forever { body } => true,
+            StatementKind::For { body: _, .. }
+            | StatementKind::While { body: _, .. }
+            | StatementKind::DoWhile { body: _, .. }
+            | StatementKind::Foreach { body: _, .. }
+            | StatementKind::Repeat { body: _, .. }
+            | StatementKind::Forever { body: _ } => true,
             StatementKind::SeqBlock { stmts, .. } => stmts.iter().any(|s| self.stmt_has_loop(s)),
             StatementKind::If {
                 then_stmt,
@@ -56315,6 +56391,7 @@ impl Simulator {
         }
     }
 
+    /// Check if any statements contain blocking constructs (timing, events, wait).
     fn stmts_have_blocking(&self, stmts: &[Statement]) -> bool {
         stmts.iter().any(|s| self.stmt_is_blocking(s))
     }
@@ -87715,6 +87792,8 @@ impl Simulator {
                     self.pop_loop_frame();
                 }
                 self.restore_loop_vars(&fv_saved);
+                // class-perf loop-heat boost (pass C): one call per loop exit.
+                self.record_ast_loop_heat(iters);
             }
             // A foreach index variable is automatic and loop-scoped (§12.7.3):
             // like a for-init declaration it always gets its own frame when
@@ -87791,6 +87870,8 @@ impl Simulator {
                     }
                 }
                 self.loop_scope_close(body, body_scope);
+                // class-perf loop-heat boost (pass C): one call per loop exit.
+                self.record_ast_loop_heat(i);
             }
             StatementKind::DoWhile { body, condition } => {
                 static LOOP_LIMIT_ENV: std::sync::OnceLock<Option<u64>> =
@@ -87829,12 +87910,15 @@ impl Simulator {
                     }
                 }
                 self.loop_scope_close(body, body_scope);
+                // class-perf loop-heat boost (pass C): one call per loop exit.
+                self.record_ast_loop_heat(i);
             }
             StatementKind::Repeat { count, body } => {
                 // §12.7.2: full count — the old 10000 cap silently truncated
                 // large loops (and negatives-as-unsigned hit it constantly).
                 let n = self.repeat_count(count);
                 let body_scope = self.loop_scope_open(body, &[], &[]);
+                let mut rp_it: u64 = 0;
                 for k in 0..n {
                     if self.finished {
                         break;
@@ -87847,6 +87931,7 @@ impl Simulator {
                     }
                     self.break_flag = false;
                     self.continue_flag = false;
+                    rp_it += 1;
                     self.exec_statement(body);
                     if self.break_flag {
                         // Keep the flag set while a `disable` unwinds to an
@@ -87859,6 +87944,8 @@ impl Simulator {
                     self.continue_flag = false;
                 }
                 self.loop_scope_close(body, body_scope);
+                // class-perf loop-heat boost (pass C): one call per loop exit.
+                self.record_ast_loop_heat(rp_it);
             }
             StatementKind::Forever { body } => {
                 let mut i: u64 = 0;
@@ -87891,6 +87978,8 @@ impl Simulator {
                         break;
                     }
                 }
+                // class-perf loop-heat boost (pass C): one call per loop exit.
+                self.record_ast_loop_heat(i);
             }
             StatementKind::SeqBlock { stmts, name } => {
                 // §6.21: a block-local declaration SHADOWS a same-named module
@@ -166398,11 +166487,45 @@ impl Simulator {
                 {
                     self.return_value = Some(cval);
                 } else {
+                    // class-perf loop-heat boost (pass C): while this method
+                    // body runs on the AST interpreter, attribute its loop
+                    // back-edges to it so the measured-heat gate can admit
+                    // repeat-loop bodies WITHOUT compiling short UVM loops.
+                    // Only wait-free loop candidates are tracked (memoized via
+                    // is_loop_candidate / pass B), and only when the boost is
+                    // enabled; when off the heat stack stays empty and
+                    // `record_ast_loop_heat` is a no-op, keeping the default
+                    // path flat.
+                    let heat_key = if compiled_methods_enabled() && method_boost_enabled() {
+                        let kind_of = CompiledBodyKind::of(&method.kind);
+                        match (
+                            self.compiled_class_method_ids.get(&cname).copied(),
+                            self.compiled_class_method_ids.get(method_name).copied(),
+                        ) {
+                            (Some(c), Some(m)) => {
+                                let key = (c, m, self.instance_spec_id(handle));
+                                if self.is_loop_candidate(key, &cname, &kind_of, body) {
+                                    Some(key)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(k) = heat_key {
+                        self.compiled_method_heat_stack.push(k);
+                    }
                     for stmt in body {
                         self.exec_statement(stmt);
                         if self.break_flag || self.return_flag {
                             break;
                         }
+                    }
+                    if heat_key.is_some() {
+                        self.compiled_method_heat_stack.pop();
                     }
                 } // end else: AST interpreter path
                 if let Some(prev) = _prev_meth {
@@ -167865,16 +167988,28 @@ impl Simulator {
         // misses HM catch below is zero-cost); one that never crosses pays
         // the counter only while below the threshold, and the count is
         // keyed by u32 ids (the same key the block cache uses).
-        // LOOP-HEAT BOOST: a wait-free body whose statements contain a loop is
-        // treated as hot on its FIRST call — heat here lives in the *iterations*,
-        // not the call count. The wait-free probe is structural for functions and
-        // the precise suspension analysis for tasks (see below).
+        // LOOP-HEAT BOOST (measured heat / pass C): instead of treating any
+        // wait-free loop body as hot on its FIRST call — which compiles
+        // short-loop UVM bodies the compiler never pays back (the maintainer's
+        // measured reference-workload cost) — the boost keys off ACTUAL loop
+        // heat: while a loop-candidate method (see `is_loop_candidate`) runs
+        // on the AST interpreter, its loop back-edges accumulate into
+        // `compiled_method_loop_heat`. A body becomes loop-hot only once
+        // measured iterations reach the tier threshold. The per-call check is
+        // a single HashMap lookup (same cost as the call counter) — no
+        // structural statement walk on the hot path. `is_loop_candidate`
+        // (pass B, memoized) confines heat-tracking to genuinely compilable
+        // wait-free loop bodies. Opt-in via method_boost_enabled() (an
+        // explicitly-set `XEZIM_METHOD_TIER`); the default remains the pure
+        // call-count tier (flat within ±0.1% on the reference workloads).
         let tier = method_tier_threshold();
-        let boost_wait_free = match kind {
-            CompiledBodyKind::Task(t) => !self.method_body_can_suspend(cname, &t.ports, &t.items),
-            _ => !self.stmts_have_blocking(body),
-        };
-        let loop_hot = self.body_has_loop(body) && boost_wait_free;
+        let loop_hot = method_boost_enabled()
+            && self
+                .compiled_method_loop_heat
+                .get(&(cid, mid, spec_id))
+                .copied()
+                .unwrap_or(0)
+                >= tier as u64;
         if tier > 0 && !loop_hot {
             let calls = self
                 .compiled_method_call_counts
@@ -170115,13 +170250,28 @@ impl Simulator {
                     *ids.entry(method.to_string()).or_insert(next)
                 }
             };
-            let calls = self
-                .compiled_method_call_counts
-                .entry((cid, mid, spec_id))
-                .or_insert(0);
-            if *calls < tier {
-                *calls += 1;
-                return None;
+            // class-perf loop-heat boost (measured): a body admitted by the
+            // heat-based main gate may be fast-called even below the
+            // call-count tier — without this the two gates diverge and a
+            // heat-admitted method never reaches the VmFastEntry (falls back
+            // to normal dispatch, which re-compiles it). Mirrors the main
+            // gate's `loop_hot` read exactly.
+            let loop_hot = method_boost_enabled()
+                && self
+                    .compiled_method_loop_heat
+                    .get(&(cid, mid, spec_id))
+                    .copied()
+                    .unwrap_or(0)
+                    >= tier as u64;
+            if !loop_hot {
+                let calls = self
+                    .compiled_method_call_counts
+                    .entry((cid, mid, spec_id))
+                    .or_insert(0);
+                if *calls < tier {
+                    *calls += 1;
+                    return None;
+                }
             }
         }
         let Some(entry) = self.vm_fast_entry_for(&md.class, method, &md.method, spec_id) else {
