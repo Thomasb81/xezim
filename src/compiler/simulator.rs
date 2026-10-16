@@ -51262,11 +51262,6 @@ impl Simulator {
         if suspended {
             self.process_contexts.insert(pid, child_ctx);
         } else {
-            if !self.loop_frame_gens.is_empty() {
-                for g in &child_ctx.local_gen_stack {
-                    self.loop_frame_gens.remove(g);
-                }
-            }
             self.process_contexts.remove(&pid);
             self.fork_baselines.remove(&pid);
             self.fork_signal_captures.remove(&pid);
@@ -83333,38 +83328,40 @@ impl Simulator {
                         }
                     }
                 }
-                let n = Self::resolve_hier_name_static(h, &sim.module);
-                // A bare identifier naming a COLLECTION MEMBER of
-                // `this` must resolve to its `<handle>#member` storage
-                // even when a same-named value-param / dyn-array is
-                // registered from an enclosing frame. Prefer the
-                // `this`-scoped member; a true local (instance_assoc_member
-                // returns None) falls through to the bare name below.
-                // Without this, a deep `Store::do_write` whose `val = t`
-                // ran while an outer `make(T val)` value-param `val` was
-                // still live in `module.dynamic_arrays` resolved the LHS
-                // to bare `"val"` and the queue copy was dropped (§13.5.2).
-                // §13.5.2/§8.24 name resolution: the CURRENT call's own
-                // queue/dyn-array formal (bound in the top `local_dyn`
-                // frame by `bind_queue_param`) shadows a same-named
-                // property — only an ENCLOSING frame's registration
-                // loses to the property. Without this, a whole-array
-                // copy whose LHS formal shadows the property
-                // (`uvm_reg_item::get_value_array(ref u64_t value[])`
-                // — body `value = this.value`) resolved the LHS to the
-                // property store: the property was clobbered and the
-                // ref writeback shipped an empty array.
-                let formal_in_current_frame = sim
-                    .local_dyn
-                    .last()
-                    .is_some_and(|f| f.iter().any(|(k, _)| k == &n));
-                if sim.module.dynamic_arrays.contains(&n) {
-                    if !formal_in_current_frame {
-                        if let Some(m) = sim.instance_assoc_member(&n) {
-                            return Some((m, true));
+                if !sim.ident_shadowed_by_non_collection(h) {
+                    let n = Self::resolve_hier_name_static(h, &sim.module);
+                    // A bare identifier naming a COLLECTION MEMBER of
+                    // `this` must resolve to its `<handle>#member` storage
+                    // even when a same-named value-param / dyn-array is
+                    // registered from an enclosing frame. Prefer the
+                    // `this`-scoped member; a true local (instance_assoc_member
+                    // returns None) falls through to the bare name below.
+                    // Without this, a deep `Store::do_write` whose `val = t`
+                    // ran while an outer `make(T val)` value-param `val` was
+                    // still live in `module.dynamic_arrays` resolved the LHS
+                    // to bare `"val"` and the queue copy was dropped (§13.5.2).
+                    // §13.5.2/§8.24 name resolution: the CURRENT call's own
+                    // queue/dyn-array formal (bound in the top `local_dyn`
+                    // frame by `bind_queue_param`) shadows a same-named
+                    // property — only an ENCLOSING frame's registration
+                    // loses to the property. Without this, a whole-array
+                    // copy whose LHS formal shadows the property
+                    // (`uvm_reg_item::get_value_array(ref u64_t value[])`
+                    // — body `value = this.value`) resolved the LHS to the
+                    // property store: the property was clobbered and the
+                    // ref writeback shipped an empty array.
+                    let formal_in_current_frame = sim
+                        .local_dyn
+                        .last()
+                        .is_some_and(|f| f.iter().any(|(k, _)| k == &n));
+                    if sim.module.dynamic_arrays.contains(&n) {
+                        if !formal_in_current_frame {
+                            if let Some(m) = sim.instance_assoc_member(&n) {
+                                return Some((m, true));
+                            }
                         }
+                        return Some((n, false));
                     }
-                    return Some((n, false));
                 }
             }
             // An object's collection PROPERTY (`d.data`, `this.data`)
@@ -83454,8 +83451,15 @@ impl Simulator {
         // Assoc-to-assoc and fixed-array-to-fixed-array copies key on
         // the PLAIN resolved names (they predate the collection
         // resolver above and must not be gated behind it — `s = a`
-        // between fixed arrays broke when they were).
-        if let (ExprKind::Ident(lhier), ExprKind::Ident(rhier)) = (&lvalue.kind, &rvalue.kind) {
+        // between fixed arrays broke when they were). A dotted path rooted
+        // at a class-handle variable (`c2.bits = c1.bits`) is a class-member
+        // access (collection members were already handled by `resolve_coll`
+        // above under `<handle>#member`), never a module-scope array whose
+        // bare name happens to match the leaf segment.
+        if let (ExprKind::Ident(lhier), ExprKind::Ident(rhier)) = (&lvalue.kind, &rvalue.kind)
+            && !self.ident_shadowed_by_non_collection(lhier)
+            && !self.ident_shadowed_by_non_collection(rhier)
+        {
             let lname = self.resolve_hier_name(lhier);
             let rname = self.resolve_hier_name(rhier);
             if self.is_associative_array(&lname) && self.is_associative_array(&rname) {
@@ -83544,12 +83548,17 @@ impl Simulator {
             }
         }
         if let ExprKind::Ident(lhier) = &lvalue.kind {
-            let mut lname = self.resolve_hier_name(lhier);
-            // An instance-scoped queue/array member (`q` inside a method,
-            // or `obj.q`) lives under `<handle>#q`, not the bare name.
-            if let Some(s) = self.instance_assoc_member(&lname) {
-                lname = std::borrow::Cow::Owned(s);
-            }
+            let mut lname = if self.ident_shadowed_by_non_collection(lhier) {
+                std::borrow::Cow::Borrowed("")
+            } else {
+                let mut n = self.resolve_hier_name(lhier);
+                // An instance-scoped queue/array member (`q` inside a method,
+                // or `obj.q`) lives under `<handle>#q`, not the bare name.
+                if let Some(s) = self.instance_assoc_member(&n) {
+                    n = std::borrow::Cow::Owned(s);
+                }
+                n
+            };
             // §10.10: a class queue / dynamic-array member (`<handle>#q`)
             // has no `arrays` row, but `obj.q = {obj.q, v}` is the same
             // unpacked-array concatenation.
@@ -83757,7 +83766,9 @@ impl Simulator {
             }
         }
         // When assigning a locator/reduction method result to a queue, store as single-element queue
-        if let ExprKind::Ident(lhier) = &lvalue.kind {
+        if let ExprKind::Ident(lhier) = &lvalue.kind
+            && !self.ident_shadowed_by_non_collection(lhier)
+        {
             let lname = self.resolve_hier_name(lhier);
             if self.module.dynamic_arrays.contains(&*lname)
                 && self.module.arrays.contains_key(&*lname)
@@ -98269,8 +98280,11 @@ impl Simulator {
             }
             return raw;
         }
-        if let Some((_head, rest)) = raw.split_once('.') {
-            if self.signal_name_to_id.contains_key(rest) || check_known_or_signal(rest, self) {
+        if let Some((head, rest)) = raw.split_once('.') {
+            if (self.module.classes.contains_key(head) || self.class_of_var(head).is_none())
+                && !self.local_stack.last().is_some_and(|f| f.contains_key(head))
+                && (self.signal_name_to_id.contains_key(rest) || check_known_or_signal(rest, self))
+            {
                 let out = rest.to_string();
                 if out.contains('.') {
                     let parent = parent_of(&out).to_string();
@@ -108496,7 +108510,9 @@ impl Simulator {
         // compared element-wise as the empty 0:-1 range: UVM's `val == t` on
         // two `T`-typed queues would otherwise both resolve to (0,-1) and the
         // guard falsely reported them equal (skipping the update).
-        if let ExprKind::Ident(h) = &expr.kind {
+        if let ExprKind::Ident(h) = &expr.kind
+            && !self.ident_shadowed_by_non_collection(h)
+        {
             let name = self.resolve_hier_name(h);
             if let Some(&(lo, hi, _)) = self.module.arrays.get(&*name) {
                 if !self.module.dynamic_arrays.contains(&*name) && !(hi < lo) {
@@ -110257,7 +110273,9 @@ impl Simulator {
         let ExprKind::Ident(h) = &e.kind else {
             return false;
         };
-        if h.path.iter().any(|s| !s.selects.is_empty()) {
+        if h.path.iter().any(|s| !s.selects.is_empty())
+            || self.ident_shadowed_by_non_collection(h)
+        {
             return false;
         }
         let nm = self.resolve_hier_name(h);
@@ -110270,7 +110288,9 @@ impl Simulator {
     /// Storage name of an ASSOCIATIVE-array operand (`a`, `this.a`,
     /// `obj.a`), or None for any other expression.
     fn assoc_operand_name(&mut self, expr: &Expression) -> Option<String> {
-        if let ExprKind::Ident(h) = &expr.kind {
+        if let ExprKind::Ident(h) = &expr.kind
+            && !self.ident_shadowed_by_non_collection(h)
+        {
             let nm = self.resolve_hier_name(h);
             let nm = self
                 .instance_assoc_member(&nm)
@@ -110285,8 +110305,60 @@ impl Simulator {
 
     /// If `expr` names a queue/array (possibly an instance-scoped member),
     /// return its resolved storage name — used for `inside {arr}` membership.
+    /// True when `h` cannot name a module- or package-scope collection under
+    /// `resolve_hier_name(h)` because it is either:
+    ///   - a single-segment name shadowed by a non-collection local/formal/loop
+    ///     variable in the current frame or a scalar/handle property of `this`
+    ///     (§6.21, §8.10), or
+    ///   - a multi-segment path rooted at `this`/`super`, a class-handle
+    ///     variable, or a frame local (`c.fa`), whose collection members live
+    ///     under `<handle>#member` and whose last-resort `resolve_hier_name`
+    ///     fallback (`"fa"`) would otherwise collide with a same-named module
+    ///     collection.
+    fn ident_shadowed_by_non_collection(&self, h: &HierarchicalIdentifier) -> bool {
+        if h.path.is_empty() {
+            return false;
+        }
+        let first = h.path[0].name.name.as_str();
+        if h.path.len() == 1 {
+            if !h.path[0].selects.is_empty() {
+                return false;
+            }
+            if self.dyn_name_lookup(first).is_some() || self.instance_assoc_member(first).is_some()
+            {
+                return false;
+            }
+            if self
+                .local_stack
+                .last()
+                .is_some_and(|f| f.contains_key(first))
+            {
+                return true;
+            }
+            if let Some(Some(th)) = self.this_stack.last()
+                && self
+                    .heap
+                    .get(*th)
+                    .and_then(|o| o.as_ref())
+                    .is_some_and(|inst| inst.properties.contains_key(first))
+            {
+                return true;
+            }
+            false
+        } else {
+            matches!(first, "this" | "super")
+                || (!self.module.classes.contains_key(first) && self.class_of_var(first).is_some())
+                || self
+                    .local_stack
+                    .last()
+                    .is_some_and(|f| f.contains_key(first))
+        }
+    }
+
     fn array_operand_name(&mut self, expr: &Expression) -> Option<String> {
-        if let ExprKind::Ident(h) = &expr.kind {
+        if let ExprKind::Ident(h) = &expr.kind
+            && !self.ident_shadowed_by_non_collection(h)
+        {
             let mut nm = self.resolve_hier_name(h);
             if let Some(s) = self.instance_assoc_member(&nm) {
                 nm = std::borrow::Cow::Owned(s);
@@ -115493,11 +115565,7 @@ impl Simulator {
     fn pop_local_frame(&mut self) {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
-        if let Some(g) = self.local_gen_stack.pop()
-            && !self.loop_frame_gens.is_empty()
-        {
-            self.loop_frame_gens.remove(&g);
-        }
+        self.local_gen_stack.pop();
         if let Some(mut f) = self.local_stack.pop() {
             if self.frame_pool.len() < 64 {
                 f.clear();
@@ -115510,11 +115578,7 @@ impl Simulator {
     fn pop_local_frame_take(&mut self) -> Option<HashMap<String, Value>> {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
-        if let Some(g) = self.local_gen_stack.pop()
-            && !self.loop_frame_gens.is_empty()
-        {
-            self.loop_frame_gens.remove(&g);
-        }
+        self.local_gen_stack.pop();
         self.local_stack.pop()
     }
 
@@ -121438,7 +121502,10 @@ impl Simulator {
         let ExprKind::Ident(h) = &e.kind else {
             return None;
         };
-        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+        if h.path.len() != 1
+            || !h.path[0].selects.is_empty()
+            || self.ident_shadowed_by_non_collection(h)
+        {
             return None;
         }
         let n = self.resolve_hier_name(h);
@@ -121469,6 +121536,9 @@ impl Simulator {
     fn ret_assoc_operand_name(&mut self, e: &Expression) -> Option<String> {
         let name = match &e.kind {
             ExprKind::Ident(h) => {
+                if self.ident_shadowed_by_non_collection(h) {
+                    return None;
+                }
                 let bare = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                 let mut nm = match self.dyn_name_lookup(bare) {
                     Some(r) if h.path.len() == 1 => r.to_string(),
@@ -126244,11 +126314,15 @@ impl Simulator {
             // member name hidden by an unrelated outer bare registration
             // still resolves to its own `<handle>#member` storage.
             // `resolve_hier_name_static` of one segment is the name itself.
-            let registered = match h.path.as_slice() {
-                [seg] => self.module.dynamic_arrays.contains(seg.name.name.as_str()),
-                _ => {
-                    let n = Self::resolve_hier_name_static(h, &self.module);
-                    self.module.dynamic_arrays.contains(&n)
+            let registered = if self.ident_shadowed_by_non_collection(h) {
+                false
+            } else {
+                match h.path.as_slice() {
+                    [seg] => self.module.dynamic_arrays.contains(seg.name.name.as_str()),
+                    _ => {
+                        let n = Self::resolve_hier_name_static(h, &self.module);
+                        self.module.dynamic_arrays.contains(&n)
+                    }
                 }
             };
             if registered {
@@ -144846,7 +144920,10 @@ impl Simulator {
     /// anything else (dynamic / associative / queue / scalar).
     fn nd_array_operand(&mut self, e: &Expression) -> Option<(String, Vec<String>, bool)> {
         match &e.kind {
-            ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => {
+            ExprKind::Ident(h)
+                if h.path.iter().all(|s| s.selects.is_empty())
+                    && !self.ident_shadowed_by_non_collection(h) =>
+            {
                 let name = self.resolve_hier_name(h);
                 if let Some(sfx) = self.nd_formal_suffixes(&name) {
                     return Some((name.to_string(), sfx, true));
