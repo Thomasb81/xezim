@@ -4193,11 +4193,13 @@ struct MethodCallPlan {
 }
 
 /// A memoized `method_defining_class` answer: the defining class, the
-/// method, and its call plan once built (see `MethodCallPlan`).
+/// method, its inherited string property names, and its call plan once built
+/// (see `MethodCallPlan`).
 #[derive(Clone)]
 struct MethodDef {
-    class: String,
+    class: std::rc::Rc<String>,
     method: Arc<crate::ast::decl::ClassMethod>,
+    string_props: std::rc::Rc<Vec<String>>,
     plan: std::rc::Rc<std::cell::RefCell<Option<std::rc::Rc<MethodCallPlan>>>>,
 }
 
@@ -51258,6 +51260,11 @@ impl Simulator {
         if suspended {
             self.process_contexts.insert(pid, child_ctx);
         } else {
+            if !self.loop_frame_gens.is_empty() {
+                for g in &child_ctx.local_gen_stack {
+                    self.loop_frame_gens.remove(g);
+                }
+            }
             self.process_contexts.remove(&pid);
             self.fork_baselines.remove(&pid);
             self.fork_signal_captures.remove(&pid);
@@ -53031,32 +53038,27 @@ impl Simulator {
                             // `this`'s class must inline via the method path
                             // (Stage 1b, with this-context), not as a free task —
                             // otherwise free task resolution without `this` causes
-                            // member accesses to fail to resolve.
-                            let is_this_method = self
-                                .this_stack
-                                .last()
-                                .copied()
-                                .flatten()
-                                .and_then(|hh| {
-                                    self.heap
-                                        .get(hh)
-                                        .and_then(|o| o.as_ref())
-                                        .map(|inst| inst.class_name.clone())
-                                })
-                                .is_some_and(|cls| {
-                                    self.class_has_method(&cls, &h.path[0].name.name)
-                                })
-                                // §8.10: in a static method a bare name binds
-                                // to the class's methods before any
-                                // compilation-unit task of the same name.
-                                || self.static_class_context().is_some_and(|cls| {
-                                    self.class_has_method(&cls, &h.path[0].name.name)
-                                });
-                            if let Some(td) = (!is_this_method)
-                                .then(|| self.task_decl_rc(&h.path[0].name.name))
-                                .flatten()
-                            {
-                                if self.stmts_have_blocking(&td.items) {
+                            // member accesses to fail to resolve. Probe
+                            // `task_decl_rc` first so the 99.9% of bare calls
+                            // that are not module/package tasks skip the
+                            // `this_stack` + `class_has_method` check entirely.
+                            let tname = h.path[0].name.name.as_str();
+                            if let Some(td) = self.task_decl_rc(tname) {
+                                let is_this_method = self
+                                    .this_stack
+                                    .last()
+                                    .copied()
+                                    .flatten()
+                                    .and_then(|hh| self.heap.get(hh).and_then(|o| o.as_ref()))
+                                    .map(|inst| inst.class_name.clone())
+                                    .is_some_and(|cls| self.class_has_method(&cls, tname))
+                                    // §8.10: in a static method a bare name binds
+                                    // to the class's methods before any
+                                    // compilation-unit task of the same name.
+                                    || self
+                                        .static_class_context()
+                                        .is_some_and(|cls| self.class_has_method(&cls, tname));
+                                if !is_this_method && self.stmts_have_blocking(&td.items) {
                                     let mut cleanup = self.bind_task_frame(&td, args, None);
                                     // §13.4/§13.3.2: a free task body must NOT
                                     // see the caller's class context — task-scope
@@ -80361,6 +80363,9 @@ impl Simulator {
         {
             return false;
         }
+        if !self.struct_root_possible(n) {
+            return true;
+        }
         let dst = match self.dyn_name_lookup(n) {
             Some(uq) => uq.to_string(),
             None => n.to_string(),
@@ -80707,7 +80712,7 @@ impl Simulator {
             }
         }
         // A call's value is spread over a member-wise struct target.
-        if rhs_call {
+        if rhs_call && self.struct_root_possible(n) {
             let dst = match self.dyn_name_lookup(n) {
                 Some(uq) => uq.to_string(),
                 None => n.to_string(),
@@ -81206,29 +81211,57 @@ impl Simulator {
         // value path cannot carry variable-size members, so `b.d[]`
         // arrived empty. Copy member-wise (the copier now clones
         // dynamic members element-by-element).
-        // A flattened name whose computation evaluates nothing impure is
-        // the same at every probe below: compute it once.
-        let l_pure = self.flat_name_pure(lvalue);
-        let r_pure = self.flat_name_pure(rvalue);
+        // Only flatten when the LHS root can possibly hold an unpacked
+        // struct or an element of a struct collection; `rflat` is computed
+        // lazily only once the LHS is confirmed to be a struct target.
+        let l_may_be_struct = match &lvalue.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                let r = h.path[0].name.name.as_str();
+                self.struct_root_possible(r)
+                    || self.struct_prop_name_possible(r)
+                    || self.coll_member_possible(r)
+                    || self.dyn_name_lookup(r).is_some()
+            }
+            _ => {
+                let _ = self.struct_root_possible("");
+                !self.struct_root_names.is_empty() || !self.struct_capable_names().is_empty()
+            }
+        };
+        let l_pure = l_may_be_struct && self.flat_name_pure(lvalue);
         // These are aggregate-shape probes, not the actual assignment.
         // Leave mutating selectors for the eventual read/write path.
-        let l_probe_safe = Self::cond_expr_is_effect_free(lvalue, false);
+        let l_probe_safe = l_may_be_struct && Self::cond_expr_is_effect_free(lvalue, false);
         let mut lflat = l_probe_safe
             .then(|| self.flat_member_name(lvalue))
             .flatten();
-        let rflat = Self::cond_expr_is_effect_free(rvalue, false)
-            .then(|| self.flat_member_name(rvalue))
-            .flatten();
-        if let (Some(dst), Some(src)) = (&lflat, &rflat) {
-            if dst != src {
-                let su_opt =
-                    self.module.var_decl_types.get(dst).cloned().and_then(|dt| {
-                        match self.resolve_dt(&dt) {
-                            DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
-                            _ => None,
-                        }
-                    });
-                if let Some(su) = su_opt {
+        let mut rflat_cache: Option<Option<String>> = None;
+        let eval_rflat = |sim: &mut Self, cache: &mut Option<Option<String>>| -> Option<String> {
+            if let Some(cached) = cache {
+                if sim.flat_name_pure(rvalue) {
+                    return cached.clone();
+                }
+            }
+            let v = Self::cond_expr_is_effect_free(rvalue, false)
+                .then(|| sim.flat_member_name(rvalue))
+                .flatten();
+            *cache = Some(v.clone());
+            v
+        };
+        if let Some(dst) = &lflat {
+            let su_opt = self
+                .module
+                .var_decl_types
+                .get(dst)
+                .cloned()
+                .and_then(|dt| match self.resolve_dt(&dt) {
+                    DataType::Struct(su) if Self::spreads_member_wise(&su) => Some(su),
+                    _ => None,
+                });
+            if let Some(su) = su_opt {
+                let dst = dst.clone();
+                if let Some(src) = eval_rflat(self, &mut rflat_cache)
+                    && dst != src
+                {
                     let has_dyn = su.members.iter().any(|m| {
                         m.declarators.iter().any(|d| {
                             d.dimensions.iter().any(|dim| {
@@ -81249,9 +81282,9 @@ impl Simulator {
                             || sim.module.dynamic_arrays.contains(n)
                             || sim.module.arrays.contains_key(n)
                     };
-                    let has_dyn = has_dyn && !whole_coll(self, dst) && !whole_coll(self, src);
-                    if has_dyn && self.struct_storage_exists(src, &su) {
-                        self.copy_unpacked_struct(dst, src, &su);
+                    let has_dyn = has_dyn && !whole_coll(self, &dst) && !whole_coll(self, &src);
+                    if has_dyn && self.struct_storage_exists(&src, &su) {
+                        self.copy_unpacked_struct(&dst, &src, &su);
                         self.settle_after_proc_write();
                         return;
                     }
@@ -81331,7 +81364,7 @@ impl Simulator {
                 return;
             }
         }
-        if self.queue_pop_call(rvalue).is_none() {
+        if l_may_be_struct && self.queue_pop_call(rvalue).is_none() {
             if !l_pure && l_probe_safe {
                 lflat = self.flat_member_name(lvalue);
             }
@@ -81346,11 +81379,7 @@ impl Simulator {
                         let cont_s = self.resolve_locator_storage(&cont);
                         if let Some(su) = self.queue_elem_struct(&cont_s) {
                             let dst_s = format!("{}{}", cont_s, &dst[cut..]);
-                            let src = if r_pure {
-                                rflat.clone()
-                            } else {
-                                self.flat_member_name(rvalue)
-                            };
+                            let src = eval_rflat(self, &mut rflat_cache);
                             if let Some(src) = src {
                                 if self.struct_storage_exists(&src, &su) {
                                     self.copy_unpacked_struct(&dst_s, &src, &su);
@@ -81393,11 +81422,7 @@ impl Simulator {
             // identical code at top level worked.
             let (dst, spread_su) = self.struct_copy_target(dst);
             if let Some(su) = spread_su {
-                let src = if r_pure {
-                    rflat
-                } else {
-                    self.flat_member_name(rvalue)
-                };
+                let src = eval_rflat(self, &mut rflat_cache);
                 if let Some(src) = src {
                     if src != dst && self.struct_storage_exists(&src, &su) {
                         self.copy_unpacked_struct(&dst, &src, &su.clone());
@@ -82212,7 +82237,12 @@ impl Simulator {
         // `assoc_copy_with_plain_side`).
         if (formal_operand
             || l_assoc.is_some() != r_assoc.is_some()
-            || matches!(rvalue.kind, ExprKind::Call { .. }))
+            || matches!(
+                &rvalue.kind,
+                ExprKind::Call { func, args }
+                    if args.is_empty()
+                        && self.callee_method_name_is(func, |m| matches!(m, "pop_front" | "pop_back"))
+            ))
             && !self.module.associative_arrays.is_empty()
             && self.assoc_copy_with_plain_side(lvalue, rvalue, lf, rf, &l_assoc, &r_assoc)
         {
@@ -101935,6 +101965,12 @@ impl Simulator {
     /// evaluating it, or nothing wider). An unpacked-array item contributes
     /// its element width; a `$` bound contributes nothing.
     fn inside_joint_width(&mut self, expr: &Expression, items: &[Expression]) -> Option<u32> {
+        if !matches!(
+            Self::unparen(expr).kind,
+            ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
+        ) {
+            return None;
+        }
         let mut bounds: Vec<(&Expression, bool)> = Vec::with_capacity(items.len());
         for it in items {
             match &it.kind {
@@ -101954,6 +101990,12 @@ impl Simulator {
         expr: &Expression,
         ranges: &[ConstraintRange],
     ) -> Option<u32> {
+        if !matches!(
+            Self::unparen(expr).kind,
+            ExprKind::Binary { .. } | ExprKind::Unary { .. } | ExprKind::Conditional { .. }
+        ) {
+            return None;
+        }
         let mut bounds: Vec<(&Expression, bool)> = Vec::with_capacity(ranges.len());
         for r in ranges {
             match r {
@@ -115449,7 +115491,11 @@ impl Simulator {
     fn pop_local_frame(&mut self) {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
-        self.local_gen_stack.pop();
+        if let Some(g) = self.local_gen_stack.pop()
+            && !self.loop_frame_gens.is_empty()
+        {
+            self.loop_frame_gens.remove(&g);
+        }
         if let Some(mut f) = self.local_stack.pop() {
             if self.frame_pool.len() < 64 {
                 f.clear();
@@ -115462,7 +115508,11 @@ impl Simulator {
     fn pop_local_frame_take(&mut self) -> Option<HashMap<String, Value>> {
         let pair = self.local_type_stack.pop();
         self.recycle_local_types(pair);
-        self.local_gen_stack.pop();
+        if let Some(g) = self.local_gen_stack.pop()
+            && !self.loop_frame_gens.is_empty()
+        {
+            self.loop_frame_gens.remove(&g);
+        }
         self.local_stack.pop()
     }
 
@@ -121330,6 +121380,10 @@ impl Simulator {
         if let ExprKind::Call { func, args } = &rvalue.kind
             && args.is_empty()
             && self.callee_method_name_is(func, |m| matches!(m, "pop_front" | "pop_back"))
+            && let Some(dst) = l_assoc
+                .clone()
+                .or_else(|| self.plain_assoc_operand(lvalue))
+                .filter(|n| self.is_associative_array(n))
             && let Some((qn, m)) = self.collection_method_of(func)
         {
             let sz = self.get_queue_size(&qn);
@@ -121338,13 +121392,7 @@ impl Simulator {
                 qn,
                 if m == "pop_front" { 0 } else { sz.max(1) - 1 }
             );
-            if sz > 0
-                && self.module.associative_arrays.contains_key(&elem)
-                && let Some(dst) = l_assoc
-                    .clone()
-                    .or_else(|| self.plain_assoc_operand(lvalue))
-                    .filter(|n| self.is_associative_array(n))
-            {
+            if sz > 0 && self.module.associative_arrays.contains_key(&elem) {
                 self.copy_assoc_entries(&dst, &elem);
                 self.eval_expr(rvalue);
                 self.settle_after_proc_write();
@@ -124454,36 +124502,45 @@ impl Simulator {
     /// which used to clone a `DataType` (and drop it) per assignment.
     fn p_elem_type_ref(&self, name: &str) -> Option<std::borrow::Cow<'_, DataType>> {
         use std::borrow::Cow;
-        self.module
-            .var_decl_types
-            .get(name)
-            .map(Cow::Borrowed)
-            .or_else(|| {
-                // A collection formal's per-call key `@name#N` (see
-                // `formal_dyn_key`): the formal's own declared type.
-                let bare = name.strip_prefix('@')?.rsplit_once('#')?.0;
-                self.module.var_decl_types.get(bare).map(Cow::Borrowed)
-            })
-            .or_else(|| match Self::flat_single_base(name) {
-                // `flat_path_type` of a one-segment path is its base's
-                // declared type: borrow it.
-                Some(base) => self.module.var_decl_types.get(base).map(Cow::Borrowed),
-                None => self.flat_path_type(name).map(|(d, _)| Cow::Owned(d)),
-            })
-            .or_else(|| {
-                // An ELEMENT (`arr[2]`) carries no type of its own, but
-                // `var_decl_types` holds the container's ELEMENT type — so the
-                // element's type is the container's entry. Without this an
-                // instance-scoped `arr[2] = arr[0]` found no struct type and
-                // copied a packed container nobody reads, leaving the members
-                // x, while the same statement at top level resolved through
-                // `flat_path_type`.
-                let base = name.rfind('[').map(|i| &name[..i])?;
-                if base.is_empty() {
-                    return None;
-                }
-                self.module.var_decl_types.get(base).map(Cow::Borrowed)
-            })
+        if let Some(dt) = self.module.var_decl_types.get(name) {
+            return Some(Cow::Borrowed(dt));
+        }
+        // A collection formal's per-call key `@name#N` (see
+        // `formal_dyn_key`): the formal's own declared type.
+        if let Some(bare) = name
+            .strip_prefix('@')
+            .and_then(|s| s.rsplit_once('#'))
+            .map(|(b, _)| b)
+            && let Some(dt) = self.module.var_decl_types.get(bare)
+        {
+            return Some(Cow::Borrowed(dt));
+        }
+        // A plain identifier without `[` or `.` already missed `var_decl_types`
+        // above; skip `flat_single_base` (which would return `Some(name)` and
+        // probe the same key a second time).
+        if !name.as_bytes().contains(&b'[') && !name.as_bytes().contains(&b'.') {
+            return None;
+        }
+        match Self::flat_single_base(name) {
+            // `flat_path_type` of a one-segment path is its base's
+            // declared type: borrow it.
+            Some(base) => self.module.var_decl_types.get(base).map(Cow::Borrowed),
+            None => self.flat_path_type(name).map(|(d, _)| Cow::Owned(d)),
+        }
+        .or_else(|| {
+            // An ELEMENT (`arr[2]`) carries no type of its own, but
+            // `var_decl_types` holds the container's ELEMENT type — so the
+            // element's type is the container's entry. Without this an
+            // instance-scoped `arr[2] = arr[0]` found no struct type and
+            // copied a packed container nobody reads, leaving the members
+            // x, while the same statement at top level resolved through
+            // `flat_path_type`.
+            let base = name.rfind('[').map(|i| &name[..i])?;
+            if base.is_empty() {
+                return None;
+            }
+            self.module.var_decl_types.get(base).map(Cow::Borrowed)
+        })
     }
 
     /// Nested element list for a multi-dimensional unpacked array. The innermost
@@ -139000,12 +139057,22 @@ impl Simulator {
         mut e: &Expression,
         last: &crate::ast::Identifier,
     ) -> Option<Expression> {
-        let mut members = vec![last.clone()];
+        // Fast reject without allocating: 99.9% of MemberAccess callees are
+        // `this.m()`, `obj.m()` (1-segment Ident), or `call().m()`, which have
+        // < 3 segments or a non-Ident root.
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() < 2 => return None,
+            ExprKind::MemberAccess { .. }
+            | ExprKind::Specialization { .. }
+            | ExprKind::Ident(_) => {}
+            _ => return None,
+        }
+        let mut members: Vec<&crate::ast::Identifier> = vec![last];
         let span = e.span;
         loop {
             match &e.kind {
                 ExprKind::MemberAccess { expr, member } => {
-                    members.push(member.clone());
+                    members.push(member);
                     e = expr;
                 }
                 ExprKind::Specialization { base, .. } => {
@@ -139014,19 +139081,18 @@ impl Simulator {
                 ExprKind::Ident(h) => {
                     if h.root.is_some()
                         || h.path.is_empty()
+                        || h.path.len() + members.len() < 3
                         || h.path.iter().any(|s| !s.selects.is_empty())
                     {
                         return None;
                     }
-                    let mut path: Vec<_> = h.path.iter().cloned().collect();
-                    members.reverse();
-                    path.extend(members.into_iter().map(|m| HierPathSegment {
-                        name: m,
+                    let mut path: Vec<HierPathSegment> =
+                        Vec::with_capacity(h.path.len() + members.len());
+                    path.extend(h.path.iter().cloned());
+                    path.extend(members.into_iter().rev().map(|m| HierPathSegment {
+                        name: m.clone(),
                         selects: Vec::new(),
                     }));
-                    if path.len() < 3 {
-                        return None;
-                    }
                     return Some(Expression::new(
                         ExprKind::Ident(HierarchicalIdentifier {
                             root: None,
@@ -153324,7 +153390,7 @@ impl Simulator {
                 return res;
             }
         }
-        if compiled_methods_enabled() {
+        if args.len() <= 1 && !self.compiled_method_plans.is_empty() && compiled_methods_enabled() {
             if let Some(md) = self.method_defining_class(&class_name, method_name) {
                 let spec_id = self.instance_spec_id(handle);
                 if let Some(entry) =
@@ -165564,8 +165630,9 @@ impl Simulator {
         while let Some(cn) = probe {
             if let Some(m) = self.cached_class_method(cn, method_name) {
                 found = Some(MethodDef {
-                    class: cn.to_string(),
+                    class: std::rc::Rc::new(cn.to_string()),
                     method: m,
+                    string_props: self.class_string_props_of(cn),
                     plan: std::rc::Rc::new(std::cell::RefCell::new(None)),
                 });
                 break;
@@ -165643,8 +165710,10 @@ impl Simulator {
         let found = self.method_defining_class(start_class, method_name);
         let mut found_method = found.as_ref().map(|d| d.method.clone());
         let found_plan = found.as_ref().map(|d| d.plan.clone());
-        let mut cur_class: Option<String> = found.map(|d| d.class);
-        while let Some(cname) = cur_class {
+        let found_string_props = found.as_ref().map(|d| d.string_props.clone());
+        let mut cur_class: Option<std::rc::Rc<String>> = found.map(|d| d.class);
+        while let Some(cname_rc) = cur_class {
+            let cname: &String = &cname_rc;
             let method_opt = found_method.take();
             cur_class = None;
             if let Some(method) = method_opt {
@@ -166290,63 +166359,6 @@ impl Simulator {
                         }
                     }
                 }
-                // Mark string-typed return variable and params so `s[i]`
-                // does byte (character) indexing instead of bit-select.
-                // §23.8: a formal's name is local to THIS frame; recording it
-                // in the shared `string_signals` set must not leak past the
-                // return — uvm's `pack_string(string value)` would otherwise
-                // make `pack_field_int(uvm_integral_t value)` resolve `value`
-                // as a string, so `value[i]` byte-selects instead of
-                // bit-selecting. Track only newly-added names and remove them
-                // on exit; HashSet::insert returning false (name already
-                // present from an active caller) is left untouched.
-                let mut frame_string_signals: Vec<String> = Vec::new();
-                // §6.21/§23.8: frame-scope the string-flag registry (see the
-                // free-function path) so this method's non-string locals can't
-                // leak a `string_signals.remove` that clobbers an enclosing
-                // scope's `string <name>`.
-                self.string_signals_removed.push(Vec::new());
-                if let ClassMethodKind::Function(f) = &method.kind {
-                    // §13.4 / §6.21: see the free-function path.
-                    for port in ports.iter() {
-                        if !Self::is_string_data_type(&port.data_type) {
-                            self.forget_string_flag(&port.name.name);
-                        }
-                    }
-                    if plan.ret.as_ref().is_some_and(|r| r.decl_string) {
-                        if self.string_signals.insert(f.name.name.name.clone()) {
-                            frame_string_signals.push(f.name.name.name.clone());
-                        }
-                    }
-                }
-                for port in ports.iter() {
-                    if Self::is_string_data_type(&port.data_type) {
-                        if self.string_signals.insert(port.name.name.clone()) {
-                            frame_string_signals.push(port.name.name.clone());
-                        }
-                    }
-                }
-                // §6.16: a class's STRING properties must be in `string_signals`
-                // so that `foreach(str[i])`, `str[i]` (char select), and
-                // `str.len()` dispatch to the string paths. Walk the inheritance
-                // chain from the callee's class and add each string property
-                // for the duration of this frame (removed on exit below).
-                // The inserted properties are remembered by position in the
-                // (immutable, shared) list rather than by a second copy of
-                // the name; they are removed after the formals, as before.
-                let frame_string_props = self.class_string_props_of(&cname);
-                let mut frame_string_prop_mask: u64 = 0;
-                let mut frame_string_prop_more: Vec<usize> = Vec::new();
-                for (i, sp) in frame_string_props.iter().enumerate() {
-                    if !self.string_signals.contains(sp) {
-                        self.string_signals.insert(sp.clone());
-                        if i < 64 {
-                            frame_string_prop_mask |= 1u64 << i;
-                        } else {
-                            frame_string_prop_more.push(i);
-                        }
-                    }
-                }
                 // Loop-control flags (`break`/`continue`) are frame-local:
                 // save the caller's, clear them for this body, and restore
                 // afterward so a `continue`/`break` inside the callee can't
@@ -166568,7 +166580,7 @@ impl Simulator {
                     .then(|| {
                         self.try_run_compiled_method(
                             handle,
-                            &cname,
+                            cname,
                             method_name,
                             ports,
                             body,
@@ -166581,6 +166593,45 @@ impl Simulator {
                 {
                     self.return_value = Some(cval);
                 } else {
+                    // Mark string-typed return variable, params, and class
+                    // properties only when the AST interpreter actually runs
+                    // this body (compiled bytecode never reads `string_signals`).
+                    let mut frame_string_signals: Vec<String> = Vec::new();
+                    self.string_signals_removed.push(Vec::new());
+                    if let ClassMethodKind::Function(f) = &method.kind {
+                        for port in ports.iter() {
+                            if !Self::is_string_data_type(&port.data_type) {
+                                self.forget_string_flag(&port.name.name);
+                            }
+                        }
+                        if plan.ret.as_ref().is_some_and(|r| r.decl_string) {
+                            if self.string_signals.insert(f.name.name.name.clone()) {
+                                frame_string_signals.push(f.name.name.name.clone());
+                            }
+                        }
+                    }
+                    for port in ports.iter() {
+                        if Self::is_string_data_type(&port.data_type) {
+                            if self.string_signals.insert(port.name.name.clone()) {
+                                frame_string_signals.push(port.name.name.clone());
+                            }
+                        }
+                    }
+                    let frame_string_props = found_string_props
+                        .clone()
+                        .unwrap_or_else(|| self.class_string_props_of(cname));
+                    let mut frame_string_prop_mask: u64 = 0;
+                    let mut frame_string_prop_more: Vec<usize> = Vec::new();
+                    for (i, sp) in frame_string_props.iter().enumerate() {
+                        if !self.string_signals.contains(sp) {
+                            self.string_signals.insert(sp.clone());
+                            if i < 64 {
+                                frame_string_prop_mask |= 1u64 << i;
+                            } else {
+                                frame_string_prop_more.push(i);
+                            }
+                        }
+                    }
                     // class-perf loop-heat boost (pass C): while this method
                     // body runs on the AST interpreter, attribute its loop
                     // back-edges to it so the measured-heat gate can admit
@@ -166593,12 +166644,12 @@ impl Simulator {
                     let heat_key = if compiled_methods_enabled() && method_boost_enabled() {
                         let kind_of = CompiledBodyKind::of(&method.kind);
                         match (
-                            self.compiled_class_method_ids.get(&cname).copied(),
+                            self.compiled_class_method_ids.get(cname.as_str()).copied(),
                             self.compiled_class_method_ids.get(method_name).copied(),
                         ) {
                             (Some(c), Some(m)) => {
                                 let key = (c, m, self.instance_spec_id(handle));
-                                if self.is_loop_candidate(key, &cname, &kind_of, body) {
+                                if self.is_loop_candidate(key, cname, &kind_of, body) {
                                     Some(key)
                                 } else {
                                     None
@@ -166621,6 +166672,23 @@ impl Simulator {
                     if heat_key.is_some() {
                         self.compiled_method_heat_stack.pop();
                     }
+                    for n in &frame_string_signals {
+                        self.string_signals.remove(n);
+                    }
+                    let mut mask = frame_string_prop_mask;
+                    while mask != 0 {
+                        let i = mask.trailing_zeros() as usize;
+                        mask &= mask - 1;
+                        self.string_signals.remove(&frame_string_props[i]);
+                    }
+                    for &i in &frame_string_prop_more {
+                        self.string_signals.remove(&frame_string_props[i]);
+                    }
+                    if let Some(removed) = self.string_signals_removed.pop() {
+                        for n in removed {
+                            self.string_signals.insert(n);
+                        }
+                    }
                 } // end else: AST interpreter path
                 if let Some(prev) = _prev_meth {
                     CUR_METHOD_HASH.store(prev, Ordering::Relaxed);
@@ -166640,23 +166708,6 @@ impl Simulator {
                 // mirrors the free-function path: the frame is torn down and
                 // re-entered on resume, re-pushing the snapshot).
                 self.close_decl_shadow_frame();
-                for n in &frame_string_signals {
-                    self.string_signals.remove(n);
-                }
-                let mut mask = frame_string_prop_mask;
-                while mask != 0 {
-                    let i = mask.trailing_zeros() as usize;
-                    mask &= mask - 1;
-                    self.string_signals.remove(&frame_string_props[i]);
-                }
-                for &i in &frame_string_prop_more {
-                    self.string_signals.remove(&frame_string_props[i]);
-                }
-                if let Some(removed) = self.string_signals_removed.pop() {
-                    for n in removed {
-                        self.string_signals.insert(n);
-                    }
-                }
                 self.restore_spec_pooled(saved_spec);
                 if let Some(prev) = saved_resolve_hint {
                     *self.name_resolve_hint.borrow_mut() = prev;
@@ -170334,7 +170385,7 @@ impl Simulator {
                 Some(&id) => id,
                 None => {
                     let next = ids.len() as u32;
-                    *ids.entry(md.class.clone()).or_insert(next)
+                    *ids.entry((*md.class).clone()).or_insert(next)
                 }
             };
             let mid = match ids.get(method) {
@@ -170399,7 +170450,7 @@ impl Simulator {
         // --- every guard passed; state changes from here on ---
         self.push_queue_frame();
         self.this_stack.push(Some(handle));
-        self.class_context_stack.push(Some(md.class.clone()));
+        self.class_context_stack.push(Some((*md.class).clone()));
         // §8.25 (seeded callee spec): parity with the interpreter call
         // route — the direct dispatch skips exec_method_in_class_hierarchy's
         // seeding, so a callee of `C#(spec)` would resolve its bare static
