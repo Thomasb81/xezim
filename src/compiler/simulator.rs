@@ -67725,7 +67725,9 @@ impl Simulator {
 
                 changed
             }
-            ExprKind::Index { expr, index } => self.assign_value_index(lhs, val, expr, index),
+            ExprKind::Index { expr, index } => {
+                self.assign_value_index(lhs, val, expr, index)
+            }
             ExprKind::RangeSelect {
                 expr,
                 left,
@@ -80824,8 +80826,17 @@ impl Simulator {
                         // member write went to the leaf — `slices[t].path`
                         // read blank (UVM's uvm_hdl_path_concat).
                         let elem_su = self.queue_elem_struct(&lname);
+                        // #328: a dynamic/queue array whose element is itself an
+                        // associative array (`int d[][string]`). Each freshly sized
+                        // element is a sparse assoc array; register it so the
+                        // multidim peel / method paths see `name[i]` as assoc.
+                        let aa_flag = self.module.array_of_assoc_elems.get(&*lname).copied();
                         for i in 0..size {
                             let elem = format!("{}[{}]", lname, i);
+                            if let Some(is_str) = aa_flag {
+                                self.module.associative_arrays.insert(elem, is_str);
+                                continue;
+                            }
                             match &elem_su {
                                 Some(su) => {
                                     for (k, lw, is_real) in
@@ -82701,8 +82712,17 @@ impl Simulator {
             // `slices[t].path` read back blank (UVM's
             // uvm_hdl_path_concat::add_path).
             let elem_su = self.queue_elem_struct(&name);
+            // #328: an array whose ELEMENT is an assoc array (`int d[][string]`).
+            // Each freshly sized element is a sparse assoc array — register it
+            // rather than seeding a scalar cell, so `d[i]` reads/`d[i].exists`
+            // and the multidim-assoc peel treat `d[i]` as an assoc receiver.
+            let aa_flag = self.module.array_of_assoc_elems.get(&*name).copied();
             for i in keep..n {
                 let elem = format!("{}[{}]", name, i);
+                if let Some(is_str) = aa_flag {
+                    self.module.associative_arrays.insert(elem, is_str);
+                    continue;
+                }
                 match &elem_su {
                     Some(su) => {
                         for (k, lw, is_real) in self.unpacked_struct_leaf_keys(&elem, su) {
@@ -104212,6 +104232,18 @@ impl Simulator {
         false
     }
 
+    /// True iff `name` is a REGISTERED associative array in its own right —
+    /// a name elaborator placed in `module.associative_arrays` (an assoc
+    /// declaration, a per-instance scoped member, or a fixed/dynamic array
+    /// ELEMENT registered as an assoc for #328). Unlike `is_associative_array`
+    /// this does NOT auto-detect nested keyed receivers via
+    /// `is_nested_assoc_elem`, so a name like `two_assoc[0]` (a keyed element,
+    /// not itself a registered array) is correctly NOT a peel-stop: peels must
+    /// keep descending through keys to the declared array that owns them.
+    fn is_registered_assoc_array(&self, name: &str) -> bool {
+        self.module.associative_arrays.contains_key(name)
+    }
+
     /// Strip trailing `[key]` index segments from a possibly-indexed storage
     /// name, returning the declaration base (module-level or `<h>#member`).
     /// `foo[1]` -> `foo`; `h#m[1][2]` -> `h#m`.
@@ -105166,6 +105198,35 @@ impl Simulator {
             .unwrap_or(false)
         {
             return true;
+        }
+
+        // #328: a NESTED receiver of a fixed/dynamic array-of-assoc
+        // (`two_fixed[0][A]`, `two_dyn[0][A]`) or a multidim assoc
+        // (`two_assoc[0][A]`) has no direct `associative_arrays` entry — only
+        // the declared sub-array (`two_fixed[0]`, `two_assoc`) does, carrying
+        // the string-keyed flag. Strip trailing `[key]` segments and consult
+        // the surviving declaration's flag, so the KEY at this depth is
+        // rendered in the assoc-key form (`[A]`) and round-trips through
+        // `.exists()`/`.delete()` and foreach exactly like a 1-level read.
+        let mut base = name;
+        loop {
+            match base.rfind('[') {
+                Some(p) if base[p + 1..].ends_with(']') && base.bytes().nth(p + 1) != Some(b'\'') => {
+                    base = &base[..p];
+                    // A quoted static key (`foo['bar']`) terminates stripping;
+                    // treat remaining as the declaration.
+                    if self
+                        .module
+                        .associative_arrays
+                        .get(base)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                }
+                _ => break,
+            }
         }
 
         // A per-specialization STATIC collection storage key
@@ -108344,7 +108405,21 @@ impl Simulator {
         // `m_recur_states[obj][obj][policy].exists(...)`.
         let mut rev: Vec<&Expression> = Vec::new();
         let mut cur = expr;
+        // #328: stop peeling once the current base is ITSELF a registered
+        // associative sub-array — e.g. the element `two_fixed[0]` of a fixed
+        // array-of-assoc (`int two_fixed[2][string][string]`). The remaining
+        // Index levels are THIS assoc's keys, so the compound receiver is
+        // `two_fixed[0][A][B]`, built from base `two_fixed[0]`. Mirrors
+        // `multidim_assoc_elem` so the read/method paths agree with the write
+        // path instead of peeling all the way to the non-assoc fixed root.
         loop {
+            let flat = self.flat_member_name(cur);
+            if flat
+                .as_ref()
+                .is_some_and(|f| self.is_registered_assoc_array(f.as_ref()))
+            {
+                break;
+            }
             if let ExprKind::Index { expr: base, index } = &cur.kind {
                 rev.push(index.as_ref());
                 cur = base.as_ref();
@@ -108355,37 +108430,46 @@ impl Simulator {
         if rev.is_empty() {
             return None; // not an Index expression
         }
-        // The root must be a plain Ident naming an associative array.
-        let bh = if let ExprKind::Ident(bh) = &cur.kind {
-            bh
+        // Resolve the assoc base name. `cur` is the element where the peel
+        // stopped: a bare Ident naming an associative array, or an INDEXED
+        // element that is itself the registered associative sub-array
+        // (`two_fixed[0]`).
+        let bn_str: Option<String> = if let Some(flat) = self.flat_member_name(cur) {
+            if self.is_associative_array(&flat) {
+                Some(flat)
+            } else if let Some(scoped) = self.instance_assoc_member(&flat) {
+                self.is_associative_array(&scoped).then_some(scoped)
+            } else {
+                None
+            }
         } else {
-            return None;
-        };
-        let mut bn = self.resolve_hier_name(bh);
-        if let Some(s) = self.instance_assoc_member(&bn) {
-            bn = std::borrow::Cow::Owned(s);
-        } else if bh.path.len() >= 2 {
-            // `obj.member` accessed from module/lower scope where the first
-            // path segment is an OBJECT handle and the member is an
-            // associative property of that object's class. resolve_hier_name
-            // collapses to the bare `member` (losing the per-instance scope),
-            // so is_associative_array(bare) is false and the multidim helper
-            // bails. Re-derive the per-instance storage `<h>#<member>`.
-            let objnm = &bh.path[0].name.name;
-            let member = &bh.path[bh.path.len() - 1].name.name;
-            if let Some(h) = self.eval_ident_handle(objnm) {
-                if h != 0 {
-                    let cand = format!("{h}#{member}");
-                    if self.is_associative_array(&cand) {
-                        bn = std::borrow::Cow::Owned(cand);
+            let ExprKind::Ident(bh) = &cur.kind else {
+                return None;
+            };
+            let mut hn = self.resolve_hier_name(bh).to_string();
+            if let Some(s) = self.instance_assoc_member(&hn) {
+                hn = s;
+            } else if bh.path.len() >= 2 {
+                // `obj.member` accessed from module/lower scope where the
+                // first path segment is an OBJECT handle and the member is an
+                // associative property of that object's class.
+                let objnm = &bh.path[0].name.name;
+                let member = &bh.path[bh.path.len() - 1].name.name;
+                if let Some(h) = self.eval_ident_handle(objnm) {
+                    if h != 0 {
+                        let cand = format!("{h}#{member}");
+                        if self.is_associative_array(&cand) {
+                            hn = cand;
+                        }
                     }
                 }
             }
-        }
-        if !self.is_associative_array(&bn) {
+            Some(hn)
+        };
+        let Some(bn) = bn_str.filter(|b| self.is_associative_array(b)) else {
             return None;
-        }
-        let mut name = bn.clone();
+        };
+        let mut name: std::borrow::Cow<'_, str> = std::borrow::Cow::Owned(bn.clone());
         // Build root→leaf so the string reads `base[K1][K2]...[Kn]`.
         for idx in rev.iter().rev() {
             let kv = self.eval_expr(idx);
@@ -108443,7 +108527,23 @@ impl Simulator {
         let mut rev: Vec<&Expression> = vec![outer_index];
         let mut cur = base;
         let mut depth = 1;
-        while let ExprKind::Index { expr: b, index } = &cur.kind {
+        // #328: peel only NON-associative leading index levels. The
+        // associative sub-array that holds the remaining keys is the element
+        // AT the boundary (a fixed / dynamic / queue outer dimension that
+        // contains an associative array), not the non-associative root.
+        // Without stopping, `two_fixed[0]["A"]["B"]` peeled all the way to
+        // the FIXED root `two_fixed`, which is not associative, and the write
+        // was silently dropped instead of creating the nested entry.
+        loop {
+            if self
+                .flat_member_name(cur)
+                .is_some_and(|nm| self.is_registered_assoc_array(nm.as_ref()))
+            {
+                break;
+            }
+            let ExprKind::Index { expr: b, index } = &cur.kind else {
+                break;
+            };
             rev.push(index.as_ref());
             cur = b.as_ref();
             depth += 1;
@@ -108451,15 +108551,25 @@ impl Simulator {
         if depth < 2 {
             return None; // 1D — existing handlers
         }
-        // A bare name, or a class member reached through a handle (`h.m`).
-        let base_name = match self.assoc_array_storage_name(cur) {
-            Some(n) => n,
-            None if matches!(&cur.kind, ExprKind::MemberAccess { .. })
-                || matches!(&cur.kind, ExprKind::Ident(h) if h.path.len() >= 2) =>
-            {
-                self.handle_assoc_storage_name(cur)?
+        // A bare name, or a class member reached through a handle (`h.m`), or
+        // an INDEXED element that IS itself the associative sub-array (`v[0]`
+        // where `v[0]` is a registered assoc array — #328). `flat_member_name`
+        // gives the storage key for the indexed case; it runs AFTER the handle
+        // path so a class member (`h.m`) keeps its handle-scoped storage key.
+        let base_name = if let Some(n) = self.assoc_array_storage_name(cur) {
+            n
+        } else if matches!(&cur.kind, ExprKind::MemberAccess { .. })
+            || matches!(&cur.kind, ExprKind::Ident(h) if h.path.len() >= 2)
+        {
+            self.handle_assoc_storage_name(cur)?
+        } else if let Some(flat) = self.flat_member_name(cur) {
+            if self.is_associative_array(&flat) {
+                flat.to_string()
+            } else {
+                return None;
             }
-            None => return None,
+        } else {
+            return None;
         };
         // Distinguish a true multidim assoc from an assoc-of-queue/
         // dynamic-array (`m[k1][i]`): if the first-level element `m[K1]` is a

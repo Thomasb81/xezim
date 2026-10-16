@@ -79,6 +79,8 @@ mod call_ret_store_into_local_coll;
 mod local_coll_init_fast_fn_eligible;
 #[path = "collections/multidim_assoc_array.rs"]
 mod multidim_assoc_array;
+#[path = "collections/nested_assoc_entries.rs"]
+mod nested_assoc_entries;
 #[path = "collections/noparen_array_methods.rs"]
 mod noparen_array_methods;
 #[path = "collections/pp_queue_slice.rs"]
